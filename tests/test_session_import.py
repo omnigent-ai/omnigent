@@ -12,6 +12,10 @@ from omnigent.session_import.local import (
     list_recent_local_session_ids,
     load_claude_session,
     load_codex_session,
+    load_kimi_session,
+    load_kiro_session,
+    load_pi_session,
+    load_qwen_session,
 )
 from omnigent.session_import.models import SessionImportNotFoundError
 
@@ -338,3 +342,594 @@ def test_list_recent_codex_sessions_includes_archived_and_deduplicates(
     recent = list_recent_local_session_ids("codex", limit=10)
 
     assert recent == (first_id, second_id)
+
+
+def test_load_qwen_session_normalizes_recorded_messages(tmp_path: Path) -> None:
+    """A Qwen recording imports its visible user and assistant messages."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "projects" / "-repo" / "chats" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "uuid": "user-1",
+            "sessionId": session_id,
+            "type": "user",
+            "cwd": "/repo",
+            "message": {"role": "user", "parts": [{"text": "inspect TODO.md"}]},
+        },
+        {
+            "uuid": "assistant-1",
+            "sessionId": session_id,
+            "type": "assistant",
+            "cwd": "/repo",
+            "message": {"role": "model", "parts": [{"text": "Done."}]},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    imported = load_qwen_session(session_id, qwen_home=tmp_path)
+
+    assert imported.source == "qwen"
+    assert imported.external_session_id == f"-repo:{session_id}"
+    assert imported.workspace == "/repo"
+    assert imported.title == "inspect TODO.md"
+    assert [item.data.model_dump()["role"] for item in imported.items] == [
+        "user",
+        "assistant",
+    ]
+    assert imported.items[1].data.model_dump()["agent"] == "qwen-native-ui"
+
+
+def test_load_qwen_session_follows_the_current_branch(tmp_path: Path) -> None:
+    """Qwen import excludes stale siblings from its linked recording."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "projects" / "-repo" / "chats" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {
+            "uuid": "root-user",
+            "parentUuid": None,
+            "type": "user",
+            "cwd": "/repo",
+            "message": {"parts": [{"text": "start"}]},
+        },
+        {
+            "uuid": "stale-assistant",
+            "parentUuid": "root-user",
+            "type": "assistant",
+            "message": {"parts": [{"text": "stale answer"}]},
+        },
+        {
+            "uuid": "active-user",
+            "parentUuid": "root-user",
+            "type": "user",
+            "message": {"parts": [{"text": "try again"}]},
+        },
+        {
+            "uuid": "active-assistant",
+            "parentUuid": "active-user",
+            "type": "assistant",
+            "message": {"parts": [{"text": "active answer"}]},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    imported = load_qwen_session(session_id, qwen_home=tmp_path)
+
+    assert [item.data.model_dump()["content"][0]["text"] for item in imported.items] == [
+        "start",
+        "try again",
+        "active answer",
+    ]
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [
+            {
+                "uuid": "duplicate",
+                "parentUuid": None,
+                "type": "user",
+                "message": {"parts": [{"text": "first"}]},
+            },
+            {
+                "uuid": "duplicate",
+                "parentUuid": None,
+                "type": "assistant",
+                "message": {"parts": [{"text": "second"}]},
+            },
+        ],
+        [
+            {
+                "uuid": "orphan",
+                "parentUuid": "missing",
+                "type": "user",
+                "message": {"parts": [{"text": "partial"}]},
+            }
+        ],
+    ],
+)
+def test_load_qwen_session_rejects_malformed_links(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+) -> None:
+    """Malformed Qwen links cannot create a permanently partial import."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "projects" / "-repo" / "chats" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    with pytest.raises(SessionImportNotFoundError, match="no importable history"):
+        load_qwen_session(session_id, qwen_home=tmp_path)
+
+
+def test_load_qwen_session_qualifies_ambiguous_project_id(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Project-qualified Qwen locators keep duplicate native ids importable."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    monkeypatch.setenv("QWEN_HOME", str(tmp_path))
+    for project in ("-repo-a", "-repo-b"):
+        transcript = tmp_path / "projects" / project / "chats" / f"{session_id}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            json.dumps(
+                {
+                    "uuid": f"user-{project}",
+                    "type": "user",
+                    "message": {"parts": [{"text": project}]},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(SessionImportNotFoundError, match="ambiguous; use one of"):
+        load_qwen_session(session_id, qwen_home=tmp_path)
+    locators = list_recent_local_session_ids("qwen", limit=10)
+    assert set(locators) == {f"-repo-a:{session_id}", f"-repo-b:{session_id}"}
+    imported = load_qwen_session(f"-repo-a:{session_id}", qwen_home=tmp_path)
+    assert imported.external_session_id == f"-repo-a:{session_id}"
+    assert imported.title == "-repo-a"
+
+
+def test_list_recent_qwen_sessions_scans_projects(tmp_path: Path, monkeypatch) -> None:
+    """Qwen batch discovery returns the newest recordings across projects."""
+    monkeypatch.setenv("QWEN_HOME", str(tmp_path))
+    recordings = [
+        (tmp_path / "projects" / "-old" / "chats" / "old.jsonl", 1),
+        (tmp_path / "projects" / "-new" / "chats" / "new.jsonl", 3),
+        (tmp_path / "projects" / "-middle" / "chats" / "middle.jsonl", 2),
+    ]
+    for path, modified_at in recordings:
+        path.parent.mkdir(parents=True)
+        path.touch()
+        os.utime(path, (modified_at, modified_at))
+
+    recent = list_recent_local_session_ids("qwen", limit=2)
+
+    assert recent == ("-new:new", "-middle:middle")
+
+
+def test_load_kiro_session_uses_metadata_and_visible_messages(tmp_path: Path) -> None:
+    """A Kiro session imports JSONL messages with workspace metadata."""
+    session_id = "kiro-session-1"
+    sessions = tmp_path / ".kiro" / "sessions" / "cli"
+    sessions.mkdir(parents=True)
+    (sessions / f"{session_id}.json").write_text(
+        json.dumps({"cwd": "/repo", "created_at": "2026-07-21T12:00:00Z"}),
+        encoding="utf-8",
+    )
+    records = [
+        {
+            "kind": "Prompt",
+            "data": {
+                "message_id": "user-1",
+                "content": [{"kind": "text", "data": "inspect TODO.md"}],
+            },
+        },
+        {
+            "kind": "AssistantMessage",
+            "data": {
+                "message_id": "assistant-1",
+                "content": [{"kind": "text", "data": "Done."}],
+            },
+        },
+    ]
+    (sessions / f"{session_id}.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records),
+        encoding="utf-8",
+    )
+
+    imported = load_kiro_session(session_id, kiro_home=tmp_path)
+
+    assert imported.source == "kiro"
+    assert imported.workspace == "/repo"
+    assert imported.title == "inspect TODO.md"
+    assert [item.data.model_dump()["role"] for item in imported.items] == [
+        "user",
+        "assistant",
+    ]
+    assert imported.items[1].data.model_dump()["agent"] == "kiro-native-ui"
+
+
+def test_list_recent_kiro_sessions_requires_metadata(tmp_path: Path, monkeypatch) -> None:
+    """Kiro batch discovery orders complete metadata/transcript pairs."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sessions = tmp_path / ".kiro" / "sessions" / "cli"
+    sessions.mkdir(parents=True)
+    for session_id, modified_at in (("old", 1), ("new", 3)):
+        (sessions / f"{session_id}.json").write_text(
+            json.dumps({"cwd": "/repo"}), encoding="utf-8"
+        )
+        transcript = sessions / f"{session_id}.jsonl"
+        transcript.touch()
+        os.utime(transcript, (modified_at, modified_at))
+    incomplete = sessions / "incomplete.jsonl"
+    incomplete.touch()
+    os.utime(incomplete, (4, 4))
+
+    recent = list_recent_local_session_ids("kiro", limit=10)
+
+    assert recent == ("new", "old")
+
+
+def test_load_pi_session_follows_the_current_branch(tmp_path: Path) -> None:
+    """Pi import follows parent links from the last entry instead of stale branches."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {"type": "session", "version": 3, "id": session_id, "cwd": "/repo"},
+        {
+            "type": "message",
+            "id": "root-user",
+            "parentId": None,
+            "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+        },
+        {
+            "type": "message",
+            "id": "stale-assistant",
+            "parentId": "root-user",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "stale branch"}],
+            },
+        },
+        {
+            "type": "message",
+            "id": "active-user",
+            "parentId": "root-user",
+            "message": {"role": "user", "content": "take another approach"},
+        },
+        {
+            "type": "message",
+            "id": "active-assistant",
+            "parentId": "active-user",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "active answer"}],
+            },
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    imported = load_pi_session(session_id, pi_home=tmp_path)
+
+    assert imported.source == "pi"
+    assert imported.workspace == "/repo"
+    assert [item.data.model_dump()["content"][0]["text"] for item in imported.items] == [
+        "start",
+        "take another approach",
+        "active answer",
+    ]
+
+
+def test_load_pi_session_preserves_tool_calls_and_results(tmp_path: Path) -> None:
+    """Pi assistant tool blocks and tool results remain ordinary tool items."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {"type": "session", "version": 3, "id": session_id, "cwd": "/repo"},
+        {
+            "type": "message",
+            "id": "assistant-tool",
+            "parentId": None,
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Checking."},
+                    {
+                        "type": "toolCall",
+                        "id": "call-1",
+                        "name": "bash",
+                        "arguments": {"cmd": "ls"},
+                    },
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "id": "tool-result",
+            "parentId": "assistant-tool",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call-1",
+                "content": [{"type": "text", "text": "README.md"}],
+            },
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    imported = load_pi_session(session_id, pi_home=tmp_path)
+
+    assert [item.type for item in imported.items] == [
+        "message",
+        "function_call",
+        "function_call_output",
+    ]
+    assert imported.items[1].data.model_dump() == {
+        "agent": "pi-native-ui",
+        "name": "bash",
+        "arguments": '{"cmd":"ls"}',
+        "call_id": "call-1",
+    }
+    assert imported.items[2].data.model_dump() == {
+        "call_id": "call-1",
+        "output": "README.md",
+    }
+
+
+def test_load_pi_session_rejects_an_orphaned_active_leaf(tmp_path: Path) -> None:
+    """A broken Pi parent chain cannot be claimed as a partial import."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {"type": "session", "version": 3, "id": session_id, "cwd": "/repo"},
+        {
+            "type": "message",
+            "id": "orphan",
+            "parentId": "missing",
+            "message": {"role": "user", "content": "partial"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    with pytest.raises(SessionImportNotFoundError, match="no importable history"):
+        load_pi_session(session_id, pi_home=tmp_path)
+
+
+def test_load_pi_session_migrates_legacy_linear_history(tmp_path: Path) -> None:
+    """Pi v1 entries without tree ids import in their original linear order."""
+    session_id = "legacy.session"
+    transcript = tmp_path / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {"type": "session", "version": 1, "id": session_id, "cwd": "/repo"},
+        {"type": "message", "message": {"role": "user", "content": "hello"}},
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hi"}],
+            },
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    imported = load_pi_session(session_id, pi_home=tmp_path)
+
+    assert [item.data.model_dump()["content"][0]["text"] for item in imported.items] == [
+        "hello",
+        "hi",
+    ]
+
+
+def test_load_pi_session_preserves_images_tool_order_and_aborted_state(tmp_path: Path) -> None:
+    """Pi content retains images, tool position, and interrupted assistant state."""
+    session_id = "my-feature"
+    transcript = tmp_path / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {"type": "session", "version": 3, "id": session_id, "cwd": "/repo"},
+        {
+            "type": "message",
+            "id": "11111111",
+            "parentId": None,
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+                    {"type": "text", "text": "inspect this"},
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "id": "22222222",
+            "parentId": "11111111",
+            "message": {
+                "role": "assistant",
+                "stopReason": "aborted",
+                "content": [
+                    {"type": "text", "text": "Before."},
+                    {
+                        "type": "toolCall",
+                        "id": "call-1",
+                        "name": "bash",
+                        "arguments": {"cmd": "ls"},
+                    },
+                    {"type": "text", "text": "After."},
+                ],
+            },
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    imported = load_pi_session(session_id, pi_home=tmp_path)
+
+    assert [item.type for item in imported.items] == [
+        "message",
+        "message",
+        "function_call",
+        "message",
+    ]
+    assert imported.items[0].data.model_dump()["content"] == [
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        {"type": "input_text", "text": "inspect this"},
+    ]
+    assert imported.items[1].data.model_dump()["interrupted"] is True
+    assert imported.items[3].data.model_dump()["interrupted"] is True
+
+
+def test_load_pi_session_preserves_active_branch_summary(tmp_path: Path) -> None:
+    """Pi branch summaries remain durable context for later active turns."""
+    session_id = "branch-summary"
+    transcript = tmp_path / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    records = [
+        {"type": "session", "version": 3, "id": session_id, "cwd": "/repo"},
+        {
+            "type": "message",
+            "id": "11111111",
+            "parentId": None,
+            "message": {"role": "user", "content": "start"},
+        },
+        {
+            "type": "branch_summary",
+            "id": "22222222",
+            "parentId": "11111111",
+            "fromId": "stale-leaf",
+            "summary": "Changed auth.py and found a token race.",
+        },
+        {
+            "type": "message",
+            "id": "33333333",
+            "parentId": "22222222",
+            "message": {"role": "user", "content": "continue"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    imported = load_pi_session(session_id, pi_home=tmp_path)
+
+    assert [item.data.is_meta for item in imported.items] == [False, True, False]
+    assert "Changed auth.py" in imported.items[1].data.model_dump()["content"][0]["text"]
+
+
+def test_list_recent_pi_sessions_scans_project_directories(tmp_path: Path, monkeypatch) -> None:
+    """Pi batch discovery extracts session UUIDs from timestamped files."""
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    session_ids = (
+        "019f8648-2797-7170-bf73-837f2655c471",
+        "019f8648-2797-7170-bf73-837f2655c472",
+    )
+    for index, session_id in enumerate(session_ids, start=1):
+        transcript = tmp_path / "sessions" / f"--repo-{index}--" / f"stamp_{session_id}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            json.dumps({"type": "session", "version": 3, "id": session_id}) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(transcript, (index, index))
+
+    recent = list_recent_local_session_ids("pi", limit=10)
+
+    assert recent == tuple(reversed(session_ids))
+
+
+def test_list_recent_pi_sessions_supports_custom_ids(tmp_path: Path, monkeypatch) -> None:
+    """Pi discovery reads safe custom session ids from transcript headers."""
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    transcript = tmp_path / "sessions" / "--repo--" / "stamp_my-feature.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps({"type": "session", "version": 3, "id": "my-feature", "cwd": "/repo"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert list_recent_local_session_ids("pi", limit=10) == ("my-feature",)
+
+
+def test_load_kimi_session_normalizes_wire_messages(tmp_path: Path) -> None:
+    """A Kimi wire log imports visible prompts and completed assistant text."""
+    session_id = "session_20260721_abc"
+    session_dir = tmp_path / "sessions" / "wd_repo" / session_id
+    wire = session_dir / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    (tmp_path / "session_index.jsonl").write_text(
+        json.dumps({"sessionDir": str(session_dir), "workDir": "/repo"}) + "\n",
+        encoding="utf-8",
+    )
+    records = [
+        {
+            "type": "turn.prompt",
+            "origin": {"kind": "user"},
+            "input": [{"type": "text", "text": "inspect TODO.md"}],
+        },
+        {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "content.part",
+                "uuid": "assistant-1",
+                "part": {"type": "think", "think": "private reasoning"},
+            },
+        },
+        {
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "content.part",
+                "uuid": "assistant-1",
+                "part": {"type": "text", "text": "Done."},
+            },
+        },
+    ]
+    wire.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+    imported = load_kimi_session(session_id, kimi_home=tmp_path)
+
+    assert imported.source == "kimi"
+    assert imported.workspace == "/repo"
+    assert imported.title == "inspect TODO.md"
+    assert [item.data.model_dump()["role"] for item in imported.items] == [
+        "user",
+        "assistant",
+    ]
+    assert imported.items[1].data.model_dump()["agent"] == "kimi-native-ui"
+
+
+def test_list_recent_kimi_sessions_uses_wire_recency(tmp_path: Path, monkeypatch) -> None:
+    """Kimi batch discovery identifies session directories by wire-log recency."""
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path))
+    for session_id, modified_at in (("session_old", 1), ("session_new", 3)):
+        wire = tmp_path / "sessions" / "wd_repo" / session_id / "agents" / "main" / "wire.jsonl"
+        wire.parent.mkdir(parents=True)
+        wire.touch()
+        os.utime(wire, (modified_at, modified_at))
+
+    recent = list_recent_local_session_ids("kimi", limit=10)
+
+    assert recent == ("session_new", "session_old")

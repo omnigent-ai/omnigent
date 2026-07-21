@@ -1759,7 +1759,11 @@
           "source": {
             "enum": [
               "claude",
-              "codex"
+              "codex",
+              "kimi",
+              "kiro",
+              "pi",
+              "qwen"
             ],
             "title": "Source",
             "type": "string"
