@@ -336,7 +336,7 @@ function MCPServerRow({
 }) {
   return (
     <div
-      className="flex flex-col gap-2 rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-container)] p-3 [box-shadow:var(--elevation-otto-1)]"
+      className="flex flex-col gap-2 rounded-md border border-[var(--border-otto-container)] p-3 [box-shadow:var(--elevation-otto-1)]"
       data-testid="create-agent-mcp-entry"
     >
       <div className="flex items-center gap-2">

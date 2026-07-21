@@ -136,7 +136,7 @@ function SortSelector({
         <button
           type="button"
           aria-label={`Sort: ${active.label}`}
-          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-xs hover:bg-muted hover:text-foreground"
+          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-sm px-2.5 py-[4px] text-muted-foreground text-xs hover:bg-muted hover:text-foreground"
         >
           <span>Sort:</span>
           <active.Icon className="size-3.5" />
@@ -162,7 +162,7 @@ function SortSelector({
 // tree (All). One control replaces the old separate Files / Changes rail tabs.
 // ---------------------------------------------------------------------------
 
-// Leading cell in the search toolbar. Rounded-full pills match the rail tabs;
+// Leading cell in the search toolbar. Compact buttons match the rail tabs;
 // the active scope uses the same theme selection surface as the sidebar.
 function FileScopeSwitch({
   flatView,
@@ -176,7 +176,7 @@ function FileScopeSwitch({
   const changedSelected = flatView;
   const allSelected = !flatView;
   const pill =
-    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-[13px] font-medium leading-5 transition-colors";
+    "flex cursor-pointer items-center gap-[6px] rounded-sm px-[14px] py-[2px] text-13 font-medium leading-5 transition-colors";
   const activePill = "bg-muted text-foreground";
   const idlePill = "text-muted-foreground hover:text-foreground";
   return (
@@ -455,7 +455,7 @@ export function FilesPanel({
                 aria-expanded={showSearchFilters}
                 title="Files to include / exclude"
                 className={cn(
-                  "flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] hover:bg-muted",
+                  "flex shrink-0 cursor-pointer items-center gap-1 rounded-sm px-2.5 py-[4px] hover:bg-muted",
                   showSearchFilters || treeFiltersActive
                     ? "text-foreground"
                     : "text-muted-foreground hover:text-foreground",

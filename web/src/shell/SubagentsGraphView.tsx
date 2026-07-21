@@ -64,7 +64,7 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
       />
       <div
         className={cn(
-          "cursor-pointer rounded-[var(--radius-otto-md)] border px-3 py-2 [box-shadow:var(--elevation-otto-1)] transition-[box-shadow,border-color] hover:[box-shadow:var(--elevation-otto-2)]",
+          "cursor-pointer rounded-lg border px-3 py-2 [box-shadow:var(--elevation-otto-1)] transition-[box-shadow,border-color] hover:[box-shadow:var(--elevation-otto-2)]",
           colors.border,
           colors.bg,
           isActive && "ring-2 ring-ring ring-offset-1 ring-offset-background",

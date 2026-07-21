@@ -751,7 +751,11 @@ describe("NewChatLandingScreen", () => {
       "buoyant-enter",
       "buoyant-enter--composer",
     );
-    expect(submit).toHaveClass("buoyant-send-action", "active:rounded-full");
+    expect(submit).toHaveClass(
+      "buoyant-send-action",
+      "rounded-sm",
+      "active:rounded-[calc(var(--radius-otto-button)+2px)]",
+    );
     // Host (auto-selected) + agent (default) + workspace (seeded from the
     // recent) are all present, but with no message there's no task → disabled.
     await waitFor(() =>
@@ -1055,10 +1059,7 @@ describe("NewChatLandingScreen", () => {
       ).getAttribute("aria-checked"),
     ).toBe("true");
     const banner = screen.getByTestId("new-chat-landing-bypass-sandbox-banner");
-    expect(banner).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
-      "[box-shadow:var(--elevation-otto-1)]",
-    );
+    expect(banner).toHaveClass("rounded-md", "[box-shadow:var(--elevation-otto-1)]");
     expect(banner.textContent).toContain("approvals and the sandbox disabled");
   });
 
@@ -1075,7 +1076,7 @@ describe("NewChatLandingScreen", () => {
     closeMenu();
     // Armed → the persistent banner is up under the composer.
     expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
+      "rounded-md",
       "[box-shadow:var(--elevation-otto-1)]",
     );
 

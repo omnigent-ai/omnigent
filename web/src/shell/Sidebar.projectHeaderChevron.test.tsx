@@ -122,7 +122,7 @@ describe("project folder header icon/chevron", () => {
     // foreground text.
     expect(header).toHaveClass(
       "gap-2",
-      "rounded-[var(--radius-otto-xs)]",
+      "rounded-[var(--radius-otto-button)]",
       "px-2",
       "py-[3px]",
       "sidebar-compact-text",

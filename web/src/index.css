@@ -118,7 +118,7 @@
   --color-user-bubble-border: var(--user-bubble-border);
   --color-user-bubble-foreground: var(--user-bubble-foreground);
   --color-background: var(--background);
-  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-sm: var(--radius-otto-button);
   --radius-md: calc(var(--radius) * 0.8);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) * 1.4);
@@ -141,10 +141,11 @@
   /* Otto's UI grammar mirrors the mascot's soft body-to-arm curvature:
    * compact controls stay precise, containers soften outward, and major
    * surfaces float with warm rather than neutral elevation. */
-  --radius-otto-xs: 6px;
-  --radius-otto-sm: 10px;
-  --radius-otto-md: 14px;
-  --radius-otto-lg: 20px;
+  --radius-otto-xs: 4px;
+  --radius-otto-button: 6px;
+  --radius-otto-sm: 8px;
+  --radius-otto-md: 12px;
+  --radius-otto-lg: 16px;
   --ease-otto: cubic-bezier(0.34, 1.4, 0.64, 1);
   --duration-otto-fast: 180ms;
   --border-otto-hairline: rgba(61, 57, 41, 0.1);

@@ -366,10 +366,7 @@ describe("InboxPage comments and errors", () => {
     renderPage();
 
     const banner = await screen.findByTestId("inbox-load-error");
-    expect(banner).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
-      "[box-shadow:var(--elevation-otto-1)]",
-    );
+    expect(banner).toHaveClass("rounded-lg", "[box-shadow:var(--elevation-otto-1)]");
     expect(within(banner).getByText(/Couldn.t load inbox items from 2/)).toBeInTheDocument();
     fireEvent.click(within(banner).getByRole("button", { name: /Retry/ }));
     expect(retryFailed).toHaveBeenCalled();

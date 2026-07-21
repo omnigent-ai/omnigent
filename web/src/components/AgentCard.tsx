@@ -100,7 +100,7 @@ export function AgentCard({
       type="button"
       data-testid={`agent-card-${agent.id}`}
       onClick={onSelect}
-      className={`flex w-full items-center gap-3 rounded-[var(--radius-otto-md)] border p-3 text-left transition [box-shadow:var(--elevation-otto-1)] ${
+      className={`flex w-full items-center gap-3 rounded-lg border p-3 text-left transition [box-shadow:var(--elevation-otto-1)] ${
         selected ? "border-primary bg-primary/5" : "border-border hover:border-muted-foreground/30"
       } cursor-pointer`}
     >

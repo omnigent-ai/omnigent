@@ -167,7 +167,7 @@ export function CommentsPanel({
             type="button"
             variant="outline"
             size="xs"
-            className="rounded-full px-3 gap-1.5"
+            className="rounded-sm px-3 gap-1.5"
             disabled={!canAddress || comments.length === 0 || addressPending}
             onClick={onAddressAll}
           >

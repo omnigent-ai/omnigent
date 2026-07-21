@@ -49,7 +49,7 @@ describe("AgentCard surface", () => {
   it("uses the standard Otto card geometry", () => {
     render(<AgentCard agent={agent()} selected={false} onSelect={() => {}} />);
     expect(screen.getByRole("button")).toHaveClass(
-      "rounded-[var(--radius-otto-md)]",
+      "rounded-lg",
       "[box-shadow:var(--elevation-otto-1)]",
     );
   });

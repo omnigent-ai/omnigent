@@ -373,7 +373,7 @@ export function PdfViewer({
           <button
             data-add-comment-btn
             type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            className="fixed z-50 flex items-center gap-1.5 rounded-sm border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-xs font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
             style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {

@@ -277,7 +277,7 @@ export function WorkspacePathField({
           type="button"
           onClick={onBrowse}
           aria-label="Browse directories"
-          className="flex size-9 shrink-0 items-center justify-center rounded-md border border-input bg-background text-muted-foreground transition hover:bg-muted hover:text-foreground"
+          className="flex size-9 shrink-0 items-center justify-center rounded-sm border border-input bg-background text-muted-foreground transition hover:bg-muted hover:text-foreground"
           data-testid="workspace-browse-toggle"
         >
           <FolderIcon className="size-4" />

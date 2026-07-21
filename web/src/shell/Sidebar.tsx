@@ -501,7 +501,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon"
                     aria-label="Search"
                     onClick={() => onOpenSearch?.()}
-                    className="size-6 rounded-md text-muted-foreground hover:text-foreground"
+                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
                     data-testid="sidebar-search-button"
                   >
                     <SearchIcon className="size-4" />
@@ -516,7 +516,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     variant="ghost"
                     size="icon"
                     aria-label="Settings"
-                    className="size-6 rounded-md text-muted-foreground hover:text-foreground"
+                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
                   >
                     <Link to="/settings" data-testid="settings-button">
                       <SettingsIcon className="size-4" />
@@ -533,7 +533,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon"
                     aria-label="Close sidebar"
                     onClick={onClose}
-                    className="size-6 rounded-md text-muted-foreground hover:text-foreground"
+                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
                   >
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
@@ -559,7 +559,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // px-2 + gap-1 puts the icon on the sidebar's left (red) column
                 // and the label on the label (blue) column — matching section
                 // headers and project folders.
-                "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 font-normal",
+                "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -596,7 +596,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   asChild
                   variant="ghost"
                   className={cn(
-                    "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 font-normal",
+                    "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
                     SIDEBAR_HOVER_HIGHLIGHT,
                   )}
                 >
@@ -611,7 +611,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                       type="button"
                       variant="ghost"
                       className={cn(
-                        "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-sm)] border-0 px-2 font-normal",
+                        "sidebar-primary-nav-item sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
                         SIDEBAR_HOVER_HIGHLIGHT,
                       )}
                       data-testid="sidebar-more-button"
@@ -748,7 +748,7 @@ function InfiniteScrollSentinel({
         if (hasMore) fetchMore();
       }}
       className={cn(
-        "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-xs disabled:pointer-events-none disabled:opacity-50",
+        "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-sm px-2 py-1.5 text-muted-foreground text-xs disabled:pointer-events-none disabled:opacity-50",
         SIDEBAR_HOVER_HIGHLIGHT,
         indent && "pl-5",
       )}
@@ -1802,7 +1802,7 @@ function SectionHeader({
         className={
           icon
             ? `${cn(
-                "group flex w-full items-center gap-2 rounded-[var(--radius-otto-xs)] border-0 px-2 py-[3px] text-left transition-colors",
+                "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )} sidebar-compact-text text-foreground`
             : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
@@ -2985,7 +2985,7 @@ function ConversationRow({
             </DialogDescription>
           </DialogHeader>
           {gitBranch !== null && (
-            <div className="flex flex-col gap-2 rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/5 p-3 [box-shadow:var(--elevation-otto-1)]">
+            <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 [box-shadow:var(--elevation-otto-1)]">
               <p className="text-xs text-muted-foreground">
                 Optionally clean up the git worktree. These actions are{" "}
                 <span className="font-semibold text-destructive">irreversible</span>.
@@ -3718,7 +3718,7 @@ function BulkActionBar({
                 type="button"
                 variant="secondary"
                 size="icon-sm"
-                className="-translate-y-1/2 absolute top-1/2 right-0 shrink-0 rounded-full"
+                className="-translate-y-1/2 absolute top-1/2 right-0 shrink-0 rounded-sm"
                 aria-label="Exit selection mode"
                 data-testid="toggle-selection-mode"
                 onClick={onExit}
@@ -3801,7 +3801,7 @@ function BulkActionBar({
               be undone.
             </DialogDescription>
           </DialogHeader>
-          <p className="flex items-start gap-2 rounded-[var(--radius-otto-sm)] border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground [box-shadow:var(--elevation-otto-1)]">
+          <p className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground [box-shadow:var(--elevation-otto-1)]">
             <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0 text-warning-foreground" />
             Branches are not cleaned up. Use single-session delete for branch surgery.
           </p>

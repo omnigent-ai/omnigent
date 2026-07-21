@@ -165,11 +165,7 @@ describe("SmartRoutingCard — failure", () => {
       "dispatch with your own model choices.";
     render(<SmartRoutingCard arguments={TWO_TASK_ARGS} output={error} state="output-available" />);
     expect(card().getAttribute("data-state-kind")).toBe("failed");
-    expect(card()).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
-      "border-destructive/20",
-      "bg-destructive/[0.035]",
-    );
+    expect(card()).toHaveClass("rounded-md", "border-destructive/20", "bg-destructive/[0.035]");
     // The error text is the honest content — rendering rows would imply an
     // enforced plan exists when none was installed.
     expect(screen.getByTestId("smart-routing-error")).toHaveTextContent("judge call failed");

@@ -17,11 +17,15 @@ The greeting can use a restrained local aura around Otto. Chat canvases stay fla
 
 ## Shape and elevation
 
-- Compact transcript and status cards: `--radius-otto-sm` (10px).
-- Small controls and code chips: `--radius-otto-xs`.
+- Compact transcript and status cards: canonical `rounded-md` (6px), matching the approved prototype.
+- Buttons and compact icon actions: `--radius-otto-button` (6px).
+- Form controls and sidebar items: `--radius-otto-sm` (8px).
+- Standard panels: `--radius-otto-md` (12px).
+- Major composer and dialog surfaces: `--radius-otto-lg` (16px maximum).
+- Tiny code actions and chips: `--radius-otto-xs` (4px).
 - User messages: 14px through the user-bubble primitive.
-- Pills, status dots, and avatars: fully rounded.
-- Use `--elevation-otto-*` and `--border-otto-*`; do not introduce literal radii or arbitrary shadows.
+- Status dots, avatars, switches, and intentionally non-button chips: fully rounded.
+- Use canonical radius utilities or shared primitives with `--elevation-otto-*` and `--border-otto-*`; do not introduce arbitrary literal radii or shadows.
 
 ## Typography
 
@@ -37,7 +41,7 @@ The greeting can use a restrained local aura around Otto. Chat canvases stay fla
 Tool calls, approvals, errors, routing cards, and status cards share:
 
 - the transcript typography scale;
-- Otto card radii and borders;
+- prototype card radii with Otto borders and elevation;
 - `TRANSCRIPT_RAIL_CLASS` for nested details;
 - semantic status foregrounds (`success-foreground`, `warning-foreground`, `info-foreground`);
 - 44px minimum mobile touch targets, with compact desktop sizing where appropriate.

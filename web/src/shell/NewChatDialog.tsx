@@ -335,7 +335,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   return (
-    <div className="flex flex-col gap-4 rounded-[var(--radius-otto-md)] border border-dashed border-[var(--border-otto-container)] p-4 [box-shadow:var(--elevation-otto-1)]">
+    <div className="flex flex-col gap-4 rounded-lg border border-dashed border-[var(--border-otto-container)] p-4 [box-shadow:var(--elevation-otto-1)]">
       {label && <p className="text-xs text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
         <Tabs defaultValue="local">
@@ -814,7 +814,7 @@ function LandingProjectPicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
+          className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
           data-testid="new-chat-landing-project-chip"
         >
           <TagIcon className="size-3 shrink-0" />
@@ -1083,7 +1083,7 @@ function BypassSandboxOption({
         <div
           role="alert"
           data-testid="new-chat-landing-bypass-sandbox-banner"
-          className="mt-1.5 flex items-start gap-1.5 rounded-[var(--radius-otto-sm)] border border-destructive bg-destructive/10 px-2 py-1.5 text-card-meta font-medium leading-relaxed text-destructive [box-shadow:var(--elevation-otto-1)]"
+          className="mt-1.5 flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-card-meta font-medium leading-relaxed text-destructive [box-shadow:var(--elevation-otto-1)]"
         >
           <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
           <span>
@@ -2988,7 +2988,7 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
+      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
       <FolderTreeIcon className="size-3 shrink-0" />
@@ -3218,7 +3218,7 @@ export function NewChatLandingScreen() {
                     <button
                       type="button"
                       onClick={() => removeMentionedItem(i)}
-                      className="ml-0.5 rounded-full hover:text-foreground"
+                      className="ml-0.5 rounded-sm hover:text-foreground"
                       aria-label={`Remove ${item.path}`}
                     >
                       <XIcon className="size-3" />
@@ -3244,7 +3244,7 @@ export function NewChatLandingScreen() {
                     <button
                       type="button"
                       onClick={() => removeFile(i)}
-                      className="ml-0.5 rounded-full hover:text-foreground"
+                      className="ml-0.5 rounded-sm hover:text-foreground"
                       aria-label={`Remove ${file.name || "image.png"}`}
                     >
                       <XIcon className="size-3" />
@@ -3263,7 +3263,7 @@ export function NewChatLandingScreen() {
                   type="button"
                   size="icon"
                   variant="ghost"
-                  className="size-8 rounded-[var(--radius-otto-xs)] text-muted-foreground hover:text-foreground"
+                  className="size-8 rounded-[var(--radius-otto-button)] text-muted-foreground hover:text-foreground"
                   disabled={creating}
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"
@@ -3331,7 +3331,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="buoyant-send-action size-8 rounded-full bg-foreground text-card transition-[opacity,transform] hover:opacity-80 active:rounded-full disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
+                          className="buoyant-send-action size-8 rounded-sm bg-foreground text-card transition-[opacity,transform] hover:opacity-80 active:rounded-[calc(var(--radius-otto-button)+2px)] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
@@ -3367,7 +3367,7 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
+                    className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
                     <MonitorCloudIcon className="size-3 shrink-0" />
@@ -3524,7 +3524,7 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
+                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="size-3 shrink-0" />
@@ -3631,7 +3631,7 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-md border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
+                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitForkIcon className="size-3 shrink-0" />
@@ -3836,7 +3836,7 @@ export function NewChatLandingScreen() {
           {supportsApprovalMode && bypassSandbox && (
             <p
               role="alert"
-              className="flex items-center gap-1.5 rounded-[var(--radius-otto-sm)] border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive [box-shadow:var(--elevation-otto-1)]"
+              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive [box-shadow:var(--elevation-otto-1)]"
               data-testid="new-chat-landing-bypass-sandbox-active-banner"
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />

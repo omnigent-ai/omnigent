@@ -18,7 +18,7 @@ describe("SystemMessageView", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /system: environment updated/i }));
     expect(screen.getByText("PATH was refreshed")).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
+      "rounded-md",
       "border-[var(--border-otto-hairline)]",
     );
   });

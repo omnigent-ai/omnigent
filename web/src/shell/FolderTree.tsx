@@ -658,7 +658,7 @@ function TreeNodeRow({
     <li>
       <button
         type="button"
-        className="group relative flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-md py-1 pr-2 text-left hover:bg-muted"
+        className="group relative flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-sm py-1 pr-2 text-left hover:bg-muted"
         style={{ paddingLeft: `${indentFor(depth)}px` }}
         onClick={() => onTogglePath(node.path)}
         aria-expanded={open}

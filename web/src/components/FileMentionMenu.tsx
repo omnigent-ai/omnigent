@@ -65,7 +65,7 @@ export function FileMentionMenu({
                   data-testid={`file-mention-item-${i}`}
                   data-active={i === activeIndex ? "true" : undefined}
                   className={cn(
-                    "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-foreground",
+                    "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-13 text-foreground",
                     i === activeIndex && "bg-accent",
                   )}
                 >
@@ -92,7 +92,7 @@ export function FileMentionMenu({
                       type="button"
                       onMouseDown={(e) => e.preventDefault()}
                       onClick={() => onAttach(entry.path, true)}
-                      className="flex shrink-0 items-center gap-0.5 rounded-md border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                      className="flex shrink-0 items-center gap-0.5 rounded-sm border border-border px-1.5 py-0.5 text-10 text-muted-foreground hover:bg-accent hover:text-foreground"
                       aria-label={`Attach whole folder ${entry.name}`}
                       title={`Attach whole folder ${entry.name}`}
                     >

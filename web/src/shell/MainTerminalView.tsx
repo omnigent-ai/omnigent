@@ -128,7 +128,7 @@ export function MainTerminalView({
       data-active-terminal={activeKey}
       className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5 md:pt-10"
     >
-      <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] bg-card p-3 [box-shadow:var(--elevation-otto-1)]">
+      <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-[var(--border-otto-container)] bg-card p-3 [box-shadow:var(--elevation-otto-1)]">
         {terminals.length === 0 ? (
           <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm">
             No terminals available.

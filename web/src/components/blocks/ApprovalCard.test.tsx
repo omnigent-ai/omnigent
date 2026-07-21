@@ -26,7 +26,7 @@ describe("ApprovalCard — binary approve/reject", () => {
     );
 
     expect(screen.getByTestId("approval-card")).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
+      "rounded-lg",
       "border-[var(--border-otto-container)]",
     );
     expect(screen.getByText("Approval required")).toHaveClass("text-card-title");

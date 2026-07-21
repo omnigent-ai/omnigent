@@ -170,7 +170,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
 
         {/* Public toggle — hidden when the server disables public access. */}
         {publicSharingEnabled && (
-          <div className="flex items-center justify-between rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] px-3 py-2 [box-shadow:var(--elevation-otto-1)]">
+          <div className="flex items-center justify-between rounded-lg border border-[var(--border-otto-container)] px-3 py-2 [box-shadow:var(--elevation-otto-1)]">
             <div>
               <p className="text-sm font-medium">Public access</p>
               <p className="text-xs text-muted-foreground">Anyone can view this session</p>

@@ -136,7 +136,7 @@ export function ThemeColorPicker({
         <PopoverContent
           align="end"
           sideOffset={8}
-          className="w-72 gap-0 overflow-hidden rounded-2xl border border-border/70 bg-popover p-0 shadow-2xl ring-1 ring-black/5"
+          className="w-72 gap-0 overflow-hidden rounded-[var(--radius-otto-md)] border border-border/70 bg-popover p-0 shadow-2xl ring-1 ring-black/5"
         >
           <div className="flex items-center justify-between px-3.5 py-2.5">
             <span className="text-xs font-medium">{label}</span>

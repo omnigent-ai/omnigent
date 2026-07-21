@@ -209,14 +209,14 @@ export function MembersPage() {
       {loadError !== null && (
         <div
           role="alert"
-          className="mb-4 rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
+          className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
         >
           {loadError}
         </div>
       )}
 
       {users !== null && users.length > 0 && (
-        <div className="overflow-hidden rounded-[var(--radius-otto-md)] border border-[var(--border-otto-container)] [box-shadow:var(--elevation-otto-1)]">
+        <div className="overflow-hidden rounded-md border border-[var(--border-otto-container)] [box-shadow:var(--elevation-otto-1)]">
           <table className="w-full text-sm">
             <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground">
               <tr>
@@ -316,7 +316,7 @@ export function MembersPage() {
           {actionError !== null && (
             <div
               role="alert"
-              className="rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
             >
               {actionError}
             </div>
@@ -403,7 +403,7 @@ export function MembersPage() {
           {actionError !== null && (
             <div
               role="alert"
-              className="rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
             >
               {actionError}
             </div>

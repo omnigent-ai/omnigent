@@ -2390,7 +2390,7 @@ export function JumpToTopButton({
         tabIndex={visible ? 0 : -1}
         aria-hidden={!visible}
         className={cn(
-          "h-7 gap-1.5 rounded-full px-3 text-xs shadow-sm",
+          "h-7 gap-1.5 rounded-sm px-3 text-xs shadow-sm",
           // Force an OPAQUE background in both themes and on hover. The outline
           // variant's hover (bg-muted) is a translucent black wash (--muted is
           // #0000000f), so over the faded chat text behind the pill it bleeds
@@ -2907,7 +2907,7 @@ function ConnectedTerminalFirstPill({
       <div
         role="group"
         aria-label="View mode"
-        className="terminal-first-switcher flex items-center gap-1 rounded-full border border-border bg-card/90 p-1 text-xs shadow-sm"
+        className="terminal-first-switcher flex items-center gap-1 rounded-sm border border-border bg-card/90 p-1 text-xs shadow-sm"
       >
         <div className="flex items-center gap-0.5">
           <button
@@ -2916,7 +2916,7 @@ function ConnectedTerminalFirstPill({
             aria-label="Chat"
             onClick={() => setView("chat")}
             className={cn(
-              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors",
+              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-sm px-2 py-0.5 transition-colors",
               view === "chat"
                 ? "bg-muted text-foreground"
                 : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -2933,7 +2933,7 @@ function ConnectedTerminalFirstPill({
             title={terminalStartingUp ? "Terminal is starting up…" : undefined}
             onClick={() => setView("terminal")}
             className={cn(
-              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              "terminal-first-switcher-option flex cursor-pointer items-center gap-1 rounded-sm px-2 py-0.5 transition-colors disabled:cursor-not-allowed disabled:opacity-50",
               view === "terminal"
                 ? "bg-muted text-foreground"
                 : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
@@ -3614,7 +3614,7 @@ export function composerHarnessLabel(
  * Status-line tray tucked behind the composer card: the worktree branch
  * on the left (truncated to an ellipsis so the tray never wraps), the
  * model/effort + context ring on the right. Shares the card's background so the two
- * read as one rounded shape: the card keeps its full rounded-2xl and
+ * read as one rounded shape: the card keeps its full composer radius and
  * paints on top (it's position:relative), while this in-flow sibling is
  * pulled up behind it so a rounded shelf peeks out below the card's
  * bottom edge — the card's own bottom border is the divider. Owns the
@@ -4701,7 +4701,7 @@ export function Composer({
                 <button
                   type="button"
                   onClick={() => onRemoveQuote(i)}
-                  className="mt-0.5 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+                  className="mt-0.5 shrink-0 rounded-sm text-muted-foreground hover:text-foreground"
                   aria-label="Remove quote"
                 >
                   <XIcon className="size-3.5" />
@@ -4827,7 +4827,7 @@ export function Composer({
                 <button
                   type="button"
                   onClick={() => removeFile(i)}
-                  className="ml-0.5 rounded-full hover:text-foreground"
+                  className="ml-0.5 rounded-sm hover:text-foreground"
                   aria-label={`Remove ${file.name || "image.png"}`}
                 >
                   <XIcon className="size-3" />
@@ -4868,7 +4868,7 @@ export function Composer({
                 <button
                   type="button"
                   onClick={() => removeMentionedItem(i)}
-                  className="ml-0.5 rounded-full hover:text-foreground"
+                  className="ml-0.5 rounded-sm hover:text-foreground"
                   aria-label={`Remove ${item.path}`}
                 >
                   <XIcon className="size-3" />
@@ -4890,7 +4890,7 @@ export function Composer({
               type="button"
               size="icon"
               variant="ghost"
-              className="size-8 rounded-[var(--radius-otto-xs)] text-muted-foreground hover:text-foreground"
+              className="size-8 rounded-[var(--radius-otto-button)] text-muted-foreground hover:text-foreground"
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onClick={() => fileInputRef.current?.click()}
               title="Attach files"
@@ -4985,7 +4985,7 @@ export function Composer({
               // overrides the base 50% disabled-opacity so the affordance
               // reads as "waiting for input", not "almost active".
               className={cn(
-                "size-8 shrink-0 rounded-full active:rounded-full",
+                "size-8 shrink-0 rounded-sm active:rounded-[calc(var(--radius-otto-button)+2px)]",
                 !showInterruptButton && "buoyant-send-action",
                 !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}

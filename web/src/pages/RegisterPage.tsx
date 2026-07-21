@@ -90,7 +90,7 @@ export function RegisterPage() {
         {missingInvite ? (
           <div
             role="alert"
-            className="rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
+            className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
           >
             This page needs an invite token in the URL — make sure you opened the link your admin
             sent you.
@@ -152,7 +152,7 @@ export function RegisterPage() {
             {error !== null && (
               <div
                 role="alert"
-                className="rounded-[var(--radius-otto-sm)] border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
               >
                 {error}
               </div>

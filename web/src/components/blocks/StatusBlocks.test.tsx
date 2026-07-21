@@ -14,7 +14,7 @@ describe("Status card surfaces", () => {
     render(<ErrorBanner message="Connection failed" source="runner" code="E_CONN" />);
     const alert = screen.getByRole("alert");
     expect(alert).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
+      "rounded-lg",
       "border-[0.5px]",
       "border-destructive/30",
       "bg-destructive/[0.045]",
@@ -28,11 +28,7 @@ describe("Status card surfaces", () => {
   it("uses the same geometry with a warning tint for policy blocks", () => {
     render(<PolicyDeniedBanner reason="Command not allowed" phase="tool_call" />);
     const alert = screen.getByRole("alert");
-    expect(alert).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
-      "border-warning/20",
-      "bg-warning/[0.04]",
-    );
+    expect(alert).toHaveClass("rounded-lg", "border-warning/20", "bg-warning/[0.04]");
     expect(screen.getByText(/Blocked by policy/)).toHaveClass("text-card-title");
     expect(screen.getByText("Command not allowed")).toHaveClass("text-card-body");
   });
@@ -113,10 +109,7 @@ describe("RoutingDecisionCard — session-level auto-routing", () => {
     expect(card).toHaveTextContent("opus");
     expect(card).toHaveTextContent("Multi-file refactor needs deep reasoning.");
     expect(card.getAttribute("data-applied")).toBe("true");
-    expect(card).toHaveClass(
-      "rounded-[var(--radius-otto-sm)]",
-      "border-[var(--border-otto-container)]",
-    );
+    expect(card).toHaveClass("rounded-md", "border-[var(--border-otto-container)]");
   });
 
   it("advisory verdict: shows '· advisory' and the model that would have been picked", () => {

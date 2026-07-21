@@ -400,7 +400,7 @@ export function ChatHeader({
                   title={shareDisabledReason}
                   // share-button-header (index.css) paints the quiet branded
                   // secondary surface in both light and dark mode.
-                  className="share-button-header h-6 rounded-full px-2.5 text-13 font-normal"
+                  className="share-button-header h-6 rounded-sm px-2.5 text-13 font-normal"
                 >
                   <UserRoundPlusIcon className="size-4" />
                   Share
@@ -416,7 +416,7 @@ export function ChatHeader({
             onClick={onShare}
             // share-button-header (index.css) paints the quiet branded
             // secondary surface in both light and dark mode.
-            className="share-button-header hidden h-6 rounded-full px-2.5 text-13 font-normal text-foreground md:inline-flex"
+            className="share-button-header hidden h-6 rounded-sm px-2.5 text-13 font-normal text-foreground md:inline-flex"
           >
             <UserRoundPlusIcon className="size-4" />
             Share

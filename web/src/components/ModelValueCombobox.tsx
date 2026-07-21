@@ -87,7 +87,7 @@ export function ModelValueCombobox({
               <button
                 key={v}
                 type="button"
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground"
+                className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-accent hover:text-accent-foreground"
                 // mousedown fires before the input's blur, so the value toggles
                 // before the click-outside handler would close the dropdown.
                 onMouseDown={(e) => {

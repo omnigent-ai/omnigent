@@ -29,11 +29,11 @@ const SIZES = ["default", "xs", "sm", "lg", "icon", "icon-xs", "icon-sm", "icon-
 
 describe("buttonVariants translate/transform composition", () => {
   it("uses Otto's compact control radius and buoyant timing", () => {
-    expect(buttonVariants({})).toContain("rounded-[var(--radius-otto-sm)]");
+    expect(buttonVariants({})).toContain("rounded-[var(--radius-otto-button)]");
     expect(buttonVariants({})).toContain("duration-[var(--duration-otto-fast)]");
     expect(buttonVariants({})).toContain("ease-[var(--ease-otto)]");
     expect(buttonVariants({})).toContain(
-      "active:not-aria-[haspopup]:rounded-[calc(var(--radius-otto-sm)+2px)]",
+      "active:not-aria-[haspopup]:rounded-[calc(var(--radius-otto-button)+2px)]",
     );
   });
 
