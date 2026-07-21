@@ -2144,6 +2144,8 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     source.mkdir()
     (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
     (source / "config.toml").write_text('[default]\nmodel = "gpt-5.4"')
+    (source / "AGENTS.md").write_text("global guidance")
+    (source / "AGENTS.override.md").write_text("global override")
     target = tmp_path / "temp_codex_home"
     target.mkdir()
 
@@ -2152,6 +2154,10 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     # auth.json: symlink so live credential refreshes propagate.
     assert (target / "auth.json").is_symlink()
     assert (target / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    assert (target / "AGENTS.md").is_symlink()
+    assert (target / "AGENTS.md").read_text() == "global guidance"
+    assert (target / "AGENTS.override.md").is_symlink()
+    assert (target / "AGENTS.override.md").read_text() == "global override"
     # config.toml: independent copy so /model writes stay session-local.
     assert not (target / "config.toml").is_symlink()
     assert (target / "config.toml").is_file()
@@ -2817,6 +2823,24 @@ def test_declared_passthrough_reads_sandbox_env_passthrough():
     assert _declared_passthrough(None) == ()
     assert _declared_passthrough(OSEnvSpec(sandbox=None)) == ()
     assert _declared_passthrough(OSEnvSpec(sandbox=OSEnvSandboxSpec(type="none"))) == ()
+
+
+def test_find_codex_cli_delegates_to_shared_resolver(monkeypatch):
+    """``_find_codex_cli`` resolves codex via the shared resolver with the
+    OMNIGENT_CODEX_PATH override. (The resolver's own PATH/override/fallback
+    behavior is covered in tests/inner/test_proc_and_platform.py.)"""
+    from omnigent.inner import codex_executor as ce
+
+    captured = {}
+
+    def fake_resolve(name, *, env_var=None):
+        captured["name"] = name
+        captured["env_var"] = env_var
+        return "/opt/homebrew/bin/codex"
+
+    monkeypatch.setattr(ce, "resolve_cli_binary", fake_resolve)
+    assert ce._find_codex_cli() == "/opt/homebrew/bin/codex"
+    assert captured == {"name": "codex", "env_var": "OMNIGENT_CODEX_PATH"}
 
 
 class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):

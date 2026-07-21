@@ -351,12 +351,10 @@ def test_delete_conversation_subtree_cleans_both_dbs(
     parent = store.create_conversation(title="parent")
     store.create_conversation(kind="sub_agent", title="child", parent_conversation_id=parent.id)
     assert _count(conv_db, "conversations") == 2
-    assert _count(conv_db, "agent_configuration") == 2
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 2
 
     asyncio.run(store.delete_conversation(parent.id))
     assert _count(conv_db, "conversations") == 0
-    assert _count(conv_db, "agent_configuration") == 0
     assert _count(omnigent_db, "omnigent_conversation_metadata") == 0
 
 
@@ -435,10 +433,10 @@ def test_agent_store_resolves_session_id_across_dbs(
         agent_description=None,
         title="split session",
     )
-    # Agent row lands in the Omnigent DB; the binding in the AP DB's
-    # agent_configuration table.
+    # Agent row lands in the Omnigent DB; the binding on the AP DB's
+    # conversations.agent_id column.
     assert _count(omnigent_db, "agents") == 1
-    assert _col(conv_db, "agent_configuration", "agent_id") == ["112c4ebea353b873df12de9d02f539ab"]
+    assert _col(conv_db, "conversations", "agent_id") == ["112c4ebea353b873df12de9d02f539ab"]
 
     agent_store = SqlAlchemyAgentStore(
         f"sqlite:///{omnigent_db}",
@@ -524,7 +522,7 @@ def test_delete_conversation_deletes_session_scoped_agent(
 
     asyncio.run(store.delete_conversation(created.conversation.id))
     assert _count(omnigent_db, "agents") == 0
-    assert _count(conv_db, "agent_configuration") == 0
+    assert _count(conv_db, "conversations") == 0
 
 
 def test_delete_conversation_keeps_template_agent(

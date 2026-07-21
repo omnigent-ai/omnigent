@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
@@ -108,6 +109,7 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
@@ -280,8 +282,15 @@ def _kill_process_tree(process: _Process | None) -> None:
     _proc.kill_tree(process)
 
 
+# Env override for an explicit codex binary, mirroring goose's
+# OMNIGENT_GOOSE_PATH. Set this when codex lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CODEX_PATH_ENV = "OMNIGENT_CODEX_PATH"
+
+
 def _find_codex_cli() -> str | None:
-    return shutil.which("codex")
+    """Resolve the ``codex`` CLI binary (override → ``PATH`` → global dirs)."""
+    return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -685,9 +694,9 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     The executor overrides ``CODEX_HOME`` to a per-conversation temp
     directory so session data (conversation history, etc.) stays isolated
     from the user's ``~/.codex/``. However, the codex CLI also reads
-    authentication tokens (``auth.json``) and provider configuration
-    (``config.toml``) from ``$CODEX_HOME``. This helper bridges those
-    files into the temp directory:
+    authentication tokens (``auth.json``), provider configuration
+    (``config.toml``) and instructions (``AGENTS.md``, ``AGENTS.override.md``)
+    from ``$CODEX_HOME``. This helper bridges those files into the temp directory:
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
@@ -695,6 +704,8 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
       enforcement isolated between concurrent sessions.
+    - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
+      are respected.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
@@ -705,7 +716,7 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     if not source_dir.is_dir():
         return
 
-    for filename in _CODEX_HOME_SYMLINK_FILES:
+    for filename in (*_CODEX_HOME_SYMLINK_FILES, *_CODEX_HOME_GLOBAL_INSTRUCTION_FILES):
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -2139,7 +2150,11 @@ class CodexExecutor(Executor):
         self._skills_filter = skills_filter
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
-            raise ImportError("CodexExecutor requires the 'codex' CLI on PATH.")
+            raise ImportError(
+                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+                "installed on a PATH the host daemon didn't inherit (e.g. an "
+                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+            )
         self._codex_path = resolved_codex
         self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI

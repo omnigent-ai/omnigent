@@ -151,6 +151,18 @@ sandbox:
     env: [OPENAI_API_KEY, ANTHROPIC_API_KEY, GIT_TOKEN]
 ```
 
+A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
+in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
+block routing a harness through a self-hosted gateway — installed into
+the sandbox before `omnigent host` starts. The block is server-managed:
+entries injected by a previous launch are replaced or removed on the
+next launch/resume, while config created inside the sandbox survives.
+Keep secrets out via
+`api_key_ref: env:VAR` (resolved in the sandbox against the injected
+env). See the [sandbox-runners config
+table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-configyaml)
+for the shape.
+
 ## Credentials for the sandbox (LLM keys, git tokens)
 
 Daytona has no provider-side named-secret store to attach at sandbox

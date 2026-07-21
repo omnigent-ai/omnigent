@@ -50,8 +50,6 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
-        base_branch: str | None = None,
-        execution_target: str = "connected_host",
         host_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
@@ -69,18 +67,12 @@ class ScheduledTaskStore(ABC):
         :param timezone: IANA timezone the trigger is evaluated in.
         :param model_override: Optional LLM model override.
         :param reasoning_effort: Optional reasoning-effort hint.
-        :param workspace: Optional runner start path (source repo / working dir).
-        :param base_branch: Optional git base ref to branch from at fire time.
-        :param execution_target: Where a firing runs —
-            ``connected_host``/``managed_sandbox``. Defaults to
-            ``"connected_host"``.
-        :param host_id: For ``connected_host``, the specific host to pin;
-            ``None`` means the owner's freshest online host.
+        :param workspace: Runner start path (source repo / working dir).
+        :param host_id: The connected host to pin the run to.
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``.
         :returns: The newly created :class:`ScheduledTask`.
-        :raises ValueError: If ``state`` or ``execution_target`` is not a
-            recognized value.
+        :raises ValueError: If ``state`` is not a recognized value.
         """
         ...
 
@@ -115,6 +107,18 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+        """
+        List active scheduled tasks across every workspace.
+
+        Scheduler startup runs outside a request workspace scope, so it cannot
+        rely on ``current_workspace_id()`` without missing tenant-scoped rows.
+
+        :returns: Active tasks ordered by ``workspace_id, created_at, id``.
+        """
+        ...
+
+    @abstractmethod
     def update(
         self,
         scheduled_task_id: str,
@@ -126,8 +130,6 @@ class ScheduledTaskStore(ABC):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
-        base_branch: str | None = None,
-        execution_target: str | None = None,
         host_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,

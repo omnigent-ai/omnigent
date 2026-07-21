@@ -80,6 +80,7 @@ import type {
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import { useTerminalActivityStore } from "./terminalActivity";
@@ -3697,7 +3698,7 @@ export async function pumpStreamEvents(
         }));
         const convId = get().conversationId;
         if (convId) {
-          queryClient?.invalidateQueries({ queryKey: ["conversation", convId, "items"] });
+          queryClient?.invalidateQueries({ queryKey: sessionItemsQueryKey(convId) });
           // No terminals invalidation: the list is SSE-sourced (see
           // useTerminals). Its query has only an empty seed queryFn, so
           // invalidating would refetch [] and wipe the live list. The

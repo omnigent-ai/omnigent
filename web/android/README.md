@@ -65,10 +65,60 @@ when the bridge methods are absent, so the Android shell omits them for now:
 
 ## Distribution
 
-Gradle assembles a release APK/AAB; `fastlane` (Android) automates signing and
-upload. Google Play restricts "WebView of a website" apps, so the initial
-channel is direct APK / F-Droid; a user-configured server client is a stronger
-Play case but review is unpredictable for this category.
+Gradle assembles a release APK/AAB. Google Play restricts "WebView of a
+website" apps, so the initial channel is direct APK / F-Droid; a
+user-configured server client is a stronger Play case but review is
+unpredictable for this category.
+
+### Release signing
+
+`bundleRelease` signs the artifact when signing credentials are available;
+without them the release build is left unsigned so debug builds still work.
+Credentials come from either a gitignored `keystore.properties` (copy
+`keystore.properties.example`) or, for CI, these environment variables:
+
+- `OMNIGENT_KEYSTORE_FILE` — path to the upload keystore
+- `OMNIGENT_KEYSTORE_PASSWORD`
+- `OMNIGENT_KEY_ALIAS`
+- `OMNIGENT_KEY_PASSWORD`
+
+Create the upload keystore once and back it up (Play App Signing then manages
+the app signing key):
+
+```sh
+keytool -genkeypair -v -keystore omnigent-upload.jks \
+  -keyalg RSA -keysize 2048 -validity 10000 -alias omnigent-upload
+```
+
+Build the Play-ready App Bundle (Play requires an `.aab`, not an APK); bump
+`versionCode` in `app/build.gradle.kts` before each upload:
+
+```sh
+./gradlew bundleRelease   # → app/build/outputs/bundle/release/app-release.aab
+```
+
+### Automated publishing (Gradle Play Publisher)
+
+After the first release is uploaded manually (Google blocks the Play API until
+an app has one human upload), `./gradlew publishReleaseBundle` builds the signed
+AAB and uploads it to the **internal** track. It needs a Google Play
+service-account key:
+
+1. In Google Cloud, create a service account and a JSON key.
+2. In Play Console → _Users & permissions_, invite that service account and
+   grant it release permissions.
+3. Point `PLAY_SERVICE_ACCOUNT_JSON` at the JSON, or drop it at
+   `web/android/play-credentials.json` (both gitignored).
+
+```sh
+export PLAY_SERVICE_ACCOUNT_JSON=/path/to/play-credentials.json
+./gradlew publishReleaseBundle   # signs + uploads to the internal track
+```
+
+The publish tasks are inert when no credentials file is present, so ordinary
+builds are unaffected. Bump `versionCode` before each publish (Play rejects a
+reused code). Change the target track via `track.set(...)` in
+`app/build.gradle.kts` (`internal` → `alpha` → `beta` → `production`).
 
 > Status: builds clean — `gradlew :app:assembleDebug :app:lintDebug` produces a
 > debug APK with 0 lint errors (JDK 17, Gradle 8.9 wrapper, `compileSdk 35`).

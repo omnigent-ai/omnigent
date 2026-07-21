@@ -29,6 +29,14 @@ def _isolate_cursor_credential(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # Codex readiness resolves the binary via resolve_cli_binary, which honors
+    # an OMNIGENT_CODEX_PATH override and probes on-disk global install dirs.
+    # Clear the override and stub the fallback dirs so a developer's real codex
+    # install can't flip the binary-missing verdict these tests assert.
+    import omnigent._platform as platform
+
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
 
 
 def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -274,6 +282,30 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
     result = configured_harness_map()
     assert all(result.values())
+
+
+def test_configured_harness_map_probes_codex_readiness_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex aliases share one potentially expensive readiness probe."""
+    calls = 0
+
+    def _codex_reason() -> str:
+        nonlocal calls
+        calls += 1
+        return "needs-auth"
+
+    monkeypatch.setattr(
+        "omnigent.codex_native._codex_auth_unavailable_reason",
+        _codex_reason,
+    )
+
+    result = configured_harness_map()
+
+    assert calls == 1
+    assert result["codex"] == "needs-auth"
+    assert result["codex-native"] == "needs-auth"
+    assert result["native-codex"] == "needs-auth"
 
 
 def test_kimi_readiness_keys_off_binary(

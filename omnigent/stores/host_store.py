@@ -28,6 +28,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, now_epoch
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # A host is considered live only if its row was touched (connect or
 # heartbeat) within this window. The host tunnel's ping loop writes a
@@ -39,7 +40,6 @@ from omnigent.db.utils import get_or_create_engine, make_managed_session_maker, 
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
-HarnessAvailability = bool | str
 
 
 @dataclass
@@ -114,7 +114,7 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
     Tolerant: ``NULL``, malformed JSON, or a non-object payload all
     map to ``None`` ("unknown") — a corrupt column value must degrade
     to no-warning in the UI, never break host listing. Entries with a
-    non-bool/string value are dropped for the same reason.
+    unsupported readiness value are dropped for the same reason.
 
     :param raw: The raw column value, e.g.
         ``'{"claude-sdk": true, "codex": false}'`` or ``None``.
@@ -129,7 +129,7 @@ def _parse_configured_harnesses(raw: str | None) -> dict[str, HarnessAvailabilit
         return None
     if not isinstance(parsed, dict):
         return None
-    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, (bool, str))}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
 def _row_to_host(row: SqlHost) -> Host:
@@ -490,6 +490,29 @@ class HostStore:
             if row is not None:
                 row.status = encode_host_status("offline")
                 row.updated_at = now_epoch()
+
+    def update_harness_readiness(
+        self,
+        host_id: str,
+        configured_harnesses: dict[str, HarnessAvailability],
+    ) -> None:
+        """Replace a connected host's live per-harness readiness map.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param configured_harnesses: Current readiness keyed by harness spelling.
+        """
+        with self._session() as session:
+            session.execute(
+                update(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                )
+                .values(
+                    configured_harnesses=json.dumps(configured_harnesses),
+                    updated_at=now_epoch(),
+                )
+            )
 
     def heartbeat(self, host_id: str) -> None:
         """

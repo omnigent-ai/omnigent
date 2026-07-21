@@ -120,7 +120,7 @@ import { useActiveRootSessionId } from "@/hooks/useSession";
 import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
-import { isOwnerLevel } from "@/lib/permissionsApi";
+import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import {
@@ -911,9 +911,48 @@ interface ConversationListProps {
   onVisibleCountChange: (count: number) => void;
 }
 
-// permission_level null (no ACL row / legacy) or >= 4 both mean owner.
-function isOwnedByViewer(conversation: Conversation): boolean {
-  return isOwnerLevel(conversation.permission_level);
+// Ownership drives the My-vs-Shared split and every owner-only row action.
+// It is derived purely from the session's `owner` (the creator's user id),
+// NOT from `permission_level` — the sidebar carries no effective-level info,
+// so the server can list rows without resolving the caller's grant per
+// session. A `null`/absent owner (permissions disabled — the server emits
+// `owner` only when a permission store is wired) reads as owned, matching the
+// prior permissive-on-null stance; otherwise the viewer owns it iff they are
+// the owner. In single-user mode the owner grant is the reserved `"local"`
+// id, and `viewerId` is `"local"` too (see `useViewerId`), so it matches via
+// the equality branch. `viewerId` is `null` until identity resolves — treated
+// as "not the owner" for shared rows so they don't briefly flash into "My
+// sessions" before the id lands.
+function isOwnedByViewer(conversation: Conversation, viewerId: string | null): boolean {
+  const owner = conversation.owner ?? null;
+  if (owner === null) return true;
+  return owner === viewerId;
+}
+
+// The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
+// (NOT `getCurrentAuthorId`): ownership compares against the session's `owner`
+// grant, which in single-user mode is the reserved `"local"` id — and
+// `getCurrentAuthorId` nulls `"local"` out (it's for author labels), which
+// would make the viewer's own sessions read as shared and vanish from the
+// default "My sessions" tab. `getCurrentUserId` keeps `"local"` and is the
+// identical real email in multi-user mode. It is synchronous (populated once
+// `resolveIdentity` has run — which `main.tsx` kicks off at boot), but on a
+// cold mount it can still be null for a tick, so we also await
+// `resolveIdentity()` and re-render when it lands. Keeping this reactive
+// (rather than a bare module read) means the My/Shared split settles correctly
+// the moment identity is known, without a manual refresh.
+function useViewerId(): string | null {
+  const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
+  useEffect(() => {
+    let cancelled = false;
+    void resolveIdentity().then(() => {
+      if (!cancelled) setViewerId(getCurrentUserId());
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return viewerId;
 }
 
 function ConversationList({
@@ -932,6 +971,8 @@ function ConversationList({
   getVisibleConversationsRef,
   onVisibleCountChange,
 }: ConversationListProps) {
+  // Viewer id for the owner-based My/Shared split below.
+  const viewerId = useViewerId();
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
   const allConversations = useMemo(
@@ -977,8 +1018,8 @@ function ConversationList({
     // same section layout with different conversations.
     const tabScoped =
       activeTab === "shared"
-        ? notArchived.filter((c) => !isOwnedByViewer(c))
-        : notArchived.filter(isOwnedByViewer);
+        ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
+        : notArchived.filter((c) => isOwnedByViewer(c, viewerId));
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -1032,6 +1073,7 @@ function ConversationList({
     activeOverride,
     projectNames,
     activeTab,
+    viewerId,
   ]);
 
   // Collapsed section titles — persisted like pins so the preference
@@ -2019,8 +2061,6 @@ function ConversationMenuItems({
   isPinned,
   isArchived,
   isOwner,
-  canEdit,
-  canManage,
   sharingOff,
   isSingleUser,
   canStop,
@@ -2044,10 +2084,8 @@ function ConversationMenuItems({
   isPinned: boolean;
   isArchived: boolean;
   isOwner: boolean;
-  canEdit: boolean;
-  canManage: boolean;
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off): disables the
-  // Share item for everyone, independent of the per-user manage check.
+  // Share item for everyone, independent of the per-user ownership check.
   sharingOff: boolean;
   // Single-user mode: hide the Share item entirely (no other users to share
   // with), rather than disabling it like sharingOff does.
@@ -2117,7 +2155,7 @@ function ConversationMenuItems({
   // Mobile project sub-view: replaces the entire menu body in place (the
   // "Back" row flips `view` without closing the menu or navigating). Reachable
   // only via the mobile project item below, which sits behind the same
-  // `canEdit && isOwner` gate.
+  // `isOwner` gate.
   if (isMobile && view === "projects") {
     return (
       <>
@@ -2161,7 +2199,7 @@ function ConversationMenuItems({
       {/* Single-user mode has no other users to share with — omit the item
           entirely rather than showing it disabled. */}
       {!isSingleUser &&
-        (canManage && !sharingOff ? (
+        (isOwner && !sharingOff ? (
           <C.Item data-testid="share-conversation" onSelect={() => setShareOpen(true)}>
             <ShareIcon className="size-3.5" />
             Share
@@ -2176,16 +2214,16 @@ function ConversationMenuItems({
                 </C.Item>
               </div>
             </TooltipTrigger>
-            {/* Sharing-off is server-wide, so it outranks the per-user manage
+            {/* Sharing-off is server-wide, so it outranks the per-user owner
                 reason when both apply. */}
             <TooltipContent side="left">
               {sharingOff
                 ? "Sharing has been disabled for this Omnigent server."
-                : "You need manage permissions to share this session"}
+                : "Only the session owner can share this session"}
             </TooltipContent>
           </Tooltip>
         ))}
-      {canEdit ? (
+      {isOwner ? (
         <C.Item data-testid="rename-conversation" onSelect={() => setIsEditing(true)}>
           <PencilIcon className="size-3.5" />
           Rename
@@ -2201,7 +2239,7 @@ function ConversationMenuItems({
             </div>
           </TooltipTrigger>
           <TooltipContent side="left">
-            You need edit permissions to rename this session
+            Only the session owner can rename this session
           </TooltipContent>
         </Tooltip>
       )}
@@ -2221,9 +2259,8 @@ function ConversationMenuItems({
         </C.Item>
       )}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
-          shared session (even editable) shows no project affordance. */}
-      {canEdit &&
-        isOwner &&
+          shared session shows no project affordance. */}
+      {isOwner &&
         (isMobile ? (
           // Mobile: no room for a side flyout, so this item swaps the menu
           // body to the project picker in place (see the `view === "projects"`
@@ -2438,9 +2475,11 @@ function ConversationRow({
   // shows nothing while the archive completes.
   const [isArchiving, setIsArchiving] = useState(false);
   const gitBranch = conversation.git_branch ?? null;
-  const isOwner = isOwnedByViewer(conversation);
-  const canEdit = conversation.permission_level === null || conversation.permission_level >= 2;
-  const canManage = conversation.permission_level === null || conversation.permission_level >= 3;
+  // Every row action gates on ownership alone — the sidebar carries no
+  // effective-permission level, so rename/share/move/drag are owner-only and
+  // non-owners get a read-only row. (Finer-grained edit/manage affordances
+  // live on the open-session view, which fetches the caller's real level.)
+  const isOwner = isOwnedByViewer(conversation, useViewerId());
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off) reported by
   // /v1/info — disables the row's Share item even for managers. Fail open
   // (share enabled) while the capability probe is still loading.
@@ -2503,11 +2542,12 @@ function ConversationRow({
         ? { kind: "unseen" as const }
         : derivedState;
 
-  // Drag-and-drop: a row is grabbable when the viewer can re-file it (edit
-  // permission), outside selection / archive / rename modes. Dragging it onto a
-  // project folder files it there; onto "Chats" unfiles it; onto "Pinned" pins
-  // it. The list-level <DndContext> routes the drop; the row only advertises
-  // itself and its source project + pinned state via the draggable `data`.
+  // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
+  // owner-only, like the Move-to-project kebab item), outside selection /
+  // archive / rename modes. Dragging it onto a project folder files it there;
+  // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
+  // routes the drop; the row only advertises itself and its source project +
+  // pinned state via the draggable `data`.
   const {
     listeners: dragListeners,
     setNodeRef: setDragNodeRef,
@@ -2515,7 +2555,7 @@ function ConversationRow({
   } = useDraggable({
     id: conversation.id,
     data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !canEdit || selectionMode || isArchived || isEditing,
+    disabled: !isOwner || selectionMode || isArchived || isEditing,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -2656,8 +2696,6 @@ function ConversationRow({
     isPinned,
     isArchived,
     isOwner,
-    canEdit,
-    canManage,
     sharingOff,
     isSingleUser,
     canStop,
@@ -2704,7 +2742,7 @@ function ConversationRow({
       }}
       onDoubleClick={(e) => {
         if (selectionMode) return;
-        if (!canEdit) return;
+        if (!isOwner) return;
         e.preventDefault();
         setIsEditing(true);
       }}
@@ -3549,6 +3587,7 @@ function BulkActionBar({
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
   const bulkDelete = useBulkDeleteConversations();
+  const viewerId = useViewerId();
 
   const selectedConversations = useMemo(
     () => allConversations.filter((c) => selectedIds.has(c.id)),
@@ -3556,8 +3595,8 @@ function BulkActionBar({
   );
 
   const ownedSelected = useMemo(
-    () => selectedConversations.filter((c) => isOwnedByViewer(c)),
-    [selectedConversations],
+    () => selectedConversations.filter((c) => isOwnedByViewer(c, viewerId)),
+    [selectedConversations, viewerId],
   );
 
   const archivedSelected = useMemo(

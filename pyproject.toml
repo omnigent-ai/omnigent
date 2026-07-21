@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.6.0.dev0"
+version = "0.7.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,8 +26,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.6.0.dev0",
-    "omnigent-ui-sdk==0.6.0.dev0",
+    "omnigent-client==0.7.0.dev0",
+    "omnigent-ui-sdk==0.7.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     # openai-agents<0.18.2 omits a field required by openai>=2.45.
@@ -192,6 +192,12 @@ cursor = ["cursor-sdk>=0.1.7"]
 # _reflect). The tools import the client lazily, so only users who enable a
 # Hindsight memory tool need this extra.
 hindsight = ["hindsight-client>=0.4.0"]
+# Backwards-compatibility alias: this extra was renamed to `hindsight` (see
+# above) in #2605. Keep `memory` pulling the same client so existing
+# `omnigent[memory]` / `--extra memory` invocations keep working.
+# TODO(0.70): remove this `memory` alias extra — it exists only to keep the
+# pre-rename install command working during the deprecation window.
+memory = ["hindsight-client>=0.4.0"]
 # Slack integration (`omni integration slack`). The @omnigent socket-mode bot
 # lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
 # aiohttp — kept out of the baseline install). The CLI launches it as a
@@ -530,6 +536,14 @@ known-first-party = ["omnigent"]
 "sdks/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# slack_bolt dispatches to handlers by parameter NAME (``body``, ``event``,
+# ``client``, ``ack``, ``view``), so unused handler args can't be renamed to
+# ``_`` without breaking injection. The bot also has deliberate boundary
+# catches (best-effort acks, background login tasks) that must never abort a
+# turn, hence BLE001.
+"integrations/slack/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
 
 [tool.mypy]
 python_version = "3.12"
@@ -723,6 +737,15 @@ follow_imports = "skip"
 # via sys.modules aliasing.
 [[tool.mypy.overrides]]
 module = "omnigent_client.*"
+ignore_missing_imports = true
+disallow_any_explicit = false
+
+# Slack integration (omnigent-slack). slack_bolt / slack_sdk ship no type
+# stubs, and Slack event/view payloads are opaque JSON dicts the handlers
+# read positionally — so the code leans on ``Any`` at that boundary. Mirror
+# the client SDK: resolve the untyped imports and lift the Any ban here.
+[[tool.mypy.overrides]]
+module = "omnigent_slack.*"
 ignore_missing_imports = true
 disallow_any_explicit = false
 

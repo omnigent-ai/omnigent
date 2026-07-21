@@ -1259,6 +1259,34 @@ def _build_claude_sdk_spawn_env(
     return env
 
 
+def _apply_harness_path_override(
+    env: dict[str, str],
+    harness: str,
+) -> None:
+    """Thread a config ``harness.<canonical>.command`` into ``OMNIGENT_<NAME>_PATH``.
+
+    The harness wraps read ``OMNIGENT_<NAME>_PATH`` to locate their vendor
+    CLI (the headless CLI-subprocess family historically read ``HARNESS_*_PATH``;
+    both are honored, ``OMNIGENT_*`` canonical). A user can set that path via
+    config (``harness.codex.command: /usr/local/bin/codex``); this threads it
+    into the spawn env when the ambient env var isn't already set (ambient
+    wins, per the shared ``env > config > default`` precedence). A no-op when
+    config has no ``command`` for *harness* or the ambient env var is set.
+
+    :param env: The spawn-env dict being built (mutated in place).
+    :param harness: A harness id (canonical or alias), e.g. ``"codex"``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.harness_startup_config import (
+        _harness_path_env_var,
+        config_harness_path_override,
+    )
+
+    path = config_harness_path_override(harness, load_config())
+    if path is not None:
+        env[_harness_path_env_var(canonicalize_harness(harness) or harness)] = path
+
+
 def _build_codex_spawn_env(
     spec: AgentSpec,
     *,
@@ -1335,6 +1363,7 @@ def _build_codex_spawn_env(
     retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
     if retry_payload is not None:
         env["HARNESS_CODEX_RETRY_POLICY"] = retry_payload
+    _apply_harness_path_override(env, "codex")
     return env
 
 
@@ -1389,6 +1418,7 @@ def _build_pi_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_PI_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "pi")
     return env
 
 
@@ -1439,6 +1469,7 @@ def _build_qwen_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_QWEN_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "qwen")
     return env
 
 
@@ -1476,6 +1507,7 @@ def _build_goose_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_GOOSE_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "goose")
     return env
 
 
@@ -1866,6 +1898,7 @@ def _build_kimi_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_KIMI_OS_ENV"] = os_env_payload
+    _apply_harness_path_override(env, "kimi")
     return env
 
 

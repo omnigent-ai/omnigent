@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from cryptography.fernet import Fernet
-
 from omnigent_slack.tokens import EncryptedTokenStore, TokenStore
 
 

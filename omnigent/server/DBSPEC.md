@@ -46,7 +46,7 @@ in `omnigent/db/db_models.py`.
 | created_at | Integer NOT NULL | |
 | title | Text | nullable, user-settable conversation title |
 
-**Indexes:** `ix_conversations_created_at`
+**Indexes:** `ix_conversations_archived_updated` (backs the default sidebar list)
 
 ---
 

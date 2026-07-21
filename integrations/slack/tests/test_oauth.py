@@ -3,7 +3,6 @@ from __future__ import annotations
 import httpx
 import pytest
 import respx
-
 from omnigent_slack.oauth import (
     AuthMode,
     AuthorizationExpiredError,
