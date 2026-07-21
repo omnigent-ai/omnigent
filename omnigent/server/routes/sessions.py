@@ -13172,7 +13172,9 @@ async def _create_session_from_existing_agent(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
                     agent_id=agent.id,
-                    harness=native_agent.harness if native_agent is not None else _resolve_harness(conv),
+                    harness=native_agent.harness
+                    if native_agent is not None
+                    else _resolve_harness(conv),
                     surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
