@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -57,6 +58,12 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent.admission import (
+    AdmissionInfo,
+    EventAdmittedCallback,
+    SessionEventAdmitter,
+    SessionInfo,
+)
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -6326,6 +6333,146 @@ async def _get_runner_client(
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
+async def _admitter_wants_session(
+    admitter: SessionEventAdmitter,
+    conv: Conversation,
+) -> bool:
+    """Evaluate the public admission selector without exposing store internals."""
+    session = SessionInfo(
+        id=conv.id,
+        agent_id=conv.agent_id,
+        harness=_resolve_harness(conv),
+        labels=dict(conv.labels),
+        parent_session_id=conv.parent_conversation_id,
+    )
+    try:
+        result = await admitter.wants(session)
+    except Exception as exc:
+        _logger.warning("Session event admitter failed for %s", conv.id, exc_info=True)
+        raise OmnigentError(
+            "Session admission selector is unavailable.",
+            code=ErrorCode.ADMISSION_UNAVAILABLE,
+        ) from exc
+    return bool(result)
+
+
+async def _reserve_event_admission(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+) -> AdmissionInfo:
+    """Reserve the runner's next FIFO slot and validate its public shape."""
+    try:
+        response = await runner_client.post(
+            f"/v1/sessions/{session_id}/admission-reservations",
+            json={"source": "ap", "kind": "user_message"},
+            timeout=5.0,
+        )
+    except (httpx.HTTPError, ConnectionError, asyncio.TimeoutError) as exc:
+        raise OmnigentError(
+            "Runner admission reservation is unavailable.",
+            code=ErrorCode.ADMISSION_UNAVAILABLE,
+        ) from exc
+    if response.status_code != 201:
+        raise OmnigentError(
+            "Runner admission reservation was rejected.",
+            code=ErrorCode.ADMISSION_UNAVAILABLE,
+        )
+    try:
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("reservation response must be an object")
+        return AdmissionInfo.from_runner_payload(payload)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise OmnigentError(
+            "Runner returned an invalid admission reservation.",
+            code=ErrorCode.ADMISSION_UNAVAILABLE,
+        ) from exc
+
+
+async def _cancel_event_admission(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    admission: AdmissionInfo,
+    *,
+    raise_on_failure: bool = True,
+) -> None:
+    """Cancel one unconsumed reservation, optionally surfacing failure."""
+    try:
+        response = await runner_client.delete(
+            f"/v1/sessions/{session_id}/admission-reservations/{admission.admission_id}",
+            timeout=5.0,
+        )
+        # Expired/already-finished reservations no longer occupy a FIFO slot,
+        # so cancellation has achieved its only required effect.
+        if response.status_code in {204, 404, 409, 410}:
+            return
+        raise httpx.HTTPStatusError(
+            "admission cancellation rejected",
+            request=response.request,
+            response=response,
+        )
+    except (httpx.HTTPError, ConnectionError, asyncio.TimeoutError) as exc:
+        _logger.warning(
+            "Admission cancellation failed for session=%s admission=%s",
+            session_id,
+            admission.admission_id,
+            exc_info=True,
+        )
+        if raise_on_failure:
+            raise OmnigentError(
+                "Runner admission cancellation is unavailable.",
+                code=ErrorCode.ADMISSION_UNAVAILABLE,
+            ) from exc
+
+
+_ADMISSION_CONSUME_ERROR_CODES = frozenset(
+    {
+        ErrorCode.ADMISSION_NOT_FOUND,
+        ErrorCode.ADMISSION_EXPIRED,
+        ErrorCode.ADMISSION_ALREADY_CONSUMED,
+        ErrorCode.ADMISSION_SESSION_MISMATCH,
+    }
+)
+
+
+def _raise_for_admission_consume_response(response: httpx.Response) -> None:
+    """Surface a runner reservation-consume failure as a named AP error."""
+    if response.status_code < 400:
+        return
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = {}
+    code = payload.get("error") if isinstance(payload, dict) else None
+    raise OmnigentError(
+        "Runner rejected the event admission reservation.",
+        code=(
+            code
+            if isinstance(code, str) and code in _ADMISSION_CONSUME_ERROR_CODES
+            else ErrorCode.ADMISSION_UNAVAILABLE
+        ),
+    )
+
+
+async def _notify_event_admitted(
+    callback: EventAdmittedCallback,
+    session_id: str,
+    item_id: str | None,
+    admission: AdmissionInfo,
+) -> None:
+    """Invoke the optional correlation callback without replaying a turn."""
+    try:
+        result = callback(session_id, item_id, admission)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        _logger.exception(
+            "on_event_admitted callback failed for session=%s admission=%s",
+            session_id,
+            admission.admission_id,
+        )
+
+
 async def _query_host_runner_status(
     host_conn: HostConnection,
     host_registry: HostRegistry,
@@ -8324,6 +8471,7 @@ async def _forward_native_terminal_message(
     body: SessionEventInput,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    admission_id: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -8343,12 +8491,15 @@ async def _forward_native_terminal_message(
         content blocks.
     :param artifact_store: Optional binary content store for
         fetching file bytes during resolution.
+    :param admission_id: Optional one-shot runner reservation to consume.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, _ = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(conv, body)
+    if admission_id is not None:
+        event["admissionId"] = admission_id
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s",
         display_name,
@@ -8407,6 +8558,8 @@ async def _forward_native_terminal_message(
             detail=f"{display_name} terminal message delivery failed",
         ) from exc
     if resp.status_code >= 400:
+        if admission_id is not None:
+            _raise_for_admission_consume_response(resp)
         _logger.warning(
             "%s terminal message forward rejected for session=%s status=%s body=%s",
             display_name,
@@ -9281,6 +9434,7 @@ async def _forward_event_to_runner(
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
+    admission_id: str | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -9309,6 +9463,7 @@ async def _forward_event_to_runner(
         this turn. ``False`` by default (agents without MCP servers).
     :param created_by: Authenticated identity of the posting actor,
         recorded on the persisted item for attribution.
+    :param admission_id: Optional one-shot runner reservation to consume.
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
@@ -9491,16 +9646,20 @@ async def _forward_event_to_runner(
     # per-event value exists; the persisted column is the source.
     if conv.harness_override is not None:
         runner_body["harness_override"] = conv.harness_override
+    if admission_id is not None:
+        runner_body["admissionId"] = admission_id
 
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
     try:
-        await runner_client.post(
+        runner_response = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=runner_body,
             timeout=_RUNNER_FORWARD_TIMEOUT,
         )
+        if admission_id is not None:
+            _raise_for_admission_consume_response(runner_response)
         # Publish input.consumed AFTER the forward succeeds —
         # the runner has the message and will start the turn.
         _publish_input_consumed(session_id, persisted_items[0])
@@ -9573,6 +9732,7 @@ async def _dispatch_session_event_to_runner(
     has_mcp_servers: bool = False,
     created_by: str | None = None,
     runner_router: RunnerRouter | None = None,
+    admission_id: str | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -9638,6 +9798,7 @@ async def _dispatch_session_event_to_runner(
         native-terminal parent-wake forward when a sub-agent fails to
         boot (see :func:`_persist_native_terminal_failure`). ``None``
         in in-process / test setups where the global client is used.
+    :param admission_id: Optional one-shot runner reservation to consume.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -9653,6 +9814,11 @@ async def _dispatch_session_event_to_runner(
             conv,
         )
         if ensure_outcome.error is not None:
+            if admission_id is not None:
+                raise OmnigentError(
+                    "Native terminal is unavailable for admitted event delivery.",
+                    code=ErrorCode.ADMISSION_UNAVAILABLE,
+                )
             item_id = await _persist_native_terminal_failure(
                 session_id,
                 conv,
@@ -9753,6 +9919,7 @@ async def _dispatch_session_event_to_runner(
                 body,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                admission_id=admission_id,
             )
             forwarded = True
         finally:
@@ -9788,6 +9955,7 @@ async def _dispatch_session_event_to_runner(
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
+        admission_id=admission_id,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -11702,6 +11870,7 @@ async def _evaluate_input_policy(
     _runner_router: RunnerRouter | None,
     *,
     actor: dict[str, str] | None = None,
+    admission: AdmissionInfo | None = None,
 ) -> dict[str, Any] | None:
     """
     Evaluate a user message against REQUEST (input) phase policy rules.
@@ -11731,6 +11900,8 @@ async def _evaluate_input_policy(
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
+    :param admission: Atomic runner decision for an opted-in request.
+        ``None`` on the stock path.
     :returns: ``None`` on ALLOW or an approved ASK (fall through to the
         forward path). A verdict dict ``{"verdict": "deny", "reason":
         ...}`` on DENY or a declined / timed-out ASK.
@@ -11761,6 +11932,7 @@ async def _evaluate_input_policy(
         content=user_text,
         tool_name=None,
         actor=actor,
+        admission=admission,
     )
     result = await engine.evaluate(ctx)
 
@@ -14657,6 +14829,8 @@ def create_sessions_router(
     runner_tunnel_tokens: frozenset[str] | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     host_registry: HostRegistry | None = None,
+    session_event_admitter: SessionEventAdmitter | None = None,
+    on_event_admitted: EventAdmittedCallback | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -14717,6 +14891,10 @@ def create_sessions_router(
         the runner is offline, so the file panel stays live without
         waking the agent. ``None`` disables the fallback (the endpoints
         then 503 on an offline runner, as before).
+    :param session_event_admitter: Optional selector for atomic event
+        admission. ``None`` leaves the stock route untouched.
+    :param on_event_admitted: Optional post-forward correlation callback
+        for events handled by ``session_event_admitter``.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -19853,7 +20031,7 @@ def create_sessions_router(
         request: Request,
         session_id: str,
         body: SessionEventInput,
-    ) -> dict[str, bool | str]:
+    ) -> dict[str, object]:
         """
         Submit a session event (input message, tool output,
         approval, or interrupt).
@@ -20020,6 +20198,24 @@ def create_sessions_router(
                 "Session is closed. Start a new sub-agent session to continue.",
                 code=ErrorCode.CONFLICT,
             )
+        _admission_info: AdmissionInfo | None = None
+        _admission_runner_client: httpx.AsyncClient | None = None
+        if (
+            body.type == "message"
+            and body.data.get("role") == "user"
+            and session_event_admitter is not None
+            and await _admitter_wants_session(session_event_admitter, conv)
+        ):
+            _admission_runner_client = await _get_runner_client(session_id, runner_router)
+            if _admission_runner_client is None:
+                raise OmnigentError(
+                    "No runner is available for atomic session admission.",
+                    code=ErrorCode.ADMISSION_UNAVAILABLE,
+                )
+            _admission_info = await _reserve_event_admission(
+                _admission_runner_client,
+                session_id,
+            )
         if (
             body.type == "message"
             and body.data.get("role") == "user"
@@ -20035,6 +20231,7 @@ def create_sessions_router(
                     agent_store,
                     runner_router,
                     actor=_actor,
+                    admission=_admission_info,
                 )
             except Exception as _policy_exc:  # noqa: BLE001 — fail-safe for misconfigured policies
                 # Policy evaluation crashed (e.g. factory misconfigured).
@@ -20056,6 +20253,13 @@ def create_sessions_router(
                 # DENY or ASK — don't forward to runner. Publish a
                 # deny sentinel on the session stream so the
                 # client/REPL sees feedback.
+                if _admission_info is not None and _admission_runner_client is not None:
+                    await _cancel_event_admission(
+                        _admission_runner_client,
+                        session_id,
+                        _admission_info,
+                    )
+                    _admission_info = None
                 reason = _input_verdict.get("reason", "Denied by policy")
                 _publish_status(session_id, "running")
                 _publish_policy_deny(session_id, reason)
@@ -20949,19 +21153,32 @@ def create_sessions_router(
                 created_by=_attribution_user(user_id),
             )
             return {"queued": True, "item_id": item_id}
-        dispatch = await _dispatch_session_event_to_runner(
-            session_id,
-            conv,
-            body,
-            conversation_store,
-            runner_client,
-            agent_name=_agent.name if _agent else None,
-            file_store=file_store,
-            artifact_store=artifact_store,
-            has_mcp_servers=_has_mcp_servers,
-            created_by=_attribution_user(user_id),
-            runner_router=runner_router,
-        )
+        try:
+            dispatch = await _dispatch_session_event_to_runner(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+                runner_client,
+                agent_name=_agent.name if _agent else None,
+                file_store=file_store,
+                artifact_store=artifact_store,
+                has_mcp_servers=_has_mcp_servers,
+                created_by=_attribution_user(user_id),
+                runner_router=runner_router,
+                admission_id=(
+                    _admission_info.admission_id if _admission_info is not None else None
+                ),
+            )
+        except BaseException:
+            if _admission_info is not None and _admission_runner_client is not None:
+                await _cancel_event_admission(
+                    _admission_runner_client,
+                    session_id,
+                    _admission_info,
+                    raise_on_failure=False,
+                )
+            raise
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id
@@ -20973,6 +21190,15 @@ def create_sessions_router(
         # stability) and relies on stableKey + FIFO instead.
         if dispatch.pending_id is not None:
             response["pending_id"] = dispatch.pending_id
+        if _admission_info is not None:
+            response["admission"] = _admission_info.to_dict()
+            if on_event_admitted is not None:
+                await _notify_event_admitted(
+                    on_event_admitted,
+                    session_id,
+                    dispatch.item_id,
+                    _admission_info,
+                )
         return response
 
     # ── GET /sessions/{session_id}/stream ────────────────────────

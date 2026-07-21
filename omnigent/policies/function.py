@@ -250,6 +250,8 @@ def _build_event(ctx: EvaluationContext) -> dict[str, Any]:
         # the server has no ``llm:`` config.
         "llm_client": ctx.llm_client,
     }
+    if ctx.admission is not None:
+        event["context"]["admission"] = ctx.admission.to_dict()
     if ctx.request_data is not None:
         event["request_data"] = ctx.request_data
     return event

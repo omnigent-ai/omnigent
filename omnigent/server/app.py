@@ -24,6 +24,7 @@ from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
+from omnigent.admission import EventAdmittedCallback, SessionEventAdmitter
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
@@ -1094,6 +1095,8 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    session_event_admitter: SessionEventAdmitter | None = None,
+    on_event_admitted: EventAdmittedCallback | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1184,6 +1187,11 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param session_event_admitter: Optional experimental admission selector.
+        Sessions for which ``wants()`` returns ``True`` use the runner's
+        atomic reserve-policy-consume path; ``None`` preserves the stock path.
+    :param on_event_admitted: Optional callback invoked after a handled event
+        is forwarded, with its AP item id and atomic admission information.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -2158,6 +2166,8 @@ def create_app(
             # workspace over the host tunnel when the runner is offline
             # (the file panel stays live without waking the agent).
             host_registry=host_registry,
+            session_event_admitter=session_event_admitter,
+            on_event_admitted=on_event_admitted,
         ),
         prefix="/v1",
         tags=["sessions"],
