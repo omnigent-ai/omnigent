@@ -491,7 +491,7 @@ async def test_external_routing_client_roundtrips_provider_prefix() -> None:
         )
 
     client = ExternalRoutingClient(
-        base_url="https://host/v1", router_name="task_v0", model_prefix="databricks-"
+        base_url="https://host/v1", router_name="task_v0", model_prefixes=["databricks-"]
     )
     with _patch_httpx(httpx.MockTransport(handler)):
         result = await client.route(
@@ -506,6 +506,79 @@ async def test_external_routing_client_roundtrips_provider_prefix() -> None:
     # Inbound: mapped back to the local (prefixed) catalog id.
     assert result is not None
     assert result.model == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_strips_first_matching_prefix() -> None:
+    """With multiple prefixes, the first matching one is stripped per id."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v0",
+        model_prefixes=["databricks-", "system.ai."],
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "hi", {"self": ["databricks-claude-opus-4-8", "system.ai.claude-sonnet-5"]}
+        )
+
+    # Each id has its own matching prefix stripped.
+    assert captured["body"]["route_options"] == [
+        {"model": "claude-opus-4-8", "harness": "self"},
+        {"model": "claude-sonnet-5", "harness": "self"},
+    ]
+    assert result is not None
+    assert result.model == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_maps_back_by_harness() -> None:
+    """The same bare id under two harnesses maps back to distinct local ids.
+
+    A Databricks-authed harness carries the ``databricks-`` prefix while a
+    subscription harness (e.g. Codex) uses the bare id; both reduce to the
+    same router id, so the (harness, router-id) key keeps them distinct.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        # Router picks the codex option (bare id, codex harness).
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "gpt-5-5", "harness": "codex"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", model_prefixes=["databricks-"]
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "hi",
+            {"pi": ["databricks-gpt-5-5"], "codex": ["gpt-5-5"]},
+        )
+
+    # Both harnesses reduce to router id "gpt-5-5"; the pick maps back to the
+    # codex local id, not pi's prefixed one.
+    assert result is not None
+    assert result.model == "gpt-5-5"
+    assert result.harness == "codex"
 
 
 @pytest.mark.asyncio
@@ -585,6 +658,33 @@ async def test_external_routing_client_empty_selection_returns_none() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"route_selection": [], "rationale": ""})
+
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_rejects_out_of_set_model() -> None:
+    """A model the router was never offered is rejected, not persisted.
+
+    Parity with the built-in judge: the returned model would become the
+    session's ``model_override``, so an out-of-set pick returns None and the
+    turn proceeds on the agent's default model.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "route_selection": [
+                    {"route_option": {"model": "hallucinated-model", "harness": "claude"}}
+                ]
+            },
+        )
 
     client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
     with _patch_httpx(httpx.MockTransport(handler)):

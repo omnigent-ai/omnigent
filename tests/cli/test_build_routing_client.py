@@ -26,10 +26,11 @@ def test_external_builds_client() -> None:
     assert client._url == "https://host/ai-gateway/routing/v1/routes:select"
     assert client._router_name == "task_v0"
     assert client._auth is None  # no profile -> unauthenticated
-    assert client._model_prefix == ""  # no prefix -> catalog ids sent verbatim
+    assert client._model_prefixes == []  # no prefix -> catalog ids sent verbatim
 
 
-def test_external_threads_model_prefix() -> None:
+def test_external_threads_model_prefix_scalar() -> None:
+    """A single ``model_prefix`` string is wrapped into a one-element list."""
     cfg = {
         "provider": "external",
         "base_url": "https://host/v1",
@@ -38,7 +39,20 @@ def test_external_threads_model_prefix() -> None:
     }
     client = _build_external_routing_client(cfg)
     assert isinstance(client, ExternalRoutingClient)
-    assert client._model_prefix == "databricks-"
+    assert client._model_prefixes == ["databricks-"]
+
+
+def test_external_threads_model_prefix_list() -> None:
+    """A list of prefixes threads through verbatim (blanks dropped)."""
+    cfg = {
+        "provider": "external",
+        "base_url": "https://host/v1",
+        "router_name": "task_v0",
+        "model_prefix": ["databricks-", "system.ai.", ""],
+    }
+    client = _build_external_routing_client(cfg)
+    assert isinstance(client, ExternalRoutingClient)
+    assert client._model_prefixes == ["databricks-", "system.ai."]
 
 
 def test_external_resolves_profile_auth() -> None:

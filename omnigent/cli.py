@@ -82,6 +82,22 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
         return yaml.safe_load(f) or {}
 
 
+def _parse_model_prefixes(
+    raw: Any,  # type: ignore[explicit-any]  # str | list | None from YAML
+) -> list[str]:
+    """Normalize the ``model_prefix`` config into a list of prefixes.
+
+    Accepts a single string (``"databricks-"``) or a list
+    (``["databricks-", "system.ai."]``); blanks are dropped. Returns an
+    empty list when unset, so catalog ids are sent verbatim.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+
+
 def _build_external_routing_client(
     routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
 ) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
@@ -90,9 +106,11 @@ def _build_external_routing_client(
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
     an explicit, provider-agnostic ``api_key`` (``${ENV}`` expanded) wins,
     else the Databricks ``profile`` convenience, else unauthenticated.
-    Optional ``model_prefix`` is stripped from catalog model ids sent to the
-    router (and restored on its answer) — e.g. ``"databricks-"`` when
-    serving-endpoint names carry that prefix but the router keys on bare ids.
+    Optional ``model_prefix`` (a single prefix or a list of prefixes) is
+    stripped from catalog model ids sent to the router (and restored on its
+    answer) — e.g. ``"databricks-"`` when serving-endpoint names carry that
+    prefix but the router keys on bare ids, or ``"system.ai."`` for Unity
+    Catalog foundation-model ids.
 
     :param routing_cfg: The parsed ``routing:`` mapping (a dict with
         ``provider == "external"``, per the caller).
@@ -103,7 +121,7 @@ def _build_external_routing_client(
     router_name = (routing_cfg.get("router_name") or "").strip()
     api_key = (routing_cfg.get("api_key") or "").strip()
     profile = (routing_cfg.get("profile") or "").strip()
-    model_prefix = (routing_cfg.get("model_prefix") or "").strip()
+    model_prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
 
     if not base_url or not router_name:
         click.echo(
@@ -137,7 +155,10 @@ def _build_external_routing_client(
     from omnigent.server.smart_routing import ExternalRoutingClient
 
     return ExternalRoutingClient(
-        base_url=base_url, router_name=router_name, auth=auth, model_prefix=model_prefix
+        base_url=base_url,
+        router_name=router_name,
+        auth=auth,
+        model_prefixes=model_prefixes,
     )
 
 
