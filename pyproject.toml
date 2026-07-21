@@ -141,6 +141,10 @@ daytona = ["daytona>=0.180,<1"]
 # pool. Same lazy-import posture as the modal/daytona extras. Pre-1.0 SDK: pin
 # minor.
 boxlite = ["boxlite>=0.9.5,<1"]
+# Microsandbox launcher: local libkrun microVMs with an embedded, optional SDK.
+# Its beta, pre-1.0 SDK has an explicit breaking-change warning, so pin minor.
+# Version 0.6.5 was yanked for missing DB migrations, hence the >=0.6.6 floor.
+microsandbox = ["microsandbox>=0.6.6,<0.7"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
@@ -639,6 +643,12 @@ ignore_missing_imports = true
 # as modal above.
 [[tool.mypy.overrides]]
 module = "boxlite.*"
+ignore_missing_imports = true
+
+# microsandbox is an optional dep (the `microsandbox` extra); same lazy-import
+# posture as modal above.
+[[tool.mypy.overrides]]
+module = "microsandbox.*"
 ignore_missing_imports = true
 
 # kubernetes is an optional dep (the `kubernetes` extra); same lazy-import

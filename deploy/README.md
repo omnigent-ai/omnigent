@@ -90,6 +90,9 @@ deploy/
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
 │
+├── microsandbox/      ← microsandbox sandbox-provider guide (local libkrun
+│   └── README.md         microVMs, embedded SDK, no daemon); NOT a server target.
+│
 ├── databricks/        ← Databricks Apps (Lakebase + UC Volumes)
 │   ├── databricks.yml     bundle declarative config
 │   ├── deploy.py          build + `bundle deploy`/`run` orchestrator
