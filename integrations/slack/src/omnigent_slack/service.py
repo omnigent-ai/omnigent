@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,7 +13,7 @@ from omnigent_slack.approvals import (
 )
 from omnigent_slack.auth_manager import pack_user_key
 from omnigent_slack.elicitation import ElicitationController, ElicitationTurnState
-from omnigent_slack.models import SlackTurn, ThreadKey
+from omnigent_slack.models import SlackTurn, ThreadKey, event_is_dm
 from omnigent_slack.notifications import (
     SlackNotifier,
     format_output_file,
@@ -25,6 +26,7 @@ from omnigent_slack.omnigent import (
     OmnigentClient,
     OmnigentClientPool,
     ServerUnreachableError,
+    StreamInterruptedError,
     extract_assistant_text,
     extract_delta,
     extract_elicitation_request,
@@ -40,7 +42,7 @@ from omnigent_slack.streaming import (
     SlackClientProtocol,
     _AnswerReply,
 )
-from omnigent_slack.text import strip_bot_mention
+from omnigent_slack.text import GENERIC_FAILURE_TEXT, strip_bot_mention
 
 # Immediate acknowledgement shown while the session spins up and while the agent
 # works before the first streamed tokens arrive. Deleted only once real content
@@ -49,30 +51,54 @@ from omnigent_slack.text import strip_bot_mention
 # the placeholder vanishing and the reply appearing.
 _ACK_TEXT = "_Working on it…_"
 
+# How long the read loop waits for the next stream event before treating the
+# stream as idle and force-flushing any buffered-but-unshown answer text. The
+# SDK flushes to Slack only when its buffer fills, so a short burst the agent
+# then pauses after (a tool call, thinking) can stay invisible until more text
+# arrives or the turn ends. This is a SENSITIVITY window, not a display delay:
+# during active streaming the buffer still flushes immediately on fill; this only
+# fires once the stream actually goes quiet. Small enough to feel live, large
+# enough not to fragment a steady token stream into one API call per token.
+_IDLE_FLUSH_SECONDS = 2.0
+
 _SERVER_UNREACHABLE_TEXT = (
     ":warning: I couldn't reach your Omnigent server. If it moved or is "
     "down, run /omnigent to reconfigure."
 )
 
-# Shown when the server rejects a turn as unauthenticated. The user was already
-# set up (a turn only runs with a saved config), so this is an expired/lost
-# login — most often the ~1h token expiry on Databricks-hosted servers, or a
-# bot restart that dropped in-memory tokens. Delivered ephemerally (sender-only)
-# so a routine re-login doesn't spam the thread.
-_AUTH_REQUIRED_TEXT = ":lock: Your Omnigent login has expired. Run /omnigent to sign in again."
+# An unauthenticated turn (expired/lost token — most often the ~1h token expiry
+# on Databricks-hosted servers, or a bot restart that dropped in-memory tokens)
+# is NOT delivered through this plain-text path. The user was already set up, so
+# they get a DM with a re-login setup button instead (see
+# ``SlackOmnigentService._notify_auth_expired``), which is reliably delivered and
+# actionable — unlike a thread ephemeral Slack may never render.
+
+# Shown when the live turn stream kept dropping and reconnect was exhausted. The
+# server was reachable throughout (a proxy severed the long-lived stream, e.g. a
+# ~5-minute duration cap), and the turn may still be running server-side — so
+# this is NOT the "server is down / reconfigure" case. Its result may still land
+# in the thread when the turn finishes.
+_STREAM_INTERRUPTED_TEXT = (
+    ":warning: I lost my live connection to the running turn. Its result may "
+    "still arrive here — send another message if it doesn't."
+)
 
 
 class _TurnAborted(Exception):
-    """A turn can't proceed; ``text`` is the user-facing reason to deliver.
+    """A turn can't proceed; ``text`` is the public user-facing reason to deliver."""
 
-    ``ephemeral`` delivers that reason only to the sender (e.g. an expired-login
-    notice), so a routine failure doesn't post to the whole thread.
-    """
-
-    def __init__(self, text: str, *, ephemeral: bool = False) -> None:
+    def __init__(self, text: str) -> None:
         super().__init__(text)
         self.text = text
-        self.ephemeral = ephemeral
+
+
+class _AuthExpired(Exception):
+    """The server rejected the turn as unauthenticated (expired/lost token).
+
+    Distinct from :class:`_TurnAborted` because it is not delivered as plain
+    text: the caller DMs the user a re-login setup button instead (a reliable,
+    actionable notice for a token that expires ~hourly).
+    """
 
 
 @dataclass
@@ -81,36 +107,38 @@ class _StreamState:
 
     # Timestamp of the live plan/todo message, edited in place across updates.
     todos_ts: str | None = None
-    # In-band ``response.error`` text captured for finalization.
-    error_text: str | None = None
+    # Whether the turn failed. The user-visible signal; a failure's raw detail is
+    # logged at the point of failure (never stored — it can carry stack traces /
+    # internal paths), and the user only ever sees the generic failure message.
+    errored: bool = False
     # Set when a known error was delivered mid-stream and the turn should stop.
     aborted: bool = False
     # In-flight elicitation cards this turn (owned by the ElicitationController).
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
 
-def _classify_turn_error(exc: BaseException, server_url: str) -> tuple[str | None, bool]:
-    """Map a known startup/turn error to ``(user_text, ephemeral)``.
+def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
+    """Map a known startup/turn error to its public user-facing text.
 
     Single source of truth shared by the session-creation and mid-turn error
-    paths, so the text and its delivery mode can't drift. ``ephemeral`` means
-    "show only to the sender": an expired login is a routine, per-user event
-    (especially with ~1h token expiry on Databricks) that only the sender can
-    act on, whereas server-down / no-host errors affect everyone on the thread
-    and stay public. ``user_text`` is ``None`` for an unrecognized error (the
-    caller falls back to ``str(exc)``).
+    paths, so the text can't drift. All these errors affect everyone on the
+    thread and are delivered publicly. Returns ``None`` for an unrecognized error
+    (the caller falls back to the generic failure). Auth errors do NOT flow
+    through here — the caller intercepts them for a DM re-login prompt.
     """
-    if isinstance(exc, AuthRequiredError):
-        return _AUTH_REQUIRED_TEXT, True
+    if isinstance(exc, StreamInterruptedError):
+        # A mid-stream drop with reconnect exhausted — the server stayed
+        # reachable, so this is NOT the "reconfigure" case. Its result may still land.
+        return _STREAM_INTERRUPTED_TEXT
     if isinstance(exc, ServerUnreachableError):
-        return _SERVER_UNREACHABLE_TEXT, False
+        return _SERVER_UNREACHABLE_TEXT
     if isinstance(exc, HostUnavailableError):
-        return host_unavailable_text(server_url), False
+        return host_unavailable_text(server_url)
     if isinstance(exc, HarnessNotConfiguredError):
         # The server's message is curated, actionable guidance for this code —
         # surface it so the user knows to run `omnigent setup` on the host.
-        return f":warning: {exc}", False
-    return None, False
+        return f":warning: {exc}"
+    return None
 
 
 class SlackOmnigentService:
@@ -171,6 +199,9 @@ class SlackOmnigentService:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancel any elicitation resolver tasks still awaiting a click so they
+        # aren't orphaned ("Task was destroyed but it is pending").
+        await self._elicitation.shutdown()
 
     async def handle_app_mention(
         self,
@@ -202,7 +233,7 @@ class SlackOmnigentService:
             )
             await client.chat_postMessage(
                 channel=key.channel_id,
-                thread_ts=key.thread_ts,
+                thread_ts=key.reply_ts,
                 text="Send a message after mentioning me to start a session.",
             )
             return
@@ -215,7 +246,7 @@ class SlackOmnigentService:
             event=event,
             text=text,
             client=client,
-            in_channel=not _is_direct_message(event),
+            in_channel=not event_is_dm(event),
         )
 
     async def handle_message(
@@ -239,7 +270,7 @@ class SlackOmnigentService:
         if not accepted:
             return
 
-        if not _is_direct_message(event):
+        if not event_is_dm(event):
             # In channels Omnigent only joins a thread when @-mentioned (which
             # arrives as an app_mention event). Plain messages — even a reply in
             # a thread that already has a session, and even one that mentions the
@@ -293,6 +324,31 @@ class SlackOmnigentService:
             # message to an owner, so we refuse to route it. Never fall through to
             # an owner-less turn (that would be an unguarded, adoptable session).
             self._logger.warning("Dropping Slack event with no user thread=%s", key.display())
+            return
+
+        # Authoritative thread-ownership gate, independent of the session store.
+        # Slack stamps ``parent_user_id`` (the thread root's author) on every
+        # threaded event; when it's present and is NOT the requester, this is a
+        # reply into someone else's thread → refuse, since a Slack thread maps 1:1
+        # to a session. This is ground truth from Slack that survives a bot
+        # restart, unlike the (ephemeral) store: without it, a restart that drops
+        # the thread→session record would let ANY user's reply create a fresh
+        # session in another user's thread. A root-level mention (new thread) has
+        # no ``parent_user_id`` and falls through to the normal store-backed path.
+        #
+        # Skip this in a DM: a 1:1 DM has no cross-user ownership concern, and the
+        # bot posts top-level there, so a user threading a reply under a BOT
+        # message carries ``parent_user_id == <bot id>`` — which would wrongly
+        # refuse the user's own message.
+        parent_user_id = str(event.get("parent_user_id") or "")
+        if not key.is_dm and parent_user_id and parent_user_id != requester:
+            self._logger.info(
+                "Ignoring reply from non-owner thread=%s parent=%s requester=%s",
+                key.display(),
+                parent_user_id,
+                requester,
+            )
+            await self._notifier.notify_non_owner(client, key, requester)
             return
 
         # LOCAL concurrency guard: reserve the thread SYNCHRONOUSLY here (no await
@@ -392,7 +448,7 @@ class SlackOmnigentService:
                     client,
                     requester,
                     channel=key.channel_id,
-                    thread_ts=key.thread_ts,
+                    thread_ts=key.reply_ts,
                     in_channel=in_channel,
                 )
                 return
@@ -455,8 +511,11 @@ class SlackOmnigentService:
 
         try:
             session_id = await self._ensure_session(turn, omnigent)
+        except _AuthExpired:
+            await self._notify_auth_expired(turn, reply)
+            return
         except _TurnAborted as aborted:
-            await reply.stop_with(aborted.text, ephemeral=aborted.ephemeral)
+            await reply.stop_with(aborted.text)
             return
         if session_id is None:
             # No session and creation disabled (a follow-up on a dead thread):
@@ -474,7 +533,7 @@ class SlackOmnigentService:
         baseline = await omnigent.latest_assistant_message(session_id)
 
         try:
-            error_text = await self._stream_turn(turn, omnigent, session_id, reply)
+            errored = await self._stream_turn(turn, omnigent, session_id, reply)
         except _TurnAborted:
             # A known mid-stream error already delivered its message and stopped
             # the reply; nothing left to finalize.
@@ -499,9 +558,12 @@ class SlackOmnigentService:
                 and not reply.already_delivered(latest[1])
             ):
                 reply.set_fallback_text(latest[1])
-        delivered_answer = await reply.finalize(error_text=error_text)
-        if error_text and delivered_answer:
-            await self._notifier.post_failure_reply(turn.slack_client, turn.key, error_text)
+        delivered_answer = await reply.finalize(errored=errored)
+        if errored and delivered_answer:
+            # An answer streamed AND the turn errored — post the generic failure
+            # as a separate reply so the answer stays intact. The detail was
+            # already logged in _stream_turn; never echo it to the channel.
+            await self._notifier.post_failure_reply(turn.slack_client, turn.key)
 
         self._logger.info(
             "Completed Slack turn thread=%s session=%s streamed_chars=%s segments=%s errored=%s",
@@ -509,8 +571,32 @@ class SlackOmnigentService:
             session_id,
             reply.streamed_len,
             reply.segments,
-            bool(error_text),
+            errored,
         )
+
+    async def _notify_auth_expired(self, turn: SlackTurn, reply: _AnswerReply) -> None:
+        """Deliver the expired-login re-login prompt as a DM with a setup button.
+
+        A configured user's delegated token expires often (roughly hourly on
+        Databricks-hosted servers), so this must be reliably seen and actionable
+        rather than a thread ephemeral that Slack may never render. Clears the
+        "Working on it…" placeholder first so a failed turn leaves nothing behind.
+        Best-effort: a DM failure is logged, never raised (the turn is already
+        aborting). In a channel, an ephemeral pointer nudges the user to their DM;
+        in a DM the re-login post already lands in the same conversation, so no
+        redundant pointer is posted (``in_channel`` is False there).
+        """
+        await reply.stop_with("")  # clear the ack placeholder without posting text
+        try:
+            await self._setup.prompt_relogin(
+                turn.slack_client,
+                turn.owner_user_id,
+                channel=turn.key.channel_id,
+                thread_ts=turn.key.reply_ts,
+                in_channel=not turn.key.is_dm,
+            )
+        except Exception:
+            self._logger.warning("Failed to deliver re-login prompt thread=%s", turn.key.display())
 
     async def _ensure_session(self, turn: SlackTurn, omnigent: OmnigentClient) -> str | None:
         """Return the session id for this turn, creating one if needed.
@@ -539,22 +625,36 @@ class SlackOmnigentService:
             runner_id = await omnigent.launch_runner(
                 session_id, workspace=turn.workspace or "", host_id=turn.host_id
             )
+        except AuthRequiredError as exc:
+            # Expired/lost token: DM a re-login button rather than a plain notice.
+            self._logger.info(
+                "Session startup needs re-login thread=%s: %s", turn.key.display(), exc
+            )
+            raise _AuthExpired() from exc
         except (
-            AuthRequiredError,
             ServerUnreachableError,
             HostUnavailableError,
             HarnessNotConfiguredError,
         ) as exc:
             self._logger.info("Session startup failed thread=%s: %s", turn.key.display(), exc)
-            text, ephemeral = _classify_turn_error(exc, self._server_url)
-            raise _TurnAborted(text or str(exc), ephemeral=ephemeral) from exc
+            # These are curated bot-composed messages; fall back to the generic
+            # failure rather than str(exc) so no server detail can leak.
+            raise _TurnAborted(
+                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+            ) from exc
         except Exception as exc:
             # Any other startup failure (e.g. a 500 surfaced as OmnigentError)
             # must still report rather than strand the thread on "Working on it…".
+            # The detail is logged here; the user gets a GENERIC message — the raw
+            # error can carry a stack trace / internal path and the thread is
+            # visible to the whole channel (DESIGN.md: server bodies are not echoed).
             self._logger.exception(
                 "Failed to start Omnigent session thread=%s", turn.key.display()
             )
-            raise _TurnAborted(f":warning: Omnigent request failed: {exc}") from exc
+            raise _TurnAborted(
+                ":warning: Something went wrong starting your Omnigent session. Please try "
+                "again; if it keeps happening, contact your Omnigent operator."
+            ) from exc
 
         await self._store.upsert_session(
             turn.key,
@@ -596,8 +696,11 @@ class SlackOmnigentService:
         omnigent: OmnigentClient,
         session_id: str,
         reply: _AnswerReply,
-    ) -> str | None:
-        """Stream the turn's events into ``reply``. Returns any error text.
+    ) -> bool:
+        """Stream the turn's events into ``reply``. Returns whether it errored.
+
+        A failure's detail is logged server-side only; the caller surfaces the
+        generic failure message (never the raw detail — see :data:`_StreamState`).
 
         Slack renders markdown server-side and owns chunking, so there's no
         mrkdwn conversion or msg_too_long handling here — just event routing.
@@ -608,30 +711,74 @@ class SlackOmnigentService:
         # Timestamp of the live plan/todo message, edited in place across updates.
         state = _StreamState()
         try:
-            async for event in omnigent.run_turn(
+            # Explicit iteration (not ``async for``) so a gap between events can
+            # be detected: when the stream goes quiet for ``_IDLE_FLUSH_SECONDS``
+            # we force any buffered answer text onto the screen, rather than
+            # letting the SDK's size-only buffer hold it invisible until the turn
+            # ends. A single in-flight "next event" task is kept alive across
+            # idle windows (a timeout must NOT cancel it — that would end the
+            # generator); we re-await it next window.
+            events = omnigent.run_turn(
                 session_id, turn.text, workspace=turn.workspace, host_id=turn.host_id
-            ):
-                await self._dispatch_stream_event(event, turn, omnigent, session_id, reply, state)
+            ).__aiter__()
+            pending: asyncio.Task[dict[str, Any]] | None = None
+            try:
+                while True:
+                    if pending is None:
+                        pending = asyncio.ensure_future(events.__anext__())
+                    done, _ = await asyncio.wait({pending}, timeout=_IDLE_FLUSH_SECONDS)
+                    if not done:
+                        # Stream idle this window — reveal any buffered text now.
+                        await reply.flush_if_buffered()
+                        continue
+                    try:
+                        event = await pending
+                    except StopAsyncIteration:
+                        break
+                    pending = None
+                    await self._dispatch_stream_event(
+                        event, turn, omnigent, session_id, reply, state
+                    )
+            finally:
+                # Reap the in-flight read so the generator isn't left running when
+                # its scope exits (mirrors _run_turn_once's teardown).
+                if pending is not None:
+                    pending.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pending
+        except AuthRequiredError as exc:
+            # Token expired mid-turn: DM a re-login button (see _notify_auth_expired).
+            self._logger.info(
+                "Turn needs re-login mid-stream thread=%s: %s", turn.key.display(), exc
+            )
+            await self._notify_auth_expired(turn, reply)
+            state.aborted = True
         except (
-            AuthRequiredError,
             ServerUnreachableError,
+            StreamInterruptedError,
             HostUnavailableError,
             HarnessNotConfiguredError,
         ) as exc:
             self._logger.info("Turn error mid-stream thread=%s: %s", turn.key.display(), exc)
-            text, ephemeral = _classify_turn_error(exc, self._server_url)
-            await reply.stop_with(text or str(exc), ephemeral=ephemeral)
+            # Curated bot-composed messages; fall back to the generic failure
+            # rather than str(exc) so no server detail can leak.
+            await reply.stop_with(
+                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+            )
             state.aborted = True
-        except Exception as exc:
+        except Exception:
+            # Log the detail here (never surfaced — it can carry a stack trace /
+            # internal path); the user gets the generic failure via ``errored``.
             self._logger.exception("Omnigent turn failed for %s", turn.key.display())
-            state.error_text = str(exc)
+            state.errored = True
         finally:
             # Settle any card still open (turn ended before its resolution push,
-            # or was torn down) so no resolver task leaks.
-            await self._elicitation.finish_pending(turn, state.elicitations)
+            # or was torn down) so no resolver task leaks; an unanswered one is
+            # declined server-side to release the park.
+            await self._elicitation.finish_pending(omnigent, turn, state.elicitations)
         if state.aborted:
             raise _TurnAborted("")  # already delivered; signal the caller to stop
-        return state.error_text
+        return state.errored
 
     async def _dispatch_stream_event(
         self,
@@ -704,12 +851,20 @@ class SlackOmnigentService:
 
         event_error = extract_error_text(event)
         if event_error:
-            state.error_text = event_error
+            # In-band server error (response.error / turn.failed). Its message can
+            # embed a stack trace / internal path, so log it and show the generic
+            # failure — do NOT echo it to the channel.
+            self._logger.warning(
+                "Omnigent in-band turn error thread=%s: %s", turn.key.display(), event_error
+            )
+            state.errored = True
 
-    async def handle_elicitation_action(self, *, elicitation_id: str, verdict: Verdict) -> bool:
+    async def handle_elicitation_action(
+        self, *, session_id: str, elicitation_id: str, verdict: Verdict
+    ) -> bool:
         """Deliver a button/form verdict (block-action handler entry point)."""
         return await self._elicitation.handle_action(
-            elicitation_id=elicitation_id, verdict=verdict
+            session_id=session_id, elicitation_id=elicitation_id, verdict=verdict
         )
 
     async def reject_non_owner_click(
@@ -769,15 +924,6 @@ class SlackOmnigentService:
             return True
         user_id = event.get("user")
         return bool(bot_user_id and user_id == bot_user_id)
-
-
-def _is_direct_message(event: dict[str, Any]) -> bool:
-    # Slack marks 1:1 DMs with channel_type "im"; channel ids also start with
-    # "D". Either signal means the message reached the bot directly rather than
-    # via a channel, so no @-mention is needed to engage.
-    if event.get("channel_type") == "im":
-        return True
-    return str(event.get("channel") or "").startswith("D")
 
 
 def _team_id(body: dict[str, Any], event: dict[str, Any]) -> str:

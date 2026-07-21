@@ -17,7 +17,10 @@ variables:
       Databricks secret scope holding the bot's credentials. Create it and
       the keys below with the databricks CLI (see README.md):
       slack_bot_token, slack_app_token, token_encryption_key,
-      databricks_state_secret.
+      databricks_oauth_client_secret, databricks_state_secret.
+  oauth_client_id:
+    description: >
+      Custom U2M OAuth app client id. Public (not a secret) — passed inline.
   server_url:
     description: "Base URL of the Omnigent server app (the bot talks to this)."
   webauth_base_url:
@@ -54,6 +57,11 @@ resources:
             scope: ${var.secret_scope}
             key: token_encryption_key
             permission: READ
+        - name: databricks-oauth-client-secret
+          secret:
+            scope: ${var.secret_scope}
+            key: databricks_oauth_client_secret
+            permission: READ
         - name: databricks-state-secret
           secret:
             scope: ${var.secret_scope}
@@ -70,11 +78,19 @@ resources:
             value_from: slack-app-token
           - name: OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY
             value_from: token-encryption-key
+          # Custom U2M OAuth app credentials (authorization code + PKCE). The
+          # client id is public (inline); only the secret is a secret.
+          - name: OMNIGENT_SLACK_DATABRICKS_CLIENT_ID
+            value: ${var.oauth_client_id}
+          - name: OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET
+            value_from: databricks-oauth-client-secret
+          # HMAC key signing the enrollment state — its own secret, kept separate
+          # from the OAuth client secret so rotating one doesn't affect the other.
           - name: OMNIGENT_SLACK_DATABRICKS_STATE_SECRET
             value_from: databricks-state-secret
           # Databricks web-auth mode + non-secret config. The workspace host
-          # and the bot's own public URL are taken from the platform-injected
-          # DATABRICKS_HOST / DATABRICKS_APP_URL, so they need no value here.
+          # defaults to the platform-injected DATABRICKS_HOST, and the bot's own
+          # public URL to DATABRICKS_APP_URL, so they need no value here.
           - name: OMNIGENT_SLACK_SERVER_AUTH
             value: databricks
           - name: OMNIGENT_SERVER_URL

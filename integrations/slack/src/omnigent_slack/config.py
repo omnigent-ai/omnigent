@@ -10,11 +10,57 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Auth posture the bot assumes for its Omnigent server. ``auto`` probes the
 # server (the historical behaviour — device grant / OIDC ticket). ``databricks``
 # is for a server fronted by the Databricks Apps proxy (header mode), which the
-# probe can't drive: identity is asserted by the proxy, so the bot enrolls each
-# user through a web page it hosts as its own Databricks App and forwards the
-# user's proxy-issued token to the server. See
-# ``docs/DATABRICKS_APP_WEBAUTH_DESIGN.md``.
+# probe can't drive: identity is asserted by the proxy. The bot runs its own
+# Databricks U2M OAuth client (authorization code + PKCE, ``offline_access``) so
+# each user signs in once and gets a durable, refreshable token the bot forwards
+# to the server. See ``docs/DATABRICKS_APP_WEBAUTH_DESIGN.md``.
 ServerAuthMode = Literal["auto", "databricks"]
+
+
+def _normalize_host(value: str | None) -> str | None:
+    """Normalize a workspace host: strip trailing slash, add ``https://`` scheme.
+
+    ``DATABRICKS_HOST`` (and often an operator-supplied value) is a bare host
+    like ``e2-dogfood.staging.cloud.databricks.com`` with no scheme; the OAuth
+    endpoints need a full URL, so default a missing scheme to ``https://``.
+    Returns ``None`` for an empty/absent value.
+    """
+    if value is None:
+        return None
+    value = value.strip().rstrip("/")
+    if not value:
+        return None
+    if not value.startswith(("http://", "https://")):
+        value = f"https://{value}"
+    return value
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Whether ``url``'s host is loopback (localhost / 127.0.0.1 / ::1).
+
+    Used to allow a plaintext ``http://`` workspace host for local testing only,
+    while requiring https for any real host.
+    """
+    from urllib.parse import urlsplit
+
+    host = urlsplit(url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _normalize_oauth_scopes(raw: str) -> str:
+    """Normalize an OAuth scope string, forcing the scopes the flow needs.
+
+    ``offline_access`` is required for a refresh token (the whole point of the
+    U2M flow — without it the token expires in ~1h and the user re-enrolls), and
+    ``openid`` is required for the ``id_token`` the bot reads the user's email
+    from. Both are added if the operator's scope string omits them, so a narrow
+    custom scope still yields a refreshable, identity-bearing token.
+    """
+    scopes = [s for s in raw.split() if s]
+    for required in ("openid", "offline_access"):
+        if required not in scopes:
+            scopes.append(required)
+    return " ".join(scopes)
 
 
 def _local_data_dir() -> Path:
@@ -87,21 +133,60 @@ class Settings(BaseSettings):
     #
     # When the Omnigent server is deployed as a Databricks App, its proxy
     # asserts identity via a header the bot can't produce from a Socket-Mode
-    # event. Set OMNIGENT_SLACK_SERVER_AUTH=databricks to enroll each user
-    # through a web page this bot serves as its own Databricks App. See
+    # event. Set OMNIGENT_SLACK_SERVER_AUTH=databricks and register a custom U2M
+    # OAuth app (authorization code + PKCE) in the workspace: the bot runs that
+    # OAuth flow through a web page it serves as its own Databricks App, so each
+    # user gets a durable, refreshable token. See
     # docs/DATABRICKS_APP_WEBAUTH_DESIGN.md.
     server_auth_mode: ServerAuthMode = Field(
         default="auto",
         validation_alias="OMNIGENT_SLACK_SERVER_AUTH",
     )
 
-    # HMAC key (any non-empty string) that signs the ``state`` binding a browser
-    # enrollment session to the Slack (team, user) that requested it. Prevents a
-    # user from enrolling someone else's Slack identity. Required when
-    # server_auth_mode == "databricks".
+    # Databricks workspace host the custom U2M OAuth app is registered in, e.g.
+    # ``https://my-workspace.cloud.databricks.com``. The bot hits its
+    # ``/oidc/v1/authorize`` and ``/oidc/v1/token`` endpoints. Distinct from
+    # server_url (the *.databricksapps.com app). Defaults to the platform-
+    # injected DATABRICKS_HOST when unset (the OAuth app lives in the same
+    # workspace the bot runs in); required — directly or via DATABRICKS_HOST —
+    # in databricks mode.
+    databricks_workspace_host: str | None = Field(
+        default_factory=lambda: _normalize_host(os.environ.get("DATABRICKS_HOST")),
+        validation_alias="OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST",
+    )
+
+    # Custom U2M OAuth app credentials (client id + secret) registered in the
+    # workspace above. The client id is public; the secret authenticates the
+    # token/refresh calls. Both required in databricks mode.
+    databricks_oauth_client_id: str | None = Field(
+        default=None,
+        validation_alias="OMNIGENT_SLACK_DATABRICKS_CLIENT_ID",
+    )
+    databricks_oauth_client_secret: str | None = Field(
+        default=None,
+        validation_alias="OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET",
+    )
+
+    # HMAC key (any long random string) that signs the enrollment ``state``.
+    # Kept separate from the OAuth client secret on purpose: rotating the OAuth
+    # credential in Databricks then doesn't invalidate in-flight enrollment
+    # links, and the state-signing key stays out of the OAuth-credential blast
+    # radius. Required in databricks mode.
     databricks_state_secret: str | None = Field(
         default=None,
         validation_alias="OMNIGENT_SLACK_DATABRICKS_STATE_SECRET",
+    )
+
+    # Space-separated OAuth scopes to request. ``openid`` and ``offline_access``
+    # are forced on (see _normalize_oauth_scopes) so the flow always yields an
+    # id_token + refresh token. The token's scopes must be a SUPERSET of the
+    # scopes omnigent-dev's app declares, or its Databricks proxy rejects the
+    # token (401 on /api, 302→login elsewhere). ``all-apis`` satisfies any app's
+    # requirement (the same default a ``databricks-cli`` token carries); narrow it
+    # only to the exact scope omnigent-dev declares once that's known.
+    databricks_oauth_scopes: str = Field(
+        default="all-apis",
+        validation_alias="OMNIGENT_SLACK_DATABRICKS_SCOPES",
     )
 
     # Public base URL of this bot's own Databricks App (where the enrollment
@@ -133,17 +218,66 @@ class Settings(BaseSettings):
         base = self.databricks_webauth_base_url or os.environ.get("DATABRICKS_APP_URL")
         return base.strip().rstrip("/") if base else None
 
+    @property
+    def databricks_redirect_uri(self) -> str | None:
+        """OAuth redirect URI the authorize call sends the ``?code=`` back to.
+
+        The custom OAuth app must register this exact value. It reuses the
+        enrollment page's ``/auth/callback`` route on the bot's own Databricks
+        App URL. ``None`` when the base URL isn't configured yet.
+        """
+        base = self.webauth_base_url
+        return f"{base}/auth/callback" if base else None
+
+    @property
+    def databricks_oauth_scopes_normalized(self) -> str:
+        """Requested scopes with ``openid`` + ``offline_access`` forced on."""
+        return _normalize_oauth_scopes(self.databricks_oauth_scopes)
+
+    @field_validator("databricks_workspace_host")
+    @classmethod
+    def _normalize_workspace_host(cls, value: str | None) -> str | None:
+        # A scheme-less host (e.g. DATABRICKS_HOST, or an operator typing just the
+        # hostname) is defaulted to https. The model validator then enforces https
+        # for any non-loopback host.
+        return _normalize_host(value)
+
     @model_validator(mode="after")
     def _check_databricks_config(self) -> Settings:
-        """Fail fast when databricks mode is missing its required secret.
+        """Fail fast when databricks mode is missing required config.
 
         Catches misconfiguration at startup rather than at first enrollment,
         where a Slack user would just see a generic failure.
         """
-        if self.server_auth_mode == "databricks" and not self.databricks_state_secret:
+        if self.server_auth_mode != "databricks":
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("OMNIGENT_SLACK_DATABRICKS_CLIENT_ID", self.databricks_oauth_client_id),
+                ("OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET", self.databricks_oauth_client_secret),
+                ("OMNIGENT_SLACK_DATABRICKS_STATE_SECRET", self.databricks_state_secret),
+                # workspace_host defaults to DATABRICKS_HOST (injected on the
+                # platform); still required for a laptop run where it's unset.
+                ("OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST", self.databricks_workspace_host),
+            )
+            if not value
+        ]
+        if missing:
             raise ValueError(
-                "OMNIGENT_SLACK_SERVER_AUTH=databricks requires "
-                "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET"
+                "OMNIGENT_SLACK_SERVER_AUTH=databricks requires " + ", ".join(missing)
+            )
+        # The OAuth flow's security rests on TLS: the client secret rides HTTP
+        # Basic on the token call, and the id_token (the confused-deputy anchor)
+        # is trusted WITHOUT signature verification because it arrives directly
+        # over TLS from the token endpoint. A plaintext workspace host defeats
+        # both, so require https (loopback excepted for local testing).
+        host = self.databricks_workspace_host or ""
+        if host.startswith("http://") and not _is_loopback_url(host):
+            raise ValueError(
+                "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST must use https:// "
+                "(plaintext exposes the client secret and lets an on-path "
+                "attacker forge the id_token identity)"
             )
         return self
 

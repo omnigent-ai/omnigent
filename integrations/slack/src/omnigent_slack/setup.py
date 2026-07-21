@@ -92,7 +92,7 @@ class SetupFlow:
         pool: OmnigentClientPool,
         server_url: str,
         auth_manager: AuthManager | None = None,
-        enrollment_url: Callable[[str, str, str], str | None] | None = None,
+        enrollment_url: Callable[[str, str, str, str], str | None] | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
@@ -110,6 +110,29 @@ class SetupFlow:
         app.action(ACTION_SETUP_START)(self._handle_setup_start)
         app.view(CALLBACK_SELECT_MODAL)(self._handle_select_submit)
 
+    async def _dm_user(
+        self,
+        client: Any,
+        user_id: str,
+        *,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+        purpose: str,
+    ) -> bool:
+        """Open a DM with ``user_id`` and post ``text`` (+ optional ``blocks``).
+
+        Centralizes the ``conversations_open`` → resolve-channel → post-or-warn
+        dance shared by the setup/re-login/logout DM prompts. ``purpose`` labels
+        the "could not open DM" warning. Returns whether the DM was delivered.
+        """
+        opened = await client.conversations_open(users=user_id)
+        dm_channel = _dm_channel_id(opened)
+        if dm_channel is None:
+            self._logger.warning("Could not open DM for %s user=%s", purpose, user_id)
+            return False
+        await client.chat_postMessage(channel=dm_channel, text=text, blocks=blocks)
+        return True
+
     async def _handle_config_command(self, ack: Any, command: dict[str, Any], client: Any) -> None:
         # ``/omnigent`` (or ``/omnigent config``) opens setup against the fixed
         # server — connectivity is validated immediately, login is folded in
@@ -120,6 +143,15 @@ class SetupFlow:
         await ack()
         team_id = str(command.get("team_id") or "")
         user_id = str(command.get("user_id") or "")
+        # Fail closed on a missing team/user. Tokens and configs are keyed by
+        # (team, user); an empty team_id would collapse keys across workspaces,
+        # so a blank one must never reach the store. Matches the event path,
+        # which raises on a missing team.
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Config command missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            return
         subcommand = str(command.get("text") or "").split()[:1]
 
         if subcommand and subcommand[0].lower() == "logout":
@@ -141,25 +173,22 @@ class SetupFlow:
         saved settings (agent/host/workspace plus thread→session mappings),
         then DMs a confirmation.
         """
-        opened = await client.conversations_open(users=user_id)
-        dm_channel = _dm_channel_id(opened)
         revoked = 0
         if self._auth is not None and self._auth.enabled:
             revoked = await self._auth.logout_all(team_id, user_id)
             # Drop any pooled clients holding the just-revoked tokens.
             await self._pool.invalidate_user(pack_user_key(team_id, user_id))
         await self._store.clear_user_data(team_id, user_id)
-        if dm_channel:
-            servers = f" and revoked {revoked} server login(s)" if revoked else ""
-            await client.chat_postMessage(
-                channel=dm_channel,
-                text=(
-                    f":wave: Logged out{servers}. Your Omnigent settings were "
-                    "cleared — run `/omnigent` to set up again."
-                ),
-            )
-        else:
-            self._logger.warning("Could not open DM to confirm logout user=%s", user_id)
+        servers = f" and revoked {revoked} server login(s)" if revoked else ""
+        await self._dm_user(
+            client,
+            user_id,
+            text=(
+                f":wave: Logged out{servers}. Your Omnigent settings were "
+                "cleared — run `/omnigent` to set up again."
+            ),
+            purpose="logout confirmation",
+        )
 
     async def prompt_unconfigured(
         self,
@@ -177,17 +206,13 @@ class SetupFlow:
         knows to check their DM rather than waiting for a reply that never
         comes.
         """
-        opened = await client.conversations_open(users=user_id)
-        dm_channel = _dm_channel_id(opened)
-        if dm_channel:
-            await client.chat_postMessage(
-                channel=dm_channel,
-                text="Set up Omnigent to start using me.",
-                blocks=setup_prompt_blocks(),
-            )
-        else:
-            self._logger.warning("Could not open DM for setup user=%s", user_id)
-
+        await self._dm_user(
+            client,
+            user_id,
+            text="Set up Omnigent to start using me.",
+            blocks=setup_prompt_blocks(),
+            purpose="setup",
+        )
         if in_channel:
             await client.chat_postEphemeral(
                 channel=channel,
@@ -195,6 +220,44 @@ class SetupFlow:
                 thread_ts=thread_ts,
                 text="Let's get you set up — check your DM with me to configure Omnigent.",
             )
+
+    async def prompt_relogin(
+        self,
+        client: Any,
+        user_id: str,
+        *,
+        channel: str,
+        thread_ts: str | None,
+        in_channel: bool,
+    ) -> bool:
+        """DM a configured user whose token expired the re-login setup button.
+
+        Reached when a stored grant can no longer be refreshed (revoked, or the
+        refresh token itself expired) — the bot drops the token and prompts a
+        fresh sign-in. A DM (not a thread ephemeral) is used because it is
+        persisted and reliably delivered, and it carries the setup button —
+        pressing it re-runs the same login flow as first-time setup. When
+        triggered from a channel, an ephemeral pointer nudges the user to their
+        DM. Returns whether the DM was delivered.
+        """
+        delivered = await self._dm_user(
+            client,
+            user_id,
+            text="Your Omnigent login has expired. Sign in again to keep going.",
+            blocks=relogin_prompt_blocks(),
+            purpose="re-login",
+        )
+        if not delivered:
+            return False
+
+        if in_channel:
+            await client.chat_postEphemeral(
+                channel=channel,
+                user=user_id,
+                thread_ts=thread_ts,
+                text=("Your Omnigent login has expired — check your DM with me to sign in again."),
+            )
+        return True
 
     async def _handle_setup_start(self, ack: Any, body: dict[str, Any], client: Any) -> None:
         await ack()
@@ -302,6 +365,67 @@ class SetupFlow:
             view=select_modal(server_url, validated, workspace_default=workspace_default),
         )
 
+    async def _revalidate_and_advance(
+        self,
+        client: Any,
+        *,
+        team_id: str,
+        user_id: str,
+        server_url: str,
+        view_id: str,
+        context: str,
+    ) -> None:
+        """Post-login/enrollment success: re-validate as the user, advance the modal.
+
+        Shared by the device-login and Databricks-enrollment success hooks. Drops
+        the tokenless client pooled during the pre-login probe so the pool rebuilds
+        it with the freshly-stored token — otherwise ``validate`` re-hits the auth
+        wall and the modal stalls. A ``views_update`` can fail if the user already
+        closed the modal — logged (with ``context``), never raised (the token is
+        stored regardless, and this runs in a background task).
+        """
+        user_key = pack_user_key(team_id, user_id)
+        await self._pool.invalidate(server_url, user_key)
+        omnigent = await self._pool.get(server_url, user_key)
+        try:
+            validated = await omnigent.validate()
+            await self._advance_to_select(
+                _ViewUpdateAck(client, view_id), omnigent, server_url, validated
+            )
+        except Exception as exc:
+            # The token was stored (the callback/login succeeded), but validating
+            # it against the server failed — most often the granted scope doesn't
+            # satisfy the server proxy, so the browser shows success while the
+            # modal would otherwise hang. Surface it instead of swallowing it, and
+            # log with a traceback so the deployed logs pinpoint the cause.
+            self._logger.warning(
+                "Post-%s modal advance failed team=%s user=%s server=%s: %s",
+                context,
+                team_id,
+                user_id,
+                server_url,
+                exc,
+                exc_info=True,
+            )
+            await self._fail_modal(
+                client,
+                view_id,
+                server_url,
+                "you're signed in, but the server rejected the sign-in when "
+                "validating it. Ask your Omnigent operator to confirm the OAuth "
+                "app's scopes are accepted by the server.",
+                context=context.capitalize(),
+            )
+
+    async def _fail_modal(
+        self, client: Any, view_id: str, server_url: str, reason: str, *, context: str
+    ) -> None:
+        """Swap the modal to the login-failed screen; best-effort, never raises."""
+        try:
+            await client.views_update(view_id=view_id, view=login_failed_modal(server_url, reason))
+        except Exception as exc:
+            self._logger.info("%s-failure modal update failed: %s", context, exc)
+
     async def _begin_in_modal_login(
         self,
         client: Any,
@@ -352,26 +476,17 @@ class SetupFlow:
         )
 
         async def _on_success() -> None:
-            # Re-validate as the now-authenticated user and advance the same
-            # modal to the agent/host picker via views_update. A views_update
-            # can fail if the user already closed the modal — log, don't crash
-            # the background task (the token is stored regardless).
-            omnigent = await self._pool.get(server_url, pack_user_key(team_id, user_id))
-            try:
-                validated = await omnigent.validate()
-                await self._advance_to_select(
-                    _ViewUpdateAck(client, view_id), omnigent, server_url, validated
-                )
-            except Exception as exc:
-                self._logger.info("Post-login modal advance failed: %s", exc)
+            await self._revalidate_and_advance(
+                client,
+                team_id=team_id,
+                user_id=user_id,
+                server_url=server_url,
+                view_id=view_id,
+                context="login",
+            )
 
         async def _on_failure(reason: str) -> None:
-            try:
-                await client.views_update(
-                    view_id=view_id, view=login_failed_modal(server_url, reason)
-                )
-            except Exception as exc:
-                self._logger.info("Login-failure modal update failed: %s", exc)
+            await self._fail_modal(client, view_id, server_url, reason, context="Login")
 
         self._auth.await_authorization_in_background(
             pending=pending,
@@ -436,22 +551,17 @@ class SetupFlow:
         )
 
         async def _on_success() -> None:
-            omnigent = await self._pool.get(server_url, pack_user_key(team_id, user_id))
-            try:
-                validated = await omnigent.validate()
-                await self._advance_to_select(
-                    _ViewUpdateAck(client, view_id), omnigent, server_url, validated
-                )
-            except Exception as exc:
-                self._logger.info("Post-enrollment modal advance failed: %s", exc)
+            await self._revalidate_and_advance(
+                client,
+                team_id=team_id,
+                user_id=user_id,
+                server_url=server_url,
+                view_id=view_id,
+                context="enrollment",
+            )
 
         async def _on_failure(reason: str) -> None:
-            try:
-                await client.views_update(
-                    view_id=view_id, view=login_failed_modal(server_url, reason)
-                )
-            except Exception as exc:
-                self._logger.info("Enrollment-failure modal update failed: %s", exc)
+            await self._fail_modal(client, view_id, server_url, reason, context="Enrollment")
 
         self._auth.await_enrollment_in_background(
             team_id=team_id,
@@ -563,18 +673,17 @@ class SetupFlow:
             host_id,
         )
 
-        opened = await client.conversations_open(users=user_id)
-        dm_channel = _dm_channel_id(opened)
-        if dm_channel:
-            host_line = f" on host *{host_name}*" if host_name else ""
-            await client.chat_postMessage(
-                channel=dm_channel,
-                text=(
-                    f":white_check_mark: You're set up! I'll use *{config.agent_name}*"
-                    f"{host_line} on {server_url}. Mention me in a channel or message me "
-                    "here to start."
-                ),
-            )
+        host_line = f" on host *{host_name}*" if host_name else ""
+        await self._dm_user(
+            client,
+            user_id,
+            text=(
+                f":white_check_mark: You're set up! I'll use *{config.agent_name}*"
+                f"{host_line} on {server_url}. Mention me in a channel or message me "
+                "here to start."
+            ),
+            purpose="setup confirmation",
+        )
 
 
 def default_workspace() -> str:
@@ -611,6 +720,34 @@ def setup_prompt_blocks() -> list[dict[str, Any]]:
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "⚙️ Set up Omnigent"},
+                    "style": "primary",
+                    "action_id": ACTION_SETUP_START,
+                }
+            ],
+        },
+    ]
+
+
+def relogin_prompt_blocks() -> list[dict[str, Any]]:
+    # Same setup button as first-time setup — pressing it re-runs the login flow
+    # (``_begin_setup`` shows the verification link when the server needs auth).
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    ":lock: *Your Omnigent login has expired.*\n"
+                    "Sign in again to keep running sessions."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🔑 Sign in to Omnigent"},
                     "style": "primary",
                     "action_id": ACTION_SETUP_START,
                 }

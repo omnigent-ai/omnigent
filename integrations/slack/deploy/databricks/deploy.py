@@ -48,7 +48,7 @@ _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
 # The Apps runtime pins a global uv exclude-newer cutoff; lock against the same
 # so the in-container re-resolve doesn't refetch (and time out) on PyPI. Bump
 # when redeploying against a newer runtime (read the cutoff from /logz).
-_UV_EXCLUDE_NEWER = "2026-07-18T00:00:00Z"
+_UV_EXCLUDE_NEWER = "2026-07-19T00:00:00Z"
 
 
 def _log(msg: str) -> None:
@@ -230,6 +230,7 @@ def _bundle_vars(args: argparse.Namespace) -> list[str]:
     pairs = {
         "app_name": args.app_name,
         "secret_scope": args.secret_scope,
+        "oauth_client_id": args.oauth_client_id,
         "server_url": args.server_url.rstrip("/"),
         "webauth_base_url": webauth_base_url.rstrip("/"),
     }
@@ -267,6 +268,11 @@ def main() -> None:
         "--server-url",
         required=True,
         help="Base URL of the Omnigent server app the bot talks to.",
+    )
+    parser.add_argument(
+        "--oauth-client-id",
+        required=True,
+        help="Custom U2M OAuth app client id (public; passed inline, not a secret).",
     )
     parser.add_argument(
         "--webauth-base-url",

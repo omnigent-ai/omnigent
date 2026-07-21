@@ -42,7 +42,7 @@ required for the bot's core behaviour:
 | `im:history` | Read direct messages. DMs are a first-class entry point and do **not** fire `app_mention`, so without this the bot can't respond in DMs. |
 | `commands` | Register and receive the `/omnigent` slash command. |
 | `team:read` | Read the workspace name (`team.info`) to label the delegated-login request. |
-| `users:read`, `users:read.email` | Read the user's email (`users.info`) — **required only for Databricks web-auth mode**, where it's signed into the enrollment link and matched against the browser's `X-Forwarded-Email` to bind the token to the right person. Omit for `accounts`/`oidc` mode. |
+| `users:read`, `users:read.email` | Read the user's email (`users.info`) — **required only for Databricks web-auth mode**, where it's signed into the enrollment link and matched against the OAuth-authenticated email to bind the token to the right person. Omit for `accounts`/`oidc` mode. |
 
 **Channel history — add per channel type where the bot will run.** These back
 the plain-`message` event; add only the ones matching where you'll use the bot:
@@ -192,43 +192,39 @@ threat model.
 When the Omnigent server is deployed as a **Databricks App**, it runs in header
 mode: the Databricks Apps proxy authenticates every request and injects the
 user's identity. A Socket-Mode event carries no such proxy-authenticated
-request, so the device/OIDC flows above can't be driven. Instead the bot is
-deployed as **its own Databricks App with user authorization enabled** and
-serves an enrollment page:
+request, so the device/OIDC flows above can't be driven. Instead the bot runs a
+**custom U2M OAuth app** (authorization code + PKCE, `offline_access`) via an
+enrollment page it serves as its own Databricks App:
 
-1. On `/omnigent`, the bot looks up the user's email (`users.info`) and posts a
-   *Sign in with Databricks* link whose signed `state` carries that email.
-2. Opening it hits the bot's own Databricks proxy, which authenticates the user
-   and forwards their token (`x-forwarded-access-token`) and identity
-   (`x-forwarded-email`).
-3. **Identity binding (confused-deputy guard):** the callback requires the
-   browser's `x-forwarded-email` to equal the Slack email in the signed state.
-   This ensures the token being captured belongs to the *same* person the link
-   was issued for — so a link bound to user A, opened by victim V, can't store
-   V's token under A. Mismatch → refused (HTTP 403).
-4. **Consent before storing:** the page (a GET) stores nothing — it shows the
-   exact identities being linked ("your Omnigent `<server>` account
+1. On `/omnigent`, the bot looks up the user's email (`users.info`), generates a
+   PKCE verifier + single-use nonce, and posts a *Sign in with Databricks* link
+   — the workspace `/oidc/v1/authorize` URL whose signed `state` carries that
+   email and nonce.
+2. The user signs in at the Databricks authorize screen and Databricks redirects
+   back to the bot's `GET /auth/callback` with a single-use, PKCE-bound code.
+3. The callback consumes the PKCE verifier for the nonce (single-use — a
+   replayed redirect is refused) and exchanges the code at `/oidc/v1/token` for
+   an **access + refresh** pair, reading the authenticated email from the
+   `id_token` (falling back to SCIM `Me`).
+4. **Identity binding (confused-deputy guard):** the callback requires the
+   OAuth-authenticated email to equal the Slack email in the signed state — so a
+   link bound to user A, signed in by victim V, can't store V's token under A.
+   Mismatch → refused (HTTP 403).
+5. **Confirm before storing:** the GET stores nothing — it shows a consent page
+   naming the exact identities being linked ("your Omnigent `<server>` account
    `<idp-email>` with Slack user `<slack-email>`") and a **Confirm** button. The
-   token is saved only when the user submits the confirming POST, so a
-   credential is never persisted without the browser user affirming it's them.
-5. On confirm, the bot stores the forwarded token and presents it as the bearer
-   to the server (Databricks on-behalf-of — the documented "pass the forwarded
-   token through" pattern). It carries only this app's `user_api_scopes` (e.g.
-   `iam.current-user:read`), so it isn't a broad workspace credential. (An
-   audience-scoped token exchange would narrow it to a single app, but
-   Databricks rejects `audience` for an `access_token` subject, so it isn't
-   available here.)
-6. The token is stored (encrypted at rest) for that Slack `(team, user)` and the
-   setup modal advances automatically.
-7. The bot calls the server with that token; the proxy validates it and injects
-   the real `X-Forwarded-Email`, so the server maps the request to the user —
-   **no server-side change needed**.
+   pair is persisted only when the user submits the confirming POST, then the
+   setup modal advances automatically. The token is bounded by the OAuth app's
+   requested scopes, so it isn't a broad workspace credential.
+6. The bot calls the server with the access token; the proxy validates it and
+   injects the real `X-Forwarded-Email`, so the server maps the request to the
+   user — **no server-side change needed**. On expiry the bot refreshes silently
+   via the refresh token; the user signs in once, not hourly.
 
-There is no refresh token (the forwarded token stands alone until it expires,
-then the user re-enrolls — the same model as `oidc` mode), so its expiry notice
-is delivered privately to just the sender. Enabled with
-`OMNIGENT_SLACK_SERVER_AUTH=databricks` plus `OMNIGENT_SLACK_DATABRICKS_STATE_SECRET`
-(see `.env.example`). To deploy the bot as its own Databricks App, see
+Enabled with `OMNIGENT_SLACK_SERVER_AUTH=databricks` plus the custom OAuth app's
+`OMNIGENT_SLACK_DATABRICKS_CLIENT_ID` / `OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET`
+and a `OMNIGENT_SLACK_DATABRICKS_STATE_SECRET` (see `.env.example`). To deploy
+the bot as its own Databricks App, see
 [`deploy/databricks/README.md`](deploy/databricks/README.md); for the full
 design and threat model, [`docs/DATABRICKS_APP_WEBAUTH_DESIGN.md`](docs/DATABRICKS_APP_WEBAUTH_DESIGN.md).
 

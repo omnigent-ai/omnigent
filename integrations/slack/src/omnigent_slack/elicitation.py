@@ -55,11 +55,15 @@ class PendingElicitation:
     card_ts: str | None
     resolver: asyncio.Task[None] | None = None
     finalized: bool = False
-    # The verdict the resolver posted (a Slack click), or None if it hasn't
-    # posted (external answer) — decides the card's outcome label.
+    # The verdict the resolver successfully DELIVERED to the server (a Slack
+    # click whose POST returned), or None if it hasn't delivered one (external
+    # answer, timeout, or delivery failure) — decides the card's outcome label.
     verdict: Verdict | None = None
     # Set when the resolver declined because nobody answered in time.
     timed_out: bool = False
+    # Set when a Slack verdict was clicked but its POST to the server failed, so
+    # the server never received it and stays parked on the request.
+    delivery_failed: bool = False
 
 
 @dataclass
@@ -95,14 +99,29 @@ class ElicitationController:
         self._server_url = server_url
         self._post_reply = post_reply
         self._logger = logger
+        # Live resolver tasks, tracked so shutdown can cancel them rather than
+        # leave them pending ("Task was destroyed but it is pending"). Each task
+        # removes itself on completion via a done callback.
+        self._resolvers: set[asyncio.Task[None]] = set()
 
-    async def handle_action(self, *, elicitation_id: str, verdict: Verdict) -> bool:
+    async def shutdown(self) -> None:
+        """Cancel any still-running resolver tasks (called on bot shutdown)."""
+        tasks = list(self._resolvers)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def handle_action(
+        self, *, session_id: str, elicitation_id: str, verdict: Verdict
+    ) -> bool:
         """Deliver a button/form verdict to the waiting resolver.
 
         Returns whether a live waiter received it — ``False`` means the request
-        already expired or was answered, so the caller can tell the user.
+        already expired or was answered, so the caller can tell the user. The
+        verdict can only wake the waiter for its own ``session_id``, so a click
+        never resolves another session's elicitation even on an id collision.
         """
-        return self._coordinator.resolve(elicitation_id, verdict)
+        return self._coordinator.resolve(session_id, elicitation_id, verdict)
 
     async def reject_non_owner_click(
         self, client: SlackClientProtocol, body: dict[str, Any], target: ClickTarget
@@ -152,6 +171,19 @@ class ElicitationController:
         """
         client = turn.slack_client
         key = turn.key
+        # Idempotent against a re-delivered elicitation (e.g. the server replaying
+        # an in-flight request on a stream reconnect): if a live, non-finalized
+        # card already exists for this id, don't post a second one and orphan the
+        # first. The coordinator waiter is already replay-safe (register is a
+        # no-op for a live key); this covers the card + resolver.
+        existing = state.pending.get(request.elicitation_id)
+        if existing is not None and not existing.finalized:
+            self._logger.info(
+                "Elicitation already in flight thread=%s elicitation_id=%s; skipping duplicate",
+                key.display(),
+                request.elicitation_id,
+            )
+            return
         if not request.is_supported:
             await self._post_reply(
                 client,
@@ -179,19 +211,43 @@ class ElicitationController:
         )
         # Register the waiter BEFORE posting the card so a fast click can't reach
         # the action handler before the future exists (lost wakeup).
-        self._coordinator.register(request.elicitation_id)
-        posted = await client.chat_postMessage(
-            channel=key.channel_id,
-            thread_ts=key.thread_ts,
-            text="Omnigent needs your input to continue.",
-            blocks=elicitation_card_blocks(request, turn.owner_user_id),
-        )
+        self._coordinator.register(request.session_id, request.elicitation_id)
+        try:
+            posted = await client.chat_postMessage(
+                channel=key.channel_id,
+                thread_ts=key.reply_ts,
+                text="Omnigent needs your input to continue.",
+                blocks=elicitation_card_blocks(request, turn.owner_user_id),
+            )
+        except Exception:
+            # The card never posted, so there's nothing for the user to answer and
+            # no pending entry for finish_pending to settle. Drop the orphaned
+            # waiter and DECLINE server-side so the turn isn't parked forever
+            # (which would deflect later thread messages as "needs action").
+            self._coordinator.unregister(request.session_id, request.elicitation_id)
+            self._logger.warning(
+                "Failed to post elicitation card thread=%s elicitation_id=%s; declining",
+                key.display(),
+                request.elicitation_id,
+            )
+            with contextlib.suppress(Exception):
+                await omnigent.resolve_elicitation(
+                    request.session_id,
+                    request.elicitation_id,
+                    accepted=False,
+                    content=None,
+                )
+            return
         card_ts = posted.get("ts")
         pending = PendingElicitation(
             request=request, card_ts=card_ts if isinstance(card_ts, str) else None
         )
         state.pending[request.elicitation_id] = pending
-        pending.resolver = asyncio.create_task(self._resolve_verdict(omnigent, request, pending))
+        resolver = asyncio.create_task(self._resolve_verdict(omnigent, request, pending))
+        pending.resolver = resolver
+        # Track for shutdown cancellation; drop from the set when it finishes.
+        self._resolvers.add(resolver)
+        resolver.add_done_callback(self._resolvers.discard)
 
     async def _resolve_verdict(
         self,
@@ -204,12 +260,16 @@ class ElicitationController:
         Runs concurrently with the turn's read loop. If the user answered
         elsewhere, the loop sees ``elicitation_resolved`` first and wakes this
         task with ``RESOLVED_EXTERNALLY`` (via :meth:`on_resolved`), so it never
-        posts. On a Slack click it POSTs the verdict and records it on ``pending``
-        (for the card's outcome label); the server then pushes
+        posts. On a Slack click it POSTs the verdict FIRST, then records it on
+        ``pending`` only once the POST returned — the server then pushes
         ``elicitation_resolved`` back, which finalizes the card. On timeout it
-        declines so the server-side park releases.
+        declines so the server-side park releases. A POST that raises is logged
+        and flagged (``delivery_failed``) WITHOUT recording the verdict, so the
+        card never shows "Approved/Denied" for an answer the server never got.
         """
-        verdict = await self._coordinator.await_verdict(request.elicitation_id)
+        verdict = await self._coordinator.await_verdict(
+            request.session_id, request.elicitation_id
+        )
         if verdict is RESOLVED_EXTERNALLY:
             # Already resolved server-side; post nothing (the loop finalizes).
             return
@@ -225,13 +285,28 @@ class ElicitationController:
             # expects (labels can exceed Slack's value cap).
             content = resolve_form_answers(request, verdict.content)
         assert isinstance(verdict, Verdict)
+        # POST BEFORE recording: the outcome label must reflect what the server
+        # actually received. If the POST raises, the server never got the verdict
+        # (still parked), so leave ``verdict`` unset and flag the failure — the
+        # card then shows a delivery-failure notice, not a false "Approved".
+        try:
+            await omnigent.resolve_elicitation(
+                request.session_id,
+                request.elicitation_id,
+                accepted=verdict.accepted,
+                content=content,
+            )
+        except Exception:
+            pending.delivery_failed = True
+            self._logger.warning(
+                "Failed to deliver elicitation verdict to server "
+                "session_id=%s elicitation_id=%s accepted=%s",
+                request.session_id,
+                request.elicitation_id,
+                verdict.accepted,
+            )
+            return
         pending.verdict = verdict
-        await omnigent.resolve_elicitation(
-            request.session_id,
-            request.elicitation_id,
-            accepted=verdict.accepted,
-            content=content,
-        )
 
     async def on_resolved(
         self, turn: SlackTurn, elicitation_id: str, state: ElicitationTurnState
@@ -249,7 +324,7 @@ class ElicitationController:
         # Wake the resolver if it's still waiting on a click (external answer):
         # RESOLVED_EXTERNALLY makes it return without posting. If it already
         # posted (our own click), this is a no-op and the resolver just finishes.
-        self._coordinator.resolve_external(elicitation_id)
+        self._coordinator.resolve_external(pending.request.session_id, elicitation_id)
         if pending.resolver is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await pending.resolver
@@ -262,25 +337,98 @@ class ElicitationController:
         )
         await self._finalize_card(turn, pending, outcome)
 
-    async def finish_pending(self, turn: SlackTurn, state: ElicitationTurnState) -> None:
+    async def finish_pending(
+        self, omnigent: OmnigentClient, turn: SlackTurn, state: ElicitationTurnState
+    ) -> None:
         """At turn end, settle any elicitation still in flight.
 
         Normally every elicitation is finalized by its pushed
         ``elicitation_resolved`` before the turn ends. This is the backstop for a
-        turn that ends (or is torn down) with a card still open: wake/await the
-        resolver and finalize the card so no resolver task leaks.
+        turn that ends (or is torn down) with a card still open.
+
+        A card whose resolver already delivered a verdict (or timed out / failed
+        delivery) is finalized with that outcome. A card left genuinely
+        unanswered — the server is still parked on it — is DECLINED here so the
+        server-side park releases, and labelled "abandoned" rather than
+        mislabelled "answered elsewhere" (nothing answered it).
         """
-        for eid, pending in list(state.pending.items()):
-            if not pending.finalized:
-                await self.on_resolved(turn, eid, state)
+        for _eid, pending in list(state.pending.items()):
+            if pending.finalized:
+                continue
+            pending.finalized = True
+            resolver = pending.resolver
+            if resolver is not None:
+                # Stop it waiting on a click so we don't block on its full
+                # timeout; if it already delivered/timed-out/failed, awaiting is a
+                # no-op and we honor that recorded outcome below.
+                resolver.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await resolver
+            # The server-side park is already released only when we successfully
+            # delivered a verdict (``verdict``) or declined on timeout
+            # (``timed_out`` posts a decline). A ``delivery_failed`` verdict never
+            # reached the server, so the park is STILL OPEN — decline it here (like
+            # the never-answered case) so the session isn't wedged, while keeping
+            # the DELIVERY_FAILED card label. Otherwise the user is told to retry
+            # but every retry is deflected as "waiting on your response".
+            server_park_released = pending.verdict is not None or pending.timed_out
+            if server_park_released:
+                outcome = self._outcome(pending)
+            else:
+                # Nothing reached the server (unanswered, or delivery failed) and
+                # the park is still open — decline to release it (best-effort).
+                await self._decline_abandoned(omnigent, pending)
+                # Keep an explicit delivery-failure label; otherwise "abandoned".
+                outcome = (
+                    self._outcome(pending)
+                    if pending.delivery_failed
+                    else ElicitationOutcome.ABANDONED
+                )
+            self._logger.info(
+                "Elicitation settled at turn end thread=%s elicitation_id=%s outcome=%s",
+                turn.key.display(),
+                pending.request.elicitation_id,
+                outcome.value,
+            )
+            await self._finalize_card(turn, pending, outcome)
+
+    async def _decline_abandoned(
+        self, omnigent: OmnigentClient, pending: PendingElicitation
+    ) -> None:
+        """Decline an unanswered elicitation at turn end so the server park frees.
+
+        Best-effort: a failed decline is logged, not raised — the turn is already
+        ending. The server treats a decline on an already-resolved request as a
+        harmless no-op, covering the rare race where a click landed as we tore
+        down.
+        """
+        request = pending.request
+        try:
+            await omnigent.resolve_elicitation(
+                request.session_id,
+                request.elicitation_id,
+                accepted=False,
+                content=None,
+            )
+        except Exception:
+            self._logger.warning(
+                "Failed to decline abandoned elicitation session_id=%s elicitation_id=%s",
+                request.session_id,
+                request.elicitation_id,
+            )
 
     @staticmethod
     def _outcome(pending: PendingElicitation) -> ElicitationOutcome:
+        if pending.delivery_failed:
+            # A Slack verdict was clicked but its POST to the server failed — the
+            # server never got it and is still parked. Say so, don't imply it went
+            # through.
+            return ElicitationOutcome.DELIVERY_FAILED
         if pending.timed_out:
             return ElicitationOutcome.TIMED_OUT
         verdict = pending.verdict
         if verdict is None:
-            # No Slack verdict was posted — answered elsewhere (web UI/other
+            # No Slack verdict was delivered — answered elsewhere (web UI/other
             # client). We don't know which way it went — neutral label.
             return ElicitationOutcome.ANSWERED_ELSEWHERE
         if pending.request.is_form:

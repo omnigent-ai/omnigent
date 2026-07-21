@@ -26,12 +26,14 @@ _OWNER = "U_owner"
 
 class _RecordingSink:
     def __init__(self, delivered: bool = True) -> None:
-        self.calls: list[tuple[str, Verdict]] = []
+        self.calls: list[tuple[str, str, Verdict]] = []
         self.rejections: list[ClickTarget] = []
         self._delivered = delivered
 
-    async def handle_elicitation_action(self, *, elicitation_id: str, verdict: Verdict) -> bool:
-        self.calls.append((elicitation_id, verdict))
+    async def handle_elicitation_action(
+        self, *, session_id: str, elicitation_id: str, verdict: Verdict
+    ) -> bool:
+        self.calls.append((session_id, elicitation_id, verdict))
         return self._delivered
 
     async def reject_non_owner_click(
@@ -81,24 +83,24 @@ async def test_coordinator_delivers_verdict_to_waiter() -> None:
 
     async def click() -> None:
         for _ in range(50):
-            if coord.resolve("elicit_1", approved):
+            if coord.resolve("sess_1", "elicit_1", approved):
                 return
             await asyncio.sleep(0.01)
 
     task = asyncio.create_task(click())
-    verdict = await coord.await_verdict("elicit_1")
+    verdict = await coord.await_verdict("sess_1", "elicit_1")
     await task
     assert verdict is approved
 
 
 async def test_coordinator_times_out_to_none() -> None:
     coord = ElicitationCoordinator(timeout_seconds=0.05)
-    assert await coord.await_verdict("elicit_1") is None
+    assert await coord.await_verdict("sess_1", "elicit_1") is None
 
 
 async def test_resolve_without_waiter_returns_false() -> None:
     coord = ElicitationCoordinator()
-    assert coord.resolve("nope", Verdict(accepted=True)) is False
+    assert coord.resolve("sess_1", "nope", Verdict(accepted=True)) is False
 
 
 async def test_register_then_resolve_before_await_is_not_lost() -> None:
@@ -106,20 +108,48 @@ async def test_register_then_resolve_before_await_is_not_lost() -> None:
     # long as the future was registered first, the verdict is captured and the
     # subsequent await returns it (no lost wakeup).
     coord = ElicitationCoordinator()
-    coord.register("elicit_1")
+    coord.register("sess_1", "elicit_1")
     approved = Verdict(accepted=True)
-    assert coord.resolve("elicit_1", approved) is True  # click before await
-    assert await coord.await_verdict("elicit_1") is approved
+    assert coord.resolve("sess_1", "elicit_1", approved) is True  # click before await
+    assert await coord.await_verdict("sess_1", "elicit_1") is approved
 
 
 async def test_resolve_is_single_shot() -> None:
     coord = ElicitationCoordinator()
-    waiter = asyncio.create_task(coord.await_verdict("elicit_1"))
+    waiter = asyncio.create_task(coord.await_verdict("sess_1", "elicit_1"))
     await asyncio.sleep(0.02)
-    assert coord.resolve("elicit_1", Verdict(accepted=False)) is True
+    assert coord.resolve("sess_1", "elicit_1", Verdict(accepted=False)) is True
     # Second click finds the future already done → not delivered.
-    assert coord.resolve("elicit_1", Verdict(accepted=True)) is False
+    assert coord.resolve("sess_1", "elicit_1", Verdict(accepted=True)) is False
     assert (await waiter).accepted is False
+
+
+async def test_resolve_is_scoped_to_session() -> None:
+    # A verdict for (sess_A, id) must NOT wake a waiter registered under
+    # (sess_B, id) — the same elicitation_id across two sessions stays isolated,
+    # so one user's click can never resolve another session's elicitation.
+    coord = ElicitationCoordinator()
+    waiter_b = asyncio.create_task(coord.await_verdict("sess_B", "shared_id"))
+    await asyncio.sleep(0.02)
+    # A click routed to session A finds no A-waiter and does not disturb B.
+    assert coord.resolve("sess_A", "shared_id", Verdict(accepted=True)) is False
+    assert not waiter_b.done()
+    # B's own resolution still lands.
+    assert coord.resolve("sess_B", "shared_id", Verdict(accepted=False)) is True
+    assert (await waiter_b).accepted is False
+
+
+async def test_register_does_not_clobber_live_waiter() -> None:
+    # A duplicate request for the same (session, id) — e.g. a stream-reconnect
+    # replay — must keep the original future so the worker already blocked on it
+    # still gets its verdict.
+    coord = ElicitationCoordinator()
+    coord.register("sess_1", "elicit_1")
+    waiter = asyncio.create_task(coord.await_verdict("sess_1", "elicit_1"))
+    await asyncio.sleep(0.02)
+    coord.register("sess_1", "elicit_1")  # replay — must be a no-op
+    assert coord.resolve("sess_1", "elicit_1", Verdict(accepted=True)) is True
+    assert (await waiter).accepted is True
 
 
 def test_binary_card_has_buttons_carrying_ids() -> None:
@@ -244,8 +274,8 @@ async def test_route_binary_click_forwards_verdict() -> None:
         sink, None, _click_body(f"{_OWNER} conv_1 elicit_1"), accepted=True
     )
     assert len(sink.calls) == 1
-    eid, verdict = sink.calls[0]
-    assert eid == "elicit_1"
+    sid, eid, verdict = sink.calls[0]
+    assert sid == "conv_1" and eid == "elicit_1"
     assert verdict.accepted is True and verdict.content is None
 
 
@@ -261,8 +291,8 @@ async def test_route_form_submit_carries_answers() -> None:
         },
     }
     await route_elicitation_click(sink, None, body, accepted=True, is_form_submit=True)
-    eid, verdict = sink.calls[0]
-    assert eid == "elicit_form"
+    sid, eid, verdict = sink.calls[0]
+    assert sid == "conv_1" and eid == "elicit_form"
     assert verdict.accepted is True
     # Carried as an option index; resolved to the label later in the service.
     assert verdict.content == {"store": "0"}
@@ -276,7 +306,7 @@ async def test_route_form_cancel_is_decline_without_content() -> None:
         "state": {"values": {}},
     }
     await route_elicitation_click(sink, None, body, accepted=False, is_form_submit=True)
-    _eid, verdict = sink.calls[0]
+    _sid, _eid, verdict = sink.calls[0]
     assert verdict.accepted is False and verdict.content is None
 
 

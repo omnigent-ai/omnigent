@@ -2,6 +2,8 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import httpx
+import omnigent_slack.omnigent as omnigent_module
+import pytest
 import respx
 from omnigent_slack.omnigent import (
     AuthRequiredError,
@@ -12,6 +14,7 @@ from omnigent_slack.omnigent import (
     OmnigentError,
     RunnerUnavailableError,
     ServerUnreachableError,
+    StreamInterruptedError,
     extract_assistant_text,
     extract_elicitation_request,
     extract_output_file,
@@ -953,3 +956,222 @@ def test_elicitation_binary_and_form_are_supported() -> None:
     )
     # Even with a schema present, an AskUserQuestion is a supported form.
     assert form is not None and form.is_form and form.is_supported is True
+
+
+async def test_stream_session_events_classifies_mid_stream_drop() -> None:
+    # A transport error AFTER the stream connected (200 OK) is a mid-tail drop
+    # (proxy severing a long-lived chunked response), NOT an unreachable server.
+    async def _drop_after_output() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+        raise httpx.RemoteProtocolError("peer closed connection (incomplete chunked read)")
+
+    with respx.mock:
+        respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+            return_value=httpx.Response(200, stream=_drop_after_output())
+        )
+        client = OmnigentClient("http://omnigent.test")
+        raised: Exception | None = None
+        try:
+            # The drop must propagate OUT of the ``async with`` so the context
+            # manager's ``__aexit__`` re-raises it into the generator, where it is
+            # classified — mirroring how ``_run_turn_once`` consumes the stream.
+            async with client.stream_session_events("conv_1") as events:
+                async for _ in events:
+                    pass
+        except Exception as exc:
+            raised = exc
+        finally:
+            await client.aclose()
+
+    assert isinstance(raised, StreamInterruptedError)
+    assert not isinstance(raised, ServerUnreachableError)
+
+
+async def test_stream_session_events_preconnect_failure_is_unreachable() -> None:
+    # A transport failure BEFORE the stream connects stays ServerUnreachableError.
+    client = OmnigentClient("http://127.0.0.1:1")  # nothing listening
+    raised: Exception | None = None
+    try:
+        async with client.stream_session_events("conv_1") as events:
+            async for _ in events:
+                pass
+    except Exception as exc:
+        raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, ServerUnreachableError)
+    assert not isinstance(raised, StreamInterruptedError)
+
+
+@respx.mock
+async def test_run_turn_reconnects_on_mid_stream_drop_without_resubmit() -> None:
+    # The proxy severs the stream mid-turn; the turn keeps running server-side.
+    # run_turn must re-open the stream WITHOUT re-submitting the message, and the
+    # server's cumulative in-flight replay must NOT double-render the shown text.
+    async def _first_leg() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Running tests"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":" now."}\n\n'
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+
+    # On reconnect the server replays the whole streamed-so-far text as one
+    # cumulative delta, then resumes the live tail and ends the turn.
+    second_body = (
+        'data: {"type":"session.heartbeat"}\n\n'
+        'data: {"type":"response.output_text.delta","delta":"Running tests now."}\n\n'
+        'data: {"type":"response.output_text.delta","delta":" All 216 pass."}\n\n'
+        'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        side_effect=[
+            httpx.Response(200, stream=_first_leg()),
+            httpx.Response(200, text=second_body),
+        ]
+    )
+    # Session still running after the drop → reconnect (not a clean stop).
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    submit = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "run the suite")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # The replayed cumulative text is de-duped to just its unseen suffix (empty
+    # here), so the answer reads once and continues cleanly across the reconnect.
+    assert "".join(d for d in deltas if d) == "Running tests now. All 216 pass."
+    # The message was submitted exactly once — the reconnect did not start a
+    # second turn.
+    assert submit.call_count == 1
+
+
+@respx.mock
+async def test_run_turn_stops_when_turn_ended_during_drop() -> None:
+    # If the turn finished during the stream drop, the server reports it idle; the
+    # client stops cleanly (the caller recovers the committed final text) rather
+    # than reconnecting into an already-finished turn.
+    async def _drop_mid_answer() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Almost done"}\n\n'
+        raise httpx.RemoteProtocolError("incomplete chunked read")
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_drop_mid_answer())
+    )
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "idle"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "finish up")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # Streamed what it saw before the drop, then stopped (no reconnect, no hang).
+    assert deltas == ["Almost done"]
+
+
+@respx.mock
+async def test_run_turn_raises_stream_interrupted_when_reconnect_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every reconnect attempt drops again while the server keeps reporting the
+    # turn running → give up as StreamInterruptedError (a non-alarming "lost the
+    # live connection"), never ServerUnreachableError.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+
+    def _always_dropping(request: httpx.Request) -> httpx.Response:
+        async def _drop() -> AsyncIterator[bytes]:
+            yield b'data: {"type":"response.output_text.delta","delta":"x"}\n\n'
+            raise httpx.RemoteProtocolError("incomplete chunked read")
+
+        return httpx.Response(200, stream=_drop())
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(side_effect=_always_dropping)
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    raised: Exception | None = None
+    try:
+        try:
+            async for _ in client.run_turn("conv_1", "go"):
+                pass
+        except Exception as exc:
+            raised = exc
+    finally:
+        await client.aclose()
+
+    assert isinstance(raised, StreamInterruptedError)
+    assert not isinstance(raised, ServerUnreachableError)
+
+
+@respx.mock
+async def test_run_turn_survives_many_drops_that_each_make_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A long, healthy turn rides through MORE than _STREAM_RECONNECT_MAX_ATTEMPTS
+    # proxy caps. Each leg streams a NEW delta before dropping — genuine progress
+    # — so the consecutive-reconnect budget resets and the turn is NOT abandoned.
+    monkeypatch.setattr(omnigent_module, "_STREAM_RECONNECT_BACKOFF_S", 0.0)
+    n_legs = omnigent_module._STREAM_RECONNECT_MAX_ATTEMPTS + 3
+
+    def _leg(index: int, *, last: bool) -> httpx.Response:
+        async def _body() -> AsyncIterator[bytes]:
+            # A distinct new delta each leg (not a replay), so _reconcile_delta
+            # forwards it and the leg counts as progress.
+            yield (
+                'data: {"type":"response.output_text.delta",'
+                f'"delta":"part{index} "}}\n\n'
+            ).encode()
+            if last:
+                yield b'data: {"type":"session.status","status":"idle"}\n\n'
+                return
+            raise httpx.RemoteProtocolError("proxy max-duration cap")
+
+        return httpx.Response(200, stream=_body())
+
+    legs = [_leg(i, last=(i == n_legs - 1)) for i in range(n_legs)]
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(side_effect=legs)
+    respx.get("http://omnigent.test/v1/sessions/conv_1").mock(
+        return_value=httpx.Response(200, json={"status": "running"})
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        deltas = [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "go")
+            if event.get("type") == "response.output_text.delta"
+        ]
+    finally:
+        await client.aclose()
+
+    # Every leg's new delta was forwarded and the turn completed — not abandoned
+    # despite far more drops than the consecutive-reconnect cap.
+    assert "".join(d for d in deltas if d) == "".join(f"part{i} " for i in range(n_legs))

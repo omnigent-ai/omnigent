@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 from omnigent_slack.models import ThreadKey
 from omnigent_slack.omnigent import OutputFile
-from omnigent_slack.text import truncate_for_slack
+from omnigent_slack.text import GENERIC_FAILURE_TEXT, truncate_for_slack
 
 if TYPE_CHECKING:
     from omnigent_slack.streaming import SlackClientProtocol
@@ -71,7 +71,7 @@ class SlackNotifier:
         # Best-effort: a failed ack must not abort the turn.
         try:
             response = await client.chat_postMessage(
-                channel=key.channel_id, thread_ts=key.thread_ts, text=text
+                channel=key.channel_id, thread_ts=key.reply_ts, text=text
             )
         except Exception:
             self._logger.warning("Ack post failed thread=%s; continuing", key.display())
@@ -82,19 +82,19 @@ class SlackNotifier:
     async def post_reply(self, client: SlackClientProtocol, key: ThreadKey, text: str) -> None:
         await client.chat_postMessage(
             channel=key.channel_id,
-            thread_ts=key.thread_ts,
+            thread_ts=key.reply_ts,
             text=truncate_for_slack(text),
         )
 
-    async def post_failure_reply(
-        self, client: SlackClientProtocol, key: ThreadKey, error_text: str
-    ) -> None:
+    async def post_failure_reply(self, client: SlackClientProtocol, key: ThreadKey) -> None:
         # Post the failure as its own thread reply so the streamed answer stays
-        # intact.
+        # intact. A GENERIC message only — the raw error detail is logged
+        # server-side and never echoed to the channel (it can carry stack traces
+        # / internal paths, and the thread is visible to everyone).
         await client.chat_postMessage(
             channel=key.channel_id,
-            thread_ts=key.thread_ts,
-            text=f":warning: Omnigent request failed: {error_text}",
+            thread_ts=key.reply_ts,
+            text=GENERIC_FAILURE_TEXT,
         )
 
     async def post_session_info(
@@ -121,7 +121,7 @@ class SlackNotifier:
         try:
             await client.chat_postMessage(
                 channel=key.channel_id,
-                thread_ts=key.thread_ts,
+                thread_ts=key.reply_ts,
                 text="\n".join(lines),
             )
         except Exception:
@@ -137,7 +137,7 @@ class SlackNotifier:
             await client.chat_postEphemeral(
                 channel=key.channel_id,
                 user=user_id,
-                thread_ts=key.thread_ts,
+                thread_ts=key.reply_ts,
                 text=text,
             )
         except Exception:
@@ -159,7 +159,7 @@ class SlackNotifier:
         try:
             if todos_ts is None:
                 response = await client.chat_postMessage(
-                    channel=key.channel_id, thread_ts=key.thread_ts, text=text
+                    channel=key.channel_id, thread_ts=key.reply_ts, text=text
                 )
                 ts = response.get("ts")
                 return str(ts) if ts else None
@@ -176,8 +176,8 @@ class SlackNotifier:
             client,
             key,
             user_id,
-            "This Omnigent thread belongs to whoever started it, so I can't "
-            "add your message to it. Start a new thread by mentioning me "
+            "This thread's Omnigent session belongs to whoever started it, so I "
+            "can't add your message to it. Start a new thread by mentioning me "
             "(or DM me) to get your own session.",
         )
 

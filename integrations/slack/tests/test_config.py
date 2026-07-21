@@ -30,10 +30,15 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
         "OMNIGENT_SLACK_DATABASE_PATH",
         "OMNIGENT_SLACK_SERVER_AUTH",
         "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET",
+        "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST",
+        "OMNIGENT_SLACK_DATABRICKS_CLIENT_ID",
+        "OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET",
+        "OMNIGENT_SLACK_DATABRICKS_SCOPES",
         "OMNIGENT_SLACK_WEBAUTH_BASE_URL",
         "OMNIGENT_SLACK_WEBAUTH_PORT",
         "DATABRICKS_APP_URL",
         "DATABRICKS_APP_PORT",
+        "DATABRICKS_HOST",
     ):
         monkeypatch.delenv(key, raising=False)
     env = {**_REQUIRED, **overrides}
@@ -95,7 +100,16 @@ def test_server_auth_mode_defaults_auto(monkeypatch: pytest.MonkeyPatch) -> None
     assert _load().server_auth_mode == "auto"
 
 
-def test_databricks_mode_requires_state_secret(
+_DATABRICKS_KNOBS = {
+    "OMNIGENT_SLACK_SERVER_AUTH": "databricks",
+    "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "https://ws.cloud.databricks.com",
+    "OMNIGENT_SLACK_DATABRICKS_CLIENT_ID": "client-id",
+    "OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET": "client-secret",
+    "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET": "state-secret",
+}
+
+
+def test_databricks_mode_requires_oauth_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_env(monkeypatch, OMNIGENT_SLACK_SERVER_AUTH="databricks")
@@ -103,15 +117,89 @@ def test_databricks_mode_requires_state_secret(
         _load()
 
 
+@pytest.mark.parametrize("omit", sorted(set(_DATABRICKS_KNOBS) - {"OMNIGENT_SLACK_SERVER_AUTH"}))
+def test_databricks_mode_requires_each_oauth_knob(
+    monkeypatch: pytest.MonkeyPatch, omit: str
+) -> None:
+    # Each of the OAuth knobs is mandatory in databricks mode — dropping any one
+    # must fail fast at startup rather than at first enrollment.
+    knobs = {k: v for k, v in _DATABRICKS_KNOBS.items() if k != omit}
+    _set_env(monkeypatch, **knobs)
+    with pytest.raises(ValidationError):
+        _load()
+
+
 def test_databricks_mode_valid_with_required_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
-    _set_env(
-        monkeypatch,
-        OMNIGENT_SLACK_SERVER_AUTH="databricks",
-        OMNIGENT_SLACK_DATABRICKS_STATE_SECRET="secret",
-    )
+    _set_env(monkeypatch, **_DATABRICKS_KNOBS)
     settings = _load()
     assert settings.server_auth_mode == "databricks"
-    assert settings.databricks_state_secret == "secret"
+    assert settings.databricks_workspace_host == "https://ws.cloud.databricks.com"
+    assert settings.databricks_oauth_client_id == "client-id"
+    # The state HMAC key is its own required knob, distinct from the client secret.
+    assert settings.databricks_state_secret == "state-secret"
+    assert settings.databricks_oauth_client_secret == "client-secret"
+
+
+def test_databricks_workspace_host_defaults_to_databricks_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On the platform the workspace host is injected as DATABRICKS_HOST — a bare
+    # host with no scheme — so the operator needn't set it explicitly, and it's
+    # normalized to https.
+    knobs = {k: v for k, v in _DATABRICKS_KNOBS.items() if "WORKSPACE_HOST" not in k}
+    _set_env(monkeypatch, **knobs)
+    monkeypatch.setenv("DATABRICKS_HOST", "ws.cloud.databricks.com")
+    assert _load().databricks_workspace_host == "https://ws.cloud.databricks.com"
+
+
+def test_databricks_scopes_force_openid_and_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(
+        monkeypatch, **_DATABRICKS_KNOBS, OMNIGENT_SLACK_DATABRICKS_SCOPES="supervisor-agents"
+    )
+    scopes = _load().databricks_oauth_scopes_normalized.split()
+    assert "supervisor-agents" in scopes
+    assert "openid" in scopes
+    assert "offline_access" in scopes
+
+
+def test_databricks_redirect_uri_reuses_callback(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(
+        monkeypatch,
+        **_DATABRICKS_KNOBS,
+        OMNIGENT_SLACK_WEBAUTH_BASE_URL="https://bot.example.com",
+    )
+    assert _load().databricks_redirect_uri == "https://bot.example.com/auth/callback"
+
+
+def test_databricks_workspace_host_defaults_scheme_to_https(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A scheme-less host (DATABRICKS_HOST returns e.g. "ws.databricks.com") is
+    # normalized to https rather than rejected.
+    _set_env(
+        monkeypatch,
+        **{**_DATABRICKS_KNOBS, "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "ws.databricks.com"},
+    )
+    assert _load().databricks_workspace_host == "https://ws.databricks.com"
+
+
+def test_databricks_workspace_host_rejects_plaintext_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    # http:// defeats the TLS assumption behind skipping id_token verification.
+    _set_env(
+        monkeypatch,
+        **{**_DATABRICKS_KNOBS, "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "http://ws.databricks.com"},
+    )
+    with pytest.raises(ValidationError):
+        _load()
+
+
+def test_databricks_workspace_host_allows_http_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Loopback is exempt so local testing against a fake token endpoint works.
+    _set_env(
+        monkeypatch,
+        **{**_DATABRICKS_KNOBS, "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "http://127.0.0.1:8080"},
+    )
+    assert _load().databricks_workspace_host == "http://127.0.0.1:8080"
 
 
 def test_webauth_base_url_falls_back_to_app_url(monkeypatch: pytest.MonkeyPatch) -> None:

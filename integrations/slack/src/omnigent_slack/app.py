@@ -17,6 +17,7 @@ from omnigent_slack.approvals import (
 )
 from omnigent_slack.auth_manager import AuthManager, pack_user_key
 from omnigent_slack.config import load_settings
+from omnigent_slack.databricks_oauth import DatabricksOAuthClient
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.setup import SetupFlow
@@ -80,23 +81,37 @@ async def run() -> None:
     async def _on_token_changed(team_id: str, user_id: str, server_url: str) -> None:
         await pool.invalidate(server_url, pack_user_key(team_id, user_id))
 
+    # Databricks web-auth mode: the server is fronted by the Databricks Apps
+    # proxy, which the device/OIDC probe can't drive. Instead the bot runs its
+    # own custom U2M OAuth app (authorization code + PKCE, offline_access) via an
+    # enrollment page it serves as a Databricks App: a Slack user signs in and
+    # the bot stores the resulting durable, refreshable token as their bearer.
+    # The OAuth client is shared as the AuthManager's rotator so refresh/revoke
+    # hit the workspace, not the Omnigent server. The web server shares the token
+    # store, so a token it writes is immediately usable by the bot.
+    webauth: WebAuthServer | None = None
+    enrollment_url = None
+    rotator: DatabricksOAuthClient | None = None
+    if settings.server_auth_mode == "databricks":
+        rotator = DatabricksOAuthClient(
+            settings.databricks_workspace_host or "",
+            client_id=settings.databricks_oauth_client_id or "",
+            client_secret=settings.databricks_oauth_client_secret or "",
+            scopes=settings.databricks_oauth_scopes_normalized,
+            redirect_uri=settings.databricks_redirect_uri,
+        )
+        webauth = WebAuthServer(
+            settings, token_store, on_enrolled=_on_token_changed, oauth_client=rotator
+        )
+        enrollment_url = webauth.enrollment_url
+
     auth_manager = AuthManager(
         token_store,
         on_token_changed=_on_token_changed,
         client_secret=settings.device_client_secret,
+        rotator=rotator,
     )
     pool.set_auth_resolver(auth_manager.resolve_auth)
-
-    # Databricks web-auth mode: the server is fronted by the Databricks Apps
-    # proxy, which the device/OIDC probe can't drive. Instead the bot serves an
-    # enrollment page (as its own Databricks App) that captures each user's
-    # proxy-forwarded token and stores it as their bearer. The web server shares
-    # the token store, so a token it writes is immediately usable by the bot.
-    webauth: WebAuthServer | None = None
-    enrollment_url = None
-    if settings.server_auth_mode == "databricks":
-        webauth = WebAuthServer(settings, token_store, on_enrolled=_on_token_changed)
-        enrollment_url = webauth.enrollment_url
 
     setup = SetupFlow(
         store=store,
@@ -134,6 +149,9 @@ async def run() -> None:
     finally:
         logger.info("Shutting down Omnigent Slack bot")
         await service.shutdown()
+        # Cancel any in-flight login/enrollment poll tasks (and their httpx
+        # clients) so they aren't abandoned mid-poll.
+        await auth_manager.shutdown()
         await pool.aclose_all()
         if webauth is not None:
             await webauth.stop()
