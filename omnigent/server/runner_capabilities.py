@@ -32,6 +32,10 @@ class RunnerAction(str, Enum):
     # TOOL_CALL / TOOL_RESULT policy still runs on every proxied call, so
     # this never widens a runner into general edit authority.
     PROXY_MCP = "proxy_mcp"
+    # Auto-title the runner's own session (the sys_session_rename builtin's
+    # POST /auto-title callback). Same-session metadata write; the server
+    # still refuses when the session already has a non-seed title.
+    RENAME_SESSION = "rename_session"
 
 
 _ALLOWED_ACTIONS: frozenset[RunnerAction] = frozenset(RunnerAction)

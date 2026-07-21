@@ -158,6 +158,7 @@ def test_relaunch_invalidates_previous_token(
         "REPORT_USAGE",
         "EVALUATE_POLICY",
         "PROXY_MCP",
+        "RENAME_SESSION",
     ],
 )
 def test_runner_action_allow_list(
