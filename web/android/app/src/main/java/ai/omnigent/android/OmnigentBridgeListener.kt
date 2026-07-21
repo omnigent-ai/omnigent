@@ -25,7 +25,7 @@ import org.json.JSONObject
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
-    private val onColorScheme: (String) -> Unit,
+    private val onColorScheme: (isLight: Boolean) -> Unit,
 ) : WebViewCompat.WebMessageListener {
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -52,9 +52,13 @@ class OmnigentBridgeListener(
 
         when (json.optString("method")) {
             "setColorScheme" -> {
-                val scheme = json.optString("scheme")
-                if (scheme != "light" && scheme != "dark") return
-                mainHandler.post { onColorScheme(scheme) }
+                val isLight =
+                    when (json.optString("scheme")) {
+                        "light" -> true
+                        "dark" -> false
+                        else -> return
+                    }
+                mainHandler.post { onColorScheme(isLight) }
             }
 
             "setBadgeCount" -> {

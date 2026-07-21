@@ -25,7 +25,7 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
-    private val appliedSchemes = mutableListOf<String>()
+    private val appliedLightValues = mutableListOf<Boolean>()
 
     private val badgeId = 1
 
@@ -36,7 +36,7 @@ class OmnigentBridgeListenerTest {
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
-                onColorScheme = appliedSchemes::add,
+                onColorScheme = appliedLightValues::add,
             )
         shadow =
             shadowOf(
@@ -50,7 +50,7 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"setColorScheme","scheme":"dark"}""")
         shadowOf(Looper.getMainLooper()).idle()
 
-        assertEquals(listOf("light", "dark"), appliedSchemes)
+        assertEquals(listOf(true, false), appliedLightValues)
     }
 
     @Test
@@ -59,7 +59,7 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"setColorScheme"}""")
         shadowOf(Looper.getMainLooper()).idle()
 
-        assertEquals(emptyList<String>(), appliedSchemes)
+        assertEquals(emptyList<Boolean>(), appliedLightValues)
     }
 
     @Test

@@ -312,16 +312,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun applyColorScheme(scheme: String) {
-        val light =
-            when (scheme) {
-                "light" -> true
-                "dark" -> false
-                else -> return
-            }
+    private fun applyColorScheme(isLight: Boolean) {
         WindowInsetsControllerCompat(window, window.decorView).apply {
-            isAppearanceLightStatusBars = light
-            isAppearanceLightNavigationBars = light
+            isAppearanceLightStatusBars = isLight
+            isAppearanceLightNavigationBars = isLight
         }
     }
 

@@ -16,7 +16,7 @@ class MainActivityTest {
     fun `configuration change preserves explicit light system bars`() {
         // Skip onCreate to isolate the bare config-change path from WebView dispatch.
         val activity = Robolectric.buildActivity(MainActivity::class.java).get()
-        activity.applyColorScheme("light")
+        activity.applyColorScheme(isLight = true)
         val insetsController = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
 
         val darkConfiguration =
@@ -26,17 +26,16 @@ class MainActivityTest {
                     Configuration.UI_MODE_NIGHT_YES
             }
         activity.onConfigurationChanged(darkConfiguration)
-        activity.applyColorScheme("system")
 
         assertTrue(insetsController.isAppearanceLightStatusBars)
         assertTrue(insetsController.isAppearanceLightNavigationBars)
     }
 
-    private fun MainActivity.applyColorScheme(scheme: String) {
+    private fun MainActivity.applyColorScheme(isLight: Boolean) {
         MainActivity::class
             .java
-            .getDeclaredMethod("applyColorScheme", String::class.java)
+            .getDeclaredMethod("applyColorScheme", Boolean::class.java)
             .apply { isAccessible = true }
-            .invoke(this, scheme)
+            .invoke(this, isLight)
     }
 }
