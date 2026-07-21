@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 import subprocess
 import time
 from pathlib import Path
@@ -2151,16 +2152,19 @@ class _ConnectSpy:
         """
         self._exceptions = exceptions
         self.call_count = 0
+        self.kwargs: list[dict[str, object]] = []
 
     def __call__(self, url: str, **kwargs: object) -> _HandshakeFailingConnect | _AcceptingConnect:
         """Return an async-CM scripting the handshake for this call.
 
         :param url: Tunnel URL passed by production (ignored).
-        :param kwargs: Connect kwargs passed by production (ignored).
+        :param kwargs: Connect kwargs passed by production; recorded on
+            :attr:`kwargs` so tests can assert what production requested.
         :returns: A context manager whose ``__aenter__`` raises the
             queued exception, or completes the handshake for a ``None``
             entry.
         """
+        self.kwargs.append(dict(kwargs))
         exc = self._exceptions[min(self.call_count, len(self._exceptions) - 1)]
         self.call_count += 1
         if exc is None:
@@ -2552,3 +2556,177 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+@pytest.fixture
+def _no_ca_bundle_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear every CA-bundle override so the ambient shell can't skew a test.
+
+    :param monkeypatch: The pytest monkeypatch fixture.
+    :returns: None.
+    """
+    for name in ("OMNIGENT_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _ca_bundle_pem(tmp_path: Path) -> Path:
+    """Write a real single-certificate PEM usable as a CA bundle.
+
+    :param tmp_path: The pytest tmp_path fixture.
+    :returns: Path to the PEM file.
+    """
+    from omnigent.inner.egress.ca import ensure_ca
+
+    cert_path, _key_path = ensure_ca(cache_dir=tmp_path)
+    return cert_path
+
+
+async def test_ssl_verify_failure_fails_loud(
+    monkeypatch: pytest.MonkeyPatch, _no_ca_bundle_env: None
+) -> None:
+    """A certificate-verification failure fails loud with the CA-bundle fix.
+
+    A TLS-inspecting corporate proxy re-signs the wss:// handshake, so
+    verification fails against the system trust store. Retrying can never
+    teach the process to trust that certificate — before this, the host
+    looped on backoff forever logging only the raw OpenSSL string, with
+    no hint that a bundle could be supplied.
+    """
+    spy = _ConnectSpy(
+        [
+            ssl.SSLCertVerificationError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "self-signed certificate in certificate chain (_ssl.c:1028)"
+            )
+        ]
+    )
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError) as excinfo:
+        await host.run()
+
+    message = str(excinfo.value)
+    # Names the real cause, not just the raw OpenSSL string...
+    assert "CERTIFICATE_VERIFY_FAILED" in message
+    # ...and the actionable remedy the user could not previously discover.
+    assert "OMNIGENT_CA_BUNDLE" in message
+    # Exactly one attempt → the infinite reconnect loop is gone.
+    assert spy.call_count == 1
+
+
+async def test_transient_ssl_error_still_retries(
+    monkeypatch: pytest.MonkeyPatch, _no_ca_bundle_env: None
+) -> None:
+    """A non-verification TLS error stays on the retry path.
+
+    A mid-handshake SSLEOFError is what a bounced Apps ingress looks like;
+    treating every ssl.SSLError as fatal would kill live hosts on a blip.
+    """
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    spy = _ConnectSpy(
+        [ssl.SSLEOFError("EOF occurred in violation of protocol"), asyncio.CancelledError()]
+    )
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    # Returns normally (no HostConnectError): the blip was retried and the
+    # 2nd-attempt CancelledError broke the loop.
+    await host.run()
+
+    assert spy.call_count == 2
+
+
+async def test_ca_bundle_env_passed_as_ssl_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _no_ca_bundle_env: None
+) -> None:
+    """OMNIGENT_CA_BUNDLE reaches the handshake as an ssl context."""
+    monkeypatch.setenv("OMNIGENT_CA_BUNDLE", str(_ca_bundle_pem(tmp_path)))
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    assert spy.call_count == 1
+    assert isinstance(spy.kwargs[0]["ssl"], ssl.SSLContext)
+
+
+async def test_missing_ca_bundle_fails_loud(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _no_ca_bundle_env: None
+) -> None:
+    """A CA bundle pointing at a nonexistent path fails loud, naming it.
+
+    Silently falling back to the system store would reproduce the original
+    verify failure while the operator believes their bundle is in use.
+    """
+    missing = tmp_path / "typo-ca.pem"
+    monkeypatch.setenv("OMNIGENT_CA_BUNDLE", str(missing))
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    with pytest.raises(HostConnectError) as excinfo:
+        await host.run()
+
+    message = str(excinfo.value)
+    assert str(missing) in message
+    assert "OMNIGENT_CA_BUNDLE" in message
+    # Never even attempted the handshake → no backoff loop on a typo.
+    assert spy.call_count == 0
+
+
+async def test_no_ca_bundle_env_leaves_ssl_default(
+    monkeypatch: pytest.MonkeyPatch, _no_ca_bundle_env: None
+) -> None:
+    """With no override, no ``ssl`` kwarg is passed at all.
+
+    Regression guard: passing an explicit context on the default path
+    would replace the library's own ``ssl=True`` handling for every
+    working install.
+    """
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host()
+
+    await host.run()
+
+    assert spy.call_count == 1
+    assert "ssl" not in spy.kwargs[0]
+
+
+async def test_ca_bundle_not_passed_on_plaintext_ws(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _no_ca_bundle_env: None
+) -> None:
+    """A ws:// tunnel gets no ssl kwarg even with a bundle configured.
+
+    ``websockets`` rejects ``ssl=`` on a plaintext URI, so an ambient
+    SSL_CERT_FILE must not break a local http:// server.
+    """
+    monkeypatch.setenv("SSL_CERT_FILE", str(_ca_bundle_pem(tmp_path)))
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+    host = _host(server_url="http://127.0.0.1:6767")
+
+    await host.run()
+
+    assert spy.call_count == 1
+    assert "ssl" not in spy.kwargs[0]
+
+
+def test_ca_bundle_env_forwarded_to_runner() -> None:
+    """OMNIGENT_CA_BUNDLE survives the runner env allowlist.
+
+    A host behind a corporate CA spawns runners that open their own
+    tunnel back to the server — they need the same bundle.
+    """
+    env = _build_runner_env(
+        {"OMNIGENT_CA_BUNDLE": "/etc/ssl/corp-ca.pem"},
+        server_url="https://app.example.databricks.com",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/tmp/ws",
+        parent_pid=1234,
+    )
+
+    assert env["OMNIGENT_CA_BUNDLE"] == "/etc/ssl/corp-ca.pem"

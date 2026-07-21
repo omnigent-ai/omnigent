@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import ssl
 import subprocess
 import sys
 from collections.abc import Iterator, Mapping
@@ -90,6 +91,13 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+)
+from omnigent.runner.transports.ws_tunnel.tls import (
+    CA_BUNDLE_ENV_VAR,
+    TunnelTLSError,
+    ca_bundle_fix_hint,
+    is_tls_verification_failure,
+    tunnel_ssl_context,
 )
 from omnigent.version import VERSION
 
@@ -294,6 +302,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "TERMINFO",
         "TERMINFO_DIRS",
         "LANG",
+        # A runner opens its own tunnel back to the server, so a host
+        # behind a TLS-inspecting proxy or private CA must pass its
+        # bundle down or the runner tunnel fails to verify.
+        CA_BUNDLE_ENV_VAR,
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "REQUESTS_CA_BUNDLE",
@@ -937,6 +949,23 @@ class HostProcess:
         return (
             "If this server uses Omnigent accounts or OIDC login, run "
             f"`omnigent login {self._server_url}` to authenticate."
+        )
+
+    def _fatal_tls_error(self, exc: ssl.SSLError) -> HostConnectError:
+        """Explain a TLS certificate-verification failure on the tunnel.
+
+        The bare OpenSSL string ("self-signed certificate in certificate
+        chain") names the symptom but not the cause or the fix, so the
+        message spells out both.
+
+        :param exc: The verification failure raised by the handshake.
+        :returns: A fatal error carrying the cause and the remedy.
+        """
+        return HostConnectError(
+            f"TLS verification failed for {self._tunnel_url()}: {exc}. This usually "
+            "means a TLS-inspecting corporate proxy (Zscaler/Netskope) or a private "
+            "CA is re-signing the connection with a certificate your system trust "
+            f"store doesn't know. {ca_bundle_fix_hint()}"
         )
 
     def _fatal_upgrade_error(self, exc: InvalidURI | InvalidStatus) -> HostConnectError | None:
@@ -1901,6 +1930,16 @@ class HostProcess:
 
         _logger.info("Connecting to %s", url)
         try:
+            ssl_context = tunnel_ssl_context(url, os.environ)
+        except TunnelTLSError as exc:
+            # A configured-but-broken bundle can never be fixed by
+            # retrying — fail loud instead of silently using the system
+            # store the operator meant to override.
+            raise HostConnectError(str(exc)) from exc
+        # Omit ``ssl`` entirely when there's no override so websockets keeps
+        # its own default handling (and never sees ssl= on a ws:// URL).
+        tls_kwargs = {"ssl": ssl_context} if ssl_context is not None else {}
+        try:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
@@ -1911,8 +1950,19 @@ class HostProcess:
                 # Symmetric with serve.py's runner-side connect().
                 ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
                 ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+                # Only carries ``ssl`` when a CA bundle override is set; the
+                # default path passes nothing so websockets keeps its own
+                # ``ssl=True`` handling untouched.
+                **tls_kwargs,  # type: ignore[arg-type]
             )
             ws = await ws_cm.__aenter__()
+        except ssl.SSLError as exc:
+            # A trust failure is permanent — retrying can never teach the
+            # process to trust the certificate. Other TLS errors (e.g. a
+            # mid-handshake EOF from a bounced ingress) stay retryable.
+            if is_tls_verification_failure(exc):
+                raise self._fatal_tls_error(exc) from exc
+            raise
         except (InvalidURI, InvalidStatus) as exc:
             # The upgrade itself was rejected. Fail loud on permanent
             # failures (auth / authorization / outdated server); let the

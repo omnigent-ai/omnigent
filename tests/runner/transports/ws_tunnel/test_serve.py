@@ -1210,3 +1210,246 @@ async def test_serve_tunnel_reconnect_uses_fresh_token_not_stale(
         f"If both are the same, the factory was cached. If either is "
         f"'tok-initial', the factory was not called before reconnect."
     )
+
+
+async def test_serve_tunnel_once_omits_ssl_without_ca_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no CA bundle configured, no ``ssl`` kwarg reaches ``connect``.
+
+    Regression guard: the runner tunnel must keep websockets' own default
+    handling on the normal path.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    for name in ("OMNIGENT_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        monkeypatch.delenv(name, raising=False)
+    captured = await _capture_connect_kwargs(monkeypatch, tunnel_url="wss://srv/tunnel")
+
+    assert "ssl" not in captured
+
+
+async def test_serve_tunnel_once_passes_ca_bundle_as_ssl_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A configured CA bundle reaches the runner handshake as an ssl context.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest tmp_path fixture.
+    :returns: None.
+    """
+    import ssl
+
+    from omnigent.inner.egress.ca import ensure_ca
+
+    for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        monkeypatch.delenv(name, raising=False)
+    cert_path, _key = ensure_ca(cache_dir=tmp_path)
+    monkeypatch.setenv("OMNIGENT_CA_BUNDLE", str(cert_path))
+    captured = await _capture_connect_kwargs(monkeypatch, tunnel_url="wss://srv/tunnel")
+
+    assert isinstance(captured["ssl"], ssl.SSLContext)
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_fails_loud_on_cert_verify_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A certificate-verification failure exits fatally, never retrying.
+
+    A runner behind a TLS-inspecting proxy without a CA bundle would
+    otherwise catch the ``SSLCertVerificationError`` under the generic
+    ``OSError`` branch and reconnect forever — the exact infinite loop the
+    issue reports. It must fail loud with the bundle hint instead.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import ssl
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+    ) -> None:
+        """Raise a TLS certificate-verification failure.
+
+        :raises ssl.SSLCertVerificationError: Always.
+        """
+        del app, tunnel_url, runner_id, runner_version, auth_token, tunnel_token
+        raise ssl.SSLCertVerificationError("self-signed certificate in certificate chain")
+
+    async def _sleep(delay: float) -> None:
+        """Fail if a permanent trust failure ever backs off for a retry.
+
+        :raises AssertionError: Always.
+        """
+        raise AssertionError(f"cert-verify failure should not sleep before retry: {delay}")
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_cert_verify",
+            runner_version="0.1.0",
+        )
+    message = str(exc_info.value)
+    assert "TLS verification failed" in message
+    assert "OMNIGENT_CA_BUNDLE" in message
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_retries_transient_ssl_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-verification TLS error stays on the reconnect path.
+
+    A mid-handshake ``SSLEOFError`` from a bounced ingress is transient, so
+    the runner must back off and retry rather than fail loud.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import ssl
+
+    calls = {"n": 0}
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+    ) -> None:
+        """First attempt hits a transient EOF; the second is cancelled to
+        break the loop.
+
+        :raises ssl.SSLEOFError: On the first call.
+        :raises asyncio.CancelledError: On the second call.
+        """
+        del app, tunnel_url, runner_id, runner_version, auth_token, tunnel_token
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+        raise asyncio.CancelledError
+
+    slept: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        """Record that the retry path backed off."""
+        slept.append(delay)
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_transient_ssl",
+            runner_version="0.1.0",
+        )
+    # The transient error backed off and reconnected instead of failing loud.
+    assert slept
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_fails_loud_on_bad_ca_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A misconfigured CA bundle exits with a clean message, not a traceback.
+
+    ``tunnel_ssl_context`` raises ``TunnelTLSError`` (a plain ``Exception``,
+    not ``OSError``) when the forwarded bundle path is absent or not a PEM.
+    ``serve_tunnel`` must convert it to a fatal ``RuntimeError`` rather than
+    letting the raw traceback crash the runner — retrying can't fix it.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.transports.ws_tunnel.tls import TunnelTLSError
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+    ) -> None:
+        """Raise the TLS-config error the ssl-context builder emits.
+
+        :raises TunnelTLSError: Always.
+        """
+        del app, tunnel_url, runner_id, runner_version, auth_token, tunnel_token
+        raise TunnelTLSError("OMNIGENT_CA_BUNDLE=/gone.pem does not point at a readable file")
+
+    async def _sleep(delay: float) -> None:
+        """Fail if a permanent config error ever backs off for a retry.
+
+        :raises AssertionError: Always.
+        """
+        raise AssertionError(f"bad CA bundle should not sleep before retry: {delay}")
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_bad_bundle",
+            runner_version="0.1.0",
+        )
+    assert "OMNIGENT_CA_BUNDLE=/gone.pem" in str(exc_info.value)
+
+
+async def _capture_connect_kwargs(
+    monkeypatch: pytest.MonkeyPatch, *, tunnel_url: str
+) -> dict[str, Any]:
+    """Run one ``_serve_tunnel_once`` and capture the ``connect`` kwargs.
+
+    Stubs ``websockets.connect`` with a recorder that aborts the handshake
+    so no socket is opened.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tunnel_url: Tunnel URL to hand production.
+    :returns: The keyword arguments production passed to ``connect``.
+    """
+    import websockets
+
+    captured: dict[str, Any] = {}
+
+    class _Abort(Exception):
+        pass
+
+    def _fake_connect(url: str, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        raise _Abort
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+
+    with pytest.raises(_Abort):
+        await _serve_tunnel_once(
+            _noop_app,
+            tunnel_url=tunnel_url,
+            server_url="https://srv",
+            runner_id="runner_tls",
+            runner_version="0.1.0",
+        )
+    return captured
