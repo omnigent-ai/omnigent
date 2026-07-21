@@ -46,7 +46,7 @@ in `omnigent/db/db_models.py`.
 | created_at | Integer NOT NULL | |
 | title | Text | nullable, user-settable conversation title |
 
-**Indexes:** `ix_conversations_created_at`
+**Indexes:** `ix_conversations_archived_updated` (backs the default sidebar list)
 
 ---
 
@@ -251,8 +251,9 @@ never knows which FTS engine is running underneath.
 
 On Postgres, the `search_vector` generated column is automatic — no extra
 write-time work beyond populating `search_text`. On SQLite, the FTS5 virtual
-table and its sync triggers are created during `Base.metadata.create_all()` via
-an `after_create` DDL event listener.
+table and its sync triggers are created during `ConversationBase.metadata.create_all()`
+(the conversations table lives on the Conversation base) via an `after_create`
+DDL event listener.
 
 ---
 

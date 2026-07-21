@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
 
 class ReadSkillFileTool(Tool):
@@ -101,13 +101,21 @@ class ReadSkillFileTool(Tool):
             skill tools, required by the :class:`Tool` interface).
         :returns: The file contents, or an error message.
         """
-        args: dict[str, str] = json.loads(arguments)
+        args, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return f"Error: {error}"
+        assert args is not None
+
         skill_name = args.get("skill_name")
-        if skill_name is None:
+        if skill_name is None or skill_name == "":
             return "Error: missing required 'skill_name' argument"
+        if not isinstance(skill_name, str):
+            return "Error: 'skill_name' must be a string"
         rel_path = args.get("path")
-        if rel_path is None:
+        if rel_path is None or rel_path == "":
             return "Error: missing required 'path' argument"
+        if not isinstance(rel_path, str):
+            return "Error: 'path' must be a string"
 
         skill = self._skills_by_name.get(skill_name)
         if skill is None:

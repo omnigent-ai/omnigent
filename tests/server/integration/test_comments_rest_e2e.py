@@ -57,7 +57,7 @@ def _seed_session(db_uri: str, *, with_agent: bool = False) -> str:
     if with_agent:
         agent_store = SqlAlchemyAgentStore(db_uri)
         agent = agent_store.create(
-            agent_id="ag_test",
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
             name="test-agent",
             bundle_location="fake/bundle",
         )
@@ -235,7 +235,7 @@ async def test_comment_on_nonexistent_session_returns_404(
     headers = {"X-Forwarded-Email": ALICE}
 
     resp = await auth_client.post(
-        "/v1/sessions/conv_does_not_exist/comments",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/comments",
         json={
             "path": "src/foo.py",
             "body": "Hello",

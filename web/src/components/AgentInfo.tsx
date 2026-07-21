@@ -261,13 +261,11 @@ function ModelUsageBreakdown({ usageByModel }: { usageByModel: Record<string, Mo
 function AddPolicyDialog({
   sessionId,
   registry,
-  appliedHandlers,
   open,
   onOpenChange,
 }: {
   sessionId: string;
   registry: PolicyRegistryEntry[];
-  appliedHandlers: Set<string>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -389,15 +387,14 @@ function AddPolicyDialog({
         <div className="min-w-0 space-y-3 pt-1">
           {!selected &&
             (() => {
-              const available = registry.filter((r) => !appliedHandlers.has(r.handler));
               const lowerFilter = filter.toLowerCase();
               const filtered = lowerFilter
-                ? available.filter(
+                ? registry.filter(
                     (r) =>
                       r.name.toLowerCase().includes(lowerFilter) ||
                       r.description?.toLowerCase().includes(lowerFilter),
                   )
-                : available;
+                : registry;
               return (
                 <>
                   <input
@@ -427,9 +424,7 @@ function AddPolicyDialog({
                     ))}
                     {filtered.length === 0 && (
                       <p className="py-2 text-center text-xs text-muted-foreground">
-                        {available.length === 0
-                          ? "All available policies are already applied."
-                          : "No policies match your filter."}
+                        No policies match your filter.
                       </p>
                     )}
                   </div>
@@ -665,6 +660,8 @@ interface McpFormState {
   transport: "http" | "stdio";
   description: string;
   url: string;
+  /** Key-value pairs for HTTP headers. Values from existing servers are "[REDACTED]". */
+  headers: { key: string; value: string }[];
   command: string;
   argsText: string;
 }
@@ -675,6 +672,7 @@ const EMPTY_MCP_FORM: McpFormState = {
   transport: "http",
   description: "",
   url: "",
+  headers: [],
   command: "",
   argsText: "",
 };
@@ -686,6 +684,7 @@ function mcpFormFromServer(server: McpServerSummary): McpFormState {
     transport: server.transport === "stdio" ? "stdio" : "http",
     description: server.description ?? "",
     url: server.url ?? "",
+    headers: Object.entries(server.headers ?? {}).map(([key, value]) => ({ key, value })),
     command: server.command ?? "",
     argsText: (server.args ?? []).join("\n"),
   };
@@ -698,10 +697,21 @@ function payloadFromMcpForm(form: McpFormState): UpsertMcpServerInput {
     description: form.description.trim() || null,
   };
   if (form.transport === "http") {
+    // null → "preserve existing" (used when creating a new server with no headers).
+    // {}  → "clear all headers" (user explicitly removed every row on an existing server).
+    // {…} → replace with these headers.
+    const filledHeaders =
+      form.headers.length > 0
+        ? Object.fromEntries(
+            form.headers.filter((h) => h.key.trim()).map((h) => [h.key.trim(), h.value]),
+          )
+        : null;
+    const headers = filledHeaders ?? (form.originalName !== null ? {} : null);
     return {
       ...base,
       transport: "http",
       url: form.url.trim(),
+      headers,
       command: null,
       args: [],
     };
@@ -905,14 +915,76 @@ function McpServerManagerDialog({
               </select>
             </label>
             {form.transport === "http" ? (
-              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-                URL
-                <Input
-                  value={form.url}
-                  onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
-                  placeholder="https://example.com/sse"
-                />
-              </label>
+              <>
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  URL
+                  <Input
+                    value={form.url}
+                    onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))}
+                    placeholder="https://example.com/sse"
+                  />
+                </label>
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Headers</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setForm((prev) => ({
+                          ...prev,
+                          headers: [...prev.headers, { key: "", value: "" }],
+                        }))
+                      }
+                      className="rounded p-0.5 hover:bg-muted"
+                      aria-label="Add header"
+                    >
+                      <PlusIcon className="size-3" />
+                    </button>
+                  </div>
+                  {form.headers.map((header, i) => (
+                    <div key={i} className="flex items-center gap-1">
+                      <Input
+                        value={header.key}
+                        onChange={(e) =>
+                          setForm((prev) => {
+                            const headers = [...prev.headers];
+                            headers[i] = { ...headers[i], key: e.target.value };
+                            return { ...prev, headers };
+                          })
+                        }
+                        className="font-mono text-xs"
+                        placeholder="Header-Name"
+                      />
+                      <Input
+                        value={header.value}
+                        onChange={(e) =>
+                          setForm((prev) => {
+                            const headers = [...prev.headers];
+                            headers[i] = { ...headers[i], value: e.target.value };
+                            return { ...prev, headers };
+                          })
+                        }
+                        className="font-mono text-xs"
+                        placeholder="value"
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="Remove header"
+                        onClick={() =>
+                          setForm((prev) => ({
+                            ...prev,
+                            headers: prev.headers.filter((_, j) => j !== i),
+                          }))
+                        }
+                      >
+                        <XIcon className="size-3 text-destructive" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </>
             ) : (
               <>
                 <label className="flex flex-col gap-1 text-xs text-muted-foreground">
@@ -976,12 +1048,19 @@ function McpServersSection({
   sessionId,
   servers,
   editable,
+  onManagerOpenChange,
 }: {
   sessionId?: string | null;
   servers: McpServerSummary[];
   editable: boolean;
+  onManagerOpenChange?: (open: boolean) => void;
 }) {
   const [managerOpen, setManagerOpen] = useState(false);
+
+  function setManagerOpenWithCallback(open: boolean) {
+    setManagerOpen(open);
+    onManagerOpenChange?.(open);
+  }
   const [mcpDirty, setMcpDirty] = useState(false);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   // Clear the dirty flag when the session restarts (launching picks up
@@ -1004,7 +1083,7 @@ function McpServersSection({
         {canEdit && (
           <button
             type="button"
-            onClick={() => setManagerOpen(true)}
+            onClick={() => setManagerOpenWithCallback(true)}
             className="rounded p-0.5 hover:bg-muted"
             title="Manage MCP servers"
             aria-label="Manage MCP servers"
@@ -1046,7 +1125,7 @@ function McpServersSection({
           sessionId={sessionId!}
           servers={servers}
           open={managerOpen}
-          onOpenChange={setManagerOpen}
+          onOpenChange={setManagerOpenWithCallback}
           dirty={mcpDirty}
           onDirty={() => setMcpDirty(true)}
         />
@@ -1067,9 +1146,6 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
 
   const userPolicies = sessionPolicies.filter((p) => p.source === "session");
   const registryByHandler = new Map(registry.map((r) => [r.handler, r]));
-  const appliedHandlers = new Set(
-    sessionPolicies.map((p) => p.handler).filter((h): h is string => h != null),
-  );
 
   return (
     <div className="flex flex-col gap-1.5 py-3">
@@ -1136,7 +1212,6 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
       <AddPolicyDialog
         sessionId={sessionId}
         registry={registry}
-        appliedHandlers={appliedHandlers}
         open={addOpen}
         onOpenChange={setAddOpen}
       />
@@ -1153,6 +1228,12 @@ interface AgentInfoProps {
   agent: Agent | undefined;
   /** Session ID — needed to manage user policies. */
   sessionId?: string | null;
+  /**
+   * Called when a sub-dialog (e.g. the MCP server manager) opens or closes.
+   * The parent popover uses this to suppress its own outside-click dismiss
+   * while a nested dialog is open.
+   */
+  onSubdialogOpenChange?: (open: boolean) => void;
 }
 
 /**
@@ -1169,7 +1250,7 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  * Shared by the desktop header popover ({@link AgentInfoButton}) and the
  * mobile header menu's agent-info dialog.
  */
-export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
+export function AgentInfoContent({ agent, sessionId, onSubdialogOpenChange }: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
   const mcpEditable = agent?.mcp_servers_editable === true;
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
@@ -1303,7 +1384,12 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
             )}
           </div>
         )}
-      <McpServersSection sessionId={sessionId} servers={servers} editable={mcpEditable} />
+      <McpServersSection
+        sessionId={sessionId}
+        servers={servers}
+        editable={mcpEditable}
+        onManagerOpenChange={onSubdialogOpenChange}
+      />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
       {versionFooter && (
         <div className="py-3">
@@ -1320,18 +1406,124 @@ export function AgentInfoContent({ agent, sessionId }: AgentInfoProps) {
 }
 
 /**
+ * Delay before a hover-opened popover closes once the pointer leaves both the
+ * icon and the panel. Long enough to cross the small gap between them without
+ * the panel flickering shut; re-entering either side cancels the pending close.
+ */
+export const HOVER_CLOSE_DELAY_MS = 150;
+
+/**
+ * Grace window after a hover-open during which a Radix click-toggle to *closed*
+ * is treated as the opening half of a single click gesture, not a dismiss.
+ *
+ * A mouse `click()` first moves the pointer onto the icon — firing
+ * `pointerenter` → hover-open (`setOpen(true)`) — and then dispatches the click,
+ * whose Radix trigger toggles `open`. On a slow render the hover-open commits
+ * `open = true` before the click's toggle runs, so the toggle reads `true` and
+ * flips it back to `false`, and the panel never opens. Both halves of that one
+ * gesture land within a few milliseconds; a deliberate hover-then-click dismiss
+ * dwells far longer. Swallowing a close inside this window keeps click-to-open
+ * reliable without weakening the real click-to-dismiss (see AgentInfoButton).
+ */
+export const HOVER_CLICK_GRACE_MS = 30;
+
+/**
  * Header info icon revealing the active agent's tools & policies.
  *
- * Desktop-only: on mobile (`< md`) the same content is reached via the
- * header's three-dot menu, which opens {@link AgentInfoContent} in a
- * dialog. Self-hides when the agent has neither tools nor policies.
+ * Opens on mouse hover over the (i) icon and stays open while the pointer is on
+ * the icon or the panel (a short close delay bridges the gap between them).
+ * Hover is gated to a real mouse pointer, so touch/pen taps fall through to
+ * Radix's native click-to-open; click and keyboard still toggle it. Desktop-only:
+ * on mobile (`< md`) the same content is reached via the header's three-dot menu,
+ * which opens {@link AgentInfoContent} in a dialog. Self-hides when the agent has
+ * neither tools nor policies.
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
+  const [open, setOpen] = useState(false);
+  const subdialogOpenRef = useRef(false);
+  // Tracks whether the current open came from hover, so we can suppress Radix's
+  // focus move into the panel on hover-open (which would steal focus and could
+  // scroll the page) while keeping it for click / keyboard access.
+  const openedByHoverRef = useRef(false);
+  const closeTimeoutRef = useRef<number | null>(null);
+  // Timestamp of the last hover-open, used to recognize the click that lands in
+  // the same gesture (pointer arrival + click) and would otherwise toggle the
+  // just-hover-opened panel straight back shut. See HOVER_CLICK_GRACE_MS.
+  const hoverOpenedAtRef = useRef(0);
+
+  useEffect(() => {
+    return () => {
+      if (closeTimeoutRef.current !== null) window.clearTimeout(closeTimeoutRef.current);
+    };
+  }, []);
+
   if (!agentHasInfo(agent, sessionId)) return null;
 
+  function cancelClose() {
+    if (closeTimeoutRef.current !== null) {
+      window.clearTimeout(closeTimeoutRef.current);
+      closeTimeoutRef.current = null;
+    }
+  }
+
+  function scheduleClose() {
+    cancelClose();
+    closeTimeoutRef.current = window.setTimeout(() => {
+      closeTimeoutRef.current = null;
+      openedByHoverRef.current = false;
+      setOpen(false);
+    }, HOVER_CLOSE_DELAY_MS);
+  }
+
+  // Hover only applies to a real mouse. Touch/pen synthesize a mouseenter that
+  // would open the panel, only for the follow-up synthetic click to toggle it
+  // straight back shut — so a tap could never open it. Gating on pointerType
+  // lets touch fall through to Radix's native tap-to-open (and keeps the hover
+  // bridge from auto-closing a tap-opened panel).
+  function openOnHover(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    cancelClose();
+    openedByHoverRef.current = true;
+    hoverOpenedAtRef.current = performance.now();
+    setOpen(true);
+  }
+
+  function scheduleCloseOnLeave(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    scheduleClose();
+  }
+
+  function cancelCloseOnEnter(e: React.PointerEvent) {
+    if (e.pointerType !== "mouse") return;
+    cancelClose();
+  }
+
   return (
-    <Popover>
-      <Tooltip>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        // A mouse click's own pointer-arrival hover-opens the panel; if that
+        // open commits before the click's Radix toggle runs, the toggle sees
+        // open=true and asks to close within the same gesture. Swallow that
+        // close so click-to-open stays reliable (a real click-to-dismiss dwells
+        // far past the grace window). Only guards the hover-opened case.
+        if (
+          !next &&
+          openedByHoverRef.current &&
+          performance.now() - hoverOpenedAtRef.current < HOVER_CLICK_GRACE_MS
+        ) {
+          return;
+        }
+        // Click / keyboard / outside-dismiss path: honor Radix immediately and
+        // drop the hover flag so focus behaves normally.
+        cancelClose();
+        if (!next) openedByHoverRef.current = false;
+        setOpen(next);
+      }}
+    >
+      {/* Suppress the tooltip while the panel is open — the panel already names
+          the agent, so showing both on the same hover is redundant noise. */}
+      <Tooltip open={open ? false : undefined}>
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <Button
@@ -1341,6 +1533,11 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
               aria-label="Agent tools and policies"
               data-testid="agent-info-trigger"
               className="hidden text-muted-foreground hover:text-foreground md:inline-flex"
+              onPointerEnter={openOnHover}
+              onPointerLeave={scheduleCloseOnLeave}
+              onFocus={() => {
+                openedByHoverRef.current = false;
+              }}
             >
               <InfoIcon className="size-4" />
             </Button>
@@ -1348,8 +1545,29 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         </TooltipTrigger>
         <TooltipContent>Agent tools &amp; policies</TooltipContent>
       </Tooltip>
-      <PopoverContent align="end" className="w-80">
-        <AgentInfoContent agent={agent} sessionId={sessionId} />
+      <PopoverContent
+        align="end"
+        className="w-80"
+        data-testid="agent-info-panel"
+        onPointerEnter={cancelCloseOnEnter}
+        onPointerLeave={scheduleCloseOnLeave}
+        onOpenAutoFocus={(e) => {
+          if (openedByHoverRef.current) e.preventDefault();
+        }}
+        onInteractOutside={(e) => {
+          if (subdialogOpenRef.current) e.preventDefault();
+        }}
+        onFocusOutside={(e) => {
+          if (subdialogOpenRef.current) e.preventDefault();
+        }}
+      >
+        <AgentInfoContent
+          agent={agent}
+          sessionId={sessionId}
+          onSubdialogOpenChange={(open) => {
+            subdialogOpenRef.current = open;
+          }}
+        />
       </PopoverContent>
     </Popover>
   );

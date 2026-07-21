@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.entities import Policy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
+from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import get_user_id
@@ -33,6 +34,7 @@ from omnigent.server.schemas import (
     CreateDefaultPolicyRequest,
     UpdateDefaultPolicyRequest,
 )
+from omnigent.spec.types import FunctionPolicySpec
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 
@@ -40,10 +42,10 @@ from omnigent.stores.policy_store import PolicyStore
 def _generate_default_policy_id() -> str:
     """Generate a unique default policy identifier.
 
-    :returns: A string of the form ``"pol_<32-char hex>"``,
-        e.g. ``"pol_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
+    :returns: A bare 32-char hex uuid,
+        e.g. ``"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"``.
     """
-    return f"pol_{uuid.uuid4().hex}"
+    return uuid.uuid4().hex
 
 
 def _entity_to_response(policy: Policy) -> dict[str, Any]:
@@ -65,6 +67,41 @@ def _entity_to_response(policy: Policy) -> dict[str, Any]:
     }
     if policy.factory_params is not None:
         result["factory_params"] = policy.factory_params
+    return result
+
+
+def _config_policies_to_response() -> list[dict[str, Any]]:
+    """Return config-file policies from :class:`RuntimeCaps` as response dicts.
+
+    These are YAML-loaded policies that are applied server-wide but not stored
+    in the database. They appear in the list as read-only entries (``source:
+    "config"``) so operators can see what the server config contributes.
+
+    Only :class:`~omnigent.spec.types.FunctionPolicySpec` entries are included
+    — those are the only type the admin UI knows how to display.
+
+    :returns: List of response dicts, one per config-file policy.
+    """
+    caps = get_caps()
+    result = []
+    for spec in caps.default_policies:
+        if not isinstance(spec, FunctionPolicySpec) or spec.function is None:
+            continue
+        entry: dict[str, Any] = {
+            "id": None,
+            "object": "default_policy",
+            "source": "config",
+            "name": spec.name,
+            "type": "python",
+            "handler": spec.function.path,
+            "enabled": True,
+            "created_at": None,
+            "updated_at": None,
+            "created_by": None,
+        }
+        if spec.function.arguments:
+            entry["factory_params"] = spec.function.arguments
+        result.append(entry)
     return result
 
 
@@ -208,7 +245,9 @@ def create_default_policies_router(
                 code=ErrorCode.UNAUTHORIZED,
             )
         policies = store.list_defaults()
-        return {"object": "list", "data": [_entity_to_response(p) for p in policies]}
+        data = [_entity_to_response(p) for p in policies]
+        data.extend(_config_policies_to_response())
+        return {"object": "list", "data": data}
 
     @router.get("/policies/{policy_id}")
     async def get_policy(

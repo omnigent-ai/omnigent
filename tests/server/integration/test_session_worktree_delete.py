@@ -29,7 +29,7 @@ from omnigent.stores.host_store import HostStore
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_wt_delete"
+_HOST_ID = "a65b7d8e4613a95946c9134383308ac7"
 
 
 class _FakeWebSocket:

@@ -18,7 +18,7 @@ It edits ONLY the ``[project].version`` line and the sibling ``==``
 pins, matched by package name — never a blind version-string replace —
 so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
-``databricks-mcp>=0.1.0``) are left untouched.
+``databricks-mcp>=0.9.0``) are left untouched.
 
 ``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
 ``web/electron/package.json`` (the desktop app's independent
@@ -214,14 +214,17 @@ def next_dev_version(released: str) -> str:
     """
     Compute the next development version after releasing *released*.
 
-    Mirrors MLflow's post-release convention: bump the patch component
-    and append ``.dev0`` (e.g. ``0.1.2`` -> ``0.1.3.dev0``).
+    ``main`` carries the next MINOR as ``.dev0`` (the 0.5 cycle left main at
+    ``0.6.0.dev0``), and post-release runs only when a new ``branch-X.Y``
+    cycle is cut — patches never move main — so bump the minor, not the
+    micro. A micro bump would re-freeze main on the released line and make
+    doc-sync stage to the docs branch the release already owns.
 
-    :param released: The just-released version, e.g. ``"0.1.2"``.
-    :returns: The next dev version, e.g. ``"0.1.3.dev0"``.
+    :param released: The just-released version, e.g. ``"0.6.0rc1"``.
+    :returns: The next dev version, e.g. ``"0.7.0.dev0"``.
     """
     v = Version(released)
-    return f"{v.major}.{v.minor}.{v.micro + 1}.dev0"
+    return f"{v.major}.{v.minor + 1}.0.dev0"
 
 
 def _read_version_constant(root: Path) -> str:

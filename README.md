@@ -68,12 +68,38 @@ curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/i
 ```
 
 <details>
+<summary>Optional integrations and extras</summary>
+
+Need an optional integration? Pass one or more extras to the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra databricks
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra modal,e2b
+```
+
+Available user-facing extras include:
+
+- **Model providers:** `databricks`, `bedrock`, `vertex`
+- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
+  `openshell`, `kubernetes`
+- **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
+- **Storage and memory:** `s3`, `hindsight`
+
+</details>
+
+<details>
 <summary>Prefer to install manually?</summary>
 
 Omnigent needs **Python 3.12+**. Install the `omnigent` package:
 
 ```bash
 uv tool install omnigent        # or: pip install "omnigent"
+```
+
+Manual installs use the same extras syntax, for example:
+
+```bash
+uv tool install "omnigent[databricks,modal]"
 ```
 
 Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
@@ -170,6 +196,41 @@ brings the server back up on the new version. Source checkouts update with
 The check queries your configured package index — honoring `UV_INDEX_URL` /
 `PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
 mirrors work out of the box; override with `OMNIGENT_INDEX_URL` if needed.
+
+</details>
+
+<details>
+<summary>Uninstalling Omnigent</summary>
+
+Preview the CLI/profile cleanup that would run by default:
+
+```bash
+omnigent uninstall
+```
+
+Remove the CLI and installer-managed PATH entries while keeping your local
+history, credentials, and projects:
+
+```bash
+omnigent uninstall --yes
+```
+
+To also remove Omnigent state under `~/.omnigent`, pass `--purge`; Omnigent
+backs it up outside the target before deletion. Your `~/omnigent` workspace is
+kept unless you explicitly add `--purge-workspace`.
+
+```bash
+omnigent uninstall --purge --yes
+```
+
+If the installed wheel is broken or `omnigent` is not on `PATH`, run the
+standalone script instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/uninstall_oss.sh | sh
+```
+
+Add `--yes` to the standalone script to perform the previewed CLI cleanup.
 
 </details>
 
@@ -447,6 +508,17 @@ Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/e
 
 ---
 
+## Telemetry
+
+Omnigent collects anonymized usage data (telemetry) by default. This data
+contains no sensitive or personally identifiable information. If you're using
+Omnigent through a managed service or distribution, please consult your managed
+service agreement to determine any data collection that may impact your use of
+the service. To opt out, follow our instructions in
+[Usage Telemetry](https://omnigent.ai/docs/deploy/telemetry).
+
+---
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](https://github.com/omnigent-ai/omnigent/blob/main/CONTRIBUTING.md) for how to set up your environment, run the checks, and open a pull request.
@@ -463,4 +535,3 @@ Thanks to all of our amazing contributors!
 <a href="https://github.com/omnigent-ai/omnigent/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=omnigent-ai/omnigent" />
 </a>
-

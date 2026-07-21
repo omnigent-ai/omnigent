@@ -31,6 +31,7 @@ import httpx
 import pytest
 import yaml
 
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import (
     POLL_INTERVAL_S,
@@ -91,7 +92,9 @@ def _spawn_host_daemon(
     """
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = f"host_{uuid.uuid4().hex}"
+    # Bare 32-char hex — host_id is a Uuid16 column, and the API returns the
+    # bare form, so _wait_for_host_online's comparison must see the same.
+    host_id = uuid.uuid4().hex
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
@@ -100,16 +103,16 @@ def _spawn_host_daemon(
             sort_keys=True,
         )
     )
+    # Route process logs to a deterministic file so tests can read the
+    # "Launched runner ... (pid=NNNN)" line and inspect it on failure.
+    daemon_log = tmp_path / "host-daemon.log"
     env = {
         **os.environ,
         "HOME": str(tmp_path),
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OPENAI_API_KEY": "mock-key",
+        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
-    # Capture the daemon's stderr to a file so tests can read the
-    # "Launched runner ... (pid=NNNN)" line (and inspect it on failure).
-    # The child keeps its own dup of the fd after this handle is closed.
-    daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
             # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),
@@ -681,7 +684,9 @@ def _spawn_host_daemon_for_mock_claude(
     """
     omni_dir = tmp_path / ".omnigent"
     omni_dir.mkdir(parents=True, exist_ok=True)
-    host_id = f"host_{uuid.uuid4().hex}"
+    # Bare 32-char hex — host_id is a Uuid16 column, and the API returns the
+    # bare form, so _wait_for_host_online's comparison must see the same.
+    host_id = uuid.uuid4().hex
     host_name = f"e2e-host-{uuid.uuid4().hex[:12]}"
     (omni_dir / "config.yaml").write_text(
         yaml.safe_dump(
@@ -690,6 +695,7 @@ def _spawn_host_daemon_for_mock_claude(
             sort_keys=True,
         )
     )
+    daemon_log = tmp_path / "host-daemon.log"
     env = {
         **os.environ,
         "HOME": str(tmp_path),
@@ -701,8 +707,8 @@ def _spawn_host_daemon_for_mock_claude(
         "ANTHROPIC_API_KEY": "mock-key",
         # Suppress beta headers so the mock server doesn't reject them.
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
     }
-    daemon_log = tmp_path / "host-daemon.log"
     with open(daemon_log, "w") as log_fh:
         proc = subprocess.Popen(
             # Compat-aware: pinned OLD host venv in runner compat mode (Config 2),

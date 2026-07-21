@@ -994,7 +994,7 @@ def test_host_status_json_reports_daemon_host_and_sessions(
 
     monkeypatch.setattr(cli, "_host_http_json", _fake_http_json)
 
-    result = CliRunner().invoke(cli_group, ["host", "status", "--json"])
+    result = CliRunner().invoke(cli_group, ["host", "status", "--json", "--sessions"])
 
     assert result.exit_code == 0, result.output
     assert '"target": "https://server.example.com"' in result.output

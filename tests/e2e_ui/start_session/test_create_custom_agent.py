@@ -87,13 +87,39 @@ def _hosts_body() -> str:
     )
 
 
+def _managed_info_body() -> str:
+    """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
+
+    ``managed_sandboxes_enabled: true`` + ``sandbox_provider: "lakebox"`` makes
+    the picker offer (and default to) the "Databricks Sandbox" target, which is
+    the shape that gates the "Create custom agent" affordance.
+    """
+    return json.dumps(
+        {
+            "accounts_enabled": False,
+            "login_url": None,
+            "needs_setup": False,
+            "databricks_features": True,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "lakebox",
+            "server_version": "0.0.0-e2e",
+            "smart_routing_enabled": False,
+        }
+    )
+
+
 async def _register_routes(
     page,
     *,
     created_session_id: str,
     create_requests: list[dict[str, Any]],
+    managed: bool = False,
 ) -> None:
-    """Install stubs for hosts, agents, session create, and events."""
+    """Install stubs for hosts, agents, session create, and events.
+
+    When ``managed`` is set, also stub ``GET /v1/info`` so the picker enters
+    managed mode and offers the sandbox target.
+    """
 
     async def handle_hosts(route: Route) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
@@ -125,6 +151,15 @@ async def _register_routes(
             )
         else:
             await route.continue_()
+
+    if managed:
+
+        async def handle_info(route: Route) -> None:
+            await route.fulfill(
+                status=200, content_type="application/json", body=_managed_info_body()
+            )
+
+        await page.route("**/v1/info", handle_info)
 
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/agents", handle_agents)
@@ -363,5 +398,123 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
                 "Claude Code"
             )
+        finally:
+            await browser.close()
+
+
+def test_create_agent_hidden_on_sandbox(
+    seeded_session: tuple[str, str],
+) -> None:
+    """On a managed sandbox target, "Create custom agent" is hidden.
+
+    A sandbox provisions its runner from a baked image with no create path for
+    an uploaded bundle, so the affordance is omitted from the picker. Switching
+    to a connected host brings it back.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_hidden_on_sandbox(base_url, session_id))
+
+
+async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_requests: list[dict[str, Any]] = []
+            # Managed mode: the picker defaults to the "Databricks Sandbox"
+            # target, alongside the one connected host.
+            await _register_routes(
+                page,
+                created_session_id=session_id,
+                create_requests=create_requests,
+                managed=True,
+            )
+            await _seed_workspace(page)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            # Sanity: the sandbox is the default managed target.
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
+                "Databricks Sandbox"
+            )
+
+            # On the sandbox, the create item is omitted from the picker.
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
+
+            # Switch to the connected host: the item reappears and opens.
+            await page.keyboard.press("Escape")
+            await page.get_by_test_id("new-chat-landing-host-chip").click()
+            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).not_to_contain_text(
+                "Databricks Sandbox"
+            )
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            create_item = page.get_by_test_id("new-chat-landing-create-agent")
+            await expect(create_item).to_be_visible()
+            await create_item.click()
+            await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
+        finally:
+            await browser.close()
+
+
+def test_pending_agent_dropped_when_switching_to_sandbox(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A pending custom agent picked on a host is dropped on switch to sandbox.
+
+    Creating a custom agent selects it as the pending pick. Since a pending
+    bundle can't run on a managed sandbox, switching the target to the sandbox
+    must fall the selection back to a real agent and drop the pending row.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_pending_dropped_on_sandbox(base_url, session_id))
+
+
+async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_requests: list[dict[str, Any]] = []
+            await _register_routes(
+                page,
+                created_session_id=session_id,
+                create_requests=create_requests,
+                managed=True,
+            )
+            await _seed_workspace(page)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Switch to the connected host, then create + submit a pending agent.
+            await page.get_by_test_id("new-chat-landing-host-chip").click()
+            await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
+            await page.get_by_test_id("create-agent-name").fill("pending-agent")
+            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+            await page.get_by_test_id("create-agent-submit").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
+                "pending-agent"
+            )
+
+            # Switch the target back to the sandbox: the pending pick is dropped.
+            await page.get_by_test_id("new-chat-landing-host-chip").click()
+            await page.get_by_test_id("new-chat-landing-sandbox-option").click()
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
+                "Databricks Sandbox"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).not_to_contain_text(
+                "pending-agent"
+            )
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-pending")).to_have_count(0)
         finally:
             await browser.close()

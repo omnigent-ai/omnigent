@@ -355,7 +355,7 @@ def create_hosts_router(
                 {
                     "host_id": host.host_id,
                     "name": host.name,
-                    "owner": host.owner,
+                    "owner": host.user_id,
                     "status": "online" if host_is_live(host, now=now) else "offline",
                     # Non-None marks a server-managed sandbox host (e.g.
                     # "modal"). Clients use it to hide sandbox-backed
@@ -387,7 +387,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         # Status comes from the DB so the answer is consistent across
@@ -396,7 +396,7 @@ def create_hosts_router(
         return {
             "host_id": host.host_id,
             "name": host.name,
-            "owner": host.owner,
+            "owner": host.user_id,
             "status": "online" if host_is_live(host) else "offline",
             # Same semantics as list_hosts: non-None marks a
             # server-managed sandbox host (e.g. "modal").
@@ -804,7 +804,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         if "\x00" in path:
@@ -885,7 +885,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         path = body.path
@@ -972,7 +972,7 @@ def create_hosts_router(
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
             raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
         if not path.strip():

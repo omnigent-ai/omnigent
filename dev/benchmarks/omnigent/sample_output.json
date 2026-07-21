@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 4,
   "generated_at": "2026-07-08T18:30:00+00:00",
   "git_sha": "0000000000000000000000000000000000000000",
   "git_branch": "main",
@@ -59,6 +59,8 @@
         }
       ],
       "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
         "avg_mean_ms": 6.166455538477749,
         "avg_p50_ms": 5.972263655470063,
         "avg_p95_ms": 7.014472328592092,
@@ -66,7 +68,8 @@
         "avg_rps": 162.7669557884957
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "create_session": {
       "runs": [
@@ -108,6 +111,8 @@
         }
       ],
       "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
         "avg_mean_ms": 24.663089563449223,
         "avg_p50_ms": 24.187361006624997,
         "avg_p95_ms": 27.691972306153428,
@@ -115,7 +120,8 @@
         "avg_rps": 40.548671853654
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "get_session": {
       "runs": [
@@ -157,6 +163,8 @@
         }
       ],
       "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
         "avg_mean_ms": 5.0386021002971875,
         "avg_p50_ms": 4.889875320562472,
         "avg_p95_ms": 6.030028006838013,
@@ -164,7 +172,8 @@
         "avg_rps": 199.59858100569238
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "load_conversation_history": {
       "runs": [
@@ -206,6 +215,8 @@
         }
       ],
       "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
         "avg_mean_ms": 1.9863408450813342,
         "avg_p50_ms": 1.9402639979186158,
         "avg_p95_ms": 2.3578193116312227,
@@ -213,7 +224,8 @@
         "avg_rps": 503.8957501013986
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     },
     "search_sessions": {
       "runs": [
@@ -255,6 +267,8 @@
         }
       ],
       "summary": {
+        "runs_total": 3,
+        "runs_ok": 3,
         "avg_mean_ms": 81.18760672068068,
         "avg_p50_ms": 79.73718066932634,
         "avg_p95_ms": 92.50315269067262,
@@ -262,7 +276,8 @@
         "avg_rps": 12.317410535217997
       },
       "kind": "latency",
-      "backend": "sqlite"
+      "backend": "sqlite",
+      "needs_runner": false
     }
   }
 }

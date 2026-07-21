@@ -6070,6 +6070,57 @@ async def test_forward_session_cost_posts_status_when_no_subagents(
     assert dedupe.posted_policy_cost == pytest.approx(0.25)
 
 
+@pytest.mark.asyncio
+async def test_forward_session_cost_backs_off_after_rate_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("parent", encoding="utf-8")
+    monkeypatch.setattr(
+        forwarder, "read_claude_context_state", lambda _bridge: {"total_cost_usd": 0.25}
+    )
+    now = {"value": 100.0}
+    monkeypatch.setattr(forwarder.time, "monotonic", lambda: now["value"])
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"retry-after": "5"}, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    dedupe = forwarder._ForwardDedupeState()
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        kwargs = {
+            "client": client,
+            "session_id": "conv_parent",
+            "bridge_dir": bridge_dir,
+            "parent_transcript_path": parent,
+            "subagent_state": forwarder.SubagentForwardState(subagents={}),
+            "dedupe": dedupe,
+            "cost_cache": {},
+        }
+        await forwarder._forward_session_cost(**kwargs)
+        assert calls == 1
+        assert dedupe.cost_retry_failures == 1
+        assert dedupe.cost_retry_not_before == pytest.approx(105.0)
+
+        await forwarder._forward_session_cost(**kwargs)
+        assert calls == 1
+
+        now["value"] = 105.0
+        await forwarder._forward_session_cost(**kwargs)
+
+    assert calls == 2
+    assert dedupe.cost_retry_failures == 0
+    assert dedupe.cost_retry_not_before == 0.0
+    assert dedupe.posted_cost == pytest.approx(0.25)
+
+
 def test_parse_json_response_returns_value_on_valid_json() -> None:
     """
     A normal JSON body parses through ``_parse_json_response`` unchanged.
@@ -7020,3 +7071,52 @@ async def test_forwarder_does_not_leave_running_open_for_slash_command_only_turn
         request["data"] for request in requests if request["type"] == "external_conversation_item"
     ]
     assert any(item["item_type"] == "slash_command" for item in forwarded)
+
+
+# _PostRetryTracker: bounded subagent_delivery_not_confirmed retries (L2)
+# ---------------------------------------------------------------------------
+
+
+def _http_status_error(status_code: int, body: object) -> httpx.HTTPStatusError:
+    """Build an httpx.HTTPStatusError whose response.json() returns `body`."""
+    request = httpx.Request("POST", "http://omnigent/v1/sessions/conv_x/events")
+    content = json.dumps(body).encode() if body is not None else b""
+    response = httpx.Response(status_code, request=request, content=content)
+    return httpx.HTTPStatusError("rejected", request=request, response=response)
+
+
+def test_subagent_delivery_not_confirmed_503_exhausts_after_budget() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(
+        503, {"error": "subagent_delivery_not_confirmed", "reason": "missing_work_entry"}
+    )
+    # Attempts 1 and 2 keep retrying...
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    # ...attempt 3 hits the not-confirmed budget and gives up.
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_generic_503_without_not_confirmed_body_never_exhausts() -> None:
+    tracker = forwarder._PostRetryTracker(max_not_confirmed_attempts=3)
+    exc = _http_status_error(503, {"error": "internal_error"})
+    for _ in range(10):
+        assert tracker.record_failure("k", exc).exhausted is False
+
+
+def test_permanent_4xx_still_exhausts_at_three() -> None:
+    tracker = forwarder._PostRetryTracker(max_permanent_attempts=3)
+    exc = _http_status_error(400, {"error": "bad_request"})
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is False
+    assert tracker.record_failure("k", exc).exhausted is True
+
+
+def test_is_subagent_delivery_not_confirmed_classifier() -> None:
+    yes = _http_status_error(503, {"error": "subagent_delivery_not_confirmed"})
+    no_status = _http_status_error(500, {"error": "subagent_delivery_not_confirmed"})
+    no_body = _http_status_error(503, {"error": "something_else"})
+    assert forwarder._is_subagent_delivery_not_confirmed(yes) is True
+    assert forwarder._is_subagent_delivery_not_confirmed(no_status) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(no_body) is False
+    assert forwarder._is_subagent_delivery_not_confirmed(httpx.ConnectError("boom")) is False

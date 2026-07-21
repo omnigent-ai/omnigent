@@ -128,15 +128,21 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | Key | Meaning |
 |---|---|
 | `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
+| `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
 | `image` | Optional runner image override (defaults to the official multi-arch amd64/arm64 host image). |
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
-| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. (arm64 note: the CEL policy module is unavailable there — `cel-expr-python` ships no aarch64 wheel — and degrades gracefully.) |
+| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
+
+To verify `host_config` end to end against a live cluster, run
+`python tests/e2e/integrations/deploy/kubernetes/e2e_managed_host_config.py
+--server <url>` — it creates a managed session and asserts the injected
+config inside the runner Pod.
 
 ## Troubleshooting
 

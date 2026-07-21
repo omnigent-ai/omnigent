@@ -1,7 +1,7 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.3.0",
+  "version": "0.6.0",
   "description": "Omnigent desktop shell (Electron edition) — a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
@@ -22,7 +22,15 @@
     "build:mac": "electron-builder --mac",
     "build:mac:release": "electron-builder --mac -c.mac.notarize=true",
     "build:linux": "electron-builder --linux",
-    "build:win": "electron-builder --win"
+    "build:win": "electron-builder --win",
+    "build:overlay": "npm --prefix ../ run build:overlay",
+    "predev": "npm run build:overlay",
+    "prestart": "npm run build:overlay",
+    "prebuild": "npm run build:overlay",
+    "prebuild:mac": "npm run build:overlay",
+    "prebuild:mac:release": "npm run build:overlay",
+    "prebuild:linux": "npm run build:overlay",
+    "prebuild:win": "npm run build:overlay"
   },
   "devDependencies": {
     "electron": "^42.3.2",
@@ -34,11 +42,18 @@
     "directories": {
       "output": "dist"
     },
+    "protocols": [
+      {
+        "name": "Omnigent session link",
+        "schemes": [
+          "omnigent"
+        ]
+      }
+    ],
     "publish": [
       {
-        "provider": "github",
-        "owner": "omnigent-ai",
-        "repo": "omnigent"
+        "provider": "generic",
+        "url": "https://omnigent.ai/_desktop/updates/"
       }
     ],
     "afterPack": "build/afterPack.js",
@@ -46,7 +61,8 @@
       "src/**/*",
       "setup/**/*",
       "find/**/*",
-      "icons/**/*"
+      "icons/**/*",
+      "overlay/**/*"
     ],
     "extraResources": [
       {
@@ -60,8 +76,8 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "icons/icon.icns",
+      "artifactName": "${productName}-${version}-${arch}-mac.${ext}",
       "identity": "Databricks, Inc. (8RMX4WU6F8)",
-      "provisioningProfile": "signing/omnigent.provisionprofile",
       "hardenedRuntime": true,
       "entitlements": "signing/entitlements.mac.plist",
       "entitlementsInherit": "signing/entitlements.mac.inherit.plist",
@@ -74,6 +90,12 @@
       "target": [
         "dmg",
         "zip"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://omnigent.ai/_desktop/updates/"
+        }
       ]
     },
     "dmg": {
@@ -104,16 +126,29 @@
       "target": [
         "AppImage",
         "deb"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://omnigent.ai/_desktop/updates/"
+        }
       ]
     },
     "win": {
       "icon": "icons/icon.ico",
       "target": [
         "nsis"
+      ],
+      "publish": [
+        {
+          "provider": "generic",
+          "url": "https://omnigent.ai/_desktop/updates/"
+        }
       ]
     }
   },
   "dependencies": {
+    "electron-updater": "^6.3.9",
     "js-yaml": "^4.2.0"
   }
 }

@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -24,7 +25,7 @@ from omnigent.stores.host_store import HostStore
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_test_001"
+_HOST_ID = "1444b179a19322377dcc75cf7fcd1bd2"
 _TUNNEL_PATH = f"/v1/hosts/{_HOST_ID}/tunnel"
 
 
@@ -36,7 +37,7 @@ def _websocket_scope(
     """Build an ASGI WebSocket scope for a test path.
 
     :param path: WebSocket path, e.g.
-        ``"/v1/hosts/host_test_001/tunnel"``.
+        ``"/v1/hosts/1444b179a19322377dcc75cf7fcd1bd2/tunnel"``.
     :param client_host: ASGI client host, e.g. ``"127.0.0.1"``.
     :returns: A minimal ASGI WebSocket scope accepted by FastAPI.
     """
@@ -304,6 +305,66 @@ async def test_host_tunnel_upserts_db_on_connect(
     assert host.status == "online"
 
 
+async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
+    db_uri: str,
+) -> None:
+    """A live host readiness update must replace the stale setup warning state."""
+    registry = HostRegistry()
+    store = HostStore(db_uri)
+    updates: list[str] = []
+
+    async def _on_host_update(host_id: str, _owner: str | None) -> None:
+        updates.append(host_id)
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(
+            registry,
+            store,
+            on_host_update=_on_host_update,
+        ),
+        prefix="/v1",
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHelloFrame(
+                    version="0.1.0-test",
+                    frame_protocol_version=1,
+                    name="test-laptop",
+                    configured_harnesses={"pi": False},
+                )
+            ),
+        }
+    )
+    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHarnessReadinessFrame(configured_harnesses={"pi": True})
+            ),
+        }
+    )
+
+    async def _wait_until_ready() -> None:
+        while True:
+            host = store.get_host(_HOST_ID)
+            if host is not None and host.configured_harnesses == {"pi": True}:
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_until_ready(), timeout=0.5)
+
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    assert conn.hello.configured_harnesses == {"pi": True}
+    assert updates == [_HOST_ID]
+
+
 async def test_host_tunnel_sets_offline_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:
@@ -489,7 +550,7 @@ async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:
     """
     app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
     # The host_id is already owned by someone else.
-    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", owner="alice@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", user_id="alice@example.com")
 
     scope = _websocket_scope(_TUNNEL_PATH)
     # Advertise the denial-response extension, as uvicorn does in prod.
@@ -509,7 +570,7 @@ async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:
     assert registry.get(_HOST_ID) is None
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.owner == "alice@example.com"
+    assert host.user_id == "alice@example.com"
     assert host.status == "online"
 
 
@@ -521,7 +582,7 @@ async def test_cross_owner_refused_with_close_when_no_denial_extension(db_uri: s
     just with the less specific message.
     """
     app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
-    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", owner="alice@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="alices-laptop", user_id="alice@example.com")
 
     # No "extensions" key in the scope → fallback path.
     comm = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
@@ -540,7 +601,7 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
     otherwise the new check would break normal reconnection.
     """
     app, registry, store = _owned_app(db_uri, authed_user="bob@example.com")
-    store.upsert_on_connect(host_id=_HOST_ID, name="bobs-laptop", owner="bob@example.com")
+    store.upsert_on_connect(host_id=_HOST_ID, name="bobs-laptop", user_id="bob@example.com")
 
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry, name="bobs-laptop")
@@ -548,7 +609,7 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
     assert _HOST_ID in registry.online_host_ids()
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.owner == "bob@example.com"
+    assert host.user_id == "bob@example.com"
     assert host.status == "online"
 
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
@@ -560,7 +621,7 @@ async def test_same_owner_reconnect_still_accepts(db_uri: str) -> None:
 def _managed_scope(path: str, token: str) -> dict[str, object]:
     """Build a WebSocket scope carrying a managed-host launch token.
 
-    :param path: WebSocket path, e.g. ``"/v1/hosts/host_x/tunnel"``.
+    :param path: WebSocket path, e.g. ``"/v1/hosts/5d23e459b50e20479abf5d3fa8e2f936/tunnel"``.
     :param token: Raw launch token for the managed-host header.
     :returns: ASGI WebSocket scope with the token header set.
     """
@@ -591,7 +652,7 @@ def _register_managed(
     store.register_managed_host(
         host_id=host_id,
         name=f"managed-{host_id}",
-        owner="alice@example.com",
+        user_id="alice@example.com",
         token=token,
         provider="modal",
         sandbox_id="sb-tunnel-1",
@@ -622,7 +683,7 @@ async def test_managed_token_authenticates_as_record_owner(
 
     host = store.get_host(_HOST_ID)
     assert host is not None
-    assert host.owner == "alice@example.com"
+    assert host.user_id == "alice@example.com"
     assert host.status == "online"
     # The managed binding survives the connect upsert.
     assert host.sandbox_id == "sb-tunnel-1"
@@ -636,7 +697,7 @@ async def test_managed_token_authenticates_as_record_owner(
         # never downgrade into the anonymous/local auth path.
         (None, None, "no-such-token", 3600),
         # Token scoped to a DIFFERENT host id than the path.
-        ("host_other_sandbox", "tunnel-token-scoped", "tunnel-token-scoped", 3600),
+        ("33fc174daced5821a9bfb975aa99b086", "tunnel-token-scoped", "tunnel-token-scoped", 3600),
         # Expired token.
         (_HOST_ID, "tunnel-token-expired", "tunnel-token-expired", -1),
     ],

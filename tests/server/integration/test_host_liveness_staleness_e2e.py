@@ -99,7 +99,7 @@ async def host_aware_client(
         yield client
 
 
-_HOST_ID = "host_stale_repro"
+_HOST_ID = "9b2ec6de30f5e014c7056afe505510c3"
 
 # How far in the past to push the host's last-seen to model a host
 # that crashed "a while ago". The freshness window (on the order of the
@@ -113,7 +113,7 @@ async def _session_host_online(client: httpx.AsyncClient, session_id: str) -> bo
 
     :param client: Test HTTP client wired to the app.
     :param session_id: Session whose host liveness to read,
-        e.g. ``"conv_abc123"``.
+        e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     :returns: ``True`` when the bound host is online and fresh,
         ``False`` when it is offline/stale, ``None`` when the session
         has no host binding.
@@ -173,7 +173,9 @@ async def test_crashed_host_session_reads_host_offline(
     # The host connects: this is exactly what the tunnel handler does on
     # host.hello — upserts the row to status='online'. No live tunnel /
     # heartbeat is modeled, which is precisely the post-crash DB state.
-    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", owner=RESERVED_USER_LOCAL)
+    host_store.upsert_on_connect(
+        host_id=_HOST_ID, name="alice-laptop", user_id=RESERVED_USER_LOCAL
+    )
     conv_store.set_host_id(session_id, _HOST_ID, workspace="/tmp/ws")
 
     # Baseline: while the host is freshly online, host_online is True. If
@@ -218,7 +220,9 @@ async def test_recently_seen_host_reads_host_online(
     agent = await create_test_agent(host_aware_client)
     session_id = agent["_session_id"]
 
-    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", owner=RESERVED_USER_LOCAL)
+    host_store.upsert_on_connect(
+        host_id=_HOST_ID, name="alice-laptop", user_id=RESERVED_USER_LOCAL
+    )
     conv_store.set_host_id(session_id, _HOST_ID, workspace="/tmp/ws")
 
     # Last seen comfortably inside the window (about a third of the TTL).

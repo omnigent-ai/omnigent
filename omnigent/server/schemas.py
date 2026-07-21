@@ -54,10 +54,9 @@ class MCPServerSummary(BaseModel):
     """
     Safe subset of an MCP server's configuration for API exposure.
 
-    Secret-bearing fields (``headers``, ``env``) are intentionally
-    excluded. This model is the wire shape returned inside
-    :class:`AgentObject` so clients can display which MCP servers
-    an agent is connected to without leaking credentials.
+    Header values are redacted (``"[REDACTED]"``) so callers can see
+    which headers are configured without leaking the actual secrets.
+    ``env`` is still fully excluded.
 
     :param name: Server name as declared in the agent spec,
         e.g. ``"github"``.
@@ -67,6 +66,9 @@ class MCPServerSummary(BaseModel):
     :param url: HTTP(S) endpoint URL for ``transport="http"``
         servers, e.g. ``"https://mcp.example.com/sse"``. ``None``
         for stdio servers.
+    :param headers: HTTP headers for ``transport="http"`` servers.
+        Values are always ``"[REDACTED]"``; only the key names are
+        exposed.
     :param command: Executable path for ``transport="stdio"``
         servers, e.g. ``"uvx"``. ``None`` for http servers.
     :param args: Command-line arguments for ``transport="stdio"``
@@ -78,6 +80,7 @@ class MCPServerSummary(BaseModel):
     transport: str
     description: str | None = None
     url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
     command: str | None = None
     args: list[str] = Field(default_factory=list)
 
@@ -89,15 +92,15 @@ class UpsertMCPServerRequest(BaseModel):
     """
     Request body for creating or updating a session agent MCP server.
 
-    Secret-bearing fields (``headers`` and ``env``) are intentionally
-    not accepted by the UI route. Existing secrets are preserved when a
-    server is edited without changing transport.
+    ``env`` is still excluded. ``headers`` is accepted for HTTP servers;
+    when omitted, existing headers in the bundle are preserved unchanged.
     """
 
     name: str = Field(min_length=1, max_length=128, pattern=_MCP_SERVER_NAME_RE)
     transport: Literal["http", "stdio"]
     description: str | None = Field(default=None, max_length=512)
     url: str | None = None
+    headers: dict[str, str] | None = None
     command: str | None = None
     args: list[str] = Field(default_factory=list, max_length=64)
 
@@ -1923,6 +1926,22 @@ class UpdateSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AutomaticSessionRenameRequest(BaseModel):
+    """Request body for the current-agent automatic rename endpoint."""
+
+    title: str = Field(min_length=2, max_length=60)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AutomaticSessionRenameResponse(BaseModel):
+    """Result of a conditional automatic session rename."""
+
+    renamed: bool
+    title: str | None = None
+    reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
+
+
 class CodexGoalObject(BaseModel):
     """
     Current Codex goal state for a Codex-native session.
@@ -2219,6 +2238,7 @@ class SessionListItem(BaseModel):
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
     search_snippet: str | None = None
+    parent_session_id: str | None = None
 
 
 class SessionList(BaseModel):
@@ -3015,6 +3035,19 @@ class OutputTextDeltaEvent(_SSEEventBase):
     message_id: str | None = None
     index: int | None = None
     final: bool | None = None
+
+
+class ToolOutputDeltaEvent(_SSEEventBase):
+    """Incremental output from an in-progress function call.
+
+    :param type: Always ``"response.function_call_output.delta"``.
+    :param call_id: Function-call correlation id.
+    :param delta: Command stdout/stderr fragment.
+    """
+
+    type: Literal["response.function_call_output.delta"]
+    call_id: str
+    delta: str
 
 
 class ReasoningStartedEvent(_SSEEventBase):
@@ -3948,6 +3981,7 @@ ServerStreamEvent = Annotated[
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────
     | OutputTextDeltaEvent
+    | ToolOutputDeltaEvent
     | ReasoningStartedEvent
     | ReasoningTextDeltaEvent
     | ReasoningSummaryTextDeltaEvent

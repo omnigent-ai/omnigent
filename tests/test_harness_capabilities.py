@@ -10,6 +10,7 @@ drift.
 from __future__ import annotations
 
 from omnigent import harness_plugins as hp
+from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
     EffortFamily,
@@ -29,7 +30,6 @@ from omnigent.harness_plugins import (
 from omnigent.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
-    _CODEX_FAMILY_HARNESSES,
 )
 
 _NATIVE_MODES = frozenset({IntegrationMode.NATIVE_TUI, IntegrationMode.NATIVE_SERVER})
@@ -61,7 +61,7 @@ def test_model_family_matches_model_override_sets() -> None:
         family = capability.model_family
         if harness in _CLAUDE_FAMILY_HARNESSES:
             assert family is ModelFamily.CLAUDE, harness
-        elif harness in _CODEX_FAMILY_HARNESSES:
+        elif harness in CODEX_CANONICAL_HARNESSES:
             assert family is ModelFamily.GPT, harness
         elif harness in _ANTIGRAVITY_FAMILY_HARNESSES:
             assert family is ModelFamily.GEMINI, harness
@@ -93,6 +93,40 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
     for harness in ("claude-sdk", "codex", "pi", "openai-agents"):
         assert caps[harness].interrupt is True, harness
         assert caps[harness].streaming is True, harness
+
+
+def test_optional_bench_capabilities_default_to_unknown() -> None:
+    capability = HarnessCapabilities(
+        IntegrationMode.SDK_IN_PROCESS,
+        Elicitation.NONE,
+        Resume.COLD_ONLY,
+        EffortFamily.NONE,
+        ModelFamily.MULTI,
+        AuthModel.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    )
+
+    assert capability.steering is None
+    assert capability.live_queue is None
+    assert capability.images is None
+    assert capability.compaction is None
+    assert capability.as_dict() == {
+        "integration_mode": "sdk-in-process",
+        "elicitation": "none",
+        "resume": "cold-only",
+        "effort": "none",
+        "model_family": "multi",
+        "auth": "own-auth",
+        "subagents": False,
+        "interrupt": True,
+        "streaming": True,
+        "steering": None,
+        "live_queue": None,
+        "images": None,
+        "compaction": None,
+    }
 
 
 def test_community_capabilities_cannot_override_builtin() -> None:
@@ -128,6 +162,6 @@ def test_catalog_rows_include_capabilities() -> None:
     for row in rows:
         if row["id"] in caps:
             assert "capabilities" in row, row["id"]
-            # JSON-serializable: values are str/bool, not enums.
+            # JSON-serializable: values are primitives, not enums.
             for value in row["capabilities"].values():
-                assert isinstance(value, (str, bool))
+                assert value is None or isinstance(value, (str, bool))

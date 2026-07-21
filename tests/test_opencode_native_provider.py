@@ -327,6 +327,71 @@ def test_merge_user_provider_config_does_not_clobber_synthesized_providers(
     )
 
 
+def test_merge_user_provider_config_adopts_user_model_when_synthesized_has_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User's default model is adopted when the synthesized config pins none.
+
+    Regression: with no gateway and no spec model_override, the synthesized
+    config had no ``model`` key; opencode-native then picked its own default
+    over the merged models map (landing on a served Gemini endpoint) instead of
+    the user's configured Claude default. The merge now carries ``model``.
+    """
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"model": "databricks/databricks-claude-opus-4-8", '
+        '"provider": {"databricks": {"npm": "@ai-sdk/openai-compatible", '
+        '"options": {"baseURL": "https://ws/serving-endpoints", "apiKey": "t"}, '
+        '"models": {"databricks-claude-opus-4-8": {"name": "Claude"}, '
+        '"databricks-gemini-2-5-pro": {"name": "Gemini"}}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {}  # no gateway, no model_override
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["model"] == "databricks/databricks-claude-opus-4-8"
+
+
+def test_merge_user_provider_config_does_not_override_synthesized_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A synthesized ``model`` (gateway / spec override) wins over the user's."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"model": "databricks/databricks-claude-opus-4-8", '
+        '"provider": {"databricks": {"models": {"m": {"name": "m"}}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {"model": "databricks-gateway/pinned-model"}
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["model"] == "databricks-gateway/pinned-model"
+
+
+def test_merge_user_provider_config_carries_model_without_user_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User's default model is adopted even when the user declares no providers."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"model": "databricks/databricks-claude-opus-4-8"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {}
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["model"] == "databricks/databricks-claude-opus-4-8"
+
+
 def test_merge_user_provider_config_merges_alongside_synthesized_providers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
