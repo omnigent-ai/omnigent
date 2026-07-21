@@ -90,7 +90,9 @@ def _arrow_menu(
         if ch == b"\x1b":
             if _select.select([fd], [], [], 0.05)[0]:
                 ch2 = os.read(fd, 1)
-                if ch2 == b"[":
+                # b"[" is normal cursor mode, b"O" application cursor mode
+                # (DECCKM) — terminals send either for ↑/↓.
+                if ch2 in (b"[", b"O"):
                     ch3 = os.read(fd, 1)
                     if ch3 == b"A":
                         return "up"
