@@ -120,6 +120,35 @@ class Journey:
             await self.teardown(env, ctx)
 
 
+# ── failure classification (shared) ──────────────────────────
+
+
+def _failure_reason(exc: Exception) -> str:
+    """Classify an exception into a stable failure-breakdown label.
+
+    HTTP status errors key off their status code (``"HTTP 500"``) so the same
+    server error groups across ops; anything else keys off its class name.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP {exc.response.status_code}"
+    return exc.__class__.__name__
+
+
+def _setup_failed_result(exc: Exception) -> RunResult:
+    """A run whose ``setup`` raised: zero successes, one recorded failure.
+
+    Returned in place of timing when a journey's per-run ``setup`` fails (e.g.
+    a 500 while resolving a target session), so the failure is recorded as a
+    data point and the suite moves on instead of the whole process aborting.
+    The ``setup:`` prefix distinguishes it from an operation-level failure, and
+    ``n_success == 0`` keeps it out of the summary averages (see
+    :func:`measure.aggregate`).
+    """
+    result = RunResult()
+    result.record_failure(f"setup: {_failure_reason(exc)}")
+    return result
+
+
 # ── timed operation (shared by both runners) ─────────────────
 
 
@@ -130,10 +159,8 @@ async def _timed(
     start = time.perf_counter()
     try:
         await journey.measure(env, ctx)
-    except httpx.HTTPStatusError as exc:
-        result.record_failure(f"HTTP {exc.response.status_code}")
     except Exception as exc:  # noqa: BLE001 — any failure is a recorded data point
-        result.record_failure(exc.__class__.__name__)
+        result.record_failure(_failure_reason(exc))
     else:
         result.latencies_ms.append((time.perf_counter() - start) * 1000)
 
@@ -148,8 +175,14 @@ async def run_latency(
 
     Warmup operations run through the same path but are excluded from the
     result, so first-call import/JIT/connection costs don't skew the numbers.
+
+    A failing ``setup`` (e.g. a 500 resolving a target session) is recorded as
+    a failed run and returned, rather than propagating and aborting the suite.
     """
-    ctx = await journey.run_setup(env)
+    try:
+        ctx = await journey.run_setup(env)
+    except Exception as exc:  # noqa: BLE001 — a setup failure is a recorded data point
+        return _setup_failed_result(exc)
     try:
         for _ in range(warmup):
             with contextlib.suppress(Exception):  # warmup errors are non-fatal
@@ -160,17 +193,15 @@ async def run_latency(
         for _ in range(iterations):
             try:
                 await journey.run_prepare(env, ctx)
-            except httpx.HTTPStatusError as exc:
-                result.record_failure(f"HTTP {exc.response.status_code}")
-                continue
             except Exception as exc:  # noqa: BLE001 — preparation failure is a data point
-                result.record_failure(exc.__class__.__name__)
+                result.record_failure(_failure_reason(exc))
                 continue
             await _timed(journey, env, ctx, result)
         result.wall_time = time.perf_counter() - wall_start
         return result
     finally:
-        await journey.run_teardown(env, ctx)
+        with contextlib.suppress(Exception):  # teardown failure must not abort the suite
+            await journey.run_teardown(env, ctx)
 
 
 async def run_throughput(
@@ -186,8 +217,14 @@ async def run_throughput(
     Wall time spans from the first dispatch to the last completion, so
     ``throughput`` reflects sustained req/s under load (MLflow's ``_run_once``
     shape, with an :class:`asyncio.Semaphore` gate).
+
+    A failing ``setup`` is recorded as a failed run and returned, rather than
+    propagating and aborting the suite.
     """
-    ctx = await journey.run_setup(env)
+    try:
+        ctx = await journey.run_setup(env)
+    except Exception as exc:  # noqa: BLE001 — a setup failure is a recorded data point
+        return _setup_failed_result(exc)
     try:
         sem = asyncio.Semaphore(concurrency)
 
@@ -196,11 +233,8 @@ async def run_throughput(
                 if count_it:
                     try:
                         await journey.run_prepare(env, ctx)
-                    except httpx.HTTPStatusError as exc:
-                        result.record_failure(f"HTTP {exc.response.status_code}")
-                        return
                     except Exception as exc:  # noqa: BLE001 — preparation failure is a data point
-                        result.record_failure(exc.__class__.__name__)
+                        result.record_failure(_failure_reason(exc))
                         return
                     await _timed(journey, env, ctx, result)
                 else:
@@ -218,7 +252,8 @@ async def run_throughput(
         result.wall_time = time.perf_counter() - wall_start
         return result
     finally:
-        await journey.run_teardown(env, ctx)
+        with contextlib.suppress(Exception):  # teardown failure must not abort the suite
+            await journey.run_teardown(env, ctx)
 
 
 # ── journey implementations ──────────────────────────────────

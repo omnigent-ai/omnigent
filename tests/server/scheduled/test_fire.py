@@ -157,7 +157,7 @@ class FakePermissionStore:
 @dataclass
 class _FakeHost:
     host_id: str
-    owner: str
+    user_id: str
 
 
 class FakeHostStore:
@@ -170,7 +170,7 @@ class FakeHostStore:
     def list_hosts(self, owner: str) -> list[_FakeHost]:
         # Mirrors the real store: most-recently-active first. Insertion order in
         # the dict stands in for that ordering here.
-        return [h for h in self.hosts.values() if h.owner == owner]
+        return [h for h in self.hosts.values() if h.user_id == owner]
 
 
 class FakeHostRegistry:
@@ -205,7 +205,7 @@ def _task(**overrides: Any) -> ScheduledTask:
         "name": "nightly",
         "prompt": "do the thing",
         "rrule": "FREQ=HOURLY",
-        "owner_user_id": None,
+        "user_id": None,
         "agent_id": "ag_1",
         "timezone": "UTC",
         "created_at": 1_800_000_000,
@@ -389,7 +389,7 @@ async def test_overlapping_fire_skips_second_launch() -> None:
 @pytest.mark.asyncio
 async def test_explicit_owner_is_granted() -> None:
     perm = FakePermissionStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(owner_user_id="alice@example.com")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
@@ -456,7 +456,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
         )
     )
 
-    await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(owner_user_id=None))
+    await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
 
     assert captured["user_id"] == RESERVED_USER_LOCAL
 
@@ -565,7 +565,7 @@ async def test_unset_host_resolves_owner_online_host_and_runs() -> None:
     perm = FakePermissionStore()
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace="/repo")}
+        rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace="/repo")}
     )
     launched: list[Any] = []
 
@@ -604,7 +604,7 @@ async def test_unset_host_no_online_host_records_failed() -> None:
     records a failed run with the no_online_host code and creates no session."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
+        rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
     )
     launched: list[Any] = []
 
@@ -640,7 +640,7 @@ async def test_no_workspace_resolved_host_launches_with_canonical_home(
     dir to an ABSOLUTE realpath (never the literal '~') and stores that."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
+        rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
     )
     launched: list[Any] = []
 
@@ -686,11 +686,7 @@ async def test_pinned_host_no_workspace_defaults_to_host_home(
     NOT re-resolved to some other live host."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={
-            "task_1": _task(
-                owner_user_id="alice@example.com", host_id="host_pinned", workspace=None
-            )
-        }
+        rows={"task_1": _task(user_id="alice@example.com", host_id="host_pinned", workspace=None)}
     )
     launched: list[Any] = []
 
@@ -739,9 +735,7 @@ async def test_pinned_nonowned_host_no_workspace_rejected_before_stat(
     ownership is authorized before any RPC reaches it."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={
-            "task_1": _task(owner_user_id="alice@example.com", host_id="host_bob", workspace=None)
-        }
+        rows={"task_1": _task(user_id="alice@example.com", host_id="host_bob", workspace=None)}
     )
 
     resolve_calls: list[str] = []
@@ -781,7 +775,7 @@ async def test_no_workspace_unresolvable_home_records_failed(
     run rather than launching with a bogus workspace."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
+        rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
     )
 
     async def _boom(deps: Any, host_id: str) -> str:
@@ -818,7 +812,7 @@ async def test_defaulted_workspace_is_boundary_validated(
     records a failed run and creates no session."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
-        rows={"task_1": _task(owner_user_id="alice@example.com", host_id=None, workspace=None)}
+        rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
     )
 
     async def _fake_resolve(deps: Any, host_id: str) -> str:
@@ -948,7 +942,7 @@ async def test_no_host_registry_records_failed_without_session() -> None:
 @pytest.mark.asyncio
 async def test_offline_connected_host_records_failed_without_session() -> None:
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(owner_user_id="alice@example.com")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
 
     on_fire = build_on_fire(
         _deps(

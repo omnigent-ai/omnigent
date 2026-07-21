@@ -18,7 +18,7 @@ firing:
    ``workspace`` / ``host_id`` and the stored ``model_override`` /
    ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
-   task's ``owner_user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
+   task's ``user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
    (single-user / OSS). Without the grant the run is invisible.
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
    (a seeded prompt with no launched runner would just sit as history).
@@ -451,7 +451,7 @@ async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
             "connected host registry/store is not configured",
             error_code="host_registry_unavailable",
         )
-    owner = task.owner_user_id or RESERVED_USER_LOCAL
+    owner = task.user_id or RESERVED_USER_LOCAL
     hosts = await asyncio.to_thread(deps.host_store.list_hosts, owner)
     for host in hosts:
         if deps.host_registry.get(host.host_id) is not None:
@@ -534,14 +534,14 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
 async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
     """Write the LEVEL_OWNER grant so the run is visible to its owner.
 
-    A NULL ``owner_user_id`` (single-user / OSS) resolves to
+    A NULL ``user_id`` (single-user / OSS) resolves to
     :data:`RESERVED_USER_LOCAL`. When ``permission_store`` is ``None`` (no auth
     configured) this is a no-op — the session is still accessible because auth
     is disabled system-wide.
     """
     if deps.permission_store is None:
         return
-    owner = task.owner_user_id or RESERVED_USER_LOCAL
+    owner = task.user_id or RESERVED_USER_LOCAL
     await asyncio.to_thread(deps.permission_store.ensure_user, owner)
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
 
@@ -605,7 +605,7 @@ async def _validate_fire_session_inputs(
 ) -> tuple[str, str] | None:
     """Validate stored task fields before creating a conversation."""
     try:
-        owner = task.owner_user_id
+        owner = task.user_id
         agent = await validate_session_agent(
             user_id=owner,
             agent_id=task.agent_id,
@@ -658,8 +658,8 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
     Shared by the preflight and by :func:`_resolve_effective_task`'s pre-stat
     check so a task pinning another owner's host is rejected before any RPC
     reaches that host. ``get_host`` is a local DB lookup — it never contacts the
-    host. When ``owner_user_id`` is ``None`` (single-user / auth disabled) the
-    owner check is skipped, matching the preflight and the rest of the server.
+    host. When ``user_id`` is ``None`` (single-user / auth disabled) the owner
+    check is skipped, matching the preflight and the rest of the server.
     """
     if deps.host_store is None:
         raise _CannotLaunchScheduledFire(
@@ -672,7 +672,7 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
             f"connected host {host_id!r} was not found",
             error_code="host_not_found",
         )
-    if task.owner_user_id is not None and host.owner != task.owner_user_id:
+    if task.user_id is not None and host.user_id != task.user_id:
         raise _CannotLaunchScheduledFire(
             f"connected host {host_id!r} is not owned by the scheduled task owner",
             error_code="host_not_owned",
@@ -726,7 +726,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         if deps.host_registry is None or deps.host_store is None:
             raise RuntimeError("connected host registry/store is not configured")
 
-        owner = task.owner_user_id or RESERVED_USER_LOCAL
+        owner = task.user_id or RESERVED_USER_LOCAL
         host_id = task.host_id
         if host_id is None or deps.host_registry.get(host_id) is None:
             raise RuntimeError(f"connected host {host_id!r} is not online")
