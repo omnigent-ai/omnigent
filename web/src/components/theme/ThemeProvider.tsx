@@ -3,15 +3,23 @@ import { ThemeProvider as NextThemesProvider, useTheme } from "next-themes";
 import { reportColorScheme } from "@/lib/nativeBridge";
 
 /**
- * Mirrors the resolved in-app theme onto native shell chrome. Renders nothing.
+ * Mirrors the in-app theme onto native shell chrome. Renders nothing.
  */
 function NativeThemeSync() {
-  const { resolvedTheme } = useTheme();
+  const { theme, resolvedTheme } = useTheme();
   useEffect(() => {
+    // Android consumes the concrete resolved scheme (system-bar icon
+    // contrast) and ignores "system"; Electron keeps whichever report comes
+    // last, so a trailing "system" lets it track the OS natively while an
+    // explicit selection leaves it forced — including system→light under a
+    // light OS, where only `theme` changes and Electron must still be told.
     if (resolvedTheme === "light" || resolvedTheme === "dark") {
       reportColorScheme(resolvedTheme);
     }
-  }, [resolvedTheme]);
+    if (theme === "system") {
+      reportColorScheme("system");
+    }
+  }, [theme, resolvedTheme]);
   return null;
 }
 
