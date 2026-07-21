@@ -8749,6 +8749,7 @@ def create_runner_app(
 
     if runner_workspace is not None:
         filesystem_registry = create_filesystem_registry(watch_path=runner_workspace)
+        filesystem_registry.start()
     else:
         filesystem_registry = None
     app.state.filesystem_registry = filesystem_registry
@@ -8993,6 +8994,7 @@ def create_runner_app(
             return filesystem_registry
 
         registry = create_filesystem_registry(watch_path=session_ws_path)
+        registry.start()
         _session_fs_registries[session_id] = registry
         return registry
 
