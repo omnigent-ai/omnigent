@@ -99,6 +99,27 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 }
 
 /**
+ * Whether a terminal-first shell view has gone stale — the open panel key
+ * still points at a user shell that no longer exists in *terminals* (e.g.
+ * the user typed ``exit`` and the runner deleted the resource). Callers
+ * exit the shell view when this is true so the user isn't stranded with
+ * the Chat/Terminal pill hidden and no shell close button (issue #479).
+ *
+ * Returns ``false`` for chat (``null``), the agent terminal, the
+ * "open with no target" sentinel, and while the list is empty
+ * (loading / offline) so a pending restore isn't clobbered.
+ *
+ * :param panelKey: The open panel key (:func:`terminalTabKey` value), or null.
+ * :param terminals: The current terminal list.
+ */
+export function shellViewIsStale(panelKey: string | null, terminals: TerminalInfo[]): boolean {
+  if (!panelKey || panelKey === PANEL_NO_TERMINAL_KEY) return false;
+  if (isAgentTerminalKey(panelKey)) return false;
+  if (terminals.length === 0) return false;
+  return !terminals.some((t) => terminalTabKey(t) === panelKey);
+}
+
+/**
  * Project the terminal list down to the session's *inventory* — the
  * shells shown in the right-rail Shells tab, its count badge, and the
  * mobile menu entry.

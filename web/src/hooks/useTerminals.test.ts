@@ -15,7 +15,9 @@ import {
   fetchTerminals,
   inventoryTerminals,
   isAgentTerminalKey,
+  PANEL_NO_TERMINAL_KEY,
   PENDING_RECONCILE_INTERVAL_MS,
+  shellViewIsStale,
   terminalInfoFromResource,
   terminalsReconcileInterval,
   terminalTabKey,
@@ -490,6 +492,43 @@ describe("terminalTabKey", () => {
     };
     const after: TerminalInfo = { ...before, name: "bash-renamed", session: "s2" };
     expect(terminalTabKey(before)).toBe(terminalTabKey(after));
+  });
+});
+
+describe("shellViewIsStale", () => {
+  const shell: TerminalInfo = {
+    id: "terminal_bash_s1",
+    name: "bash",
+    session: "s1",
+    running: true,
+  };
+  const agent: TerminalInfo = {
+    id: "terminal_claude_main",
+    name: "claude",
+    session: "main",
+    running: true,
+  };
+  const shellKey = terminalTabKey(shell); // "terminal:terminal_bash_s1"
+
+  it("is false while the shell still exists (the normal open-shell state)", () => {
+    expect(shellViewIsStale(shellKey, [agent, shell])).toBe(false);
+  });
+
+  it("is true once the shell leaves the list (user typed `exit`) — drives the #479 auto-exit", () => {
+    expect(shellViewIsStale(shellKey, [agent])).toBe(true);
+  });
+
+  it("is false for chat (null) and the no-target sentinel", () => {
+    expect(shellViewIsStale(null, [agent, shell])).toBe(false);
+    expect(shellViewIsStale(PANEL_NO_TERMINAL_KEY, [agent, shell])).toBe(false);
+  });
+
+  it("is false for the agent terminal — it's the pill's Terminal view, never a stale shell", () => {
+    expect(shellViewIsStale(terminalTabKey(agent), [agent])).toBe(false);
+  });
+
+  it("is false while the list is empty (loading / offline) so a pending restore isn't clobbered", () => {
+    expect(shellViewIsStale(shellKey, [])).toBe(false);
   });
 });
 

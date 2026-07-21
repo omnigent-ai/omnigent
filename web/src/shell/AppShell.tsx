@@ -49,6 +49,7 @@ import {
   inventoryTerminals,
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
+  shellViewIsStale,
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
@@ -1179,13 +1180,9 @@ export function AppShell() {
   // Auto-exit shell view when the active shell leaves the terminal list
   // (e.g. the user typed `exit`, so the runner deleted the resource):
   // restore the prior view instead of stranding the user with the pill
-  // hidden and no shell ✕ to click (issue #479). Skip while the list is
-  // empty (loading / offline) so we don't clobber a pending restore.
+  // hidden and no shell ✕ to click (issue #479).
   useEffect(() => {
-    if (!terminalFirst || !panelInitialKey) return;
-    if (isAgentTerminalKey(panelInitialKey) || panelInitialKey === PANEL_NO_TERMINAL_KEY) return;
-    if (terminals.length === 0) return;
-    if (!terminals.some((t) => terminalTabKey(t) === panelInitialKey)) exitShellView();
+    if (terminalFirst && shellViewIsStale(panelInitialKey, terminals)) exitShellView();
   }, [terminalFirst, panelInitialKey, terminals, exitShellView]);
 
   // `terminals` is already runner-accurate (useTerminals empties it when the
