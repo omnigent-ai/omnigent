@@ -38,8 +38,8 @@ Env vars read at startup:
   ``HARNESS_CODEX_GATEWAY`` (the gateway path pins its own
   generated provider).
 - ``HARNESS_CODEX_CWD``: working directory the executor launches
-  the Codex CLI in. ``None`` falls back to the subprocess's
-  inherited cwd.
+  the Codex CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE``
+  if set, then to the subprocess's inherited cwd.
 - ``OMNIGENT_CODEX_PATH``: absolute path to a ``codex`` CLI binary.
   ``None`` searches ``PATH``. (Legacy ``HARNESS_CODEX_PATH`` still honored,
   deprecated.)
@@ -288,7 +288,7 @@ def _build_codex_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return CodexExecutor(
-        cwd=os.environ.get(_ENV_CWD),
+        cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         codex_path=resolve_harness_path("codex"),
