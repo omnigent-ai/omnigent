@@ -1378,7 +1378,7 @@ class GuardrailsSpec:
     ask_timeout: int = DEFAULT_ASK_TIMEOUT
 
 
-@dataclass
+@dataclass(frozen=True)
 class VerifySpec:
     """
     Opt-in deterministic verification gates — a PASS/FAIL quality

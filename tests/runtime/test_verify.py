@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
+
+import pytest
+
 from omnigent.runtime.verify import VerifyResult, run_verify
 from omnigent.spec.types import VerifySpec
 
@@ -233,3 +237,107 @@ async def test_combined_checks_aggregate_in_order() -> None:
         "not_contains[0]",
         "no_stubs[0]",
     ]
+
+
+async def test_failed_command_stdout_feeds_contains() -> None:
+    """A failing command's stdout still satisfies a contains gate (stdout is captured)."""
+    spec = VerifySpec(commands=("pytest",), contains=("5 passed",))
+    os_env = _FakeOSEnv(
+        shell={
+            "pytest": {
+                "exit_code": 1,
+                "stdout": "1 failed, 5 passed",
+                "stderr": "",
+                "timed_out": False,
+                "error": "Command exited with status 1: 1 failed, 5 passed",
+            }
+        },
+    )
+
+    result = await run_verify(spec, os_env)
+
+    by_name = {c.name: c for c in result.checks}
+    assert result.passed is False
+    assert by_name["command[0]"].passed is False
+    # stdout was captured despite the failure, so the contains gate passes.
+    assert by_name["contains[0]"].passed is True
+
+
+async def test_commands_stdout_is_combined_across_commands() -> None:
+    """contains sees the stdout of every command, not just the first."""
+    spec = VerifySpec(commands=("echo-a", "echo-b"), contains=("alpha", "beta"))
+    os_env = _FakeOSEnv(
+        shell={
+            "echo-a": {"exit_code": 0, "stdout": "alpha", "stderr": "", "timed_out": False},
+            "echo-b": {"exit_code": 0, "stdout": "beta", "stderr": "", "timed_out": False},
+        },
+    )
+
+    result = await run_verify(spec, os_env)
+
+    assert result.passed is True
+
+
+async def test_timeout_partial_stdout_is_captured() -> None:
+    """A timed-out command's partial stdout still feeds the content checks."""
+    spec = VerifySpec(commands=("slow",), contains=("progress",))
+    os_env = _FakeOSEnv(
+        shell={
+            "slow": {
+                "exit_code": None,
+                "stdout": "partial progress before kill",
+                "stderr": "",
+                "timed_out": True,
+                "error": "Command timed out after 120 seconds",
+            }
+        },
+    )
+
+    result = await run_verify(spec, os_env)
+
+    by_name = {c.name: c for c in result.checks}
+    assert by_name["command[0]"].passed is False  # timed out
+    assert by_name["contains[0]"].passed is True  # partial stdout was captured
+
+
+async def test_no_stubs_invalid_regex_records_failure() -> None:
+    """An unparseable no_stubs regex fails its check.
+
+    Defense-in-depth: the parser rejects invalid regex at load time, but
+    run_verify still handles one gracefully when called directly.
+    """
+    spec = VerifySpec(no_stubs=("(",), paths=("a.py",))
+    os_env = _FakeOSEnv(read={"a.py": {"content": "x = 1\n", "path": "a.py"}})
+
+    result = await run_verify(spec, os_env)
+
+    assert result.passed is False
+    assert "invalid regex" in result.checks[0].detail
+
+
+async def test_command_detail_truncates_long_output() -> None:
+    """A command's verbose output is truncated so the verdict stays compact."""
+    spec = VerifySpec(commands=("noisy",))
+    os_env = _FakeOSEnv(
+        shell={
+            "noisy": {
+                "exit_code": 0,
+                "stdout": "x" * 5000,
+                "stderr": "",
+                "timed_out": False,
+            }
+        },
+    )
+
+    result = await run_verify(spec, os_env)
+
+    detail = result.checks[0].detail
+    assert "…" in detail  # truncated marker
+    assert len(detail) < 2000
+
+
+def test_verify_spec_is_frozen() -> None:
+    """VerifySpec is a frozen value object — parsed gates must not be mutated."""
+    spec = VerifySpec(commands=("pytest",))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.commands = ("ruff",)  # type: ignore[misc]

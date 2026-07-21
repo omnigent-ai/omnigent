@@ -2735,7 +2735,12 @@ def _parse_guardrails(
     )
 
 
-def _parse_str_tuple(raw: object, field_name: str) -> tuple[str, ...]:
+def _parse_str_tuple(
+    raw: object,
+    field_name: str,
+    *,
+    non_empty: bool = False,
+) -> tuple[str, ...]:
     """
     Coerce a YAML scalar/list into a tuple of strings.
 
@@ -2745,25 +2750,37 @@ def _parse_str_tuple(raw: object, field_name: str) -> tuple[str, ...]:
     :param raw: The raw YAML value.
     :param field_name: Dotted field name for error messages, e.g.
         ``"verify.commands"``.
+    :param non_empty: When True, reject empty strings — an empty command,
+        substring, regex, or path is never a useful gate value.
     :returns: A tuple of strings.
-    :raises OmnigentError: If *raw* is not a string or list of strings.
+    :raises OmnigentError: If *raw* is not a string or list of strings,
+        or (when *non_empty*) contains an empty string.
     """
     if raw is None:
         return ()
     if isinstance(raw, str):
-        return (raw,)
-    if not isinstance(raw, list):
+        items: tuple[str, ...] = (raw,)
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, str):
+                raise OmnigentError(
+                    f"{field_name} must contain only strings, got {type(item).__name__}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        items = tuple(raw)
+    else:
         raise OmnigentError(
             f"{field_name} must be a string or list of strings, got {type(raw).__name__}",
             code=ErrorCode.INVALID_INPUT,
         )
-    for item in raw:
-        if not isinstance(item, str):
-            raise OmnigentError(
-                f"{field_name} must contain only strings, got {type(item).__name__}",
-                code=ErrorCode.INVALID_INPUT,
-            )
-    return tuple(raw)
+    if non_empty:
+        for item in items:
+            if not item:
+                raise OmnigentError(
+                    f"{field_name} must not contain empty strings",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+    return items
 
 
 def _parse_verify(raw: dict[str, Any] | None) -> VerifySpec | None:
@@ -2777,8 +2794,9 @@ def _parse_verify(raw: dict[str, Any] | None) -> VerifySpec | None:
     :returns: A populated :class:`VerifySpec`, or ``None`` when *raw* is
         ``None``.
     :raises OmnigentError: If the block is not a mapping, holds an unknown
-        key, declares no checks, pairs ``no_stubs`` with an empty ``paths``
-        list, or holds non-string fields.
+        key, holds an empty or non-string field, declares no checks, pairs
+        ``no_stubs`` with an empty ``paths`` list, or holds an invalid
+        ``no_stubs`` regex.
     """
     if raw is None:
         return None
@@ -2793,11 +2811,19 @@ def _parse_verify(raw: dict[str, Any] | None) -> VerifySpec | None:
             f"verify: unknown key(s): {', '.join(sorted(unknown))}",
             code=ErrorCode.INVALID_INPUT,
         )
-    commands = _parse_str_tuple(raw.get("commands"), "verify.commands")
-    contains = _parse_str_tuple(raw.get("contains"), "verify.contains")
-    not_contains = _parse_str_tuple(raw.get("not_contains"), "verify.not_contains")
-    no_stubs = _parse_str_tuple(raw.get("no_stubs"), "verify.no_stubs")
-    paths = _parse_str_tuple(raw.get("paths"), "verify.paths")
+    commands = _parse_str_tuple(raw.get("commands"), "verify.commands", non_empty=True)
+    contains = _parse_str_tuple(raw.get("contains"), "verify.contains", non_empty=True)
+    not_contains = _parse_str_tuple(raw.get("not_contains"), "verify.not_contains", non_empty=True)
+    no_stubs = _parse_str_tuple(raw.get("no_stubs"), "verify.no_stubs", non_empty=True)
+    paths = _parse_str_tuple(raw.get("paths"), "verify.paths", non_empty=True)
+    for pattern in no_stubs:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise OmnigentError(
+                f"verify.no_stubs: invalid regex {pattern!r}: {exc}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
     if no_stubs and not paths:
         raise OmnigentError(
             "verify.no_stubs requires verify.paths to name files to scan",
