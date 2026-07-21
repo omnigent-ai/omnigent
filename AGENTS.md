@@ -55,3 +55,17 @@ Keep comments short and focused on the code, not on the change history.
   *why* it exists, in terms a future reader needs. Don't reference PR numbers,
   issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
   should be clear without chasing external links.
+
+## Framework-owned instructions
+
+Keep runtime lifecycle and metadata instructions separate from portable agent
+instructions:
+
+- Agent-spec and per-request instructions are user-authored. Framework-owned
+  instructions are additive runtime behavior and are appended after them in
+  `omnigent/runtime/prompt.py`.
+- Keep the canonical instruction text and lifecycle gate in the owning framework
+  module. Harness adapters should only transport the composed instructions; do
+  not duplicate policy across adapters or add lifecycle metadata to `AgentSpec`.
+- If framework instructions grow beyond a small ordered list, introduce a
+  structured `FrameworkInstructions` value at the prompt-composition boundary.

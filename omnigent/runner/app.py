@@ -91,8 +91,26 @@ from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
     format_skill_meta_text,
 )
+from omnigent.tools.builtins.session_rename import (
+    session_rename_allowed_tools,
+    session_rename_instruction,
+)
 
 _logger = logging.getLogger(__name__)
+
+
+def _is_first_user_turn(history: list[dict[str, Any]]) -> bool:
+    """Return whether history contains one user message and no assistant reply."""
+    user_messages = 0
+    for item in history:
+        if item.get("type") != "message":
+            continue
+        role = item.get("role")
+        if role == "assistant":
+            return False
+        if role == "user":
+            user_messages += 1
+    return user_messages == 1
 
 
 # ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
@@ -308,6 +326,11 @@ _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[Any]] = {}
 # Bound how long terminal (re)creation waits for a cancelled forwarder.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
 
+# Delegated runner bearers last 30 minutes and refresh five minutes before
+# expiry. A one-minute cadence allows several retries without giving the child
+# the runner binding token; cached factory calls stay local and cheap.
+_PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S = 60.0
+
 
 class _CodexNativeModelOptionsNotReady(RuntimeError):
     """Raised when Codex model options are requested before bridge startup."""
@@ -365,6 +388,36 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[Any]) -> N
             del _AUTO_FORWARDER_TASKS[session_id]
 
     task.add_done_callback(_evict)
+
+
+async def _refresh_claude_permission_hook_auth(
+    *,
+    bridge_dir: Path,
+    server_url: str,
+    auth_token_factory: Callable[[], str | None],
+    refresh_interval_s: float = _PERMISSION_HOOK_AUTH_REFRESH_INTERVAL_S,
+) -> None:
+    """Keep the Claude permission hook's bearer snapshot current.
+
+    :param bridge_dir: Owner-only Claude bridge directory.
+    :param server_url: Omnigent server receiving permission requests.
+    :param auth_token_factory: Refresh-capable runner bearer factory.
+    :param refresh_interval_s: Delay between snapshot refresh attempts.
+    """
+    from omnigent.claude_native_bridge import update_permission_hook_auth_headers
+    from omnigent.cli_auth import databricks_request_headers
+
+    while True:
+        await asyncio.sleep(refresh_interval_s)
+        try:
+            token = await asyncio.to_thread(auth_token_factory)
+            if token:
+                headers = databricks_request_headers(server_url, bearer_token=token)
+                update_permission_hook_auth_headers(bridge_dir, headers)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — retain the last still-valid snapshot
+            _logger.warning("Could not refresh Claude permission-hook auth")
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -3729,6 +3782,11 @@ async def _auto_create_codex_terminal(
         profile=_codex_launch.profile,
         extra_config_overrides=[*_codex_launch.config_overrides, *mcp_overrides],
         bridge_dir=bridge_dir,
+        developer_instructions=session_rename_instruction(
+            initial_session=(
+                launch_config.external_session_id is None and not launch_config.fork_carry_history
+            )
+        ),
         ap_server_url=launch_config.policy_server_url,
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
@@ -5356,6 +5414,7 @@ async def _auto_create_claude_terminal(
     agent_name: str | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     skills_filter: str | list[str] = "all",
+    auth_token_factory: Callable[[], str | None] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -5392,6 +5451,8 @@ async def _auto_create_claude_terminal(
     :param skills_filter: The agent spec's ``skills_filter`` (``"all"``
         / ``"none"`` / list of skill names), threaded to
         :func:`augment_claude_args`. Defaults to ``"all"``.
+    :param auth_token_factory: Runner-owned refreshable bearer factory.
+        ``None`` preserves direct-call behavior by resolving one locally.
     :returns: The launched terminal's :class:`SessionResourceView`, so
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
@@ -5481,18 +5542,15 @@ async def _auto_create_claude_terminal(
     # PermissionRequest hook (so Claude's approval prompts route to the
     # web UI instead of its TUI) and the transcript forwarder. The CLI
     # client supplies these on the wrapper path; on this host-spawned
-    # path the runner reconstructs them from its own environment/auth.
+    # path the runner reuses its process-level auth context.
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
     # Authenticate the runner's outbound POSTs the same way its other
     # HTTP calls are authenticated.
-    _auth_factory = _make_auth_token_factory()
-    # The PermissionRequest hook runs in a separate subprocess that reads
-    # static headers from permission_hook.json, so it gets a one-shot
-    # token snapshot. The long-running transcript forwarder instead gets
-    # a refresh-capable ``httpx.Auth`` (below) so it survives the ~1h
-    # Databricks OAuth token expiry; a one-shot header would silently
-    # stop forwarding after the token lapses. ``_RunnerDatabricksAuth``
-    # with a ``None`` factory is a safe no-op (local unauthenticated).
+    _auth_factory = auth_token_factory
+    if _auth_factory is None:
+        _auth_factory = _make_auth_token_factory()
+    # The hook reads an owner-only header snapshot that the parent refreshes.
+    # The forwarder uses refresh-capable auth directly; ``None`` is a no-op.
     _auth_token = _auth_factory() if _auth_factory is not None else None
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable auth of its own); the helper pairs the bearer with the
@@ -5808,6 +5866,12 @@ async def _auto_create_claude_terminal(
         agent_name=agent_name,
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
+        append_system_prompt=session_rename_instruction(
+            initial_session=session_external_id is None and not fork_carry_history
+        ),
+        allowed_tools=session_rename_allowed_tools(
+            initial_session=session_external_id is None and not fork_carry_history
+        ),
     )
 
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
@@ -5950,16 +6014,34 @@ async def _auto_create_claude_terminal(
     # ``claude_native.py``.
     from omnigent.claude_native_forwarder import supervise_forwarder
 
+    async def _supervise_bridge() -> None:
+        refresh_task: asyncio.Task[None] | None = None
+        if _auth_factory is not None:
+            refresh_task = asyncio.create_task(
+                _refresh_claude_permission_hook_auth(
+                    bridge_dir=bridge_dir,
+                    server_url=server_url,
+                    auth_token_factory=_auth_factory,
+                ),
+                name=f"claude-hook-auth-{session_id}",
+            )
+        try:
+            await supervise_forwarder(
+                base_url=server_url,
+                headers=_runner_headers,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                start_at_end=resume_external_session_id is not None,
+                auth=_runner_auth,
+            )
+        finally:
+            if refresh_task is not None:
+                refresh_task.cancel()
+                _ = await asyncio.gather(refresh_task, return_exceptions=True)
+
     _forwarder_task = asyncio.create_task(
-        supervise_forwarder(
-            base_url=server_url,
-            headers=_runner_headers,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            agent_name="claude-native-ui",
-            start_at_end=resume_external_session_id is not None,
-            auth=_runner_auth,
-        ),
+        _supervise_bridge(),
         name=f"claude-forwarder-{session_id}",
     )
     _register_auto_forwarder_task(session_id, _forwarder_task)
@@ -6843,13 +6925,12 @@ def _wrap_as_message_event(body: dict[str, Any]) -> dict[str, Any]:
 
 class _ContextWindowOverflow(Exception):
     """
-    Raised by the proxy_stream when the harness reports a context-window overflow.
+    Raised and caught inside ``proxy_stream`` when the harness reports a
+    context-window overflow, so both live and background turns end the
+    same way.
 
-    Caught by ``_run_turn_bg_setup_and_stream`` to end the turn with
-    a descriptive error.
-
-    :param max_tokens: The model's context window, e.g. ``128000``.
-    :param actual_tokens: The prompt size that overflowed, e.g. ``131072``.
+    :param max_tokens: The model's context window.
+    :param actual_tokens: The prompt size that overflowed.
     """
 
     def __init__(self, max_tokens: int, actual_tokens: int) -> None:
@@ -7870,6 +7951,7 @@ def create_runner_app(
     per_session_workspace: bool = True,
     mcp_manager: Any | None = None,
     auth_token: str | None = None,
+    auth_token_factory: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -7902,6 +7984,9 @@ def create_runner_app(
         request except ``GET /health`` is rejected with 401 if
         the token is missing or wrong.  ``None``
         disables auth (in-process / test path).
+    :param auth_token_factory: Refresh-capable server bearer factory owned by
+        the runner process. Native terminal helpers reuse it instead of
+        resolving host credentials again for every terminal launch.
     """
     import hmac
 
@@ -9166,6 +9251,7 @@ def create_runner_app(
                             agent_name=_native_agent_name,
                             agent_spec=_native_spec,
                             skills_filter=_native_skills_filter,
+                            auth_token_factory=auth_token_factory,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -13759,6 +13845,13 @@ def create_runner_app(
                 else cached_spec
             )
 
+        if conv not in _session_histories:
+            _session_histories[conv] = await _load_history_as_input(conv)
+        rename_instruction = session_rename_instruction(
+            initial_session=_is_first_user_turn(_session_histories[conv])
+        )
+        framework_instructions = (rename_instruction,) if rename_instruction else ()
+
         harness_name: str | None = None
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
@@ -13782,15 +13875,18 @@ def create_runner_app(
                 # readout). Forwarded by the Omnigent server in the message body.
                 model_override=msg_body.get("model_override"),
             )
-            from omnigent.runtime.prompt import (
-                build_instructions,
-            )
+            from omnigent.runtime.prompt import build_instructions
 
             instructions = build_instructions(
                 cached_spec,
                 None,
                 [],
+                framework_instructions=framework_instructions,
             )
+        elif framework_instructions:
+            from omnigent.runtime.prompt import append_framework_instructions
+
+            instructions = append_framework_instructions(None, framework_instructions)
 
         ctx = TurnDispatch(
             agent_id=msg_body.get("agent_id"),
@@ -13802,9 +13898,6 @@ def create_runner_app(
             ),
             instructions=instructions,
         )
-
-        if conv not in _session_histories:
-            _session_histories[conv] = await _load_history_as_input(conv)
 
         harness_body: dict[str, Any] = {
             "type": "message",
@@ -14012,48 +14105,31 @@ def create_runner_app(
                 await_notify=False,
             )
 
-        try:
-            response = await _stream_message_to_harness(
-                harness_body,
-                conv,
-                dispatch=ctx,
-            )
-            if isinstance(response, StreamingResponse):
-                await _drain_streaming_response(response, conv)
-            else:
-                err_detail = "harness returned error response"
-                if hasattr(response, "body"):
-                    with contextlib.suppress(
-                        UnicodeDecodeError,
-                        AttributeError,
-                    ):
-                        err_detail = response.body.decode(
-                            "utf-8",
-                        )[:200]
-                _logger.error(
-                    "turn bg error for %s: %s",
-                    conv,
-                    err_detail,
-                )
-                _on_proxy_stream_end(
-                    conv,
-                    error={"message": err_detail},
-                )
-        except _ContextWindowOverflow as overflow:
+        response = await _stream_message_to_harness(
+            harness_body,
+            conv,
+            dispatch=ctx,
+        )
+        if isinstance(response, StreamingResponse):
+            await _drain_streaming_response(response, conv)
+        else:
+            err_detail = "harness returned error response"
+            if hasattr(response, "body"):
+                with contextlib.suppress(
+                    UnicodeDecodeError,
+                    AttributeError,
+                ):
+                    err_detail = response.body.decode(
+                        "utf-8",
+                    )[:200]
             _logger.error(
-                "Context window exceeded for session=%s: %d > %d",
+                "turn bg error for %s: %s",
                 conv,
-                overflow.actual_tokens,
-                overflow.max_tokens,
+                err_detail,
             )
             _on_proxy_stream_end(
                 conv,
-                error={
-                    "message": (
-                        f"Context window exceeded: {overflow.actual_tokens} tokens "
-                        f"> {overflow.max_tokens} max"
-                    ),
-                },
+                error={"message": err_detail},
             )
 
     async def _drain_streaming_response(
@@ -14084,8 +14160,6 @@ def create_runner_app(
             _active_turns.pop(session_id, None)
             _live_response_id.pop(session_id, None)
             _publish_turn_status(session_id, "idle")
-            raise
-        except _ContextWindowOverflow:
             raise
         except (httpx.HTTPError, RuntimeError, StopAsyncIteration) as exc:
             _logger.error(
@@ -14842,6 +14916,29 @@ def create_runner_app(
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
                     _on_proxy_stream_end(conv_id, error=_stream_failed_error)
+
+            except _ContextWindowOverflow as overflow:
+                # Handled here, not by the callers of proxy_stream, so the
+                # in-flight marker is cleared on every caller (live-stream
+                # and background turns alike). Missing this used to leave
+                # the marker set forever, hiding the harness process from
+                # the idle reaper for the rest of the server's lifetime.
+                _error = {
+                    "code": "context_length_exceeded",
+                    "message": (
+                        f"Context window exceeded: {overflow.actual_tokens} tokens "
+                        f"> {overflow.max_tokens} max"
+                    ),
+                    "type": "_ContextWindowOverflow",
+                }
+                _overflow_fail = {
+                    "type": "response.failed",
+                    "response": {"status": "failed", "error": _error},
+                    "error": _error,
+                }
+                _publish_event(conv_id, _overflow_fail)
+                _on_proxy_stream_end(conv_id, error=_error)
+                yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
                 # RuntimeError covers httpx.StreamClosed which
@@ -15920,6 +16017,7 @@ def create_runner_app(
                         _publish_event,
                         server_client=server_client,
                         agent_spec=claude_agent_spec,
+                        auth_token_factory=auth_token_factory,
                     )
                 except Exception as exc:
                     _logger.exception(

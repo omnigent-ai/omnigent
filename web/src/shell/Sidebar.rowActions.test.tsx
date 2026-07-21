@@ -94,7 +94,8 @@ const CONV: Conversation = {
   created_at: 1_700_000_000,
   updated_at: 1_700_000_000,
   labels: {},
-  permission_level: null, // owner → can edit + pin
+  permission_level: null,
+  // owner absent → the viewer owns it (rename/share/pin all enabled)
   status: "idle",
 };
 
@@ -335,11 +336,11 @@ describe("double-click to rename", () => {
   });
 
   it("does not enter rename on double-click for a viewer-only row", () => {
-    // permission_level 1 is below the edit threshold (>= 2), so the kebab's
-    // Rename item is disabled and double-click must be inert too. A viewer-only
-    // (non-owner) session lives on the "Shared with me" tab, so switch to it
+    // Rename is owner-only now, so a session owned by another user has its
+    // kebab Rename item disabled and double-click must be inert too. A
+    // non-owner session lives on the "Shared with me" tab, so switch to it
     // before reaching for the row.
-    mockConversations([{ ...CONV, permission_level: 1 }]);
+    mockConversations([{ ...CONV, owner: "other@example.com" }]);
     renderSidebar();
     // Radix Tabs triggers activate on mousedown (primary button), not click.
     fireEvent.mouseDown(screen.getByTestId("sidebar-tab-shared"), { button: 0 });

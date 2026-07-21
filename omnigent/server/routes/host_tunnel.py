@@ -5,10 +5,10 @@ outbound WebSocket. The server sends control frames
 (launch/stop runner) over the tunnel; the host process spawns
 or terminates runner subprocesses accordingly.
 
-Per ``designs/DAEMON_API.md``, the host sends a ``host.hello``
-frame on connect advertising its version, name, and live runner
-IDs. The server validates ``frame_protocol_version`` for
-version-skew enforcement (strict-major).
+The host sends a ``host.hello`` frame on connect advertising its
+version, name, live runner IDs, and harness readiness, then reports
+readiness changes while connected. The server validates
+``frame_protocol_version`` for version-skew enforcement (strict-major).
 
 The endpoint registers the host in the :class:`HostRegistry`
 (in-memory, per-replica) and upserts the host in the ``hosts``
@@ -30,6 +30,7 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostFsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
@@ -70,6 +71,7 @@ def create_host_tunnel_router(
     auth_provider: AuthProvider | None = None,
     on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
+    on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
@@ -102,6 +104,8 @@ def create_host_tunnel_router(
         runner-tunnel ``on_runner_disconnect`` path never fires).
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
+    :param on_host_update: Optional async callback fired when a connected
+        host reports changed harness readiness. Receives ``host_id`` and owner.
     :param local_single_user: When ``True``, allow a host to re-own a
         ``host_id`` already registered under a different owner — needed
         only for the single-user loopback local server, where the owner
@@ -268,7 +272,15 @@ def create_host_tunnel_router(
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
-                _receive_loop(ws, conn, host_id, runner_exit_reports, on_runner_exited),
+                _receive_loop(
+                    ws,
+                    conn,
+                    host_id,
+                    host_store,
+                    runner_exit_reports,
+                    on_runner_exited,
+                    on_host_update,
+                ),
                 name=f"host-receive:{host_id}",
             )
 
@@ -384,18 +396,23 @@ async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
     host_id: str,
+    host_store: HostStore,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection for resolving pending requests.
     :param host_id: Host id for logging.
+    :param host_store: Persistent store receiving live readiness updates.
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
         when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_host_update: Callback fired after readiness changes persist;
+        ``None`` skips it.
     """
     while True:
         message = await ws.receive()
@@ -442,6 +459,20 @@ async def _receive_loop(
                 host_id,
                 type(runner_frame).__name__,
             )
+            continue
+
+        if isinstance(frame, HostHarnessReadinessFrame):
+            await asyncio.to_thread(
+                host_store.update_harness_readiness,
+                host_id,
+                frame.configured_harnesses,
+            )
+            conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            if on_host_update is not None:
+                try:
+                    await on_host_update(host_id, conn.owner)
+                except Exception:
+                    _logger.exception("on_host_update callback failed for %s", host_id)
             continue
 
         if isinstance(frame, HostLaunchRunnerResultFrame):

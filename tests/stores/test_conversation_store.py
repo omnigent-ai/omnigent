@@ -76,6 +76,28 @@ def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> Non
     assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 
 
+def test_rename_conversation_if_title_matches_is_atomic(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation(title="original request title")
+
+    renamed = conversation_store.rename_conversation_if_title_matches(
+        conv.id,
+        "original request title",
+        "Debug request timeout",
+    )
+    stale = conversation_store.rename_conversation_if_title_matches(
+        conv.id,
+        "original request title",
+        "Overwrite manual title",
+    )
+
+    assert renamed is not None
+    assert renamed.title == "Debug request timeout"
+    assert stale is None
+    assert conversation_store.get_conversation(conv.id).title == "Debug request timeout"  # type: ignore[union-attr]
+
+
 def test_get_conversations_bulk(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -657,20 +679,18 @@ def test_position_ordering(conversation_store: SqlAlchemyConversationStore) -> N
     assert texts == ["First", "Second"]
 
 
-def test_unique_position_constraint(
+def test_position_not_enforced_by_db(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    The (conversation_id, position, created_at) tuple has a unique index.
+    The position index is plain (non-unique): the DB permits duplicate positions.
 
-    created_at joined the index for partition-readiness (unique indexes must
-    contain a partition key), so the DB safety net blocks duplicate positions
-    only within the same epoch second — which still covers the concurrent
-    double-append race. Slower duplicates are prevented by the next_position
-    allocator, not the index.
+    Strict position uniqueness is owned by the ``next_position`` allocator under
+    ``_lock_conversation`` (proven by
+    ``test_concurrent_appends_do_not_collide_on_position``), not the index — no
+    code catches a position IntegrityError. This documents that raw
+    duplicate-position inserts are accepted at the DB level.
     """
-    from sqlalchemy.exc import IntegrityError
-
     from omnigent.db.db_models import SqlConversationItem
     from omnigent.db.enum_codecs import encode_item_status, encode_item_type
     from omnigent.db.utils import generate_item_id
@@ -704,13 +724,10 @@ def test_unique_position_constraint(
             search_text="",
         )
 
-    # Same second (the double-append race shape): the index rejects it.
-    with pytest.raises(IntegrityError):
-        with conversation_store._session() as session:
-            session.add(_duplicate_position_row(existing_created_at))
-
-    # A different second slips past the index; only the next_position
-    # allocator prevents this in real appends.
+    # Neither a same-second nor a later-second duplicate is rejected now: the
+    # index is not UNIQUE, and distinct ids keep the PK unique so both persist.
+    with conversation_store._session() as session:
+        session.add(_duplicate_position_row(existing_created_at))
     with conversation_store._session() as session:
         session.add(_duplicate_position_row(existing_created_at + 1))
 

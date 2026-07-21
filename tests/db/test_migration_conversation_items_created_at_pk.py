@@ -30,7 +30,6 @@ _TABLE = "conversation_items"
 _POSITION_INDEX = "ix_conversation_items_conversation_id_position"
 _HEAD_PK = ["workspace_id", "conversation_id", "id", "created_at"]
 _PRIOR_PK = ["workspace_id", "conversation_id", "id"]
-_HEAD_INDEX = ["workspace_id", "conversation_id", "position", "created_at"]
 _PRIOR_INDEX = ["workspace_id", "conversation_id", "position"]
 
 # An UPDATE targeting the items table itself (not the FTS shadow table).
@@ -54,15 +53,22 @@ def _message(text: str, response_id: str = "resp_1") -> NewConversationItem:
     )
 
 
-def test_head_pk_and_unique_index_include_created_at(tmp_path: Path) -> None:
-    """At head both the PK and the unique position index end in created_at."""
+def test_head_pk_includes_created_at_and_position_index_is_plain(tmp_path: Path) -> None:
+    """At head the PK still ends in created_at, but the position index is plain.
+
+    z8 added created_at to both the PK and the (then-UNIQUE) position index for
+    partition-readiness. A later migration (c7d2e9f4a1b8) repointed the position
+    index to a plain ``(workspace_id, conversation_id, position)`` — strict
+    position uniqueness is owned by the next_position allocator, not the DB. The
+    PK keeps created_at, so the table stays partition-ready.
+    """
     uri = f"sqlite:///{tmp_path / 'head.db'}"
     engine = get_or_create_engine(uri)
     try:
         assert _pk(engine) == _HEAD_PK
         index = _position_index(engine)
-        assert index["column_names"] == _HEAD_INDEX
-        assert index["unique"]
+        assert index["column_names"] == _PRIOR_INDEX  # created_at dropped by c7d2e9f4a1b8
+        assert not index["unique"]  # uniqueness moved to the app allocator
     finally:
         engine.dispose()
         clear_engine_cache()

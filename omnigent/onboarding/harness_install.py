@@ -42,6 +42,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from omnigent._platform import resolve_cli_binary
 from omnigent.harness_install_spec import HarnessInstallSpec
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
@@ -298,14 +299,15 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
 
 
 def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
-    """Return a harness's required CLI spec when that CLI is absent from ``PATH``.
+    """Return a harness's required CLI spec when that CLI can't be resolved.
 
     Combines :func:`required_cli_for_harness` with the same
-    ``shutil.which`` probe :func:`harness_cli_installed` uses, so the
-    verdict matches what the harness's own launch will see (both read the
-    process ``PATH``). Used by sub-agent dispatch to fail loud *before*
-    spawning a worker whose harness can never boot here, instead of letting
-    the missing binary surface as a lazy, generic turn failure.
+    :func:`resolve_cli_binary` probe :func:`harness_cli_installed` uses, so the
+    verdict matches what the harness's own launch will see (both check ``PATH``
+    plus the common global install dirs the host daemon's frozen ``PATH`` may
+    omit). Used by sub-agent dispatch to fail loud *before* spawning a worker
+    whose harness can never boot here, instead of letting the missing binary
+    surface as a lazy, generic turn failure.
 
     :param harness: An executor harness identifier, e.g. ``"pi"`` or
         ``"claude-native"``.
@@ -316,7 +318,7 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     spec = required_cli_for_harness(harness)
     if spec is None:
         return None
-    if shutil.which(spec.binary) is not None:
+    if resolve_cli_binary(spec.binary) is not None:
         return None
     return spec
 
@@ -364,21 +366,23 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
 
 
 def harness_cli_installed(key: str) -> bool:
-    """Return whether the harness's CLI binary is on ``PATH``.
+    """Return whether the harness's CLI binary can be resolved.
 
-    "Installed" is deliberately the CLI binary (``shutil.which``), matching
-    ucode and the npm install-prompt UX — even though the SDK-based
-    ``claude-sdk`` harness can run without the ``claude`` CLI.
+    "Installed" is deliberately the CLI binary (:func:`resolve_cli_binary` —
+    ``PATH`` plus the common global install dirs the host daemon's frozen
+    ``PATH`` may omit), matching ucode and the npm install-prompt UX — even
+    though the SDK-based ``claude-sdk`` harness can run without the ``claude``
+    CLI.
 
     :param key: A harness family (``"anthropic"`` / ``"openai"``) or
         :data:`PI_KEY` / :data:`KIMI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH``; ``False`` when it isn't or
+    :returns: ``True`` when the CLI resolves; ``False`` when it doesn't or
         the key has no associated CLI.
     """
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    return shutil.which(spec.binary) is not None
+    return resolve_cli_binary(spec.binary) is not None
 
 
 def harness_install_command(key: str) -> list[str]:
@@ -429,20 +433,27 @@ def install_harness_cli(key: str) -> bool:
         subprocess.run(cmd, check=False, timeout=300)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    if harness_cli_installed(key):
+    # harness_install_command would have raised for a spec-less key, so spec is
+    # non-None past this point.
+    assert spec is not None
+    # This is the setup flow's own process: check bare ``PATH`` (not the
+    # resolve_cli_binary ladder), because the point of the ~/.local/bin refresh
+    # below is to make the binary reachable via ``PATH`` for this process — the
+    # subsequent harness_login/harness_cli_logged_in shell out with the bare
+    # binary name and rely on the inherited ``PATH``.
+    if shutil.which(spec.binary) is not None:
         return True
 
     # uv-based vendor installers commonly place entry points here and update
     # shell startup files, which cannot change this already-running process.
-    if spec is not None:
-        user_bin = Path.home() / ".local" / "bin"
-        candidate = user_bin / spec.binary
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            current_path = os.environ.get("PATH", "")
-            path_entries = current_path.split(os.pathsep) if current_path else []
-            if str(user_bin) not in path_entries:
-                os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
-    return harness_cli_installed(key)
+    user_bin = Path.home() / ".local" / "bin"
+    candidate = user_bin / spec.binary
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        current_path = os.environ.get("PATH", "")
+        path_entries = current_path.split(os.pathsep) if current_path else []
+        if str(user_bin) not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
+    return shutil.which(spec.binary) is not None
 
 
 def harness_cli_logged_in(key: str) -> bool:

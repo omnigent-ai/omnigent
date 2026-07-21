@@ -173,7 +173,7 @@ document without running the harness.
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "generated_at": "<ISO-8601 UTC>",
   "git_sha": "<HEAD sha>",
   "git_branch": "<branch>",
@@ -192,9 +192,13 @@ document without running the harness.
          "wall_time_s": …, "mean_ms": …, "p50_ms": …, "p95_ms": …,
          "p99_ms": …, "max_ms": …, "rps": …}
       ],
-      "summary": {"avg_mean_ms": …, "avg_p50_ms": …, "avg_p95_ms": …,
-                  "avg_p99_ms": …, "avg_rps": …}    // averaged across runs
+      "summary": {"runs_total": 3, "runs_ok": 3,   // how many runs the averages cover
+                  "avg_mean_ms": …, "avg_p50_ms": …, "avg_p95_ms": …,
+                  "avg_p99_ms": …, "avg_rps": …}    // averaged over the runs_ok runs
     }
+    // A journey that errored out of measurement entirely instead carries:
+    //   {"kind", "backend", "needs_runner", "runs": [], "summary": {},
+    //    "skipped": true, "error": "HTTPStatusError: ..."}
   }
 }
 ```
@@ -202,6 +206,19 @@ document without running the harness.
 The per-journey `summary` + `runs` shape mirrors MLflow's gateway benchmark, so
 the same ETL flatten works — keyed by `journey` and `backend`. Bump
 `SCHEMA_VERSION` on any breaking shape change so the notebook can branch on it.
+
+**Failures never abort the run.** A per-operation error is recorded in that
+run's `failures` breakdown (keyed `HTTP 500` etc.); a run in which *every*
+operation failed keeps its per-run row but is excluded from the `summary`
+averages (`runs_ok` < `runs_total`) so a failed run can't masquerade as an
+infinitely fast one. A journey whose `setup` fails (e.g. a 500 resolving a
+target session — the exact crash this harness used to die on) records a single
+`setup: HTTP 500` failed run and moves on. Any other unexpected per-journey
+error is caught in `run.py`, recorded as `"skipped": true` with the `error`
+string, and the remaining journeys still run. Skips/all-failed journeys are
+non-fatal on their own, but if any CI threshold (`--max-p50-ms` etc.) is
+supplied, a journey with no successful sample fails the gate — the guarantee
+couldn't be verified.
 
 ## Layout
 

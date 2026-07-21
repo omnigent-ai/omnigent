@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     SqlAgent,
-    SqlAgentConfiguration,
+    SqlConversation,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import encode_agent_kind
@@ -63,10 +63,10 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         Reverse-lookup the conversation bound to a session-scoped agent.
 
-        ``agent_configuration.agent_id`` is the sole link (the agent row
-        carries no back-pointer), and the ``agent_configuration`` table lives
-        in the AP DB — so this must run on the conversation engine, not
-        the Omnigent engine that owns the ``agents`` table.
+        ``conversations.agent_id`` is the sole link (the agent row carries no
+        back-pointer), and the ``conversations`` table lives in the AP DB — so
+        this must run on the conversation engine, not the Omnigent engine that
+        owns the ``agents`` table.
 
         :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
         :returns: Owning conversation id, or ``None`` when no
@@ -74,10 +74,10 @@ class SqlAlchemyAgentStore(AgentStore):
         """
         with self._conv_session() as conv_sess:
             return conv_sess.execute(
-                select(SqlAgentConfiguration.conversation_id)
+                select(SqlConversation.id)
                 .where(
-                    SqlAgentConfiguration.workspace_id == current_workspace_id(),
-                    SqlAgentConfiguration.agent_id == agent_id,
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.agent_id == agent_id,
                 )
                 .limit(1)
             ).scalar_one_or_none()
