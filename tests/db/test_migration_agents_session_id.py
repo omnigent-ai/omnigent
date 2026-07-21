@@ -48,16 +48,15 @@ def test_agents_session_id_index_removed(db_engine: Engine) -> None:
     assert "ix_agents_session_id" not in index_names
 
 
-def test_ix_agent_configuration_agent_id_added(db_engine: Engine) -> None:
-    """The agent-lookup index lives on agent_configuration at head.
+def test_ix_conversations_agent_id_present(db_engine: Engine) -> None:
+    """The agent-lookup index lives back on conversations at head.
 
-    ix_conversations_agent_id moved there when the agent binding split
-    out of conversations.
+    The agent binding merged back onto conversations (dropping the
+    agent_configuration table), so the index is ix_conversations_agent_id.
     """
+    assert "agent_configuration" not in set(sa.inspect(db_engine).get_table_names())
     conv_indexes = {i["name"] for i in sa.inspect(db_engine).get_indexes("conversations")}
-    assert "ix_conversations_agent_id" not in conv_indexes
-    ra_indexes = {i["name"] for i in sa.inspect(db_engine).get_indexes("agent_configuration")}
-    assert "ix_agent_configuration_agent_id" in ra_indexes
+    assert "ix_conversations_agent_id" in conv_indexes
 
 
 def test_agents_name_index_exists(db_engine: Engine) -> None:
@@ -122,7 +121,7 @@ def test_session_agent_kind_stored_and_read(db_engine: Engine) -> None:
 
 
 def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> None:
-    """agent_configuration.agent_id (forward pointer) accepts a valid agent id."""
+    """conversations.agent_id (forward pointer) accepts a valid agent id."""
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
@@ -137,35 +136,28 @@ def test_agents_session_id_fk_accepts_existing_session(db_engine: Engine) -> Non
                 "loc": "552f255351da28d9c68a67cc9758840d/bundle",
             },
         )
-        # The agent binding lives on agent_configuration, paired 1:1 with
-        # the conversations row.
+        # The agent binding lives on the conversations row itself.
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id)"
-                " VALUES (:id, :ts, :ts, :id)"
-            ),
-            {"id": "e6c4a1ce71909cfba7d30a314c5f94ee", "ts": 1700000002},
-        )
-        conn.execute(
-            sa.text(
-                "INSERT INTO agent_configuration (conversation_id, agent_id)"
-                " VALUES (:id, :agent_id)"
+                " (id, created_at, updated_at, root_conversation_id, agent_id)"
+                " VALUES (:id, :ts, :ts, :id, :agent_id)"
             ),
             {
                 "id": "e6c4a1ce71909cfba7d30a314c5f94ee",
+                "ts": 1700000002,
                 "agent_id": "552f255351da28d9c68a67cc9758840d",
             },
         )
         stored = conn.execute(
-            sa.text("SELECT agent_id FROM agent_configuration WHERE conversation_id = :id"),
+            sa.text("SELECT agent_id FROM conversations WHERE id = :id"),
             {"id": "e6c4a1ce71909cfba7d30a314c5f94ee"},
         ).scalar_one()
     assert stored == "552f255351da28d9c68a67cc9758840d"
 
 
 def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None:
-    """Without DB FK, agent_configuration.agent_id accepts any value including nonexistent agents.
+    """Without DB FK, conversations.agent_id accepts any value including nonexistent agents.
 
     Referential integrity is now the application's responsibility.
     """
@@ -174,29 +166,17 @@ def test_agents_session_id_fk_rejects_missing_session(db_engine: Engine) -> None
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (id, created_at, updated_at, root_conversation_id)"
-                " VALUES (:id, :ts, :ts, :id)"
-            ),
-            {"id": "5eca720dc2bc6cdc3a99028d7bd0f917", "ts": 1700000002},
-        )
-        conn.execute(
-            sa.text(
-                "INSERT INTO agent_configuration (conversation_id, agent_id)"
-                " VALUES (:id, :agent_id)"
+                " (id, created_at, updated_at, root_conversation_id, agent_id)"
+                " VALUES (:id, :ts, :ts, :id, :agent_id)"
             ),
             {
                 "id": "5eca720dc2bc6cdc3a99028d7bd0f917",
+                "ts": 1700000002,
                 "agent_id": "5ff5b2e31fe10beb80134394037b17b0",
             },
         )
     # Clean up
     with db_engine.begin() as conn:
-        conn.execute(
-            sa.text(
-                "DELETE FROM agent_configuration "
-                "WHERE conversation_id = '5eca720dc2bc6cdc3a99028d7bd0f917'"
-            )
-        )
         conn.execute(
             sa.text("DELETE FROM conversations WHERE id = '5eca720dc2bc6cdc3a99028d7bd0f917'")
         )
@@ -365,21 +345,16 @@ def test_agents_session_id_downgrade_round_trip(tmp_path: Path) -> None:
                 " 'my-session', '372d0296768feff7262c605c5553d1da/b', 1, 2)"
             )
         )
+        # agent_id lives back on conversations at head (the agent_configuration
+        # table was merged away). The downgrade chain moves it out to
+        # agent_configuration and back before the older downgrades read it.
         conn.execute(
             sa.text(
                 "INSERT INTO conversations"
-                " (workspace_id, id, created_at, updated_at, root_conversation_id, title)"
+                " (workspace_id, id, created_at, updated_at, root_conversation_id, title,"
+                " agent_id)"
                 " VALUES (0, '8e32600337d08f59ad381caf96a90659', 3, 3,"
-                " '8e32600337d08f59ad381caf96a90659', '')"
-            )
-        )
-        # agent_id lives on agent_configuration at head; the bb2c3d4e5f6a
-        # downgrade restores it to conversations before the older
-        # downgrades read it.
-        conn.execute(
-            sa.text(
-                "INSERT INTO agent_configuration (workspace_id, conversation_id, agent_id)"
-                " VALUES (0, '8e32600337d08f59ad381caf96a90659',"
+                " '8e32600337d08f59ad381caf96a90659', '',"
                 " '372d0296768feff7262c605c5553d1da')"
             )
         )

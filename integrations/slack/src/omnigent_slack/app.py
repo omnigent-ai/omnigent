@@ -7,6 +7,14 @@ from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
+from omnigent_slack.approvals import (
+    ACTION_APPROVE,
+    ACTION_DENY,
+    ACTION_FORM_ANSWER,
+    ACTION_FORM_CANCEL,
+    ACTION_FORM_SUBMIT,
+    route_elicitation_click,
+)
 from omnigent_slack.auth_manager import AuthManager, pack_user_key
 from omnigent_slack.config import load_settings
 from omnigent_slack.omnigent import OmnigentClientPool
@@ -110,3 +118,29 @@ def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:
         if not body.get("team_id") and not event.get("team"):
             return
         await service.handle_message(body=body, event=event, client=client, context=context)
+
+    @app.action(ACTION_APPROVE)
+    async def handle_approve(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=True)
+
+    @app.action(ACTION_DENY)
+    async def handle_deny(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=False)
+
+    @app.action(ACTION_FORM_SUBMIT)
+    async def handle_form_submit(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=True, is_form_submit=True)
+
+    @app.action(ACTION_FORM_CANCEL)
+    async def handle_form_cancel(ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        await route_elicitation_click(service, client, body, accepted=False, is_form_submit=True)
+
+    @app.action(ACTION_FORM_ANSWER)
+    async def handle_form_answer(ack: Any) -> None:
+        # Radio/checkbox selection changes are read from state.values at submit
+        # time; ack each change so Slack doesn't flag an unhandled interaction.
+        await ack()

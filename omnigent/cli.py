@@ -35,6 +35,7 @@ from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
+    _merge_effective_config,
     global_config_path,
     load_global_config,
     load_local_config,
@@ -79,6 +80,111 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
         return {}
     with open(path) as f:
         return yaml.safe_load(f) or {}
+
+
+def _parse_model_prefixes(
+    raw: Any,  # type: ignore[explicit-any]  # str | list | None from YAML
+) -> list[str]:
+    """Normalize the ``model_prefix`` config into a list of prefixes.
+
+    Accepts a single string (``"databricks-"``) or a list
+    (``["databricks-", "system.ai."]``); blanks are dropped. Returns an
+    empty list when unset, so catalog ids are sent verbatim.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+
+
+def _build_external_routing_client(
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
+    """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
+
+    Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
+    an explicit, provider-agnostic ``api_key`` (``${ENV}`` expanded) wins,
+    else the Databricks ``profile`` convenience, else unauthenticated.
+    Optional ``model_prefix`` (a single prefix or a list of prefixes) is
+    stripped from catalog model ids sent to the router (and restored on its
+    answer) — e.g. ``"databricks-"`` when serving-endpoint names carry that
+    prefix but the router keys on bare ids, or ``"system.ai."`` for Unity
+    Catalog foundation-model ids.
+
+    :param routing_cfg: The parsed ``routing:`` mapping (a dict with
+        ``provider == "external"``, per the caller).
+    :returns: A configured client, or ``None`` when required config is
+        missing (a warning is logged; routing stays off rather than raising).
+    """
+    base_url = (routing_cfg.get("base_url") or "").strip()
+    router_name = (routing_cfg.get("router_name") or "").strip()
+    api_key = (routing_cfg.get("api_key") or "").strip()
+    profile = (routing_cfg.get("profile") or "").strip()
+    model_prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
+
+    if not base_url or not router_name:
+        click.echo(
+            "routing.provider=external requires base_url and router_name; skipping",
+            err=True,
+        )
+        return None
+
+    from omnigent.server.smart_routing import _bearer_auth
+
+    # Auth precedence mirrors the ``llm:`` block: an explicit (provider-
+    # agnostic) api_key wins, else the Databricks ``profile`` convenience,
+    # else unauthenticated.
+    auth = None
+    if api_key:
+        from omnigent.spec import expand_env_vars
+
+        auth = _bearer_auth(expand_env_vars({"api_key": api_key})["api_key"])
+    elif profile:
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        try:
+            creds = resolve_databricks_workspace(profile)
+            auth = _bearer_auth(creds.token)
+        except OSError:
+            click.echo(
+                f"routing.profile={profile} could not be resolved; calling router unauthenticated",
+                err=True,
+            )
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    return ExternalRoutingClient(
+        base_url=base_url,
+        router_name=router_name,
+        auth=auth,
+        model_prefixes=model_prefixes,
+    )
+
+
+def _build_local_llm_routing_client(
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
+    """Build the built-in :class:`LLMRoutingClient` from the ``llm:`` block.
+
+    :param server_llm: The parsed server-level ``LLMConfig``.
+    :returns: A configured client, or ``None`` when there is no ``llm:``
+        block (or its policy client can't be built).
+    """
+    if server_llm is None:
+        return None
+    from omnigent.runtime.policies.builder import (
+        _build_policy_llm_client,
+        _resolve_server_llm_connection,
+    )
+
+    conn = _resolve_server_llm_connection(server_llm)
+    policy_client = _build_policy_llm_client(server_llm, conn)
+    if policy_client is None:
+        return None
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    return LLMRoutingClient(policy_client)
 
 
 def _server_uvicorn_log_config(
@@ -490,9 +596,14 @@ def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     → local (``.omnigent/config.yaml`` in cwd).  Project config
     always wins so per-repo settings override user defaults.
 
+    The ``harness`` mapping is deep-merged (per-harness sub-keys, local
+    winning per-field) via :func:`omnigent.config._merge_effective_config`
+    so a project's per-harness overrides augment — rather than replace —
+    the user's global ones. Every other key is a shallow replace.
+
     :returns: Merged config dict.
     """
-    return {**_load_global_config(), **_load_local_config()}
+    return _merge_effective_config(_load_global_config(), _load_local_config())
 
 
 def _peek_default_agent_harness(target: str) -> str | None:
@@ -747,6 +858,35 @@ def _resolve_auto_open_conversation_from_config(cfg: dict[str, Any]) -> bool:  #
     return setting if setting is not None else False
 
 
+def _normalize_harness_scalar_on_write(
+    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    path: Path,
+) -> bool:
+    """Migrate a legacy scalar ``harness:`` to the mapping form in *cfg*.
+
+    Rewrites ``cfg["harness"]`` from a plain string (``harness: claude-sdk``)
+    to ``{"default": <str>}`` in place, preserving any per-harness overrides
+    that a prior write may already have introduced under a partial mapping.
+    Returns ``True`` when a scalar was actually migrated so the caller can
+    emit the one-time notice. A no-op when ``harness`` is already a mapping,
+    absent, or not a string. Behavior is unchanged by the migration — the
+    scalar was the default, and ``{"default": <scalar>}`` means the same.
+
+    :param cfg: The config dict about to be written (mutated in place).
+    :param path: The config file path (for the one-time notice message).
+    :returns: ``True`` iff a scalar was migrated.
+    """
+    raw = cfg.get("harness")
+    if not isinstance(raw, str):
+        return False
+    cfg["harness"] = {"default": raw}
+    click.echo(
+        f"omnigent: migrated `harness:` to the new mapping form in {path} (behavior unchanged)",
+        err=True,
+    )
+    return True
+
+
 def _save_global_config(  # type: ignore[explicit-any]
     # Any (matching the yaml-boundary helpers above): config values are
     # heterogeneous YAML scalars and nested mappings — e.g. the providers:
@@ -800,6 +940,7 @@ def _save_global_config(  # type: ignore[explicit-any]
     for key in unset_keys:
         cfg.pop(key, None)
     path = _effective_global_config_path()
+    _normalize_harness_scalar_on_write(cfg, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
@@ -853,26 +994,41 @@ def _materialize_internal_beta_agents() -> Path:
 
 
 def _save_local_config(
-    settings: dict[str, str | bool],
+    settings: dict[str, str | bool | Mapping[str, Any]],  # type: ignore[explicit-any]
     unset_keys: tuple[str, ...] = (),
+    deep_merge_keys: tuple[str, ...] = (),
 ) -> None:
     """
     Merge *settings* into ``.omnigent/config.yaml`` in cwd and remove
     any keys listed in *unset_keys*.
 
-    Creates the ``.omnigent/`` directory if it does not exist.
+    Creates the ``.omnigent/`` directory if it does not exist. Mirrors
+    :func:`_save_global_config`: keys in *deep_merge_keys* are merged one
+    level deep into the existing mapping (used by ``config set harness=``)
+    so a per-harness default can be set without dropping existing
+    per-harness overrides; every other key is a shallow replace.
 
     :param settings: Key/value pairs to set, e.g.
         ``{"default_agent": "examples/agent.yaml",
         "auto_open_conversation": True}``.
-    :param unset_keys: Keys to remove from the config, e.g.
-        ``("server",)``.
+    :param unset_keys: Keys to remove from the config, e.g. ``("server",)``.
+    :param deep_merge_keys: Keys whose mapping value should be merged one
+        level deep into the existing mapping rather than replacing it,
+        e.g. ``("harness",)``.
     """
     path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     cfg = _load_local_config()
-    cfg.update(settings)
+    for key, value in settings.items():
+        if key in deep_merge_keys and isinstance(value, Mapping):
+            existing = cfg.get(key)
+            merged = dict(existing) if isinstance(existing, Mapping) else {}
+            merged.update(value)
+            cfg[key] = merged
+        else:
+            cfg[key] = value
     for key in unset_keys:
         cfg.pop(key, None)
+    _normalize_harness_scalar_on_write(cfg, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
@@ -1399,6 +1555,30 @@ def _should_skip_update_check(argv: list[str]) -> bool:
     }
 
 
+def _warn_deprecated_harness_path_env_vars() -> None:
+    """Print a terminal-visible deprecation notice for legacy ``HARNESS_*_PATH``.
+
+    These were the documented per-harness binary override knobs; they're now
+    replaced by ``OMNIGENT_<NAME>_PATH`` (one var per binary, ``-native`` suffix
+    stripped). The legacy read still works but is slated for removal in
+    v0.8.0. Surface the replacement at CLI startup so a user with a legacy var
+    in their shell/systemd/CI sees it regardless of which harness they launch
+    or whether the run is local or remote (the runner-side log warning only
+    reaches users on local launches). Gated to interactive stderr to avoid
+    noise in pipes/CI logs.
+    """
+    if not sys.stderr.isatty():
+        return
+    from omnigent.harness_startup_config import legacy_harness_path_env_vars_set
+
+    for legacy, canonical in legacy_harness_path_env_vars_set():
+        click.echo(
+            f"omnigent: {legacy} is deprecated; set {canonical} instead. "
+            f"{legacy} support will be removed in v0.8.0.",
+            err=True,
+        )
+
+
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -1420,6 +1600,16 @@ def main() -> None:
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
     """
+    # Friendly crash handler: replaces Python's raw traceback with a
+    # calm, branded crash screen + a one-tap path to file a GitHub issue
+    # (browser opens the repo's pre-filled bug-report template with the
+    # traceback, version, and OS in the Description field).
+    # Installed first so crashes anywhere below — argv shorthands, Click
+    # dispatch, imports — are all caught. See omnigent/crash_handler.py.
+    from omnigent.crash_handler import install_crash_handler
+
+    install_crash_handler(app_name="omnigent", repo="omnigent-ai/omnigent")
+
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
@@ -1511,6 +1701,14 @@ def main() -> None:
 
         maybe_show_update_notice()
 
+    # Terminal-visible deprecation notice for legacy ``HARNESS_*_PATH`` env
+    # vars (now ``OMNIGENT_<NAME>_PATH``). Same gating as the update notice so
+    # help/version/upgrade invocations stay quiet. The runner-side log warning
+    # only reaches users on local launches; this reaches the terminal for every
+    # interactive invocation regardless of local-vs-remote.
+    if not _should_skip_update_check(argv):
+        _warn_deprecated_harness_path_env_vars()
+
     try:
         cli(args=argv, standalone_mode=False)
     except click.ClickException as exc:
@@ -1525,10 +1723,19 @@ def main() -> None:
         click.echo("Aborted!", err=True)
         raise SystemExit(1) from exc
     except Exception as exc:
+        # Keep the diagnostics log line ("Details logged to …") — the
+        # always-on CLI log has more context than this single crash — then
+        # hand off to the friendly crash handler for the calm screen,
+        # de-emphasized traceback, and the bug-filing prompt. We drop the
+        # `omnigent setup` hint here: genuine crashes are rarely auth issues,
+        # and "run setup" would contradict the crash screen's reassurance.
+        # `handle_crash` renders the UX and we exit with code 1 (SystemExit
+        # does NOT re-trigger sys.excepthook, so there's no double render).
+        from omnigent.crash_handler import handle_crash
+
         log_cli_error_hint(exc)
-        if suggest_setup:
-            print_setup_hint()
-        raise
+        handle_crash(exc)
+        raise SystemExit(1) from exc
 
 
 def _is_run_shorthand(argv: list[str]) -> bool:
@@ -3194,6 +3401,9 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
 
     agent_store = SqlAlchemyAgentStore(db_uri, conv_db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
@@ -3201,6 +3411,7 @@ def server(
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
+    scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3221,23 +3432,20 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the default LLM-based routing client when BOTH the server
-    # has an ``llm:`` config AND the feature is explicitly enabled via
-    # OMNIGENT_SMART_ROUTING=1.  Hidden by default — managed deployments
-    # override RuntimeCaps.routing_client with their own implementation.
+    # Build the routing client when the feature is enabled via
+    # OMNIGENT_SMART_ROUTING=1. Two mutually-exclusive providers, chosen
+    # by ``routing.provider``:
+    #   - ``external``: call an external ``routes:select`` service.
+    #   - ``llm`` (default): the built-in judge using the ``llm:`` block.
+    # Hidden by default — managed deployments override
+    # RuntimeCaps.routing_client with their own implementation.
     routing_client = None
-    if server_llm is not None and os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
-        from omnigent.runtime.policies.builder import (
-            _build_policy_llm_client,
-            _resolve_server_llm_connection,
-        )
-
-        _conn = _resolve_server_llm_connection(server_llm)
-        _policy_client = _build_policy_llm_client(server_llm, _conn)
-        if _policy_client is not None:
-            from omnigent.server.smart_routing import LLMRoutingClient
-
-            routing_client = LLMRoutingClient(_policy_client)
+    if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
+        routing_cfg = cfg.get("routing")
+        if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+            routing_client = _build_external_routing_client(routing_cfg)
+        else:
+            routing_client = _build_local_llm_routing_client(server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
@@ -3354,6 +3562,7 @@ def server(
         agent_cache=agent_cache,
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
+        scheduled_task_store=scheduled_task_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,
@@ -4635,10 +4844,10 @@ def _reject_native_on_windows(harness: str) -> None:
     default=None,
     metavar="CMD",
     help=(
-        "Claude Code CLI executable to run. "
-        "Defaults to ``claude``. Use this when a wrapper binary replaces the "
-        "``claude`` CLI while preserving its interface (e.g. a custom launcher "
-        "that injects auth or environment before delegating to ``claude``)."
+        "[DEPRECATED] Claude Code CLI executable to run. Use the "
+        "``OMNIGENT_CLAUDE_PATH`` env var or the "
+        "``harness.claude-native.command`` config override instead; this "
+        "flag will be removed in a future release."
     ),
 )
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
@@ -4712,18 +4921,32 @@ def claude(
     )
 
     from omnigent.claude_native import run_claude_native
+    from omnigent.harness_startup_config import resolve_harness_command
 
     startup_profiler.mark("native module imported")
 
+    if claude_command:
+        click.echo(
+            "omnigent: `claude --command` is deprecated; set OMNIGENT_CLAUDE_PATH "
+            "or harness.claude-native.command instead. The --command flag will "
+            "be removed in a future release.",
+            err=True,
+        )
+    resolved_command = resolve_harness_command(
+        "claude-native",
+        default="claude",
+        explicit=claude_command,
+        cfg=cfg,
+    )
     run_claude_native(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        claude_args=claude_args,
+        claude_args=_resolve_harness_startup_args(cfg, "claude-native", claude_args),
         use_claude_config=use_claude_config,
         auto_open_conversation=auto_open_conversation,
         startup_profiler=startup_profiler,
-        **({"command": claude_command} if claude_command else {}),
+        command=resolved_command,
     )
 
 
@@ -4805,6 +5028,7 @@ def codex(
         )
 
     from omnigent.codex_native import run_codex_native
+    from omnigent.harness_startup_config import resolve_harness_command
 
     cfg = _load_effective_config()
     if server is None:
@@ -4835,14 +5059,21 @@ def codex(
         choice.conversation_id if choice.conversation_id is not None else session_id
     )
 
+    resolved_command = resolve_harness_command(
+        "codex-native",
+        default="codex",
+        explicit=None,
+        cfg=cfg,
+    )
     run_codex_native(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        codex_args=codex_args,
+        codex_args=_resolve_harness_startup_args(cfg, "codex-native", codex_args),
         model=model,
         prompt=prompt,
         auto_open_conversation=auto_open_conversation,
+        command=resolved_command,
     )
 
 
@@ -4897,6 +5128,11 @@ def opencode(
     # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
     # :param model: OpenCode model id pinned on the wrapper spec.
     # :param opencode_args: Pass-through args persisted for the ``opencode attach`` TUI.
+    # NOTE: no ``--command`` flag — override the opencode binary via
+    # ``OMNIGENT_OPENCODE_PATH`` or ``harness.opencode-native.command`` config.
+    # (opencode-native resolves its binary on the runner side; if a spec/env
+    # path to thread a client override through is added later, this stays
+    # consistent with the other native commands' env/config override model.)
     """Launch OpenCode TUI in an Omnigent terminal.
 
     \b
@@ -4939,7 +5175,7 @@ def opencode(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        opencode_args=opencode_args,
+        opencode_args=_resolve_harness_startup_args(cfg, "opencode-native", opencode_args),
         model=model,
         auto_open_conversation=auto_open_conversation,
     )
@@ -5005,9 +5241,18 @@ def pi(
             "prefer --resume (--session is deprecated).",
         )
 
+    from omnigent.harness_startup_config import resolve_harness_command
     from omnigent.pi_native import run_pi_native
 
     cfg = _load_effective_config()
+    # Thread ``harness.pi-native.command`` config into the runner via the
+    # canonical ``OMNIGENT_PI_PATH`` env var (set before ``_ensure_backend``
+    # so a locally-spawned daemon inherits it; a remote ``--server`` runner
+    # reads its own host env, so set the var there). No ``--command`` flag —
+    # override via ``OMNIGENT_PI_PATH`` or config.
+    _resolved = resolve_harness_command("pi-native", default="", explicit=None, cfg=cfg)
+    if _resolved:
+        os.environ["OMNIGENT_PI_PATH"] = _resolved
     if server is None:
         server = cfg.get("server")
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
@@ -5021,7 +5266,7 @@ def pi(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        pi_args=pi_args,
+        pi_args=_resolve_harness_startup_args(cfg, "pi-native", pi_args),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -5233,8 +5478,16 @@ def cursor(
         )
 
     from omnigent.cursor_native import run_cursor_native
+    from omnigent.harness_startup_config import resolve_harness_command
 
     cfg = _load_effective_config()
+    # Thread ``--command`` / ``harness.cursor-native.command`` config into the
+    # runner via the canonical ``OMNIGENT_CURSOR_PATH`` env var (set before
+    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
+    # ``--server`` runner reads its own host env, so set the var there).
+    _resolved = resolve_harness_command("cursor-native", default="", explicit=None, cfg=cfg)
+    if _resolved:
+        os.environ["OMNIGENT_CURSOR_PATH"] = _resolved
     if server is None:
         server = cfg.get("server")
     # Deliberately no ``cfg.get("model")`` fallback (unlike ``codex``): the
@@ -5252,7 +5505,7 @@ def cursor(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        cursor_args=cursor_args,
+        cursor_args=_resolve_harness_startup_args(cfg, "cursor-native", cursor_args),
         model=model,
         auto_open_conversation=auto_open_conversation,
         mode=mode,
@@ -5348,9 +5601,17 @@ def kiro(
         )
     _reject_reserved_kiro_resume_args(kiro_args)
 
+    from omnigent.harness_startup_config import resolve_harness_command
     from omnigent.kiro_native import run_kiro_native
 
     cfg = _load_effective_config()
+    # Thread ``--command`` / ``harness.kiro-native.command`` config into the
+    # runner via the canonical ``OMNIGENT_KIRO_PATH`` env var (set before
+    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
+    # ``--server`` runner reads its own host env, so set the var there).
+    _resolved = resolve_harness_command("kiro-native", default="", explicit=None, cfg=cfg)
+    if _resolved:
+        os.environ["OMNIGENT_KIRO_PATH"] = _resolved
     if server is None:
         server = cfg.get("server")
     if model is None:
@@ -5361,7 +5622,7 @@ def kiro(
         kiro_agent=kiro_agent,
         trust_tools=trust_tools,
         trust_all_tools=trust_all_tools,
-        passthrough_args=kiro_args,
+        passthrough_args=_resolve_harness_startup_args(cfg, "kiro-native", kiro_args),
     )
 
     server = _ensure_backend(server)
@@ -5472,8 +5733,16 @@ def goose(
         )
 
     from omnigent.goose_native import run_goose_native
+    from omnigent.harness_startup_config import resolve_harness_command
 
     cfg = _load_effective_config()
+    # Thread ``--command`` / ``harness.goose-native.command`` config into the
+    # runner via the canonical ``OMNIGENT_GOOSE_PATH`` env var (set before
+    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
+    # ``--server`` runner reads its own host env, so set the var there).
+    _resolved = resolve_harness_command("goose-native", default="", explicit=None, cfg=cfg)
+    if _resolved:
+        os.environ["OMNIGENT_GOOSE_PATH"] = _resolved
     if server is None:
         server = cfg.get("server")
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
@@ -5487,7 +5756,7 @@ def goose(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        goose_args=goose_args,
+        goose_args=_resolve_harness_startup_args(cfg, "goose-native", goose_args),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -5551,9 +5820,17 @@ def hermes(
             "prefer --resume (--session is deprecated).",
         )
 
+    from omnigent.harness_startup_config import resolve_harness_command
     from omnigent.hermes_native import run_hermes_native
 
     cfg = _load_effective_config()
+    # Thread ``--command`` / ``harness.hermes-native.command`` config into the
+    # runner via the canonical ``OMNIGENT_HERMES_PATH`` env var (set before
+    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
+    # ``--server`` runner reads its own host env, so set the var there).
+    _resolved = resolve_harness_command("hermes-native", default="", explicit=None, cfg=cfg)
+    if _resolved:
+        os.environ["OMNIGENT_HERMES_PATH"] = _resolved
     if server is None:
         server = cfg.get("server")
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
@@ -5567,7 +5844,7 @@ def hermes(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        hermes_args=hermes_args,
+        hermes_args=_resolve_harness_startup_args(cfg, "hermes-native", hermes_args),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -5637,6 +5914,7 @@ def antigravity(
         )
 
     from omnigent.antigravity_native import run_antigravity_native
+    from omnigent.harness_startup_config import resolve_harness_command
 
     cfg = _load_effective_config()
     if server is None:
@@ -5656,13 +5934,22 @@ def antigravity(
     # inside run_antigravity_native. It is plumbed through build_agy_launch so a
     # future caller CAN set it, but this human CLI path exposes no permission
     # flag and never needs one.
+    resolved_command = resolve_harness_command(
+        "antigravity-native",
+        default="",
+        explicit=None,
+        cfg=cfg,
+    )
     run_antigravity_native(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        antigravity_args=antigravity_args,
+        antigravity_args=_resolve_harness_startup_args(
+            cfg, "antigravity-native", antigravity_args
+        ),
         model=model,
         auto_open_conversation=auto_open_conversation,
+        command=resolved_command or None,
     )
 
 
@@ -5725,9 +6012,17 @@ def qwen(
             "prefer --resume (--session is deprecated).",
         )
 
+    from omnigent.harness_startup_config import resolve_harness_command
     from omnigent.qwen_native import run_qwen_native
 
     cfg = _load_effective_config()
+    # Thread ``--command`` / ``harness.qwen-native.command`` config into the
+    # runner via the canonical ``OMNIGENT_QWEN_PATH`` env var (set before
+    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
+    # ``--server`` runner reads its own host env, so set the var there).
+    _resolved = resolve_harness_command("qwen-native", default="", explicit=None, cfg=cfg)
+    if _resolved:
+        os.environ["OMNIGENT_QWEN_PATH"] = _resolved
     if server is None:
         server = cfg.get("server")
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
@@ -5741,7 +6036,7 @@ def qwen(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        qwen_args=qwen_args,
+        qwen_args=_resolve_harness_startup_args(cfg, "qwen-native", qwen_args),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -5895,9 +6190,17 @@ def kimi(
             "prefer --resume (--session is deprecated).",
         )
 
+    from omnigent.harness_startup_config import resolve_harness_command
     from omnigent.kimi_native import run_kimi_native
 
     cfg = _load_effective_config()
+    # Thread ``--command`` / ``harness.kimi-native.command`` config into the
+    # runner via the canonical ``OMNIGENT_KIMI_PATH`` env var (set before
+    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
+    # ``--server`` runner reads its own host env, so set the var there).
+    _resolved = resolve_harness_command("kimi-native", default="", explicit=None, cfg=cfg)
+    if _resolved:
+        os.environ["OMNIGENT_KIMI_PATH"] = _resolved
     if server is None:
         server = cfg.get("server")
     auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
@@ -5911,7 +6214,7 @@ def kimi(
         server=server,
         session_id=resolved_session_id,
         resume_picker=choice.picker,
-        kimi_args=kimi_args,
+        kimi_args=_resolve_harness_startup_args(cfg, "kimi-native", kimi_args),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -7290,7 +7593,10 @@ def run(
     if model is None and not direct_server_cli:
         model = _global_cfg.get("model")
     if harness is None and not direct_server_cli:
-        harness = _global_cfg.get("harness")
+        from omnigent.harness_startup_config import resolve_harness_config
+
+        harness_default, _ = resolve_harness_config(_global_cfg)
+        harness = harness_default
 
     # First-run smart defaults: a bare `run` with no AGENT, no --harness, and no
     # explicit persisted default → derive a harness from the *current* creds
@@ -8102,10 +8408,12 @@ def _host_shorten(text: _HostJsonValue, *, max_chars: int) -> str:
     value = _host_display_value(text)
     if len(value) <= max_chars:
         return value
-    if max_chars <= 1:
+    if max_chars <= 2:
+        # Too narrow for a head + ellipsis + tail; middle-truncation with a
+        # 1-char tail would overflow the budget, so only ever show the head.
         return value[:max_chars]
     head = max(1, (max_chars - 1) // 2)
-    tail = max(1, max_chars - head - 1)
+    tail = max_chars - head - 1
     return f"{value[:head]}…{value[-tail:]}"
 
 
@@ -8613,6 +8921,31 @@ def _parse_config_settings(
     return parsed
 
 
+def _harness_deep_merge_keys(
+    parsed: dict[str, str | bool | Mapping[str, Any]],  # type: ignore[explicit-any]
+) -> tuple[str, ...]:
+    """Rewrite a ``harness=<id>`` setting for deep-merge into the harness mapping.
+
+    ``config set harness=claude-sdk`` should set the default without dropping
+    any existing per-harness overrides (``harness.codex.command``, etc.). So
+    the scalar value is rewritten to ``{"default": <id>}`` and ``("harness",)``
+    is returned so the save function deep-merges it one level into the existing
+    ``harness`` mapping. A non-scalar ``harness`` value (already a mapping from
+    a future structured setter) is left untouched.
+
+    :param parsed: The ``KEY=VALUE`` mapping from :func:`_parse_config_settings`,
+        mutated in place when it contains a scalar ``harness`` value.
+    :returns: ``("harness",)`` when *parsed* has a ``harness`` entry, else
+        ``()`` so no deep-merge is requested.
+    """
+    value = parsed.get("harness")
+    if isinstance(value, str):
+        parsed["harness"] = {"default": value}
+    if "harness" in parsed:
+        return ("harness",)
+    return ()
+
+
 def _validate_unset_keys(unset_keys: tuple[str, ...]) -> list[str]:
     """
     Validate keys passed to ``--unset`` against ``_GLOBAL_CONFIG_KEYS``.
@@ -8632,6 +8965,70 @@ def _validate_unset_keys(unset_keys: tuple[str, ...]) -> list[str]:
             )
         validated.append(key)
     return validated
+
+
+def _format_harness_for_display(
+    value: object,  # type: ignore[explicit-any]
+) -> tuple[str, list[str]]:
+    """Render a ``harness`` config value for ``config list``.
+
+    :param value: The raw ``harness`` config value — scalar string or mapping.
+    :returns: ``(default_display, override_ids)`` where *default_display* is
+        the string to show after ``harness=`` (``"(none)"`` when absent) and
+        *override_ids* is the sorted list of per-harness override keys.
+    """
+    from omnigent.harness_startup_config import resolve_harness_config
+
+    if isinstance(value, str):
+        return value, []
+    if isinstance(value, dict):
+        default, overrides = resolve_harness_config({"harness": value})
+        return default or "(none)", sorted(overrides)
+    return str(value) if value is not None else "(none)", []
+
+
+def _resolve_harness_startup_args(
+    cfg: dict[str, Any],  # type: ignore[explicit-any]
+    harness: str,
+    cli_args: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Resolve the launch args for a native harness: config base + CLI args.
+
+    Config ``harness.<canonical>.args`` form the base; the CLI pass-through
+    *cli_args* append *after* so a per-invocation flag wins for last-wins CLIs.
+    Returns a tuple suitable for the ``<name>_args`` param of
+    ``run_<name>_native`` (persisted as ``terminal_launch_args``).
+
+    :param cfg: Effective config dict.
+    :param harness: A harness id (canonical or alias), e.g. ``"codex-native"``.
+    :param cli_args: Explicit CLI pass-through args (may be empty).
+    :returns: The combined arg tuple: config base + CLI pass-through.
+    """
+    from omnigent.harness_startup_config import resolve_harness_args
+
+    return tuple(resolve_harness_args(harness, cli_args, cfg=cfg))
+
+
+def _print_config_default_rows(
+    cfg: dict[str, object],  # type: ignore[explicit-any]
+) -> None:
+    """Print one ``key=value`` row per config default, handling the ``harness`` key.
+
+    The ``harness`` key may be a scalar (legacy) or a mapping with a ``default``
+    plus per-harness overrides. Render it as ``harness=<default>`` and, when
+    per-harness overrides are present, add a note line so they're visible without
+    dumping the whole mapping. Every other key prints as ``key=value``.
+
+    :param cfg: A config dict filtered to ``_GLOBAL_CONFIG_KEYS``.
+    """
+    for k, v in sorted(cfg.items()):
+        if k == "harness":
+            default, overrides = _format_harness_for_display(v)
+            click.echo(f"  harness={default}")
+            if overrides:
+                click.echo(f"    # per-harness overrides: {', '.join(sorted(overrides))}")
+        else:
+            click.echo(f"  {k}={v}")
 
 
 def _print_config_defaults() -> None:
@@ -8664,12 +9061,10 @@ def _print_config_defaults() -> None:
     local_is_global = local_cfg and local_path.resolve() == global_path.resolve()
     if global_cfg:
         click.echo(f"  # {_display_config_path(global_path)}")
-        for k, v in sorted(global_cfg.items()):
-            click.echo(f"  {k}={v}")
+        _print_config_default_rows(global_cfg)
     if local_cfg and not local_is_global:
         click.echo(f"  # {local_path}")
-        for k, v in sorted(local_cfg.items()):
-            click.echo(f"  {k}={v}")
+        _print_config_default_rows(local_cfg)
 
 
 class _ConfigGroup(click.Group):
@@ -8975,11 +9370,13 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     """
     if is_global:
         parsed = _parse_config_settings(settings, resolve_paths=True)
-        _save_global_config(parsed, ())
+        deep_keys = _harness_deep_merge_keys(parsed)
+        _save_global_config(parsed, (), deep_keys)
         config_path: Path = _effective_global_config_path()
     else:
         parsed = _parse_config_settings(settings, resolve_paths=False)
-        _save_local_config(parsed, ())
+        deep_keys = _harness_deep_merge_keys(parsed)
+        _save_local_config(parsed, (), deep_keys)
         config_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     click.echo(f"Set {len(parsed)} key(s) in {config_path}")
 

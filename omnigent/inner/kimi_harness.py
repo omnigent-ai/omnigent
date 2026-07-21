@@ -18,8 +18,8 @@ Env vars read at startup (full contract in
 - ``HARNESS_KIMI_CWD`` — working directory the kimi subprocess runs in
   (upstream has no ``--work-dir`` flag, so this is threaded as
   subprocess ``cwd=``).
-- ``HARNESS_KIMI_PATH`` — path to the ``kimi`` binary. Default
-  ``"kimi"``.
+- ``OMNIGENT_KIMI_PATH`` — path to the ``kimi`` binary. Default
+  ``"kimi"``. (Legacy ``HARNESS_KIMI_PATH`` still honored, deprecated.)
 - ``HARNESS_KIMI_PLAN`` — truthy → ``--plan`` (read-only plan mode).
 - ``HARNESS_KIMI_CONTINUE_LAST`` — truthy → ``-C`` (continue the
   previous session for the working directory). Mutually exclusive with
@@ -44,6 +44,7 @@ import os
 
 from fastapi import FastAPI
 
+from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.kimi_executor import KimiExecutor, _resolve_skills_dirs
@@ -53,7 +54,10 @@ _logger = logging.getLogger(__name__)
 
 _ENV_MODEL = "HARNESS_KIMI_MODEL"
 _ENV_CWD = "HARNESS_KIMI_CWD"
-_ENV_BIN = "HARNESS_KIMI_PATH"
+_ENV_BIN = "OMNIGENT_KIMI_PATH"
+# Deprecated alias — read via resolve_harness_path() which warns on use.
+# Remove this constant and the HARNESS_KIMI_PATH read in v0.8.0.
+_LEGACY_ENV_BIN = "HARNESS_KIMI_PATH"
 _ENV_PLAN = "HARNESS_KIMI_PLAN"
 _ENV_CONTINUE_LAST = "HARNESS_KIMI_CONTINUE_LAST"
 _ENV_SKILLS_DIRS = "HARNESS_KIMI_SKILLS_DIRS"
@@ -123,7 +127,7 @@ def _build_kimi_executor() -> Executor:
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL) or None,
-        binary_path=os.environ.get(_ENV_BIN) or None,
+        binary_path=resolve_harness_path("kimi"),
         plan=_parse_truthy_with_default(os.environ.get(_ENV_PLAN), default=False),
         continue_last_session=_parse_truthy_with_default(
             os.environ.get(_ENV_CONTINUE_LAST), default=False

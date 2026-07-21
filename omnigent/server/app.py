@@ -69,6 +69,7 @@ from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
@@ -79,6 +80,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -1071,18 +1073,6 @@ def _ensure_default_polly_agent(
     )
 
 
-async def _placeholder_on_fire(scheduled_task_id: str) -> None:
-    """Default scheduler fire callback (no-op placeholder that logs).
-
-    Exercises the ``on_fire`` seam without side effects: the real fire path
-    (creating an agent session for the task) supplies its own callback.
-    """
-    _logger.info(
-        "scheduler: task %s is due (no fire path wired yet — skipping)",
-        scheduled_task_id,
-    )
-
-
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -1241,6 +1231,10 @@ def create_app(
         registry=tunnel_registry,
         conversation_store=conversation_store,
     )
+    runner_session_initializer = RunnerSessionInitializer(
+        tunnel_registry,
+        server_version=_server_version(),
+    )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
@@ -1390,18 +1384,36 @@ def create_app(
 
         # Recurring-task scheduler: arm a timer per active
         # scheduled task and fire the injected ``on_fire`` callback on
-        # schedule. The default callback is a no-op that logs; a real fire
-        # path (creating a session) can be injected in its place.
+        # schedule. The callback (see scheduled.fire) re-reads the row,
+        # creates + owner-grants a session, launches its runner, and records
+        # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+
+            on_fire = build_on_fire(
+                FireDeps(
+                    scheduled_task_store=scheduled_task_store,
+                    agent_store=agent_store,
+                    conversation_store=conversation_store,
+                    permission_store=permission_store,
+                    host_store=host_store,
+                    host_registry=host_registry,
+                    agent_cache=agent_cache,
+                    runner_router=runner_router,
+                    tunnel_registry=tunnel_registry,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                )
+            )
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
-                on_fire=_placeholder_on_fire,
+                on_fire=on_fire,
             )
             app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
             # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error in list_active()) must not take down
-            # server boot. Log and continue with the scheduler unstarted.
+            # schedule (e.g. a DB error listing active tasks) must not take
+            # down server boot. Log and continue with the scheduler unstarted.
             try:
                 await scheduled_task_scheduler.start()
             except Exception as exc:
@@ -1449,6 +1461,7 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
+    app.state.runner_session_initializer = runner_session_initializer
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
@@ -2240,6 +2253,19 @@ def create_app(
         prefix="/v1",
         tags=["policy_registry"],
     )
+    if scheduled_task_store is not None:
+        app.include_router(
+            create_scheduled_tasks_router(
+                scheduled_task_store,
+                agent_store=agent_store,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                agent_cache=agent_cache,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["scheduled_tasks"],
+        )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server
     # resolves the setting from the editable file-backed default.
@@ -2289,6 +2315,7 @@ def create_app(
                 runner_id,
             )
             return
+        runner_session_initializer.invalidate_runner(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other
         # replicas flip offline immediately rather than after the TTL.
         session_live_state.clear_runner_liveness(runner_id)
@@ -2417,12 +2444,9 @@ def create_app(
                 )
             else:
                 try:
-                    await routed.client.post(
-                        "/v1/sessions",
-                        json={
-                            "session_id": conv.id,
-                            "agent_id": conv.agent_id,
-                        },
+                    await runner_session_initializer.initialize(
+                        conv,
+                        routed.client,
                         timeout=10.0,
                     )
                 except Exception:
@@ -2459,14 +2483,12 @@ def create_app(
             )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
-        """Owner for a server-managed sandbox runner, by its bound session.
+        """Owner for a delegated runner, by its bound session.
 
-        Managed runners authenticate with a server-minted binding token,
-        not a user session, so the runner tunnel cannot resolve their
-        owner from the handshake. The server wrote ``runner_id`` onto the
-        session row at launch (``replace_runner_id``), so the bound
-        conversation's owner is authoritative — the runner-side analog of
-        the host tunnel's ``resolve_launch_token``.
+        Host-launched and managed-sandbox runners authenticate with a binding
+        token instead of inheriting the host user's credential. The server
+        wrote ``runner_id`` onto the session row before launch, so the bound
+        conversation's owner is authoritative.
 
         :param runner_id: Token-bound runner id from the tunnel handshake.
         :returns: The session owner's user id, or ``None`` when no session
@@ -2503,10 +2525,7 @@ def create_app(
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
 
-        async def _on_host_connect(_host_id: str, owner: str | None) -> None:
-            announce_hosts_changed(owner)
-
-        async def _on_host_disconnect(_host_id: str, owner: str | None) -> None:
+        async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
 
         app.include_router(
@@ -2516,8 +2535,9 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
-                on_host_connect=_on_host_connect,
-                on_host_disconnect=_on_host_disconnect,
+                on_host_connect=_on_hosts_changed,
+                on_host_disconnect=_on_hosts_changed,
+                on_host_update=_on_hosts_changed,
             ),
             prefix="/v1",
             tags=["hosts"],

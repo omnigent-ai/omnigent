@@ -15,7 +15,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +24,7 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
@@ -32,6 +33,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -73,7 +75,9 @@ from omnigent.process_logging import (
     process_log_dir,
 )
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -92,6 +96,22 @@ from omnigent.runner.transports.ws_tunnel.limits import (
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+
+# Binary appearance is cheap to probe, so new CLI installs surface quickly.
+HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
+# Auth changes and removals need the full, potentially expensive readiness map.
+HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
+
+
+def _unavailable_harness_became_ready(
+    previous: Mapping[str, HarnessAvailability],
+) -> bool:
+    """Detect newly available binaries; auth changes wait for the full refresh."""
+    return any(
+        (availability is False or availability == HARNESS_BINARY_MISSING)
+        and harness_is_configured(harness)
+        for harness, availability in previous.items()
+    )
 
 
 def _runner_log_dir() -> Path:
@@ -508,6 +528,7 @@ def _build_runner_env(
     binding_token: str,
     workspace: str,
     parent_pid: int,
+    initial_auth_token: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -531,6 +552,9 @@ def _build_runner_env(
     :param workspace: Absolute runner cwd on the host, e.g.
         ``"/Users/alice/proj"``.
     :param parent_pid: Host process pid, for orphan detection.
+    :param initial_auth_token: Current host bearer for the runner's initial
+        server connection. The runner consumes and removes it before spawning
+        any children. ``None`` leaves the legacy auth path unchanged.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -549,6 +573,9 @@ def _build_runner_env(
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
+    env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"
+    if initial_auth_token:
+        env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
     return env
@@ -651,6 +678,12 @@ class HostProcess:
         self._identity = identity
         self._server_url = server_url.rstrip("/")
         self._runners: dict[str, _RunnerHandle] = {}
+        # Retain the host's refreshable auth context after the first tunnel
+        # handshake so runner launches can reuse its warm bearer. Failed or
+        # unavailable resolution is not latched, allowing a later reconnect
+        # to retry credential discovery.
+        self._auth_token_factory: Callable[[], str | None] | None = None
+        self._auth_token_factory_resolved = False
         # Set on the first accepted WS upgrade. Distinguishes a host that
         # never authenticated (login redirects turn fatal after
         # _LOGIN_REDIRECT_FATAL_ATTEMPTS) from a live host hit by a server
@@ -1072,6 +1105,10 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
+        initial_auth_token = await asyncio.to_thread(
+            self._current_auth_token,
+            initialize=False,
+        )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,
@@ -1079,6 +1116,7 @@ class HostProcess:
             binding_token=frame.binding_token,
             workspace=str(workspace),
             parent_pid=os.getpid(),
+            initial_auth_token=initial_auth_token,
         )
 
         try:
@@ -1957,21 +1995,43 @@ class HostProcess:
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
-        try:
-            from omnigent.runner._entry import _make_auth_token_factory
+        token = self._current_auth_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
-            # Pass server_url explicitly. The factory's OIDC-token path
-            # would otherwise look up ``RUNNER_SERVER_URL`` from env,
-            # which only the runner subprocess sets — without it the
-            # stored ``omnigent login`` token is silently skipped and
-            # the factory falls through to the Databricks path.
-            factory = _make_auth_token_factory(server_url=self._server_url)
-            token = factory() if factory else None
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
+    def _current_auth_token(self, *, initialize: bool = True) -> str | None:
+        """Return a bearer from the host's retained refreshable auth context.
+
+        The first call builds the same factory the host tunnel already used.
+        Later calls reuse its SDK ``Config`` and in-memory token cache, so a
+        runner launch normally performs no CLI or network authentication.
+
+        :param initialize: Build the factory when it has not been used yet.
+            Runner launch passes ``False`` because it must only reuse the
+            already-warm host context, never add auth work to the launch path.
+        :returns: Current bearer token, or ``None`` when credentials are not
+            available or this is a managed host authenticated by launch token.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        if os.environ.get(HOST_TOKEN_ENV_VAR):
+            return None
+        try:
+            if not self._auth_token_factory_resolved:
+                if not initialize:
+                    return None
+                from omnigent.runner._entry import _make_auth_token_factory
+
+                factory = _make_auth_token_factory(server_url=self._server_url)
+                if factory is not None:
+                    self._auth_token_factory = factory
+                    self._auth_token_factory_resolved = True
+            if self._auth_token_factory is not None:
+                return self._auth_token_factory()
         except Exception:  # noqa: BLE001
             _logger.debug("Could not obtain auth token", exc_info=True)
-        return headers
+        return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
         """Announce readiness, then service host frames until disconnect.
@@ -2001,16 +2061,15 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
+        configured_harnesses = await asyncio.to_thread(configured_harness_map)
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
-            # Off the event loop: probes PATH (shutil.which) and reads
-            # ~/.omnigent/config.yaml. Recomputed on every (re)connect, so
-            # the server's view refreshes whenever the tunnel does; the
-            # launch-time check above stays the authoritative gate.
-            configured_harnesses=await asyncio.to_thread(configured_harness_map),
+            # Off the event loop: probes PATH and reads local config.
+            # The loop below refreshes changes; launch remains authoritative.
+            configured_harnesses=configured_harnesses,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
         )
@@ -2033,11 +2092,42 @@ class HostProcess:
             flush=True,
         )
 
+        loop = asyncio.get_running_loop()
+        next_quick_refresh = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
+        next_full_refresh = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
-            except asyncio.TimeoutError:
-                continue
+            raw: object | None = None
+            with contextlib.suppress(asyncio.TimeoutError):
+                raw = await asyncio.wait_for(
+                    ws.recv(),
+                    timeout=max(
+                        0.0,
+                        min(next_quick_refresh, next_full_refresh) - loop.time(),
+                    ),
+                )
+
+            now = loop.time()
+            refresh_full_map = now >= next_full_refresh
+            if now >= next_quick_refresh:
+                next_quick_refresh = now + HARNESS_READINESS_REFRESH_INTERVAL_S
+                if not refresh_full_map:
+                    refresh_full_map = await asyncio.to_thread(
+                        _unavailable_harness_became_ready,
+                        configured_harnesses,
+                    )
+
+            if refresh_full_map:
+                latest_harnesses = await asyncio.to_thread(configured_harness_map)
+                next_full_refresh = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+                if latest_harnesses != configured_harnesses:
+                    await ws.send(
+                        encode_host_frame(
+                            HostHarnessReadinessFrame(
+                                configured_harnesses=latest_harnesses,
+                            )
+                        )
+                    )
+                    configured_harnesses = latest_harnesses
             if isinstance(raw, str):
                 await self._handle_raw_message(ws, raw)
 

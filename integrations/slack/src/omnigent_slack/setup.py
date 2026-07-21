@@ -208,7 +208,7 @@ class SetupFlow:
         """
         try:
             resp = await client.views_open(trigger_id=trigger_id, view=connecting_modal())
-        except Exception as exc:  # noqa: BLE001 — surface as a no-op; nothing opened
+        except Exception as exc:
             self._logger.warning("Could not open setup modal: %s", exc)
             return None
         view = resp.get("view") if hasattr(resp, "get") else None
@@ -373,7 +373,7 @@ class SetupFlow:
         """
         try:
             resp = await client.team_info(team=team_id)
-        except Exception as exc:  # noqa: BLE001 — label lookup must never block login
+        except Exception as exc:
             self._logger.info("team.info lookup failed team=%s error=%s", team_id, exc)
             return ""
         team = resp.get("team") if hasattr(resp, "get") else None

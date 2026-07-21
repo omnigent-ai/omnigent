@@ -746,6 +746,23 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def rename_conversation_if_title_matches(
+        self,
+        conversation_id: str,
+        expected_title: str,
+        title: str,
+    ) -> Conversation | None:
+        """Rename a conversation only while its current title matches.
+
+        :param conversation_id: Conversation to update.
+        :param expected_title: Title that must still be stored.
+        :param title: Replacement title.
+        :returns: The updated conversation, or ``None`` when the row is
+            missing or its title changed before this call.
+        """
+        ...
+
+    @abstractmethod
     def set_labels(
         self,
         conversation_id: str,

@@ -84,6 +84,71 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("ZEBRA-99", prompt)
         self.assertIn("Summarize our conversation.", prompt)
 
+    def test_historical_image_data_uri_is_replaced_with_compact_placeholder(self):
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        image_data_uri = f"data:image/png;base64,{image_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_uri,
+                        "filename": "screenshot.png",
+                    },
+                    {"type": "input_text", "text": "What is shown here?"},
+                ],
+            },
+            {"role": "assistant", "content": "It shows a test image."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        self.assertNotIn("data:", prompt)
+        self.assertNotIn(image_payload, prompt)
+        self.assertIn(
+            "[image: screenshot.png, image/png, 28 base64 chars]",
+            prompt,
+        )
+        self.assertIn("What is shown here?", prompt)
+
+    def test_historical_file_data_uri_is_replaced_with_compact_placeholder(self):
+        # The blowup hits ALL attachments, not just images: the runner resolves a
+        # non-image file_id block to ``file_data = data:...;base64,...`` too. This
+        # locks in the field-name-independent redaction fallback for file_data.
+        executor = self._make_executor()
+        file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
+        file_data_uri = f"data:application/pdf;base64,{file_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": file_data_uri,
+                        "filename": "doc.pdf",
+                    },
+                    {"type": "input_text", "text": "What does this document say?"},
+                ],
+            },
+            {"role": "assistant", "content": "It is a test document."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        self.assertNotIn("data:", prompt)
+        self.assertNotIn(file_payload, prompt)
+        self.assertIn(
+            f"[attachment: doc.pdf, application/pdf, {len(file_payload)} base64 chars]",
+            prompt,
+        )
+        self.assertIn("What does this document say?", prompt)
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties
@@ -1738,6 +1803,101 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
             self.assertIn(
                 "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
+                captured_options["system_prompt"],
+            )
+            self.assertIsInstance(events[-1], TurnComplete)
+
+        _run(_t())
+
+    def test_session_rename_tool_uses_exact_sdk_mcp_name(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured_options = {}
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            @staticmethod
+            def tool(name, desc, params):
+                def decorator(handler):
+                    return type(
+                        "Tool",
+                        (),
+                        {
+                            "name": name,
+                            "description": desc,
+                            "parameters": params,
+                            "handler": handler,
+                        },
+                    )()
+
+                return decorator
+
+            @staticmethod
+            def create_sdk_mcp_server(**kwargs):
+                return kwargs
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = getattr(options, "system_prompt", None)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [_ResultMessage(session_id, "done")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "session-a"}],
+                        [
+                            {
+                                "name": "sys_session_rename",
+                                "description": "Rename current session",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"title": {"type": "string"}},
+                                    "required": ["title"],
+                                },
+                            }
+                        ],
+                        "Call `sys_session_rename` before replying.",
+                    )
+                ]
+            self.assertIn(
+                "mcp__omnigent__sys_session_rename",
+                captured_options["allowed_tools"],
+            )
+            self.assertIn(
+                "use `mcp__omnigent__sys_session_rename` when instructions say "
+                "`sys_session_rename`",
                 captured_options["system_prompt"],
             )
             self.assertIsInstance(events[-1], TurnComplete)

@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+# Custom-method path (Google API convention) appended to the external
+# router's base URL, e.g. ``<base_url>/routes:select``.
+ROUTES_SELECT_PATH = "routes:select"
+
 # ── Model lists per harness family ──────────────────────────────────────────
 #
 # Ordered cheapest → most powerful within each family.
@@ -321,6 +325,174 @@ class LLMRoutingClient:
             )
 
         return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
+
+
+def _bearer_auth(token: str) -> Any:  # type: ignore[explicit-any]  # returns httpx.Auth
+    """Build a static ``Authorization: Bearer <token>`` httpx auth.
+
+    :param token: The bearer token, e.g. a Databricks workspace token.
+    :returns: An ``httpx.Auth`` that adds the bearer header to each request.
+    """
+    import httpx
+
+    class _BearerAuth(httpx.Auth):
+        def auth_flow(self, request: httpx.Request):  # type: ignore[no-untyped-def]
+            request.headers["Authorization"] = f"Bearer {token}"
+            yield request
+
+    return _BearerAuth()
+
+
+class ExternalRoutingClient:
+    """Routing client backed by an external ``routes:select`` service.
+
+    Calls an external routing service (the Databricks AI-Gateway router,
+    or any endpoint speaking the ``omnigent.api.routing.v1`` proto)
+    instead of running a local judge. The candidate models come from
+    ``available_models`` (the same live catalog the built-in judge sees),
+    so no catalog plumbing changes. A failure or empty selection returns
+    ``None`` so the turn proceeds on the agent's default model.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        router_name: str,
+        auth: Any = None,  # type: ignore[explicit-any]  # httpx.Auth, imported lazily
+        model_prefixes: list[str] | None = None,
+        request_timeout: float = 20.0,
+    ) -> None:
+        """
+        :param base_url: Routing service base, e.g.
+            ``"https://host/ai-gateway/routing/v1"``.
+            ``/routes:select`` is appended.
+        :param router_name: Router strategy name, e.g. ``"task_v0"``.
+        :param auth: Optional httpx auth (a Databricks bearer for the
+            router's host). ``None`` for an unauthenticated endpoint.
+        :param model_prefixes: Optional prefixes this deployment's catalog
+            attaches to model ids that the router does NOT expect. The
+            first matching prefix is stripped from ids sent to the router
+            and restored on its answer via the (harness, bare-id) -> local
+            map. Examples: ``"databricks-"`` when serving-endpoint names are
+            ``databricks-claude-opus-4-8`` but the router keys on
+            ``claude-opus-4-8``; ``"system.ai."`` for Unity Catalog
+            foundation-model ids like ``system.ai.claude-opus-4-8``. Empty
+            or omitted (default) sends catalog ids verbatim — no provider
+            assumed.
+        :param request_timeout: Per-call timeout in seconds; routing
+            runs once per turn so a slow router can't stall forever.
+        """
+        self._url = base_url.rstrip("/") + "/" + ROUTES_SELECT_PATH
+        self._router_name = router_name
+        self._auth = auth
+        self._model_prefixes = model_prefixes or []
+        self._request_timeout = request_timeout
+
+    def _to_router_id(self, model: str) -> str:
+        """Strip the first matching ``model_prefixes`` entry for the router.
+
+        A no-op when no configured prefix matches *model* (or none is set).
+        """
+        for prefix in self._model_prefixes:
+            if prefix and model.startswith(prefix):
+                return model[len(prefix) :]
+        return model
+
+    async def route(
+        self,
+        message: str,
+        available_models: dict[str, list[str]],
+    ) -> RoutingResult | None:
+        import httpx
+        from google.protobuf import json_format
+
+        from omnigent.api.routing.v1 import routing_pb2 as pb
+
+        # Send router-vocabulary ids (model_prefixes stripped) and keep a
+        # (harness, router-id) -> local-id map to recover the exact catalog id
+        # from the answer. Harness is part of the key because one bare id can
+        # be served under different harnesses (Databricks-authed PI vs a Codex
+        # subscription) that must map back to distinct local ids.
+        options: list[pb.RouteOption] = []
+        router_to_local: dict[tuple[str, str], str] = {}
+        for harness, models in available_models.items():
+            for model in models:
+                router_id = self._to_router_id(model)
+                router_to_local[(harness, router_id)] = model
+                options.append(pb.RouteOption(model=router_id, harness=harness))
+        if not options:
+            return None
+        request = pb.SelectRouteRequest(
+            route_options=options,
+            task=pb.Task(prompt=message[:4000]),
+            route_selector=pb.RouteSelector(router_name=self._router_name),
+        )
+        # snake_case wire format — the router uses the proto field names.
+        body = json_format.MessageToDict(request, preserving_proto_field_name=True)
+        _logger.info("ExternalRoutingClient: available_models=%s", dict(available_models))
+        _logger.info("ExternalRoutingClient: POST %s body=%s", self._url, body)
+        try:
+            async with httpx.AsyncClient(timeout=self._request_timeout) as http:
+                resp = await http.post(
+                    self._url,
+                    headers={"Content-Type": "application/json"},
+                    json=body,
+                    auth=self._auth,
+                )
+        except httpx.HTTPError as exc:
+            # Transport-level failure (connect/timeout/DNS): no response body.
+            _logger.warning("ExternalRoutingClient: routes:select request failed: %s", exc)
+            return None
+        if resp.status_code >= 400:
+            # Log the response body — the gateway puts the actual reason there
+            # (e.g. task_v0's required-model-set error), which the bare status
+            # code from raise_for_status() omits.
+            _logger.warning(
+                "ExternalRoutingClient: routes:select returned %s: %s",
+                resp.status_code,
+                resp.text[:2000],
+            )
+            return None
+        try:
+            out = json_format.ParseDict(resp.json(), pb.SelectRouteResponse())
+        except (ValueError, json_format.ParseError):
+            _logger.warning(
+                "ExternalRoutingClient: could not parse routes:select response: %s",
+                resp.text[:2000],
+            )
+            return None
+        if not out.route_selection:
+            return None
+        selected = out.route_selection[0].route_option
+        if not selected.model:
+            return None
+        # Map the router's pick back to the local catalog id, rejecting an
+        # out-of-set model (falls back to an id-only match when the router
+        # omits the harness).
+        local_model = router_to_local.get((selected.harness, selected.model))
+        if local_model is None:
+            local_model = next(
+                (
+                    local
+                    for (_harness, router_id), local in router_to_local.items()
+                    if router_id == selected.model
+                ),
+                None,
+            )
+        if local_model is None:
+            _logger.warning(
+                "ExternalRoutingClient: router returned model %r (harness %r) "
+                "not in the candidate set; ignoring",
+                selected.model,
+                selected.harness,
+            )
+            return None
+        return RoutingResult(
+            model=local_model,
+            rationale=out.rationale,
+            harness=selected.harness or None,
+        )
 
 
 # ── Public API ──────────────────────────────────────────────────────────────

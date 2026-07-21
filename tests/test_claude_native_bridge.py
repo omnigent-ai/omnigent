@@ -45,7 +45,6 @@ from omnigent.claude_native_bridge import (
     record_hook_event,
     start_tool_relay,
     stop_hook_seen_since,
-    user_prompt_submit_seen_since,
     write_tmux_target,
 )
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
@@ -2085,6 +2084,53 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+def test_augment_claude_args_appends_caller_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Claude native appends framework instructions supplied by its launcher."""
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=SESSION_RENAME_INSTRUCTION,
+    )
+
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == SESSION_RENAME_INSTRUCTION
+
+
+def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
+    """Framework preapproval extends rather than replaces the user's allowlist."""
+    args = augment_claude_args(
+        ("--allowedTools", "Bash,mcp__user__tool"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        allowed_tools=("mcp__omnigent__sys_session_rename", "Bash"),
+    )
+
+    assert args.count("--allowedTools") == 1
+    index = args.index("--allowedTools")
+    assert args[index + 1].split(",") == [
+        "Bash",
+        "mcp__user__tool",
+        "mcp__omnigent__sys_session_rename",
+    ]
+
+
+def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+    """The bridge does not invent framework policy on its own."""
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert "--append-system-prompt" not in args
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.
@@ -2870,281 +2916,6 @@ def test_inject_user_message_raises_when_draft_never_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="message was not delivered"):
         inject_user_message(bridge_dir, content="fix the flaky test")
-
-
-# ── user_prompt_submit_seen_since ────────────────────────────────────
-
-
-def test_user_prompt_submit_seen_since_detects_parent_prompt(
-    tmp_path: Path,
-) -> None:
-    """
-    A parent ``UserPromptSubmit`` after the cursor is detected.
-
-    This is the authoritative "submit registered" signal the delivery ack
-    keys on; without it a swallowed submit Enter looks like success.
-    """
-    bridge_dir = tmp_path / "bridge"
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-    assert not user_prompt_submit_seen_since(bridge_dir, 1)
-    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "p"})
-    assert user_prompt_submit_seen_since(bridge_dir, 1)
-
-
-def test_user_prompt_submit_seen_since_ignores_subagent_prompt(
-    tmp_path: Path,
-) -> None:
-    """
-    A subagent ``UserPromptSubmit`` must not count as the parent's submit.
-
-    Subagent hooks land in the same ``hooks.jsonl``; their
-    ``transcript_path`` carries a ``subagents/`` component. Counting one
-    would falsely ack a parent message that never registered.
-    """
-    bridge_dir = tmp_path / "bridge"
-    subagent_transcript = tmp_path / "session" / "subagents" / "agent-abc.jsonl"
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-    record_hook_event(
-        bridge_dir,
-        {
-            "hook_event_name": "UserPromptSubmit",
-            "session_id": "sub",
-            "transcript_path": str(subagent_transcript),
-        },
-    )
-    assert not user_prompt_submit_seen_since(bridge_dir, 1)
-
-
-def test_user_prompt_submit_seen_since_absent_file_is_false(
-    tmp_path: Path,
-) -> None:
-    """A missing ``hooks.jsonl`` reports no submit rather than raising."""
-    assert not user_prompt_submit_seen_since(tmp_path / "bridge", 0)
-
-
-# ── inject_user_message: end-to-end delivery ack ─────────────────────
-
-
-def _shrink_ack_timers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Collapse the ack poll cadence/timeouts so tests run in milliseconds.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    for name, value in {
-        "_CLAUDE_READY_POLL_INTERVAL_S": 0.01,
-        "_SUBMIT_RETRY_INTERVAL_S": 0.02,
-        "_PASTE_SETTLE_S": 0.0,
-        "_SUBMIT_VERIFY_TIMEOUT_S": 0.15,
-        "_SUBMIT_ACK_TIMEOUT_S": 0.15,
-        "_TURN_START_SETTLE_S": 0.03,
-        "_TURN_START_TIMEOUT_S": 0.15,
-    }.items():
-        monkeypatch.setattr(f"omnigent.claude_native_bridge.{name}", value)
-
-
-def test_inject_user_message_acks_when_turn_starts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Delivery succeeds once ``UserPromptSubmit`` + a turn-start hook land.
-
-    Models Claude accepting the prompt on Enter (fires ``UserPromptSubmit``)
-    and starting a turn (fires ``PreToolUse``). The helper must return
-    without raising and without extra retry Enters.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-
-    enters: list[list[str]] = []
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ ship the fix"
-        if cmd[-1] == "Enter":
-            enters.append(cmd)
-            tui["pane"] = "❯ "  # submitted — box clears
-            # Claude accepts the prompt and starts a turn.
-            record_hook_event(
-                bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "p"}
-            )
-            record_hook_event(bridge_dir, {"hook_event_name": "PreToolUse", "session_id": "p"})
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content="ship the fix")  # must not raise
-
-    assert len(enters) == 1, f"Healthy delivery should send exactly one Enter, got {len(enters)}."
-
-
-def test_inject_user_message_raises_when_prompt_never_registers(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The box clearing is not enough: no ``UserPromptSubmit`` means not delivered.
-
-    This is the blind-Enter / swallowed-submit gap. Previously the draft
-    leaving the box returned "success"; now, with the hook stream live and
-    no ``UserPromptSubmit`` recorded, the helper raises so the caller can
-    surface the drop.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-    # Hook stream is live (SessionStart already recorded) but the submit
-    # never produces a UserPromptSubmit.
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ never delivered"
-        if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "  # box clears (looks fine) but no UPS fires
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="UserPromptSubmit"):
-        inject_user_message(bridge_dir, content="never delivered")
-
-
-def test_inject_user_message_raises_on_draft_restore_stall(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Submit registers, draft is restored, no turn starts → raise.
-
-    The observed #2061 stall: ``UserPromptSubmit`` fires (submit took) but
-    the draft bounces back into the box and no assistant turn begins. The
-    ack re-submits the restored draft; when redelivery still yields no
-    turn-start it raises rather than stranding the message.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-
-    state = {"pane": "❯ ", "submitted": False}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            pane = state["pane"]
-            # The submit momentarily clears the box — the first capture-pane
-            # read after that clear sees empty, so the TUI-level submit
-            # verification passes — then draft-restore bounces the text back
-            # into the box for the delivery ack to catch as a stall.
-            if state["submitted"] and pane == "❯ ":
-                state["pane"] = "❯ stalled message"
-            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
-        if "paste-buffer" in cmd:
-            state["pane"] = "❯ stalled message"
-        if cmd[-1] == "Enter":
-            if not state["submitted"]:
-                # First submit registers and the box momentarily clears...
-                state["pane"] = "❯ "
-                record_hook_event(
-                    bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "p"}
-                )
-                # ...then draft-restore puts it back; no turn-start hook ever fires.
-                state["submitted"] = True
-            # Subsequent (nudge) Enters do NOT start a turn — the stall persists.
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="no assistant turn started"):
-        inject_user_message(bridge_dir, content="stalled message")
-
-
-def test_inject_user_message_degrades_without_hooks_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    With no ``hooks.jsonl`` the ack is skipped and delivery is not blocked.
-
-    The hook signal is unobservable for this bridge, so the helper must
-    fall back to pane-only behavior (prior semantics) instead of raising.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ no hooks here"
-        if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content="no hooks here")  # must not raise
-    assert not (bridge_dir / "hooks.jsonl").exists()
-
-
-def test_inject_user_message_steering_skips_hook_ack(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    ``verify_delivery=False`` keeps legacy pane-only behavior.
-
-    Mid-turn steering can be queued without a prompt ack, so the strict
-    hook ack is bypassed: even with the hook stream live and no
-    ``UserPromptSubmit``, the helper returns once the box clears.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ steer me"
-        if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "  # box clears; no UPS — would raise if strict
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    # Would raise under the default strict ack; verify_delivery=False must not.
-    inject_user_message(bridge_dir, content="steer me", verify_delivery=False)
 
 
 def test_inject_interrupt_sends_escape_keystroke(

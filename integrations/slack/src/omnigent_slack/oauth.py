@@ -28,6 +28,7 @@ See ``designs/DEVICE_AUTH.md`` for the device-grant design.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -371,10 +372,8 @@ class DeviceFlowClient:
 
     async def revoke(self, refresh_token: str) -> None:
         """Revoke the grant behind a refresh token. Best-effort."""
-        try:
+        with contextlib.suppress(httpx.HTTPError):
             await self._client.post("/oauth/revoke", data={"refresh_token": refresh_token})
-        except httpx.HTTPError:
-            pass
 
 
 def _error_code(response: httpx.Response) -> str | None:

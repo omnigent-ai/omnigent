@@ -361,14 +361,15 @@ describe("Sidebar session list", () => {
 
 // Sidebar grouping: the viewer's own sessions ("My sessions" tab) keep the
 // Pinned / Projects / Sessions structure; sessions shared with the viewer live
-// on a separate "Shared with me" tab. "Shared" = sessions where the caller's
-// permission_level says non-owner (< 4); null/4+ are the viewer's own.
+// on a separate "Shared with me" tab. "Shared" = sessions whose `owner` is
+// another user; a null/absent owner is the viewer's own (single-user / legacy).
+// In tests the resolved viewer id is null, so any non-null owner reads as shared.
 describe("Sidebar sections", () => {
   it("splits owned and shared sessions across the My sessions / Shared with me tabs", () => {
     mockConversations([
-      conv("conv_mine_legacy", "Claude Code"), // permission_level null = owner
-      conv("conv_mine_acl", "Claude Code", { permission_level: 4 }),
-      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+      conv("conv_mine_legacy", "Claude Code"), // owner absent = owned
+      conv("conv_mine_acl", "Claude Code", { owner: null }),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
     renderSidebar();
 
@@ -407,7 +408,7 @@ describe("Sidebar tabs", () => {
   it("keeps New session visible on both tabs and snaps back to My sessions when used", () => {
     mockConversations([
       conv("conv_mine", "Claude Code"),
-      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
     renderSidebar();
     expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
@@ -431,7 +432,7 @@ describe("Sidebar tabs", () => {
     isServerLocalMock.mockReturnValue(true);
     mockConversations([
       conv("conv_mine", "Claude Code"),
-      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
     renderSidebar();
     expect(screen.queryByTestId("sidebar-tab-mine")).toBeNull();
@@ -448,7 +449,7 @@ describe("Sidebar tabs", () => {
     // sessions (which shows only owned sessions).
     mockConversations([
       conv("conv_mine", "Claude Code"),
-      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
     localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_shared"]));
     renderSidebar();
@@ -472,7 +473,7 @@ describe("Sidebar tabs", () => {
     projectsMock.push("Alpha");
     mockConversations([
       conv("conv_mine", "Claude Code", { labels: { omni_project: "Alpha" } }),
-      conv("conv_shared", "Claude Code", { permission_level: 2 }),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
     renderSidebar();
 

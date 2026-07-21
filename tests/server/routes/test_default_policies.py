@@ -15,8 +15,10 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.runtime import get_caps
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -216,3 +218,86 @@ async def test_delete_default_policy_idempotent(policy_client: httpx.AsyncClient
     resp = await policy_client.delete("/v1/policies/087a5ba1a5c50583fc5bd2e3f035d3df")
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
+
+
+# ── Config-file policies (RuntimeCaps.default_policies) ──────────────
+
+
+async def test_list_includes_config_policies(
+    policy_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config-file policies appear in GET /v1/policies with source='config'."""
+    spec = FunctionPolicySpec(
+        name="yaml_audit",
+        on=None,
+        function=FunctionRef(path=_REGISTERED_HANDLER),
+    )
+    monkeypatch.setattr(get_caps(), "default_policies", [spec])
+
+    resp = await policy_client.get("/v1/policies")
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    config_entries = [p for p in data if p.get("source") == "config"]
+    assert len(config_entries) == 1
+    entry = config_entries[0]
+    assert entry["name"] == "yaml_audit"
+    assert entry["handler"] == _REGISTERED_HANDLER
+    assert entry["id"] is None
+    assert entry["enabled"] is True
+
+
+async def test_list_config_policy_with_factory_params(
+    policy_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """factory_params from FunctionRef.arguments appear in the config entry."""
+    spec = FunctionPolicySpec(
+        name="yaml_rate_limit",
+        on=None,
+        function=FunctionRef(path=_REGISTERED_HANDLER, arguments={"limit": 5}),
+    )
+    monkeypatch.setattr(get_caps(), "default_policies", [spec])
+
+    resp = await policy_client.get("/v1/policies")
+    data = resp.json()["data"]
+    entry = next(p for p in data if p.get("source") == "config")
+    assert entry["factory_params"] == {"limit": 5}
+
+
+async def test_list_config_and_db_policies_together(
+    policy_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB-managed and config-file policies both appear in the list."""
+    # Create a DB policy.
+    create_resp = await policy_client.post("/v1/policies", json=_policy_payload(name="db_policy"))
+    db_id = create_resp.json()["id"]
+
+    # Add a config policy via RuntimeCaps.
+    spec = FunctionPolicySpec(
+        name="config_policy",
+        on=None,
+        function=FunctionRef(path=_REGISTERED_HANDLER),
+    )
+    monkeypatch.setattr(get_caps(), "default_policies", [spec])
+
+    resp = await policy_client.get("/v1/policies")
+    data = resp.json()["data"]
+    ids = [p["id"] for p in data]
+    names = [p["name"] for p in data]
+    assert db_id in ids
+    assert "config_policy" in names
+    config_entries = [p for p in data if p.get("source") == "config"]
+    assert len(config_entries) == 1
+
+
+async def test_list_no_config_policies_when_caps_empty(
+    policy_client: httpx.AsyncClient,
+) -> None:
+    """No config entries appear when RuntimeCaps.default_policies is empty."""
+    # runtime_init sets default_policies=[] by default.
+    resp = await policy_client.get("/v1/policies")
+    data = resp.json()["data"]
+    config_entries = [p for p in data if p.get("source") == "config"]
+    assert config_entries == []
