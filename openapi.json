@@ -165,6 +165,64 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "AutomaticSessionRenameRequest": {
+        "additionalProperties": false,
+        "description": "Request body for the current-agent automatic rename endpoint.",
+        "properties": {
+          "title": {
+            "maxLength": 60,
+            "minLength": 2,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "AutomaticSessionRenameRequest",
+        "type": "object"
+      },
+      "AutomaticSessionRenameResponse": {
+        "description": "Result of a conditional automatic session rename.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_top_level",
+                  "no_seed",
+                  "title_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "renamed": {
+            "title": "Renamed",
+            "type": "boolean"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "renamed"
+        ],
+        "title": "AutomaticSessionRenameResponse",
+        "type": "object"
+      },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
         "properties": {
           "bundle": {
@@ -7430,7 +7488,7 @@
     },
     "/v1/runners/{runner_id}/token": {
       "post": {
-        "description": "Mint a short-lived owner bearer for a managed-sandbox runner.\n\nA managed sandbox runner has no user credential of its own; it\npresents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and managed sandboxes always run\ntoken-bound (no allow-list).\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
+        "description": "Mint a short-lived owner bearer for a delegated runner.\n\nA host-launched or managed-sandbox runner does not inherit the host\nuser's credential; it presents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and delegated runners are token-bound.\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
         "operationId": "mint_runner_owner_token_v1_runners__runner_id__token_post",
         "parameters": [
           {
@@ -8235,6 +8293,59 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/auto-title": {
+      "post": {
+        "description": "Replace the deterministic first-message title when still current.",
+        "operationId": "automatically_rename_session_v1_sessions__session_id__auto_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Automatically Rename Session",
+        "tags": [
+          "sessions"
         ]
       }
     },

@@ -21,6 +21,7 @@ from omnigent.runtime.filesystem_registry import (
     AgentEditFilesystemRegistry,
     GitFilesystemRegistry,
     GitStatusUnavailable,
+    _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
     _unquote_git_path,
@@ -666,6 +667,233 @@ def test_git_list_changed_files_expands_untracked_nested_dir(tmp_path: Path) -> 
     record = next(r for r in results if r["path"] == nested_rel)
     assert record["status"] == "created", (
         f"Expected status 'created' for the new file, got {record['status']!r}."
+    )
+
+
+# ── git-status performance tuning (timeout / pathspec / untracked cache) ──────
+
+
+def test_git_timeout_seconds_default_and_env_override(monkeypatch) -> None:
+    """The git timeout defaults to 30s and honors the env override.
+
+    Guards the large-repo headroom bump and the operator-tunable knob: unset
+    → default, a valid positive value → that value, and invalid/non-positive
+    values fall back to the default rather than raising or disabling the cap.
+    """
+    monkeypatch.delenv("OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS", raising=False)
+    assert _git_timeout_seconds() == pytest.approx(30.0)
+
+    monkeypatch.setenv("OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS", "90")
+    assert _git_timeout_seconds() == pytest.approx(90.0)
+
+    for bad in ("not-a-number", "0", "-5", ""):
+        monkeypatch.setenv("OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS", bad)
+        assert _git_timeout_seconds() == pytest.approx(30.0), (
+            f"Expected fallback to default for invalid value {bad!r}."
+        )
+
+
+def test_git_list_changed_files_honors_env_timeout(tmp_path: Path, monkeypatch) -> None:
+    """``list_changed_files`` passes the env-overridden timeout to the subprocess.
+
+    A slow-but-not-hung ``git status`` on a large repo must survive when the
+    operator raises the timeout, instead of failing at the old 5s cap.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    monkeypatch.setenv("OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS", "42")
+
+    seen: dict[str, float | None] = {}
+
+    def _capture(*_args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(args="git", returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _capture)
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    reg.list_changed_files("any-conv", limit=100)
+
+    assert seen["timeout"] == pytest.approx(42.0), (
+        f"Expected the env-overridden 42s timeout, got {seen['timeout']!r}."
+    )
+
+
+def test_git_list_changed_files_excludes_skip_dirs_via_pathspec(tmp_path: Path) -> None:
+    """Untracked files inside ``_SKIP_DIRS`` are excluded and never returned.
+
+    The ``:(exclude)`` pathspecs stop git from walking large build/cache trees
+    (node_modules/ …). A real repo confirms both that git honors the pathspec
+    (the skip-dir file is absent) and that a genuine change still surfaces.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    # Root-level skip dir: must be pruned.
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "big.js").write_text("x" * 10)
+    # A skip-dir name nested under a real source dir is NOT a root-level match,
+    # so it stays visible — mirrors the first-component post-filter semantics.
+    (tmp_path / "src" / "node_modules").mkdir(parents=True)
+    (tmp_path / "src" / "node_modules" / "keep.js").write_text("y")
+    (tmp_path / "real_change.py").write_text("agent wrote this")
+
+    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    paths = [r["path"] for r in reg.list_changed_files("any-conv", limit=100)]
+
+    assert "real_change.py" in paths, f"Expected 'real_change.py' in results but got {paths}."
+    assert not any(p.startswith("node_modules/") for p in paths), (
+        f"Root-level node_modules/ should be pruned but got {paths}."
+    )
+    assert "src/node_modules/keep.js" in paths, (
+        f"Nested (non-root) node_modules should stay visible but got {paths}."
+    )
+
+
+def test_skip_dir_pathspecs_anchored_to_workspace_subdir(tmp_path: Path) -> None:
+    """Pathspecs are anchored to the workspace's prefix within the git root.
+
+    When the workspace is a subdirectory of the git root, the excludes must be
+    prefixed with that subdir so a skip dir elsewhere in the repo is untouched.
+    """
+    git_root = tmp_path
+    workspace = tmp_path / "sub" / "ws"
+    workspace.mkdir(parents=True)
+
+    reg = GitFilesystemRegistry(watch_path=workspace, git_root=git_root)
+    specs = reg._skip_dir_pathspecs()
+
+    assert ":(exclude)sub/ws/node_modules" in specs, (
+        f"Expected workspace-prefixed exclude pathspec, got {specs}."
+    )
+    # No bare (unprefixed) skip-dir exclude should be present.
+    assert ":(exclude)node_modules" not in specs
+
+
+def test_untracked_cache_enabled_on_init(tmp_path: Path) -> None:
+    """The registry enables ``core.untrackedCache`` on the repo at construction.
+
+    This is the large-repo ``git status`` speedup (upstream git ≥ 2.8); the
+    registry sets it best-effort on init. Verifies the config lands.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    result = subprocess.run(
+        ["git", "config", "--get", "core.untrackedCache"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.stdout.strip() == "true", (
+        f"Expected core.untrackedCache=true after init, got {result.stdout.strip()!r}."
+    )
+
+
+def test_untracked_cache_failure_does_not_break_init(tmp_path: Path, monkeypatch) -> None:
+    """A failure enabling the untracked cache must not break registry construction.
+
+    The setting is a pure speedup; old git / read-only .git / mtime-unreliable
+    filesystems should degrade silently rather than raising.
+    """
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    def _raise_oserror(*_args, **_kwargs):
+        raise OSError("git not found")
+
+    monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _raise_oserror)
+
+    # Construction must not raise even though the config subprocess fails.
+    GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+
+def test_untracked_cache_config_written_once_per_root(tmp_path: Path, monkeypatch) -> None:
+    """The ``git config`` write runs at most once per git-root per process.
+
+    The host fallback path builds a fresh registry per fs request, so without
+    the one-shot guard every request would re-spawn ``git config``. Building
+    several registries on the same root must issue the config write only once.
+    """
+    from omnigent.runtime import filesystem_registry as fsr
+
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    # Reset the process-global guard so this test is order-independent.
+    monkeypatch.setattr(fsr, "_untracked_cache_enabled", set())
+
+    config_calls: list[tuple] = []
+    real_run = subprocess.run
+
+    def _counting_run(args, *a, **kw):
+        if args[:3] == ["git", "config", "core.untrackedCache"]:
+            config_calls.append(tuple(args))
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"", stderr=b"")
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(fsr.subprocess, "run", _counting_run)
+
+    for _ in range(3):
+        GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert len(config_calls) == 1, (
+        f"Expected core.untrackedCache config write exactly once, got {len(config_calls)}."
+    )
+
+
+def test_untracked_cache_not_enabled_when_probe_fails(tmp_path: Path, monkeypatch) -> None:
+    """When ``--test-untracked-cache`` fails, the cache config is not written.
+
+    On mtime-unreliable filesystems git's probe exits non-zero; enabling the
+    cache there risks a newly-untracked file missing from the panel, so the
+    registry must leave ``core.untrackedCache`` unset.
+    """
+    from omnigent.runtime import filesystem_registry as fsr
+
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+
+    monkeypatch.setattr(fsr, "_untracked_cache_enabled", set())
+
+    config_calls: list[tuple] = []
+    real_run = subprocess.run
+
+    def _probe_fails_run(args, *a, **kw):
+        if args[:2] == ["git", "update-index"]:
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout=b"", stderr=b"mtime unreliable"
+            )
+        if args[:3] == ["git", "config", "core.untrackedCache"]:
+            config_calls.append(tuple(args))
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(fsr.subprocess, "run", _probe_fails_run)
+
+    GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    assert config_calls == [], (
+        f"Expected no config write when the probe fails, got {config_calls}."
+    )
+    result = subprocess.run(
+        ["git", "config", "--get", "core.untrackedCache"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.stdout.strip() == "", (
+        f"core.untrackedCache should be unset when the probe fails, got {result.stdout.strip()!r}."
     )
 
 

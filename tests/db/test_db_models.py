@@ -16,7 +16,6 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlAgent,
-    SqlAgentConfiguration,
     SqlComment,
     SqlConversation,
     SqlConversationItem,
@@ -70,6 +69,8 @@ def _make_conversation(
     root_conversation_id: str | None = None,
     title: str | None = None,
     archived: bool = False,
+    agent_id: str | None = None,
+    session_overrides: str | None = None,
 ) -> SqlConversation:
     return SqlConversation(
         id=id,
@@ -79,14 +80,9 @@ def _make_conversation(
         root_conversation_id=root_conversation_id or id,
         title=title,
         archived=archived,
+        agent_id=agent_id,
+        session_overrides=session_overrides,
     )
-
-
-def _make_agent_configuration(
-    conversation_id: str = "a9930027fd3e2e979e65844f7af7bf88",
-    agent_id: str | None = None,
-) -> SqlAgentConfiguration:
-    return SqlAgentConfiguration(conversation_id=conversation_id, agent_id=agent_id)
 
 
 def _make_metadata(
@@ -357,9 +353,8 @@ class TestSqlConversation:
             loaded = session.get(SqlConversation, (0, "a9930027fd3e2e979e65844f7af7bf88"))
             assert loaded is not None
             assert loaded.title == "Hello World"
-            # Identity/hierarchy columns only; kind/archived live on
-            # SqlConversationMetadata, agent binding + overrides on
-            # SqlAgentConfiguration.
+            # kind lives on SqlConversationMetadata; the agent binding
+            # (agent_id) and per-session override blob live on the row itself.
             assert loaded.root_conversation_id == "a9930027fd3e2e979e65844f7af7bf88"
             assert loaded.next_position == 0
 
@@ -368,17 +363,15 @@ class TestSqlConversation:
         managed = make_managed_session_maker(engine)
 
         conv = _make_conversation()
-        agent_config = _make_agent_configuration()
         with managed() as session:
             session.add(conv)
-            session.add(agent_config)
 
         with managed() as session:
-            loaded = session.get(SqlAgentConfiguration, (0, "a9930027fd3e2e979e65844f7af7bf88"))
+            loaded = session.get(SqlConversation, (0, "a9930027fd3e2e979e65844f7af7bf88"))
             assert loaded is not None
-            assert loaded.reasoning_effort is None
-            assert loaded.model_override is None
+            # Agent binding + overrides default to NULL on a bare conversation.
             assert loaded.agent_id is None
+            assert loaded.session_overrides is None
 
     def test_metadata_kind_and_archived(self, db_uri: str) -> None:
         """kind lives on SqlConversationMetadata; archived on SqlConversation."""
@@ -505,8 +498,14 @@ class TestSqlConversationItem:
             assert loaded.status == encode_item_status("completed")
             assert loaded.created_by is None
 
-    def test_unique_position_per_conversation(self, db_uri: str) -> None:
-        """Two items in the same conversation cannot share the same position."""
+    def test_position_not_unique_at_db_level(self, db_uri: str) -> None:
+        """Two items in one conversation may share a position at the DB level.
+
+        The position index is plain (non-unique); strict position uniqueness is
+        owned by the ``next_position`` allocator under ``_lock_conversation``, not
+        the index (see the store's concurrent-append test). Distinct ``id`` keeps
+        the PK unique, so both rows persist.
+        """
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
 
@@ -514,11 +513,15 @@ class TestSqlConversationItem:
         item1 = _make_item(id="9980c8a9248139f14f4165e5d53088aa", position=0)
         item2 = _make_item(id="0fd4e86b2daa009cd9929641dbd7dab6", position=0)
 
-        with pytest.raises(IntegrityError):
-            with managed() as session:
-                session.add(conv)
-                session.add(item1)
-                session.add(item2)
+        # No IntegrityError: the DB does not enforce position uniqueness anymore.
+        with managed() as session:
+            session.add(conv)
+            session.add(item1)
+            session.add(item2)
+
+        with managed() as session:
+            count = session.query(SqlConversationItem).filter_by(conversation_id=conv.id).count()
+        assert count == 2, f"both position-0 items should persist; found {count}"
 
     def test_delete_conversation_via_orm_leaves_items_without_fk(self, db_uri: str) -> None:
         """Without DB-level FK cascade, deleting a conversation leaves its items intact.

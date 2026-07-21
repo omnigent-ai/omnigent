@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -82,20 +83,45 @@ async def test_lifespan_starts_and_stops_scheduler(
     assert scheduler.job_count == 0
 
 
+async def test_lifespan_arms_active_task_from_non_default_workspace(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """Startup loads active tasks across workspaces, not just ambient workspace 0."""
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    with workspace_scope(42):
+        task = store.create(
+            scheduled_task_id=_uid("tenant-nightly"),
+            name="tenant nightly triage",
+            prompt="triage the queue",
+            rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+            owner_user_id=None,
+            agent_id=_uid("agent-1"),
+            timezone="America/Los_Angeles",
+        )
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+
+    async with app.router.lifespan_context(app):
+        scheduler = app.state.scheduled_task_scheduler
+        assert scheduler.is_started
+        assert scheduler.job_count == 1
+        assert scheduler.next_run_at(uuid.UUID(task.id).hex) is not None
+
+
 async def test_lifespan_survives_scheduler_start_failure(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failure loading the schedule at boot (e.g. a DB error in
-    ``list_active()``) is logged and swallowed — server boot still completes."""
+    """A failure loading the schedule at boot is logged and swallowed."""
     store = SqlAlchemyScheduledTaskStore(db_uri)
 
     def _boom() -> list:
         raise RuntimeError("db is down")
 
-    monkeypatch.setattr(store, "list_active", _boom)
+    monkeypatch.setattr(store, "list_active_all_workspaces", _boom)
     app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
 
     # Entering the lifespan must not raise despite start() blowing up.

@@ -41,10 +41,15 @@ export function isOwnerLevel(level: number | null): boolean {
  *    source. Sub-agent (child) sessions are filtered out of the
  *    sidebar list query, so this is the only place their level is
  *    observable.
- * 2. ``activeConv.permission_level`` — sidebar list row. Available
- *    synchronously the moment the user navigates between top-level
- *    conversations, so we use it as a fast path before the single
- *    fetch resolves.
+ * 2. ``activeConv.permission_level`` — sidebar list row, but ONLY when it
+ *    actually carries a level. Available synchronously the moment the user
+ *    navigates between top-level conversations, so it's a fast path before
+ *    the single fetch resolves. A row whose level is ``null`` (a deployment
+ *    whose session list is owner-only and omits the caller's effective
+ *    level, e.g. the Databricks-managed server) carries no conclusion, so we
+ *    skip it and fall through to the authoritative snapshot / fallback
+ *    rather than mistaking the absent level for the permissive ``null``
+ *    sentinel.
  * 3. ``null`` while the single fetch is still in flight (the UI
  *    treats ``null`` permissively, avoiding a read-only flicker
  *    during the snapshot's first round-trip on child sessions).
@@ -60,7 +65,7 @@ export function derivePermissionLevel(
   conversationsLoaded: boolean,
 ): number | null {
   if (session != null) return session.permissionLevel;
-  if (activeConv != null) return activeConv.permission_level ?? null;
+  if (activeConv != null && activeConv.permission_level != null) return activeConv.permission_level;
   if (sessionLoading) return null;
   if (conversationId && conversationsLoaded) return 1;
   return null;

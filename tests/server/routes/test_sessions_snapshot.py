@@ -18,6 +18,7 @@ from omnigent.server.routes.sessions import (
     _publish_subtree_cost_to_ancestors,
     _truncate_label,
 )
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
 async def _drain_runner_skills(session_id: str) -> None:
@@ -181,6 +182,91 @@ async def test_session_snapshot_reads_latest_items_then_returns_chronological() 
     assert [item.id for item in snapshot.items] == ["item_103", "item_104", "item_105"]
     assert snapshot.agent_id == "087b7cb7ac30abf4debfaa578d052ec6"
     assert snapshot.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_uses_child_spec_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Child snapshots expose their selected spec while parents keep the root spec."""
+    child_spec = AgentSpec(
+        spec_version=1,
+        name="executor",
+        executor=ExecutorSpec(
+            config={"harness": "codex"},
+            model="openai-codex/gpt-5.6-sol:medium",
+            context_window=100_000,
+        ),
+    )
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="advisor",
+        executor=ExecutorSpec(
+            config={"harness": "codex"},
+            model="openai-codex/gpt-5.6-sol:high",
+            context_window=200_000,
+        ),
+        sub_agents=[child_spec],
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+            kind="sub_agent",
+            sub_agent_name="executor",
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            assert agent_id == "ag_advisor"
+            return type(
+                "StoredAgent",
+                (),
+                {"id": agent_id, "name": "advisor-row", "bundle_location": "bundle"},
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str) -> Any:
+            assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    parent = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_parent",
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+    child = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "conv_child",
+        agent_store=_AgentStore(),  # type: ignore[arg-type]
+        agent_cache=_AgentCache(),  # type: ignore[arg-type]
+    )
+
+    assert parent.agent_name == "advisor"
+    assert parent.llm_model == "openai-codex/gpt-5.6-sol:high"
+    assert parent.context_window == 200_000
+    assert child.agent_name == "executor"
+    assert child.llm_model == "openai-codex/gpt-5.6-sol:medium"
+    assert child.context_window == 100_000
 
 
 @pytest.mark.asyncio

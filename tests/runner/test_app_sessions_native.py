@@ -68,6 +68,7 @@ from omnigent.runner.app import (
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
+    _refresh_claude_permission_hook_auth,
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
@@ -994,6 +995,73 @@ async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
         pm.marked_in_flight
     )
     assert pm.cleared_in_flight == ["9217a860245985f541fd686eb2a32b73"], pm.cleared_in_flight
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_clears_in_flight_on_context_overflow_live_stream() -> None:
+    """clear_in_flight fires for a live (``stream=true``) turn that overflows context.
+
+    Regression for a leak where a context-window overflow on the live-stream
+    path left the reaper's in-flight marker set forever: proxy_stream raised
+    _ContextWindowOverflow uncaught on this path, so _on_proxy_stream_end never
+    ran and the idle reaper (which skips anything in-flight) never reclaimed
+    the harness. The background-turn path already handled this; live turns did
+    not.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_overflow"}}),
+        _sse(
+            {
+                "type": "response.failed",
+                "error": {
+                    "message": (
+                        "context_length_exceeded: 5000 tokens > 4096 maximum context length"
+                    ),
+                    "code": "context_length_exceeded",
+                },
+            }
+        ),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = "b4f6a4f0f2f74d76a2e4c0c9a8e0f9aa"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "965906f5d9fb596610dda599a80faaee",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        # Drain the live SSE stream like a real browser client would. Pre-fix
+        # this can surface the uncaught overflow as a transport error; either
+        # way the assertions below are what pin the regression.
+        with contextlib.suppress(Exception):
+            async for _chunk in resp.aiter_text():
+                pass
+
+    # Marked live on response.created, then cleared despite the overflow.
+    assert pm.marked_in_flight == [(conv_id, "resp_overflow")], pm.marked_in_flight
+    assert pm.cleared_in_flight == [conv_id], (
+        f"in-flight marker never cleared on live-stream context overflow "
+        f"(got {pm.cleared_in_flight}) -- the reaper would skip this "
+        f"conversation's harness forever"
+    )
 
 
 @pytest.mark.asyncio
@@ -2055,6 +2123,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert app_server.codex_home == expected_codex_home
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
+    assert build_calls[0]["developer_instructions"] is None
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
@@ -2645,6 +2714,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     #   worktree    — the session's stored workspace (correct answer)
     runner_env = tmp_path / "runner_workspace"
     runner_env.mkdir()
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     bundle_dir = tmp_path / "runner-specs" / f"{session_id}-v1"
     bundle_dir.mkdir(parents=True)
     worktree = tmp_path / "repo-worktrees" / "feature-x"
@@ -2850,6 +2920,9 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    assert build_calls[0]["developer_instructions"] == SESSION_RENAME_INSTRUCTION
 
     # Sandbox-override regression: the launched Codex terminal must inherit
     # the agent's sandbox: none rather than falling back to the platform
@@ -14172,9 +14245,25 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     SessionStart/Stop/.../PreCompact + statusLine but no
     PermissionRequest).
     """
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+
+    token_calls: list[int] = []
+
+    def _shared_auth_factory() -> str:
+        token_calls.append(1)
+        return "shared-runner-token"
+
+    def _unexpected_auth_resolution(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("terminal launch must reuse the runner auth factory")
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        _unexpected_auth_resolution,
+    )
 
     # The real forwarder opens an HTTP stream to the server; stub it so
     # the auto-create flow runs without network. The created task is
@@ -14225,6 +14314,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        auth_token_factory=_shared_auth_factory,
     )
 
     spec = captured["spec"]
@@ -14235,6 +14325,10 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     # early no longer cascades into "no server running" (#540).
     assert spec.keep_alive_after_exit is True
     args = spec.args
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    prompt_index = args.index("--append-system-prompt")
+    assert args[prompt_index + 1] == SESSION_RENAME_INSTRUCTION
     settings = json.loads(args[args.index("--settings") + 1])
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
@@ -14247,6 +14341,8 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         bridge_dir_for_bridge_id("4e92b5a0c0ee6db3f874f9c4a3f855a5")
     )
     assert config["ap_server_url"] == "http://127.0.0.1:8000"
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer shared-runner-token"
+    assert token_calls == [1]
 
     # The forwarder must get a refresh-capable httpx.Auth (not just a
     # one-shot Authorization header) so a long-running host-spawned
@@ -14257,6 +14353,49 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+
+
+@pytest.mark.asyncio
+async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent runner refreshes delegated hook auth in the bridge file."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("refresh-hook-auth", workspace=tmp_path)
+    claude_native_bridge.build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigent.example.com",
+        ap_auth_headers={"Authorization": "Bearer old-token"},
+    )
+
+    task = asyncio.create_task(
+        _refresh_claude_permission_hook_auth(
+            bridge_dir=bridge_dir,
+            server_url="https://omnigent.example.com",
+            auth_token_factory=lambda: "fresh-delegated-token",
+            refresh_interval_s=0.01,
+        )
+    )
+    try:
+
+        async def _wait_for_refresh() -> None:
+            while True:
+                config = read_permission_hook_config(bridge_dir)
+                if config.get("ap_auth_headers", {}).get("Authorization") == (
+                    "Bearer fresh-delegated-token"
+                ):
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_refresh(), timeout=1.0)
+    finally:
+        task.cancel()
+        _ = await asyncio.gather(task, return_exceptions=True)
+
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer fresh-delegated-token"
 
 
 @pytest.mark.asyncio
@@ -15242,6 +15381,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -15320,6 +15460,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
             return _SnapResponse()
 
+    launched_args: list[str] = []
+
     class _FakeResourceRegistry:
         """Resource registry that returns a terminal without launching."""
 
@@ -15336,7 +15478,8 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view without spawning a TTY."""
-            del terminal_name, session_key, spec
+            del terminal_name, session_key
+            launched_args.extend(spec.args)
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -15373,8 +15516,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     # snapshot carried an external session id.
     if snapshot_external_id is None:
         assert synth_calls == []
+        assert "--append-system-prompt" in launched_args
     else:
         assert synth_calls == [snapshot_external_id]
+        assert "--append-system-prompt" not in launched_args
 
 
 @pytest.mark.asyncio

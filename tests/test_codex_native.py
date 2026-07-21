@@ -60,9 +60,9 @@ def _point_codex_auth_check_at(
         lambda: codex_native._CodexAuthSource(auth_path=auth_path),
     )
     monkeypatch.setattr(
-        codex_native.shutil,
-        "which",
-        lambda name: f"/tmp/{name}" if binary_present else None,
+        codex_native,
+        "_find_codex_cli",
+        lambda: "/tmp/codex" if binary_present else None,
     )
 
 

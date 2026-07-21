@@ -77,8 +77,19 @@ export const reactRouterRouting: RoutingApi = {
  */
 function rebasePath(path: string, basename: string): string {
   if (!path.startsWith("/")) return path;
-  // Avoid double-prefixing if already under the basename.
-  if (path === basename || path.startsWith(`${basename}/`)) return path;
+  // Avoid double-prefixing if already under the basename. The basename ends at
+  // the first `/`, `?`, or `#` (or end of string) — so `/mount`, `/mount/c/x`,
+  // and `/mount?o=1` are all "already under `/mount`", but a distinct segment
+  // like `/mounting` is not. Checking only `=== basename` / `${basename}/`
+  // missed the query/hash forms: a mount-absolute path carrying a search (e.g.
+  // the settings "Back to Omnigent" target `/mount?o=123`, captured from
+  // `useLocation()` which already includes the basename) fell through and got
+  // prefixed again → `/mount/mount?o=123`, a 404.
+  if (path === basename) return path;
+  if (path.startsWith(basename)) {
+    const boundary = path[basename.length];
+    if (boundary === "/" || boundary === "?" || boundary === "#") return path;
+  }
   return `${basename}${path}`;
 }
 

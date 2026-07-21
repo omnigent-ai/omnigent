@@ -34,6 +34,25 @@ stores into ``create_app``):
        sandbox:
          provider: modal          # lakebox|modal|daytona|boxlite|cwsandbox|islo|e2b|openshell
          server_url: https://omnigent.example.com
+         host_config:             # optional; provider-agnostic. Verbatim
+                                  # in-sandbox ~/.omnigent/config.yaml content,
+                                  # installed before `omnigent host` starts
+                                  # (e.g. route the `pi` harness through a
+                                  # self-hosted gateway). Server-managed:
+                                  # entries injected earlier are replaced or
+                                  # removed on the next launch/resume; user
+                                  # config in the sandbox survives. Keep
+                                  # secrets out via api_key_ref: env: —
+                                  # resolved in the SANDBOX env (harness
+                                  # Secret / provider env lane).
+           providers:
+             litellm:
+               kind: gateway
+               default: [pi]
+               openai:
+                 base_url: http://litellm.litellm.svc.cluster.local/v1
+                 api_key_ref: env:LITELLM_API_KEY
+                 wire_api: chat
          modal:                   # optional block
            image: docker.io/me/omnigent-host:latest  # default: official image
            secrets: [omnigent-llm]  # Modal secrets injected as sandbox env
@@ -367,6 +386,17 @@ class ManagedSandboxConfig:
         falls back to the generic "New Sandbox" label. Exposed (when
         managed launch is supported) on the unauthenticated
         ``GET /v1/info`` as ``sandbox_provider``.
+    :param host_config: Verbatim in-sandbox ``~/.omnigent/config.yaml``
+        content (e.g. a ``providers:`` block routing a harness through
+        a self-hosted gateway) installed into the sandbox's config before
+        ``omnigent host`` starts, or ``None``. Server-managed: previously
+        injected entries are replaced or removed on each launch/resume so
+        the sandbox always reflects the current block. Provider-agnostic:
+        forwarded to every launcher's ``start_host`` — see
+        :func:`omnigent.onboarding.sandboxes.base.render_host_config_write_command`.
+        Non-secret by design: credentials stay behind
+        ``api_key_ref: env:VAR`` indirection, resolved inside the
+        sandbox against its own environment.
     """
 
     server_url: str
@@ -374,6 +404,7 @@ class ManagedSandboxConfig:
     token_ttl_s: int
     managed_launch_supported: bool = True
     provider: str | None = None
+    host_config: dict[str, object] | None = None
 
 
 @dataclass
@@ -602,6 +633,95 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher
     return _reject
 
 
+def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
+    """
+    Extract and validate the top-level ``sandbox.host_config`` block.
+
+    Verbatim in-sandbox ``~/.omnigent/config.yaml`` content forwarded at
+    managed launch (see :class:`ManagedSandboxConfig`). When a
+    ``providers`` key is present, its SHAPE is validated through the same
+    parser ``omnigent`` itself uses — structurally only: secret
+    references (``api_key_ref: env:VAR``) name variables in the
+    SANDBOX's environment, not the server's, so they are deliberately
+    never resolved here. Validating at parse time matters doubly for
+    this block: inside the sandbox a malformed ``providers`` entry
+    degrades silently (the harness falls back to its own login), so
+    server startup is the only place a typo can fail loud.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The validated ``host_config`` mapping, or ``None`` when
+        the key is absent.
+    :raises ValueError: When present but not a mapping, or when its
+        ``providers`` block fails shape validation.
+    """
+    host_config = raw.get("host_config")
+    if host_config is None:
+        return None
+    if not isinstance(host_config, dict):
+        raise ValueError(
+            "server config 'sandbox.host_config' must be a mapping — verbatim "
+            "in-sandbox ~/.omnigent/config.yaml content merged in before "
+            "'omnigent host' starts"
+        )
+    # Key presence, not get(): an explicit `providers: null` would skip
+    # validation here yet still ride to the sandbox, where the merge writes
+    # `providers: null` over any existing block — the silent degradation this
+    # parse exists to prevent.
+    if "providers" in host_config:
+        providers = host_config["providers"]
+        # load_providers silently ignores a non-mapping providers value, so
+        # the mapping check must happen here to fail loud.
+        if not isinstance(providers, dict):
+            raise ValueError("server config 'sandbox.host_config.providers' must be a mapping")
+        # Lazy imports, matching the provider branches below: the parse path
+        # must not pull the onboarding layer in at module import time.
+        from omnigent.errors import OmnigentError
+        from omnigent.onboarding.provider_config import get_default_provider, load_providers
+
+        try:
+            parsed_providers = load_providers(host_config)
+            default_scopes = {
+                scope
+                for provider in parsed_providers.values()
+                for scope in provider.default_families
+            }
+            for scope in sorted(default_scopes):
+                get_default_provider(host_config, scope)
+        except OmnigentError as exc:
+            raise ValueError(
+                f"server config 'sandbox.host_config.providers' is invalid: {exc}"
+            ) from exc
+        for provider in parsed_providers.values():
+            for family_name, family in provider.families.items():
+                if family.api_key is not None:
+                    raise ValueError(
+                        "server config "
+                        f"'sandbox.host_config.providers.{provider.name}."
+                        f"{family_name}.api_key' must not contain an inline API key — "
+                        "use api_key_ref: env:VAR instead"
+                    )
+    # The block rides json.dumps to the sandbox on every launch, and
+    # yaml.safe_load produces values json can't take (an unquoted date
+    # becomes datetime.date) — round-trip now so that fails startup, not
+    # every launch.
+    import json
+
+    try:
+        serialized = json.dumps(host_config)
+        round_tripped = json.loads(serialized)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"server config 'sandbox.host_config' must be JSON-serializable "
+            f"(quote YAML scalars like dates): {exc}"
+        ) from exc
+    if round_tripped != host_config:
+        raise ValueError(
+            "server config 'sandbox.host_config' must be JSON-serializable without loss "
+            "(mapping keys must be strings and values must preserve their JSON types)"
+        )
+    return host_config
+
+
 def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
     """
     Parse and validate the server config's ``sandbox:`` section.
@@ -633,6 +753,9 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             "server config 'sandbox.server_url' is required — the public URL "
             "of this server that sandboxed hosts connect back to"
         )
+    # Validated regardless of provider (like server_url): a malformed
+    # host_config should stop startup even for staged/unsupported providers.
+    host_config = _parse_host_config(raw)
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -721,6 +844,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s=token_ttl_s,
         managed_launch_supported=provider in PROVIDERS_WITH_MANAGED_LAUNCH,
         provider=provider,
+        host_config=host_config,
     )
 
 
@@ -1943,6 +2067,9 @@ async def _arm_and_start_host(
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
             on_stage=on_stage,
+            # Omitted entirely when unset: a deployment-injected launcher
+            # predating the host_config parameter must keep launching.
+            **({"host_config": config.host_config} if config.host_config is not None else {}),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
@@ -2166,6 +2293,13 @@ async def resume_managed_host(
                 host_name=host.name,
                 server_url=config.server_url,
                 repo_url=None,  # the persistent volume already holds the workspace
+                # Re-materialized on every wake, so an operator's host_config
+                # change lands on the next resume without a new sandbox.
+                # Omitted entirely when unset: a deployment-injected launcher
+                # predating the host_config parameter must keep resuming.
+                # (Base start_host still cleans up previously injected entries
+                # on resumable launchers when the block is removed.)
+                **({"host_config": config.host_config} if config.host_config is not None else {}),
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:

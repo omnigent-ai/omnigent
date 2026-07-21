@@ -1809,6 +1809,101 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
+    def test_session_rename_tool_uses_exact_sdk_mcp_name(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured_options = {}
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            @staticmethod
+            def tool(name, desc, params):
+                def decorator(handler):
+                    return type(
+                        "Tool",
+                        (),
+                        {
+                            "name": name,
+                            "description": desc,
+                            "parameters": params,
+                            "handler": handler,
+                        },
+                    )()
+
+                return decorator
+
+            @staticmethod
+            def create_sdk_mcp_server(**kwargs):
+                return kwargs
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = getattr(options, "system_prompt", None)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [_ResultMessage(session_id, "done")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "session-a"}],
+                        [
+                            {
+                                "name": "sys_session_rename",
+                                "description": "Rename current session",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"title": {"type": "string"}},
+                                    "required": ["title"],
+                                },
+                            }
+                        ],
+                        "Call `sys_session_rename` before replying.",
+                    )
+                ]
+            self.assertIn(
+                "mcp__omnigent__sys_session_rename",
+                captured_options["allowed_tools"],
+            )
+            self.assertIn(
+                "use `mcp__omnigent__sys_session_rename` when instructions say "
+                "`sys_session_rename`",
+                captured_options["system_prompt"],
+            )
+            self.assertIsInstance(events[-1], TurnComplete)
+
+        _run(_t())
+
     def test_crashed_session_refuses_future_turns(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 

@@ -25,6 +25,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 import uuid
 from collections.abc import Callable
@@ -72,6 +73,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
     # (not duplicated) so the runner's REST-backed peek clamps to the same
@@ -232,6 +234,8 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
+_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+
 # Grantee sentinel for an anonymous, public read-only share. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
@@ -317,6 +321,17 @@ _AGENT_TOOLS = frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list
 # The runner proxies the Omnigent server's session policy REST endpoint.
 _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
+# Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
+# server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
+_SCHEDULED_TASK_TOOLS = frozenset(
+    {
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+    }
+)
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -366,6 +381,7 @@ _BROWSER_TIMEOUT_ERROR = (
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
+    | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -374,6 +390,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _TASK_LIFECYCLE_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _SCHEDULED_TASK_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -455,6 +472,7 @@ def build_native_relay_tool_schemas(spec: Any | None) -> list[dict[str, Any]]:
             SysSessionListTool,
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
+            SysSessionRenameTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -513,6 +531,7 @@ _ALL_LOCAL_TOOLS = (
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
+    | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _HINDSIGHT_TOOLS
@@ -522,6 +541,7 @@ _ALL_LOCAL_TOOLS = (
     | _COMMENT_TOOLS
     | _AGENT_TOOLS
     | _POLICY_TOOLS
+    | _SCHEDULED_TASK_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -1593,12 +1613,16 @@ async def _execute_subagent_tool(
         ):
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "already has a launching or running turn; wait for completion before sending again"
+                "already has a launching or running turn. Use a distinct task-based title "
+                "for independent parallel work; reuse this title only to continue the same "
+                "conversation after completion."
             )
         if existing.get("busy") is True:
             return (
                 f"Error: sub-agent {sub_agent_name!r} title {session_name!r} "
-                "is already running; wait for completion before sending again"
+                "is already running. Use a distinct task-based title for independent "
+                "parallel work; reuse this title only to continue the same conversation "
+                "after completion."
             )
     else:
         child_harness = _subagent_harness(str(sub_agent_name), agent_spec)
@@ -3110,6 +3134,100 @@ async def _execute_add_policy(
         return json.dumps({"error": f"sys_add_policy failed: {exc}"})
 
 
+# Fields the create tool forwards to POST /v1/scheduled-tasks.
+_SCHEDULED_TASK_CREATE_FIELDS = (
+    "name",
+    "prompt",
+    "rrule",
+    "agent_id",
+    "timezone",
+    "model_override",
+    "reasoning_effort",
+    "workspace",
+    "host_id",
+)
+# Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
+_SCHEDULED_TASK_UPDATE_FIELDS = (
+    "name",
+    "prompt",
+    "rrule",
+    "timezone",
+    "model_override",
+    "reasoning_effort",
+    "workspace",
+    "host_id",
+    "state",
+)
+_SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _scheduled_task_url(task_id: object) -> str | None:
+    """Return a safe scheduled-task URL path for a canonical id."""
+    if not isinstance(task_id, str) or not _SCHEDULED_TASK_ID_RE.fullmatch(task_id):
+        return None
+    return f"/v1/scheduled-tasks/{task_id.lower()}"
+
+
+async def _execute_scheduled_task_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """
+    Runner-local handler for the ``sys_scheduled_task_*`` family.
+
+    The runner has no in-process ScheduledTaskStore, so these tools proxy the
+    Omnigent server's ``/v1/scheduled-tasks`` REST endpoints over
+    ``server_client`` — same posture as :func:`_execute_policy_tool` /
+    :func:`_execute_session_query_tool`. Ownership + RRULE validation are
+    enforced server-side.
+
+    :param tool_name: One of the ``sys_scheduled_task_*`` names.
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :param server_client: HTTP client pointed at the Omnigent server; ``None``
+        returns an error string.
+    :returns: Tool output JSON string.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args: dict[str, Any] = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+
+    try:
+        if tool_name == "sys_scheduled_task_list":
+            resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
+        elif tool_name == "sys_scheduled_task_create":
+            payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
+        elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
+            task_id = args.get("scheduled_task_id")
+            if not task_id:
+                return json.dumps({"error": f"{tool_name} requires 'scheduled_task_id'"})
+            task_url = _scheduled_task_url(task_id)
+            if task_url is None:
+                return json.dumps(
+                    {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
+                )
+            if tool_name == "sys_scheduled_task_delete":
+                resp = await server_client.delete(task_url, timeout=30.0)
+            else:
+                payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
+                resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+        else:  # pragma: no cover — routing guarantees a known name
+            return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        )
+    return json.dumps(resp.json())
+
+
 @dataclass
 class _ParsedTitle:
     """
@@ -3936,6 +4054,49 @@ async def _session_list_via_rest(
     return json.dumps({"sub_agents": sub_agents, "sessions": sessions})
 
 
+async def _rename_current_session_via_rest(
+    args: dict[str, Any],
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Conditionally rename the calling session through the server API.
+
+    Automatic naming is framework metadata, never a prerequisite for the
+    user's turn. Every failure therefore becomes a tool-result envelope so a
+    missing route, unavailable server, or malformed response cannot abort the
+    harness session.
+    """
+    if server_client is None:
+        return json.dumps({"error": "sys_session_rename requires server access"})
+    if conversation_id is None:
+        return json.dumps({"error": "sys_session_rename requires a session id"})
+    title = args.get("title")
+    if not isinstance(title, str):
+        return json.dumps({"error": "sys_session_rename requires a string 'title'"})
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/auto-title",
+            json={"title": title},
+            timeout=30.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"sys_session_rename failed: {exc}"})
+    if response.status_code >= 400:
+        return json.dumps(
+            {
+                "error": f"sys_session_rename returned {response.status_code}",
+                "detail": response.text[:200],
+            }
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "sys_session_rename returned a non-object response"})
+    return json.dumps(payload)
+
+
 async def _collect_sub_agents(
     conversation_id: str,
     server_client: httpx.AsyncClient,
@@ -4533,6 +4694,12 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
             )
+        elif tool_name in _SESSION_SELF_WRITE_TOOLS:
+            output = await _rename_current_session_via_rest(
+                args,
+                conversation_id,
+                server_client,
+            )
         elif tool_name in _SESSION_QUERY_TOOLS:
             output = await _execute_session_query_tool(
                 tool_name,
@@ -4615,6 +4782,12 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 conversation_id=conversation_id,
+                server_client=server_client,
+            )
+        elif tool_name in _SCHEDULED_TASK_TOOLS:
+            output = await _execute_scheduled_task_tool(
+                tool_name,
+                arguments,
                 server_client=server_client,
             )
         elif tool_name in _BROWSER_TOOLS:
