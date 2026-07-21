@@ -103,6 +103,14 @@ export interface ServerInfo {
    * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
    */
   smart_routing_enabled: boolean;
+  /**
+   * True when the server can transcribe dictation audio
+   * (``WS /v1/dictation/stream``; the ``dictation`` extra plus models
+   * are installed). Gates the composer mic button's server
+   * speech-to-text fallback where the browser Web Speech API has no
+   * backend (Electron, Firefox/Chromium).
+   */
+  dictation_available: boolean;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
@@ -121,6 +129,7 @@ const _OFF: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  dictation_available: false,
 };
 
 let _cached: ServerInfo | null = null;
@@ -161,6 +170,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           public_sharing_enabled: data.public_sharing_enabled !== false,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: data.smart_routing_enabled === true,
+          dictation_available: data.dictation_available === true,
         };
         return _cached;
       }

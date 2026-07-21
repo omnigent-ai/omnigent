@@ -65,6 +65,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -1999,9 +2000,10 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``, ``single_user``), the short
-        sandbox provider name (``sandbox_provider``) the web UI labels
-        the new-session sandbox option with, and the installed
+        ``managed_sandboxes_enabled``, ``dictation_available``,
+        ``single_user``), the short sandbox provider name
+        (``sandbox_provider``) the web UI labels the new-session
+        sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
@@ -2077,6 +2079,13 @@ def create_app(
             )
         except ImportError:
             smart_routing_enabled = False
+        # dictation_available gates the composer mic button's server
+        # speech-to-text fallback (designs/server-dictation.md). Checks
+        # config presence only (extra installed + models on disk) — no
+        # model is loaded here.
+        from omnigent.server.dictation import engine_availability
+
+        dictation_available, _ = engine_availability()
         return {
             "accounts_enabled": accounts_enabled,
             "single_user": single_user,
@@ -2089,6 +2098,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "dictation_available": dictation_available,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
@@ -2194,6 +2204,14 @@ def create_app(
         create_harnesses_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["harnesses"],
+    )
+    # Server-side speech-to-text behind the composer mic button
+    # (designs/server-dictation.md). Availability is probed lazily, so
+    # registering unconditionally is free for servers without the extra.
+    app.include_router(
+        create_dictation_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["dictation"],
     )
     app.include_router(
         create_terminal_attach_router(

@@ -86,6 +86,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import {
@@ -3798,6 +3799,7 @@ export function Composer({
   subAgentLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4880,12 +4882,17 @@ export function Composer({
             <ComposerMicButton
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onTranscript={(text) => {
-                setValue((prev) => (prev ? `${prev} ${text}` : text));
+                dictation.appendFinal(text);
                 dirtyRef.current = true;
                 // Dictation is a user-driven edit — exit prompt-recall mode
                 // so ArrowUp/ArrowDown don't clobber the dictated text.
                 resetCursor();
                 if (commandError !== null) setCommandError(null);
+              }}
+              onInterim={(text) => {
+                dictation.replaceInterim(text);
+                dirtyRef.current = true;
+                resetCursor();
               }}
             />
           </div>

@@ -181,6 +181,22 @@ antigravity = ["google-antigravity>=0.1,<1"]
 # extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
 # why it is not part of the baseline install. Pin major.
 copilot = ["github-copilot-sdk>=1,<2"]
+# Server-side streaming dictation (`WS /v1/dictation/stream`,
+# designs/server-dictation.md). Local CPU speech-to-text via sherpa-onnx;
+# the engine module imports it lazily, so only servers offering dictation
+# need the extra. Models are fetched separately
+# (scripts/fetch-dictation-models.sh). sherpa-onnx-core (the native
+# onnxruntime payload) is pinned explicitly because sherpa-onnx's wheel
+# metadata declares it inconsistently across platforms — without the
+# explicit pin it is missing from uv.lock, which breaks both the hashed
+# OSV audit and aarch64 installs.
+dictation = [
+    "sherpa-onnx>=1.13,<2",
+    "sherpa-onnx-core>=1.13,<2",
+    # The engine converts PCM frames with numpy directly; declare it
+    # rather than riding whichever extra happens to pull it in.
+    "numpy>=1.24,<3",
+]
 # Cursor SDK harness (`harness: cursor`). Optional like antigravity: the
 # harness imports the cursor-sdk lazily on first turn, so only `--harness
 # cursor` users need this extra (`omnigent[cursor]`). Was a baseline dependency;
