@@ -14,7 +14,7 @@ This guide covers the Omnigent-specific OpenShell setup:
 - configure CLI-launched or server-managed sandboxes.
 
 ```bash
-pip install 'omnigent[openshell]'
+uv pip install 'omnigent[openshell]'
 ```
 
 Omnigent uses OpenShell two ways:
@@ -404,6 +404,6 @@ upload, foreground streaming, attach, terminate, env passthrough, error handling
 and the managed-config parsing:
 
 ```bash
-pip install -e '.[openshell,dev]'
+uv pip install -e '.[openshell,dev]'
 pytest tests/onboarding/sandboxes/test_openshell.py tests/server/test_managed_hosts.py
 ```
