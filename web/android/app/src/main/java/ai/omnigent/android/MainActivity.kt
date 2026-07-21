@@ -33,7 +33,6 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 
@@ -149,9 +148,9 @@ class MainActivity : ComponentActivity() {
                     downloadFile(downloadUrl, contentDisposition, mimeType)
                 }
             }
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
-            WebSettingsCompat.setAlgorithmicDarkeningAllowed(webView.settings, true)
-        }
+        // No algorithmic darkening: with targetSdk >= 33 the DayNight theme alone
+        // makes prefers-color-scheme track the OS, and darkening would invert the
+        // SPA when the user forces light mode under an OS dark theme.
         // Wrap the WebView in a FrameLayout so the floating server-switcher
         // pill can sit on top of it. The pill uses the app's brand palette
         // (values/values-night colors.xml) so it adapts to light/dark mode.
