@@ -37,6 +37,7 @@ async def test_create_mcp_server_updates_agent_bundle(client: httpx.AsyncClient)
         "transport": "http",
         "description": "GitHub tools",
         "url": "https://example.com/sse",
+        "headers": {},
         "command": None,
         "args": [],
     }
@@ -135,6 +136,7 @@ async def test_update_mcp_server_can_rename_and_change_transport(
         "transport": "stdio",
         "description": None,
         "url": None,
+        "headers": {},
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-search"],
     }
