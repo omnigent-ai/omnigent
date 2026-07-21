@@ -51,6 +51,10 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.background_session_titles import (
+    BackgroundSessionTitleCoordinator,
+    RunnerBackgroundTitleGenerator,
+)
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -1242,6 +1246,10 @@ def create_app(
         tunnel_registry,
         server_version=_server_version(),
     )
+    background_title_coordinator = BackgroundSessionTitleCoordinator(
+        conversation_store,
+        RunnerBackgroundTitleGenerator(runner_router),
+    )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
@@ -1455,6 +1463,7 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -1479,6 +1488,7 @@ def create_app(
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
+    app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
@@ -2219,6 +2229,7 @@ def create_app(
             # Validates target-project ownership when PATCH /v1/sessions/{id}
             # files a session into a project (owner-private membership).
             project_store=project_store,
+            background_title_coordinator=background_title_coordinator,
         ),
         prefix="/v1",
         tags=["sessions"],
