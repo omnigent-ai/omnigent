@@ -461,6 +461,9 @@ def _body_to_inline_yaml(
     return result
 
 
+_REDACTED_SENTINEL = "[REDACTED]"
+
+
 def _apply_headers(
     result: dict[str, Any],
     body: UpsertMCPServerRequest,
@@ -471,11 +474,21 @@ def _apply_headers(
     Uses body.headers when provided; falls back to preserving the existing
     bundle's headers so a URL-only edit doesn't wipe configured auth tokens.
     Omits the key entirely when neither is present.
+
+    Values equal to ``"[REDACTED]"`` are treated as the UI's sentinel for
+    "this header exists but I didn't change it" — those values are restored
+    from the existing bundle rather than written as the literal string.
     """
     if body.headers is not None:
-        if body.headers:
-            result["headers"] = body.headers
-        # else: explicitly cleared — omit the key
+        if not body.headers:
+            # Explicitly cleared — omit the key entirely.
+            return
+        existing_headers: dict[str, Any] = existing.get("headers") or {}
+        merged = {
+            k: (existing_headers.get(k, v) if v == _REDACTED_SENTINEL else v)
+            for k, v in body.headers.items()
+        }
+        result["headers"] = merged
     elif "headers" in existing:
         result["headers"] = existing["headers"]
 
