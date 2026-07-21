@@ -43,7 +43,7 @@ class ScheduledTaskStore(ABC):
         name: str,
         prompt: str,
         rrule: str,
-        owner_user_id: str | None,
+        user_id: str | None,
         agent_id: str,
         timezone: str,
         *,
@@ -61,7 +61,7 @@ class ScheduledTaskStore(ABC):
         :param prompt: The instruction dispatched to the agent on each firing.
         :param rrule: The required RFC 5545 recurrence rule for the recurring
             trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``.
-        :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant
+        :param user_id: User the spawned session's ``LEVEL_OWNER`` grant
             is written for; ``None`` in single-user mode.
         :param agent_id: The agent bound to this task.
         :param timezone: IANA timezone the trigger is evaluated in.

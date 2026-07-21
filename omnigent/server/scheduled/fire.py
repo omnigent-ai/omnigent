@@ -14,7 +14,7 @@ firing:
 #. **Creates a session** bound to the task's agent, carrying the stored
    ``workspace`` / ``host_id`` / ``model_override`` / ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
-   task's ``owner_user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
+   task's ``user_id`` — or :data:`RESERVED_USER_LOCAL` when it is NULL
    (single-user / OSS). Without the grant the run is invisible.
 #. **Launches the runner and dispatches the prompt** so the agent actually runs
    (a seeded prompt with no launched runner would just sit as history).
@@ -375,14 +375,14 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
 async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
     """Write the LEVEL_OWNER grant so the run is visible to its owner.
 
-    A NULL ``owner_user_id`` (single-user / OSS) resolves to
+    A NULL ``user_id`` (single-user / OSS) resolves to
     :data:`RESERVED_USER_LOCAL`. When ``permission_store`` is ``None`` (no auth
     configured) this is a no-op — the session is still accessible because auth
     is disabled system-wide.
     """
     if deps.permission_store is None:
         return
-    owner = task.owner_user_id or RESERVED_USER_LOCAL
+    owner = task.user_id or RESERVED_USER_LOCAL
     await asyncio.to_thread(deps.permission_store.ensure_user, owner)
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
 
@@ -446,7 +446,7 @@ async def _validate_fire_session_inputs(
 ) -> tuple[str, str] | None:
     """Validate stored task fields before creating a conversation."""
     try:
-        owner = task.owner_user_id
+        owner = task.user_id
         agent = await validate_session_agent(
             user_id=owner,
             agent_id=task.agent_id,
@@ -511,7 +511,7 @@ def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
                 f"connected host {host_id!r} was not found",
                 error_code="host_not_found",
             )
-        if task.owner_user_id is not None and host.owner != task.owner_user_id:
+        if task.user_id is not None and host.user_id != task.user_id:
             raise _CannotLaunchScheduledFire(
                 f"connected host {host_id!r} is not owned by the scheduled task owner",
                 error_code="host_not_owned",
@@ -549,7 +549,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         if deps.host_registry is None or deps.host_store is None:
             raise RuntimeError("connected host registry/store is not configured")
 
-        owner = task.owner_user_id or RESERVED_USER_LOCAL
+        owner = task.user_id or RESERVED_USER_LOCAL
         host_id = task.host_id
         if host_id is None or deps.host_registry.get(host_id) is None:
             raise RuntimeError(f"connected host {host_id!r} is not online")

@@ -157,7 +157,7 @@ class FakePermissionStore:
 @dataclass
 class _FakeHost:
     host_id: str
-    owner: str
+    user_id: str
 
 
 class FakeHostStore:
@@ -200,7 +200,7 @@ def _task(**overrides: Any) -> ScheduledTask:
         "name": "nightly",
         "prompt": "do the thing",
         "rrule": "FREQ=HOURLY",
-        "owner_user_id": None,
+        "user_id": None,
         "agent_id": "ag_1",
         "timezone": "UTC",
         "created_at": 1_800_000_000,
@@ -384,7 +384,7 @@ async def test_overlapping_fire_skips_second_launch() -> None:
 @pytest.mark.asyncio
 async def test_explicit_owner_is_granted() -> None:
     perm = FakePermissionStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(owner_user_id="alice@example.com")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
@@ -451,7 +451,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
         )
     )
 
-    await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(owner_user_id=None))
+    await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
 
     assert captured["user_id"] == RESERVED_USER_LOCAL
 
@@ -597,7 +597,7 @@ async def test_no_host_registry_records_failed_without_session() -> None:
 @pytest.mark.asyncio
 async def test_offline_connected_host_records_failed_without_session() -> None:
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(owner_user_id="alice@example.com")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
 
     on_fire = build_on_fire(
         _deps(

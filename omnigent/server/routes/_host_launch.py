@@ -74,7 +74,7 @@ def resolve_host_owner(
     host = host_store.get_host(host_id)
     if host is None:
         raise HTTPException(status_code=404, detail="host not found")
-    if user_id is not None and host.owner != user_id:
+    if user_id is not None and host.user_id != user_id:
         raise HTTPException(status_code=403, detail="not your host")
     return host
 

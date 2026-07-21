@@ -2,8 +2,8 @@
 
 Verifies that at head ``uq_hosts_token_hash`` is gone (the launch-token auth
 path resolves by the ``(workspace_id, host_id)`` PK and matches the digest in
-Python), that ``uq_hosts_workspace_owner_name`` is untouched, and that downgrade
-restores the constraint.
+Python), that the ``(workspace_id, user_id, name)`` uniqueness is untouched, and
+that downgrade restores the constraint.
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ def test_token_hash_unique_dropped_at_head(db_engine: Engine) -> None:
     """At head the (workspace_id, token_hash) unique key is gone."""
     uniques = {u["name"] for u in sa.inspect(db_engine).get_unique_constraints("hosts")}
     assert "uq_hosts_token_hash" not in uniques
-    # The owner/name uniqueness that guards host_id rotation is untouched.
-    assert "uq_hosts_workspace_owner_name" in uniques
+    # The user_id/name uniqueness that guards host_id rotation is untouched.
+    assert "uq_hosts_workspace_user_id_name" in uniques
 
 
 def test_downgrade_restores_token_hash_unique(tmp_path: Path) -> None:

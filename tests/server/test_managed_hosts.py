@@ -1142,7 +1142,7 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1166,7 +1166,7 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     # launchers record their own name.
     host = host_store.get_host(result.host_id)
     assert host is not None
-    assert host.owner == _OWNER
+    assert host.user_id == _OWNER
     assert host.name == start.host_name
     assert host.status == "online"
     assert host.sandbox_provider == "modal"
@@ -1193,7 +1193,7 @@ async def test_launch_materializes_host_config_before_host_start(db_uri: str) ->
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1223,7 +1223,7 @@ async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register, can_resume=True)
@@ -1253,7 +1253,7 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1277,7 +1277,7 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     class _LegacySignatureLauncher(FakeSandboxLauncher):
@@ -1337,7 +1337,7 @@ async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = _AcmeLauncher(on_host_start=_register)
@@ -1494,7 +1494,7 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1608,7 +1608,7 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
             self._host_store.resolve_launch_token(host_id, token) is not None
         )
         # Simulate the host's entrypoint dialing back over the tunnel.
-        self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
+        self._host_store.upsert_on_connect(host_id=host_id, name=host_name, user_id=_OWNER)
         return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
 
 
@@ -1687,7 +1687,7 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1708,7 +1708,7 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host is not None
     assert host.sandbox_id == "sb-fake-2"
     assert host.name == gen1.name
-    assert host.owner == _OWNER
+    assert host.user_id == _OWNER
     # Generation 2 authenticated with a NEW token; generation 1's is
     # revoked by the re-arm (its digest no longer matches anything).
     gen2_token = fake.host_starts[1].token
@@ -1734,7 +1734,7 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1776,7 +1776,7 @@ async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
     host = host_store.register_managed_host(
         host_id="8369cb15e751573a1ee641d5fa09c70a",
         name="managed-mismatch",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok",
         provider="daytona",
         sandbox_id="dt-1",
@@ -1811,7 +1811,7 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     host = host_store.register_managed_host(
         host_id="292a6322075a34e482fde44975da10f3",
         name="managed-resume-gate",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-gate",
         provider="islo",
         sandbox_id="sb-resume-gate",
@@ -1830,7 +1830,7 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     no_sandbox = host_store.register_managed_host(
         host_id="0c3d744a455047df9a3c0acf432d08dd",
         name="managed-resume-no-sandbox",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-no-sandbox",
         provider="islo",
         sandbox_id="sb-temp",
@@ -1849,7 +1849,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
@@ -1886,7 +1886,7 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
     host_store.register_managed_host(
         host_id="62d4405ba38711fe34bebfeb5a7adaf2",
         name="managed-resume-force",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-force",
         provider="islo",
         sandbox_id="sb-resume-force",
@@ -1895,7 +1895,7 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
     host_store.upsert_on_connect(
         host_id="62d4405ba38711fe34bebfeb5a7adaf2",
         name="managed-resume-force",
-        owner=_OWNER,
+        user_id=_OWNER,
     )
     assert host_store.is_online("62d4405ba38711fe34bebfeb5a7adaf2") is True
     fake = _IsloFakeLauncher(can_resume=True)
@@ -1922,7 +1922,7 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     host_store.register_managed_host(
         host_id="249d058fbcde7b2ce941479cdb8c82d7",
         name="managed-resume-noop",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-noop",
         provider="modal",
         sandbox_id="sb-resume-noop",
@@ -1952,7 +1952,7 @@ async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_u
     host_store.register_managed_host(
         host_id="efbef7dede7be6577770cbb1287992f2",
         name="managed-resume-fail",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-fail",
         provider="islo",
         sandbox_id="sb-resume-fail",
@@ -1992,7 +1992,7 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     host = host_store.register_managed_host(
         host_id="62a91eb065624754c6a6dfb5869dd7e8",
         name="managed-term1",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-1",
         provider="modal",
         sandbox_id="sb-term-1",
@@ -2027,7 +2027,7 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     host = host_store.register_managed_host(
         host_id="057e7fa3f1cdb40c0ec393a3d42affc7",
         name="managed-term2",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-2",
         provider="modal",
         sandbox_id="sb-term-2",
@@ -2055,7 +2055,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     host = host_store.register_managed_host(
         host_id="487212fd2b157b6ab6a6d6d3ef06ce5b",
         name="managed-term3",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-3",
         # Row launched under a provider the current config doesn't run.
         provider="acme-cloud",
@@ -2075,7 +2075,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     host2 = host_store.register_managed_host(
         host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-4",
         provider="modal",
         sandbox_id="sb-term-4",

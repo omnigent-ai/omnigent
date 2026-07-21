@@ -1185,7 +1185,7 @@ class SqlHost(OmnigentBase):
     :param name: Human-readable name from ``config.yaml``, e.g.
         ``"corey-laptop"``. Displayed in the Web UI host picker. Max 64
         characters.
-    :param owner: User ID from the Databricks auth Bearer token
+    :param user_id: User ID from the Databricks auth Bearer token
         presented during the host's WebSocket handshake, e.g.
         ``"corey.zumar@databricks.com"``.
     :param status: ``"online"`` when the host has an active WebSocket
@@ -1234,7 +1234,10 @@ class SqlHost(OmnigentBase):
         default=current_workspace_id,
     )
     host_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
-    owner: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Session-owner identity from the Databricks auth Bearer token. String(128)
+    # matches session_permissions.user_id and every other user-identity column
+    # in this schema.
+    user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # HOST_STATUS: online=1, offline=2).
@@ -1253,10 +1256,12 @@ class SqlHost(OmnigentBase):
             "status IN (1, 2)",
             name="ck_hosts_status",
         ),
-        # (workspace_id, owner, name) was the old PK; keep it unique so the
-        # upsert-on-connect logic (look up by owner+name to detect host_id
+        # (workspace_id, user_id, name) was the old PK; keep it unique so the
+        # upsert-on-connect logic (look up by user_id+name to detect host_id
         # rotation) stays consistent.
-        UniqueConstraint("workspace_id", "owner", "name", name="uq_hosts_workspace_owner_name"),
+        UniqueConstraint(
+            "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
     )
 
 
@@ -1328,7 +1333,7 @@ class SqlScheduledTask(OmnigentBase):
     :param rrule: The required RFC 5545 recurrence rule for the recurring
         trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
         ``timezone``.
-    :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
+    :param user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for — who the run belongs to, e.g. ``"alice@example.com"``.
         ``None`` in single-user / OSS mode; the fire path resolves it to the
         reserved ``"local"`` user.
@@ -1397,7 +1402,7 @@ class SqlScheduledTask(OmnigentBase):
     # resolves null to the reserved "local" user). String(128) to match
     # session_permissions.user_id (the column the LEVEL_OWNER grant is
     # written into) and every other user-identity column in this schema.
-    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Relates to agents.id. No DB foreign key (Rule R032); cascade is app-owned.
     agent_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Per-task overrides — None means fall back to the agent default. Widths
@@ -1437,7 +1442,7 @@ class SqlScheduledTask(OmnigentBase):
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         Index("ix_scheduled_tasks_created_at", "workspace_id", "created_at", "id"),
-        Index("ix_scheduled_tasks_owner_user_id", "workspace_id", "owner_user_id", "id"),
+        Index("ix_scheduled_tasks_user_id", "workspace_id", "user_id", "id"),
     )
 
 

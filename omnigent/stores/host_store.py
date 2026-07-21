@@ -2,7 +2,7 @@
 Persistent store for host registrations.
 
 Hosts are machines connected via ``omnigent host``. The store
-tracks which hosts have ever connected, their names, owners, and
+tracks which hosts have ever connected, their names, user_ids, and
 online/offline status. The ``hosts`` table is the source of truth
 for ``GET /v1/hosts`` — all server replicas query it. Live WebSocket
 connection state is tracked separately in the in-memory
@@ -51,7 +51,7 @@ class Host:
     :param host_id: Stable identifier from the host's local
         ``~/.omnigent/config.yaml``, e.g. ``"host_a1b2c3d4..."``.
     :param name: Human-readable name, e.g. ``"corey-laptop"``.
-    :param owner: User ID from the Databricks auth Bearer token,
+    :param user_id: User ID from the Databricks auth Bearer token,
         e.g. ``"corey.zumar@databricks.com"``.
     :param status: ``"online"`` or ``"offline"``.
     :param created_at: Unix epoch seconds of first registration.
@@ -75,7 +75,7 @@ class Host:
 
     host_id: str
     name: str
-    owner: str
+    user_id: str
     status: str
     created_at: int
     updated_at: int
@@ -143,7 +143,7 @@ def _row_to_host(row: SqlHost) -> Host:
     return Host(
         host_id=row.host_id,
         name=row.name,
-        owner=row.owner,
+        user_id=row.user_id,
         status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -191,7 +191,7 @@ class HostStore:
         self,
         host_id: str,
         name: str,
-        owner: str,
+        user_id: str,
         *,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
@@ -200,16 +200,16 @@ class HostStore:
         Register or update a host on WebSocket connect.
 
         Inserts a new row if ``host_id`` does not exist, otherwise
-        updates ``name``, ``owner``, ``status``, and ``updated_at``.
+        updates ``name``, ``user_id``, ``status``, and ``updated_at``.
         Called by the host tunnel endpoint when a host sends its
         ``host.hello`` frame.
 
-        The upsert keys on the ``(owner, name)`` primary key, but
+        The upsert keys on the ``(user_id, name)`` primary key, but
         ``host_id`` carries its own UNIQUE constraint. When the same
-        physical host re-registers under a *different* owner (e.g. a
+        physical host re-registers under a *different* user_id (e.g. a
         local server respawned with a flipped auth posture changes the
-        owner between an accounts user and the reserved ``local`` user),
-        the ``(owner, name)`` lookup misses and a plain INSERT would
+        user_id between an accounts user and the reserved ``local`` user),
+        the ``(user_id, name)`` lookup misses and a plain INSERT would
         collide on ``host_id``. That collision is a deliberate W2-class
         boundary in shared deployments — a different user must not be
         able to claim another user's host_id — so re-owning is gated
@@ -222,10 +222,10 @@ class HostStore:
             ``"host_a1b2c3d4..."``.
         :param name: Human-readable name from ``config.yaml``, e.g.
             ``"corey-laptop"``.
-        :param owner: Authenticated user ID from the Bearer token,
+        :param user_id: Authenticated user ID from the Bearer token,
             e.g. ``"corey.zumar@databricks.com"``.
         :param allow_host_id_reown: When ``True`` and a row already
-            exists for *host_id* under a different ``(owner, name)``,
+            exists for *host_id* under a different ``(user_id, name)``,
             re-own that row in place (preserving the ``host_id`` and its
             conversation bindings) instead of inserting. Intended solely
             for the single-user loopback local server.
@@ -247,32 +247,32 @@ class HostStore:
                 # W2-class boundary: a different user must not claim another
                 # user's host_id. Raise the same IntegrityError the old UNIQUE
                 # constraint produced so the tunnel handler rejects the hijack.
-                if row.owner != owner and not allow_host_id_reown:
+                if row.user_id != user_id and not allow_host_id_reown:
                     raise IntegrityError(
                         "host_id already owned by a different user",
-                        params={"host_id": host_id, "owner": owner},
+                        params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
                     )
-                # Known host_id (same owner, or reown opted in): update
-                # owner/name in case they changed, then refresh status and timestamp.
-                row.owner = owner
+                # Known host_id (same user_id, or reown opted in): update
+                # user_id/name in case they changed, then refresh status and timestamp.
+                row.user_id = user_id
                 row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
                 return _row_to_host(row)
 
-            # host_id is new — check whether (workspace_id, owner, name)
+            # host_id is new — check whether (workspace_id, user_id, name)
             # already exists. If it does, the same machine regenerated its
             # identity file: this is a host_id rotation. If allow_host_id_reown
             # is set, also check if any row holds this host_id under a different
-            # owner and re-own it instead of inserting.
+            # user_id and re-own it instead of inserting.
             if allow_host_id_reown:
                 reowned = self._reown_host_id(
                     session,
                     host_id=host_id,
                     name=name,
-                    owner=owner,
+                    user_id=user_id,
                     configured_harnesses_json=harnesses_json,
                 )
                 if reowned is not None:
@@ -281,12 +281,12 @@ class HostStore:
             existing_by_name = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.owner == owner,
+                    SqlHost.user_id == user_id,
                     SqlHost.name == name,
                 )
             ).scalar_one_or_none()
             if existing_by_name is not None:
-                # Same (owner, name), different host_id: identity rotation.
+                # Same (user_id, name), different host_id: identity rotation.
                 # host_id is now part of the PK, so we can't UPDATE it via the
                 # ORM — delete the old row and insert a fresh one that carries
                 # the new host_id while preserving created_at.
@@ -295,7 +295,7 @@ class HostStore:
 
             # Genuinely new host: plain INSERT.
             row = SqlHost(
-                owner=owner,
+                user_id=user_id,
                 name=name,
                 host_id=host_id,
                 status=encode_host_status("online"),
@@ -338,7 +338,7 @@ class HostStore:
         old_host_id = row.host_id
         # Preserve durable fields from the outgoing row before deletion.
         created_at = row.created_at
-        owner = row.owner
+        user_id = row.user_id
         name = row.name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
@@ -376,7 +376,7 @@ class HostStore:
         new_row = SqlHost(
             workspace_id=current_workspace_id(),
             host_id=new_host_id,
-            owner=owner,
+            user_id=user_id,
             name=name,
             status=encode_host_status("online"),
             created_at=created_at,
@@ -409,25 +409,26 @@ class HostStore:
         *,
         host_id: str,
         name: str,
-        owner: str,
+        user_id: str,
         configured_harnesses_json: str | None = None,
     ) -> Host | None:
-        """Re-own an existing host_id row under a new ``(owner, name)``.
+        """Re-own an existing host_id row under a new ``(user_id, name)``.
 
         Used only when ``upsert_on_connect`` opts in via
         ``allow_host_id_reown`` (the single-user loopback local server).
-        Updates ``owner``, ``name``, ``status``, and ``updated_at`` on the
+        Updates ``user_id``, ``name``, ``status``, and ``updated_at`` on the
         row that already holds *host_id*, leaving ``host_id`` itself
         unchanged so the ``conversations.host_id`` foreign-key bindings
-        survive the owner change. ``owner`` / ``name`` are the table's
-        primary key, so the change is issued as a Core ``UPDATE`` rather
-        than mutating the ORM object's PK in place.
+        survive the user_id change. ``(workspace_id, user_id, name)`` is a
+        unique constraint (the PK is ``(workspace_id, host_id)``), so the
+        change is issued as a Core ``UPDATE`` rather than loading and
+        mutating the ORM object in place.
 
         :param session: The active SQLAlchemy session.
         :param host_id: Host identifier whose row should be re-owned,
             e.g. ``"host_a1b2c3d4..."``.
         :param name: New host name to record, e.g. ``"corey-laptop"``.
-        :param owner: New owner to record, e.g. ``"local"`` or
+        :param user_id: New user_id to record, e.g. ``"local"`` or
             ``"corey.zumar@databricks.com"``.
         :param configured_harnesses_json: JSON-encoded readiness map from
             the connecting host's hello, e.g.
@@ -453,7 +454,7 @@ class HostStore:
                 SqlHost.host_id == host_id,
             )
             .values(
-                owner=owner,
+                user_id=user_id,
                 name=name,
                 status=encode_host_status("online"),
                 updated_at=now,
@@ -463,7 +464,7 @@ class HostStore:
         return Host(
             host_id=host_id,
             name=name,
-            owner=owner,
+            user_id=user_id,
             status="online",
             created_at=created_at,
             updated_at=now,
@@ -598,14 +599,14 @@ class HostStore:
             if row.status == online_code and row.updated_at >= ref - HOST_LIVENESS_TTL_S
         }
 
-    def list_hosts(self, owner: str) -> list[Host]:
+    def list_hosts(self, user_id: str) -> list[Host]:
         """
         List all hosts owned by a specific user.
 
         Returns both online and offline hosts, ordered by
         ``updated_at`` descending (most recently active first).
 
-        :param owner: User ID to filter by, e.g.
+        :param user_id: User ID to filter by, e.g.
             ``"corey.zumar@databricks.com"``.
         :returns: List of :class:`Host` entities.
         """
@@ -614,7 +615,7 @@ class HostStore:
                 session.query(SqlHost)
                 .filter(
                     SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.owner == owner,
+                    SqlHost.user_id == user_id,
                 )
                 .order_by(SqlHost.updated_at.desc())
                 .all()
@@ -644,7 +645,7 @@ class HostStore:
         *,
         host_id: str,
         name: str,
-        owner: str,
+        user_id: str,
         token: str,
         provider: str,
         sandbox_id: str,
@@ -671,8 +672,8 @@ class HostStore:
             ``"host_a1b2c3d4..."``.
         :param name: Display name for the host picker, e.g.
             ``"managed-a1b2c3d4"``. Part of the table's
-            ``(owner, name)`` primary key.
-        :param owner: User the managed host acts for, e.g.
+            ``(user_id, name)`` primary key.
+        :param user_id: User the managed host acts for, e.g.
             ``"alice@example.com"``.
         :param token: The RAW launch token (hashed here, never stored),
             e.g. the value of ``secrets.token_urlsafe(32)``.
@@ -683,7 +684,7 @@ class HostStore:
             token no longer authenticates.
         :returns: The registered :class:`Host`.
         :raises ValueError: If a row for *host_id* exists under a
-            DIFFERENT owner — a relaunch may only re-credential a host
+            DIFFERENT user_id — a relaunch may only re-credential a host
             the same user owns.
         """
         now = now_epoch()
@@ -695,7 +696,7 @@ class HostStore:
                 )
             ).scalar_one_or_none()
             if existing is not None:
-                if existing.owner != owner:
+                if existing.user_id != user_id:
                     # Fail closed (W2-class boundary): re-crediting a host
                     # row hands its launch token holder the row owner's
                     # identity, so a cross-owner overwrite would be a host
@@ -703,7 +704,7 @@ class HostStore:
                     # launch), so this can only fire on a bug or a forged
                     # id — refuse rather than re-own.
                     raise ValueError(
-                        f"host {host_id!r} is registered to a different owner; "
+                        f"host {host_id!r} is registered to a different user; "
                         "refusing to re-credential it"
                     )
                 existing.token_hash = token_hash
@@ -713,7 +714,7 @@ class HostStore:
                 existing.updated_at = now
                 return _row_to_host(existing)
             row = SqlHost(
-                owner=owner,
+                user_id=user_id,
                 name=name,
                 host_id=host_id,
                 status=encode_host_status("offline"),

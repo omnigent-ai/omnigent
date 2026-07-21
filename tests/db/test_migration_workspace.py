@@ -194,7 +194,7 @@ def test_check_constraint_allows_host_id_with_workspace(
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
-                "(owner, name, host_id, status, created_at, updated_at) "
+                "(user_id, name, host_id, status, created_at, updated_at) "
                 "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {
@@ -280,7 +280,7 @@ def test_host_id_fk_sets_null_when_host_deleted(db_engine: Engine) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
-                "(owner, name, host_id, status, created_at, updated_at) "
+                "(user_id, name, host_id, status, created_at, updated_at) "
                 "VALUES (:o, :n, :hid, 1, :ts, :ts)"
             ),
             {

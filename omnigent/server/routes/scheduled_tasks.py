@@ -87,7 +87,9 @@ def _to_response(task: ScheduledTask) -> dict[str, Any]:
         "name": task.name,
         "prompt": task.prompt,
         "rrule": task.rrule,
-        "owner_user_id": task.owner_user_id,
+        # JSON key preserved for API/UI stability; the DB column + entity
+        # attribute are now ``user_id``.
+        "owner_user_id": task.user_id,
         "agent_id": task.agent_id,
         "timezone": task.timezone,
         "created_at": task.created_at,
@@ -192,7 +194,7 @@ def create_scheduled_tasks_router(
         enumerable across users.
         """
         task = store.get(scheduled_task_id)
-        if task is None or task.owner_user_id != owner:
+        if task is None or task.user_id != owner:
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
@@ -219,7 +221,7 @@ def create_scheduled_tasks_router(
             name=body.name,
             prompt=body.prompt,
             rrule=body.rrule,
-            owner_user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            user_id=None if owner == RESERVED_USER_LOCAL else owner,
             agent_id=body.agent_id,
             timezone=body.timezone,
             model_override=model_override,
@@ -237,7 +239,7 @@ def create_scheduled_tasks_router(
         """List the caller's scheduled tasks."""
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list() if t.owner_user_id == owner_id]
+        tasks = [t for t in store.list() if t.user_id == owner_id]
         return {"scheduled_tasks": [_to_response(t) for t in tasks]}
 
     @router.get("/scheduled-tasks/{scheduled_task_id}")
