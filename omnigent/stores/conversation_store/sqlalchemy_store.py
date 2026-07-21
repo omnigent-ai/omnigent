@@ -53,7 +53,7 @@ from omnigent.db.enum_codecs import (
 from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
-    delete_fts_by_conversation,
+    delete_fts_by_conversation_ids,
     ensure_fts_table,
     extract_search_text,
     generate_conversation_id,
@@ -3533,8 +3533,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .all()
             )
             bound_agent_ids = candidate_agent_ids - surviving_refs
-            for conv_id in subtree_ids:
-                delete_fts_by_conversation(ap_sess, conv_id)
+            delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
