@@ -342,11 +342,14 @@ def ui_installable_harnesses() -> frozenset[str]:
     return frozenset(resolvable)
 
 
-# How each UI-installable family authenticates, for the setup checklist. Derived
-# alongside the install step from the existing HarnessInstallSpec rather than a
-# parallel table. ``command`` steps run on the host and are status-tracked;
-# ``setup`` steps (pi/qwen: API key or gateway) can't be driven from the UI yet,
-# so M1 points at ``omnigent setup`` and does not track their status.
+# The auth step per UI-installable family, for the setup checklist. These are
+# display-only checklist rows (the command is shown for the user to run on the
+# host, never executed server-side), so the commands are literal here rather
+# than derived from ``HarnessInstallSpec.login_args`` — keep them in sync with
+# that spec by hand if a harness's login command changes.
+# ``command`` steps run on the host and are status-tracked; ``setup`` steps
+# (pi/qwen: API key or gateway) can't be driven from the UI yet, so M1 points at
+# ``omnigent setup`` and does not track their status.
 #   claude/codex: subscription login via the CLI's own login command.
 #   opencode: its own `opencode auth login`.
 #   pi/qwen: a provider credential (API key or gateway) — configured by setup.
@@ -398,10 +401,11 @@ def ui_setup_steps(harness: str) -> list[SetupStep]:
     """Return the ordered setup checklist for a UI harness identifier.
 
     Mirrors what ``omnigent setup`` walks a user through for the harness: an
-    install step, then (for the five first-class families) an auth step whose
-    method matches the CLI. Derived from the harness's
-    :class:`HarnessInstallSpec` so it can't drift from the real install/login
-    commands. Harnesses outside the UI-installable set get a single generic
+    install step, then (for the five first-class families) an auth step. The
+    install step's label uses the harness's :class:`HarnessInstallSpec` display
+    name; the auth step's command is a display-only literal from
+    :data:`_UI_AUTH_STEP_BY_KEY` (shown for the user to run, not executed).
+    Harnesses outside the UI-installable set get a single generic
     "run ``omnigent setup``" step (M1 scope).
 
     :param harness: A harness identifier the UI holds, e.g. ``"codex"`` or the
