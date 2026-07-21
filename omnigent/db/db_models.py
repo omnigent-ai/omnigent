@@ -342,7 +342,9 @@ class SqlFile(OmnigentBase):
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
-        Index("ix_files_created_at", "workspace_id", "created_at", "id"),
+        # Files are only ever listed per session (WHERE session_id = ?),
+        # so a session-scoped composite is the only index needed. There is
+        # no session-less "all files" listing.
         Index(
             "ix_files_session_id_created_at",
             "workspace_id",
