@@ -7,7 +7,9 @@ issues requests to that fixed host. Each user still authenticates as their own
 Omnigent identity against it.
 
 > This README is the operator/user guide (setup, scopes, running, auth). For the
-> architecture and key technical decisions, see **[DESIGN.md](DESIGN.md)**.
+> user-facing behaviour contract (setup, DM, channels, error handling), see
+> **[docs/CUJS.md](docs/CUJS.md)**; for the Databricks-App auth design, see
+> **[docs/DATABRICKS_APP_WEBAUTH_DESIGN.md](docs/DATABRICKS_APP_WEBAUTH_DESIGN.md)**.
 
 ## Setup
 
@@ -268,8 +270,10 @@ Send another message while the bot is still replying and it privately tells you
 to wait or continue in the web UI; a message to an idle thread just continues the
 conversation.
 
-For how any of this works under the hood — streaming, turn-end detection,
-elicitation handling, concurrency, ordering — see **[DESIGN.md](DESIGN.md)**.
+For the full set of user-facing behaviours — setup, DM vs channel routing,
+ownership, and error handling — see **[docs/CUJS.md](docs/CUJS.md)**. The
+under-the-hood details (streaming, turn-end detection, elicitation handling,
+concurrency, ordering) live in the module docstrings and inline comments.
 
 ## Development
 

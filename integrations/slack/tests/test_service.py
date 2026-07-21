@@ -489,6 +489,50 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     assert stream.ack_live_when_visible is True
 
 
+async def test_failed_handle_unclaims_event_so_it_can_retry(tmp_path: Path) -> None:
+    # Regression: the event is claimed (dedup) and Bolt auto-acks before the turn
+    # runs, so Slack won't redeliver. If handling then fails, the claim must be
+    # released — otherwise the user's message is permanently swallowed and even a
+    # re-send with the same id is deduped away.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    boom = RuntimeError("DB hiccup mid-route")
+    original_get_session = store.get_session
+    fail_next = {"on": True}
+
+    async def _flaky_get_session(key: ThreadKey):  # type: ignore[no-untyped-def]
+        if fail_next["on"]:
+            raise boom
+        return await original_get_session(key)
+
+    store.get_session = _flaky_get_session  # type: ignore[method-assign]
+
+    args: dict[str, Any] = {
+        "body": {"team_id": "T1", "event_id": "Ev1"},
+        "event": {"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        "client": slack,
+        "context": {"bot_user_id": "B1"},
+    }
+    # The handler propagates the failure (Bolt's error handler logs it)...
+    with pytest.raises(RuntimeError):
+        await service.handle_app_mention(**args)  # type: ignore[arg-type]
+
+    # ...and the event was unclaimed, so the SAME id is processable again.
+    fail_next["on"] = False
+    store.get_session = original_get_session  # type: ignore[method-assign]
+    await service.handle_app_mention(**args)  # type: ignore[arg-type]
+    stream = await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The retry actually ran the turn (it wasn't deduped away).
+    assert omnigent.turns == [("conv_1", "hello")]
+    assert stream.text == "hello final"
+
+
 async def test_session_title_falls_back_when_permalink_unavailable(tmp_path: Path) -> None:
     # The title lookup is cosmetic and must never block session start: if
     # chat.getPermalink fails (e.g. a missing scope), fall back to a plain
@@ -1010,6 +1054,22 @@ async def test_direct_message_creates_session(tmp_path: Path) -> None:
     service, _pool, _setup = _service(store, omnigent)
     await _configure_user(store, "T1", "U1")
 
+    stream = await _run_dm_and_stop(service, slack)
+    await service.shutdown()
+
+    assert len(omnigent.created) == 1
+    assert omnigent.created[0][0] == "ag_1"
+    assert omnigent.bound == ["conv_1"]
+    assert omnigent.turns == [("conv_1", "hello there")]
+    # A DM keys its session PER THREAD (like a channel): this top-level message
+    # keys on its own ts, starting a new thread/session.
+    record = await store.get_session(ThreadKey("T1", "D1", "100.1"))
+    assert record is not None and record.session_id == "conv_1"
+    # The reply threads under the triggering message.
+    assert stream.start_kwargs["thread_ts"] == "100.1"
+
+
+async def _run_dm_and_stop(service: Any, slack: "FakeSlackClient") -> "FakeStream":
     await service.handle_message(
         body={"team_id": "T1", "event_id": "Ev1"},
         event={
@@ -1022,25 +1082,14 @@ async def test_direct_message_creates_session(tmp_path: Path) -> None:
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_stream_stop(slack)
-    await service.shutdown()
-
-    assert len(omnigent.created) == 1
-    assert omnigent.created[0][0] == "ag_1"
-    assert omnigent.bound == ["conv_1"]
-    assert omnigent.turns == [("conv_1", "hello there")]
-    # A DM keys its session on the CHANNEL (not the per-message ts), so the whole
-    # 1:1 DM maps to one session.
-    record = await store.get_session(ThreadKey("T1", "D1", "D1"))
-    assert record is not None and record.session_id == "conv_1"
+    return await _wait_for_stream_stop(slack)
 
 
-async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> None:
-    # A DM's session is keyed on the CHANNEL, so a fresh TOP-LEVEL DM (no
-    # thread_ts, its own unique ts) reuses the existing session rather than
-    # spawning a new one per message.
+async def test_direct_message_threaded_reply_reuses_existing_session(tmp_path: Path) -> None:
+    # A DM maps one session PER THREAD (like a channel): a reply carrying the
+    # thread's root ts reuses that thread's session rather than creating a new one.
     store = await _store(tmp_path)
-    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="D1")
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(
         key,
         "conv_existing",
@@ -1056,7 +1105,7 @@ async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> N
         event={
             "channel": "D1",
             "channel_type": "im",
-            # No thread_ts — a bare top-level DM with its own unique ts.
+            "thread_ts": "100.1",  # a reply under the existing thread root
             "ts": "101.1",
             "user": "U1",
             "text": "follow up",
@@ -1072,13 +1121,47 @@ async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> N
     assert omnigent.turns == [("conv_existing", "follow up")]
 
 
+async def test_direct_message_top_level_starts_new_session_per_thread(tmp_path: Path) -> None:
+    # A DM is NOT one standing session per channel: a bare top-level DM (its own
+    # ts, no thread_ts) starts a NEW thread/session, keyed on its ts.
+    store = await _store(tmp_path)
+    # An unrelated prior DM thread exists on the same channel.
+    await store.upsert_session(
+        ThreadKey("T1", "D1", "099.9"), "conv_old", "title", owner_user_id="U1"
+    )
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "101.1",  # top-level, no thread_ts
+            "user": "U1",
+            "text": "brand new topic",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # A new session was created for the new thread, keyed on the message ts.
+    assert omnigent.turns == [("conv_1", "brand new topic")]
+    record = await store.get_session(ThreadKey("T1", "D1", "101.1"))
+    assert record is not None and record.session_id == "conv_1"
+
+
 async def test_message_while_server_busy_is_deflected(tmp_path: Path) -> None:
     # The decision to accept is the SERVER's: if the snapshot reports the session
     # running/waiting, a new message is NOT run and NOT queued — the user is
     # privately told to wait or interrupt in the web UI. (Local connection state
     # is not consulted, so a stale reservation can't wrongly report busy.)
     store = await _store(tmp_path)
-    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="D1")
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
     slack = FakeSlackClient()
     omnigent = FakeOmnigentClient()
@@ -1116,7 +1199,7 @@ async def test_second_message_while_local_stream_active_is_deflected(tmp_path: P
     # (the duplicate-responses bug). The local reservation catches this before
     # the server-activity check.
     store = await _store(tmp_path)
-    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="D1")
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
     slack = FakeSlackClient()
 
@@ -1174,7 +1257,7 @@ async def test_message_while_awaiting_action_points_to_pending_request(tmp_path:
     # user is told to answer the pending request (here or in the web UI), matching
     # the web UI's "action required" state — distinct from the "still working" one.
     store = await _store(tmp_path)
-    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="D1")
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
     slack = FakeSlackClient()
     omnigent = FakeOmnigentClient()
@@ -1203,12 +1286,59 @@ async def test_message_while_awaiting_action_points_to_pending_request(tmp_path:
     assert notices[0]["user"] == "U1"
 
 
+async def test_message_while_parked_in_process_points_to_pending_request(tmp_path: Path) -> None:
+    # Regression: a turn parked on a pending elicitation is STILL streaming, so it
+    # holds the in-process reservation — a new message hits the _active_threads
+    # branch, not the server-activity one. That branch must still surface the
+    # "respond to the pending request above" notice (needs_action=True), NOT the
+    # generic "still working" one, by consulting the server's activity.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    # While parked, the server reports the session needs user action.
+    omnigent.route_pending_elicitation = True
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    # First mention parks on the approval card (the turn keeps streaming).
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_card(slack)
+
+    # A second mention in the same thread WHILE the card is pending in-process.
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "101.1",
+            "user": "U1",
+            "text": "<@B1> another",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+
+    # It got the pending-request notice, not the generic "still working" one.
+    notices = [e for e in slack.ephemerals if "waiting on your response" in e["text"].lower()]
+    assert len(notices) == 1
+    assert notices[0]["user"] == "U1"
+    assert not any("still working" in e["text"].lower() for e in slack.ephemerals)
+
+    # Tear down with the card still parked (shutdown cancels the resolver).
+    await service.shutdown()
+
+
 async def test_idle_follow_up_message_runs_in_thread(tmp_path: Path) -> None:
     # A follow-up to an existing thread that is NOT currently streaming runs
     # normally in Slack (run-when-idle) — Slack stays a full conversational
     # surface, not kickoff-only.
     store = await _store(tmp_path)
-    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="D1")
+    key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(key, "conv_existing", "title", owner_user_id="U1")
     slack = FakeSlackClient()
     omnigent = FakeOmnigentClient()
@@ -2792,6 +2922,10 @@ async def test_answer_then_trailing_notice_is_not_duplicated(tmp_path: Path) -> 
     # into a fresh post-notice segment by the fallback.
     answer_segments = [s for s in slack.streams if "The full answer." in s.text]
     assert len(answer_segments) == 1
+    # And the sealed-off answer must NOT trip the empty-segment fallback: no
+    # "completed without returning response text" segment after the notice.
+    all_stream_text = " ".join(s.text for s in slack.streams)
+    assert "without returning" not in all_stream_text
 
 
 async def test_todos_posted_once_then_updated_in_place(tmp_path: Path) -> None:

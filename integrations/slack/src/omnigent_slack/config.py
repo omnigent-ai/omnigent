@@ -16,12 +16,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # to the server. See ``docs/DATABRICKS_APP_WEBAUTH_DESIGN.md``.
 ServerAuthMode = Literal["auto", "databricks"]
 
+# Minimum length for the enrollment-state HMAC secret. 32 chars is a floor
+# against offline brute-forcing a weak operator value (which would let an
+# attacker forge a signed `state`); `openssl rand -hex 32` yields 64.
+_MIN_STATE_SECRET_LEN = 32
+
 
 def _normalize_host(value: str | None) -> str | None:
     """Normalize a workspace host: strip trailing slash, add ``https://`` scheme.
 
     ``DATABRICKS_HOST`` (and often an operator-supplied value) is a bare host
-    like ``e2-dogfood.staging.cloud.databricks.com`` with no scheme; the OAuth
+    like ``my-workspace.cloud.databricks.com`` with no scheme; the OAuth
     endpoints need a full URL, so default a missing scheme to ``https://``.
     Returns ``None`` for an empty/absent value.
     """
@@ -180,10 +185,10 @@ class Settings(BaseSettings):
     # Space-separated OAuth scopes to request. ``openid`` and ``offline_access``
     # are forced on (see _normalize_oauth_scopes) so the flow always yields an
     # id_token + refresh token. The token's scopes must be a SUPERSET of the
-    # scopes omnigent-dev's app declares, or its Databricks proxy rejects the
+    # scopes the target server app declares, or its Databricks proxy rejects the
     # token (401 on /api, 302→login elsewhere). ``all-apis`` satisfies any app's
     # requirement (the same default a ``databricks-cli`` token carries); narrow it
-    # only to the exact scope omnigent-dev declares once that's known.
+    # only to the exact scope the server app declares once that's known.
     databricks_oauth_scopes: str = Field(
         default="all-apis",
         validation_alias="OMNIGENT_SLACK_DATABRICKS_SCOPES",
@@ -210,6 +215,15 @@ class Settings(BaseSettings):
         value = value.strip().rstrip("/")
         if not value.startswith(("http://", "https://")):
             raise ValueError("OMNIGENT_SERVER_URL must start with http:// or https://")
+        # The per-user delegated bearer is sent to this host on every request
+        # (see omnigent.py). Plaintext http:// would transmit that credential in
+        # the clear, so reject it for any non-loopback host — same rule the
+        # Databricks workspace host uses. Loopback stays allowed for local dev.
+        if value.startswith("http://") and not _is_loopback_url(value):
+            raise ValueError(
+                "OMNIGENT_SERVER_URL must use https:// (plaintext would leak the "
+                "delegated bearer token); http:// is allowed only for loopback"
+            )
         return value
 
     @property
@@ -278,6 +292,27 @@ class Settings(BaseSettings):
                 "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST must use https:// "
                 "(plaintext exposes the client secret and lets an on-path "
                 "attacker forge the id_token identity)"
+            )
+        # The web-auth base URL is the OAuth redirect target — where the ``?code=``
+        # and the PII consent page land — so it must be TLS too, same rule as the
+        # workspace host. Only checked when set: it's legitimately absent on the
+        # first deploy (the app URL doesn't exist yet), which just means no
+        # enrollment link is issued — not a plaintext leak.
+        base = self.webauth_base_url or ""
+        if base.startswith("http://") and not _is_loopback_url(base):
+            raise ValueError(
+                "OMNIGENT_SLACK_WEBAUTH_BASE_URL must use https:// "
+                "(it is the OAuth redirect target — plaintext would expose the "
+                "authorization code and the consent page's identity data)"
+            )
+        # The state secret is the HMAC key protecting the enrollment `state`; a
+        # weak value is offline-brute-forceable from one legitimately-signed state,
+        # after which an attacker can forge a state binding a victim's Slack id to
+        # the attacker's email (identity corruption). Require real entropy.
+        if len(self.databricks_state_secret or "") < _MIN_STATE_SECRET_LEN:
+            raise ValueError(
+                f"OMNIGENT_SLACK_DATABRICKS_STATE_SECRET must be at least "
+                f"{_MIN_STATE_SECRET_LEN} characters (use e.g. `openssl rand -hex 32`)"
             )
         return self
 

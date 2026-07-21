@@ -45,10 +45,6 @@ _APP_REQUIRES_PYTHON = ">=3.12,<3.13"
 # Public PyPI by default. Set UV_INDEX_URL to lock against a private mirror or
 # proxy (e.g. the Databricks internal proxy) instead.
 _UV_DEFAULT_INDEX_URL = "https://pypi.org/simple"
-# The Apps runtime pins a global uv exclude-newer cutoff; lock against the same
-# so the in-container re-resolve doesn't refetch (and time out) on PyPI. Bump
-# when redeploying against a newer runtime (read the cutoff from /logz).
-_UV_EXCLUDE_NEWER = "2026-07-19T00:00:00Z"
 
 
 def _log(msg: str) -> None:
@@ -140,7 +136,10 @@ def _toml_string(value: str) -> str:
 
 
 def _write_uv_dependency_files(
-    wheel: Path, deploy_version: str, index_url: str | None = None
+    wheel: Path,
+    deploy_version: str,
+    index_url: str | None = None,
+    exclude_newer: str | None = None,
 ) -> None:
     """Copy the wheel into src/ and write the app pyproject.toml + uv.lock.
 
@@ -149,6 +148,8 @@ def _write_uv_dependency_files(
     the co-located wheel, plus a matching ``uv.lock``.
 
     :param index_url: Optional index URL forwarded to the lock step.
+    :param exclude_newer: Optional uv ``--exclude-newer`` cutoff forwarded to
+        the lock step.
     """
     src = _src_dir()
     _sweep_src_wheels()
@@ -173,43 +174,35 @@ def _write_uv_dependency_files(
     )
     (src / "pyproject.toml").write_text(pyproject)
     _log("src/pyproject.toml:\n" + pyproject)
-    _run_uv_lock(src, index_url)
+    _run_uv_lock(src, index_url, exclude_newer)
 
 
-def _run_uv_lock(src: Path, index_url: str | None = None) -> None:
+def _run_uv_lock(
+    src: Path, index_url: str | None = None, exclude_newer: str | None = None
+) -> None:
     """Generate src/uv.lock, then normalize its registry to public PyPI.
 
     Locking honors the index override (``--index-url`` or ``UV_INDEX_URL``,
     default public PyPI) so a Databricks-network machine can resolve via the
     internal proxy; the normalize step then rewrites every registry URL back to
-    public PyPI so the uploaded lock is canonical (the Apps runtime resolves
-    against public PyPI with the exclude-newer cutoff), mirroring the server
-    deploy.
+    public PyPI so the uploaded lock is canonical, mirroring the server deploy.
 
     :param index_url: Explicit index URL (from ``--index-url``); falls back to
         ``UV_INDEX_URL`` then public PyPI.
+    :param exclude_newer: Optional uv ``--exclude-newer`` cutoff. The Apps runtime
+        pins a global cutoff; passing the same one keeps the in-container
+        re-resolve from refetching (and timing out) on PyPI. Omitted → no cutoff.
     """
     index_url = index_url or os.environ.get("UV_INDEX_URL") or _UV_DEFAULT_INDEX_URL
     env = os.environ.copy()
     env.pop("UV_INDEX", None)
     env.pop("UV_DEFAULT_INDEX", None)
     env["UV_INDEX_URL"] = index_url
-    _log(f"uv lock --python 3.12 --index-url {index_url} --exclude-newer {_UV_EXCLUDE_NEWER}")
-    subprocess.run(
-        [
-            "uv",
-            "lock",
-            "--python",
-            "3.12",
-            "--index-url",
-            index_url,
-            "--exclude-newer",
-            _UV_EXCLUDE_NEWER,
-        ],
-        cwd=src,
-        env=env,
-        check=True,
-    )
+    cmd = ["uv", "lock", "--python", "3.12", "--index-url", index_url]
+    if exclude_newer:
+        cmd += ["--exclude-newer", exclude_newer]
+    _log(f"$ {' '.join(cmd)}")
+    subprocess.run(cmd, cwd=src, env=env, check=True)
     # Rewrite proxy/registry URLs to public PyPI so the uploaded lock is
     # reproducible regardless of the machine that generated it.
     normalize = _repo_root() / "scripts" / "normalize_uv_lock_registry.py"
@@ -300,6 +293,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--exclude-newer",
+        default=None,
+        help=(
+            "uv --exclude-newer cutoff (e.g. 2026-07-19T00:00:00Z) for the lock "
+            "step. Match the Apps runtime's pinned cutoff so the in-container "
+            "re-resolve doesn't refetch (and time out) on PyPI — read it from "
+            "/logz. Omit for no cutoff."
+        ),
+    )
+    parser.add_argument(
         "--skip-build",
         action="store_true",
         help="Reuse the existing src/ wheel + lock — skip the wheel build.",
@@ -324,7 +327,9 @@ def main() -> None:
         original_pyproject = _stamp_version(deploy_version)
         try:
             wheel = _build_wheel()
-            _write_uv_dependency_files(wheel, deploy_version, args.index_url)
+            _write_uv_dependency_files(
+                wheel, deploy_version, args.index_url, args.exclude_newer
+            )
         finally:
             # Restore the working-tree version so the deploy leaves no diff.
             (_slack_root() / "pyproject.toml").write_text(original_pyproject)

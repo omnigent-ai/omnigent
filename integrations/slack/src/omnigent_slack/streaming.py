@@ -300,9 +300,18 @@ class _AnswerReply:
         # IS the reply. Raw error detail is NEVER shown here (it can carry stack
         # traces / internal paths) — only whether the turn errored is known.
         tail = self._tail()
-        delivered_answer = bool(self._streamed or tail)
-        if delivered_answer:
+        # An answer counts as delivered if THIS segment has text OR an earlier
+        # segment already showed one before a mid-turn out-of-band post sealed it
+        # off (recorded in ``_delivered_texts``). Without the latter, the common
+        # "answer streamed, then a trailing notice fired" sequence leaves the
+        # current segment empty and would wrongly post "completed without
+        # returning…" (or, when errored, suppress the separate failure reply).
+        delivered_answer = bool(self._streamed or tail or self._delivered_texts)
+        if self._streamed or tail:
             await self._reply.stop(tail or None)
+        elif self._delivered_texts:
+            # The answer already landed in a prior segment; just close silently.
+            await self._reply.stop(None)
         else:
             await self._reply.stop(
                 GENERIC_FAILURE_TEXT

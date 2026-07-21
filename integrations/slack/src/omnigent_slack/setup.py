@@ -267,6 +267,14 @@ class SetupFlow:
             return
         team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
         user_id = str((body.get("user") or {}).get("id") or "")
+        # Fail closed on a missing team/user: tokens/configs key on (team, user),
+        # so an empty team_id would collapse keys across workspaces. Matches the
+        # guard in the slash-command path.
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Setup start missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            return
         view_id = await self._open_connecting_modal(client, trigger_id)
         if view_id:
             await self._begin_setup(client, team_id=team_id, user_id=user_id, view_id=view_id)
@@ -469,11 +477,20 @@ class SetupFlow:
             )
             return
 
-        # Swap the modal to the "open the link and approve" screen.
-        await client.views_update(
-            view_id=view_id,
-            view=login_waiting_modal(server_url, pending.verification_url, pending.user_code),
-        )
+        # Swap the modal to the "open the link and approve" screen. If this fails
+        # (e.g. the user closed the modal) before the background poll is spawned,
+        # close ``pending`` — otherwise its open httpx client would leak, since
+        # nothing else owns it until the poll takes over below.
+        try:
+            await client.views_update(
+                view_id=view_id,
+                view=login_waiting_modal(
+                    server_url, pending.verification_url, pending.user_code
+                ),
+            )
+        except Exception:
+            await pending.close()
+            raise
 
         async def _on_success() -> None:
             await self._revalidate_and_advance(
@@ -662,6 +679,14 @@ class SetupFlow:
 
         team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
         user_id = str((body.get("user") or {}).get("id") or "")
+        # Fail closed: an empty team/user would write the config under a key that
+        # collapses across workspaces (configs key on (team, user)).
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Setup submit missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            await ack()
+            return
         await self._store.upsert_user_config(team_id, user_id, config)
         await ack()
         self._logger.info(

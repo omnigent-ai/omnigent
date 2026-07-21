@@ -172,14 +172,14 @@ class ElicitationController:
         client = turn.slack_client
         key = turn.key
         # Idempotent against a re-delivered elicitation (e.g. the server replaying
-        # an in-flight request on a stream reconnect): if a live, non-finalized
-        # card already exists for this id, don't post a second one and orphan the
-        # first. The coordinator waiter is already replay-safe (register is a
-        # no-op for a live key); this covers the card + resolver.
-        existing = state.pending.get(request.elicitation_id)
-        if existing is not None and not existing.finalized:
+        # a request on a stream reconnect): if we've already created a pending for
+        # this id THIS TURN — whether still live or already finalized (timed out /
+        # declined) — don't post a second card and orphan the first. The
+        # coordinator waiter is also replay-safe (register no-ops for a live key).
+        if request.elicitation_id in state.pending:
             self._logger.info(
-                "Elicitation already in flight thread=%s elicitation_id=%s; skipping duplicate",
+                "Elicitation already seen this turn thread=%s elicitation_id=%s; skipping "
+                "duplicate",
                 key.display(),
                 request.elicitation_id,
             )
@@ -220,34 +220,53 @@ class ElicitationController:
                 blocks=elicitation_card_blocks(request, turn.owner_user_id),
             )
         except Exception:
-            # The card never posted, so there's nothing for the user to answer and
-            # no pending entry for finish_pending to settle. Drop the orphaned
-            # waiter and DECLINE server-side so the turn isn't parked forever
-            # (which would deflect later thread messages as "needs action").
-            self._coordinator.unregister(request.session_id, request.elicitation_id)
-            self._logger.warning(
-                "Failed to post elicitation card thread=%s elicitation_id=%s; declining",
-                key.display(),
-                request.elicitation_id,
-            )
-            with contextlib.suppress(Exception):
-                await omnigent.resolve_elicitation(
-                    request.session_id,
-                    request.elicitation_id,
-                    accepted=False,
-                    content=None,
-                )
+            await self._abandon_unpostable(omnigent, request, key, reason="post failed")
             return
+        # No ``ts`` means the card can never be finalized (its buttons can't be
+        # replaced), so it would sit live-looking forever even after the verdict
+        # is delivered — treat it like a failed post: drop the waiter and decline.
         card_ts = posted.get("ts")
-        pending = PendingElicitation(
-            request=request, card_ts=card_ts if isinstance(card_ts, str) else None
-        )
+        if not isinstance(card_ts, str):
+            await self._abandon_unpostable(omnigent, request, key, reason="no message ts")
+            return
+        pending = PendingElicitation(request=request, card_ts=card_ts)
         state.pending[request.elicitation_id] = pending
         resolver = asyncio.create_task(self._resolve_verdict(omnigent, request, pending))
         pending.resolver = resolver
         # Track for shutdown cancellation; drop from the set when it finishes.
         self._resolvers.add(resolver)
         resolver.add_done_callback(self._resolvers.discard)
+
+    async def _abandon_unpostable(
+        self,
+        omnigent: OmnigentClient,
+        request: ElicitationRequest,
+        key: ThreadKey,
+        *,
+        reason: str,
+    ) -> None:
+        """Give up on an elicitation whose card can't be shown/finalized.
+
+        Reached when the card post raises or returns no ``ts`` (so its buttons
+        could never be replaced). There's no answerable card and no pending entry
+        for ``finish_pending`` to settle, so drop the orphaned waiter and DECLINE
+        server-side — otherwise the turn stays parked and later thread messages
+        deflect as "needs action". Best-effort; the decline may itself fail.
+        """
+        self._coordinator.unregister(request.session_id, request.elicitation_id)
+        self._logger.warning(
+            "Cannot show elicitation card (%s) thread=%s elicitation_id=%s; declining",
+            reason,
+            key.display(),
+            request.elicitation_id,
+        )
+        with contextlib.suppress(Exception):
+            await omnigent.resolve_elicitation(
+                request.session_id,
+                request.elicitation_id,
+                accepted=False,
+                content=None,
+            )
 
     async def _resolve_verdict(
         self,
@@ -364,14 +383,16 @@ class ElicitationController:
                 resolver.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await resolver
-            # The server-side park is already released only when we successfully
-            # delivered a verdict (``verdict``) or declined on timeout
-            # (``timed_out`` posts a decline). A ``delivery_failed`` verdict never
-            # reached the server, so the park is STILL OPEN — decline it here (like
-            # the never-answered case) so the session isn't wedged, while keeping
-            # the DELIVERY_FAILED card label. Otherwise the user is told to retry
-            # but every retry is deflected as "waiting on your response".
-            server_park_released = pending.verdict is not None or pending.timed_out
+            # The server-side park is released only when a POST actually reached
+            # the server: a delivered verdict, or a timeout whose decline POST
+            # landed. ``delivery_failed`` means the LAST POST (verdict OR the
+            # timeout decline) never landed — so even a timed-out request whose
+            # decline failed is still parked. Excluding delivery_failed here routes
+            # that compound case into _decline_abandoned (best-effort re-decline)
+            # so the session isn't wedged, while keeping the DELIVERY_FAILED label.
+            server_park_released = not pending.delivery_failed and (
+                pending.verdict is not None or pending.timed_out
+            )
             if server_park_released:
                 outcome = self._outcome(pending)
             else:

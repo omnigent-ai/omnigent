@@ -413,11 +413,13 @@ def _decode_sse_event(
         return data
     try:
         payload = json.loads(data)
-    except json.JSONDecodeError as exc:
-        # Keep the raw payload out of the exception — it reaches the Slack
-        # thread as error text; log it for operators instead.
-        _logger.warning("Invalid SSE JSON payload (%d chars)", len(data))
-        raise OmnigentError("Omnigent server sent a malformed event.") from exc
+    except json.JSONDecodeError:
+        # Skip a single malformed frame (e.g. a proxy injecting a partial chunk)
+        # rather than failing the whole turn — a good answer may have already
+        # streamed. Log for operators; keep the raw payload out of any user-facing
+        # text. The stream's own turn-end / idle detection still terminates it.
+        _logger.warning("Skipping malformed SSE JSON payload (%d chars)", len(data))
+        return None
     if not isinstance(payload, dict):
         return None
     if event_name and "type" not in payload:

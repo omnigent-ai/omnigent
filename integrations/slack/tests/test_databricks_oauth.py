@@ -145,6 +145,21 @@ async def test_refresh_invalid_grant_is_expired() -> None:
 
 
 @respx.mock
+@pytest.mark.parametrize("error", ["invalid_client", "unauthorized_client"])
+async def test_refresh_client_error_is_transient_not_expired(error: str) -> None:
+    # invalid_client / unauthorized_client describe the bot's SHARED OAuth app
+    # (e.g. a rotated/misconfigured client secret), not the user's grant. They
+    # must be transient — never DatabricksAuthExpiredError — so a recoverable
+    # bot-side misconfig doesn't delete every enrolled user's refresh token.
+    respx.post(f"{_HOST}/oidc/v1/token").mock(
+        return_value=httpx.Response(401, json={"error": error})
+    )
+    with pytest.raises(DatabricksOAuthError) as excinfo:
+        await _client().refresh("still-good")
+    assert not isinstance(excinfo.value, DatabricksAuthExpiredError)
+
+
+@respx.mock
 async def test_refresh_5xx_is_transient_not_expired() -> None:
     # A 5xx is transient — must NOT be classified as a dead grant, so a valid
     # refresh token isn't discarded on a momentary server error.

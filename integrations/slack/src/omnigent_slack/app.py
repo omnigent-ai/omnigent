@@ -132,11 +132,12 @@ async def run() -> None:
     register_handlers(app, service)
     _register_error_handler(app, logger)
 
-    if webauth is not None:
-        await webauth.start()
-
     handler = AsyncSocketModeHandler(app, settings.slack_app_token)
     try:
+        # Inside the try so a webauth-start failure still runs the finally cleanup
+        # (store/pool/auth_manager close, webauth.stop is idempotent).
+        if webauth is not None:
+            await webauth.start()
         logger.info("Connecting to Slack Socket Mode")
         await handler.start_async()  # type: ignore[no-untyped-call]
     except Exception:

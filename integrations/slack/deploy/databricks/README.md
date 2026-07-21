@@ -29,6 +29,16 @@ wheel. Runs unchanged from a laptop; re-runnable.
 
 ## Prerequisites
 
+> [!IMPORTANT]
+> **Run this app as a single instance — do NOT enable "Horizontal scaling"
+> (Beta).** The bot is a Slack Socket-Mode consumer, so a second replica opens a
+> second socket and double-processes every event (duplicate turns); and the
+> enrollment PKCE verifiers / unconfirmed tokens live in process memory, so a
+> callback routed to a different replica fails closed with a confusing "link
+> expired". Databricks Apps are single-instance by default — just leave scaling
+> off. (There's no Asset Bundle field to pin instance count during the Beta;
+> instance count is UI-only, so this is enforced by not turning it on.)
+
 1. A Databricks workspace with Databricks Apps enabled.
 2. A **custom U2M OAuth app** ("custom app integration") registered in the
    workspace with the authorization-code grant enabled — see step 1 below for
@@ -210,7 +220,7 @@ Environment wired by `databricks.yml` (secrets via `value_from`, rest inline):
 | --- | --- | --- |
 | `ModuleNotFoundError: No module named 'omnigent_slack'` | The wheel/`pyproject.toml`/`uv.lock` were git-ignored, so `bundle deploy` didn't sync them | Ensure `src/*.whl`, `src/pyproject.toml`, `src/uv.lock` are untracked but NOT git-ignored; re-run `deploy.py` (not `--skip-build` on a clean `src/`) |
 | `uv lock` fails with a PyPI DNS error | Public PyPI blocked on the Databricks network | Re-run with `UV_INDEX_URL=https://pypi-proxy.cloud.databricks.com/simple` |
-| App install fails; `/logz` shows an `exclude-newer` re-resolve then a PyPI timeout | Runtime's uv `exclude-newer` cutoff differs from the lock's | Read the cutoff from `/logz` and set `_UV_EXCLUDE_NEWER` in `deploy.py` to match, then redeploy |
+| App install fails; `/logz` shows an `exclude-newer` re-resolve then a PyPI timeout | Runtime's uv `exclude-newer` cutoff differs from the lock's | Read the cutoff from `/logz` and pass it via `--exclude-newer <cutoff>`, then redeploy |
 | Sign-in ends on an OAuth error page (redirect mismatch) | The OAuth app's redirect URI ≠ `<this-app-url>/auth/callback` | Register the exact `/auth/callback` URL on the custom OAuth app |
 | Sign-in page says the link was already used or expired | The redirect was replayed, or the bot restarted between link-issue and callback (in-memory PKCE verifier lost) | Run `/omnigent` again for a fresh link |
 | Enrolled, but turns fail auth against the server                      | User lacks access to the server app, or the token's scopes don't satisfy the server proxy | Grant the user server-app access; widen `OMNIGENT_SLACK_DATABRICKS_SCOPES` if the server proxy needs more |

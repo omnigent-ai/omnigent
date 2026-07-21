@@ -147,6 +147,24 @@ _STREAM_RECONNECT_MAX_ATTEMPTS = 6
 _STREAM_RECONNECT_MAX_TOTAL = 200
 _STREAM_RECONNECT_BACKOFF_S = 1.0
 
+# Path fragments that mark a redirect Location as an auth/login bounce (the
+# Databricks Apps proxy 302s an unauthenticated request to its OAuth authorize
+# endpoint). Used to tell an auth wall apart from a benign canonical redirect.
+_AUTH_REDIRECT_MARKERS = ("/oidc/", "/oauth", "/authorize", "/login", "/.auth/")
+
+
+def _is_auth_redirect(location: str) -> bool:
+    """Whether a redirect ``Location`` points at an auth/login endpoint."""
+    from urllib.parse import urlsplit
+
+    if not location:
+        return False
+    # Match on the path (+query) only, so an unrelated host in the URL can't
+    # smuggle a marker; the proxy's login path is what identifies the bounce.
+    parts = urlsplit(location)
+    hay = f"{parts.path}?{parts.query}".lower()
+    return any(marker in hay for marker in _AUTH_REDIRECT_MARKERS)
+
 
 @dataclass(frozen=True, slots=True)
 class ValidatedServer:
@@ -230,6 +248,26 @@ class OmnigentClient:
             return {"Authorization": f"Bearer {self._auth.access_token}"}
         return {}
 
+    @staticmethod
+    def _is_auth_wall(response: httpx.Response) -> bool:
+        """Whether a response means "the token was rejected, refresh it".
+
+        A 401 is the direct signal. A Databricks-App proxy instead returns a 3xx
+        redirect to its OAuth login for an expired/invalid token (the client has
+        ``follow_redirects=False``, so it surfaces as a raw 3xx) — but only a
+        redirect whose ``Location`` points at an auth/login endpoint counts, not a
+        benign canonical-URL/trailing-slash 3xx. Narrowing this avoids
+        double-submitting a non-idempotent request (and burning a single-use
+        refresh token) on a legitimate redirect, while still catching the
+        proxy login bounce that would otherwise strand the session at token expiry.
+        """
+        if response.status_code == 401:
+            return True
+        if not response.is_redirect:
+            return False
+        location = response.headers.get("location", "")
+        return _is_auth_redirect(location)
+
     def _unreachable(self, exc: httpx.HTTPError) -> ServerUnreachableError:
         # A transport failure (DNS, refused connection, timeout) means the server
         # itself is unreachable — distinct from an HTTP error response, which
@@ -248,9 +286,10 @@ class OmnigentClient:
             response = await self._client.request(method, url, headers=headers, **kwargs)
         except httpx.HTTPError as exc:
             raise self._unreachable(exc) from exc
-        # A delegated token expires within the hour; on a 401 refresh once
-        # and retry so long-lived threads keep working without re-login.
-        if response.status_code == 401 and self._auth is not None:
+        # A delegated token expires within the hour; on an auth wall (401, or a
+        # Databricks proxy 3xx→login) refresh once and retry so long-lived threads
+        # keep working without re-login.
+        if self._auth is not None and self._is_auth_wall(response):
             try:
                 new_token = await self._auth.refresh(used_token)
             except TokenRefreshTransientError as exc:
@@ -517,7 +556,7 @@ class OmnigentClient:
         if self._auth is not None and self._auth.access_token:
             used_token = self._auth.access_token
             probe = await self._request("GET", "/health")
-            if probe.status_code == 401:
+            if self._is_auth_wall(probe):
                 # A transient refresh failure keeps the (still-valid) token; open
                 # the stream with it rather than aborting the turn on a blip.
                 with contextlib.suppress(TokenRefreshTransientError):
@@ -613,6 +652,16 @@ class OmnigentClient:
         # the unseen suffix and the reply never double-renders.
         open_response_id: str | None = None
         saw_open_running = False
+        # Whether THIS turn has actually started producing on the stream. A
+        # freshly-resumed session's stream (``idle=false``) replays the session's
+        # CURRENT status first — which, hours after the last turn, is a stale
+        # ``idle`` (no response_id) that arrives before our just-submitted
+        # message's ``running`` edge. Without this guard the ``id_less_end`` branch
+        # below would treat that pre-turn idle as the end and return 0 events
+        # ("Omnigent completed without returning response text"). We only honor a
+        # terminal idle/failed once we've seen the turn begin: a running/waiting
+        # edge, a forwarded answer delta, or a hard-terminal event.
+        turn_started = False
         emitted: dict[str | None, str] = {}
         attempt = 0
         total_reconnects = 0
@@ -678,6 +727,13 @@ class OmnigentClient:
                                 # this leg advanced the turn, so it resets the
                                 # consecutive-reconnect budget below.
                                 progressed_this_leg = True
+                                # Actual answer TEXT means the turn is producing, so
+                                # a later idle is a real end. Do NOT count a passed-
+                                # through ``session.status`` here — a stale pre-turn
+                                # idle also flows through reconcile, and counting it
+                                # would defeat the stale-idle guard below.
+                                if event.get("type") == "response.output_text.delta":
+                                    turn_started = True
                                 yield reconciled
 
                             if is_hard_terminal_event(event):
@@ -693,6 +749,11 @@ class OmnigentClient:
                             if parsed is None:
                                 continue
                             status, response_id = parsed
+                            if status in ("running", "waiting"):
+                                # The turn is now producing — any subsequent idle is
+                                # a real end, not a stale pre-turn one replayed on
+                                # resume.
+                                turn_started = True
                             if status in ("running", "waiting") and response_id is not None:
                                 # An id-bearing open edge (claude-native Stop hook).
                                 # Mark a response OPEN so a later matching terminal
@@ -700,8 +761,23 @@ class OmnigentClient:
                                 # a mid-answer flap.
                                 open_response_id = response_id
                                 saw_open_running = True
+                            elif status in ("idle", "failed") and not turn_started:
+                                # A terminal BEFORE this turn started producing is
+                                # stale — the session's pre-existing status replayed
+                                # on connect (common when resuming an idle session
+                                # hours later). Ignore it and keep reading; the
+                                # idle-grace timeout is the backstop if nothing ever
+                                # comes. Ending here would return 0 events and post
+                                # "completed without returning response text".
+                                self._logger.info(
+                                    "Ignoring stale pre-turn %s (no prior activity) "
+                                    "session_id=%s response_id=%s",
+                                    status,
+                                    session_id,
+                                    response_id,
+                                )
                             elif status in ("idle", "failed"):
-                                # Terminal edge. End when:
+                                # Terminal edge (turn has started). End when:
                                 #  (a) id-bearing and matches the open response (or we
                                 #      saw no id-bearing open — some paths only stamp
                                 #      the end);

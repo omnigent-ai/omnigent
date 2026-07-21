@@ -57,6 +57,20 @@ def test_server_url_rejects_bad_scheme(monkeypatch: pytest.MonkeyPatch) -> None:
         _load()
 
 
+def test_server_url_rejects_plaintext_http_non_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The delegated bearer is sent to server_url on every request; plaintext would
+    # leak it. Reject non-loopback http:// (mirrors the workspace-host rule).
+    _set_env(monkeypatch, OMNIGENT_SERVER_URL="http://omnigent.example.com")
+    with pytest.raises(ValidationError):
+        _load()
+
+
+def test_server_url_allows_http_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Loopback is exempt for local dev.
+    _set_env(monkeypatch, OMNIGENT_SERVER_URL="http://127.0.0.1:8000")
+    assert _load().server_url == "http://127.0.0.1:8000"
+
+
 def test_server_url_required(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_env(monkeypatch)
     monkeypatch.delenv("OMNIGENT_SERVER_URL", raising=False)
@@ -105,7 +119,7 @@ _DATABRICKS_KNOBS = {
     "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "https://ws.cloud.databricks.com",
     "OMNIGENT_SLACK_DATABRICKS_CLIENT_ID": "client-id",
     "OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET": "client-secret",
-    "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET": "state-secret",
+    "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET": "state-secret-0123456789abcdef0123456789",
 }
 
 
@@ -136,8 +150,16 @@ def test_databricks_mode_valid_with_required_knobs(monkeypatch: pytest.MonkeyPat
     assert settings.databricks_workspace_host == "https://ws.cloud.databricks.com"
     assert settings.databricks_oauth_client_id == "client-id"
     # The state HMAC key is its own required knob, distinct from the client secret.
-    assert settings.databricks_state_secret == "state-secret"
+    assert settings.databricks_state_secret == "state-secret-0123456789abcdef0123456789"
     assert settings.databricks_oauth_client_secret == "client-secret"
+
+
+def test_databricks_mode_rejects_short_state_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A weak state secret is brute-forceable → forgeable `state`. Require entropy.
+    knobs = {**_DATABRICKS_KNOBS, "OMNIGENT_SLACK_DATABRICKS_STATE_SECRET": "too-short"}
+    _set_env(monkeypatch, **knobs)
+    with pytest.raises(ValidationError):
+        _load()
 
 
 def test_databricks_workspace_host_defaults_to_databricks_host(
@@ -169,6 +191,38 @@ def test_databricks_redirect_uri_reuses_callback(monkeypatch: pytest.MonkeyPatch
         OMNIGENT_SLACK_WEBAUTH_BASE_URL="https://bot.example.com",
     )
     assert _load().databricks_redirect_uri == "https://bot.example.com/auth/callback"
+
+
+def test_databricks_rejects_plaintext_webauth_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The web-auth base URL is the OAuth redirect target (code + PII consent land
+    # there), so it must be https for any non-loopback host — same rule as the
+    # workspace host and server_url.
+    _set_env(
+        monkeypatch,
+        **_DATABRICKS_KNOBS,
+        OMNIGENT_SLACK_WEBAUTH_BASE_URL="http://bot.example.com",
+    )
+    with pytest.raises(ValidationError):
+        _load()
+
+
+def test_databricks_allows_loopback_webauth_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(
+        monkeypatch,
+        **_DATABRICKS_KNOBS,
+        OMNIGENT_SLACK_WEBAUTH_BASE_URL="http://localhost:8000",
+    )
+    assert _load().databricks_redirect_uri == "http://localhost:8000/auth/callback"
+
+
+def test_databricks_valid_without_webauth_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Legitimately absent on the first deploy (app URL doesn't exist yet); that's
+    # not a plaintext leak, just "no enrollment link yet".
+    monkeypatch.delenv("DATABRICKS_APP_URL", raising=False)
+    _set_env(monkeypatch, **_DATABRICKS_KNOBS)
+    settings = _load()
+    assert settings.webauth_base_url is None
+    assert settings.databricks_redirect_uri is None
 
 
 def test_databricks_workspace_host_defaults_scheme_to_https(

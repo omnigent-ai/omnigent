@@ -18,6 +18,7 @@ from omnigent_slack.notifications import (
     SlackNotifier,
     format_output_file,
     format_policy_denied,
+    format_todos,
 )
 from omnigent_slack.omnigent import (
     AuthRequiredError,
@@ -66,12 +67,12 @@ _SERVER_UNREACHABLE_TEXT = (
     "down, run /omnigent to reconfigure."
 )
 
-# An unauthenticated turn (expired/lost token — most often the ~1h token expiry
-# on Databricks-hosted servers, or a bot restart that dropped in-memory tokens)
-# is NOT delivered through this plain-text path. The user was already set up, so
-# they get a DM with a re-login setup button instead (see
-# ``SlackOmnigentService._notify_auth_expired``), which is reliably delivered and
-# actionable — unlike a thread ephemeral Slack may never render.
+# An unauthenticated turn (a grant that can no longer be refreshed, or a bot
+# restart that dropped in-memory tokens) is NOT delivered through this plain-text
+# path. The user was already set up, so they get a DM with a re-login setup
+# button instead (see ``SlackOmnigentService._notify_auth_expired``), which is
+# reliably delivered and actionable — unlike a thread ephemeral Slack may never
+# render.
 
 # Shown when the live turn stream kept dropping and reconnect was exhausted. The
 # server was reachable throughout (a proxy severed the long-lived stream, e.g. a
@@ -97,7 +98,7 @@ class _AuthExpired(Exception):
 
     Distinct from :class:`_TurnAborted` because it is not delivered as plain
     text: the caller DMs the user a re-login setup button instead (a reliable,
-    actionable notice for a token that expires ~hourly).
+    actionable notice for a grant that can no longer be refreshed).
     """
 
 
@@ -223,31 +224,38 @@ class SlackOmnigentService:
         if not accepted:
             return
 
-        team_id = _team_id(body, event)
-        key = ThreadKey.from_event(team_id, event)
-        text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
-        if not text:
-            self._logger.info(
-                "Slack app_mention had no text after mention thread=%s",
-                key.display(),
-            )
-            await client.chat_postMessage(
-                channel=key.channel_id,
-                thread_ts=key.reply_ts,
-                text="Send a message after mentioning me to start a session.",
-            )
-            return
+        # The event is now claimed and Bolt has auto-acked, so Slack won't
+        # redeliver. If handling fails before the turn is underway, release the
+        # claim so a redelivery / re-send isn't silently deduped away.
+        try:
+            team_id = _team_id(body, event)
+            key = ThreadKey.from_event(team_id, event)
+            text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
+            if not text:
+                self._logger.info(
+                    "Slack app_mention had no text after mention thread=%s",
+                    key.display(),
+                )
+                await client.chat_postMessage(
+                    channel=key.channel_id,
+                    thread_ts=key.reply_ts,
+                    text="Send a message after mentioning me to start a session.",
+                )
+                return
 
-        self._logger.info(
-            "Accepted Slack app_mention thread=%s chars=%s", key.display(), len(text)
-        )
-        await self._route_turn(
-            key=key,
-            event=event,
-            text=text,
-            client=client,
-            in_channel=not event_is_dm(event),
-        )
+            self._logger.info(
+                "Accepted Slack app_mention thread=%s chars=%s", key.display(), len(text)
+            )
+            await self._route_turn(
+                key=key,
+                event=event,
+                text=text,
+                client=client,
+                in_channel=not event_is_dm(event),
+            )
+        except Exception:
+            await self._unclaim_event(body, event)
+            raise
 
     async def handle_message(
         self,
@@ -270,44 +278,51 @@ class SlackOmnigentService:
         if not accepted:
             return
 
-        if not event_is_dm(event):
-            # In channels Omnigent only joins a thread when @-mentioned (which
-            # arrives as an app_mention event). Plain messages — even a reply in
-            # a thread that already has a session, and even one that mentions the
-            # bot (app_mention handles that copy) — are human discussion and must
-            # not be added to the Omnigent session.
+        # The event is now claimed and Bolt has auto-acked, so Slack won't
+        # redeliver. If handling fails before the turn is underway, release the
+        # claim so a redelivery / re-send isn't silently deduped away.
+        try:
+            if not event_is_dm(event):
+                # In channels Omnigent only joins a thread when @-mentioned (which
+                # arrives as an app_mention event). Plain messages — even a reply in
+                # a thread that already has a session, and even one that mentions the
+                # bot (app_mention handles that copy) — are human discussion and must
+                # not be added to the Omnigent session.
+                self._logger.info(
+                    "Ignoring channel message channel=%s ts=%s",
+                    event.get("channel"),
+                    event.get("ts"),
+                )
+                return
+
+            team_id = _team_id(body, event)
+            key = ThreadKey.from_event(team_id, event)
+
+            # DMs do not fire app_mention, so a "<@bot>" here is the only event we
+            # get — strip the mention (if any) and treat it like any other DM rather
+            # than dropping it as a duplicate.
+            text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
+            if not text:
+                self._logger.info("Ignoring empty Slack direct message thread=%s", key.display())
+                return
+
+            # A DM maps one session per thread (like a channel): a top-level message
+            # starts a new session, a threaded reply continues it.
             self._logger.info(
-                "Ignoring channel message channel=%s ts=%s",
-                event.get("channel"),
-                event.get("ts"),
+                "Accepted Slack direct message thread=%s chars=%s",
+                key.display(),
+                len(text),
             )
-            return
-
-        team_id = _team_id(body, event)
-        key = ThreadKey.from_event(team_id, event)
-
-        # DMs do not fire app_mention, so a "<@bot>" here is the only event we
-        # get — strip the mention (if any) and treat it like any other DM rather
-        # than dropping it as a duplicate.
-        text = strip_bot_mention(str(event.get("text") or ""), bot_user_id)
-        if not text:
-            self._logger.info("Ignoring empty Slack direct message thread=%s", key.display())
-            return
-
-        # A DM has no human-only discussion to gate on: the whole thread maps to
-        # one Omnigent session, created on the first message and reused after.
-        self._logger.info(
-            "Accepted Slack direct message thread=%s chars=%s",
-            key.display(),
-            len(text),
-        )
-        await self._route_turn(
-            key=key,
-            event=event,
-            text=text,
-            client=client,
-            in_channel=False,
-        )
+            await self._route_turn(
+                key=key,
+                event=event,
+                text=text,
+                client=client,
+                in_channel=False,
+            )
+        except Exception:
+            await self._unclaim_event(body, event)
+            raise
 
     async def _route_turn(
         self,
@@ -336,10 +351,10 @@ class SlackOmnigentService:
         # session in another user's thread. A root-level mention (new thread) has
         # no ``parent_user_id`` and falls through to the normal store-backed path.
         #
-        # Skip this in a DM: a 1:1 DM has no cross-user ownership concern, and the
-        # bot posts top-level there, so a user threading a reply under a BOT
-        # message carries ``parent_user_id == <bot id>`` — which would wrongly
-        # refuse the user's own message.
+        # Skip this in a DM: a 1:1 DM has no cross-user ownership concern (only the
+        # one user and the bot are there), and a reply threaded under a BOT message
+        # carries ``parent_user_id == <bot id>`` — which would wrongly refuse the
+        # user's own message.
         parent_user_id = str(event.get("parent_user_id") or "")
         if not key.is_dm and parent_user_id and parent_user_id != requester:
             self._logger.info(
@@ -367,11 +382,25 @@ class SlackOmnigentService:
             if record is not None and record.owner_user_id != requester:
                 await self._notifier.notify_non_owner(client, key, requester)
             else:
+                # A parked turn (awaiting an approval/question) is STILL streaming,
+                # so it holds this reservation — meaning this branch, not the
+                # server-activity one below, handles a new message during a pending
+                # elicitation. Ask the server whether the session needs user action
+                # so we show "respond to the pending request above" rather than the
+                # generic "still working" notice. Best-effort: no record / unknown
+                # activity falls back to the busy notice.
+                needs_action = False
+                if record is not None:
+                    omnigent = await self._pool.get(
+                        self._server_url, pack_user_key(key.team_id, requester)
+                    )
+                    activity = await omnigent.get_session_activity(record.session_id)
+                    needs_action = activity.needs_user_action
                 await self._notifier.notify_thread_busy(
                     client,
                     key,
                     requester,
-                    needs_action=False,
+                    needs_action=needs_action,
                     session_id=record.session_id if record is not None else None,
                 )
             return
@@ -577,9 +606,10 @@ class SlackOmnigentService:
     async def _notify_auth_expired(self, turn: SlackTurn, reply: _AnswerReply) -> None:
         """Deliver the expired-login re-login prompt as a DM with a setup button.
 
-        A configured user's delegated token expires often (roughly hourly on
-        Databricks-hosted servers), so this must be reliably seen and actionable
-        rather than a thread ephemeral that Slack may never render. Clears the
+        Reached when a configured user's grant can no longer be refreshed
+        (revoked, or the refresh token itself expired) or a restart dropped
+        in-memory tokens — so this must be reliably seen and actionable rather
+        than a thread ephemeral that Slack may never render. Clears the
         "Working on it…" placeholder first so a failed turn leaves nothing behind.
         Best-effort: a DM failure is logged, never raised (the turn is already
         aborting). In a channel, an ephemeral pointer nudges the user to their DM;
@@ -837,8 +867,12 @@ class SlackOmnigentService:
         todos = extract_todos(event)
         if todos is not None:
             # The first plan post is a new out-of-band message → seal before it;
-            # later updates edit it in place (no boundary, no fragmentation).
-            if state.todos_ts is None:
+            # later updates edit it in place (no boundary, no fragmentation). Seal
+            # ONLY when a message will actually land: an empty todos render posts
+            # nothing and leaves todos_ts None, so sealing on it would fragment the
+            # answer into extra segments with no notice between them.
+            will_post = state.todos_ts is None and format_todos(todos) is not None
+            if will_post:
                 await reply.seal_for_interruption()
             state.todos_ts = await self._notifier.post_or_update_todos(
                 client, turn.key, todos, state.todos_ts
@@ -905,8 +939,15 @@ class SlackOmnigentService:
         return True, bot_user_id
 
     async def _claim_event(self, body: dict[str, Any], event: dict[str, Any]) -> bool:
-        event_id = body.get("event_id") or event.get("client_msg_id")
-        return await self._store.claim_event(str(event_id) if event_id else None)
+        return await self._store.claim_event(_event_id(body, event))
+
+    async def _unclaim_event(self, body: dict[str, Any], event: dict[str, Any]) -> None:
+        """Release the event's dedup claim (best-effort) so a failed handle retries."""
+        try:
+            await self._store.unclaim_event(_event_id(body, event))
+        except Exception:
+            # Never mask the original failure with an unclaim error.
+            self._logger.warning("Failed to unclaim Slack event after handler error")
 
     def _resolve_bot_user_id(self, context: dict[str, Any] | None) -> str | None:
         bot_user_id = None if context is None else context.get("bot_user_id")
@@ -931,6 +972,12 @@ def _team_id(body: dict[str, Any], event: dict[str, Any]) -> str:
     if not team_id:
         raise ValueError("Slack event is missing team_id")
     return str(team_id)
+
+
+def _event_id(body: dict[str, Any], event: dict[str, Any]) -> str | None:
+    """The dedup key for a Slack event (``event_id``, else ``client_msg_id``)."""
+    event_id = body.get("event_id") or event.get("client_msg_id")
+    return str(event_id) if event_id else None
 
 
 async def _session_title(

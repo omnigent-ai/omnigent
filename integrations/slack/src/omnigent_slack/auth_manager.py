@@ -373,11 +373,13 @@ class AuthManager:
         exists" — is essential: a stale token from a prior sign-in can already be
         present, and firing ``on_success`` against it advances the modal before
         the fresh token lands, so validation 401s and the modal hangs. The
-        baseline is captured HERE (synchronously at enrollment start), before the
-        user can finish, so the fresh write is always seen as a change. On arrival
-        ``on_success`` runs (the setup modal advances to agent/host selection,
-        mirroring the device flow); on timeout ``on_failure`` runs so the modal
-        doesn't hang forever. UI-agnostic.
+        baseline is captured when the poll task first runs — before the user can
+        complete browser SSO, because the caller shows the enrollment link (via
+        ``views_update``) only after spawning this poll — so the fresh write is
+        always seen as a change; keep that ordering. On arrival ``on_success``
+        runs (the setup modal advances to agent/host selection, mirroring the
+        device flow); on timeout ``on_failure`` runs so the modal doesn't hang
+        forever. UI-agnostic.
         """
         self._spawn_tracked(
             self._await_enrollment(

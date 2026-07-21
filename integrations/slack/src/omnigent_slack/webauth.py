@@ -386,8 +386,23 @@ def _build_oauth_client(settings: Settings) -> DatabricksOAuthClient:
     )
 
 
+# Response headers for every callback page. The consent page embeds both email
+# addresses (PII) and the confirm_id, so keep it out of browser history/bfcache
+# on shared machines (``no-store``); the anti-framing/sniff/referrer headers are
+# cheap defense-in-depth for an interstitial that carries identity data.
+_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
 def _html_response(body: str, *, status: int = 200) -> web.Response:
-    return web.Response(text=body, status=status, content_type="text/html")
+    return web.Response(
+        text=body, status=status, content_type="text/html", headers=_SECURITY_HEADERS
+    )
 
 
 # Status → aiohttp exception for the error responses the callback can raise.
@@ -401,7 +416,9 @@ _HTTP_ERRORS: dict[int, type[web.HTTPException]] = {
 
 def _error(status: int, reason: str) -> web.HTTPException:
     """Build a raisable HTML error response with a friendly page body."""
-    return _HTTP_ERRORS[status](text=_error_page(reason), content_type="text/html")
+    return _HTTP_ERRORS[status](
+        text=_error_page(reason), content_type="text/html", headers=_SECURITY_HEADERS
+    )
 
 
 def _identity_summary(

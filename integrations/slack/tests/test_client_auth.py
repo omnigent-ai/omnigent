@@ -49,6 +49,68 @@ async def test_refresh_on_401_then_retry() -> None:
     assert auth.access_token == "tok-2"
 
 
+@respx.mock
+async def test_refresh_on_proxy_redirect_then_retry() -> None:
+    # A Databricks-App proxy returns a 3xx→login (not 401) for an expired token.
+    # Refresh must still fire on that auth wall, else tokens never rotate and the
+    # session dies at the ~1h access-token expiry.
+    calls: list[str | None] = []
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("Authorization"))
+        if len(calls) == 1:
+            return httpx.Response(
+                302, headers={"location": "https://ws.example.com/oidc/v1/authorize"}
+            )
+        return httpx.Response(200, json={"status": "ok"})
+
+    respx.get(_BASE + "/health").mock(side_effect=_record)
+
+    async def _refresh() -> str | None:
+        return "tok-2"
+
+    auth = ClientAuth("tok-1", _refresh)
+    client = OmnigentClient(_BASE, auth=auth)
+    try:
+        await client.check_health()
+    finally:
+        await client.aclose()
+    assert calls == ["Bearer tok-1", "Bearer tok-2"]
+    assert auth.access_token == "tok-2"
+
+
+@respx.mock
+async def test_benign_redirect_does_not_trigger_refresh() -> None:
+    # A legitimate (non-auth) 3xx — e.g. a canonical/trailing-slash redirect —
+    # must NOT be treated as an auth wall: no refresh (which would burn a
+    # single-use rotating token) and no re-request of a possibly non-idempotent
+    # call. The response is returned as-is.
+    calls: list[str | None] = []
+    refreshed = False
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers.get("Authorization"))
+        return httpx.Response(307, headers={"location": "https://omnigent.test/v1/agents/"})
+
+    respx.get(_BASE + "/health").mock(side_effect=_record)
+
+    async def _refresh() -> str | None:
+        nonlocal refreshed
+        refreshed = True
+        return "tok-2"
+
+    auth = ClientAuth("tok-1", _refresh)
+    client = OmnigentClient(_BASE, auth=auth)
+    try:
+        resp = await client._request("GET", "/health")
+    finally:
+        await client.aclose()
+    assert resp.status_code == 307
+    assert calls == ["Bearer tok-1"]  # requested once, not retried
+    assert refreshed is False  # no token burned
+    assert auth.access_token == "tok-1"
+
+
 async def test_concurrent_refresh_rotates_once() -> None:
     """Concurrent 401s on one ClientAuth trigger a single rotation.
 

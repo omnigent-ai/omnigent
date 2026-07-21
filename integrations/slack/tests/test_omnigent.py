@@ -87,6 +87,31 @@ async def test_iter_sse_events_parses_json_and_done() -> None:
     ]
 
 
+async def test_iter_sse_events_skips_malformed_frame() -> None:
+    # A single corrupt frame (e.g. a proxy injecting a partial chunk) is skipped,
+    # not fatal — the good events before and after it still yield, so a turn
+    # whose answer already streamed isn't discarded by one bad frame.
+    events = [
+        event
+        async for event in iter_sse_events(
+            _lines(
+                [
+                    'data: {"type":"response.output_text.delta","delta":"good1"}',
+                    "",
+                    "data: {not valid json",
+                    "",
+                    'data: {"type":"response.output_text.delta","delta":"good2"}',
+                    "",
+                ]
+            )
+        )
+    ]
+    assert events == [
+        {"type": "response.output_text.delta", "delta": "good1"},
+        {"type": "response.output_text.delta", "delta": "good2"},
+    ]
+
+
 def test_extract_assistant_text_from_stream_item() -> None:
     assert (
         extract_assistant_text(
@@ -532,6 +557,49 @@ async def test_run_turn_ends_on_idless_idle_for_in_process_harness() -> None:
     # The post-`waiting` summary streamed (waiting didn't end the turn), and the
     # id-less idle ended it cleanly — no truncation, no hang.
     assert deltas == ["Dispatching partners.", "Both partners are back."]
+
+
+@respx.mock
+async def test_run_turn_ignores_stale_idle_when_resuming_idle_session() -> None:
+    # Incident: resuming a session that's been idle for hours. The stream
+    # (idle=false) replays the session's CURRENT status first — a stale id-less
+    # `idle` — which arrives BEFORE the just-submitted message's `running` edge.
+    # The turn must NOT end on that pre-turn idle (which would stream 0 chars and
+    # post "completed without returning response text"); it must wait for the real
+    # turn to run and stream its answer.
+    async def _resumed_stream() -> AsyncIterator[bytes]:
+        # Leftover status from the previous (long-finished) turn, replayed first.
+        yield b'data: {"type":"session.status","status":"idle"}\n\n'
+        # Now the server processes the newly-submitted message.
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"Fresh answer."}\n\n'
+        yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        yield b'data: {"type":"session.status","status":"idle"}\n\n'  # the REAL end
+        await asyncio.sleep(30)  # server keeps the stream open after idle
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_resumed_stream())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[str | None]:
+        return [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "resume", idle_grace_seconds=5.0)
+            if event.get("type") == "response.output_text.delta"
+        ]
+
+    try:
+        deltas = await asyncio.wait_for(_drain(), timeout=5.0)
+    finally:
+        await client.aclose()
+
+    # The stale idle was ignored; the real answer streamed and the real idle ended
+    # the turn — not 0 chars.
+    assert deltas == ["Fresh answer."]
 
 
 @respx.mock

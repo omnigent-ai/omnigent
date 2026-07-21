@@ -229,9 +229,16 @@ class DatabricksOAuthClient:
         return _email_from_scim(body)
 
 
-# OAuth token-endpoint error codes (RFC 6749 §5.2) that mean the grant itself
-# is permanently rejected — a fresh sign-in is required, retrying won't help.
-_TERMINAL_GRANT_ERRORS = frozenset({"invalid_grant", "invalid_client", "unauthorized_client"})
+# OAuth token-endpoint error code (RFC 6749 §5.2) that means the USER's grant is
+# permanently rejected — the refresh token is invalid/expired/revoked, so a fresh
+# sign-in is required and retrying won't help. Deliberately ONLY ``invalid_grant``:
+# ``invalid_client`` / ``unauthorized_client`` describe the bot's shared OAuth app
+# (e.g. a rotated/misconfigured client secret), not any user's grant. Treating
+# those as terminal would delete EVERY enrolled user's refresh token on one
+# recoverable bot-side misconfig — a mass logout the transient/terminal split
+# exists to prevent — and the deletion wouldn't even help (re-enrollment also
+# fails until the secret is fixed). So they stay transient: keep the token, retry.
+_TERMINAL_GRANT_ERRORS = frozenset({"invalid_grant"})
 
 
 def _error_detail(resp: httpx.Response) -> str:

@@ -16,7 +16,7 @@ _EMAIL = "user@example.com"
 _WORKSPACE = "https://ws.cloud.databricks.com"
 # The enrollment state is signed with its own dedicated secret, distinct from
 # the OAuth client secret.
-_STATE_SECRET = "state-secret"
+_STATE_SECRET = "state-secret-0123456789abcdef0123456789"
 
 
 def _settings() -> Settings:
@@ -314,3 +314,21 @@ async def test_health_ok(harness) -> None:
     client, _server, _store, _ = harness
     resp = await client.get("/health")
     assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_callback_pages_carry_security_headers(harness) -> None:
+    # The consent page embeds PII (both emails) + the confirm_id; it must not be
+    # cached, framed, or sniffed. Assert on both a 200 (consent) and an error page.
+    client, server, _store, _ = harness
+    state = _state_of(_issue_link(server))
+
+    consent = await client.get("/auth/callback", params={"state": state, "code": "c"})
+    assert consent.headers["Cache-Control"] == "no-store"
+    assert consent.headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in consent.headers["Content-Security-Policy"]
+    assert consent.headers["X-Content-Type-Options"] == "nosniff"
+
+    err = await client.get("/auth/callback", params={"state": "bad", "code": "c"})
+    assert err.status == 400
+    assert err.headers["Cache-Control"] == "no-store"

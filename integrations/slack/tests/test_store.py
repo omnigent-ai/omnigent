@@ -65,3 +65,16 @@ async def test_store_claim_event_dedupes(tmp_path: Path) -> None:
     assert await store.claim_event("Ev1") is True
     assert await store.claim_event("Ev1") is False
     assert await store.claim_event(None) is True
+
+
+async def test_store_unclaim_event_allows_reclaim(tmp_path: Path) -> None:
+    store = SQLiteStore(tmp_path / "store.sqlite3")
+    await store.initialize()
+
+    assert await store.claim_event("Ev1") is True
+    # Releasing the claim lets the same event id be processed again.
+    await store.unclaim_event("Ev1")
+    assert await store.claim_event("Ev1") is True
+    # A no-op without an id, and harmless on an unknown id.
+    await store.unclaim_event(None)
+    await store.unclaim_event("never-seen")

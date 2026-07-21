@@ -33,6 +33,14 @@ variables:
 resources:
   apps:
     # Resource key must match _BUNDLE_RESOURCE_KEY in deploy.py.
+    #
+    # SINGLE INSTANCE ONLY — do NOT enable "Horizontal scaling" (Beta) on this
+    # app. The bot is a Slack Socket-Mode consumer (a 2nd replica double-processes
+    # every event → duplicate turns), and the enrollment PKCE verifiers /
+    # unconfirmed tokens live in process memory (a callback routed to another
+    # replica fails closed with "link expired"). Apps are single-instance by
+    # default; keep it that way. There is no DAB field to pin this yet (instance
+    # count is UI-only in the Beta), so this is enforced by NOT turning it on.
     omnigent-slack:
       name: ${var.app_name}
       description: "Omnigent Slack bot with Databricks web-auth enrollment."
@@ -110,6 +118,6 @@ targets:
   prod:
     mode: production
     workspace:
-      host: https://e2-dogfood.staging.cloud.databricks.com/ # ← your workspace URL
+      host: https://example.databricks.com   # ← your workspace URL
       # Isolate remote state per app so one bundle can deploy multiple apps.
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}

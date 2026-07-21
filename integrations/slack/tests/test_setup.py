@@ -807,6 +807,27 @@ async def test_config_command_fails_closed_on_missing_team(tmp_path: Path) -> No
     assert client.opened_views == []
 
 
+async def test_setup_start_button_fails_closed_on_missing_team(tmp_path: Path) -> None:
+    # The button-driven setup path must apply the same empty-team/user fail-closed
+    # guard as the slash-command path (keys collapse across workspaces otherwise).
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    try:
+        await flow._handle_setup_start(
+            ack,
+            {"trigger_id": "tid-1", "team": {"id": ""}, "user": {"id": "U1"}},
+            client,
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls == [{}]
+    assert client.opened_views == []
+
+
 async def test_prompt_relogin_dms_setup_button(tmp_path: Path) -> None:
     # An expired-token user gets a DM carrying the re-login setup button — reliably
     # delivered and actionable — plus an in-channel ephemeral pointer to the DM.
