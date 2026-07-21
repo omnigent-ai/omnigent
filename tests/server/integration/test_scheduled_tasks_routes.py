@@ -693,3 +693,81 @@ async def test_list_runs_leaves_young_running_run_untouched(
     run = resp.json()["runs"][0]
     assert run["status"] == "running"
     assert run["finished_at"] is None
+
+
+async def test_list_tasks_force_fails_stale_running_run(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The LIST endpoint also force-fails a stale ``running`` run (no conv read).
+
+    Reading GET /v1/scheduled-tasks reaps the owner's stale orphans so a
+    Tasks-list badge never shows one as ``running``. Verified via the detail
+    endpoint afterward (the list response itself carries no run rows yet).
+    """
+    import time
+    import uuid
+
+    from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    stale_at = int(time.time()) - STALE_RUN_MAX_AGE_SECONDS - 60
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=stale_at,
+        fired_at=stale_at + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    # Hitting the LIST endpoint triggers the lazy stale backstop.
+    list_resp = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert list_resp.status_code == 200, list_resp.text
+
+    # The run was force-failed as a side effect of the list read.
+    detail = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    run = detail.json()["runs"][0]
+    assert run["status"] == "failed"
+    assert run["error_code"] == "incomplete"
+    assert run["finished_at"] is not None
+
+
+async def test_list_tasks_leaves_young_running_run_untouched(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The LIST endpoint does NOT reap a young in-flight run."""
+    import time
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    run_id = uuid.uuid4().hex
+    recent = int(time.time()) - 30
+    _seed_run(
+        db_uri,
+        task_id,
+        run_id,
+        status="running",
+        scheduled_at=recent,
+        fired_at=recent + 1,
+        finished_at=None,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    list_resp = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert list_resp.status_code == 200, list_resp.text
+
+    detail = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    run = detail.json()["runs"][0]
+    assert run["status"] == "running"
+    assert run["finished_at"] is None

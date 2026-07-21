@@ -372,17 +372,29 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.execute(stmt).scalars().first()
             return _run_to_entity(row) if row is not None else None
 
-    def list_runs_by_status_all_workspaces(self, status: str) -> list[ScheduledTaskRun]:
-        """List every run in ``status`` across all workspaces (startup sweep)."""
+    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
+        """List ``running`` runs for the given tasks in the current workspace.
+
+        Powers the lazy-on-read stale backstop on the scheduled-task LIST
+        endpoint: the route resolves the owner's tasks, then this returns their
+        still-``running`` runs (one indexed, workspace-scoped query over the
+        ``scheduled_task_id`` index) so the route can force-fail the stale ones.
+        An empty ``scheduled_task_ids`` returns an empty list without a query.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``running`` runs for those tasks, ordered
+            ``scheduled_at DESC, id DESC``.
+        """
+        if not scheduled_task_ids:
+            return []
+        running_code = encode_scheduled_task_run_status("running")
         with self._session() as session:
             stmt = (
                 select(SqlScheduledTaskRun)
-                .where(SqlScheduledTaskRun.status == encode_scheduled_task_run_status(status))
-                .order_by(
-                    asc(SqlScheduledTaskRun.workspace_id),
-                    asc(SqlScheduledTaskRun.scheduled_at),
-                    asc(SqlScheduledTaskRun.id),
-                )
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.scheduled_task_id.in_(scheduled_task_ids))
+                .where(SqlScheduledTaskRun.status == running_code)
+                .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
             )
             rows = session.execute(stmt).scalars().all()
             return [_run_to_entity(r) for r in rows]

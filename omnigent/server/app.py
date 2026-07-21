@@ -83,7 +83,6 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
-from omnigent.server.scheduled.run_reconciler import ScheduledRunReconciler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1390,7 +1389,6 @@ def create_app(
         # creates + owner-grants a session, launches its runner, and records
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
-        scheduled_run_reconciler: ScheduledRunReconciler | None = None
         if scheduled_task_store is not None:
             from omnigent.server.scheduled.fire import FireDeps, build_on_fire
 
@@ -1426,26 +1424,12 @@ def create_app(
                     exc,
                 )
 
-            # Run-completion orphan backstop. Completion itself is
-            # event-driven (persist_scheduled_run_completion fires from
-            # _publish_status the instant a fired conversation's turn ends —
-            # no poll). This startup sweep runs ONCE to reconcile runs left
-            # ``running`` by a restart mid-fire; lazy-on-read at GET
-            # /scheduled-tasks/{id}/runs covers the rest. Non-critical — a
-            # sweep failure must not abort boot.
-            scheduled_run_reconciler = ScheduledRunReconciler(
-                scheduled_task_store=scheduled_task_store,
-                conversation_store=conversation_store,
-            )
-            app_inst.state.scheduled_run_reconciler = scheduled_run_reconciler
-            try:
-                await scheduled_run_reconciler.run_startup_sweep()
-            except Exception as exc:
-                _logger.exception(
-                    "scheduled run startup sweep failed; continuing without "
-                    "orphaned-run reconciliation (%s)",
-                    exc,
-                )
+            # Run completion is event-driven (persist_scheduled_run_completion
+            # fires from _publish_status the instant a fired conversation's turn
+            # ends — no poll). The only orphan backstop is a lazy-on-read
+            # force-fail of stale ``running`` runs on the scheduled-task read
+            # endpoints (see routes/scheduled_tasks.py); there is no startup
+            # sweep and no periodic reconcile.
 
         try:
             yield

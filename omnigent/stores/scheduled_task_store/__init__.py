@@ -266,17 +266,18 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_runs_by_status_all_workspaces(self, status: str) -> list[ScheduledTaskRun]:
+    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
         """
-        List every run in ``status`` across all workspaces.
+        List ``running`` runs for the given tasks in the current workspace.
 
-        Used by the startup orphan sweep to find ``running`` runs left behind
-        by a server restart mid-fire. Mirrors
-        :meth:`ScheduledTaskStore.list_active_all_workspaces` — the caller
-        re-enters each run's ``workspace_scope`` before acting on it.
+        Powers the lazy-on-read stale backstop on the scheduled-task LIST
+        endpoint: the route resolves the owner's tasks, then this returns their
+        still-``running`` runs so the route can force-fail the ones past the max
+        age. Workspace-scoped (filters on ``current_workspace_id()``) like every
+        other read; an empty id list returns an empty list.
 
-        :param status: The run status to filter on, e.g. ``"running"``.
-        :returns: Matching :class:`ScheduledTaskRun` instances, ordered by
-            ``workspace_id ASC, scheduled_at ASC, id ASC``.
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``running`` :class:`ScheduledTaskRun` instances for those
+            tasks, ordered ``scheduled_at DESC, id DESC``.
         """
         ...

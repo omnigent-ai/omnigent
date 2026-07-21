@@ -730,17 +730,67 @@ def test_update_run_unknown_run_returns_none(
     assert store.update_run(_uid("nope"), status="succeeded", finished_at=1) is None
 
 
-# ── list_runs_by_status_all_workspaces (reconciler sweep source) ─────────────
+# ── list_running_runs_for_tasks (lazy-on-read LIST backstop source) ──────────
 
 
-def test_list_runs_by_status_all_workspaces_spans_tenants(
+def test_list_running_runs_for_tasks_filters_status_and_tasks(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
-    """The sweep source returns ``running`` runs across every workspace.
+    """Returns only ``running`` runs, and only for the requested tasks.
 
-    Non-``running`` runs are excluded, so the reconciler only ever sees rows
-    it might transition.
+    Powers the LIST endpoint's lazy stale backstop: the route passes the
+    owner's task ids and gets back their still-``running`` runs to age-check.
     """
+    for seed in ("a", "b"):
+        store.create(
+            scheduled_task_id=_uid(f"task_{seed}"),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+    # task_a: one running + one terminal run.
+    store.create_run(
+        run_id=_uid("run_a_running"),
+        scheduled_task_id=_uid("task_a"),
+        status="running",
+        scheduled_at=100,
+    )
+    store.create_run(
+        run_id=_uid("run_a_done"),
+        scheduled_task_id=_uid("task_a"),
+        status="succeeded",
+        scheduled_at=90,
+        finished_at=95,
+    )
+    # task_b: one running run.
+    store.create_run(
+        run_id=_uid("run_b_running"),
+        scheduled_task_id=_uid("task_b"),
+        status="running",
+        scheduled_at=200,
+    )
+
+    got = store.list_running_runs_for_tasks([_uid("task_a"), _uid("task_b")])
+    ids = {r.id for r in got}
+    assert ids == {_uid("run_a_running"), _uid("run_b_running")}  # terminal excluded
+    # Ordered scheduled_at DESC (run_b scheduled_at=200 > run_a=100).
+    assert got[0].id == _uid("run_b_running")
+
+
+def test_list_running_runs_for_tasks_empty_ids_returns_empty(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An empty task-id list short-circuits to an empty result (no query)."""
+    assert store.list_running_runs_for_tasks([]) == []
+
+
+def test_list_running_runs_for_tasks_is_workspace_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A task's running run is invisible from another workspace."""
     with workspace_scope(11):
         store.create(
             scheduled_task_id=_uid("task_w11"),
@@ -757,40 +807,11 @@ def test_list_runs_by_status_all_workspaces_spans_tenants(
             status="running",
             scheduled_at=100,
         )
-        # A terminal run in the same workspace must be excluded.
-        store.create_run(
-            run_id=_uid("run_w11_done"),
-            scheduled_task_id=_uid("task_w11"),
-            status="succeeded",
-            scheduled_at=90,
-            finished_at=95,
-        )
-    with workspace_scope(22):
-        store.create(
-            scheduled_task_id=_uid("task_w22"),
-            name="w22",
-            prompt="p",
-            rrule="FREQ=MINUTELY",
-            user_id="b",
-            agent_id=_uid("ag"),
-            timezone="UTC",
-        )
-        store.create_run(
-            run_id=_uid("run_w22"),
-            scheduled_task_id=_uid("task_w22"),
-            status="running",
-            scheduled_at=200,
-        )
-
-    running = store.list_runs_by_status_all_workspaces("running")
-    ids = {r.id for r in running}
-    assert _uid("run_w11") in ids
-    assert _uid("run_w22") in ids
-    assert _uid("run_w11_done") not in ids
-    # Each carries its owning workspace_id for the reconciler's workspace_scope.
-    by_id = {r.id: r for r in running}
-    assert by_id[_uid("run_w11")].workspace_id == 11
-    assert by_id[_uid("run_w22")].workspace_id == 22
+    # Default workspace cannot see the workspace-11 run.
+    assert store.list_running_runs_for_tasks([_uid("task_w11")]) == []
+    with workspace_scope(11):
+        got = store.list_running_runs_for_tasks([_uid("task_w11")])
+        assert [r.id for r in got] == [_uid("run_w11")]
 
 
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
