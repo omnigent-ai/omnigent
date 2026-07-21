@@ -1176,6 +1176,18 @@ export function AppShell() {
     else setView("chat");
   }, [setView]);
 
+  // Auto-exit shell view when the active shell leaves the terminal list
+  // (e.g. the user typed `exit`, so the runner deleted the resource):
+  // restore the prior view instead of stranding the user with the pill
+  // hidden and no shell ✕ to click (issue #479). Skip while the list is
+  // empty (loading / offline) so we don't clobber a pending restore.
+  useEffect(() => {
+    if (!terminalFirst || !panelInitialKey) return;
+    if (isAgentTerminalKey(panelInitialKey) || panelInitialKey === PANEL_NO_TERMINAL_KEY) return;
+    if (terminals.length === 0) return;
+    if (!terminals.some((t) => terminalTabKey(t) === panelInitialKey)) exitShellView();
+  }, [terminalFirst, panelInitialKey, terminals, exitShellView]);
+
   // `terminals` is already runner-accurate (useTerminals empties it when the
   // runner is offline), so a non-empty list means an openable PTY.
   const terminalsAvailable = terminals.length > 0;
