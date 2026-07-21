@@ -2847,18 +2847,15 @@ describe("AppShell share action", () => {
     });
   });
 
-  it("keeps the Share button visible but disabled in single-user mode", () => {
+  it("hides the Share button in single-user mode", () => {
     // Non-local origin isolates the single-user gate from the local-server
-    // path. The header action remains structurally stable, but the explicit
-    // single_user marker disables it because there is nobody to grant access.
+    // path. With nobody to grant access to, the action is omitted entirely.
     withWindowOrigin("https://app.example.com", () => {
       mockConversations([{ id: "conv_top", permission_level: null }]);
 
       renderShell("/c/conv_top", serverInfo({ single_user: true }));
 
-      const shareButton = screen.getByRole("button", { name: /share session/i });
-      expect(shareButton).toBeDisabled();
-      expect(shareButton).toHaveAttribute("title", "Sharing is unavailable in single-user mode.");
+      expect(screen.queryByRole("button", { name: /share session/i })).not.toBeInTheDocument();
     });
   });
 
