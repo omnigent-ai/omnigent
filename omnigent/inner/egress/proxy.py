@@ -1449,14 +1449,16 @@ class EgressProxy:
         The header is ignored on every other method, so those requests
         pass through untouched.
 
-        :param method: HTTP method (upper-case), e.g. ``"TRACE"``.
+        :param method: HTTP method (case-insensitive), e.g. ``"TRACE"``.
         :param headers_raw: Raw request header block (CRLF-separated).
         :returns: ``(terminate, headers)``. ``terminate`` is ``True`` when
             the proxy must answer as the final recipient (the caller must
             not forward upstream); otherwise ``headers`` is the block to
             forward, with ``Max-Forwards`` decremented when it was present.
         """
-        if method not in _MAX_FORWARDS_METHODS:
+        # Normalize here so the guard holds even if a future caller forgets
+        # to upper-case the verb (both current callers already do).
+        if method.upper() not in _MAX_FORWARDS_METHODS:
             return False, headers_raw
         msg = _parse_http_headers(headers_raw)
         raw = msg.get("Max-Forwards")
@@ -1515,6 +1517,11 @@ class EgressProxy:
         sensitive headers stripped; OPTIONS reports the proxy's own
         communication options via ``Allow``.
 
+        Any request body (e.g. an ``OPTIONS`` with ``Content-Length``) is
+        intentionally left undrained: the reply sets ``Connection: close``
+        and the caller tears the connection down, so leftover bytes are
+        discarded rather than mistaken for a pipelined request.
+
         :param writer: Stream to write the response to (the plaintext
             client writer, or the MITM ``tls_writer`` inside CONNECT).
         :param method: ``"TRACE"`` or ``"OPTIONS"`` (upper-case).
@@ -1531,6 +1538,10 @@ class EgressProxy:
                 b"\r\n" + body
             )
         else:  # OPTIONS
+            # This ``Allow`` list is intentionally static and proxy-scoped:
+            # it advertises the verbs the proxy itself answers for as the
+            # final recipient of a ``Max-Forwards: 0`` request, NOT the
+            # origin's capabilities (which are never queried on this path).
             resp = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"Allow: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE\r\n"
