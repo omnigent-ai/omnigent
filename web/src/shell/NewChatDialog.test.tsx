@@ -20,6 +20,7 @@ import {
   worktreePathTail,
   NewChatLandingScreen,
   resetLandingDraft,
+  mobilePickerCollisionPadding,
 } from "./NewChatDialog";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -2311,6 +2312,98 @@ describe("NewChatLandingScreen agent picker (mobile)", () => {
     openPicker();
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
     expect(screen.queryByTestId("new-chat-landing-agent-config-page")).toBeNull();
+  });
+
+  it("reserves the screen-chrome insets and keeps the menu body scrollable", () => {
+    // jsdom has no layout engine, so the resulting pixel geometry
+    // (collisionPadding → --radix-...-available-height) can't be asserted
+    // here; a real-browser run covers that. This pins the wiring instead:
+    // opening on mobile resolves both --omnigent-inset-* vars (the
+    // collisionPadding inputs, measured via a fixed probe), and the content
+    // carries the available-height cap + overflow-scroll classes.
+    const measured = trackInsetProbeMeasurements();
+    try {
+      renderLanding();
+      openPicker();
+      expect(measured).toContain("var(--omnigent-inset-top)");
+      expect(measured).toContain("var(--omnigent-inset-bottom)");
+      const content = screen
+        .getByTestId("new-chat-landing-agent-a1")
+        .closest('[data-slot="dropdown-menu-content"]');
+      expect(content).not.toBeNull();
+      expect(content!.className).toContain(
+        "max-h-[var(--radix-dropdown-menu-content-available-height)]",
+      );
+      expect(content!.className).toContain("overflow-y-auto");
+    } finally {
+      measured.restore();
+    }
+  });
+});
+
+/**
+ * Record every fixed-probe measurement of an `--omnigent-inset-*` var (the
+ * picker resolves them to px for `collisionPadding` when it opens on mobile).
+ * Returns the recorded array with a `restore()` to undo the patch.
+ */
+function trackInsetProbeMeasurements(): string[] & { restore: () => void } {
+  const measured: string[] = [];
+  const real = Element.prototype.getBoundingClientRect;
+  Element.prototype.getBoundingClientRect = function (this: Element) {
+    const height = this instanceof HTMLElement ? this.style.height : "";
+    if (height.startsWith("var(--omnigent-inset-")) measured.push(height);
+    return real.call(this);
+  };
+  return Object.assign(measured, {
+    restore: () => {
+      Element.prototype.getBoundingClientRect = real;
+    },
+  });
+}
+
+describe("NewChatLandingScreen agent picker (desktop)", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  it("does not measure chrome insets when opened on desktop", () => {
+    // The collisionPadding path is mobile-only; desktop keeps Radix's default
+    // collision handling (and geometry) untouched.
+    const measured = trackInsetProbeMeasurements();
+    try {
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
+      expect(measured).toHaveLength(0);
+    } finally {
+      measured.restore();
+    }
+  });
+});
+
+describe("mobilePickerCollisionPadding", () => {
+  it("returns undefined on desktop so the default collision handling is unchanged", () => {
+    expect(mobilePickerCollisionPadding(false, { top: 47, bottom: 90 })).toBeUndefined();
+  });
+
+  it("reserves the measured top + bottom chrome insets (with matching edge pad) on mobile", () => {
+    expect(mobilePickerCollisionPadding(true, { top: 47, bottom: 90 })).toEqual({
+      top: 47,
+      bottom: 90,
+      left: 8,
+      right: 8,
+    });
+  });
+
+  it("reserves no vertical inset off-shell, where the insets fold to zero", () => {
+    expect(mobilePickerCollisionPadding(true, { top: 0, bottom: 0 })).toEqual({
+      top: 0,
+      bottom: 0,
+      left: 8,
+      right: 8,
+    });
   });
 });
 

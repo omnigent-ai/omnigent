@@ -1256,6 +1256,30 @@ function ModelEffortOptions({
   );
 }
 
+// Resolves a CSS length (e.g. the calc()/env()-based --omnigent-inset-* vars)
+// to pixels by measuring a throwaway fixed-position probe.
+function cssLengthToPx(length: string): number {
+  const probe = document.createElement("div");
+  probe.style.position = "fixed";
+  probe.style.visibility = "hidden";
+  probe.style.pointerEvents = "none";
+  probe.style.height = length;
+  document.body.appendChild(probe);
+  const px = probe.getBoundingClientRect().height;
+  probe.remove();
+  return px;
+}
+
+// Collision padding for the mobile picker: reserve the OS chrome insets (status
+// bar, native bottom bar) so Radix's size middleware caps the menu to the
+// visible band between them. 8px sides match its max-w clamp; desktop keeps default.
+export function mobilePickerCollisionPadding(
+  isMobile: boolean,
+  insets: { top: number; bottom: number },
+): { top: number; bottom: number; left: number; right: number } | undefined {
+  return isMobile ? { top: insets.top, bottom: insets.bottom, left: 8, right: 8 } : undefined;
+}
+
 /** Group / section header inside the picker dropdown (plain div, so Radix
  * doesn't claim roving focus for it — mirrors the in-session picker). */
 function PickerSectionHeader({ children }: { children: ReactNode }) {
@@ -1367,6 +1391,12 @@ function AgentHarnessPicker({
   // (`avoidCollisions` off), so the in-place swap can't change the direction.
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [mobileSide, setMobileSide] = useState<"top" | "bottom">("bottom");
+
+  // Screen-chrome insets (OS status bar / native bottom bar) measured at open
+  // time on mobile. The WebView viewport spans the full screen, so without
+  // them Radix lets the tall menu slide under both bars, leaving the ends
+  // unreachable. Fed to `collisionPadding` below.
+  const [mobileInsets, setMobileInsets] = useState({ top: 0, bottom: 0 });
 
   const hasKnobs = (agent: AvailableAgent): boolean =>
     nativeAgentHasCapability(agent, "permissionMode") ||
@@ -1638,6 +1668,12 @@ function AgentHarnessPicker({
           // tall list, so the later drill-in (shorter page) can't flip it.
           const rect = triggerRef.current?.getBoundingClientRect();
           if (rect) setMobileSide(window.innerHeight - rect.bottom >= rect.top ? "bottom" : "top");
+          if (isMobile) {
+            setMobileInsets({
+              top: cssLengthToPx("var(--omnigent-inset-top)"),
+              bottom: cssLengthToPx("var(--omnigent-inset-bottom)"),
+            });
+          }
           // Prefetch harness/description/skills for all session-discovered
           // agents so hasKnobs is stable before the user reads the list.
           for (const agent of [...harnessEntries, ...agentEntries]) {
@@ -1670,12 +1706,13 @@ function AgentHarnessPicker({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
-        // Desktop keeps the default collision handling (the content never
-        // resizes there — knobs live in hover flyouts). On mobile we force the
-        // measured side and disable flipping so the in-place page swap holds
-        // its direction; `--radix-..-available-height` still caps + scrolls it.
+        // On mobile, lock the measured side and disable flipping so the in-place
+        // page swap can't change direction; the inset-aware collisionPadding
+        // (see mobilePickerCollisionPadding) then caps the menu to the visible
+        // band and `--radix-..-available-height` scrolls it. Desktop is untouched.
         side={isMobile ? mobileSide : "bottom"}
         avoidCollisions={!isMobile}
+        collisionPadding={mobilePickerCollisionPadding(isMobile, mobileInsets)}
         className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
       >
         {showMobileKnobs && mobileKnobsAgent ? (
