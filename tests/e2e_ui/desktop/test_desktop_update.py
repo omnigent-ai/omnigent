@@ -120,6 +120,3 @@ def test_settings_updates_section_check_and_mode(
     check_button.click()
     page.wait_for_function("() => window.__omniUpdate.calls.includes('check')")
     assert "check" in _bridge_calls(page)
-
-
-
