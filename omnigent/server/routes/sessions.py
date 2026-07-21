@@ -60,6 +60,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
+    cost_unpriced_label_set,
     reserved_cost_control_keys,
 )
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
@@ -3260,6 +3261,14 @@ def _persist_native_cumulative_usage(
 
     conv = conversation_store.get_conversation(session_id)
     current = dict(conv.session_usage) if conv and conv.session_usage else {}
+    # A subscription-backed native session (flat-rate ChatGPT/Codex or Claude
+    # Pro/Max) has ~$0 marginal spend, so pricing its tokens at catalog API
+    # rates produces a phantom cost that trips the budget gate. When the bound
+    # runner has marked the session subscription-covered, record token buckets
+    # for display but price the cost at $0 (see the cost writes below). The
+    # marker lives in the runner-authority ``cost_control.*`` label namespace,
+    # so a session owner can't forge it to disable their own budget.
+    unpriced = bool(conv and cost_unpriced_label_set(conv.labels))
     # Native usage is cumulative (SET semantics), so the per-turn delta
     # for the daily rollup is new_total - old_total. Capture the old
     # cumulative + enforcement costs before the fields below overwrite them.
@@ -3321,7 +3330,15 @@ def _persist_native_cumulative_usage(
         if needs_model
         else None
     )
-    if cost is not None:
+    if unpriced:
+        # Subscription-backed: real marginal spend is ~$0, so price the whole
+        # session at $0 instead of token-pricing it at catalog API rates. A
+        # PRESENT $0 keeps the cost-budget gate quiet (0 < every threshold)
+        # AND avoids the "unpriced model" ASK/DENY that a *missing* cost key
+        # triggers (``_usage_is_unpriced`` in policies/builtins/cost.py fires
+        # only when tokens are present but ``total_cost_usd`` is absent).
+        current["total_cost_usd"] = 0.0
+    elif cost is not None:
         # Monotonic: a reported total below the persisted one is ignored.
         current["total_cost_usd"] = max(old_cost, float(cost))
     elif has_tokens:
@@ -3367,7 +3384,11 @@ def _persist_native_cumulative_usage(
     # must never lower it. When an in-flight estimate later resolves below a
     # prior peak the clamp keeps the peak — conservative (the gate errs toward
     # MORE enforcement, never less), which is the safe direction for a budget.
-    if policy_cost is not None:
+    if unpriced:
+        # Match the display cost: the enforcement figure is $0 too, so the
+        # gate never denies a subscription session.
+        current["policy_cost_usd"] = 0.0
+    elif policy_cost is not None:
         current["policy_cost_usd"] = max(old_policy_cost, float(policy_cost))
 
     conversation_store.set_session_usage(session_id, current)

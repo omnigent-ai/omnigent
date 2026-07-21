@@ -15,6 +15,34 @@ from collections.abc import Mapping
 # ``create_session`` in :mod:`omnigent.server.routes.sessions`).
 COST_CONTROL_LABEL_NAMESPACE = "cost_control."
 
+# Label key (under the reserved namespace) the session's bound runner sets
+# when the native harness authenticates via a flat-rate SUBSCRIPTION
+# (ChatGPT/Codex or Claude Pro/Max) rather than pay-per-use API credentials.
+# Value ``"true"`` marks the session subscription-covered: token usage is still
+# recorded for display, but the server prices the cost at $0 rather than at
+# per-token catalog rates (real marginal spend is ~$0), so the cost-budget gate
+# never fires on a phantom figure. A present $0 (not a missing cost key) is
+# deliberate — it also keeps the gate's "unpriced model" ASK/DENY from firing.
+# It shares the runner-authority write path of the rest of the namespace, so a
+# session owner cannot forge it to disable their own budget.
+COST_CONTROL_UNPRICED_LABEL_KEY = COST_CONTROL_LABEL_NAMESPACE + "unpriced"
+
+# Stored string value that turns the unpriced marker on. Any other value
+# (or an absent key) leaves the session priced.
+COST_CONTROL_UNPRICED_LABEL_VALUE = "true"
+
+
+def cost_unpriced_label_set(labels: Mapping[str, str]) -> bool:
+    """
+    Return whether *labels* marks the session as subscription-unpriced.
+
+    :param labels: A conversation label mapping, e.g.
+        ``{"cost_control.unpriced": "true", "team": "ml"}``.
+    :returns: ``True`` only when :data:`COST_CONTROL_UNPRICED_LABEL_KEY`
+        is present with value :data:`COST_CONTROL_UNPRICED_LABEL_VALUE`.
+    """
+    return labels.get(COST_CONTROL_UNPRICED_LABEL_KEY) == COST_CONTROL_UNPRICED_LABEL_VALUE
+
 
 def reserved_cost_control_keys(labels: Mapping[str, str]) -> tuple[str, ...]:
     """

@@ -1672,6 +1672,53 @@ def _native_claude_config_from_entry(
     return None
 
 
+def claude_login_is_subscription() -> bool:
+    """Return whether Claude Code's own login is a Pro/Max subscription.
+
+    The config-independent half of subscription detection: Claude Code's OAuth
+    credential is present (``claudeAiOauth`` in ``~/.claude/.credentials.json``,
+    or the macOS Keychain) and no ``ANTHROPIC_API_KEY`` is in the environment
+    (which Claude Code would bill against the API even with a cached login).
+    Callers pair this with "no provider config routes the launch" (a ``None``
+    :func:`resolve_native_claude_config`). Never raises.
+
+    :returns: ``True`` when the login is an OAuth subscription with no API key.
+    """
+    from omnigent.onboarding.ambient import _claude_login_detected
+
+    try:
+        if os.environ.get(_ANTHROPIC_API_KEY_ENV, "").strip():
+            return False
+        return _claude_login_detected()
+    except Exception:  # noqa: BLE001 - detection must never raise; stay priced.
+        _logger.debug("claude login-subscription detect failed", exc_info=True)
+        return False
+
+
+def claude_native_is_subscription(*, spec: AgentSpec | None) -> bool:
+    """Return whether a native Claude launch is backed by a Pro/Max subscription.
+
+    :func:`resolve_native_claude_config` returns ``None`` for a subscription
+    login *and* for an unconfigured host *and* for a global API-key setup, so
+    ``None`` alone is not a positive signal — it must be paired with
+    :func:`claude_login_is_subscription`. Such a session has ~$0 marginal
+    spend, so its usage must not be token-priced. Never raises: any failure is
+    treated as "not a subscription" so the session stays priced (the safe
+    direction for a budget).
+
+    :param spec: The agent spec, or ``None`` for the bare ``omnigent claude``
+        launch — passed straight to :func:`resolve_native_claude_config`.
+    :returns: ``True`` when the session should be left unpriced.
+    """
+    try:
+        if resolve_native_claude_config(spec=spec) is not None:
+            return False
+    except Exception:  # noqa: BLE001 - detection must never raise; stay priced.
+        _logger.debug("claude subscription detect failed", exc_info=True)
+        return False
+    return claude_login_is_subscription()
+
+
 def resolve_native_claude_config(
     *,
     spec: AgentSpec | None,
@@ -1908,6 +1955,20 @@ def _run_with_local_server(
             # future ``--resume`` can detect mismatches.
             _record_launch_for_fresh_session(prepared.session_id)
             startup_profiler.mark("fresh session launch state recorded")
+        # No provider config routes the launch and Claude Code's own login is a
+        # flat-rate Pro/Max subscription: bill nothing, so mark the session
+        # unpriced rather than pricing its usage at catalog API rates. Local
+        # server is single-user, so the session-bearer PATCH is authorized.
+        if claude_config is None and claude_login_is_subscription():
+            from omnigent.cost_unpriced import mark_session_unpriced
+
+            async def _mark_unpriced() -> None:
+                async with httpx.AsyncClient(
+                    base_url=base_url, timeout=httpx.Timeout(10.0)
+                ) as client:
+                    await mark_session_unpriced(client, prepared.session_id)
+
+            asyncio.run(_mark_unpriced())
         click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
         startup_profiler.mark("web ui url printed")
         open_conversation_link_if_enabled(

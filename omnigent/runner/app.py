@@ -3442,6 +3442,7 @@ async def _auto_create_codex_terminal(
     import socket as _socket
     from pathlib import Path
 
+    from omnigent.codex_native import codex_launch_is_subscription
     from omnigent.codex_native_app_server import (
         CodexAppServerClient,
         build_codex_native_server,
@@ -3457,6 +3458,7 @@ async def _auto_create_codex_terminal(
         prepare_bridge_dir,
         socket_path_for_bridge_dir,
     )
+    from omnigent.cost_unpriced import mark_session_unpriced
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     launch_config = await _codex_native_launch_config(
@@ -3477,6 +3479,11 @@ async def _auto_create_codex_terminal(
     default_model = launch_config.model_override or _codex_native_model_from_spec(agent_spec)
     _codex_launch = resolve_native_codex_launch(model=default_model)
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
+    # A subscription-backed Codex login (ChatGPT/OAuth) bills a flat rate, so
+    # its token usage must not be priced at catalog API rates. Mark the session
+    # unpriced up front, reusing the launch already resolved here.
+    if server_client is not None and codex_launch_is_subscription(_codex_launch):
+        await mark_session_unpriced(server_client, session_id)
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
@@ -5411,6 +5418,7 @@ async def _auto_create_claude_terminal(
         ClaudeNativeUcodeConfig,
         augment_claude_args,
         build_native_claude_terminal_env,
+        claude_login_is_subscription,
         resolve_native_claude_config,
     )
 
@@ -5672,6 +5680,13 @@ async def _auto_create_claude_terminal(
         bool(claude_config.api_key_helper) if claude_config is not None else False,
         bool(claude_config.model) if claude_config is not None else False,
     )
+    # No provider config routes the launch (claude_config is None) and Claude
+    # Code's own login is a flat-rate Pro/Max subscription: bill nothing, so
+    # mark the session unpriced rather than token-pricing at catalog API rates.
+    if server_client is not None and claude_config is None and claude_login_is_subscription():
+        from omnigent.cost_unpriced import mark_session_unpriced
+
+        await mark_session_unpriced(server_client, session_id)
 
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,

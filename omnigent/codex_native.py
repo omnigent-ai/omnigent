@@ -37,6 +37,7 @@ from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
+    NativeCodexLaunch,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
@@ -234,6 +235,79 @@ def _codex_auth_unavailable_reason() -> str | None:
     if not _codex_auth_json_has_available_credential(source.auth_path):
         return _CODEX_AUTH_UNAVAILABLE_NEEDS_AUTH
     return None
+
+
+def _codex_auth_json_is_oauth_only(auth_path: Path) -> bool:
+    """Return whether ``auth.json`` carries a ChatGPT/OAuth login and no API key.
+
+    ChatGPT-mode auth stores a ``tokens`` object (``access_token`` /
+    ``refresh_token``); API-key mode stores a top-level ``OPENAI_API_KEY`` or
+    ``personal_access_token``. Mirrors the field precedence in
+    :func:`_codex_auth_json_has_available_credential` but discriminates the
+    *mode* rather than mere availability: ``True`` only when a ``tokens``
+    credential is present and no API key is.
+
+    :param auth_path: Path to the Codex ``auth.json``.
+    :returns: ``True`` for a pure ChatGPT/OAuth login; ``False`` when an API
+        key is present, no credential parses, or the file is missing/malformed.
+    """
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    for key in ("OPENAI_API_KEY", "personal_access_token"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return False
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        return False
+    return any(
+        isinstance(tokens.get(field), str) and tokens[field].strip()
+        for field in ("access_token", "refresh_token")
+    )
+
+
+def codex_launch_is_subscription(launch: NativeCodexLaunch) -> bool:
+    """Return whether an already-resolved Codex launch is subscription-backed.
+
+    True only when the launch defers to Codex's own login (no Databricks
+    profile and no ``model_provider`` override — the same condition that makes
+    ``auth.json`` the deciding credential) **and** that login is a ChatGPT/OAuth
+    subscription rather than an API key.
+
+    :param launch: A resolved :class:`NativeCodexLaunch`.
+    :returns: ``True`` when the session should be left unpriced.
+    """
+    defers_to_login = (
+        launch.profile is None and codex_session_meta_model_provider(launch) == "openai"
+    )
+    if not defers_to_login:
+        return False
+    return _codex_auth_json_is_oauth_only(_resolve_codex_auth_source().auth_path)
+
+
+def codex_native_is_subscription(model: str | None = None) -> bool:
+    """Return whether a native Codex launch is backed by a flat-rate subscription.
+
+    Resolves the launch and delegates to :func:`codex_launch_is_subscription`.
+    Such a session has ~$0 marginal spend, so its usage must not be
+    token-priced. Never raises: any resolver failure is treated as "not a
+    subscription" so the session stays priced (the safe direction for a
+    budget).
+
+    :param model: Optional model id to resolve the launch with (matches the
+        session's ``model_override``); ``None`` uses the default.
+    :returns: ``True`` when the session should be left unpriced.
+    """
+    try:
+        launch = resolve_native_codex_launch(model=model)
+    except Exception:  # noqa: BLE001 - detection must never raise; stay priced.
+        _logger.debug("codex subscription detect: launch resolve failed", exc_info=True)
+        return False
+    return codex_launch_is_subscription(launch)
 
 
 def _update_startup_progress(
@@ -1332,6 +1406,12 @@ async def _initialize_fresh_terminal_thread(
         timeout=httpx.Timeout(30.0),
     ) as client:
         await _patch_external_session_id(client, prepared.session_id, thread_id)
+        # A ChatGPT/OAuth (subscription) Codex login bills a flat rate, so its
+        # usage must not be token-priced. Best-effort — never blocks startup.
+        if codex_native_is_subscription():
+            from omnigent.cost_unpriced import mark_session_unpriced
+
+            await mark_session_unpriced(client, prepared.session_id)
     write_bridge_state(
         prepared.bridge_dir,
         CodexNativeBridgeState(
