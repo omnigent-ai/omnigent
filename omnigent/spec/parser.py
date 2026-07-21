@@ -161,7 +161,12 @@ def _parse_float_field(raw: object, field_name: str) -> float:
         ) from exc
 
 
-def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
+def parse(
+    root: Path,
+    *,
+    expand_env: bool = True,
+    prune_invalid_sub_agents: bool = False,
+) -> AgentSpec:
     """
     Parse an agent image directory into an :class:`AgentSpec`.
 
@@ -171,6 +176,9 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         connection blocks and MCP headers. ``True`` (default) for
         deploy/runtime — raises on unresolved vars. ``False`` for
         scaffolding/validation where env vars may not yet be set.
+    :param prune_invalid_sub_agents: When true, omit sub-agents that cannot
+        be parsed so execution can fall back to the remaining workers. Root
+        parse errors still fail loud.
     :returns: A fully populated :class:`AgentSpec` (not yet
         validated).
     :raises OmnigentError: If ``config.yaml`` is not valid YAML,
@@ -282,7 +290,15 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
     mcp_servers = mcp_servers + _parse_inline_mcp_servers(raw_tools, expand_env=expand_env)
     local_tools = _discover_local_tools(root / "tools")
-    sub_agents = _discover_sub_agents(root / "agents", expand_env=expand_env)
+    sub_agents, unparseable_sub_agents = _discover_sub_agents(
+        root / "agents",
+        expand_env=expand_env,
+        prune_invalid_sub_agents=prune_invalid_sub_agents,
+    )
+    if unparseable_sub_agents:
+        tools_config.agents = [
+            name for name in tools_config.agents if name not in unparseable_sub_agents
+        ]
 
     return AgentSpec(
         spec_version=spec_version,
@@ -2651,7 +2667,8 @@ def _discover_sub_agents(
     agents_dir: Path,
     *,
     expand_env: bool = True,
-) -> list[AgentSpec]:
+    prune_invalid_sub_agents: bool = False,
+) -> tuple[list[AgentSpec], set[str]]:
     """
     Recursively discover and parse sub-agents under ``agents/``.
 
@@ -2662,21 +2679,41 @@ def _discover_sub_agents(
         ``root / "agents"``.
     :param expand_env: Whether to expand ``${VAR}`` references.
         Propagated to :func:`parse` for each sub-agent.
-    :returns: A sorted list of recursively parsed
-        :class:`AgentSpec` objects. Returns an empty list if
-        *agents_dir* does not exist.
+    :param prune_invalid_sub_agents: When true, skip child specs that fail
+        parsing and report their directory names alongside the surviving
+        specs. Strict authoring loads leave this false and still fail loud.
+    :returns: The recursively parsed specs and names skipped during parsing.
     """
     if not agents_dir.is_dir():
-        return []
+        return [], set()
     sub_agents: list[AgentSpec] = []
+    skipped: set[str] = set()
     for agent_dir in sorted(agents_dir.iterdir()):
         if not agent_dir.is_dir():
             continue
         config_yaml = agent_dir / "config.yaml"
         if not config_yaml.exists():
             continue
-        sub_agents.append(parse(agent_dir, expand_env=expand_env))
-    return sub_agents
+        try:
+            sub_agents.append(
+                parse(
+                    agent_dir,
+                    expand_env=expand_env,
+                    prune_invalid_sub_agents=prune_invalid_sub_agents,
+                )
+            )
+        except OmnigentError as exc:
+            if not prune_invalid_sub_agents:
+                raise
+            skipped.add(agent_dir.name)
+            _log.warning(
+                "Dropping sub-agent %r: its config could not be loaded and the "
+                "worker will be unavailable. Falling back to the remaining "
+                "workers. Load error: %s",
+                agent_dir.name,
+                exc,
+            )
+    return sub_agents, skipped
 
 
 # ── Guardrails / policy parsers (POLICIES.md §3.3) ───────────

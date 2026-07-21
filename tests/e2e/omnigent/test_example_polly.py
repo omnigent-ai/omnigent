@@ -19,6 +19,7 @@ What breaks if this fails:
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,36 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
         assert "IMPLEMENT — write real product code" in prompt
         assert "REVIEW — verify another agent's diff" in prompt
         assert "EXPLORE / SEARCH — answer a specific question" in prompt
+
+
+def test_execution_load_keeps_codex_when_optional_cursor_config_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optional subscription workers fail independently from Polly and Codex."""
+    bundle = tmp_path / "polly"
+    shutil.copytree(_POLLY_BUNDLE, bundle)
+    cursor_config = bundle / "agents" / "cursor" / "config.yaml"
+    cursor_config.write_text(
+        cursor_config.read_text(encoding="utf-8").replace(
+            "executor:\n  type: omnigent\n",
+            "executor:\n"
+            "  type: omnigent\n"
+            "  connection:\n"
+            "    api_key: ${MISSING_CURSOR_SUBSCRIPTION}\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("MISSING_CURSOR_SUBSCRIPTION", raising=False)
+
+    spec = load(bundle, prune_invalid_sub_agents=True)
+
+    workers = {agent.name for agent in spec.sub_agents}
+    assert spec.executor.config.get("harness") == "claude-sdk"
+    assert "cursor" not in workers
+    assert "cursor" not in spec.tools.agents
+    assert "codex" in workers
+    assert "codex" in spec.tools.agents
 
 
 def test_pi_subagent_is_headless_scaffold_worker(polly_spec: AgentSpec) -> None:

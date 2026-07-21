@@ -538,6 +538,49 @@ def test_load_without_pruning_still_fails_on_invalid_sub_agent(tmp_path: Path) -
         load(tmp_path)
 
 
+def test_load_pruning_drops_sub_agent_with_unresolved_credentials(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An optional worker's missing credential cannot block execution loading."""
+    _write_parent_with_sub_agents(
+        tmp_path,
+        parent_agents=["optional_vendor", "codex"],
+        sub_agents={
+            "optional_vendor": {
+                "spec_version": 1,
+                "name": "optional_vendor",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {"harness": "claude-sdk"},
+                    "connection": {"api_key": "${MISSING_OPTIONAL_VENDOR_KEY}"},
+                },
+            },
+            "codex": {
+                "spec_version": 1,
+                "name": "codex",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {"harness": "codex-native"},
+                },
+            },
+        },
+    )
+
+    with pytest.raises(OmnigentError, match="MISSING_OPTIONAL_VENDOR_KEY"):
+        load(tmp_path)
+
+    with caplog.at_level("WARNING", logger="omnigent.spec.parser"):
+        spec = load(tmp_path, prune_invalid_sub_agents=True)
+
+    assert {sa.name for sa in spec.sub_agents} == {"codex"}
+    assert spec.tools.agents == ["codex"]
+    assert any(
+        "optional_vendor" in record.message
+        and "Falling back to the remaining workers" in record.message
+        for record in caplog.records
+    )
+
+
 def test_load_pruning_still_fails_on_invalid_root(tmp_path: Path) -> None:
     """Pruning never masks a genuine *root*-level error."""
     config = {"spec_version": 99, "name": "bad-root"}

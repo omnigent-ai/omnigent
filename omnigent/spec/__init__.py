@@ -290,7 +290,11 @@ def load(
             prune_invalid_sub_agents=prune_invalid_sub_agents,
         )
 
-    spec = parse(root, expand_env=expand_env)
+    spec = parse(
+        root,
+        expand_env=expand_env,
+        prune_invalid_sub_agents=prune_invalid_sub_agents,
+    )
     if prune_invalid_sub_agents:
         _prune_invalid_sub_agents(spec)
     result = validate(spec)
