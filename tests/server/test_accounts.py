@@ -1381,8 +1381,9 @@ def test_alice_cannot_see_bobs_admin_endpoints(accounts_app: TestClient) -> None
         ("/auth/users", "GET"),
         ("/auth/invite", "POST"),
         ("/auth/users/admin/reset", "POST"),
+        ("/auth/users/admin", "PATCH"),
     ):
-        resp = alice.request(method, path, json={})
+        resp = alice.request(method, path, json={"is_admin": True})
         assert resp.status_code == 403, f"{method} {path} should 403 for non-admin"
 
 
@@ -1645,6 +1646,102 @@ def test_admin_can_delete_normal_member(accounts_app: TestClient) -> None:
 
     post = admin.get("/auth/users").json()
     assert "alice" not in {u["id"] for u in post["users"]}
+
+
+def test_admin_can_promote_member_to_admin(accounts_app: TestClient) -> None:
+    """PATCH /auth/users/{id} {is_admin: true} promotes a regular member.
+
+    Positive path for the promote direction. Confirms both the
+    response body and the listing reflect the new flag.
+    """
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    invite = admin.post("/auth/invite", json={"is_admin": False}).json()["token"]
+    from fastapi.testclient import TestClient as _TC
+
+    alice = _TC(accounts_app.app)
+    alice.post(
+        "/auth/register",
+        json={"invite": invite, "username": "alice", "password": "alice-pw-1234"},
+    )
+
+    resp = admin.patch("/auth/users/alice", json={"is_admin": True})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_admin"] is True
+
+    listing = admin.get("/auth/users").json()["users"]
+    alice_row = next(u for u in listing if u["id"] == "alice")
+    assert alice_row["is_admin"] is True
+
+
+def test_admin_can_demote_admin_when_others_exist(accounts_app: TestClient) -> None:
+    """Demoting a second admin succeeds when at least one admin remains.
+
+    Mirrors ``test_admin_can_delete_former_admin_when_others_exist``
+    for the demote-not-delete case.
+    """
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    invite = admin.post("/auth/invite", json={"is_admin": True}).json()["token"]
+    from fastapi.testclient import TestClient as _TC
+
+    second = _TC(accounts_app.app)
+    second.post(
+        "/auth/register",
+        json={"invite": invite, "username": "second", "password": "second-pw-1234"},
+    )
+
+    resp = admin.patch("/auth/users/second", json={"is_admin": False})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_admin"] is False
+
+
+def test_admin_cannot_demote_last_admin(accounts_app: TestClient) -> None:
+    """Demoting the sole remaining admin is refused with 400.
+
+    Same recovery-path invariant as
+    ``test_admin_cannot_delete_last_admin``, for the demote path.
+    This is the promote endpoint that test's docstring notes didn't
+    exist yet, and it now closes that gap.
+    """
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    resp = admin.patch("/auth/users/admin", json={"is_admin": False})
+    assert resp.status_code == 400
+    assert "last admin" in resp.json()["error"].lower()
+
+    # The flag is unchanged: still admin, still able to call admin routes.
+    me = admin.get("/auth/me").json()
+    assert me["is_admin"] is True
+
+
+def test_admin_can_demote_self_when_other_admin_exists(accounts_app: TestClient) -> None:
+    """Self-demotion is allowed once a second admin exists.
+
+    Unlike delete (which always refuses self), role change only
+    protects the "zero admins left" invariant, so a hand-off works:
+    promote a successor, then step down.
+    """
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    invite = admin.post("/auth/invite", json={"is_admin": True}).json()["token"]
+    from fastapi.testclient import TestClient as _TC
+
+    second = _TC(accounts_app.app)
+    second.post(
+        "/auth/register",
+        json={"invite": invite, "username": "second", "password": "second-pw-1234"},
+    )
+
+    resp = admin.patch("/auth/users/admin", json={"is_admin": False})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_admin"] is False
+
+    me = admin.get("/auth/me").json()
+    assert me["is_admin"] is False
+
+
+def test_set_role_unknown_user_returns_404(accounts_app: TestClient) -> None:
+    """PATCH on a user id that doesn't exist returns 404."""
+    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    resp = admin.patch("/auth/users/ghost", json={"is_admin": True})
+    assert resp.status_code == 404
 
 
 def test_change_own_password_round_trip(accounts_app: TestClient) -> None:

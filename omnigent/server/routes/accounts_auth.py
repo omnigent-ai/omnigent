@@ -125,6 +125,17 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=_MIN_PASSWORD_LENGTH, max_length=1024)
 
 
+class SetUserRoleRequest(BaseModel):
+    """Body of ``PATCH /auth/users/{user_id}``.
+
+    :param is_admin: The target's new admin flag. ``True`` promotes,
+        ``False`` demotes. Required (not optional), since a role change
+        should always be an explicit choice, never an implicit default.
+    """
+
+    is_admin: bool
+
+
 def _set_session_cookie(
     response: Response,
     token: str,
@@ -707,6 +718,60 @@ def create_accounts_auth_router(
 
         account_store.delete_user(user_id)
         return Response(status_code=204)
+
+    @router.patch("/users/{user_id}")
+    async def set_user_role(request: Request, user_id: str, body: SetUserRoleRequest) -> Response:
+        """Promote or demote a user's admin flag (admin only).
+
+        Unlike delete, self-role-change is allowed, since an admin may
+        demote themselves after handing off, or an admin invited
+        as a regular member can be promoted. The one invariant this
+        enforces is the same one :func:`delete_user` enforces: the
+        deploy must always retain at least one admin, so demoting
+        the last admin (self or otherwise) is refused with 400.
+        Promotions and no-op writes (setting the flag to its current
+        value) are always allowed.
+        """
+        admin_id = auth_provider.get_user_id(request)
+        if admin_id is None or not account_store.is_admin(admin_id):
+            return JSONResponse(status_code=403, content={"error": "admin only"})
+
+        target = account_store.get_user(user_id)
+        if target is None:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+
+        if not body.is_admin and target.is_admin:
+            other_admins = [
+                u for u in account_store.list_users() if u.is_admin and u.id != user_id
+            ]
+            if not other_admins:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "cannot demote the last admin, promote another "
+                        "user first or the deploy would have no recovery path"
+                    },
+                )
+
+        account_store.set_admin(user_id, body.is_admin)
+        _logger.info(
+            "auth/users/role: %s set is_admin=%s for %s",
+            _redact_for_log(admin_id),
+            body.is_admin,
+            _redact_for_log(user_id),
+        )
+        updated = account_store.get_user(user_id)
+        assert updated is not None  # just wrote this row above
+        return JSONResponse(
+            status_code=200,
+            content={
+                "id": updated.id,
+                "is_admin": updated.is_admin,
+                "created_at": updated.created_at,
+                "last_login_at": updated.last_login_at,
+                "has_password": updated.has_password,
+            },
+        )
 
     @router.post("/users/{user_id}/reset")
     async def reset_user_password(request: Request, user_id: str) -> Response:
