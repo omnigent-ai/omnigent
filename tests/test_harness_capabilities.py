@@ -24,6 +24,7 @@ from omnigent.harness_plugins import (
     HarnessContribution,
     harness_capabilities,
     harness_catalog,
+    harness_setup_steps_by_spelling,
     native_agents,
     valid_harnesses,
 )
@@ -183,3 +184,18 @@ def test_catalog_rows_carry_setup_steps() -> None:
     codex = rows["codex"]["setup_steps"]
     assert [s["action"] for s in codex] == ["install", "command"]
     assert codex[1]["command"] == "codex login"
+
+
+def test_setup_steps_by_spelling_covers_native_and_installable_ids() -> None:
+    """The by-spelling map resolves the ids a session declares, not just picker
+    rows — native wrappers and installable non-picker ids included."""
+    by_spelling = harness_setup_steps_by_spelling()
+    # Native wrappers (what a session actually declares) resolve to steps...
+    for native in ("codex-native", "claude-native", "opencode-native", "qwen-native"):
+        assert native in by_spelling, native
+        assert len(by_spelling[native]) >= 1
+    # ...and match their bare-id counterpart's steps (same ui_setup_steps source).
+    assert by_spelling["codex-native"] == by_spelling["codex"]
+    # Installable ids that are NOT picker rows still resolve.
+    assert "opencode" in by_spelling
+    assert "qwen" in by_spelling

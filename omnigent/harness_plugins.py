@@ -946,6 +946,34 @@ def harness_catalog() -> list[dict[str, Any]]:
     return rows
 
 
+def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
+    """Map every harness spelling to its ordered UI setup steps.
+
+    The web setup dialog looks steps up by the harness a *session* declares —
+    which is often a native wrapper (``codex-native``) or an installable id
+    that is not a picker row (``opencode``/``qwen``), neither of which appears
+    in :func:`harness_catalog`. Keying by spelling here lets the dialog resolve
+    steps for whatever id it holds. Values mirror ``harness_catalog``'s
+    ``setup_steps`` (same :func:`ui_setup_steps` source), so the two can't
+    drift.
+
+    :returns: ``{spelling: [step.as_dict(), ...]}`` for every accepted spelling;
+        empty when the onboarding stack can't be imported (fail-open).
+    """
+    try:
+        from omnigent.onboarding.harness_install import ui_installable_harnesses, ui_setup_steps
+    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+        _logger.debug("setup-step metadata unavailable", exc_info=True)
+        return {}
+    # Cover the picker ids (catalog rows) plus every installable spelling
+    # (bare + native), so a session's declared harness always resolves.
+    spellings: set[str] = set(valid_harnesses())
+    spellings.update(ui_installable_harnesses())
+    return {
+        spelling: [step.as_dict() for step in ui_setup_steps(spelling)] for spelling in spellings
+    }
+
+
 def load_object(import_path: str) -> Any:
     """Load ``module:attribute`` or ``module.attribute``."""
     if ":" in import_path:

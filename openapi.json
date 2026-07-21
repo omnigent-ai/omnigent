@@ -6608,13 +6608,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
-                    "type": "array"
-                  },
+                  "additionalProperties": true,
                   "title": "Response List Harnesses V1 Harnesses Get",
                   "type": "object"
                 }
