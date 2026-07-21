@@ -70,7 +70,7 @@ def test_orchestrator_executor(polly_spec: AgentSpec) -> None:
 
 def test_coding_subagents(polly_spec: AgentSpec) -> None:
     """
-    The bundle has exactly six coding sub-agents: ``claude_code`` (claude-native),
+    The bundle keeps six core coding sub-agents: ``claude_code`` (claude-native),
     ``codex`` (codex-native), ``opencode`` (opencode-native), ``cursor``
     (cursor-native), and ``hermes`` (hermes-native) on the native terminal
     harnesses, plus ``pi`` (pi) as the headless multi-model worker. All
@@ -81,22 +81,25 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     would break cross-vendor review — polly's differentiator.
     """
     fam = {a.name: a.executor.config.get("harness") for a in polly_spec.sub_agents}
-    assert sorted(polly_spec.tools.agents) == [
+    core_agents = {
         "claude_code",
         "codex",
         "cursor",
         "hermes",
         "opencode",
         "pi",
-    ]
+    }
+    assert core_agents <= set(polly_spec.tools.agents)
     assert fam["claude_code"] == "claude-native"
     assert fam["codex"] == "codex-native"
     assert fam["opencode"] == "opencode-native"
     assert fam["cursor"] == "cursor-native"
     assert fam["hermes"] == "hermes-native"
     assert fam["pi"] == "pi"
-    # Six distinct vendors → any implementer's diff is reviewable by another.
-    assert len(set(fam.values())) == 6
+    # Core workers stay distinct; optional workers may add more vendor routes.
+    assert len({fam[name] for name in core_agents}) == 6
+    if "gpt_worker" in fam:
+        assert fam["gpt_worker"] == "openai-agents"
     # Headless bypass knobs so workers don't stall on ApprovalCards.
     by_name = {a.name: a for a in polly_spec.sub_agents}
     assert by_name["claude_code"].executor.config.get("permission_mode") == "auto"
@@ -474,7 +477,6 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
                 f"as the evaluator and the first gated tool call would fail closed."
             )
             checked += 1
-    # orchestrator: blast_radius + spawn_bounds + headless_subagent_purpose_guard
-    # = 3; sub-agents: blast_radius x6 (claude_code, codex, opencode, cursor,
-    # hermes, pi) = 6 -> 9 total. Fewer = a policy dropped.
-    assert checked == 9, f"expected 9 function policies in the bundle, inspected {checked}"
+    # The root and six core workers currently contribute at least nine policies;
+    # optional workers may add their own runtime-specific gates.
+    assert checked >= 9, f"expected at least 9 function policies, inspected {checked}"
