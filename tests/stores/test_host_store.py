@@ -710,7 +710,7 @@ def test_register_managed_host_and_resolve_token_roundtrip(db_uri: str) -> None:
         token_expires_at=now_epoch() + 3600,
     )
 
-    resolved = store.resolve_launch_token("raw-launch-token-1")
+    resolved = store.resolve_launch_token("e932ccae9eeb8f2a86f7ebfc5089c28d", "raw-launch-token-1")
     assert resolved is not None
     assert resolved.host_id == "e932ccae9eeb8f2a86f7ebfc5089c28d"
     assert resolved.name == "managed-m1"
@@ -739,8 +739,13 @@ def test_resolve_launch_token_rejects_unknown_and_expired(db_uri: str) -> None:
         token_expires_at=now_epoch() - 1,
     )
 
-    assert store.resolve_launch_token("no-such-token") is None
-    assert store.resolve_launch_token("raw-launch-token-2") is None
+    # Unknown host id: nothing to resolve.
+    assert store.resolve_launch_token("00000000000000000000000000000000", "no-such-token") is None
+    # Known host, but its token is already expired.
+    assert (
+        store.resolve_launch_token("e5e05ec590da46a0e27bb138d343ffe7", "raw-launch-token-2")
+        is None
+    )
 
 
 def test_register_managed_host_relaunch_rotates_credential(db_uri: str) -> None:
@@ -778,8 +783,11 @@ def test_register_managed_host_relaunch_rotates_credential(db_uri: str) -> None:
     assert second.sandbox_id == "sb-gen2"
     # Generation-1 token is revoked by the overwrite; generation-2
     # resolves to the same host now backed by the new sandbox.
-    assert store.resolve_launch_token("generation-1-token") is None
-    resolved = store.resolve_launch_token("generation-2-token")
+    assert (
+        store.resolve_launch_token("a687a760841c785578a03f4677f8db3c", "generation-1-token")
+        is None
+    )
+    resolved = store.resolve_launch_token("a687a760841c785578a03f4677f8db3c", "generation-2-token")
     assert resolved is not None
     assert resolved.host_id == "a687a760841c785578a03f4677f8db3c"
     assert resolved.sandbox_id == "sb-gen2"
@@ -813,7 +821,10 @@ def test_managed_columns_survive_connect(db_uri: str) -> None:
     assert connected.sandbox_provider == "modal"
     assert connected.sandbox_id == "sb-m4"
     # The credential still resolves after connect.
-    assert store.resolve_launch_token("raw-launch-token-4") is not None
+    assert (
+        store.resolve_launch_token("d55a61010459cea88ed2af0fe916139b", "raw-launch-token-4")
+        is not None
+    )
 
 
 def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
@@ -835,7 +846,10 @@ def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
 
     store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566")
     assert store.get_host("dcf4eb5fc0b04985ec45f79cfda95566") is None
-    assert store.resolve_launch_token("raw-launch-token-5") is None
+    assert (
+        store.resolve_launch_token("dcf4eb5fc0b04985ec45f79cfda95566", "raw-launch-token-5")
+        is None
+    )
     assert store.list_hosts("alice@example.com") == []
     # Second delete is a no-op, not an error.
     store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566")
@@ -860,13 +874,19 @@ def test_revoke_launch_token_keeps_row_but_stops_resolution(db_uri: str) -> None
     )
     # Sanity: the token resolves before the revoke — without this, a
     # broken register would make the post-revoke assertion vacuous.
-    assert store.resolve_launch_token("raw-launch-token-revoke") is not None
+    assert (
+        store.resolve_launch_token("f59827fa9468170e62cf28104d2a5251", "raw-launch-token-revoke")
+        is not None
+    )
 
     store.revoke_launch_token("f59827fa9468170e62cf28104d2a5251")
 
     # The credential is dead but the row (and its managed binding)
     # survives — a deleted row here would null the session's host_id.
-    assert store.resolve_launch_token("raw-launch-token-revoke") is None
+    assert (
+        store.resolve_launch_token("f59827fa9468170e62cf28104d2a5251", "raw-launch-token-revoke")
+        is None
+    )
     host = store.get_host("f59827fa9468170e62cf28104d2a5251")
     assert host is not None
     assert host.sandbox_provider == "modal"
@@ -935,8 +955,9 @@ def test_register_managed_host_refuses_cross_owner_recredential(db_uri: str) -> 
 
     # Alice's credential and binding are untouched; Bob's token never
     # became valid.
-    resolved = store.resolve_launch_token("alice-token-7")
+    resolved = store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "alice-token-7")
     assert resolved is not None
     assert resolved.owner == "alice@example.com"
     assert resolved.sandbox_id == "sb-m7"
-    assert store.resolve_launch_token("bob-token-7") is None
+    # Bob's token never armed Alice's host: it does not match the stored digest.
+    assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None

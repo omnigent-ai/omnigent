@@ -1174,7 +1174,7 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     # The token injected into the sandbox is the one whose digest was
     # stored: resolving it (the tunnel's auth path) yields this host,
     # which also proves it is unexpired.
-    resolved = host_store.resolve_launch_token(start.token)
+    resolved = host_store.resolve_launch_token(start.host_id, start.token)
     assert resolved is not None
     assert resolved.host_id == result.host_id
     # Nothing was torn down on the success path.
@@ -1475,7 +1475,10 @@ async def test_launch_online_timeout_terminates_and_deletes_host(
     assert host_store.list_hosts(_OWNER) == []
     # The start command DID run (the failure was registration, not
     # startup), so its minted token exists — and must be dead.
-    assert host_store.resolve_launch_token(fake.host_starts[0].token) is None
+    assert (
+        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
+        is None
+    )
 
 
 async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
@@ -1601,7 +1604,9 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
             }
         )
         # The token was registered before start_host, so it resolves now.
-        self.token_resolved_at_start = self._host_store.resolve_launch_token(token) is not None
+        self.token_resolved_at_start = (
+            self._host_store.resolve_launch_token(host_id, token) is not None
+        )
         # Simulate the host's entrypoint dialing back over the tunnel.
         self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
         return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
@@ -1708,9 +1713,9 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     # revoked by the re-arm (its digest no longer matches anything).
     gen2_token = fake.host_starts[1].token
     assert gen2_token != gen1_token
-    resolved = host_store.resolve_launch_token(gen2_token)
+    resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, gen2_token)
     assert resolved is not None and resolved.host_id == first.host_id
-    assert host_store.resolve_launch_token(gen1_token) is None
+    assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
@@ -1755,7 +1760,10 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     # cleanup (revoke_launch_token — covered directly in the host-store
     # suite). Gen 1's raw token is the only one observable here (the
     # failed start never executed), so assert on it.
-    assert host_store.resolve_launch_token(fake.host_starts[0].token) is None
+    assert (
+        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
+        is None
+    )
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -1867,8 +1875,8 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert woke.sandbox_id == "sb-fake-1"
     second_token = fake.host_starts[1].token
     assert second_token != first_token
-    assert host_store.resolve_launch_token(first_token) is None
-    resolved = host_store.resolve_launch_token(second_token)
+    assert host_store.resolve_launch_token(fake.host_starts[0].host_id, first_token) is None
+    resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, second_token)
     assert resolved is not None and resolved.host_id == first.host_id
 
 
@@ -1898,8 +1906,13 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
 
     assert fake.resumed == ["sb-resume-force"]
     assert len(fake.host_starts) == 1
-    assert host_store.resolve_launch_token("tok-resume-force") is None
-    resolved = host_store.resolve_launch_token(fake.host_starts[0].token)
+    assert (
+        host_store.resolve_launch_token("62d4405ba38711fe34bebfeb5a7adaf2", "tok-resume-force")
+        is None
+    )
+    resolved = host_store.resolve_launch_token(
+        "62d4405ba38711fe34bebfeb5a7adaf2", fake.host_starts[0].token
+    )
     assert resolved is not None and resolved.host_id == "62d4405ba38711fe34bebfeb5a7adaf2"
 
 
@@ -1927,7 +1940,10 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     assert host is not None
     assert host.status == "offline"
     assert host.sandbox_id == "sb-resume-noop"
-    assert host_store.resolve_launch_token("tok-resume-noop") is not None
+    assert (
+        host_store.resolve_launch_token("249d058fbcde7b2ce941479cdb8c82d7", "tok-resume-noop")
+        is not None
+    )
 
 
 async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_uri: str) -> None:
@@ -1956,7 +1972,10 @@ async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_u
     assert host is not None
     assert host.status == "offline"
     assert host.sandbox_id == "sb-resume-fail"
-    assert host_store.resolve_launch_token("tok-resume-fail") is not None
+    assert (
+        host_store.resolve_launch_token("efbef7dede7be6577770cbb1287992f2", "tok-resume-fail")
+        is not None
+    )
 
 
 # ── terminate_managed_host ──────────────────────────────────
@@ -1984,7 +2003,9 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
 
     assert fake.terminated == ["sb-term-1"]
     assert host_store.get_host("62a91eb065624754c6a6dfb5869dd7e8") is None
-    assert host_store.resolve_launch_token("tok-term-1") is None
+    assert (
+        host_store.resolve_launch_token("62a91eb065624754c6a6dfb5869dd7e8", "tok-term-1") is None
+    )
 
 
 async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
@@ -2016,7 +2037,9 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     await terminate_managed_host(host, host_store, _injected_config(fake))
 
     assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
-    assert host_store.resolve_launch_token("tok-term-2") is None
+    assert (
+        host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
+    )
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
@@ -2044,7 +2067,9 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     # No cross-provider terminate was attempted.
     assert fake.terminated == []
     assert host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b") is None
-    assert host_store.resolve_launch_token("tok-term-3") is None
+    assert (
+        host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
+    )
 
     # config=None behaves the same: row deleted, nothing terminated.
     host2 = host_store.register_managed_host(

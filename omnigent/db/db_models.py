@@ -1257,9 +1257,6 @@ class SqlHost(OmnigentBase):
         # upsert-on-connect logic (look up by owner+name to detect host_id
         # rotation) stays consistent.
         UniqueConstraint("workspace_id", "owner", "name", name="uq_hosts_workspace_owner_name"),
-        # resolve_launch_token filters workspace_id + token_hash, so scoping
-        # the unique to the workspace keeps that lookup index-served.
-        UniqueConstraint("workspace_id", "token_hash", name="uq_hosts_token_hash"),
     )
 
 
