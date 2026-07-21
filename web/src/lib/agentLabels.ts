@@ -35,7 +35,9 @@ async function fetchHarnessLabels(): Promise<Record<string, string>> {
   const res = await authenticatedFetch("/v1/harnesses");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HarnessCatalogWire;
-  const labels: Record<string, string> = { ...BRAIN_HARNESS_LABELS };
+  // Start empty — only expose harnesses the server actually returns.
+  // A missing catalog response must not reintroduce dismissed harnesses.
+  const labels: Record<string, string> = {};
   for (const row of body.data ?? []) {
     if (typeof row.id === "string" && typeof row.label === "string") {
       labels[row.id] = row.label;
@@ -50,7 +52,9 @@ export function useBrainHarnessLabels(): Record<string, string> {
     queryFn: fetchHarnessLabels,
     staleTime: 30_000,
   });
-  return data ?? BRAIN_HARNESS_LABELS;
+  // Fail closed: a static fallback would reintroduce dismissed harnesses
+  // while the catalog query is loading or unavailable.
+  return data ?? {};
 }
 
 /**

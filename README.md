@@ -301,6 +301,15 @@ omnigent host           # (separate terminal) register this machine as a host
 In the web UI, hit **New Chat**, pick your machine, and go. Check status with
 `omnigent server status`; stop everything with `omnigent stop`.
 
+If the harness picker shows runtimes you cannot use, hide them from the web UI
+without changing the underlying harness registry:
+
+```bash
+omnigent harness list
+omnigent harness hide claude-sdk
+omnigent harness unhide claude-sdk
+```
+
 ### 3. Choose & switch models
 
 ```bash

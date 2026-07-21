@@ -167,6 +167,17 @@ const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
   NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
 );
 
+// Native terminal wrappers are distinct executor harnesses, while the web
+// catalog uses the corresponding user-configurable harness ids. Native-only
+// wrappers without a catalog entry intentionally return undefined.
+const CATALOG_HARNESS_ID_BY_NATIVE_KEY: Partial<Record<NativeCodingAgentIconKind, string>> = {
+  claude: "claude-sdk",
+  codex: "codex",
+  cursor: "cursor",
+  pi: "pi",
+  antigravity: "antigravity",
+};
+
 // Reversed harness spellings that fold to a canonical native `harness`.
 // Mirrors omnigent.harness_aliases.NATIVE_HARNESSES on the server, which
 // accepts both the canonical and reversed native spellings (claude/codex
@@ -213,6 +224,14 @@ export function isNativeCodingAgent(
   agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
 ): boolean {
   return nativeCodingAgentForAvailableAgent(agent) !== undefined;
+}
+
+/** Return the web catalog id that controls visibility of a native wrapper. */
+export function catalogHarnessIdForNativeCodingAgent(
+  agent: Pick<AvailableAgent, "name" | "harness"> | null | undefined,
+): string | undefined {
+  const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
+  return nativeAgent == null ? undefined : CATALOG_HARNESS_ID_BY_NATIVE_KEY[nativeAgent.key];
 }
 
 export function isNativeWrapper(wrapper: string | null | undefined): boolean {

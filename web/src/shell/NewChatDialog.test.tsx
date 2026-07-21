@@ -72,18 +72,23 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // host/workspace defaults under test still apply on ?project= visits.
   useNewestProjectSession: () => ({ data: null, isError: false }),
 }));
-// The harness-label catalog is not under test here. Keep it synchronous so
-// create-session fetch assertions only observe the POST/PATCH calls they own.
-vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
-  useBrainHarnessLabels: () => ({
+const brainHarnessLabels = vi.hoisted(() => {
+  const defaults = {
     "claude-sdk": "Claude SDK",
     codex: "Codex",
     cursor: "Cursor",
     pi: "Pi",
     antigravity: "Antigravity",
     copilot: "Copilot",
-  }),
+  } as Record<string, string>;
+  return { defaults, current: defaults };
+});
+
+// The harness-label catalog is not under test here. Keep it synchronous so
+// create-session fetch assertions only observe the POST/PATCH calls they own.
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  useBrainHarnessLabels: () => brainHarnessLabels.current,
 }));
 // Partial mock: only spy on the first-message handoff so the "@"-mention
 // tests can assert the prepended attachment marker. Everything else
@@ -590,6 +595,7 @@ function mockAgents(agents: AvailableAgent[]) {
 // directory-session / runner-health / filesystem stubs, and a persisted
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
+  brainHarnessLabels.current = { ...brainHarnessLabels.defaults };
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
   useAvailableAgentsMock.mockReset();
@@ -765,7 +771,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("No agents")).toBeTruthy();
   });
 
-  it("orders native built-ins together in the agent picker", () => {
+  it("filters native built-ins to the configured catalog in the agent picker", () => {
+    brainHarnessLabels.current = { codex: "Codex", pi: "Pi" };
     mockAgents([
       {
         id: "a_pi",
@@ -818,13 +825,14 @@ describe("NewChatLandingScreen", () => {
     ]);
     renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    const cursor = screen.getByTestId("new-chat-landing-agent-a_cursor");
+    const codex = screen.getByTestId("new-chat-landing-agent-a_codex");
     const pi = screen.getByTestId("new-chat-landing-agent-a_pi");
-    const kiro = screen.getByTestId("new-chat-landing-agent-a_kiro");
     const polly = screen.getByTestId("new-chat-landing-agent-a_polly");
-    expect(cursor.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(pi.compareDocumentPosition(kiro) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(kiro.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_kiro")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_claude")).toBeNull();
+    expect(codex.compareDocumentPosition(pi) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pi.compareDocumentPosition(polly) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   // The default agents are claude-native (a1) and codex-native (a2); the host

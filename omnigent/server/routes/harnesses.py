@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from omnigent.harness_plugins import harness_catalog
+from omnigent.harness_visibility import filtered_harness_catalog
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 
@@ -18,6 +18,6 @@ def create_harnesses_router(*, auth_provider: AuthProvider | None = None) -> API
     @router.get("/harnesses")
     async def list_harnesses(request: Request) -> dict[str, list[dict[str, Any]]]:
         require_user(request, auth_provider)
-        return {"data": harness_catalog()}
+        return {"data": filtered_harness_catalog()}
 
     return router

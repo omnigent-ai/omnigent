@@ -41,6 +41,12 @@ from omnigent.config import (
     load_local_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_plugins import harness_catalog
+from omnigent.harness_visibility import (
+    DISMISSED_HARNESSES_CONFIG_KEY,
+    dismissed_harness_ids,
+    resolve_catalog_harness_id,
+)
 from omnigent.host.local_server import (
     _DEFAULT_LOCAL_PORT,
     _pid_alive,
@@ -1498,6 +1504,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debug",
         "doctor",
         "goose",
+        "harness",
         "hermes",
         "host",
         "import",
@@ -9405,6 +9412,67 @@ def config_unset(is_global: bool, keys: tuple[str, ...]) -> None:
         _save_local_config({}, tuple(validated))
         config_path = Path.cwd() / _LOCAL_CONFIG_RELPATH
     click.echo(f"Unset {len(validated)} key(s) from {config_path}")
+
+
+@cli.group("harness")
+def harness_grp() -> None:
+    """List and configure web UI harness picker visibility."""
+
+
+@harness_grp.command("list")
+def harness_list() -> None:
+    """List harness catalog rows and their web UI visibility status."""
+    rows = harness_catalog()
+    dismissed = dismissed_harness_ids(_load_global_config(), rows)
+    table = Table(title="Harnesses", box=box.SIMPLE)
+    table.add_column("ID")
+    table.add_column("Visibility")
+    table.add_column("Label")
+    for row in rows:
+        harness_id = str(row["id"])
+        status = "dismissed" if harness_id in dismissed else "visible"
+        table.add_row(harness_id, status, str(row.get("label", "")))
+    Console().print(table)
+
+
+def _resolve_visible_harness_or_raise(harness_id: str) -> str:
+    """Resolve a CLI harness id/alias to a web-catalog row id."""
+    resolved = resolve_catalog_harness_id(harness_id, harness_catalog())
+    if resolved is None:
+        raise click.ClickException(
+            f"Unknown harness id {harness_id!r}. Run `omnigent harness list` to see "
+            "harnesses that can be hidden from the web UI picker."
+        )
+    return resolved
+
+
+@harness_grp.command("hide")
+@click.argument("harness_id")
+def harness_hide(harness_id: str) -> None:
+    """Hide a harness id from the web UI harness picker."""
+    resolved = _resolve_visible_harness_or_raise(harness_id)
+    rows = harness_catalog()
+    cfg = _load_global_config()
+    dismissed = set(dismissed_harness_ids(cfg, rows))
+    dismissed.add(resolved)
+    _save_global_config({DISMISSED_HARNESSES_CONFIG_KEY: sorted(dismissed)})
+    click.echo(f"Hidden {resolved} in {_effective_global_config_path()}")
+
+
+@harness_grp.command("unhide")
+@click.argument("harness_id")
+def harness_unhide(harness_id: str) -> None:
+    """Restore a hidden harness id to the web UI harness picker."""
+    resolved = _resolve_visible_harness_or_raise(harness_id)
+    rows = harness_catalog()
+    cfg = _load_global_config()
+    dismissed = set(dismissed_harness_ids(cfg, rows))
+    dismissed.discard(resolved)
+    if dismissed:
+        _save_global_config({DISMISSED_HARNESSES_CONFIG_KEY: sorted(dismissed)})
+    else:
+        _save_global_config({}, unset_keys=(DISMISSED_HARNESSES_CONFIG_KEY,))
+    click.echo(f"Visible {resolved} in {_effective_global_config_path()}")
 
 
 # Node version hint shared by the preflight problem messages and surfaced

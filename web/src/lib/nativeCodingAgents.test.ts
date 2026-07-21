@@ -3,6 +3,7 @@ import {
   UI_MODE_LABEL_KEY,
   UI_MODE_TERMINAL_VALUE,
   WRAPPER_LABEL_KEY,
+  catalogHarnessIdForNativeCodingAgent,
   nativeCodingAgentForHarness,
   nativeWrapperLabelsForAgent,
 } from "./nativeCodingAgents";
@@ -70,6 +71,23 @@ describe("nativeCodingAgentForHarness", () => {
     expect(nativeCodingAgentForHarness("antigravity")).toBeUndefined();
     expect(nativeCodingAgentForHarness(null)).toBeUndefined();
     expect(nativeCodingAgentForHarness(undefined)).toBeUndefined();
+  });
+});
+
+describe("catalogHarnessIdForNativeCodingAgent", () => {
+  it("maps native wrappers to their web-catalog ids", () => {
+    expect(
+      catalogHarnessIdForNativeCodingAgent({ name: "codex-native-ui", harness: "codex-native" }),
+    ).toBe("codex");
+    expect(
+      catalogHarnessIdForNativeCodingAgent({ name: "claude-native-ui", harness: "claude-native" }),
+    ).toBe("claude-sdk");
+  });
+
+  it("does not expose native-only wrappers through the web catalog", () => {
+    expect(
+      catalogHarnessIdForNativeCodingAgent({ name: "goose-native-ui", harness: "goose-native" }),
+    ).toBeUndefined();
   });
 });
 
