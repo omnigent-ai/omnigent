@@ -15,15 +15,12 @@ from tests.e2e_ui.conftest import open_right_rail
 
 
 async def _forward_spawn_activity(base_url: str, session_id: str) -> None:
-    """Drive one native Codex spawn activity through the real server."""
+    """Drive a native Codex spawn and child completion through the server."""
     state = codex_native_forwarder._CodexForwarderState(parent_session_id=session_id)
     tracker = codex_native_forwarder._CodexElicitationTaskTracker()
     async with httpx.AsyncClient(base_url=base_url) as client:
-        await codex_native_forwarder._handle_event(
-            client,
-            session_id=session_id,
-            bridge_dir=Path(),
-            event={
+        events = [
+            {
                 "method": "item/completed",
                 "params": {
                     "threadId": "thread_parent",
@@ -37,11 +34,32 @@ async def _forward_spawn_activity(base_url: str, session_id: str) -> None:
                     },
                 },
             },
-            usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(client, session_id),
-            elicitation_tracker=tracker,
-            expected_thread_id="thread_parent",
-            forwarder_state=state,
-        )
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread_child",
+                    "turn": {"id": "turn_child", "status": "inProgress"},
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread_child",
+                    "turn": {"id": "turn_child", "status": "completed", "items": []},
+                },
+            },
+        ]
+        for event in events:
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id=session_id,
+                bridge_dir=Path(),
+                event=event,
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(client, session_id),
+                elicitation_tracker=tracker,
+                expected_thread_id="thread_parent",
+                forwarder_state=state,
+            )
     await tracker.close()
 
 
@@ -58,6 +76,8 @@ def test_codex_spawn_activity_appears_in_agents_rail(
         f"{base_url}/v1/sessions/{session_id}/child_sessions", timeout=10.0
     ).json()["data"]
     assert [child["session_name"] for child in children] == ["thread_child"]
+    assert children[0]["busy"] is False
+    assert children[0]["current_task_status"] == "completed"
 
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
@@ -66,3 +86,4 @@ def test_codex_spawn_activity_appears_in_agents_rail(
     child_row = rail.locator('[data-testid="subagent-row"]')
     expect(child_row).to_have_count(1, timeout=30_000)
     expect(child_row).to_contain_text("Codex")
+    expect(child_row.get_by_test_id("subagent-status-dot")).to_have_attribute("aria-label", "Done")

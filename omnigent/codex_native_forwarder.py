@@ -4157,6 +4157,8 @@ async def _handle_completed_item(
     )
     # Child-spawn items register sessions; they do not append transcript records
     # and must not go through the dedup gate.
+    # Completed spawns may run on child routes so nested children attach to the
+    # root parent, matching ``collabAgentToolCall`` behavior.
     if item_type == _CODEX_COLLAB_AGENT_ITEM_TYPE:
         if forwarder_state is not None:
             await _handle_collab_item(client, params, item, forwarder_state)
