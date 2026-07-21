@@ -13,6 +13,7 @@ below the minimum-interval floor) is a 400.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -25,6 +26,7 @@ from omnigent.entities import ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -191,9 +193,29 @@ def create_scheduled_tasks_router(
             reasoning_effort=reasoning_effort,
         )
         if workspace is None:
-            # No pinned workspace: nothing to validate against a host here — the
-            # fire path defaults it to the launch host's HOME. (host_id set or
-            # not; a bare host with no workspace is allowed.)
+            # No pinned workspace: the fire path defaults it to the launch host's
+            # HOME, so there is nothing to validate against the host boundary
+            # here (a bare host with no workspace is allowed). But a PINNED host
+            # must still be authorized at create — existence + ownership — even
+            # without a workspace, so a non-owned / nonexistent host reference
+            # fails fast with a clean 4xx instead of persisting and only
+            # surfacing as a failed run at fire time. This is a LOCAL store read
+            # (no host.stat / workspace RPC), via the same resolve_host_owner the
+            # workspace-present branch below uses inside
+            # validate_existing_host_workspace — and whose semantics
+            # fire.py:_authorize_pinned_host mirrors — so create-time and
+            # fire-time host authorization cannot drift. When user_id is None
+            # (single-user / auth disabled) resolve_host_owner skips the owner
+            # check, matching the fire path and the rest of the server.
+            if host_id is not None:
+                host_store = getattr(request.app.state, "host_store", None)
+                if host_store is not None:
+                    await asyncio.to_thread(
+                        resolve_host_owner,
+                        user_id=user_id,
+                        host_id=host_id,
+                        host_store=host_store,
+                    )
             return None, validated_model, validated_effort
         if host_id is None:
             raise OmnigentError(
