@@ -87,10 +87,11 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list(self) -> list[ScheduledTask]:
+    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
         """
         List all scheduled tasks ordered by ``created_at ASC, id ASC``.
 
+        :param owner_user_id: When given, return only tasks owned by this user.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
@@ -199,12 +200,13 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_runs(self, scheduled_task_id: str) -> list[ScheduledTaskRun]:
+    def list_runs(self, scheduled_task_id: str, *, limit: int = 100) -> list[ScheduledTaskRun]:
         """
         List runs for a task ordered by ``scheduled_at DESC, id DESC``
         (most recent first).
 
         :param scheduled_task_id: The task whose runs to return.
+        :param limit: Maximum number of runs to return. Defaults to 100.
         :returns: List of :class:`ScheduledTaskRun` instances.
         """
         ...

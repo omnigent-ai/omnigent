@@ -157,14 +157,19 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             return _to_entity(row)
 
-    def list(self) -> list[ScheduledTask]:
-        """List all scheduled tasks ordered by ``created_at ASC, id ASC``."""
+    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+        """List all scheduled tasks ordered by ``created_at ASC, id ASC``.
+
+        When *owner_user_id* is given, only tasks owned by that user are returned.
+        """
         with self._session() as session:
             stmt = (
                 select(SqlScheduledTask)
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
                 .order_by(asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id))
             )
+            if owner_user_id is not None:
+                stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
@@ -191,6 +196,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     asc(SqlScheduledTask.created_at),
                     asc(SqlScheduledTask.id),
                 )
+                .limit(10_000)
             )
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
@@ -314,7 +320,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _run_to_entity(row)
 
-    def list_runs(self, scheduled_task_id: str) -> list[ScheduledTaskRun]:
+    def list_runs(self, scheduled_task_id: str, *, limit: int = 100) -> list[ScheduledTaskRun]:
         """List a task's runs ordered by ``scheduled_at DESC, id DESC``."""
         with self._session() as session:
             stmt = (
@@ -322,6 +328,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
                 .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
                 .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
+                .limit(limit)
             )
             rows = session.execute(stmt).scalars().all()
             return [_run_to_entity(r) for r in rows]

@@ -316,7 +316,7 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list() if t.user_id == owner_id]
+        tasks = store.list(owner_user_id=owner_id)
         running = store.list_running_runs_for_tasks([t.id for t in tasks])
         force_fail_stale_runs(store, running)
         return {"scheduled_tasks": [_to_response(t) for t in tasks]}
