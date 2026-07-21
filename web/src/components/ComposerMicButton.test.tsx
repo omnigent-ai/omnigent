@@ -187,11 +187,14 @@ describe("ComposerMicButton", () => {
 /** ServerInfo with dictation on; the other capabilities are irrelevant here. */
 const DICTATION_INFO: ServerInfo = {
   accounts_enabled: false,
+  single_user: false,
   login_url: null,
   needs_setup: false,
   databricks_features: false,
   managed_sandboxes_enabled: false,
   sandbox_provider: null,
+  sharing_mode: "on",
+  public_sharing_enabled: true,
   server_version: "test",
   smart_routing_enabled: false,
   dictation_available: true,
