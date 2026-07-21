@@ -185,6 +185,56 @@ def test_codex_auth_unavailable_reason_provider_override_available(
     assert codex_native._codex_auth_unavailable_reason() is None
 
 
+def test_codex_auth_unavailable_reason_custom_provider_env_key_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A populated custom-provider ``env_key`` works without auth.json."""
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    auth_path.parent.mkdir(parents=True)
+    auth_path.with_name("config.toml").write_text(
+        """
+model_provider = "aigateway"
+
+[model_providers.aigateway]
+name = "AI Gateway"
+base_url = "https://coder.example.com/api/v2/aibridge/openai/v1"
+env_key = "OPENAI_CODER_AIGATEWAY_SESSION_TOKEN"
+wire_api = "responses"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_CODER_AIGATEWAY_SESSION_TOKEN", "session-token")
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
+@pytest.mark.parametrize("credential", [None, "", "   "])
+def test_codex_auth_unavailable_reason_custom_provider_env_key_missing_needs_auth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, credential: str | None
+) -> None:
+    """A missing or empty custom-provider variable still reports needs-auth."""
+    auth_path = tmp_path / "codex-home" / "auth.json"  # never created
+    _point_codex_auth_check_at(monkeypatch, auth_path, binary_present=True)
+    auth_path.parent.mkdir(parents=True)
+    auth_path.with_name("config.toml").write_text(
+        """
+model_provider = "aigateway"
+
+[model_providers.aigateway]
+base_url = "https://coder.example.com/openai/v1"
+env_key = "OPENAI_CODER_AIGATEWAY_SESSION_TOKEN"
+""",
+        encoding="utf-8",
+    )
+    if credential is None:
+        monkeypatch.delenv("OPENAI_CODER_AIGATEWAY_SESSION_TOKEN", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_CODER_AIGATEWAY_SESSION_TOKEN", credential)
+
+    assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
+
+
 def test_codex_auth_unavailable_reason_resolver_failure_falls_back_to_auth_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

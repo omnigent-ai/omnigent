@@ -231,6 +231,22 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     if routes_through_provider:
         return None
     source = _resolve_codex_auth_source()
+    # An env-key-only custom provider stays in the bridged config.toml rather
+    # than becoming a launch override, so the resolver above legitimately
+    # looks like the built-in OpenAI path. Check the declared key against the
+    # same scrubbed environment Codex receives before falling back to
+    # auth.json. This avoids both the false ``needs-auth`` report and a false
+    # green for variables that the executor would filter out.
+    from omnigent.inner.codex_executor import _clean_codex_env
+    from omnigent.onboarding.ambient import codex_config_custom_provider_env_key
+
+    provider_env_key = codex_config_custom_provider_env_key(
+        source.auth_path.with_name("config.toml")
+    )
+    if provider_env_key is not None:
+        provider_credential = _clean_codex_env().get(provider_env_key)
+        if isinstance(provider_credential, str) and provider_credential.strip():
+            return None
     if not _codex_auth_json_has_available_credential(source.auth_path):
         return HARNESS_NEEDS_AUTH
     return None

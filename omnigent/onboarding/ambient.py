@@ -317,6 +317,55 @@ def _effective_codex_model_provider(config: dict[str, object]) -> str | None:
     return None
 
 
+def _read_codex_config(config_path: Path) -> dict[str, object] | None:
+    """Read a Codex ``config.toml`` without surfacing local config errors.
+
+    :param config_path: Path to the Codex ``config.toml`` to inspect.
+    :returns: The parsed config mapping, or ``None`` when the file is missing,
+        unreadable, malformed, or not a TOML table.
+    """
+    try:
+        raw = config_path.read_bytes()
+    except OSError:
+        return None
+    try:
+        config = tomllib.loads(raw.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def codex_config_custom_provider_env_key(config_path: Path) -> str | None:
+    """Return the effective custom provider's declared ``env_key``.
+
+    Codex can authenticate a custom ``model_provider`` from an environment
+    variable named by its provider table. This helper identifies that variable
+    without reading or returning its value, so callers can check the exact
+    environment they will pass to Codex.
+
+    :param config_path: Path to the Codex ``config.toml`` to inspect.
+    :returns: The non-empty ``env_key`` name, or ``None`` when the config is
+        absent/malformed, selects a built-in or undefined provider, requires
+        OpenAI login, or does not declare an ``env_key``.
+    """
+    config = _read_codex_config(config_path)
+    if config is None:
+        return None
+    provider_id = _effective_codex_model_provider(config)
+    if provider_id is None or provider_id in _CODEX_BUILTIN_PROVIDERS:
+        return None
+    providers = config.get("model_providers")
+    if not isinstance(providers, dict):
+        return None
+    table = providers.get(provider_id)
+    if not isinstance(table, dict) or table.get("requires_openai_auth") is True:
+        return None
+    env_key = table.get("env_key")
+    if not isinstance(env_key, str) or not env_key.strip():
+        return None
+    return env_key.strip()
+
+
 def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | None:
     """Detect a custom, auth-carrying default model provider in a Codex config.
 
@@ -347,15 +396,8 @@ def codex_config_custom_provider(config_path: Path) -> CodexConfigProvider | Non
         malformed, the effective provider is built-in or unset, its table
         is absent, or the table carries no self-contained auth.
     """
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        # Missing or unreadable file — nothing configured.
-        return None
-    try:
-        config = tomllib.loads(raw.decode("utf-8"))
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
-        # Malformed TOML — treat as not configured rather than crash setup.
+    config = _read_codex_config(config_path)
+    if config is None:
         return None
 
     provider_id = _effective_codex_model_provider(config)
