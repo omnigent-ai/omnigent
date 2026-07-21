@@ -442,7 +442,7 @@ def create_hosts_router(
             # Idempotent: already pruned (or never existed). Nothing to
             # leak, nothing to delete.
             return Response(status_code=204)
-        if user_id is not None and host.owner != user_id:
+        if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
         if host.sandbox_provider is not None:
             raise HTTPException(
