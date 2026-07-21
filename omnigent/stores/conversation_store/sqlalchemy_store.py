@@ -3216,7 +3216,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all()
 
-            fts_rows = []
+            fts_rows: list[tuple[str, str, str]] = []
             for pos, src_item in enumerate(source_items):
                 # src_item.type/status are int codes copied verbatim to the new
                 # row; only generate_item_id needs the decoded string type.
