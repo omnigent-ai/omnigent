@@ -97,6 +97,9 @@ class ScheduledTaskRun:
     :param error_code: Short failure classification (e.g. ``"timeout"``,
         ``"rate_limited"``) for future retry logic; ``None`` unless
         ``status == "failed"``.
+    :param workspace_id: Tenant partition key that owns this row. Carried on
+        the entity so a cross-workspace listing (the run reconciler's sweep)
+        can re-enter each run's ``workspace_scope`` before acting on it.
     """
 
     id: str
@@ -108,3 +111,4 @@ class ScheduledTaskRun:
     finished_at: int | None = None
     error: str | None = None
     error_code: str | None = None
+    workspace_id: int = 0

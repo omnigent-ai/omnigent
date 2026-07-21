@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from omnigent.entities import ScheduledTask
+from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -110,6 +110,24 @@ def _to_response(task: ScheduledTask) -> dict[str, Any]:
         "last_run_at": task.last_run_at,
         "last_run_conversation_id": task.last_run_conversation_id,
         "updated_at": task.updated_at,
+    }
+
+
+def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
+    """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
+
+    Excludes the free-text ``error`` blob (never SQL-queried, potentially
+    large); ``error_code`` carries the queryable failure classification.
+    """
+    return {
+        "id": run.id,
+        "scheduled_task_id": run.scheduled_task_id,
+        "status": run.status,
+        "scheduled_at": run.scheduled_at,
+        "conversation_id": run.conversation_id,
+        "fired_at": run.fired_at,
+        "finished_at": run.finished_at,
+        "error_code": run.error_code,
     }
 
 
@@ -300,6 +318,24 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
         return _to_response(task)
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}/runs")
+    async def list_scheduled_task_runs(
+        request: Request,
+        scheduled_task_id: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """List the run history for one of the caller's scheduled tasks.
+
+        Owner-scoped: a task owned by someone else (or absent) 404s via
+        ``_require_owned``, so runs aren't enumerable across users. Runs come
+        back most-recent-first (``scheduled_at DESC``); an empty history is an
+        empty list.
+        """
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        _require_owned(scheduled_task_id, owner_id)
+        runs = store.list_runs(scheduled_task_id)
+        return {"runs": [_run_to_response(r) for r in runs]}
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(

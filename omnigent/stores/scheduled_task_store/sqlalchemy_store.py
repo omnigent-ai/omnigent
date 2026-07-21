@@ -80,6 +80,7 @@ def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
         finished_at=row.finished_at,
         error=row.error,
         error_code=row.error_code,
+        workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
     )
 
 
@@ -322,6 +323,48 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
                 .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
                 .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_run_to_entity(r) for r in rows]
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """Transition a still-``running`` run to a terminal status.
+
+        Conditional on the current status being ``running`` so an
+        already-terminal run is never clobbered and concurrent sweeps cannot
+        double-transition (see the interface docstring).
+        """
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            if row is None or row.status != running_code:
+                return None
+            row.status = encode_scheduled_task_run_status(status)
+            row.finished_at = finished_at
+            row.error = error
+            row.error_code = error_code
+            session.flush()
+            return _run_to_entity(row)
+
+    def list_runs_by_status_all_workspaces(self, status: str) -> list[ScheduledTaskRun]:
+        """List every run in ``status`` across all workspaces (reconciler sweep)."""
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.status == encode_scheduled_task_run_status(status))
+                .order_by(
+                    asc(SqlScheduledTaskRun.workspace_id),
+                    asc(SqlScheduledTaskRun.scheduled_at),
+                    asc(SqlScheduledTaskRun.id),
+                )
             )
             rows = session.execute(stmt).scalars().all()
             return [_run_to_entity(r) for r in rows]

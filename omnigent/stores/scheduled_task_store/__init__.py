@@ -208,3 +208,52 @@ class ScheduledTaskStore(ABC):
         :returns: List of :class:`ScheduledTaskRun` instances.
         """
         ...
+
+    @abstractmethod
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """
+        Transition a still-``running`` run to a terminal status.
+
+        Idempotent and conditional: the update only applies to a run whose
+        current status is ``running`` (guarded by ``WHERE status = running``),
+        so a run already advanced to a terminal state (a fire-time
+        ``skipped``/``failed``, or a prior reconciliation) is never clobbered
+        and two concurrent sweeps cannot double-transition it.
+
+        :param run_id: The run to transition.
+        :param status: The terminal status to set — ``succeeded`` or
+            ``failed``.
+        :param finished_at: Unix epoch seconds the run reached the terminal
+            state.
+        :param error: Optional failure detail (only for ``failed``).
+        :param error_code: Optional short failure classification (only for
+            ``failed``), e.g. ``"incomplete"``.
+        :returns: The updated :class:`ScheduledTaskRun` if a ``running`` run
+            was transitioned; ``None`` if no matching ``running`` run existed
+            (not found, or already terminal).
+        """
+        ...
+
+    @abstractmethod
+    def list_runs_by_status_all_workspaces(self, status: str) -> list[ScheduledTaskRun]:
+        """
+        List every run in ``status`` across all workspaces.
+
+        Used by the run reconciler at sweep time to find ``running`` runs to
+        reconcile against their conversations. Mirrors
+        :meth:`ScheduledTaskStore.list_active_all_workspaces` — the caller
+        re-enters each run's ``workspace_scope`` before acting on it.
+
+        :param status: The run status to filter on, e.g. ``"running"``.
+        :returns: Matching :class:`ScheduledTaskRun` instances, ordered by
+            ``workspace_id ASC, scheduled_at ASC, id ASC``.
+        """
+        ...

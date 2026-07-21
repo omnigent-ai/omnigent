@@ -502,3 +502,115 @@ async def test_scheduler_synced_on_create_and_delete(
 
     await auth_client.delete(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
     assert scheduler.job_count == before
+
+
+# ── GET /v1/scheduled-tasks/{id}/runs (run history) ──────────────────────────
+
+
+def _seed_run(db_uri: str, task_id: str, run_id: str, **overrides: object) -> None:
+    """Seed a run row directly (the sweep/fire path writes these in prod).
+
+    Tests run at the default workspace (no tenant middleware), matching the
+    route's read scope.
+    """
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    kwargs: dict[str, object] = {
+        "run_id": run_id,
+        "scheduled_task_id": task_id,
+        "status": "succeeded",
+        "scheduled_at": 1000,
+        "conversation_id": "conv_seed",
+        "fired_at": 1001,
+        "finished_at": 1002,
+    }
+    kwargs.update(overrides)
+    store.create_run(**kwargs)  # type: ignore[arg-type]
+
+
+async def test_list_runs_returns_history_for_owned_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """An owned task's run history comes back most-recent-first with run fields."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    import uuid
+
+    older_id = uuid.uuid4().hex
+    newer_id = uuid.uuid4().hex
+    conv_id = uuid.uuid4().hex
+    _seed_run(
+        db_uri, task_id, older_id, scheduled_at=1000, status="succeeded", conversation_id=conv_id
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        newer_id,
+        scheduled_at=2000,
+        status="failed",
+        error_code="incomplete",
+        finished_at=2002,
+        conversation_id=conv_id,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    runs = resp.json()["runs"]
+    assert [r["id"] for r in runs] == [newer_id, older_id]  # scheduled_at DESC
+    newest = runs[0]
+    assert newest["status"] == "failed"
+    assert newest["error_code"] == "incomplete"
+    assert newest["finished_at"] == 2002
+    assert newest["conversation_id"] == conv_id
+    assert newest["scheduled_task_id"] == task_id
+    # The free-text error blob is not exposed on the run list.
+    assert "error" not in newest
+
+
+async def test_list_runs_empty_for_task_with_no_runs(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A task that has never fired returns an empty run list (not a 404)."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["runs"] == []
+
+
+async def test_list_runs_404_for_nonexistent_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Runs for an unknown task id 404 (owner-scoped, not enumerable)."""
+    _make_user(db_uri)
+    resp = await auth_client.get(
+        "/v1/scheduled-tasks/ffffffffffffffffffffffffffffffff/runs", headers=_headers()
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_list_runs_404_for_nonowned_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A task owned by another user 404s its runs (no cross-user enumeration)."""
+    _make_user(db_uri, "alice@example.com")
+    _make_user(db_uri, "bob@example.com")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers("alice@example.com")
+        )
+    ).json()
+    # Bob asks for Alice's task runs → 404.
+    resp = await auth_client.get(
+        f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers("bob@example.com")
+    )
+    assert resp.status_code == 404, resp.text

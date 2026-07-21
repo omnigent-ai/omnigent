@@ -83,6 +83,7 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.scheduled.run_reconciler import ScheduledRunReconciler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1389,6 +1390,7 @@ def create_app(
         # creates + owner-grants a session, launches its runner, and records
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
+        scheduled_run_reconciler: ScheduledRunReconciler | None = None
         if scheduled_task_store is not None:
             from omnigent.server.scheduled.fire import FireDeps, build_on_fire
 
@@ -1424,9 +1426,30 @@ def create_app(
                     exc,
                 )
 
+            # Run-completion backstop: the fire path records a run as
+            # ``running`` and never revisits it, so a periodic reconciler
+            # transitions completed runs to ``succeeded``/``failed`` (and
+            # force-fails stale ones). Also non-critical — a start failure
+            # must not abort boot.
+            scheduled_run_reconciler = ScheduledRunReconciler(
+                scheduled_task_store=scheduled_task_store,
+                conversation_store=conversation_store,
+            )
+            app_inst.state.scheduled_run_reconciler = scheduled_run_reconciler
+            try:
+                await scheduled_run_reconciler.start()
+            except Exception as exc:
+                _logger.exception(
+                    "scheduled run reconciler failed to start; continuing "
+                    "without run-completion tracking (%s)",
+                    exc,
+                )
+
         try:
             yield
         finally:
+            if scheduled_run_reconciler is not None:
+                scheduled_run_reconciler.stop()
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
