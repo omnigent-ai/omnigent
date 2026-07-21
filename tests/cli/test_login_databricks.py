@@ -142,7 +142,14 @@ def _patch_login_env(
     class _Completed:
         returncode: int = 0
 
+    real_run = cli_mod.subprocess.run
+
     def _fake_run(argv: list[str], **kwargs: object) -> _Completed:
+        # Patching ``cli_mod.subprocess`` swaps ``run`` on the module
+        # itself, so background threads land here too. Anything that is
+        # not the databricks CLI goes to the real runner.
+        if Path(argv[0]).name != "databricks":
+            return real_run(argv, **kwargs)
         login_calls.append(" ".join(argv[1:]))  # drop the binary path
         return _Completed()
 
@@ -351,6 +358,41 @@ def test_login_stale_cached_grant_triggers_fresh_login_and_retry(
     # The retry verify presented the freshly minted token, not the stale one.
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
     assert load_databricks_workspace_host(_APPS_URL) == _WORKSPACE
+
+
+def test_foreign_subprocess_calls_stay_out_of_the_login_recorder(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """Only the databricks CLI reaches ``login_calls``; the rest pass through.
+
+    ``_patch_login_env`` swaps ``run`` on the ``subprocess`` module itself,
+    so every thread in the process sees the stub. A background caller
+    landing mid-test would otherwise append its argv to the recorder and
+    break the login assertions.
+    """
+    fake = _FakeHttpx(
+        responses=[
+            _response(302, headers={"location": _APPS_REDIRECT}),
+            _response(200, body={"user_id": "alice@example.com"}),
+        ]
+    )
+    login_calls = _patch_login_env(
+        monkeypatch,
+        fake_httpx=fake,
+        # No cached grant, so the flow shells out to `databricks auth login`.
+        cached_tokens=[None, "tok-fresh"],
+    )
+
+    # Stands in for a background thread shelling out mid-login.
+    probe = cli_mod.subprocess.run(["git", "--version"], capture_output=True)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+
+    assert result.exit_code == 0, result.output
+    assert login_calls == [f"auth login --host {_WORKSPACE}"]
+    # Delegated to the real runner rather than stubbed out from under it.
+    assert probe.returncode == 0
+    assert b"git version" in probe.stdout
 
 
 # ── ?o= workspace selector ──────────────────────────────────────────

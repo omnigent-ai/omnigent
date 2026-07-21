@@ -859,6 +859,7 @@ def test_untracked_cache_config_written_once_per_root(tmp_path: Path, monkeypatc
 def test_untracked_cache_start_runs_once_in_daemon_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    untracked_cache_start: None,
 ) -> None:
     """Registry startup launches one non-blocking optimization worker."""
     registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
@@ -876,6 +877,29 @@ def test_untracked_cache_start_runs_once_in_daemon_thread(
 
     assert completed.wait(timeout=1)
     assert daemon_values == [True]
+
+
+def test_untracked_cache_start_is_stubbed_for_unrelated_tests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The suite-wide guard keeps the optimization worker from firing.
+
+    The worker shells out to git at an arbitrary later moment. Landing
+    inside a test that has swapped the process-global ``subprocess.run``,
+    its argv is recorded as if the test had made the call. Tests that want
+    the real worker request the ``untracked_cache_start`` fixture.
+    """
+    registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    started = threading.Event()
+    monkeypatch.setattr(registry, "_enable_untracked_cache", started.set)
+
+    registry.start()
+
+    assert not started.wait(timeout=0.25), (
+        "The untracked-cache worker ran in a test that did not opt in; "
+        "it can corrupt any test that patches subprocess.run."
+    )
 
 
 def test_untracked_cache_already_enabled_skips_probe(
