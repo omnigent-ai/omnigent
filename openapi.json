@@ -1924,7 +1924,7 @@
         "type": "object"
       },
       "MCPServerSummary": {
-        "description": "Safe subset of an MCP server's configuration for API exposure.\n\nSecret-bearing fields (`headers`, `env`) are intentionally\nexcluded. This model is the wire shape returned inside\n`AgentObject` so clients can display which MCP servers\nan agent is connected to without leaking credentials.",
+        "description": "Safe subset of an MCP server's configuration for API exposure.\n\nHeader values are redacted (`\"[REDACTED]\"`) so callers can see\nwhich headers are configured without leaking the actual secrets.\n`env` is still fully excluded.",
         "properties": {
           "args": {
             "description": "Command-line arguments for `transport=\"stdio\"` servers, e.g. `[\"mcp-server-github\"]`. Empty list when unset.",
@@ -1957,6 +1957,14 @@
             ],
             "description": "Optional free-text description from the spec, e.g. `\"GitHub MCP server\"`. `None` when unset.",
             "title": "Description"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "HTTP headers for `transport=\"http\"` servers. Values are always `\"[REDACTED]\"`; only the key names are exposed.",
+            "title": "Headers",
+            "type": "object"
           },
           "name": {
             "description": "Server name as declared in the agent spec, e.g. `\"github\"`.",
@@ -6188,7 +6196,7 @@
         "type": "object"
       },
       "UpsertMCPServerRequest": {
-        "description": "Request body for creating or updating a session agent MCP server.\n\nSecret-bearing fields (`headers` and `env`) are intentionally\nnot accepted by the UI route. Existing secrets are preserved when a\nserver is edited without changing transport.",
+        "description": "Request body for creating or updating a session agent MCP server.\n\n`env` is still excluded. `headers` is accepted for HTTP servers;\nwhen omitted, existing headers in the bundle are preserved unchanged.",
         "properties": {
           "args": {
             "items": {
@@ -6220,6 +6228,20 @@
               }
             ],
             "title": "Description"
+          },
+          "headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headers"
           },
           "name": {
             "maxLength": 128,
