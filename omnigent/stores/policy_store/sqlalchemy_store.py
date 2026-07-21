@@ -89,6 +89,10 @@ class SqlAlchemyPolicyStore(PolicyStore):
         """Insert a new session-scoped policy.
 
         Raises ``IntegrityError`` on ``(session_id, name)`` collision.
+        Session-name uniqueness is enforced here in the application
+        layer (the table carries no unique constraint) so names are
+        unique within a session while different sessions may reuse a
+        name.
         """
         row = SqlPolicy(
             id=policy_id,
@@ -103,6 +107,22 @@ class SqlAlchemyPolicyStore(PolicyStore):
             enabled=enabled,
         )
         with self._session() as session:
+            existing = (
+                session.execute(
+                    select(SqlPolicy)
+                    .where(SqlPolicy.workspace_id == current_workspace_id())
+                    .where(SqlPolicy.session_id == session_id)
+                    .where(SqlPolicy.name_cksum == policy_name_cksum(name))
+                )
+                .scalars()
+                .first()
+            )
+            if existing is not None:
+                raise IntegrityError(
+                    "Duplicate session policy name",
+                    params={"name": name},
+                    orig=Exception(f"UNIQUE constraint: name={name!r}"),
+                )
             session.add(row)
             session.flush()
             return _to_entity(row)
@@ -116,11 +136,20 @@ class SqlAlchemyPolicyStore(PolicyStore):
             return _to_entity(row)
 
     def list_for_session(self, session_id: str) -> list[Policy]:
-        """List policies for a session ordered by ``created_at ASC``."""
+        """List policies for a session ordered by ``created_at ASC``.
+
+        Filters on ``scope='session'`` in addition to ``session_id`` —
+        redundant for correctness (a real ``session_id`` never matches a
+        default, which has ``session_id IS NULL``) but required so the
+        query can seek ``ix_policies_scope_session`` (scope leads
+        session_id in that key). Without it the planner falls back to a
+        full workspace scan.
+        """
         with self._session() as session:
             stmt = (
                 select(SqlPolicy)
                 .where(SqlPolicy.workspace_id == current_workspace_id())
+                .where(SqlPolicy.scope == encode_policy_scope("session"))
                 .where(SqlPolicy.session_id == session_id)
                 .order_by(asc(SqlPolicy.created_at), asc(SqlPolicy.id))
             )
@@ -146,6 +175,26 @@ class SqlAlchemyPolicyStore(PolicyStore):
                 return None
             changed = False
             if name is not None and row.name != name:
+                # Session-name uniqueness is enforced here in the application
+                # layer (no unique constraint on the table), so this check is
+                # the guard, not just a nicer error.
+                conflict = (
+                    session.execute(
+                        select(SqlPolicy)
+                        .where(SqlPolicy.workspace_id == current_workspace_id())
+                        .where(SqlPolicy.session_id == session_id)
+                        .where(SqlPolicy.name_cksum == policy_name_cksum(name))
+                        .where(SqlPolicy.id != policy_id)
+                    )
+                    .scalars()
+                    .first()
+                )
+                if conflict is not None:
+                    raise IntegrityError(
+                        "Duplicate session policy name",
+                        params={"name": name},
+                        orig=Exception(f"UNIQUE constraint: name={name!r}"),
+                    )
                 row.name = name
                 # Column defaults don't fire on UPDATE — recompute the digest.
                 row.name_cksum = policy_name_cksum(name)
@@ -186,10 +235,8 @@ class SqlAlchemyPolicyStore(PolicyStore):
 
         Raises ``IntegrityError`` on name collision among defaults.
 
-        SQLite treats NULLs as distinct in composite unique
-        constraints, so the ``(session_id, name_cksum)`` constraint
-        does not enforce uniqueness among default policies.
-        This method checks for duplicates explicitly (by name digest).
+        The table carries no unique constraint, so default-name
+        uniqueness is enforced here explicitly (by name digest).
         """
 
         row = SqlPolicy(
@@ -206,9 +253,8 @@ class SqlAlchemyPolicyStore(PolicyStore):
             created_by=created_by,
         )
         with self._session() as session:
-            # Explicit uniqueness check: SQLite treats NULLs as
-            # distinct in composite unique constraints, so
-            # (NULL, name) won't collide with another (NULL, name).
+            # Default-name uniqueness is enforced here (no DB constraint):
+            # scan for an existing default with the same name digest.
             existing = (
                 session.execute(
                     select(SqlPolicy)

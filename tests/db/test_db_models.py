@@ -788,12 +788,22 @@ class TestSqlPolicy:
             assert loaded.enabled is True
             assert loaded.session_id is None
 
-    def test_unique_constraint_session_name(self, db_uri: str) -> None:
-        """Two policies in the same session cannot share the same name."""
-        engine = get_or_create_engine(db_uri)
-        managed = make_managed_session_maker(engine)
+    def test_session_name_uniqueness_not_db_enforced(self, db_uri: str) -> None:
+        """Session-name uniqueness lives in the store, not a DB constraint.
 
-        conv = _make_conversation()
+        The ``(session_id, name_cksum)`` unique key was dropped
+        (migration d4c1b9e6f3a2), so the raw table accepts two session
+        policies that share a name. ``SqlAlchemyPolicyStore.create`` is
+        the guard (see ``tests/stores/test_session_policy_store.py``).
+        """
+        import sqlalchemy as sa
+
+        engine = get_or_create_engine(db_uri)
+
+        uniques = {u["name"] for u in sa.inspect(engine).get_unique_constraints("policies")}
+        assert "uq_policies_session_id_name_cksum" not in uniques
+
+        managed = make_managed_session_maker(engine)
         p1 = SqlPolicy(
             id="12a6858438cb1aa1b9e00dc79bb04dd9",
             name="guard",
@@ -812,11 +822,18 @@ class TestSqlPolicy:
             type=encode_policy_type("python"),
             handler="mod:fn2",
         )
-        with pytest.raises(IntegrityError):
-            with managed() as session:
-                session.add(conv)
-                session.add(p1)
-                session.add(p2)
+        # No IntegrityError: the DB permits the duplicate now.
+        with managed() as session:
+            session.add(p1)
+            session.add(p2)
+
+        with managed() as session:
+            rows = (
+                session.execute(sa.select(SqlPolicy).where(SqlPolicy.name == "guard"))
+                .scalars()
+                .all()
+            )
+            assert len(rows) == 2
 
 
 # ── SqlHost ───────────────────────────────────────────
