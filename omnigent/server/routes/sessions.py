@@ -21681,6 +21681,7 @@ def create_sessions_router(
                         transport=srv.transport,
                         description=srv.description,
                         url=srv.url,
+                        headers=dict.fromkeys(srv.headers, "[REDACTED]") if srv.headers else {},
                         command=srv.command,
                         args=srv.args,
                     )
