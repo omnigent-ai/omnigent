@@ -32,9 +32,10 @@ import logging
 from typing import Any
 
 try:
-    from cel_expr_python import cel as _cel
+    import celpy
+    import celpy.celtypes
 except ImportError:
-    _cel = None  # type: ignore[assignment]
+    celpy = None  # type: ignore[assignment]
 
 from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
 
@@ -69,57 +70,49 @@ def cel_policy(
         :class:`PolicyCallable` contract.
     :raises ValueError: If the expression has CEL syntax errors.
     """
-    if _cel is None:
+    if celpy is None:
         raise ImportError(
-            "cel-expr-python is required for CEL policies but is not installed. "
-            "Install it with: pip install cel-expr-python"
+            "cel-python is required for CEL policies but is not installed. "
+            "Install it with: pip install cel-python"
         )
 
-    env = _cel.NewEnv(variables={"event": _cel.Type.DYN})
+    env = celpy.Environment()
     try:
-        compiled = env.compile(expression)
-    except RuntimeError as exc:
-        # cel-expr-python raises bare RuntimeError for all compile
-        # failures (syntax errors, undeclared references, etc.) — it
-        # does not expose a more specific exception type.
+        ast = env.compile(expression)
+    except celpy.CELParseError as exc:
         _log.warning("CEL compile error: %s", exc)
         raise ValueError(f"CEL policy: compile error in expression: {exc}") from exc
 
+    prog = env.program(ast)
+    _result_key = celpy.celtypes.StringType("result")
+    _reason_key = celpy.celtypes.StringType("reason")
+
     def evaluate(event: PolicyEvent) -> PolicyResponse | None:
-        """
-        Evaluate the CEL expression against a policy event.
-
-        The expression must return a map with a ``result`` key
-        (``"ALLOW"``, ``"DENY"``, or ``"ASK"``). An optional
-        ``"reason"`` key overrides the factory default. Any
-        other return shape (including bool) abstains.
-
-        :param event: The policy event dict.
-        :returns: A :class:`PolicyResponse` dict, or ``None``
-            to abstain.
-        """
-        result = compiled.eval(data={"event": dict(event)})
-
-        # Eval errors (missing field, type mismatch) → abstain.
-        if result.type() == _cel.Type.ERROR:
+        # llm_client is a live object used by Python policy callables;
+        # CEL expressions cannot call methods on it and json_to_cel would
+        # raise ValueError trying to convert it.
+        cel_event = {k: v for k, v in event.items() if k != "llm_client"}
+        try:
+            result = prog.evaluate({"event": celpy.json_to_cel(cel_event)})
+        except (celpy.CELEvalError, ValueError, TypeError):
             _log.debug(
                 "CEL policy eval error on event type %r, abstaining",
                 event.get("type"),
             )
             return None
 
-        raw = result.value()
-        if not isinstance(raw, dict):
+        if not isinstance(result, celpy.celtypes.MapType):
             return None
 
-        response: dict[str, str] = {k: v.plain_value() for k, v in raw.items()}
-        verdict = response.get("result", "").upper()
+        if _result_key not in result:
+            return None
+        verdict = str(result[_result_key]).upper()
         if verdict not in ("DENY", "ASK", "ALLOW"):
             return None
 
         out: PolicyResponse = {"result": verdict}  # type: ignore[typeddict-item]
-        if "reason" in response:
-            out["reason"] = response["reason"]
+        if _reason_key in result:
+            out["reason"] = str(result[_reason_key])
         elif verdict != "ALLOW":
             out["reason"] = reason
         return out
@@ -131,7 +124,7 @@ def cel_policy(
 
 POLICY_REGISTRY: list[dict[str, Any]] = (
     []
-    if _cel is None
+    if celpy is None
     else [
         {
             "handler": "omnigent.policies.builtins.cel.cel_policy",

@@ -4180,16 +4180,13 @@ export function handleSessionEvent(event: StreamEvent): void {
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
       useChatStore.setState((s) => {
-        if (
-          event.status === "idle" &&
-          event.responseId === undefined &&
-          s.activeResponse?.state === "streaming"
-        ) {
-          // A denied queued input publishes running→idle while the prior
-          // response is still streaming. That idle must not clear the
-          // prior turn's working signal; response_end owns that lifecycle.
-          return {};
-        }
+        // `sessionStatus` tracks the server's session-level status 1:1 — a
+        // server `idle` means the session is idle, full stop, and the
+        // "Working…" indicator (which reads only `sessionStatus`) turns off.
+        // There is exactly one idle heuristic and it lives server-side (the
+        // runner's PTY-activity watcher); the client must not second-guess it.
+        // The bubble lifecycle below (`status`/`activeResponse`) still defers
+        // to response_end, but that is separate from the session-level status.
         const patch: Partial<ChatState> = { sessionStatus: event.status };
         // The background-shell tally is STICKY. Only the Stop-hook-derived
         // status carries an authoritative count (the forwarder relabels its

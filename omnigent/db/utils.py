@@ -793,6 +793,26 @@ def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
         )
 
 
+def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> None:
+    """
+    Remove all FTS rows for a list of conversations in a single query.
+
+    No-op when ``conv_ids`` is empty or the dialect lacks FTS5.
+
+    :param session: An active SQLAlchemy session.
+    :param conv_ids: Conversation IDs whose FTS rows should be removed.
+    """
+    if not conv_ids:
+        return
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        placeholders = ", ".join(f":cid{i}" for i in range(len(conv_ids)))
+        params = {f"cid{i}": cid for i, cid in enumerate(conv_ids)}
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id IN ({placeholders})"),
+            params,
+        )
+
+
 # ── Search text extraction ─────────────────────────────
 
 
