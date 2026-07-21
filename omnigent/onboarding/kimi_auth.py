@@ -16,7 +16,7 @@ def kimi_credential_dirs(home: Path | None = None) -> tuple[Path, ...]:
     default_home = Path.home()
     paths = [default_home / ".kimi" / "credentials", default_home / ".kimi-code" / "credentials"]
     if configured_home:
-        paths.insert(0, Path(configured_home) / "credentials")
+        paths.insert(0, Path(configured_home).expanduser() / "credentials")
     return tuple(dict.fromkeys(paths))
 
 

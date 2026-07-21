@@ -12504,7 +12504,7 @@ def _run_configure_harnesses_interactive() -> None:
         # logged-in installation is not incorrectly reported as unconfigured.
         if harness_cli_installed(KIMI_KEY):
             if kimi_login_detected():
-                rows.append((_KIMI, "Kimi Code", "Ready", "ok", "Kimi login detected."))
+                rows.append((_KIMI, "Kimi Code", "Ready", "ready", "Kimi login detected."))
             else:
                 rows.append(
                     (_KIMI, "Kimi Code", "Not configured", "warn", "Sign in with `kimi login`.")
