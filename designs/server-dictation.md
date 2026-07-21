@@ -40,30 +40,50 @@ to it whenever Web Speech is unavailable.
 
 ### Engine — `omnigent/server/dictation.py`
 
-A small engine layer isolates sherpa-onnx behind a protocol so tests (and a
-future alternate backend, e.g. an OpenAI-compatible transcription API) don't
-need the native dependency:
+A small engine layer isolates the recognizer behind a protocol so tests
+(and alternate backends, e.g. Whisper or an OpenAI-compatible
+transcription API) don't need the native dependency:
 
 ```python
 class DictationStreamHandle(Protocol):
-    def accept_pcm16(self, data: bytes) -> None: ...   # 16 kHz mono s16le
-    def decode(self) -> DictationUpdate | None: ...    # drain pending audio
-    def finish(self) -> str: ...                       # flush tail, final text
+    def feed_pcm16(self, data: bytes) -> DictationUpdate: ...  # decode a chunk
+    def finish(self) -> str: ...                              # flush tail, final text
+    def close(self) -> None: ...                              # release (client vanished)
 
 @dataclass(frozen=True)
 class DictationUpdate:
-    partial: str          # current in-progress utterance (revisable)
+    partial: str          # current in-progress utterance, display-ready (revisable)
     finalized: str | None # utterance completed by endpointing, if any
 ```
 
-`SherpaDictationEngine` implements it with a process-wide
+Emitted text is **display-ready** — an engine that needs punctuation/casing
+applies it internally before returning, so the route and protocol stay
+engine-agnostic. Most modern models (Whisper, Parakeet) punctuate
+themselves; sherpa is the exception (see below).
+
+**Engine registry.** Engines are registered by name and selected via
+`OMNIGENT_DICTATION_ENGINE`:
+
+```python
+register_engine("sherpa", lambda: SherpaDictationEngine(...), available=_sherpa_available)
+register_engine("fake", FakeDictationEngine)
+```
+
+Adding an engine (Whisper, Parakeet, a hosted API) is one `register_engine`
+call with a factory and an optional availability probe — no edits to
+`get_engine` or `engine_availability`. Third-party engines register
+themselves on import. The default (unset env var) is `sherpa`.
+
+`SherpaDictationEngine` implements the protocol with a process-wide
 `OnlineRecognizer` (streaming transducer: `encoder/decoder/joiner + tokens`)
 shared across connections — the ~650 MB weights load once — plus one
 recognizer *stream* per WebSocket. Endpointing folds completed utterances
 into `finalized` and resets the stream, exactly the loop proven in pi-voice.
 An optional `OnlinePunctuation` model re-punctuates partials/finals
 (lowercase + strip punctuation before re-adding, throttled) so the live
-preview reads like a sentence.
+preview reads like a sentence. This punctuation is **internal** to the
+sherpa engine — the raw transducer emits lowercase, unpunctuated text, so
+the streams beautify before returning; it is not part of the protocol.
 
 Decode calls are CPU-bound → they run via `asyncio.to_thread`, serialized by
 a per-engine `threading.Lock` (sherpa recognizer streams are not documented
@@ -77,7 +97,7 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 | `OMNIGENT_DICTATION_MODEL_DIR` | `~/.omnigent/models/dictation/asr` | dir containing `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`, `tokens.txt` |
 | `OMNIGENT_DICTATION_PUNCT_DIR` | `~/.omnigent/models/dictation/punct` | optional online-punctuation model dir (`model*.onnx` + `bpe.vocab`) |
 | `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
-| `OMNIGENT_DICTATION_REMOTE_URL` | unset | relay takes to a dictation worker at this `ws://` URL; local models (if any) become the fallback |
+| `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name; `fake` for tests |
 
 `scripts/fetch-dictation-models.sh` downloads a known-good pair (streaming
 Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
@@ -112,31 +132,11 @@ recognizer output is emitted as-is), and the mic button's `lang` prop only
 affects the Web Speech path — the server path's language is decided by the
 operator's model choice.
 
-### Remote worker
-
-When the main server's CPU can't run the model you want, point
-`OMNIGENT_DICTATION_REMOTE_URL` at a **dictation worker** on a beefier
-LAN box — either another omnigent server or the standalone single-route
-process:
-
-```
-pip install omnigent[dictation] && scripts/fetch-dictation-models.sh
-python -m omnigent.server.dictation_worker --host 0.0.0.0 --port 8100
-```
-
-`RemoteDictationEngine` relays each take over the same wire protocol the
-browser speaks (PCM frames up, transcript events down), so the worker
-needed no new protocol or code path — it is `create_dictation_router`
-served standalone. The browser never talks to the worker; the main
-server authenticates the user on its own route, then relays. The worker
-itself is unauthenticated — bind it to a trusted network only.
-
-Fallback: if local models are also installed on the main server, they
-back the worker up. The fallback engine is built lazily on the first
-take that finds the worker unreachable (so its weights cost no RAM in
-normal operation), and each new take retries the worker first. Example:
-an N95 main server relaying to a workstation running Nemotron 0.6 B,
-falling back to its own mid-size zipformer when the workstation sleeps.
+Where a mini-PC server can't run the model an operator wants at realtime, a
+follow-up adds a **remote worker**: a `RemoteDictationEngine` (registered as
+`OMNIGENT_DICTATION_ENGINE=remote`) that relays takes over this same wire
+protocol to a beefier LAN box. It slots into the registry without changing
+the route or the protocol, so it ships separately from this core PR.
 
 ### Routes — `omnigent/server/routes/dictation.py`
 

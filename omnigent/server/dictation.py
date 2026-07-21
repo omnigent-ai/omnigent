@@ -9,19 +9,21 @@ operator's infrastructure. See ``designs/server-dictation.md``.
 Engine selection
 ----------------
 
-:func:`engine_availability` / :func:`get_engine` resolve the engine from
-``OMNIGENT_DICTATION_ENGINE`` / ``OMNIGENT_DICTATION_REMOTE_URL``:
+Engines are looked up by name in a small registry
+(:func:`register_engine`), selected via ``OMNIGENT_DICTATION_ENGINE``:
 
-- default — the sherpa-onnx engine. Requires the ``dictation`` extra
-  (``pip install omnigent[dictation]``) and a streaming transducer
+- unset (default) — the sherpa-onnx engine. Requires the ``dictation``
+  extra (``pip install omnigent[dictation]``) and a streaming transducer
   model on disk; both are checked lazily so the base install carries no
   new dependencies.
-- ``OMNIGENT_DICTATION_REMOTE_URL`` set — :class:`RemoteDictationEngine`
-  relays takes to a dictation worker on another machine, with the local
-  sherpa engine (when models are installed) as a lazy fallback.
-- ``OMNIGENT_DICTATION_ENGINE=fake`` — a deterministic scripted engine
-  used by tests and the Playwright e2e suite; no native dependency, no
-  models, no microphone.
+- ``sherpa`` — the same engine, named explicitly.
+- ``fake`` — a deterministic scripted engine used by tests and the
+  Playwright e2e suite; no native dependency, no models, no microphone.
+
+Adding an engine (e.g. Whisper) is one :func:`register_engine` call with
+a factory and an availability probe — no edits to :func:`get_engine` or
+:func:`engine_availability`. Third-party engines register themselves on
+import.
 
 sherpa-onnx engine
 ------------------
@@ -33,7 +35,10 @@ the model weights load once; each WebSocket gets its own recognizer
 ``DictationUpdate.finalized`` and resets the stream. An optional online
 punctuation model re-punctuates emitted text (the raw transducer output
 is lowercased and stripped of punctuation first — the model wants clean
-input) so live partials read like sentences.
+input) so live partials read like sentences. The recognizer returns
+display-ready text directly; punctuation is an internal detail, not part
+of the engine protocol (most models — Whisper, Parakeet — punctuate
+themselves).
 
 Recognizer calls are CPU-bound and sherpa streams are not documented
 thread-safe, so every recognizer/punctuation call holds the engine's
@@ -60,14 +65,11 @@ the default locations.
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
-import json
 import logging
 import os
 import re
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,14 +81,12 @@ ENGINE_ENV = "OMNIGENT_DICTATION_ENGINE"
 MODEL_DIR_ENV = "OMNIGENT_DICTATION_MODEL_DIR"
 PUNCT_DIR_ENV = "OMNIGENT_DICTATION_PUNCT_DIR"
 MAX_STREAMS_ENV = "OMNIGENT_DICTATION_MAX_STREAMS"
-#: When set (``ws://host:port/v1/dictation/stream``), takes are relayed to
-#: that dictation worker — another omnigent server or the standalone
-#: ``python -m omnigent.server.dictation_worker`` — so a small main server
-#: can borrow a beefier box's CPU for recognition. If local models are
-#: also installed, they serve as the fallback when the worker is down.
-REMOTE_URL_ENV = "OMNIGENT_DICTATION_REMOTE_URL"
 
+#: Built-in engine names. The default (empty ``OMNIGENT_DICTATION_ENGINE``)
+#: resolves to the sherpa engine.
+ENGINE_SHERPA = "sherpa"
 ENGINE_FAKE = "fake"
+_DEFAULT_ENGINE = ENGINE_SHERPA
 
 #: The one PCM format the stream route accepts: 16 kHz mono s16le.
 SAMPLE_RATE = 16000
@@ -95,10 +95,7 @@ _BYTES_PER_SECOND = SAMPLE_RATE * 2
 #: Stable machine-readable unavailability reasons.
 REASON_EXTRA_NOT_INSTALLED = "extra_not_installed"
 REASON_MODELS_MISSING = "models_missing"
-
-#: Worker handshake budget: covers a cold model load on the worker side.
-_REMOTE_READY_TIMEOUT_S = 30.0
-_REMOTE_STOP_TIMEOUT_S = 10.0
+REASON_UNKNOWN_ENGINE = "unknown_engine"
 
 DEFAULT_MAX_STREAMS = 2
 
@@ -116,11 +113,12 @@ _PUNCT_STRIP_RE = re.compile(r"[.,?!:;…]+")
 class DictationUpdate:
     """Result of feeding one audio chunk to a dictation stream.
 
-    :param partial: The current in-progress utterance. Revisable — later
-        updates may rewrite earlier words as more context arrives.
+    :param partial: The current in-progress utterance, display-ready
+        (punctuated/cased by the engine if it does that). Revisable —
+        later updates may rewrite earlier words as more context arrives.
     :param finalized: An utterance completed by endpoint detection (a
-        pause), if one closed on this chunk. The partial restarts empty
-        after a finalized utterance.
+        pause), if one closed on this chunk, display-ready. The partial
+        restarts empty after a finalized utterance.
     """
 
     partial: str
@@ -131,16 +129,13 @@ class DictationStreamHandle(Protocol):
     """One dictation take: a stateful recognizer stream.
 
     All methods are synchronous and CPU-bound; call them via
-    ``asyncio.to_thread`` from async code.
+    ``asyncio.to_thread`` from async code. Emitted text is display-ready:
+    engines that need punctuation/casing apply it internally before
+    returning (see the sherpa engine), so the route just forwards text.
     """
 
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         """Feed a chunk of 16 kHz mono s16le PCM and decode it."""
-        ...
-
-    def beautify(self, text: str) -> str:
-        """Re-punctuate/case *text* for display. Identity when the
-        engine has no punctuation model."""
         ...
 
     def finish(self) -> str:
@@ -150,9 +145,9 @@ class DictationStreamHandle(Protocol):
     def close(self) -> None:
         """Release the take's resources without flushing (client vanished).
 
-        Idempotent, and safe after :meth:`finish`. Matters most for the
-        remote engine: an unclosed take keeps a worker capacity slot
-        until the worker's ping timeout reaps the socket (~20s).
+        Idempotent, and safe after :meth:`finish`. A no-op for the
+        in-process engines (the stream frees with the handle); the hook
+        exists for engines holding an external resource.
         """
         ...
 
@@ -163,6 +158,48 @@ class DictationEngine(Protocol):
     def create_stream(self) -> DictationStreamHandle:
         """Open a fresh recognizer stream for one connection."""
         ...
+
+
+#: An engine's availability probe: ``() -> (available, reason)`` where
+#: *reason* is ``None`` when available, else a machine-readable
+#: ``REASON_*`` string. Called without loading any model.
+AvailabilityProbe = Callable[[], "tuple[bool, str | None]"]
+EngineFactory = Callable[[], DictationEngine]
+
+
+@dataclass(frozen=True)
+class _EngineEntry:
+    factory: EngineFactory
+    available: AvailabilityProbe
+
+
+_ENGINE_REGISTRY: dict[str, _EngineEntry] = {}
+
+
+def register_engine(
+    name: str,
+    factory: EngineFactory,
+    *,
+    available: AvailabilityProbe | None = None,
+) -> None:
+    """Register a dictation engine under *name*.
+
+    Selected via ``OMNIGENT_DICTATION_ENGINE=<name>``. This is the whole
+    swap-in surface: a new engine (Whisper, Parakeet, …) is one call with
+    a factory and an optional availability probe — no edits to
+    :func:`get_engine` or :func:`engine_availability`.
+
+    :param name: Selector value, e.g. ``"whisper"``.
+    :param factory: Builds the engine on first use (weights load here —
+        keep it lazy).
+    :param available: Probe returning ``(available, reason)`` without
+        loading a model. Defaults to always-available (``(True, None)``)
+        — right for engines with no optional dependency or model on disk.
+    """
+    _ENGINE_REGISTRY[name] = _EngineEntry(
+        factory=factory,
+        available=available or (lambda: (True, None)),
+    )
 
 
 def _asr_dir() -> Path:
@@ -220,34 +257,33 @@ def _punct_files(punct_dir: Path) -> dict[str, Path] | None:
     return {"model": model, "vocab": vocab}
 
 
-def _local_engine_ready() -> bool:
-    """True when the sherpa extra and an ASR model are both installed."""
-    return (
-        importlib.util.find_spec("sherpa_onnx") is not None and _asr_files(_asr_dir()) is not None
-    )
-
-
-def engine_availability() -> tuple[bool, str | None]:
-    """Report whether dictation can serve, without loading any model.
-
-    A configured remote worker counts as available without probing it —
-    the worker may be briefly down or still booting, and the stream
-    route degrades cleanly (local fallback, or an error frame) when a
-    take actually starts.
-
-    :returns: ``(available, reason)`` where *reason* is ``None`` when
-        available, else one of :data:`REASON_EXTRA_NOT_INSTALLED` /
-        :data:`REASON_MODELS_MISSING`.
-    """
-    if os.environ.get(ENGINE_ENV) == ENGINE_FAKE:
-        return True, None
-    if os.environ.get(REMOTE_URL_ENV, "").strip():
-        return True, None
+def _sherpa_available() -> tuple[bool, str | None]:
+    """Availability probe for the sherpa engine (loads nothing)."""
     if importlib.util.find_spec("sherpa_onnx") is None:
         return False, REASON_EXTRA_NOT_INSTALLED
     if _asr_files(_asr_dir()) is None:
         return False, REASON_MODELS_MISSING
     return True, None
+
+
+def _selected_engine_name() -> str:
+    """Resolve the configured engine name (default: sherpa)."""
+    return os.environ.get(ENGINE_ENV, "").strip() or _DEFAULT_ENGINE
+
+
+def engine_availability() -> tuple[bool, str | None]:
+    """Report whether dictation can serve, without loading any model.
+
+    Resolves the configured engine and calls its registered availability
+    probe. Unknown engine names report unavailable.
+
+    :returns: ``(available, reason)`` where *reason* is ``None`` when
+        available, else a machine-readable ``REASON_*`` string.
+    """
+    entry = _ENGINE_REGISTRY.get(_selected_engine_name())
+    if entry is None:
+        return False, REASON_UNKNOWN_ENGINE
+    return entry.available()
 
 
 _engine_lock = threading.Lock()
@@ -257,36 +293,27 @@ _engine: DictationEngine | None = None
 def get_engine() -> DictationEngine:
     """Return the process-wide engine, loading models on first use.
 
-    Config (env vars) is read once, on the first successful load — a
-    failed load caches nothing, so a server that gains models later
-    serves the next take without a restart. Tests never hit this: they
-    inject an engine through the router's ``engine_provider``.
+    The configured engine name is resolved once, on the first successful
+    load — a failed load caches nothing, so a server that gains models
+    later serves the next take without a restart. Tests never hit this:
+    they inject an engine through the router's ``engine_provider``.
 
-    :raises RuntimeError: When dictation is unavailable (check
-        :func:`engine_availability` first) or the model fails to load.
+    :raises RuntimeError: When the configured engine is unknown or
+        unavailable (check :func:`engine_availability` first), or the
+        model fails to load.
     """
     global _engine
     with _engine_lock:
         if _engine is not None:
             return _engine
-        remote_url = os.environ.get(REMOTE_URL_ENV, "").strip()
-        if os.environ.get(ENGINE_ENV) == ENGINE_FAKE:
-            _engine = FakeDictationEngine()
-        elif remote_url:
-            # Local models, when present, back the worker up. The factory
-            # is lazy so the fallback's weights don't cost RAM unless the
-            # worker actually goes down.
-            fallback = (
-                (lambda: SherpaDictationEngine(_asr_dir(), _punct_dir()))
-                if _local_engine_ready()
-                else None
-            )
-            _engine = RemoteDictationEngine(remote_url, fallback_factory=fallback)
-        else:
-            available, reason = engine_availability()
-            if not available:
-                raise RuntimeError(f"dictation unavailable: {reason}")
-            _engine = SherpaDictationEngine(_asr_dir(), _punct_dir())
+        name = _selected_engine_name()
+        entry = _ENGINE_REGISTRY.get(name)
+        if entry is None:
+            raise RuntimeError(f"unknown dictation engine: {name!r}")
+        available, reason = entry.available()
+        if not available:
+            raise RuntimeError(f"dictation unavailable: {reason}")
+        _engine = entry.factory()
         return _engine
 
 
@@ -347,8 +374,13 @@ class SherpaDictationEngine:
         # not documented thread-safe, and decode is CPU-bound anyway.
         self._lock = threading.Lock()
 
-    def beautify(self, text: str) -> str:
-        """Re-punctuate and re-case *text* for display."""
+    def _beautify(self, text: str) -> str:
+        """Re-punctuate and re-case *text* for display.
+
+        Internal: the raw transducer emits lowercase, punctuation-free
+        text, so the streams call this before returning so partials/finals
+        read like sentences. Identity when no punctuation model loaded.
+        """
         if self._punct is None or not text:
             return text
         # The model expects lowercase, punctuation-free input.
@@ -395,11 +427,13 @@ class _SherpaStream:
                     finalized = partial
                 partial = ""
                 recognizer.reset(self._stream)
-        return DictationUpdate(partial=partial, finalized=finalized)
-
-    def beautify(self, text: str) -> str:
-        """Delegate to the engine's punctuation model."""
-        return self._engine.beautify(text)
+        # Punctuate outside the recognizer lock's decode section (beautify
+        # takes the lock itself). Emit display-ready text so the route and
+        # protocol stay engine-agnostic.
+        return DictationUpdate(
+            partial=engine._beautify(partial),
+            finalized=engine._beautify(finalized) if finalized else None,
+        )
 
     def finish(self) -> str:
         """Flush the tail: pad with silence, drain, return final text."""
@@ -415,158 +449,10 @@ class _SherpaStream:
             while recognizer.is_ready(self._stream):
                 recognizer.decode_stream(self._stream)
             tail = recognizer.get_result(self._stream).strip()
-        return self.beautify(tail)
+        return engine._beautify(tail)
 
     def close(self) -> None:
         """No-op: the recognizer stream frees with the handle."""
-
-
-class RemoteDictationEngine:
-    """Relays dictation takes to a remote worker over WebSocket.
-
-    The worker is anything speaking the ``/v1/dictation/stream`` wire
-    protocol — another omnigent server or the standalone
-    ``python -m omnigent.server.dictation_worker``. Lets a small main
-    server (a mini-PC) borrow a beefier LAN box for recognition.
-
-    Fallback happens per take, at stream creation: if the worker is
-    unreachable, the lazily-built local engine (when models are
-    installed) serves the take instead. A worker dying mid-take fails
-    that take; the next one retries the worker.
-    """
-
-    def __init__(
-        self,
-        url: str,
-        *,
-        fallback_factory: Callable[[], DictationEngine] | None = None,
-    ) -> None:
-        """
-        :param url: Worker stream URL, e.g.
-            ``ws://venus:8100/v1/dictation/stream``.
-        :param fallback_factory: Builds the local fallback engine on
-            first use (lazy — its model weights cost ~real RAM), or
-            ``None`` when no local model is installed.
-        """
-        self._url = url
-        self._fallback_factory = fallback_factory
-        self._fallback: DictationEngine | None = None
-        self._fallback_lock = threading.Lock()
-
-    def create_stream(self) -> DictationStreamHandle:
-        """Connect a take to the worker, or to the local fallback."""
-        try:
-            return _RemoteStream(self._url)
-        except Exception:
-            if self._fallback_factory is None:
-                raise
-            _logger.warning(
-                "dictation worker unreachable at %s; using local fallback engine",
-                self._url,
-                exc_info=True,
-            )
-            with self._fallback_lock:
-                if self._fallback is None:
-                    self._fallback = self._fallback_factory()
-            return self._fallback.create_stream()
-
-
-class _RemoteStream:
-    """One relayed take: raw PCM up, transcript events down.
-
-    A daemon reader thread folds the worker's ``partial``/``final``
-    events into state that :meth:`feed_pcm16` returns on each call, so
-    the relay presents the same synchronous handle interface the local
-    engines do. The worker already punctuates, so :meth:`beautify` is
-    identity.
-    """
-
-    def __init__(self, url: str) -> None:
-        from websockets.sync.client import connect
-
-        self._ws = connect(url, open_timeout=5)
-        try:
-            deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
-            while True:
-                message = self._ws.recv(timeout=max(0.1, deadline - time.monotonic()))
-                if not isinstance(message, str):
-                    continue
-                event = json.loads(message)
-                if event.get("type") == "ready":
-                    break
-                if event.get("type") == "error":
-                    raise RuntimeError(f"dictation worker error: {event.get('message')}")
-        except BaseException:
-            self._ws.close()
-            raise
-        self._lock = threading.Lock()
-        self._partial = ""
-        self._finals: list[str] = []
-        self._tail = ""
-        self._dead = False
-        self._stopped = threading.Event()
-        threading.Thread(target=self._read_loop, daemon=True).start()
-
-    def _read_loop(self) -> None:
-        try:
-            while True:
-                message = self._ws.recv()
-                if not isinstance(message, str):
-                    continue
-                try:
-                    event = json.loads(message)
-                except ValueError:
-                    continue
-                kind = event.get("type")
-                with self._lock:
-                    if kind == "partial":
-                        self._partial = str(event.get("text", ""))
-                    elif kind == "final":
-                        self._finals.append(str(event.get("text", "")))
-                        self._partial = ""
-                    elif kind == "stopped":
-                        self._tail = str(event.get("text", ""))
-                        break
-                    elif kind == "error":
-                        self._dead = True
-                        break
-        except Exception:  # noqa: BLE001 - any transport failure kills the take
-            with self._lock:
-                self._dead = True
-        self._stopped.set()
-
-    def feed_pcm16(self, data: bytes) -> DictationUpdate:
-        """Ship a chunk to the worker; return its latest transcript state."""
-        with self._lock:
-            if self._dead:
-                raise RuntimeError("dictation worker connection lost")
-        self._ws.send(data)
-        with self._lock:
-            finalized = " ".join(t for t in self._finals if t).strip() or None
-            self._finals.clear()
-            return DictationUpdate(partial=self._partial, finalized=finalized)
-
-    def beautify(self, text: str) -> str:
-        """Identity — the worker already re-punctuates."""
-        return text
-
-    def finish(self) -> str:
-        """Ask the worker to flush; return its tail utterance."""
-        with contextlib.suppress(Exception):
-            self._ws.send(json.dumps({"type": "stop"}))
-        self._stopped.wait(timeout=_REMOTE_STOP_TIMEOUT_S)
-        self.close()
-        with self._lock:
-            return self._tail
-
-    def close(self) -> None:
-        """Close the worker socket, releasing its capacity slot.
-
-        Also unblocks the reader thread's ``recv``. Idempotent — the
-        sync websockets client tolerates repeated ``close`` calls.
-        """
-        with contextlib.suppress(Exception):
-            self._ws.close()
 
 
 #: Scripted transcript the fake engine reveals; asserted verbatim by the
@@ -615,10 +501,6 @@ class _FakeStream:
             return DictationUpdate(partial="", finalized=" ".join(self._words))
         return DictationUpdate(partial=" ".join(self._words[:revealed]))
 
-    def beautify(self, text: str) -> str:
-        """Identity — the fake has no punctuation model."""
-        return text
-
     def finish(self) -> str:
         """Return the words revealed so far as the tail utterance."""
         if self._done:
@@ -630,3 +512,14 @@ class _FakeStream:
     def close(self) -> None:
         """Record the close so tests can assert take cleanup."""
         self.closed = True
+
+
+# Built-in engines register themselves at import. The sherpa factory is
+# lazy (weights load on first take), so importing this module costs no
+# model RAM.
+register_engine(
+    ENGINE_SHERPA,
+    lambda: SherpaDictationEngine(_asr_dir(), _punct_dir()),
+    available=_sherpa_available,
+)
+register_engine(ENGINE_FAKE, FakeDictationEngine)

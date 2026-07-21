@@ -81,19 +81,6 @@ _WS_CLOSE_INTERNAL_ERROR: Final[int] = 1011
 _PARTIAL_INTERVAL_S: Final[float] = 0.15
 
 
-#: Strong references to in-flight take closes. asyncio keeps only a weak
-#: reference to a running task, so a close scheduled as its request task is
-#: cancelled could otherwise be garbage-collected before it runs.
-_pending_closes: set[asyncio.Task[None]] = set()
-
-
-def _close_finished(task: asyncio.Task[None]) -> None:
-    """Drop the strong ref and surface a failed close instead of warning."""
-    _pending_closes.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        _logger.warning("dictation take failed to close", exc_info=task.exception())
-
-
 def create_dictation_router(
     *,
     auth_provider: AuthProvider | None = None,
@@ -148,29 +135,16 @@ def create_dictation_router(
                     )
                     await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
                 return
-            # The take MUST be closed on every exit — normal stop, abrupt
-            # browser disconnect, or a crash mid-send. An unclosed remote take
-            # holds a worker capacity slot until the worker's own ping timeout
-            # reaps it (~20s), so closing promptly matters under concurrency.
+            # Release the take on every exit — normal stop, abrupt browser
+            # disconnect, or a crash mid-send. For the in-process engines
+            # close() just frees the recognizer stream, so a best-effort
+            # close on the way out is enough.
             try:
                 await websocket.send_text(json.dumps({"type": "ready"}))
                 await _pump_dictation(websocket, handle)
             finally:
-                # Close must survive cancellation. An ASGI server cancels this
-                # task on shutdown, and CancelledError is a BaseException that
-                # contextlib.suppress(Exception) does not catch — so a plain
-                # `await asyncio.to_thread(handle.close)` here races the
-                # cancellation and skips the close about half the time.
-                # Creating the task before the first await point guarantees the
-                # close is scheduled; shield keeps it running while the
-                # cancellation propagates through us. (A vanished browser is
-                # also reaped by the ASGI server's ping timeout, ~20s; this
-                # releases the take promptly and explicitly instead.)
-                closing = asyncio.create_task(asyncio.to_thread(handle.close))
-                _pending_closes.add(closing)  # strong ref: the loop keeps only a weak one
-                closing.add_done_callback(_close_finished)
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(closing)
+                    await asyncio.to_thread(handle.close)
 
     return router
 
@@ -193,8 +167,9 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
             if data is not None:
                 update = await asyncio.to_thread(handle.feed_pcm16, data)
                 if update.finalized:
-                    text = await asyncio.to_thread(handle.beautify, update.finalized)
-                    await websocket.send_text(json.dumps({"type": "final", "text": text}))
+                    await websocket.send_text(
+                        json.dumps({"type": "final", "text": update.finalized})
+                    )
                     last_partial_sent = ""
                     last_partial_at = 0.0
                 now = time.monotonic()
@@ -202,8 +177,9 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
                     update.partial != last_partial_sent
                     and now - last_partial_at >= _PARTIAL_INTERVAL_S
                 ):
-                    text = await asyncio.to_thread(handle.beautify, update.partial)
-                    await websocket.send_text(json.dumps({"type": "partial", "text": text}))
+                    await websocket.send_text(
+                        json.dumps({"type": "partial", "text": update.partial})
+                    )
                     last_partial_sent = update.partial
                     last_partial_at = now
                 continue

@@ -98,6 +98,35 @@ def test_get_engine_is_a_singleton_and_failure_caches_nothing(
     assert dictation.get_engine() is first
 
 
+def test_get_engine_rejects_unknown_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unregistered engine name is unavailable and raises on load."""
+    monkeypatch.setattr(dictation, "_engine", None)
+    monkeypatch.setenv(dictation.ENGINE_ENV, "does-not-exist")
+    assert dictation.engine_availability() == (False, dictation.REASON_UNKNOWN_ENGINE)
+    with pytest.raises(RuntimeError):
+        dictation.get_engine()
+
+
+def test_register_engine_is_selectable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A registered engine is selected by name with no core edits.
+
+    Mirrors what adding Whisper looks like: one register_engine call, then
+    OMNIGENT_DICTATION_ENGINE picks it up.
+    """
+    monkeypatch.setattr(dictation, "_engine", None)
+    monkeypatch.setitem(
+        dictation._ENGINE_REGISTRY,
+        "probe-engine",
+        dictation._EngineEntry(
+            factory=dictation.FakeDictationEngine,
+            available=lambda: (True, None),
+        ),
+    )
+    monkeypatch.setenv(dictation.ENGINE_ENV, "probe-engine")
+    assert dictation.engine_availability() == (True, None)
+    assert isinstance(dictation.get_engine(), dictation.FakeDictationEngine)
+
+
 def test_fake_stream_reveals_script_by_bytes() -> None:
     """One script word per 100 ms of audio; sentence finalizes when done."""
     word = b"\x00" * (dictation.SAMPLE_RATE * 2 // 10)
