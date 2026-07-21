@@ -3,17 +3,15 @@ import { ThemeProvider as NextThemesProvider, useTheme } from "next-themes";
 import { reportColorScheme } from "@/lib/nativeBridge";
 
 /**
- * Mirrors the in-app theme selection onto the Electron shell (nativeTheme), so
- * the shell-owned update overlay, native dialogs, and menus follow the theme
- * switcher rather than only the OS. No-op outside Electron. Renders nothing.
+ * Mirrors the resolved in-app theme onto native shell chrome. Renders nothing.
  */
 function NativeThemeSync() {
-  const { theme } = useTheme();
+  const { resolvedTheme } = useTheme();
   useEffect(() => {
-    if (theme === "light" || theme === "dark" || theme === "system") {
-      reportColorScheme(theme);
+    if (resolvedTheme === "light" || resolvedTheme === "dark") {
+      reportColorScheme(resolvedTheme);
     }
-  }, [theme]);
+  }, [resolvedTheme]);
   return null;
 }
 

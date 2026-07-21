@@ -3,6 +3,7 @@ package ai.omnigent.android
 import android.app.Application
 import android.app.NotificationManager
 import android.content.Context
+import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -24,6 +25,7 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
+    private val appliedSchemes = mutableListOf<String>()
 
     private val badgeId = 1
 
@@ -34,11 +36,30 @@ class OmnigentBridgeListenerTest {
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
+                onColorScheme = appliedSchemes::add,
             )
         shadow =
             shadowOf(
                 context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
             )
+    }
+
+    @Test
+    fun `setColorScheme applies concrete schemes`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"light"}""")
+        listener.handle("""{"method":"setColorScheme","scheme":"dark"}""")
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(listOf("light", "dark"), appliedSchemes)
+    }
+
+    @Test
+    fun `setColorScheme rejects missing and unsupported schemes`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"system"}""")
+        listener.handle("""{"method":"setColorScheme"}""")
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(emptyList<String>(), appliedSchemes)
     }
 
     @Test

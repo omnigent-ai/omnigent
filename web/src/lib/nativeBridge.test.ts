@@ -8,6 +8,7 @@ import {
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
+  reportColorScheme,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   supportsBrowser,
@@ -18,6 +19,7 @@ const electronSetBadge = vi.fn();
 const electronNotify = vi.fn().mockResolvedValue(true);
 const electronUnsubscribe = vi.fn();
 const electronOnNotificationActivated = vi.fn().mockReturnValue(electronUnsubscribe);
+const electronSetColorScheme = vi.fn();
 
 // The iOS WKWebView bridge mock, installed on window.omnigentNative.
 const iosSetBadge = vi.fn();
@@ -36,6 +38,7 @@ const androidSetBadge = vi.fn();
 const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
+const androidSetColorScheme = vi.fn();
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -50,6 +53,7 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
       setBadgeCount: (...args: unknown[]) => electronSetBadge(...args),
+      setColorScheme: (...args: unknown[]) => electronSetColorScheme(...args),
       notify: (...args: unknown[]) => electronNotify(...args),
       ...(withClickRouting
         ? {
@@ -91,6 +95,7 @@ function setAndroid(on: boolean, withClickRouting = true): void {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
       setBadgeCount: (...args: unknown[]) => androidSetBadge(...args),
+      setColorScheme: (...args: unknown[]) => androidSetColorScheme(...args),
       notify: (...args: unknown[]) => androidNotify(...args),
       ...(withClickRouting
         ? {
@@ -194,6 +199,28 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("reportColorScheme", () => {
+  it("keeps the Electron color-scheme path intact", () => {
+    setElectron(true);
+    reportColorScheme("system");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("system");
+  });
+
+  it("routes concrete schemes through the Android bridge", () => {
+    setAndroid(true);
+    reportColorScheme("light");
+    reportColorScheme("dark");
+    expect(androidSetColorScheme).toHaveBeenNthCalledWith(1, "light");
+    expect(androidSetColorScheme).toHaveBeenNthCalledWith(2, "dark");
+  });
+
+  it("does not route an unresolved system scheme to Android", () => {
+    setAndroid(true);
+    reportColorScheme("system");
+    expect(androidSetColorScheme).not.toHaveBeenCalled();
   });
 });
 

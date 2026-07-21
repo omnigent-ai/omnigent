@@ -32,6 +32,7 @@ import androidx.core.view.MenuCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
@@ -303,10 +304,19 @@ class MainActivity : ComponentActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
+                    onColorScheme = ::applyColorScheme,
                 ),
             )
         } catch (_: IllegalArgumentException) {
             // Malformed origin rule — leave the bridge absent; the web layer falls back.
+        }
+    }
+
+    private fun applyColorScheme(scheme: String) {
+        val light = scheme == "light"
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = light
+            isAppearanceLightNavigationBars = light
         }
     }
 

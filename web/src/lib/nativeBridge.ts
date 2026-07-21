@@ -59,6 +59,8 @@ interface NativeShellApi {
    * ignore it.
    */
   setBadgeCount: (count: number, activation?: BadgeActivation) => void;
+  /** Mirror the web app's resolved theme in shell-owned chrome. */
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
   // Optional: a shell older than this SPA may lack notification-click routing,
@@ -143,12 +145,6 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
-  /**
-   * Report the web app's resolved color scheme so the shell mirrors it via
-   * nativeTheme (keeps the shell-owned update overlay, native dialogs, and
-   * menus in sync with the in-app theme). Absent on older shells.
-   */
-  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -467,15 +463,26 @@ export function onNativeSidebarDrag(
  * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
 /**
- * Tell the Electron shell the web app's resolved color scheme so it can mirror
- * it natively (nativeTheme.themeSource). No-op outside Electron or on older
- * shells. Fire-and-forget.
+ * Tell native shell chrome the web app's resolved color scheme. Electron
+ * mirrors it via nativeTheme; Android updates system-bar icon contrast.
+ * No-op outside supported shells. Fire-and-forget.
  */
 export function reportColorScheme(scheme: "light" | "dark" | "system"): void {
-  const native = electronApi();
-  if (!native?.setColorScheme) return;
+  const electron = electronApi();
+  if (electron?.setColorScheme) {
+    try {
+      electron.setColorScheme(scheme);
+    } catch (err) {
+      console.warn("[nativeBridge] setColorScheme failed:", err);
+    }
+    return;
+  }
+
+  if (scheme === "system") return;
+  const android = nativeApi();
+  if (android?.kind !== "android" || !android.setColorScheme) return;
   try {
-    native.setColorScheme(scheme);
+    android.setColorScheme(scheme);
   } catch (err) {
     console.warn("[nativeBridge] setColorScheme failed:", err);
   }

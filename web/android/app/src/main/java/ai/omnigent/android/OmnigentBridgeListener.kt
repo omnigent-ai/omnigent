@@ -1,6 +1,8 @@
 package ai.omnigent.android
 
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.webkit.WebView
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebMessageCompat
@@ -17,13 +19,16 @@ import org.json.JSONObject
  * structural equivalent of the iOS `isMainFrame` + frame-origin check that a
  * raw `addJavascriptInterface` bridge cannot express.
  *
- * Callbacks arrive on the UI thread, so notification calls need no hop; the
- * blob write offloads to [BlobSaver]'s own worker.
+ * Color-scheme updates are posted to the main looper; [BlobSaver] offloads
+ * writes to its own worker.
  */
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
+    private val onColorScheme: (String) -> Unit,
 ) : WebViewCompat.WebMessageListener {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     override fun onPostMessage(
         view: WebView,
         message: WebMessageCompat,
@@ -46,6 +51,12 @@ class OmnigentBridgeListener(
             }
 
         when (json.optString("method")) {
+            "setColorScheme" -> {
+                val scheme = json.optString("scheme")
+                if (scheme != "light" && scheme != "dark") return
+                mainHandler.post { onColorScheme(scheme) }
+            }
+
             "setBadgeCount" -> {
                 notifications.setBadgeCount(
                     count = json.optInt("count", 0),
