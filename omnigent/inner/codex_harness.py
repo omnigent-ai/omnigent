@@ -125,6 +125,7 @@ _ENV_AGENT_NAME = "HARNESS_CODEX_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CODEX_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CODEX_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
+_ENV_WIRE_API = "HARNESS_CODEX_WIRE_API"
 
 # Truthy strings the wrap accepts for boolean env vars. Must
 # match the claude-sdk wrap's parser for consistency — operators
@@ -308,6 +309,7 @@ def _build_codex_executor() -> Executor:
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
         or None,
+        wire_api=os.environ.get(_ENV_WIRE_API) or None,
         retry_policy=_resolve_retry_policy(),
         bundle_dir=bundle_dir,
         agent_name=agent_name,
