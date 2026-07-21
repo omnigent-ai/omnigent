@@ -236,17 +236,25 @@ async def test_create_rejects_relative_workspace(
     assert resp.status_code == 400, resp.text
 
 
-async def test_create_rejects_partial_binding_host_without_workspace(
+async def test_create_pinned_host_without_workspace_persists_null_workspace(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    """A host with no workspace is a broken connected-host binding: the shared
-    ``validate_existing_host_workspace`` requires a workspace when a host is
-    set, so this is a 400 (not a no-workspace task)."""
+    """A pinned host with NO workspace is allowed (e.g. an MCP-only task): the
+    row persists the host and a null workspace, and the connected-host workspace
+    validation is skipped. The fire path defaults the workspace to host HOME."""
     _make_user(db_uri)
     body = _create_body()
     del body["workspace"]
     resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert created["workspace"] is None
+
+    got = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
+    assert got.json()["workspace"] is None
 
 
 async def test_create_rejects_unsupported_public_fields(

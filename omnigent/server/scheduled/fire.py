@@ -399,19 +399,20 @@ async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> Schedu
     """Resolve the host/workspace the fire actually launches against.
 
     A task may omit ``host_id`` (run on the owner's live host, whichever it is)
-    and/or ``workspace`` (a task that does no code work). This returns a copy of
-    *task* with those holes filled for this one fire:
+    and/or ``workspace`` (a task that does no code work — e.g. an MCP-only task).
+    This returns a copy of *task* with those holes filled for this one fire:
 
     * ``host_id`` unset → the owner's most-recently-active ONLINE host. No live
       host (or no host store/registry) raises :class:`_CannotLaunchScheduledFire`
       so the caller records a failed run instead of silently no-oping.
-    * ``workspace`` unset → the host's home directory, canonicalized to an
+    * ``workspace`` unset → the launch host's home directory, canonicalized to an
       absolute realpath via a ``host.stat`` round-trip, so the runner launches
-      with a real cwd and the stored row never holds a literal ``~``.
+      with a real cwd and the stored row never holds a literal ``~``. This HOME
+      default applies whether the host was pinned or resolved above.
 
-    A pinned ``host_id`` is left untouched — its liveness is enforced by the
-    existing preflight, not here. The resolved values are never written back to
-    the stored row; the next fire re-resolves the live host.
+    A pinned ``host_id`` is left untouched — not re-resolved — and its liveness is
+    enforced by the existing preflight, not here. The resolved values are never
+    written back to the stored row; the next fire re-resolves the live host.
     """
     host_id = task.host_id
     if host_id is None:

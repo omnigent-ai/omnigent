@@ -678,6 +678,59 @@ async def test_no_workspace_resolved_host_launches_with_canonical_home(
 
 
 @pytest.mark.asyncio
+async def test_pinned_host_no_workspace_defaults_to_host_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A task that PINS a host but omits the workspace launches on that pinned
+    host with the workspace defaulted to its canonical HOME — the pinned host is
+    NOT re-resolved to some other live host."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                owner_user_id="alice@example.com", host_id="host_pinned", workspace=None
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    async def _fake_resolve(deps: Any, host_id: str) -> str:
+        # Defaulting runs against the PINNED host, not a re-resolved one.
+        assert host_id == "host_pinned"
+        return "/home/alice"
+
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", _fake_resolve)
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore(
+                {
+                    "host_pinned": _FakeHost("host_pinned", "alice@example.com"),
+                    "host_other": _FakeHost("host_other", "alice@example.com"),
+                }
+            ),
+            host_registry=FakeHostRegistry(online={"host_pinned", "host_other"}),
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["host_id"] == "host_pinned"
+    assert conv_store.created[0]["workspace"] == "/home/alice"
+    assert launched[0][1].host_id == "host_pinned"
+    assert launched[0][1].workspace == "/home/alice"
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
 async def test_no_workspace_unresolvable_home_records_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

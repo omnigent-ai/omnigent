@@ -170,14 +170,13 @@ def create_scheduled_tasks_router(
     ) -> tuple[str | None, str | None, str | None]:
         """Validate inputs that scheduled tasks persist into future sessions.
 
-        When BOTH host and workspace are unset (no PINNED host/workspace),
-        connected-host workspace validation is skipped here and the canonical
-        workspace persists as ``None``; the fire path then resolves the owner's
-        live host and defaults the workspace to that host's home directory (and
-        records a failed run if no host is online). Supplying just one of the
-        pair is still an error — :func:`validate_existing_host_workspace`
-        requires a workspace when a host is set, and a host is required when a
-        workspace is set.
+        Workspace is always optional. When it is unset the canonical workspace
+        persists as ``None`` and the fire path defaults it to the launch host's
+        home directory — this holds whether the host was pinned or is resolved
+        from the owner's live hosts at fire time. Only a workspace pinned WITHOUT
+        a host is an error (a path with no machine is meaningless). When both a
+        host and a workspace are supplied, the workspace is validated against the
+        host boundary here so a bad pin fails fast at create.
         """
         user_id = None if owner == RESERVED_USER_LOCAL else owner
         agent = await validate_session_agent(
@@ -191,8 +190,10 @@ def create_scheduled_tasks_router(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
         )
-        if host_id is None and workspace is None:
-            # No-workspace task: nothing to bind, so no connected-host check.
+        if workspace is None:
+            # No pinned workspace: nothing to validate against a host here — the
+            # fire path defaults it to the launch host's HOME. (host_id set or
+            # not; a bare host with no workspace is allowed.)
             return None, validated_model, validated_effort
         if host_id is None:
             raise OmnigentError(
