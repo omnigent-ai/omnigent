@@ -59,7 +59,7 @@ interface NativeShellApi {
    * ignore it.
    */
   setBadgeCount: (count: number, activation?: BadgeActivation) => void;
-  /** Mirror the web app's resolved theme in shell-owned chrome. */
+  /** ThemeProvider sends resolved light/dark; legacy "system" reaches Electron only, never Android. */
   setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
