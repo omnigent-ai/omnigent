@@ -29,6 +29,8 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from omnigent.runner.app import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
 
@@ -40,7 +42,7 @@ _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
-# Re-mint a managed runner's owner JWT this many seconds before it
+# Re-mint a delegated runner's owner JWT this many seconds before it
 # expires, so a live session's HTTP callbacks never present an expired
 # token. Well under the server-side token TTL.
 _MANAGED_MINT_REFRESH_SKEW_S = 300.0
@@ -247,6 +249,7 @@ class _RunnerDatabricksAuth(httpx.Auth):
         if self._factory is None:
             return
         if _is_login_redirect_or_unauthorized(response):
+            _invalidate_auth_token_factory(self._factory)
             token = self._factory()
             if token:
                 request.headers["Authorization"] = f"Bearer {token}"
@@ -271,7 +274,9 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     :returns: ``True`` when the response indicates the request should
         be retried with a fresh token, ``False`` otherwise.
     """
-    if response.status_code == 401:
+    if response.status_code in (401, 403):
+        # Databricks Apps returns 403 "Invalid Token" for an expired bearer
+        # in addition to the 302→/oidc/ bounce; treat both as re-auth signals.
         return True
     if not response.is_redirect:
         return False
@@ -283,15 +288,79 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     return "/oidc/" in location or "/.auth/" in location
 
 
+def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
+    """Invalidate a bootstrap token factory when it supports that operation.
+
+    Ordinary token factories already return a fresh token on each call and
+    expose no invalidation hook. A host-bootstrap factory holds its initial
+    bearer until the server rejects it; invalidating switches the factory to
+    the runner's existing refreshable credential path.
+
+    :param factory: Runner auth token factory.
+    :returns: ``True`` when a bootstrap token was invalidated.
+    """
+    invalidate = getattr(factory, "invalidate", None)
+    if not callable(invalidate):
+        return False
+    return bool(invalidate())
+
+
+class _InitialAuthTokenFactory:
+    """Use a host bearer until rejection, then lazily resolve runner auth."""
+
+    def __init__(self, token: str, server_url: str) -> None:
+        """
+        :param token: Current bearer obtained from the connected host.
+        :param server_url: Omnigent server URL used by the fallback resolver.
+        """
+        self._initial_token: str | None = token
+        self._server_url = server_url
+        self._fallback_factory: Callable[[], str | None] | None = None
+        self._fallback_resolved = False
+        self._lock = threading.Lock()
+
+    def __call__(self) -> str | None:
+        """Return the host bearer or a token from the lazy local fallback."""
+        with self._lock:
+            if self._initial_token is not None:
+                return self._initial_token
+            if not self._fallback_resolved:
+                self._fallback_factory = _make_auth_token_factory(
+                    self._server_url,
+                    _allow_initial_token=False,
+                    _allow_delegated_mint=False,
+                )
+                self._fallback_resolved = True
+            if self._fallback_factory is None:
+                return None
+            return self._fallback_factory()
+
+    def invalidate(self) -> bool:
+        """Discard the host bearer so the next call resolves local auth."""
+        with self._lock:
+            if self._initial_token is None:
+                return False
+            self._initial_token = None
+            _logger.info("host bootstrap bearer rejected; resolving runner-local auth")
+            return True
+
+
 def _make_auth_token_factory(
     server_url: str | None = None,
+    *,
+    _allow_initial_token: bool = True,
+    _allow_delegated_mint: bool = True,
 ) -> Callable[[], str | None] | None:
     """Build a callable that mints fresh auth tokens.
 
     Resolution order:
-      1. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
+      1. Host's current bearer, when injected for runner bootstrap. This is
+         used until rejection; local refreshable auth resolves lazily.
+      2. Host-delegated runner token, when the host launch marker and
+         binding token are present.
+      3. Stored OIDC token from ``~/.omnigent/auth_tokens.json``
          (populated by ``omnigent login``), keyed by ``server_url``.
-      2. Databricks OAuth token (refreshed via the SDK) — host-keyed
+      4. Databricks OAuth token (refreshed via the SDK) — host-keyed
          when a Databricks Apps pointer record is stored for
          ``server_url`` (``omnigent login <apps-url>``), ambient
          otherwise.
@@ -316,13 +385,40 @@ def _make_auth_token_factory(
     :returns: A sync callable returning a bearer token string, or
         ``None`` when no refresh mechanism is available.
     """
+    resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+
+    # Consume the host bearer before any credential discovery. Removing it
+    # from os.environ here ensures later harness/terminal children cannot
+    # inherit it even if a spawn path bypasses the standard secret scrubber.
+    from omnigent.runner.identity import (
+        RUNNER_DELEGATED_AUTH_ENV_VAR,
+        RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    )
+
+    initial_token = (
+        os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "").strip()
+        if _allow_initial_token
+        else ""
+    )
+    if initial_token and resolved_server_url:
+        _logger.info("using host-provided bearer for runner bootstrap")
+        return _InitialAuthTokenFactory(initial_token, resolved_server_url)
+
     from omnigent.inner.databricks_executor import (
         DatabricksAuthError,
         _DatabricksBearerAuth,
         _resolve_databricks_auth,
     )
 
-    resolved_server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
+    # Prefer the host-launched runner's owner-bound capability so user
+    # credentials stay out of the runner and credential discovery is skipped.
+    delegated_auth = os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() == "1"
+    binding_token = os.environ.get(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "").strip()
+    if _allow_delegated_mint and delegated_auth and resolved_server_url and binding_token:
+        delegated_factory = _make_managed_mint_factory(resolved_server_url, binding_token)
+        if delegated_factory is not None:
+            return delegated_factory
 
     # Reused Databricks SDK auth, resolved once on first use and cached
     # here for the life of the factory. Reusing one Config is the whole
@@ -407,7 +503,7 @@ def _make_auth_token_factory(
     # tunnel bearer) with a short-lived owner JWT the server mints against
     # that binding token — refreshed on demand, so there is no static
     # credential at rest and no fixed session-length cap.
-    if resolved_server_url:
+    if _allow_delegated_mint and resolved_server_url:
         try:
             binding_token = _runner_tunnel_binding_token_from_env()
         except RuntimeError:
@@ -441,14 +537,15 @@ def _make_managed_mint_factory(
         only credential), presented to the mint endpoint.
     :returns: A sync callable returning a fresh owner JWT, or ``None`` only
         when the server *definitively* will not mint for this runner (HTTP
-        400 no-auth/header mode, or 404 older server without the endpoint) —
-        the runner then sends unauthenticated requests, as it did before this
-        fallback existed. A *transient* probe failure still installs the
-        factory, which re-mints on the next callback (so a blip at boot does
-        not leave the runner unauthenticated until process restart). If such
-        a post-install mint then gets the definitive 400/404, the factory
-        latches ``declined`` and returns ``None`` thereafter, and
-        :class:`_RunnerDatabricksAuth` falls back to bare requests.
+        400 no-auth/header mode, 404 older server without the endpoint, or a
+        Databricks Apps OAuth redirect before the request reaches the app) —
+        the runner then uses the legacy credential path. A *transient* probe
+        failure still installs the factory, which re-mints on the next
+        callback (so a blip at boot does not leave the runner unauthenticated
+        until process restart). If such a post-install mint then gets a
+        definitive refusal, the factory latches ``declined`` and returns
+        ``None`` thereafter, and :class:`_RunnerDatabricksAuth` falls back to
+        bare requests.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -457,12 +554,12 @@ def _make_managed_mint_factory(
 
     # Construction probe. Decline to install the factory ONLY when the
     # server definitively will not mint for this runner — HTTP 400 (no auth
-    # provider / header mode) or 404 (an older server without the endpoint).
-    # There the runner falls back to bare requests, which are correct on a
-    # no-auth server. Every other outcome installs the factory: a success
-    # seeds the cache; a transient failure (network blip, 5xx, timeout)
-    # installs it anyway so the next callback re-mints, rather than leaving
-    # the runner unauthenticated until process restart.
+    # provider / header mode), 404 (an older server without the endpoint), or
+    # an Apps OAuth redirect that happens before the request reaches Omnigent.
+    # Every other outcome installs the factory: a success seeds the cache; a
+    # transient failure (network blip, 5xx, timeout) installs it anyway so the
+    # next callback re-mints, rather than leaving the runner unauthenticated
+    # until process restart.
     factory = _ManagedMintTokenFactory(mint_url, server_url, binding_token)
     factory()
     if factory.declined:
@@ -475,7 +572,8 @@ class _ManagedMintTokenFactory:
 
     Each call returns the cached JWT until it nears expiry, then re-mints
     via :func:`_mint_managed_owner_token`. When a mint gets a *definitive*
-    refusal (HTTP 400 no-auth/header mode, 404 older server), the
+    refusal (HTTP 400 no-auth/header mode, 404 older server, or an Apps OAuth
+    redirect), the
     :attr:`declined` latch is set and every subsequent call returns
     ``None`` without touching the network —
     :meth:`_RunnerDatabricksAuth.auth_flow` reads the latch to send bare
@@ -517,7 +615,10 @@ class _ManagedMintTokenFactory:
                 self._mint_url, self._server_url, self._binding_token
             )
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (400, 404):
+            response = exc.response
+            if response.status_code in (400, 404) or (
+                response.is_redirect and _is_login_redirect_or_unauthorized(response)
+            ):
                 self.declined = True
                 return None
             return self._still_valid_cached_token(now)
@@ -710,6 +811,15 @@ def _run_parent_death_killer(
         return
     request_shutdown()
     time.sleep(grace_s)
+    # The hard exit is a backstop reached only when graceful shutdown did not
+    # finish within the grace window; record it since os._exit skips the
+    # exit-reason logging in _run_tunnel_from_env's finally block. The file
+    # handler flushes per record, so this lands even though os._exit follows.
+    _logger.warning(
+        "runner exiting: parent process died and graceful shutdown did not "
+        "complete within %.1fs; forcing hard exit",
+        grace_s,
+    )
     # os._exit skips buffer flushing, so flush logs first for diagnosability.
     with contextlib.suppress(Exception):
         sys.stderr.flush()
@@ -849,12 +959,10 @@ def create_app(
 ) -> FastAPI:
     """Factory for the runner FastAPI app exposing the harness-contract subset.
 
-    :param auth_token_factory: Pre-built Databricks token factory to reuse for
-        the server httpx client's auth, e.g. the one ``_run_tunnel_from_env``
-        already built for the WS tunnel header. When ``None``, the app builds
-        its own. Reusing the caller's factory shares one resolved SDK auth (and
-        its in-memory token cache) instead of resolving Databricks credentials
-        a second time during runner boot.
+    :param auth_token_factory: Pre-built server bearer factory to reuse for the
+        HTTP client and native terminal helpers, e.g. the delegated factory
+        ``_run_tunnel_from_env`` already built for the WS tunnel. When ``None``,
+        the app builds its own.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.cli_auth import databricks_request_headers
@@ -1004,6 +1112,7 @@ def create_app(
         per_session_workspace=isolate_session,
         mcp_manager=mcp_manager,
         auth_token=runner_auth_token,
+        auth_token_factory=auth_token_factory,
     )
 
     async def _start_pm() -> None:
@@ -1129,10 +1238,29 @@ async def _run_tunnel_from_env() -> None:
             return False
         return bool(callback())
 
+    # Human-readable reason for why the runner is shutting down, recorded
+    # by whichever path wins the shutdown race and logged on the way out so
+    # the runner log explains the exit instead of just stopping.
+    exit_reason: str | None = None
+
+    def _record_exit_reason(reason: str) -> None:
+        """Record the first observed shutdown reason.
+
+        :param reason: Human-readable cause, e.g. ``"received SIGTERM"``.
+        :returns: None.
+        """
+        nonlocal exit_reason
+        if exit_reason is None:
+            exit_reason = reason
+
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
-    _install_signal_handlers(stop_event, adopted_event=adopted_event)
+    _install_signal_handlers(
+        stop_event,
+        adopted_event=adopted_event,
+        record_reason=_record_exit_reason,
+    )
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1150,16 +1278,37 @@ async def _run_tunnel_from_env() -> None:
     stop_task = asyncio.create_task(stop_event.wait(), name="runner-signal-wait")
     idle_task: asyncio.Task[None] | None = None
     if idle_timeout_s > 0:
+
+        def _request_idle_shutdown() -> None:
+            """Attribute the exit to the idle watchdog, then stop.
+
+            :returns: None.
+            """
+            _record_exit_reason("idle timeout reached")
+            stop_event.set()
+
         idle_task = asyncio.create_task(
             _run_inactivity_monitor(
                 idle_timeout_s=idle_timeout_s,
                 get_last_activity=_last_activity,
                 has_active_work=_has_active_work,
-                request_shutdown=stop_event.set,
+                request_shutdown=_request_idle_shutdown,
             ),
             name=f"runner-idle-monitor:{runner_id}",
         )
     if parent_pid is not None:
+
+        def _request_parent_death_shutdown() -> None:
+            """Attribute the exit to parent death, then stop on the loop.
+
+            Invoked from the parent-death daemon thread, so the reason is
+            recorded and the stop event set via the event loop.
+
+            :returns: None.
+            """
+            _record_exit_reason("parent process died")
+            loop.call_soon_threadsafe(stop_event.set)
+
         # Orphan guard runs on a dedicated daemon thread, not the event
         # loop: if the loop wedges during shutdown (harness mid-boot when
         # the host dies), an event-loop watchdog could never fire. The
@@ -1167,7 +1316,7 @@ async def _run_tunnel_from_env() -> None:
         # as a backstop. See _run_parent_death_killer.
         threading.Thread(
             target=_run_parent_death_killer,
-            args=(parent_pid, lambda: loop.call_soon_threadsafe(stop_event.set)),
+            args=(parent_pid, _request_parent_death_shutdown),
             kwargs={"adopted": adopted_event},
             name=f"runner-parent-killer:{parent_pid}",
             daemon=True,
@@ -1181,8 +1330,16 @@ async def _run_tunnel_from_env() -> None:
             return_when=asyncio.FIRST_COMPLETED,
         )
         if tunnel_task in done:
+            # The tunnel returning first means the WS connection ended on its
+            # own rather than a signal/idle/parent-death shutdown request.
+            _record_exit_reason("websocket tunnel closed")
             await tunnel_task
     finally:
+        # Log why the runner is stopping so the runner log explains the exit.
+        # A crash unwinding through here is attributed by sys.excepthook with
+        # its traceback, so only record the reason for an orderly shutdown.
+        if sys.exc_info()[0] is None:
+            _logger.info("runner exiting: %s", exit_reason or "shutdown requested")
         for task in wait_tasks:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1198,6 +1355,7 @@ async def _run_tunnel_from_env() -> None:
 def _install_signal_handlers(
     stop_event: asyncio.Event,
     adopted_event: threading.Event | None = None,
+    record_reason: Callable[[str], None] | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -1206,12 +1364,26 @@ def _install_signal_handlers(
         :data:`RUNNER_ADOPT_SIGNAL` arrives, telling the parent-death
         killer to stand down so the runner survives an intentional CLI
         exit (tmux detach). ``None`` skips the handler.
+    :param record_reason: Optional callback given the signal name when a
+        shutdown signal arrives, so the exit log line can attribute the
+        cause. ``None`` skips attribution.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
+
+    def _handle_shutdown_signal(sig: int) -> None:
+        """Record the triggering signal and request graceful shutdown.
+
+        :param sig: The delivered signal number, e.g. ``signal.SIGTERM``.
+        :returns: None.
+        """
+        if record_reason is not None:
+            record_reason(f"received {signal.Signals(sig).name}")
+        stop_event.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, stop_event.set)
+            loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
     if adopted_event is not None:
         from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
 
@@ -1221,23 +1393,67 @@ def _install_signal_handlers(
             loop.add_signal_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
 
 
+def _install_crash_logging() -> None:
+    """Log the exit reason for otherwise-silent runner crashes.
+
+    Chains a ``sys.excepthook`` that records any uncaught exception (the
+    "randomly dying" case) to the runner log before the interpreter
+    prints its traceback and exits. Signals, idle timeout, and tunnel
+    drops are attributed at their own sites; this covers the crashes that
+    would otherwise leave only a bare traceback on stderr.
+
+    Note: neither this hook nor ``atexit`` fires on ``os._exit`` (the
+    parent-death backstop, which logs its own reason) or on ``SIGKILL``.
+    Idempotent: a second call is a no-op so repeated installs never stack.
+
+    :returns: None.
+    """
+    previous_hook = sys.excepthook
+    if getattr(previous_hook, "_omnigent_runner_crash_hook", False):
+        return
+
+    def _log_uncaught(
+        exc_type: type[BaseException],
+        exc: BaseException,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Record an uncaught exception, then defer to the prior hook.
+
+        :param exc_type: The exception class, e.g. ``RuntimeError``.
+        :param exc: The exception instance.
+        :param traceback: The associated traceback object.
+        :returns: None.
+        """
+        with contextlib.suppress(Exception):
+            _logger.critical(
+                "runner exiting: uncaught %s: %s",
+                exc_type.__name__,
+                exc,
+                exc_info=(exc_type, exc, traceback),
+            )
+        previous_hook(exc_type, exc, traceback)
+
+    _log_uncaught._omnigent_runner_crash_hook = True  # type: ignore[attr-defined]
+    sys.excepthook = _log_uncaught
+
+
 def main() -> None:
     """Console entry point for the runner tunnel process.
 
     :returns: None.
     """
-    log_level = os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        stream=sys.stderr,
-    )
+    from omnigent.process_logging import configure_process_logging
+
+    configure_process_logging("runner", force=True)
+    _install_crash_logging()
     try:
         asyncio.run(_run_tunnel_from_env())
     except RuntimeError as exc:
         if not str(exc).startswith(RUNNER_TUNNEL_REJECTION_PREFIX):
             raise
+        # A fatal server rejection is an expected, actionable exit — log the
+        # reason but keep stderr to the concise message (no traceback).
+        _logger.error("runner exiting: %s", exc)
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from None
 

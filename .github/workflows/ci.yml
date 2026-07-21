@@ -12,11 +12,14 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
   push:
     branches:
       - main
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+      # Release branches: release.yml's green-CI gate reads check runs off the
+      # branch head, so cherry-picks and release-bump commits must run CI.
+      - 'release/v[0-9]*'
+    paths-ignore: ['web/**', 'tests/e2e_ui/**', 'CHANGELOG.md']
 
 permissions:
   contents: read

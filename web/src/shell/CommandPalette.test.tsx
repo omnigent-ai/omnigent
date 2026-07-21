@@ -14,12 +14,23 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
 }));
 
-function conv(id: string, title: string | null, agent_name: string | null = null) {
-  return { id, title, agent_name, archived: false };
+function conv(
+  id: string,
+  title: string | null,
+  agent_name: string | null = null,
+  search_snippet: string | null = null,
+) {
+  return { id, title, agent_name, archived: false, search_snippet };
 }
 
 function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
+}
+
+/** Find a session row by its full label text even when the highlighter has
+    split it around a <mark> (so the text lives across several nodes). */
+function labelRow(text: string) {
+  return screen.getByText((_content, el) => el?.tagName === "SPAN" && el.textContent === text);
 }
 
 function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>> = {}) {
@@ -69,21 +80,22 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      // Empty query on mount → shares AppShell's `["conversations","",false]` entry.
-      expect(useConversations).toHaveBeenCalledWith("", false);
+      // Empty query on mount → shares AppShell's `["conversations","",true]` entry.
+      expect(useConversations).toHaveBeenCalledWith("", true);
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
       });
       // Before the debounce elapses the query has NOT yet reached the hook.
-      expect(useConversations).not.toHaveBeenCalledWith("deploy", false);
+      expect(useConversations).not.toHaveBeenCalledWith("deploy", true);
 
       act(() => {
         vi.advanceTimersByTime(300);
       });
       // After the 300ms debounce, the typed query drives a server search with
-      // archived excluded — proving the palette searches the server, not a page.
-      expect(useConversations).toHaveBeenCalledWith("deploy", false);
+      // archived rows included (filtered client-side) — proving the palette
+      // searches the server, not a page.
+      expect(useConversations).toHaveBeenCalledWith("deploy", true);
     } finally {
       vi.useRealTimers();
     }
@@ -119,8 +131,10 @@ describe("CommandPalette — sessions", () => {
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      expect(screen.getByText("Session 5")).toBeTruthy();
-      expect(screen.getByText("Session 7")).toBeTruthy();
+      // The label is now split around the highlighted query term
+      // (`<mark>Session</mark> 5`), so match on the row's combined text.
+      expect(labelRow("Session 5")).toBeTruthy();
+      expect(labelRow("Session 7")).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }
@@ -148,6 +162,50 @@ describe("CommandPalette — sessions", () => {
     // silently regress.
     const item = screen.getByText("Fix the parser").closest("[data-slot=command-item]");
     expect(item?.className).toContain("pl-6");
+  });
+});
+
+describe("CommandPalette — match preview", () => {
+  // Drive a debounced query through so the palette highlights against it.
+  function search(term: string) {
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: term } });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+  }
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("shows the content snippet as a second line when the match is in the body", () => {
+    setSessions([conv("c1", "Hello", "cursor", "…can you fix the what if I switch…")]);
+    renderPalette();
+    search("what");
+
+    // The title stays as the primary line; the snippet shows where it matched.
+    expect(screen.getByText("Hello")).toBeTruthy();
+    expect(screen.getByText(/can you fix the/)).toBeTruthy();
+  });
+
+  it("highlights the query term in both the title and the snippet", () => {
+    setSessions([conv("c1", "what model", "cursor", "Hello what model are you using?")]);
+    renderPalette();
+    search("what");
+
+    // Every occurrence of the query renders inside a <mark> (title + snippet).
+    const marks = document.querySelectorAll("mark");
+    expect(marks.length).toBeGreaterThanOrEqual(2);
+    for (const m of marks) expect(m.textContent?.toLowerCase()).toBe("what");
+  });
+
+  it("omits the snippet line for a title-only match (no search_snippet)", () => {
+    setSessions([conv("c1", "deploy runbook", "agent", null)]);
+    renderPalette();
+    search("deploy");
+
+    expect(screen.getByText(/deploy/)).toBeTruthy();
+    // No second line: only the single title row is present.
+    expect(screen.queryByText(/runbook.*\n/)).toBeNull();
   });
 });
 

@@ -203,7 +203,7 @@ async def test_mcp_nonexistent_session_returns_error(
     """
     resp = await _post_mcp(
         client,
-        "conv_does_not_exist_mcp",
+        "3628cfc9b00f747da23485e2534458a6",
         _jsonrpc("tools/list", rpc_id=10),
     )
     assert resp.status_code == 200

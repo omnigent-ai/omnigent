@@ -51,7 +51,7 @@ from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
-_HOST_ID = "host_runner_wt"
+_HOST_ID = "51dc949aba31e24ca8f047d6fba31a0d"
 _SOURCE_REPO = "/Users/alice/myrepo"
 
 

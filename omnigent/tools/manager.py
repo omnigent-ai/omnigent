@@ -13,6 +13,7 @@ from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
+from omnigent.runtime import get_caps
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
@@ -29,11 +30,16 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysReadInboxTool,
+    SysScheduledTaskCreateTool,
+    SysScheduledTaskDeleteTool,
+    SysScheduledTaskListTool,
+    SysScheduledTaskUpdateTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
+    SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
     SysTimerCancelTool,
@@ -151,6 +157,7 @@ class ToolManager:
         self._register_skill_tools()
         self._register_builtin_tools()
         self._register_sub_agent_tools()
+        self._register_session_tools()
         self._register_agent_mgmt_tools()
         self._register_os_env_tools()
         self._register_terminal_tools()
@@ -182,6 +189,13 @@ class ToolManager:
         # Policy tool is always auto-registered so agents can add
         # inline CEL policies at runtime without spec changes.
         self._register_policy_tools()
+        # Scheduled-task tools are always auto-registered so agents can
+        # manage recurring runs at runtime without the spec opting in.
+        self._register_scheduled_task_tools()
+        # Embedded-browser tools are always auto-registered so any agent
+        # can drive the desktop app's browser without the spec opting in
+        # (framework-owned).
+        self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
         """
@@ -196,6 +210,23 @@ class ToolManager:
 
         self._tools[SysAddPolicyTool.name()] = SysAddPolicyTool()
         self._tools[SysPolicyRegistryTool.name()] = SysPolicyRegistryTool()
+
+    def _register_scheduled_task_tools(self) -> None:
+        """
+        Auto-register the scheduled-task management builtins.
+
+        Always available so an agent can create, list, update, and delete
+        recurring scheduled tasks at runtime without the spec opting in. The
+        runner dispatches all four via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
+        """
+        for tool in (
+            SysScheduledTaskCreateTool(),
+            SysScheduledTaskListTool(),
+            SysScheduledTaskUpdateTool(),
+            SysScheduledTaskDeleteTool(),
+        ):
+            self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
         """
@@ -455,11 +486,11 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
-        # Advise-models is registered unconditionally alongside the
-        # dispatch grant — same pattern as sys_list_models. The server's
-        # MCP intercept returns router_on:false when routing is off,
-        # giving the model a clear signal without hiding the tool.
-        self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
+        # Advise-models is capability-gated: expose it only when the server
+        # has a routing client configured. Hiding the tool prevents agents
+        # from probing router_on via a no-op call when routing is disabled.
+        if get_caps().routing_client is not None:
+            self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents
         # by id, or custom bundles via config_path) requires the
@@ -467,6 +498,10 @@ class ToolManager:
         # alone only permits the specified sub-agent types.
         if self._spec.spawn:
             self._tools[SysSessionCreateTool.name()] = SysSessionCreateTool()
+
+    def _register_session_tools(self) -> None:
+        """Register framework-owned tools for the current session."""
+        self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
 
     def _register_agent_mgmt_tools(self) -> None:
         """
@@ -521,6 +556,37 @@ class ToolManager:
         """
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
+
+    def _register_browser_tools(self) -> None:
+        """
+        Auto-register the embedded-browser tools (``browser_navigate`` /
+        ``browser_snapshot`` / ``browser_click`` / ``browser_type`` /
+        ``browser_screenshot``).
+
+        Framework-owned and always available so any agent can drive the
+        desktop app's embedded browser without the spec opting in. The
+        classes here are schema-only (``name`` / ``description`` /
+        ``get_schema``); execution lives in the runner ``_BROWSER_TOOLS``
+        dispatch branch (``omnigent/runner/tool_dispatch.py``), which
+        needs the runner's ``server_client`` that ``ToolContext`` does
+        not carry.
+        """
+        from omnigent.tools.builtins.browser import (
+            BrowserClickTool,
+            BrowserNavigateTool,
+            BrowserScreenshotTool,
+            BrowserSnapshotTool,
+            BrowserTypeTool,
+        )
+
+        for _cls in (
+            BrowserNavigateTool,
+            BrowserSnapshotTool,
+            BrowserClickTool,
+            BrowserTypeTool,
+            BrowserScreenshotTool,
+        ):
+            self._tools[_cls.name()] = _cls()
 
     def _register_os_env_tools(self) -> None:
         """

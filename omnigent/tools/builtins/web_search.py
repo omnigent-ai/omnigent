@@ -30,13 +30,13 @@ Usage in config.yaml::
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
 _logger = logging.getLogger(__name__)
 
@@ -178,10 +178,14 @@ class WebSearchTool(Tool):
                 "invoke() should never be called."
             )
 
-        parsed: dict[str, Any] = json.loads(arguments)
+        parsed, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return f"Error: {error}"
+        assert parsed is not None
         query = parsed.get("query")
-        if not query:
+        if not isinstance(query, str) or not query.strip():
             return "Error: 'query' parameter is required."
+        query = query.strip()
 
         return _search(query, self._config)
 

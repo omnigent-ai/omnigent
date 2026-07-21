@@ -538,12 +538,14 @@ def test_fastapi_session_id_hook_stamps_session_id(
     """
     tracer = otel_trace.get_tracer("test")
     span = tracer.start_span("POST /v1/sessions/{id}/events")
-    telemetry._fastapi_session_id_hook(span, {"path": "/v1/sessions/conv_deadbeef/events"})
+    telemetry._fastapi_session_id_hook(
+        span, {"path": "/v1/sessions/e8d54a2f98774dc2988c895df854a815/events"}
+    )
     span.end()
 
     exported = in_memory_exporter.get_finished_spans()
     assert exported[-1].attributes is not None
-    assert exported[-1].attributes.get("session.id") == "conv_deadbeef"
+    assert exported[-1].attributes.get("session.id") == "e8d54a2f98774dc2988c895df854a815"
 
 
 def test_fastapi_session_id_hook_ignores_non_session_paths(
@@ -575,14 +577,14 @@ def test_tracing_context_stamps_session_id_on_agent_span(
     """
     from omnigent.inner.tracing import TracingContext
 
-    tctx = TracingContext(session_id="conv_abc123")
+    tctx = TracingContext(session_id="d1f9214d74c38b9f9a9db17ed8352dc4")
     agent_span = tctx.start_agent_span("my-agent", "hello")
     tctx.end_agent_span(agent_span, response="hi")
 
     exported = in_memory_exporter.get_finished_spans()
     agent_spans = [s for s in exported if s.name == "agent:my-agent"]
     assert agent_spans, "expected an agent span to be exported"
-    assert agent_spans[-1].attributes.get("session.id") == "conv_abc123"
+    assert agent_spans[-1].attributes.get("session.id") == "d1f9214d74c38b9f9a9db17ed8352dc4"
 
 
 def test_set_session_id_stamps_current_span(
@@ -598,11 +600,11 @@ def test_set_session_id_stamps_current_span(
     """
     tracer = otel_trace.get_tracer("test")
     with tracer.start_as_current_span("POST /v1/sessions"):
-        telemetry.set_session_id("conv_cafef00d")
+        telemetry.set_session_id("7bf6ff2daf0081cc71f6620b5f550430")
         telemetry.set_session_id(None)  # no-op, must not raise or clear
 
     exported = in_memory_exporter.get_finished_spans()
-    assert exported[-1].attributes.get("session.id") == "conv_cafef00d"
+    assert exported[-1].attributes.get("session.id") == "7bf6ff2daf0081cc71f6620b5f550430"
 
 
 def test_session_scope_processor_stamps_every_span() -> None:
@@ -620,7 +622,7 @@ def test_session_scope_processor_stamps_every_span() -> None:
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     tracer = provider.get_tracer("test")
 
-    with telemetry.session_scope("conv_generic01"):
+    with telemetry.session_scope("15ccc6868d9fc724f74fa2435e716ef0"):
         with tracer.start_as_current_span("server.request"):
             with tracer.start_as_current_span("db.query"):  # child span, never stamped by hand
                 pass
@@ -628,8 +630,10 @@ def test_session_scope_processor_stamps_every_span() -> None:
         pass
 
     spans = {s.name: s for s in exporter.get_finished_spans()}
-    assert spans["server.request"].attributes.get("session.id") == "conv_generic01"
-    assert spans["db.query"].attributes.get("session.id") == "conv_generic01"
+    assert (
+        spans["server.request"].attributes.get("session.id") == "15ccc6868d9fc724f74fa2435e716ef0"
+    )
+    assert spans["db.query"].attributes.get("session.id") == "15ccc6868d9fc724f74fa2435e716ef0"
     assert "session.id" not in (spans["outside.scope"].attributes or {})
 
 

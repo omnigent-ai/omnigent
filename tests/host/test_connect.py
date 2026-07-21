@@ -25,12 +25,15 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -39,7 +42,9 @@ from omnigent.host.frames import (
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -90,6 +95,8 @@ async def test_handle_launch_spawns_subprocess(
     failed or the result frame construction is wrong.
     """
     host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
     workspace.mkdir()
 
@@ -139,6 +146,7 @@ async def test_handle_launch_spawns_subprocess(
     # Verify env vars passed to the subprocess.
     assert spawned_env.get("RUNNER_SERVER_URL") == "http://localhost:8000"
     assert spawned_env.get("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN") == "test_token_abc"
+    assert spawned_env.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "host-bootstrap-bearer"
     assert spawned_env.get("OMNIGENT_RUNNER_WORKSPACE") == str(workspace)
 
     # Runners must get a clean /dev/null stdin, not the daemon's inherited fd:
@@ -419,14 +427,14 @@ async def test_handle_launch_prints_exact_runner_log_path(
         result = await host._handle_launch(frame)
 
     assert result.status == "launched", result.error
-    # Exactly one runner-*.log was created under the host-runner dir.
-    runner_log_dir = tmp_path / ".omnigent" / "logs" / "host-runner"
+    # Exactly one runner-*.log was created under the runner log dir.
+    runner_log_dir = tmp_path / ".omnigent" / "logs" / "runner"
     log_files = list(runner_log_dir.glob("runner-*.log"))
     assert len(log_files) == 1
     out = capsys.readouterr().out
     assert "↑ Runner started:" in out
     # The exact file path is printed, home-collapsed to ``~`` for readability.
-    assert f"log: ~/.omnigent/logs/host-runner/{log_files[0].name}" in out
+    assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
     assert "session: conv_log" in out
 
     _cleanup_host(host)
@@ -460,6 +468,102 @@ class _FakeTunnel:
         :raises ConnectionError: Always — ends the serve loop.
         """
         raise ConnectionError("test disconnect")
+
+
+class _ReadinessChangingTunnel(_FakeTunnel):
+    """Trigger one idle refresh before disconnecting the fake tunnel."""
+
+    def __init__(self) -> None:
+        """Initialize the frame log and receive counter."""
+        super().__init__()
+        self.recv_count = 0
+
+    async def recv(self) -> str:
+        """Simulate one idle interval followed by a disconnect."""
+        self.recv_count += 1
+        if self.recv_count == 1:
+            await asyncio.Future()
+        raise ConnectionError("test disconnect")
+
+
+async def test_live_host_refreshes_harness_readiness_without_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A setup completed after connect must replace the advertised readiness."""
+    readiness = iter(({"pi": False}, {"pi": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: harness == "pi",
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    hello = decode_host_frame(tunnel.sent[0])
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"pi": False}
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"pi": True}
+
+
+async def test_live_host_full_refresh_detects_auth_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full-refresh fallback catches readiness changes beyond binary installs."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+
+
+async def test_live_host_does_not_repeat_unchanged_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A periodic full refresh sends nothing when the readiness map is unchanged."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": "needs-auth"}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 1
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
@@ -515,7 +619,7 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     # The exit code identifies the failure class without log-reading.
     assert "code 7" in error
     # The log path lets the user fetch the full log on the host.
-    assert "~/.omnigent/logs/host-runner/runner-" in error
+    assert "~/.omnigent/logs/runner/runner-" in error
     # The tail carries the actual cause — the whole point of the report.
     assert "RuntimeError: boom-traceback" in error
 
@@ -744,6 +848,77 @@ def test_handle_stop_unknown_runner() -> None:
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
+
+
+def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``alive`` for a tracked
+    runner whose process is still running.
+
+    This is the still-booting / still-serving case: the server must wait
+    for this runner's tunnel rather than relaunch a healthy process.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        host._runners["runner_live"] = _RunnerHandle(
+            proc=proc, log_path=tmp_path / "runner-live.log"
+        )
+        result = host._handle_runner_status(
+            HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
+        )
+        assert isinstance(result, HostRunnerStatusResultFrame)
+        assert result.request_id == "req_rs"
+        assert result.status == "alive"
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``dead`` for a tracked
+    runner whose process has exited.
+
+    A tracked-but-exited runner will never connect its tunnel, so the
+    server must relaunch immediately instead of burning the connect
+    grace on it.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()  # ensure the process has exited before we query
+    host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "dead"
+
+
+def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``unknown`` for a runner
+    this host has no record of.
+
+    Covers a runner that was stopped (``_handle_stop`` popped it) and a
+    fresh post-restart host that never spawned it — the exact
+    host-restart case that used to strand the server on a full connect
+    grace. Both must read ``unknown`` so the server relaunches at once.
+    """
+    host = _make_host_process()
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "unknown"
 
 
 def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
@@ -1235,6 +1410,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
         "KUBECONFIG": "/home/alice/.kube/config",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
+        "OMNIGENT_LOG_LEVEL": "DEBUG",
+        "OMNIGENT_LOG_TO_STDERR": "1",
+        "OMNIGENT_LOG_TTY_FD": "9",
     }
 
     env = _build_runner_env(
@@ -1244,6 +1423,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         binding_token="tok",
         workspace="/ws",
         parent_pid=42,
+        initial_auth_token="host-bootstrap-bearer",
     )
 
     # Process essentials + the locale family pass through.
@@ -1278,6 +1458,17 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    # Opaque request-routing headers forward host→runner so the runner's tunnel
+    # and server callbacks reach the same server instance the host registered on
+    # (without the operator also listing it in OMNIGENT_RUNNER_ENV_PASSTHROUGH).
+    assert (
+        env["OMNIGENT_DATABRICKS_EXTRA_HEADERS"] == '{"x-databricks-route-hint": "instance-abc"}'
+    )
+    # Process logging controls forward so host-spawned runners honor --debug
+    # and --log-to-stderr.
+    assert env["OMNIGENT_LOG_LEVEL"] == "DEBUG"
+    assert env["OMNIGENT_LOG_TO_STDERR"] == "1"
+    assert env["OMNIGENT_LOG_TTY_FD"] == "9"
     # Non-harness secrets are stripped — the point of the allowlist.
     assert "DATABRICKS_TOKEN" not in env
     assert "AWS_SECRET_ACCESS_KEY" not in env
@@ -1287,6 +1478,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["RUNNER_SERVER_URL"] == "http://server"
     assert env[RUNNER_ID_ENV_VAR] == "runner_abc"
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
+    assert env[RUNNER_DELEGATED_AUTH_ENV_VAR] == "1"
+    assert env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] == "host-bootstrap-bearer"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
 
@@ -1305,6 +1498,7 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "HOME": "/root",
         "ANTHROPIC_API_KEY": "sk-a",
         "ANTHROPIC_BASE_URL": "https://gateway.example.com/anthropic",
+        "ANTHROPIC_MODEL": "gateway-served-claude",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-sub",
         "CODEX_ACCESS_TOKEN": "codex-workspace-token",
         "OPENAI_API_KEY": "sk-o",
@@ -1312,6 +1506,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "GEMINI_API_KEY": "g-key",
         "AWS_BEARER_TOKEN_BEDROCK": "absk-fwd",
         "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        # An unrelated secret must never ride the credential set.
+        "MY_UNRELATED_SECRET": "leak-me-not",
     }
 
     env = _build_runner_env(
@@ -1326,6 +1522,10 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        # The gateway model pin travels with the key/endpoint — without it a
+        # LiteLLM-style gateway session launches Claude Code model-less and
+        # the gateway rejects Claude Code's own default model.
+        "ANTHROPIC_MODEL",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CODEX_ACCESS_TOKEN",
         "OPENAI_API_KEY",
@@ -1342,6 +1542,8 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     # but never invented into the env.
     assert "ANTHROPIC_AUTH_TOKEN" in HARNESS_CREDENTIAL_ENV_VARS
     assert "ANTHROPIC_AUTH_TOKEN" not in env
+    # A secret not on the credential set / allowlist is not forwarded.
+    assert "MY_UNRELATED_SECRET" not in env
 
 
 def test_build_runner_env_forwards_omnigent_prefixed_harness_credentials() -> None:
@@ -2046,6 +2248,38 @@ def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) 
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
 
 
+def test_build_connect_headers_retains_auth_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host reconnects and runner launches share one warm auth factory."""
+    import omnigent.runner._entry as entry_mod
+
+    factory_builds: list[str | None] = []
+    token_calls: list[int] = []
+
+    def _factory() -> str:
+        token_calls.append(1)
+        return "warm-host-token"
+
+    def _make_factory(*, server_url: str | None = None) -> object:
+        factory_builds.append(server_url)
+        return _factory
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
+
+    host = _host("https://app.example.databricksapps.com")
+    first = host._build_connect_headers()
+    second = host._build_connect_headers()
+    launch_token = host._current_auth_token(initialize=False)
+
+    assert first["Authorization"] == "Bearer warm-host-token"
+    assert second["Authorization"] == "Bearer warm-host-token"
+    assert launch_token == "warm-host-token"
+    assert factory_builds == ["https://app.example.databricksapps.com"]
+    assert token_calls == [1, 1, 1]
+
+
 async def test_run_retries_on_login_redirect(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -2356,4 +2590,5 @@ def test_run_host_process_announces_session_log_dir_on_start(
     )
 
     out = capsys.readouterr().out
-    assert "Session logs: ~/.omnigent/logs/host-runner/" in out
+    assert "Session logs: ~/.omnigent/logs/runner/" in out
+    assert "This host's log: ~/.omnigent/logs/host/host-" in out

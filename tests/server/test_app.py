@@ -144,11 +144,13 @@ def _build_liveness_app(
     host_store = HostStore(db_uri)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     # Online host so a host-bound session reports host_online=True.
-    host_store.upsert_on_connect("host_live", "laptop", "alice@example.com")
+    host_store.upsert_on_connect("2fd786c75c03cfbbec099a6820c08b62", "laptop", "alice@example.com")
     # A host that EXISTS (so the conversations.host_id FK is satisfied) but
     # is offline, for the runner-down + host-offline state.
-    host_store.upsert_on_connect("host_offline", "old-laptop", "alice@example.com")
-    host_store.set_offline("host_offline")
+    host_store.upsert_on_connect(
+        "3d9665477127e41f42de3f4109418173", "old-laptop", "alice@example.com"
+    )
+    host_store.set_offline("3d9665477127e41f42de3f4109418173")
 
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -199,11 +201,11 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
     _register_live_runner(app, "rnr_live")
     # (b) runner bound but tunnel NOT registered, host online.
     runner_down_host_up = conversation_store.create_conversation(
-        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
     # (c) runner bound but tunnel down, host offline (unknown host id).
     runner_down_host_down = conversation_store.create_conversation(
-        runner_id="rnr_dead2", host_id="host_offline", workspace="/tmp/ws"
+        runner_id="rnr_dead2", host_id="3d9665477127e41f42de3f4109418173", workspace="/tmp/ws"
     )
     # (d) runner bound but tunnel down, NO host binding.
     runner_down_no_host = conversation_store.create_conversation(runner_id="rnr_dead3")
@@ -211,7 +213,7 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
     # tunnel/host state only — the stopped marker is no longer consulted by
     # liveness. Bind a (down) runner so this isn't the no-runner terminal.
     stopped = conversation_store.create_conversation(
-        runner_id="rnr_dead4", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead4", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
     conversation_store.set_labels(stopped.id, {"omnigent.stopped": "true"})
 
@@ -222,7 +224,7 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
             runner_down_host_down.id,
             runner_down_no_host.id,
             stopped.id,
-            "conv_unknown",
+            "fee171f70cf25c4cff8203046e727fd4",
         ]
     )
     transport = httpx.ASGITransport(app=app)
@@ -278,7 +280,7 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
         "host_version": None,
     }
     # Unknown id (no conversation row) ⇒ reachable, no host.
-    assert sessions["conv_unknown"] == {
+    assert sessions["fee171f70cf25c4cff8203046e727fd4"] == {
         "runner_online": True,
         "host_online": None,
         "host_version": None,
@@ -301,7 +303,7 @@ async def test_health_single_session_reports_both_liveness_fields(
     wired = _build_liveness_app(db_uri, tmp_path)
     # Dead runner on a live host: the runner-down-but-host-alive state.
     conv = wired.conversation_store.create_conversation(
-        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
     app = wired.app
 
@@ -346,13 +348,13 @@ async def test_health_reports_host_version_from_live_registry(
     # host_live is already online in the host_store (DB) via the builder;
     # registering it in the in-memory registry is what carries the version.
     app.state.host_registry.register(
-        "host_live",
+        "2fd786c75c03cfbbec099a6820c08b62",
         _StubWebSocket(),
         HostHelloFrame(version="9.9.9-test", frame_protocol_version=1, name="laptop"),
         "alice@example.com",
     )
     conv = wired.conversation_store.create_conversation(
-        runner_id="rnr_dead", host_id="host_live", workspace="/tmp/ws"
+        runner_id="rnr_dead", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
     )
 
     transport = httpx.ASGITransport(app=app)
@@ -441,7 +443,9 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     # Unbound forks: no runner_id, no host_id. The label is the only
     # difference between them.
     coding_fork = conversation_store.create_conversation()
-    conversation_store.set_labels(coding_fork.id, {"omnigent.fork.source_id": "conv_src"})
+    conversation_store.set_labels(
+        coding_fork.id, {"omnigent.fork.source_id": "e9f8f58523cec9a57d3bdf93be543e8c"}
+    )
     chat_fork = conversation_store.create_conversation()
 
     app = create_app(
@@ -1046,7 +1050,7 @@ async def test_api_only_unknown_path_gets_json_404(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         for headers in ({"accept": "text/html"}, {"accept": "application/json"}):
-            resp = await c.get("/c/conv_abc", headers=headers)
+            resp = await c.get("/c/4e92b5a0c0ee6db3f874f9c4a3f855a5", headers=headers)
             assert resp.status_code == 404, headers
             assert resp.json() == {"detail": "Not Found"}, headers
 
@@ -1063,3 +1067,49 @@ async def test_api_only_root_does_not_shadow_real_routes(
         resp = await c.get("/health", headers={"accept": "text/html"})
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_health_derives_runner_online_from_fresh_row_stamp(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A runner whose tunnel lives on ANOTHER replica reads online here.
+
+    Under host_id replica sharding, the replica holding a runner's tunnel
+    stamps ``conversations.runner_last_seen`` (on connect + each ping-loop
+    tick of that tunnel) and clears it on graceful disconnect. A replica
+    serving ``/health`` with an EMPTY tunnel registry — this app — must
+    derive ``runner_online`` from that stamp's freshness: fresh reads
+    online, past the TTL reads offline (the self-correcting path for an
+    ungraceful host/replica death), cleared reads offline immediately.
+    """
+    import time
+
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+
+    wired = _build_liveness_app(db_uri, tmp_path)
+    app = wired.app
+    conversation_store = wired.conversation_store
+
+    fresh = conversation_store.create_conversation(runner_id="rnr_remote_fresh")
+    stale = conversation_store.create_conversation(runner_id="rnr_remote_stale")
+    cleared = conversation_store.create_conversation(runner_id="rnr_remote_cleared")
+    now = int(time.time())
+    conversation_store.touch_runner_liveness(["rnr_remote_fresh"], now=now - 5)
+    conversation_store.touch_runner_liveness(
+        ["rnr_remote_stale"], now=now - RUNNER_LIVENESS_TTL_S - 5
+    )
+    conversation_store.touch_runner_liveness(["rnr_remote_cleared"], now=now - 5)
+    conversation_store.clear_runner_liveness("rnr_remote_cleared")
+
+    ids = ",".join([fresh.id, stale.id, cleared.id])
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    assert sessions[fresh.id]["runner_online"] is True
+    assert sessions[stale.id]["runner_online"] is False
+    assert sessions[cleared.id]["runner_online"] is False

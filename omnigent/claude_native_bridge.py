@@ -124,6 +124,10 @@ _TMUX_SEND_TIMEOUT_S = 5.0
 # The glyph persists while Claude is busy responding, so its presence
 # means "input box mounted" (not "idle"), which is what injection needs.
 _CLAUDE_PROMPT_GLYPH = "❯"
+# Matches a selected numbered menu row (``❯ 2. No (recommended)``): the glyph
+# followed by a numbered choice, which the chat input never renders. Used to
+# exclude startup menus from the readiness scan (see ``_is_selected_menu_row``).
+_SELECTED_MENU_ROW_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.\s")
 # Box-drawing glyphs Claude Code's input-box frame is made of. A line of
 # these below ``❯`` marks the live input box (see ``_is_box_rule``),
 # distinguishing it from a bare prompt echoed into scrollback.
@@ -1048,6 +1052,26 @@ def read_permission_hook_config(bridge_dir: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def update_permission_hook_auth_headers(
+    bridge_dir: Path,
+    headers: dict[str, str],
+) -> bool:
+    """Atomically replace the permission hook's server auth headers.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param headers: Fresh server request headers.
+    :returns: ``True`` when the hook config existed and was updated.
+    """
+    path = bridge_dir / _PERMISSION_HOOK_FILE
+    payload = _read_json_file(path)
+    if not payload:
+        return False
+    payload["ap_auth_headers"] = dict(headers)
+    payload["updated_at"] = time.time()
+    _write_json_file(path, payload)
+    return True
+
+
 def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> dict[str, Any]:
     """
     Build the Claude Code MCP config for the Omnigent bridge server.
@@ -1086,6 +1110,9 @@ def build_hook_settings(
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
+    launch_model: str | None = None,
+    launch_permission_mode: str | None = None,
+    launch_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Build invocation-local Claude Code hook settings.
@@ -1105,6 +1132,15 @@ def build_hook_settings(
     :param api_key_helper: Optional Claude Code ``apiKeyHelper``
         command from ucode state, e.g. ``"databricks auth token
         --host https://example.databricks.com ..."``.
+    :param launch_model: Effective launch model from ``--model``. Mirrored
+        into the invocation-local settings sidecar so a wrapped Claude Code
+        re-exec that preserves ``--settings`` but rebuilds argv cannot fall
+        back to the user's global default model.
+    :param launch_permission_mode: Effective launch permission mode from
+        ``--permission-mode``. Mirrored into ``permissions.defaultMode``
+        for the same re-exec hardening.
+    :param launch_effort: Effective launch effort from ``--effort``.
+        Mirrored into ``effortLevel`` for restart/re-exec parity.
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
@@ -1290,6 +1326,12 @@ def build_hook_settings(
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
     settings: dict[str, Any] = {"hooks": hooks}
+    if launch_model:
+        settings["model"] = launch_model
+    if launch_permission_mode:
+        settings["permissions"] = {"defaultMode": launch_permission_mode}
+    if launch_effort and launch_effort in CLAUDE_EFFORTS:
+        settings["effortLevel"] = launch_effort
     if api_key_helper:
         settings["apiKeyHelper"] = api_key_helper
     # Override Claude Code's statusLine so we receive its stdin (the
@@ -1345,6 +1387,8 @@ def augment_claude_args(
     bundle_dir: Path | None = None,
     agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    append_system_prompt: str | None = None,
+    allowed_tools: tuple[str, ...] = (),
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -1377,6 +1421,10 @@ def augment_claude_args(
         / ``"none"`` / list of skill names), mapped to
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
+    :param append_system_prompt: Optional framework-owned instructions to
+        append through Claude Code's native ``--append-system-prompt`` flag.
+    :param allowed_tools: Optional narrowly scoped Claude tool names to merge
+        into ``--allowedTools`` without replacing the user's allowlist.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -1386,8 +1434,12 @@ def augment_claude_args(
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
+        launch_model=_arg_value(claude_args, "--model"),
+        launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
+        launch_effort=_arg_value(claude_args, "--effort"),
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
+    args = _merge_allowed_tools(args, allowed_tools)
     args.extend(
         [
             "--mcp-config",
@@ -1396,6 +1448,8 @@ def augment_claude_args(
             json.dumps(hook_settings, separators=(",", ":")),
         ]
     )
+    if append_system_prompt:
+        args.extend(["--append-system-prompt", append_system_prompt])
     args.extend(
         claude_native_skill_args(
             bundle_dir,
@@ -1403,6 +1457,54 @@ def augment_claude_args(
             skills_filter=skills_filter,
         )
     )
+    return args
+
+
+def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
+    """Return the effective CLI flag value from ``args``.
+
+    Supports both ``--flag value`` and ``--flag=value`` spellings. When a
+    flag appears more than once, the last valid occurrence wins, matching the
+    usual CLI precedence for repeated long options.
+
+    :param args: Claude CLI args, e.g. ``("--model", "sonnet")``.
+    :param flag: Long flag to read, e.g. ``"--model"``.
+    :returns: The flag value, or ``None`` when absent/empty.
+    """
+    joined_prefix = f"{flag}="
+    value: str | None = None
+    for idx, arg in enumerate(args):
+        if arg.startswith(joined_prefix):
+            candidate = arg[len(joined_prefix) :]
+            if candidate:
+                value = candidate
+            continue
+        if arg == flag and idx + 1 < len(args):
+            candidate = args[idx + 1]
+            if candidate and not candidate.startswith("--"):
+                value = candidate
+    return value
+
+
+def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
+    """Merge framework-approved tools into Claude's ``--allowedTools`` flag.
+
+    :param args: Claude CLI argument list to mutate-and-return.
+    :param extra: Tool names Omnigent may call without an interactive prompt.
+    :returns: ``args`` with a deduplicated, order-preserving allowlist.
+    """
+    if not extra:
+        return args
+    try:
+        idx = args.index("--allowedTools")
+    except ValueError:
+        args.extend(["--allowedTools", ",".join(extra)])
+        return args
+    value_idx = idx + 1
+    if value_idx >= len(args):
+        return args
+    existing = [tool for tool in args[value_idx].split(",") if tool]
+    args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
     return args
 
 
@@ -2882,12 +2984,24 @@ def _claude_prompt_rendered(pane: str) -> bool:
     it's framed by a box rule — the ``────`` closing line the live input
     box always renders below ``❯`` but a bare echoed prompt never has.
 
+    A bare ``❯`` on a selected numbered menu row is not the chat input. A
+    numbered line with an input-box rule below it still counts, however: the
+    readiness gate runs before every injection, so a restored composer draft
+    may legitimately begin with text such as ``2. buy milk``.
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the input box appears mounted.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    if any(_CLAUDE_PROMPT_GLYPH in line for line in non_empty[-_PROMPT_SCAN_TAIL_LINES:]):
-        return True
+    tail_start = max(0, len(non_empty) - _PROMPT_SCAN_TAIL_LINES)
+    for idx in range(tail_start, len(non_empty)):
+        line = non_empty[idx]
+        if _CLAUDE_PROMPT_GLYPH not in line:
+            continue
+        if not _is_selected_menu_row(line) or any(
+            _is_box_rule(rule) for rule in non_empty[idx + 1 :]
+        ):
+            return True
     # Above that window, trust the glyph only when a box rule sits below
     # it — the live input box's closing frame, absent from scrollback.
     # The footer height scales with concurrent subagents (a fan-out of
@@ -2900,6 +3014,23 @@ def _claude_prompt_rendered(pane: str) -> bool:
         if any(_is_box_rule(rule) for rule in non_empty[idx + 1 :]):
             return True
     return False
+
+
+def _is_selected_menu_row(line: str) -> bool:
+    """
+    Return whether a ``❯`` line is a selected numbered menu row.
+
+    Claude Code's startup menus (e.g. the "Detected a custom API key"
+    confirmation) mark the highlighted choice with the same ``❯`` glyph the
+    chat input uses (``❯ 2. No (recommended)``). The readiness scan must not
+    treat such a row as the chat composer, or the first message gets typed
+    into the menu. A chat prompt never renders a numbered choice after the
+    glyph, so the ``<glyph> <digit>.`` shape distinguishes them.
+
+    :param line: A single pane line, e.g. ``"❯ 2. No (recommended)"``.
+    :returns: ``True`` when the line is a selected numbered menu choice.
+    """
+    return bool(_SELECTED_MENU_ROW_RE.match(line.strip()))
 
 
 def _is_box_rule(line: str) -> bool:

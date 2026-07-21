@@ -13,7 +13,9 @@
 import type { ConversationItem } from "./conversationItems";
 import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
+import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
+import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import type {
   CodexModelOption,
   ModelUsage,
@@ -25,6 +27,14 @@ import type {
   SessionStatus,
   SkillSummary,
 } from "./types";
+
+/** Returns the client surface label for the X-Omnigent-Client telemetry header. */
+function getClientSurface(): string {
+  if (isElectronShell()) return "desktop";
+  if (isIOSShell()) return "ios";
+  if (isAndroidShell()) return "android";
+  return "web";
+}
 
 /**
  * MCP-shape elicitation response, used as the `result` argument to
@@ -212,6 +222,7 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
    * idle. Lets a client reconnecting mid-turn reopen a streaming
@@ -304,6 +315,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
 }
@@ -425,7 +437,7 @@ export async function createSession(
   }
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -461,6 +473,7 @@ export async function createBundledSession(
   form.append("bundle", bundle);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
+    headers: { "X-Omnigent-Client": getClientSurface() },
     body: form,
   });
   if (!res.ok) {
@@ -513,7 +526,7 @@ export async function forkSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));

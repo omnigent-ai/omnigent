@@ -1,7 +1,8 @@
-import { BotIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
+import { BotIcon, FileIcon, GlobeIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
@@ -142,6 +143,9 @@ interface WorkspacePanelProps {
   onRightRailTabChange: (next: RightRailTab) => void;
   /** Whether the Files tab is available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
+  /** Whether the Browser tab is available — Electron shell only (hidden in a
+   *  plain web build, which has no embedded WebContentsView). */
+  showBrowserTab: boolean;
   /** Count of changed files, shown as the Files tab badge. */
   changedCount: number;
   /**
@@ -160,8 +164,8 @@ interface WorkspacePanelProps {
    * badge denominator) — starts at 1 for a lone agent.
    */
   agentCount: number;
-  /** Whether this is a claude-native session (gates the Tasks tab). */
-  isClaudeNative: boolean;
+  /** Whether the session publishes a todo list (gates the Tasks tab). */
+  todosSupported: boolean;
   /** Number of completed todos (Tasks tab badge numerator). */
   todosCompleted: number;
   /** Total todo count (Tasks tab badge denominator + visibility gate). */
@@ -226,12 +230,13 @@ export function WorkspacePanel({
   rightRailTab,
   onRightRailTabChange,
   showFilesPanel,
+  showBrowserTab,
   changedCount,
   showShellsTab,
   terminalsLength,
   subagentsWorking,
   agentCount,
-  isClaudeNative,
+  todosSupported,
   todosCompleted,
   todosTotal,
   rootSessionId,
@@ -358,7 +363,7 @@ export function WorkspacePanel({
                 )}
               </TabsTrigger>
             )}
-            {isClaudeNative && todosTotal > 0 && (
+            {todosSupported && todosTotal > 0 && (
               <TabsTrigger
                 value="todos"
                 className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
@@ -368,6 +373,15 @@ export function WorkspacePanel({
                 <span className={cn(TAB_BADGE_BASE, "ml-0.5 bg-muted text-muted-foreground")}>
                   {todosCompleted}/{todosTotal}
                 </span>
+              </TabsTrigger>
+            )}
+            {showBrowserTab && (
+              <TabsTrigger
+                value="browser"
+                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+              >
+                <GlobeIcon className="size-4" />
+                Browser
               </TabsTrigger>
             )}
           </TabsList>
@@ -409,7 +423,7 @@ export function WorkspacePanel({
           The Shells branch is unreachable when its tab is hidden —
           native wrappers, claude-native sub-agents, or no shell
           attached. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {selectedFilePath !== null ? (
           <FileViewer
             frameless
@@ -423,9 +437,13 @@ export function WorkspacePanel({
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
           />
+        ) : rightRailTab === "browser" && showBrowserTab ? (
+          // Embedded browser (Electron only) — BrowserPane self-gates and
+          // measures this rail slot to position the native view over it.
+          <BrowserPane conversationId={conversationId} className="min-h-0 flex-1" />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-        ) : rightRailTab === "todos" && isClaudeNative ? (
+        ) : rightRailTab === "todos" && todosSupported ? (
           <TodoPanel frameless />
         ) : rightRailTab === "terminals" && showShellsTab ? (
           <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalsPanel} />

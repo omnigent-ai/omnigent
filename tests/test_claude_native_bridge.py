@@ -2016,6 +2016,121 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_augment_claude_args_mirrors_launch_overrides_into_settings(
+    tmp_path: Path,
+) -> None:
+    """
+    Launch-time overrides are duplicated into the ``--settings`` sidecar.
+
+    Claude Code has had restart/re-exec paths that preserve ``--settings``
+    while rebuilding argv without ``--model`` / ``--effort`` /
+    ``--permission-mode``. Mirroring the same effective values into the
+    sidecar prevents a restarted wrapped CLI from falling back to the user's
+    global ``~/.claude/settings.json`` and diverging from the Omnigent
+    session pill.
+    """
+    args = augment_claude_args(
+        ("--model", "claude-fable-5", "--permission-mode", "auto", "--effort", "xhigh"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings["model"] == "claude-fable-5"
+    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["effortLevel"] == "xhigh"
+
+
+def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
+    tmp_path: Path,
+) -> None:
+    """The ``--model=<id>`` spelling is mirrored just like ``--model <id>``."""
+    args = augment_claude_args(
+        ("--model=claude-sonnet-5",),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings["model"] == "claude-sonnet-5"
+    assert "permissions" not in settings
+    assert "effortLevel" not in settings
+
+
+def test_augment_claude_args_uses_last_repeated_launch_override(
+    tmp_path: Path,
+) -> None:
+    """Repeated launch override flags mirror the same last-value-wins semantics."""
+    args = augment_claude_args(
+        (
+            "--model",
+            "claude-old",
+            "--model=claude-new",
+            "--permission-mode",
+            "default",
+            "--permission-mode",
+            "auto",
+            "--effort=low",
+            "--effort",
+            "high",
+        ),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = json.loads(args[args.index("--settings") + 1])
+    assert settings["model"] == "claude-new"
+    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["effortLevel"] == "high"
+
+
+def test_augment_claude_args_appends_caller_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Claude native appends framework instructions supplied by its launcher."""
+    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=SESSION_RENAME_INSTRUCTION,
+    )
+
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == SESSION_RENAME_INSTRUCTION
+
+
+def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
+    """Framework preapproval extends rather than replaces the user's allowlist."""
+    args = augment_claude_args(
+        ("--allowedTools", "Bash,mcp__user__tool"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        allowed_tools=("mcp__omnigent__sys_session_rename", "Bash"),
+    )
+
+    assert args.count("--allowedTools") == 1
+    index = args.index("--allowedTools")
+    assert args[index + 1].split(",") == [
+        "Bash",
+        "mcp__user__tool",
+        "mcp__omnigent__sys_session_rename",
+    ]
+
+
+def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+    """The bridge does not invent framework policy on its own."""
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert "--append-system-prompt" not in args
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.
@@ -4929,6 +5044,59 @@ def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
         ]
     )
     assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_ignores_custom_api_key_menu() -> None:
+    """The custom-API-key menu's selected row is not the chat input.
+
+    Claude Code's startup "Detected a custom API key" confirmation renders
+    its highlighted choice with the same ``❯`` glyph the chat composer uses
+    (``❯ 2. No (recommended)``). Treating it as ready pastes the first web
+    message into the menu, so no turn starts — the tmux delivery false
+    positive this guards against.
+    """
+    pane = "\n".join(
+        [
+            "Detected a custom API key in your environment",
+            "Do you want to use this API key?",
+            "  1. Yes",
+            "❯ 2. No (recommended)",  # selected menu row, NOT the chat input
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
+    """A real chat prompt still reads ready even past a menu-shaped echo.
+
+    A numbered ``❯`` choice echoed into scrollback must not suppress the
+    live input box below it: the chat ``❯`` row (no numbered choice after
+    the glyph) is the one that marks readiness.
+    """
+    pane = "\n".join(
+        [
+            "❯ 2. No (recommended)",  # scrollback echo of a prior menu row
+            "output",
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live chat prompt
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
+    """A numbered composer draft is distinguished from an unframed menu row."""
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",
+            "❯ 2. buy milk",
+            "────────────────────────────────────────",
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
 
 
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:

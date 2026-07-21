@@ -427,11 +427,18 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     server sees both the user's providers (with their custom base URLs) and
     any Omnigent-synthesized providers (e.g. Databricks gateway).
 
-    Only ``provider`` entries are merged — the synthesized config takes
-    precedence for all other keys (model, mcp, plugin, permission, etc.).
+    ``provider`` entries are merged, and the user config's top-level ``model``
+    default is adopted **only when the synthesized config pins none** — the
+    synthesized config still takes precedence for all keys it sets (model, mcp,
+    plugin, permission, etc.). The ``model`` carry-over matters because when
+    neither a gateway nor a spec-supplied ``model_override`` is present, the
+    synthesized config has no ``model`` key, and opencode-native would otherwise
+    pick its own default over the merged models map (e.g. landing on a served
+    Gemini endpoint even though the user's config defaults to Claude).
 
     :param config: The synthesized config dict (may be empty).
-    :returns: *config* with user's ``provider`` entries merged in (if any).
+    :returns: *config* with user's ``provider`` entries (and, if unset, the
+        user's default ``model``) merged in.
     """
     from omnigent.opencode_native_bridge import user_opencode_config_path
 
@@ -462,9 +469,23 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     if not isinstance(user_config, dict):
         return config
 
+    # Adopt the user's default ``model`` when the synthesized config pins none.
+    # ``setdefault`` keeps the synthesized value authoritative (gateway /
+    # spec-supplied ``model_override`` win); it only fills the gap where both
+    # were absent, so opencode-native launches on the user's chosen default
+    # instead of picking its own over the merged models map.
+    def _carry_model(target: dict[str, object]) -> None:
+        user_model = user_config.get("model")
+        if isinstance(user_model, str) and user_model:
+            target.setdefault("model", user_model)
+
     user_providers = user_config.get("provider")
     if not isinstance(user_providers, dict) or not user_providers:
-        return config
+        # No custom providers to merge, but the user's default model still
+        # applies when the synthesized config didn't pin one.
+        result = dict(config)
+        _carry_model(result)
+        return result
 
     result = dict(config)
     existing = result.get("provider")
@@ -480,6 +501,7 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     else:
         result["provider"] = dict(user_providers)
 
+    _carry_model(result)
     result.setdefault("$schema", "https://opencode.ai/config.json")
 
     return result

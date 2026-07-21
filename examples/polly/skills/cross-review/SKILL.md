@@ -15,6 +15,11 @@ anyone needs to read through.
 2. Run the deterministic gates first — tests / lint / typecheck via
    `sys_os_shell`. If red, re-dispatch the implementer to drive it green first;
    don't involve the reviewer yet.
+   If a pytest result's count must be recorded or reconciled, collect ground
+   truth with `python -m pytest --collect-only -q <same files>` against the
+   exact file set/command/commit the implementer reported. Never use
+   `grep -c 'def test_'` as a pytest count: it counts functions, not collected
+   cases, and misses parametrized case expansion.
 3. Dispatch a DIFFERENT-vendor sub-agent as reviewer: pick any AVAILABLE worker
    whose vendor differs from the implementer's — `claude_code`, `codex`,
    `opencode`, `cursor`, `hermes`, or `pi` (e.g. Claude built it → any of

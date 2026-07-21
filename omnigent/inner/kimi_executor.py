@@ -33,9 +33,9 @@ Env-var contract (read once at construction by
 - ``HARNESS_KIMI_CWD``: working directory the kimi subprocess runs in.
   Upstream has no ``--work-dir`` flag so this is threaded through
   ``cwd=`` on the subprocess. ``None`` falls back to the runner's cwd.
-- ``HARNESS_KIMI_PATH``: explicit path to the ``kimi`` binary, e.g.
+- ``OMNIGENT_KIMI_PATH``: explicit path to the ``kimi`` binary, e.g.
   ``"/Users/x/.kimi-code/bin/kimi"``. Defaults to ``"kimi"`` looked up
-  on ``PATH``.
+  on ``PATH``. (Legacy ``HARNESS_KIMI_PATH`` still honored, deprecated.)
 - ``HARNESS_KIMI_PLAN``: truthy → ``--plan`` (read-only plan mode).
 - ``HARNESS_KIMI_CONTINUE_LAST``: truthy → ``--continue`` (resume the
   most recent session for the working directory). Mutually exclusive
@@ -65,6 +65,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -110,16 +111,17 @@ def _parse_truthy(value: str | None) -> bool:
 def _resolve_kimi_binary() -> str:
     """Resolve the ``kimi`` binary path.
 
-    ``HARNESS_KIMI_PATH`` wins (lets users point at a custom build or a
-    non-standard install location). Otherwise default to ``"kimi"`` and
-    rely on ``shutil.which`` so a missing binary surfaces clearly at
-    ``run_turn``.
+    ``OMNIGENT_KIMI_PATH`` wins (legacy ``HARNESS_KIMI_PATH`` still honored
+    via :func:`resolve_harness_path`, which emits a deprecation warning; lets
+    users point at a custom build or a non-standard install location).
+    Otherwise default to ``"kimi"`` and rely on ``shutil.which`` so a missing
+    binary surfaces clearly at ``run_turn``.
 
     The legacy pypi ``kimi-cli`` package is intentionally NOT detected —
     its command-line surface is incompatible with the upstream binary
     Omnigent supports.
     """
-    explicit = os.environ.get("HARNESS_KIMI_PATH", "").strip()
+    explicit = resolve_harness_path("kimi")
     if explicit:
         return explicit
     return "kimi"
@@ -424,7 +426,8 @@ class KimiExecutor(Executor):
                 message=(
                     f"kimi harness: binary {self._binary_path!r} not found on PATH. "
                     "Install via `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash` "
-                    "or set HARNESS_KIMI_PATH to its absolute location."
+                    "or set OMNIGENT_KIMI_PATH (legacy HARNESS_KIMI_PATH) to its"
+                    " absolute location."
                 ),
                 retryable=False,
             )

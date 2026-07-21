@@ -129,6 +129,10 @@ def _harnesses_installed(monkeypatch):
         "omnigent.onboarding.harness_install.harness_logout",
         lambda family: True,
     )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_logged_in",
+        lambda family: True,
+    )
 
 
 def _config_yaml(config_home) -> dict[str, object]:
@@ -546,7 +550,7 @@ def test_add_menu_options_ordering() -> None:
         "Gemini — API key",
         "ChatGPT — subscription",
         "Claude — subscription (Pro/Max)",
-        "Gateway — custom base URL + key (e.g. OpenRouter)",
+        "Gateway — custom base URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
@@ -560,7 +564,7 @@ def test_add_menu_options_ordering() -> None:
     assert codex == [
         "OpenAI — API key",
         "ChatGPT — subscription",
-        "Gateway — custom base URL + key (e.g. OpenRouter)",
+        "Gateway — custom base URL + key",
         "OpenRouter — API key",
         "Databricks — workspace",
         "Other provider — API key",
@@ -573,7 +577,7 @@ def test_add_menu_options_ordering() -> None:
     assert claude == [
         "Anthropic — API key",
         "Claude — subscription (Pro/Max)",
-        "Gateway — custom base URL + key (e.g. OpenRouter)",
+        "Gateway — custom base URL + key",
         "Databricks — workspace",
         "AWS Bedrock — API key",
     ]
@@ -1757,6 +1761,43 @@ def test_overview_lists_kiro_row(isolated_config, monkeypatch) -> None:
     assert "kiro-cli login" in Text.from_markup(descriptions[kiro]).plain
 
 
+def test_overview_reports_missing_cursor_cli_despite_sdk_api_key(
+    isolated_config, monkeypatch
+) -> None:
+    """A Cursor SDK key must not make the native Cursor CLI look ready."""
+    from rich.text import Text
+
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_sdk_only")
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda key: key != "cursor",
+    )
+
+    options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
+    names = _overview_row_names(options, selectable)
+
+    assert "Cursor CLI" not in names
+    assert "Cursor SDK" not in names
+    cursor = names.index("Cursor")
+    assert "CLI not installed" in Text.from_markup(options[cursor]).plain
+    assert "SDK ready" in Text.from_markup(options[cursor]).plain
+    assert "cursor.com/install" in Text.from_markup(descriptions[cursor]).plain
+
+
+def test_missing_cursor_cli_drillin_shows_install_and_login(isolated_config, monkeypatch) -> None:
+    """The consolidated Cursor setup gives both steps needed by the web agent."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda key: key != "cursor",
+    )
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="3\n1\nq\nq\n")
+
+    assert result.exit_code == 0, result.output
+    assert "curl https://cursor.com/install -fsS | bash" in result.output
+    assert "cursor-agent login" in result.output
+
+
 def test_overview_hermes_row_reflects_configured_model(isolated_config, monkeypatch) -> None:
     """Hermes reads ready (with its picked model) once ``hermes model`` has run.
 
@@ -1986,7 +2027,7 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     }
     assert desc_by_name["Claude"] == "Open to add a credential."
     assert desc_by_name["Codex"] == "Open to add a credential."
-    assert desc_by_name["Cursor"] == "Open to add the Cursor API key."
+    assert desc_by_name["Cursor"] == ""
     assert desc_by_name["OpenCode"] == "Open to sign in (opencode auth login)."
     assert desc_by_name["Hermes"] == "Open to configure with `hermes model`."
     assert desc_by_name["Pi"] == "Open to add a credential."
@@ -2422,7 +2463,8 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
 
 # ── Cursor API-key flow ─────────────────────────────────────────────────────
 # Cursor runs via the ``cursor-sdk`` package and authenticates with a
-# ``CURSOR_API_KEY``; it has no provider/gateway family. Its drill-in (L1 row 4)
+# ``CURSOR_API_KEY``; it has no provider/gateway family. Its drill-in is under
+# the consolidated Cursor row (L1 row 3, then Cursor SDK).
 # stores the key in the secret store + a dedicated ``cursor:`` config block,
 # mirroring the other harnesses' api-key persistence. The menu is API-key-only
 # (Set/Replace/Remove), so it touches neither the ``cursor-agent`` binary nor a
@@ -2456,9 +2498,8 @@ def test_cursor_set_api_key_paste_writes_block_and_secret(
     Proves the api-key path: the secret lands in the store (never plaintext in
     config) and the config references it via ``keychain:cursor``.
     """
-    # L1 3=Cursor → cursor menu 1=Set API key → paste key (crsr_ → no warn) →
-    # cursor menu q=back → L1 q=quit.
-    stdin = "\n".join(["3", "1", "crsr_test_key_123", "q", "q"]) + "\n"
+    # L1 Cursor → Cursor SDK → Set API key → paste key → back through both menus.
+    stdin = "\n".join(["3", "2", "1", "crsr_test_key_123", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2478,9 +2519,8 @@ def test_cursor_adopt_env_api_key_writes_env_ref(
     at the live environment variable so the key never leaves the user's shell.
     """
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_env_key_456")
-    # L1 3=Cursor → 1=Set API key → "y" adopt detected $CURSOR_API_KEY →
-    # q back → q quit.
-    stdin = "\n".join(["3", "1", "y", "q", "q"]) + "\n"
+    # L1 Cursor → Cursor SDK → Set API key → adopt detected env key → back.
+    stdin = "\n".join(["3", "2", "1", "y", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2499,9 +2539,8 @@ def test_cursor_remove_api_key_drops_block_and_secret(
     with open(config_path, "w") as f:
         yaml.safe_dump({"cursor": {"api_key_ref": "keychain:cursor"}}, f)
 
-    # L1 3=Cursor → cursor menu (key set: 1=Replace 2=Remove 3=Back) → 2=Remove
-    # → q back → q quit.
-    stdin = "\n".join(["3", "2", "q", "q"]) + "\n"
+    # L1 Cursor → Cursor SDK → Remove → back through both menus.
+    stdin = "\n".join(["3", "2", "2", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2518,9 +2557,8 @@ def test_cursor_set_api_key_non_crsr_declined_is_not_stored(
     The soft prefix check warns and asks to store anyway; declining must leave
     both the secret store and the config untouched.
     """
-    # L1 3=Cursor → 1=Set API key → paste non-crsr_ key → "n" decline warning →
-    # q back → q quit.
-    stdin = "\n".join(["3", "1", "sk-not-a-cursor-key", "n", "q", "q"]) + "\n"
+    # L1 Cursor → Cursor SDK → Set → decline the non-crsr_ warning → back.
+    stdin = "\n".join(["3", "2", "1", "sk-not-a-cursor-key", "n", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2550,23 +2588,18 @@ def _cursor_sdk_absent(monkeypatch):
     )
 
 
-def test_cursor_overview_install_command_is_selection_only(
+def test_cursor_overview_stays_cli_ready_when_sdk_missing(
     isolated_config, _cursor_sdk_absent, monkeypatch
 ) -> None:
-    """With the cursor extra absent, the Cursor row's install command is its description.
-
-    The install command (dynamically computed) is the selection-only hint —
-    the selector's per-row description, shown when the row is highlighted —
-    and is NOT baked into the always-visible row label.
-    """
+    """A missing SDK does not duplicate or downgrade a ready Cursor CLI row."""
     from rich.text import Text
 
     options, selectable, descriptions, _, _max_visible = _capture_setup_overview(monkeypatch)
     names = _overview_row_names(options, selectable)
+    assert names.count("Cursor") == 1
     cursor = names.index("Cursor")
-    assert "omnigent[cursor]" in Text.from_markup(descriptions[cursor]).plain
-    # The command lives in the description only — never the always-visible row.
-    assert "omnigent[cursor]" not in Text.from_markup(options[cursor]).plain
+    assert "CLI ready" in Text.from_markup(options[cursor]).plain
+    assert Text.from_markup(descriptions[cursor]).plain == ""
 
 
 def test_cursor_drillin_offers_install_when_sdk_missing(
@@ -2577,8 +2610,8 @@ def test_cursor_drillin_offers_install_when_sdk_missing(
     Here the user picks "show the command" (choice 3), which prints it and falls
     through to the key menu, then backs out.
     """
-    # L1 3=Cursor → install offer 3=show command → key menu q=back → L1 q.
-    stdin = "\n".join(["3", "3", "q", "q"]) + "\n"
+    # Cursor → Cursor SDK → show command → back through both menus.
+    stdin = "\n".join(["3", "2", "3", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     out = result.output
@@ -2593,9 +2626,8 @@ def test_cursor_key_settable_when_sdk_missing(isolated_config, _cursor_sdk_absen
     NOT gate key management on it. Here the user declines ("set the key anyway" =
     choice 2), then sets the key — which must persist as it does with the SDK.
     """
-    # L1 3=Cursor → install offer 2=set key anyway → key menu 1=Set →
-    # paste crsr_ key → key menu q=back → L1 q=quit.
-    stdin = "\n".join(["3", "2", "1", "crsr_key_no_sdk", "q", "q"]) + "\n"
+    # Cursor → Cursor SDK → set key anyway → Set → paste key → back.
+    stdin = "\n".join(["3", "2", "2", "1", "crsr_key_no_sdk", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2624,8 +2656,8 @@ def test_cursor_install_now_invokes_runner_without_index(
     monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.cursor_auth.subprocess.run", _run)
 
-    # L1 3=Cursor → install offer 1=install now → key menu q=back → L1 q.
-    stdin = "\n".join(["3", "1", "q", "q"]) + "\n"
+    # Cursor → Cursor SDK → install now → back through both menus.
+    stdin = "\n".join(["3", "2", "1", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -2851,7 +2883,11 @@ def test_copilot_overview_install_command_is_selection_only(
 @pytest.mark.parametrize(
     "choice,sdk_probe,unexpected_header",
     [
-        ("3", "omnigent.onboarding.cursor_auth.cursor_sdk_installed", "Cursor — no API key yet"),
+        (
+            "3\n2",
+            "omnigent.onboarding.cursor_auth.cursor_sdk_installed",
+            "Cursor — no API key yet",
+        ),
         (
             "7",
             "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
@@ -2876,7 +2912,7 @@ def test_soft_sdk_install_prompt_abort_returns_to_overview(
     """
     monkeypatch.setattr(sdk_probe, lambda: False)
 
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\nq\n")
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\nq\nq\n")
 
     assert result.exit_code == 0, result.output
     assert unexpected_header not in result.output

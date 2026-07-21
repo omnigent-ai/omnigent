@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-HarnessAvailability = bool | str
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -38,11 +38,14 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
     STOP_RUNNER = "host.stop_runner"
     STOP_RUNNER_RESULT = "host.stop_runner_result"
     RUNNER_EXITED = "host.runner_exited"
+    RUNNER_STATUS = "host.runner_status"
+    RUNNER_STATUS_RESULT = "host.runner_status_result"
     STAT = "host.stat"
     STAT_RESULT = "host.stat_result"
     LIST_DIR = "host.list_dir"
@@ -55,6 +58,8 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    FS_REQUEST = "host.fs_request"
+    FS_RESULT = "host.fs_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -77,8 +82,9 @@ class HostHelloFrame:
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
         unknown (an older host that doesn't report it) — never
-        treat ``None`` as "nothing is configured". Recomputed on
-        each (re)connect; the launch-time check is authoritative.
+        treat ``None`` as "nothing is configured". Changes arrive in
+        :class:`HostHarnessReadinessFrame`; launch-time checks remain
+        authoritative.
     """
 
     version: str
@@ -86,6 +92,19 @@ class HostHelloFrame:
     name: str
     runners: list[str] = field(default_factory=list)
     configured_harnesses: dict[str, HarnessAvailability] | None = None
+    telemetry_opt_out: bool = False
+    installation_id: str | None = None
+
+
+@dataclass
+class HostHarnessReadinessFrame:
+    """Host's refreshed per-harness readiness while the tunnel stays open.
+
+    :param configured_harnesses: Current launch readiness keyed by every
+        accepted harness spelling. Sent only when the map changes.
+    """
+
+    configured_harnesses: dict[str, HarnessAvailability]
 
 
 @dataclass
@@ -197,6 +216,48 @@ class HostRunnerExitedFrame:
 
     runner_id: str
     error: str
+
+
+@dataclass
+class HostRunnerStatusFrame:
+    """Server → host: is this runner's process alive, dead, or unknown?
+
+    The host is the authoritative owner of runner-process liveness — it
+    holds each runner's :class:`subprocess.Popen`. The runner tunnel
+    only tells the server "connected right now"; it cannot distinguish a
+    runner that is still booting (will connect) from one that was stopped
+    or died when the host restarted (never will). The message-dispatch
+    path asks this before its connect grace so it waits for a runner that
+    is coming and relaunches immediately for one that is not.
+
+    :param request_id: Unique id for correlating the result, e.g.
+        ``"req_rs_1"``.
+    :param runner_id: Runner to query, e.g. ``"runner_abc123..."``.
+    """
+
+    request_id: str
+    runner_id: str
+
+
+@dataclass
+class HostRunnerStatusResultFrame:
+    """Host → server: liveness of a queried runner.
+
+    :param request_id: Correlates to the :class:`HostRunnerStatusFrame`,
+        e.g. ``"req_rs_1"``.
+    :param status: One of:
+
+        * ``"alive"`` — the host has this runner and its process is
+          running (booting or serving). The runner is coming; wait.
+        * ``"dead"`` — the host has this runner but its process has
+          exited. It will never connect; relaunch now.
+        * ``"unknown"`` — the host has no record of this runner (it was
+          stopped, or a fresh post-restart host never spawned it).
+          Relaunch now.
+    """
+
+    request_id: str
+    status: str
 
 
 @dataclass
@@ -518,13 +579,69 @@ class HostCreateDirResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostFsRequestFrame:
+    """Server → host: read-only workspace filesystem request.
+
+    Serves the web UI's file panel (directory browse, changed files,
+    diffs, search, file content) from the host when the session's runner
+    is offline but the host still holds the workspace on disk. The host
+    runs :class:`omnigent.workspace_fs.WorkspaceReader` against
+    ``workspace`` and returns the same JSON the runner's filesystem
+    endpoints would.
+
+    :param request_id: Correlates the result, e.g. ``"req_fs_1"``.
+    :param op: Operation name — one of ``"list_or_read"``, ``"changes"``,
+        ``"diff"``, ``"search"``.
+    :param workspace: Absolute path to the session's workspace on the
+        host, e.g. ``"/Users/alice/project"``.
+    :param session_id: Session id, forwarded to the change registry.
+    :param params: Operation-specific arguments (relative path, glob
+        filters, pagination cursors), e.g.
+        ``{"path": "src", "limit": 100, "order": "asc"}``.
+    """
+
+    request_id: str
+    op: str
+    workspace: str
+    session_id: str
+    params: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HostFsResultFrame:
+    """Host → server: outcome of a workspace filesystem request.
+
+    :param request_id: Correlates to the :class:`HostFsRequestFrame`.
+    :param status: ``"ok"`` when ``payload`` carries the runner-shaped
+        result, or ``"error"`` when the read failed.
+    :param payload: The runner-shaped JSON result on success, ``None`` on
+        error.
+    :param error_status: HTTP status the runner would have returned on
+        failure (e.g. ``404``), or ``None`` on success.
+    :param error_code: Machine-readable error code on failure (e.g.
+        ``"not_found"``), or ``None`` on success.
+    :param error: Human-readable error detail on failure, or ``None``.
+    """
+
+    request_id: str
+    status: str
+    payload: dict[str, Any] | None = None
+    error_status: int | None = None
+    error_code: str | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
+    | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
     | HostStopRunnerFrame
     | HostStopRunnerResultFrame
     | HostRunnerExitedFrame
+    | HostRunnerStatusFrame
+    | HostRunnerStatusResultFrame
     | HostStatFrame
     | HostStatResultFrame
     | HostListDirFrame
@@ -537,6 +654,8 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostFsRequestFrame
+    | HostFsResultFrame
 )
 
 
@@ -582,6 +701,15 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "frame_protocol_version": frame.frame_protocol_version,
                 "name": frame.name,
                 "runners": list(frame.runners),
+                "configured_harnesses": frame.configured_harnesses,
+                "telemetry_opt_out": frame.telemetry_opt_out,
+                "installation_id": frame.installation_id,
+            }
+        )
+    if isinstance(frame, HostHarnessReadinessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_READINESS.value,
                 "configured_harnesses": frame.configured_harnesses,
             }
         )
@@ -630,6 +758,22 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRunnerStatusFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUNNER_STATUS.value,
+                "request_id": frame.request_id,
+                "runner_id": frame.runner_id,
+            }
+        )
+    if isinstance(frame, HostRunnerStatusResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RUNNER_STATUS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
             }
         )
     if isinstance(frame, HostStatFrame):
@@ -759,6 +903,29 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostFsRequestFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FS_REQUEST.value,
+                "request_id": frame.request_id,
+                "op": frame.op,
+                "workspace": frame.workspace,
+                "session_id": frame.session_id,
+                "params": frame.params,
+            }
+        )
+    if isinstance(frame, HostFsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.FS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "payload": frame.payload,
+                "error_status": frame.error_status,
+                "error_code": frame.error_code,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -821,6 +988,8 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.HARNESS_READINESS:
+            return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:
@@ -831,6 +1000,10 @@ def _decode_known_host_frame(
             return _decode_stop_runner_result(msg)
         case HostFrameKind.RUNNER_EXITED:
             return _decode_runner_exited(msg)
+        case HostFrameKind.RUNNER_STATUS:
+            return _decode_runner_status(msg)
+        case HostFrameKind.RUNNER_STATUS_RESULT:
+            return _decode_runner_status_result(msg)
         case HostFrameKind.STAT:
             return _decode_stat(msg)
         case HostFrameKind.STAT_RESULT:
@@ -855,6 +1028,10 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.FS_REQUEST:
+            return _decode_fs_request(msg)
+        case HostFrameKind.FS_RESULT:
+            return _decode_fs_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -870,7 +1047,22 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         name=_required_str(msg, "name"),
         runners=_optional_str_list(msg, "runners"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
+        installation_id=_optional_nullable_str(msg, "installation_id"),
     )
+
+
+def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
+    """Decode a live harness-readiness refresh frame."""
+    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    if configured_harnesses is None:
+        raise ValueError("harness readiness frame requires a configured_harnesses object")
+    raw = msg["configured_harnesses"]
+    if len(configured_harnesses) != len(raw):
+        raise ValueError("harness readiness frame contains an unsupported availability state")
+    if not configured_harnesses:
+        raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
+    return HostHarnessReadinessFrame(configured_harnesses=configured_harnesses)
 
 
 def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
@@ -941,6 +1133,32 @@ def _decode_runner_exited(msg: dict[str, Any]) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+    )
+
+
+def _decode_runner_status(msg: dict[str, Any]) -> HostRunnerStatusFrame:
+    """Decode a host.runner_status request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.runner_status frame.
+    """
+    return HostRunnerStatusFrame(
+        request_id=_required_str(msg, "request_id"),
+        runner_id=_required_str(msg, "runner_id"),
+    )
+
+
+def _decode_runner_status_result(
+    msg: dict[str, Any],
+) -> HostRunnerStatusResultFrame:
+    """Decode a host.runner_status_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.runner_status_result frame.
+    """
+    return HostRunnerStatusResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
     )
 
 
@@ -1163,6 +1381,48 @@ def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
     )
 
 
+def _decode_fs_request(msg: dict[str, Any]) -> HostFsRequestFrame:
+    """Decode a host.fs_request request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.fs_request frame.
+    """
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError("frame field must be a JSON object: 'params'")
+    return HostFsRequestFrame(
+        request_id=_required_str(msg, "request_id"),
+        op=_required_str(msg, "op"),
+        workspace=_required_str(msg, "workspace"),
+        session_id=_required_str(msg, "session_id"),
+        params=params,
+    )
+
+
+def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
+    """Decode a host.fs_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.fs_result frame.
+    """
+    payload = msg.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        raise ValueError("frame field must be a JSON object or null: 'payload'")
+    error_status = msg.get("error_status")
+    if error_status is not None and (
+        not isinstance(error_status, int) or isinstance(error_status, bool)
+    ):
+        raise ValueError("frame field must be an int or null: 'error_status'")
+    return HostFsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        payload=payload,
+        error_status=error_status,
+        error_code=_optional_nullable_str(msg, "error_code"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
 # ── Field validators ─────────────────────────────────────
 
 
@@ -1230,7 +1490,7 @@ def _optional_str_availability_map(
     Tolerant by design: absent, null, or non-mapping values all decode
     to ``None`` ("unknown") rather than raising, so an older or newer
     peer's hello never breaks the tunnel handshake. Entries with a
-    non-string key or non-bool/string value are dropped for the same reason.
+    non-string key or unsupported readiness value are dropped for the same reason.
 
     :param msg: Decoded frame object.
     :param key: Field name, e.g. ``"configured_harnesses"``.
@@ -1240,7 +1500,7 @@ def _optional_str_availability_map(
     val = msg.get(key)
     if not isinstance(val, dict):
         return None
-    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, (bool, str))}
+    return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
 def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:

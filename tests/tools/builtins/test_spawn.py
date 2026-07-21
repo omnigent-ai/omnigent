@@ -51,7 +51,6 @@ def test_file_ids_present_and_optional() -> None:
         "type": "array",
         "items": {"type": "string", "minLength": 1},
         "minItems": 1,
-        "uniqueItems": True,
         "description": branch["properties"]["file_ids"]["description"],
     }
     assert "file_ids" not in branch["required"]
@@ -75,6 +74,16 @@ def test_file_ids_description_mentions_fresh_named_spawn_only() -> None:
     assert "first named" in file_ids_description
     assert "session_id" in file_ids_description
     assert "continuing an existing named session" in file_ids_description
+
+
+def test_parallel_description_requires_distinct_titles() -> None:
+    schema = _schema_with_subagent()
+    description = schema["function"]["description"]
+    title_description = schema["function"]["parameters"]["properties"]["title"]["description"]
+
+    assert "distinct task-based title" in description
+    assert "Every independent parallel call" in title_description
+    assert "cannot start another concurrent turn" in title_description
 
 
 # ── Happy paths ───────────────────────────────────────
@@ -105,9 +114,10 @@ def test_empty_file_ids_rejected() -> None:
         _validate({"input": "go", "file_ids": []})
 
 
-def test_duplicate_file_ids_rejected() -> None:
-    with pytest.raises(jsonschema.ValidationError):
-        _validate({"input": "go", "file_ids": ["file_abc", "file_abc"]})
+def test_duplicate_file_ids_allowed() -> None:
+    # uniqueItems was removed so non-OpenAI models don't reject the schema;
+    # duplicate file ids are deduplicated by the server handler instead.
+    _validate({"input": "go", "file_ids": ["file_abc", "file_abc"]})
 
 
 def test_empty_file_id_rejected() -> None:

@@ -82,6 +82,21 @@ describe("mergeItemsIntoPages", () => {
     expect(found).toEqual(new Set(["a"]));
   });
 
+  it("leaves a cached search_snippet intact when the wire omits the key", () => {
+    // search_snippet is search-only: the WS stream excludes it from its dump,
+    // so a changed/snapshot frame never carries the key. A key-absent overlay
+    // must NOT touch the snippet the search response put in the cache — this is
+    // what stops the palette's match preview from flickering away on a tick.
+    const before = data([conv("a", { search_snippet: "…setup.py test…" })]);
+    const items = new Map<string, SessionListWireItem>([["a", { id: "a", status: "running" }]]);
+
+    const { data: after } = mergeItemsIntoPages(before, items, DEFAULT_FILTERS, NO_ACTIVE);
+
+    // Snippet survives; only the field the frame carried is applied.
+    expect(after!.pages[0].data[0].search_snippet).toBe("…setup.py test…");
+    expect(after!.pages[0].data[0].status).toBe("running");
+  });
+
   it("returns the same data reference when nothing actually changed", () => {
     const before = data([conv("a", { status: "running" })]);
     // Wire item restates the current values — an idempotent snapshot replay.
@@ -254,6 +269,75 @@ describe("nullsToUndefined", () => {
   });
 });
 
+describe("mergeItemsIntoPages project-filtered membership", () => {
+  const alpha = filtersFromConversationQueryKey(["conversations", "", true, "Alpha"]);
+  const unfiltered = filtersFromConversationQueryKey(["conversations", "", true]);
+
+  it("evicts a row relabeled OUT of the selected project and flags a refetch", () => {
+    const before = data([
+      conv("a", { archived: true, labels: { omni_project: "Alpha" } }),
+      conv("b", { archived: true, labels: { omni_project: "Alpha" } }),
+    ]);
+    // A push-delta moves `a` from Alpha to Beta (full row, new labels).
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, labels: { omni_project: "Beta" } }],
+    ]);
+
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha, NO_ACTIVE);
+
+    // `a` no longer belongs in the Alpha cache; `b` (still Alpha) stays.
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["b"]);
+    expect(needsRefetch).toBe(true);
+  });
+
+  it("flags a refetch when a row is relabeled INTO a project so filtered variants reconcile", () => {
+    // The row lives in the unfiltered archived variant; a session moved into
+    // "Alpha" isn't in the Alpha-filtered cache yet, so only a server reconcile
+    // can place it. The label change here must trigger the prefix-wide refetch.
+    const before = data([conv("a", { archived: true, labels: {} })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, labels: { omni_project: "Alpha" } }],
+    ]);
+
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, unfiltered, NO_ACTIVE);
+
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
+    expect(needsRefetch).toBe(true);
+  });
+
+  it("keeps a row whose project still matches when a non-label field changes", () => {
+    const before = data([
+      conv("a", { archived: true, status: "idle", labels: { omni_project: "Alpha" } }),
+    ]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, status: "running", labels: { omni_project: "Alpha" } }],
+    ]);
+
+    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, alpha, NO_ACTIVE);
+
+    // Membership holds, so the row is patched in place (not evicted), and a
+    // status-only change needs no server reconcile.
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
+    expect(after!.pages[0].data[0].status).toBe("running");
+    expect(needsRefetch).toBe(false);
+  });
+
+  it("treats an empty-string project as 'all projects' (no membership constraint)", () => {
+    // The contract: a falsy project is "all projects", not a distinct "unfiled"
+    // slice (this list never requests unfiled). So gaining a label does NOT
+    // evict the row — matching the request, which omits `project=` for "".
+    const allProjects = filtersFromConversationQueryKey(["conversations", "", true, ""]);
+    const before = data([conv("a", { archived: true, labels: {} })]);
+    const items = new Map<string, SessionListWireItem>([
+      ["a", { id: "a", archived: true, labels: { omni_project: "Alpha" } }],
+    ]);
+
+    const { data: after } = mergeItemsIntoPages(before, items, allProjects, NO_ACTIVE);
+
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["a"]);
+  });
+});
+
 describe("filtersFromConversationQueryKey", () => {
   it("parses current conversation query keys", () => {
     expect(filtersFromConversationQueryKey(["conversations", "needle", true])).toEqual({
@@ -262,8 +346,22 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
+  it("parses the project-filtered four-element key", () => {
+    // The Archived picker appends `project`; the parser must accept it so the
+    // rename overlay / push-delta merge don't throw when this variant is cached.
+    expect(filtersFromConversationQueryKey(["conversations", "", true, "Design"])).toEqual({
+      searchQuery: "",
+      includeArchived: true,
+      project: "Design",
+    });
+  });
+
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
+      "Invalid conversations query key",
+    );
+    // A non-string project element is malformed and must fail loudly.
+    expect(() => filtersFromConversationQueryKey(["conversations", "", true, 5])).toThrow(
       "Invalid conversations query key",
     );
   });

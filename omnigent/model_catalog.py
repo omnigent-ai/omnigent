@@ -20,7 +20,11 @@ Enumeration is deterministic per provider kind:
   ``GET <base_url>/v1/models`` with a bearer token (source
   ``"openai-compatible"``).
 - ``subscription`` → a curated static list (source ``"static"``,
-  ``verified: false`` — CLI logins expose no listing API).
+  ``verified: false`` — CLI logins expose no listing API). The cursor
+  harnesses always resolve here: cursor-agent brings its own login.
+- ``cli-config`` → the codex curated static list (source ``"static"``,
+  ``verified: false`` — the credential lives in the CLI's own config
+  file and is resolved by the CLI at launch).
 - anything unresolvable → source ``"none"`` with an explanatory note,
   which doubles as a dead-worker preflight signal.
 """
@@ -43,6 +47,7 @@ from omnigent._platform import default_shell_argv
 from omnigent.model_override import model_family_mismatch
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
+    CLI_CONFIG_KIND,
     DATABRICKS_KIND,
     KEY_KIND,
     OPENAI_FAMILY,
@@ -121,6 +126,12 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, str] = {
     "native-antigravity": "antigravity",
 }
 
+# cursor-agent always routes through its own stored login — there is no
+# omnigent-side provider config for it to resolve (or fail), so resolution
+# short-circuits to a subscription-style readout instead of reporting the
+# harness as having "no model-provider resolution".
+_CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
+
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
@@ -176,8 +187,9 @@ class ResolvedModelProvider:
     """The model provider a worker's spawn/launch path would route through.
 
     :param kind: Provider kind — ``"key"`` / ``"gateway"`` / ``"local"``
-        / ``"subscription"`` / ``"databricks"`` from the provider config
-        layer, or ``"none"`` when no usable provider resolved.
+        / ``"subscription"`` / ``"databricks"`` / ``"cli-config"`` from
+        the provider config layer, or ``"none"`` when no usable provider
+        resolved.
     :param family: ``"anthropic"`` / ``"openai"`` for inline-family
         kinds, else ``None``.
     :param profile: Databricks profile for ``kind="databricks"``, e.g.
@@ -188,7 +200,8 @@ class ResolvedModelProvider:
         Never serialized into tool output.
     :param auth_command: Shell command printing a bearer token, for
         providers configured with a dynamic credential.
-    :param cli: ``"claude"`` / ``"codex"`` for ``kind="subscription"``.
+    :param cli: ``"claude"`` / ``"codex"`` / ``"cursor-agent"`` for
+        ``kind="subscription"``; ``"codex"`` for ``kind="cli-config"``.
     :param detail: Non-secret descriptor of how the provider resolved,
         e.g. ``"provider 'openrouter'"`` — used in listing notes.
     """
@@ -347,6 +360,11 @@ def _resolve_model_provider_unsafe(spec: Any, harness: str | None) -> ResolvedMo
     # Imported lazily; workflow.py imports broadly and this module is
     # consumed from the runner's dispatch path.
     from omnigent.runtime.workflow import _resolve_provider_for_build
+
+    if (harness or "") in _CURSOR_HARNESSES:
+        return ResolvedModelProvider(
+            kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
+        )
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
     if harness_type is None:
@@ -539,6 +557,20 @@ def _provider_from_entry(entry: ProviderEntry, harness_type: str) -> ResolvedMod
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli=entry.cli, detail=f"provider {entry.name!r}"
         )
+    if entry.kind == CLI_CONFIG_KIND:
+        # The provider table (base_url + credential) lives in the CLI's own
+        # config file and the CLI resolves it at launch — there is nothing
+        # to resolve statically here, so the entry is usable as-is. Falling
+        # through to the inline-family loop would misreport it as "no
+        # resolvable credentials" (cli-config entries carry no families).
+        return ResolvedModelProvider(
+            kind=CLI_CONFIG_KIND,
+            cli=entry.cli,
+            detail=(
+                f"provider {entry.name!r} (codex config.toml model provider "
+                f"{entry.model_provider!r})"
+            ),
+        )
     # Inline-family kinds: single-family harnesses get exactly their family;
     # pi takes the first whose credential resolves, anthropic preferred.
     preferred = _KEY_AUTH_FAMILY[harness_type] if harness_type != "pi" else None
@@ -728,6 +760,8 @@ def _listing_for_provider(
         )
     if provider.kind == SUBSCRIPTION_KIND:
         return _static_subscription_listing(provider)
+    if provider.kind == CLI_CONFIG_KIND:
+        return _static_cli_config_listing(provider)
 
     cache_key = _listing_cache_key(provider)
     with _listing_cache_lock:
@@ -765,7 +799,7 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
     :param provider: A ``kind="subscription"`` provider descriptor.
     :returns: A ``source="static"`` listing with ``verified=False``.
     """
-    ids = _SUBSCRIPTION_STATIC_MODELS.get(provider.cli or "", ())
+    ids = _subscription_static_ids(provider.cli or "")
     return ModelListing(
         source="static",
         verified=False,
@@ -774,6 +808,47 @@ def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListin
             f"curated aliases for the {provider.cli or 'unknown'} CLI login "
             "(subscription logins expose no model-listing API; availability "
             "depends on the logged-in plan)"
+        ),
+    )
+
+
+def _subscription_static_ids(cli: str) -> tuple[str, ...]:
+    """Return the curated model ids for a subscription CLI.
+
+    :param cli: The CLI short-name, e.g. ``"claude"`` or ``"cursor-agent"``.
+    :returns: Curated model ids; empty for an unknown CLI.
+    """
+    if cli == "cursor-agent":
+        # Reuse the web picker's curated base-model catalog (derived from
+        # ``cursor-agent models``); imported lazily to keep this module off
+        # the TUI launcher's import path.
+        from omnigent.cursor_native import cursor_base_model_options
+
+        return tuple(str(option["id"]) for option in cursor_base_model_options())
+    return _SUBSCRIPTION_STATIC_MODELS.get(cli, ())
+
+
+def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build the curated static listing for a ``cli-config`` provider.
+
+    A ``cli-config`` provider pins a custom ``[model_providers.X]`` table in
+    the codex CLI's own ``config.toml``; its credential (an auth command /
+    env key in that file) is resolved by codex at launch, so the listing is
+    the codex curated ids with a note saying the credential is the CLI's to
+    resolve — not a "no credentials" preflight failure.
+
+    :param provider: A ``kind="cli-config"`` provider descriptor.
+    :returns: A ``source="static"`` listing with ``verified=False``.
+    """
+    ids = _SUBSCRIPTION_STATIC_MODELS.get(provider.cli or "", ())
+    return ModelListing(
+        source="static",
+        verified=False,
+        models=tuple(ModelEntry(id=i, family=model_family_token(i)) for i in ids),
+        note=(
+            f"curated ids for {provider.detail}; its credential lives in the "
+            "CLI's own config file and is resolved by the CLI at launch, so "
+            "it cannot be verified from here"
         ),
     )
 

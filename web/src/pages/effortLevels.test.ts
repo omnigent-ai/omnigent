@@ -5,6 +5,7 @@ import {
   effortLevelsForConv,
   shouldShowCodexPlanModeControl,
   shouldShowEffortPicker,
+  shouldShowGoalControl,
   shouldShowModelPicker,
 } from "./ChatPage";
 
@@ -161,5 +162,16 @@ describe("shouldShowCodexPlanModeControl", () => {
     ).toBe(false);
     expect(shouldShowCodexPlanModeControl({ labels: { "omnigent.ui": "terminal" } })).toBe(false);
     expect(shouldShowCodexPlanModeControl(null)).toBe(false);
+  });
+});
+
+describe("shouldShowGoalControl", () => {
+  it("keeps the goal control Codex-only until a generic capability exists", () => {
+    expect(shouldShowGoalControl({ labels: { "omnigent.wrapper": "codex-native-ui" } })).toBe(true);
+    expect(shouldShowGoalControl({ labels: { "omnigent.wrapper": "claude-code-native-ui" } })).toBe(
+      false,
+    );
+    expect(shouldShowGoalControl({ labels: {} })).toBe(false);
+    expect(shouldShowGoalControl(null)).toBe(false);
   });
 });

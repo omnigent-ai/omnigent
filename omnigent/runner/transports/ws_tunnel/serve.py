@@ -312,6 +312,12 @@ async def serve_tunnel(
         except WebSocketException as exc:
             redirect_url = _websocket_auth_redirect_url(exc)
             if redirect_url is not None:
+                if _invalidate_auth_token_factory(auth_token_factory):
+                    auth_token = await _handle_refreshable_auth_failure(
+                        auth_token_factory, 302, exc
+                    )
+                    delay_s = _INITIAL_RECONNECT_DELAY_S
+                    continue
                 # The websockets library auto-followed a redirect
                 # away from our ws:// endpoint to an http(s):// URL
                 # — typically a Databricks App login page when the
@@ -328,6 +334,7 @@ async def serve_tunnel(
                 ) from exc
             http_status = _websocket_http_status(exc)
             if http_status in _REFRESHABLE_HTTP_STATUSES:
+                _invalidate_auth_token_factory(auth_token_factory)
                 auth_token = await _handle_refreshable_auth_failure(
                     auth_token_factory, http_status, exc
                 )
@@ -374,6 +381,18 @@ async def serve_tunnel(
         # promptly at the base delay instead of doubling toward the cap.
         if not recycle:
             delay_s = min(delay_s * 2, _MAX_RECONNECT_DELAY_S)
+
+
+def _invalidate_auth_token_factory(factory: Callable[[], str | None] | None) -> bool:
+    """Invalidate a host-bootstrap bearer when the factory supports it.
+
+    :param factory: Runner token factory, or ``None``.
+    :returns: ``True`` when an initial host bearer was invalidated.
+    """
+    invalidate = getattr(factory, "invalidate", None)
+    if not callable(invalidate):
+        return False
+    return bool(invalidate())
 
 
 async def _refresh_auth_token(
@@ -583,11 +602,22 @@ async def _send_hello(
         frame, e.g. ``"0.1.0"``.
     :returns: None.
     """
+    # Signal host-side telemetry opt-out to the server so it can honour
+    # it on a best-effort basis when emitting session events.
+    _tel_opt_out = False
+    try:
+        from omnigent.telemetry.client import is_disabled as _tel_disabled
+
+        _tel_opt_out = _tel_disabled()
+    except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
+        pass
+
     await send_text(
         encode_frame(
             HelloFrame(
                 runner_version=runner_version,
                 frame_protocol_version=1,
+                telemetry_opt_out=_tel_opt_out,
                 harnesses=[
                     "claude-native",
                     "claude-sdk",

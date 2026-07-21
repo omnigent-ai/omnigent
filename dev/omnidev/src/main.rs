@@ -77,6 +77,11 @@ struct RunArgs {
     /// Wipe the pod directory before starting.
     #[arg(long)]
     clean: bool,
+
+    /// Log every observed file change and whether it triggers a backend reload
+    /// (with the skip reason otherwise).
+    #[arg(long)]
+    debug: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -188,7 +193,13 @@ async fn run_supervisor(args: RunArgs) -> Result<()> {
 
     // File watcher: Python changes -> Reload commands. Keep the debouncer alive
     // for the whole session.
-    let _watcher = watcher::spawn(&pod.omnigent_dir(), cmd_tx.clone())?;
+    let _watcher = watcher::spawn(
+        &pod.repo_root,
+        &pod.omnigent_dir(),
+        shared.clone(),
+        args.debug,
+        cmd_tx.clone(),
+    )?;
 
     // Supervisor runs on the tokio runtime; the TUI drives it via cmd_tx.
     let supervisor = Supervisor::new(

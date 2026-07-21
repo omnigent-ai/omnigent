@@ -165,6 +165,64 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "AutomaticSessionRenameRequest": {
+        "additionalProperties": false,
+        "description": "Request body for the current-agent automatic rename endpoint.",
+        "properties": {
+          "title": {
+            "maxLength": 60,
+            "minLength": 2,
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "title": "AutomaticSessionRenameRequest",
+        "type": "object"
+      },
+      "AutomaticSessionRenameResponse": {
+        "description": "Result of a conditional automatic session rename.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "not_top_level",
+                  "no_seed",
+                  "title_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "renamed": {
+            "title": "Renamed",
+            "type": "boolean"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "renamed"
+        ],
+        "title": "AutomaticSessionRenameResponse",
+        "type": "object"
+      },
       "Body_update_session_agent_v1_sessions__session_id__agent_put": {
         "properties": {
           "bundle": {
@@ -191,6 +249,53 @@
           "file"
         ],
         "title": "Body_upload_session_file_v1_sessions__session_id__resources_files_post",
+        "type": "object"
+      },
+      "BrowserActionRequestEvent": {
+        "description": "Request that the desktop renderer perform one browser action.\n\nEmitted by the server `POST /v1/sessions/{id}/browser/action_request`\nroute when a runner-side `browser_*` tool dispatch needs the\nOmnigent desktop app's embedded browser to act. The event fans out\non the session stream to every subscribed renderer; each renderer\nfirst POSTs `/browser/action_claim/{action_id}` and only the\nwinning claimant executes the action and POSTs the result back to\n`/browser/action_result/{action_id}`. The claim lease prevents\ndouble execution when more than one renderer is subscribed.",
+        "properties": {
+          "action": {
+            "description": "The browser action to perform \u2014 the `browser_` tool name with the prefix stripped, e.g. `\"navigate\"`, `\"snapshot\"`, `\"click\"`, `\"type\"`, `\"screenshot\"`.",
+            "title": "Action",
+            "type": "string"
+          },
+          "action_id": {
+            "description": "Unique correlation id for this request, e.g. `\"baction_abc123\"`. Echoed on the claim and result routes.",
+            "title": "Action Id",
+            "type": "string"
+          },
+          "args": {
+            "additionalProperties": true,
+            "description": "Action arguments forwarded from the tool call, e.g. `{\"url\": \"https://example.com\"}`.",
+            "title": "Args",
+            "type": "object"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "browser.action_request",
+            "description": "Always `\"browser.action_request\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "action_id",
+          "action",
+          "args"
+        ],
+        "title": "BrowserActionRequestEvent",
         "type": "object"
       },
       "CancelledEvent": {
@@ -1606,6 +1711,105 @@
         "title": "HeartbeatEvent",
         "type": "object"
       },
+      "ImportItemInput": {
+        "description": "One normalized existing Omnigent item received from the CLI.",
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "title": "Data",
+            "type": "object"
+          },
+          "response_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Response Id",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "response_id",
+          "data"
+        ],
+        "title": "ImportItemInput",
+        "type": "object"
+      },
+      "ImportSessionRequest": {
+        "description": "Request body for importing one local harness session.",
+        "properties": {
+          "external_session_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "External Session Id",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ImportItemInput"
+            },
+            "maxItems": 100000,
+            "minItems": 1,
+            "title": "Items",
+            "type": "array"
+          },
+          "source": {
+            "enum": [
+              "claude",
+              "codex"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "source",
+          "external_session_id",
+          "items"
+        ],
+        "title": "ImportSessionRequest",
+        "type": "object"
+      },
+      "ImportSessionResponse": {
+        "description": "Result of importing or locating one source session.",
+        "properties": {
+          "item_count": {
+            "title": "Item Count",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "imported",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "status",
+          "item_count"
+        ],
+        "title": "ImportSessionResponse",
+        "type": "object"
+      },
       "InProgressEvent": {
         "description": "Event emitted once the task transitions to in-progress.\n\nAlways follows `response.created` (and `response.queued`\nfor background tasks).",
         "properties": {
@@ -1720,7 +1924,7 @@
         "type": "object"
       },
       "MCPServerSummary": {
-        "description": "Safe subset of an MCP server's configuration for API exposure.\n\nSecret-bearing fields (`headers`, `env`) are intentionally\nexcluded. This model is the wire shape returned inside\n`AgentObject` so clients can display which MCP servers\nan agent is connected to without leaking credentials.",
+        "description": "Safe subset of an MCP server's configuration for API exposure.\n\nHeader values are redacted (`\"[REDACTED]\"`) so callers can see\nwhich headers are configured without leaking the actual secrets.\n`env` is still fully excluded.",
         "properties": {
           "args": {
             "description": "Command-line arguments for `transport=\"stdio\"` servers, e.g. `[\"mcp-server-github\"]`. Empty list when unset.",
@@ -1754,6 +1958,14 @@
             "description": "Optional free-text description from the spec, e.g. `\"GitHub MCP server\"`. `None` when unset.",
             "title": "Description"
           },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "HTTP headers for `transport=\"http\"` servers. Values are always `\"[REDACTED]\"`; only the key names are exposed.",
+            "title": "Headers",
+            "type": "object"
+          },
           "name": {
             "description": "Server name as declared in the agent spec, e.g. `\"github\"`.",
             "title": "Name",
@@ -1782,6 +1994,39 @@
           "transport"
         ],
         "title": "MCPServerSummary",
+        "type": "object"
+      },
+      "McpServerStartup": {
+        "description": "One MCP server's startup state within a `session.mcp_startup` event.",
+        "properties": {
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Failure detail when `status == \"failed\"`, e.g. `\"handshaking with MCP server failed\"`. `None` otherwise.",
+            "title": "Error"
+          },
+          "status": {
+            "description": "Latest startup state reported by the harness, mirroring Codex's `McpServerStartupState` enum.",
+            "enum": [
+              "starting",
+              "ready",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "McpServerStartup",
         "type": "object"
       },
       "MessageData": {
@@ -2915,6 +3160,7 @@
       "ServerStreamEvent": {
         "discriminator": {
           "mapping": {
+            "browser.action_request": "#/components/schemas/BrowserActionRequestEvent",
             "response.cancelled": "#/components/schemas/CancelledEvent",
             "response.client_task.cancel": "#/components/schemas/ClientTaskCancelEvent",
             "response.compaction.completed": "#/components/schemas/CompactionCompletedEvent",
@@ -2926,6 +3172,7 @@
             "response.elicitation_resolved": "#/components/schemas/ElicitationResolvedEvent",
             "response.error": "#/components/schemas/ErrorEvent",
             "response.failed": "#/components/schemas/FailedEvent",
+            "response.function_call_output.delta": "#/components/schemas/ToolOutputDeltaEvent",
             "response.heartbeat": "#/components/schemas/HeartbeatEvent",
             "response.in_progress": "#/components/schemas/InProgressEvent",
             "response.incomplete": "#/components/schemas/IncompleteEvent",
@@ -2946,6 +3193,7 @@
             "session.heartbeat": "#/components/schemas/SessionHeartbeatEvent",
             "session.input.consumed": "#/components/schemas/SessionInputConsumedEvent",
             "session.interrupted": "#/components/schemas/SessionInterruptedEvent",
+            "session.mcp_startup": "#/components/schemas/SessionMcpStartupEvent",
             "session.model": "#/components/schemas/SessionModelEvent",
             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
             "session.presence": "#/components/schemas/SessionPresenceEvent",
@@ -2996,6 +3244,9 @@
             "$ref": "#/components/schemas/SessionSandboxStatusEvent"
           },
           {
+            "$ref": "#/components/schemas/SessionMcpStartupEvent"
+          },
+          {
             "$ref": "#/components/schemas/SessionSkillsEvent"
           },
           {
@@ -3035,6 +3286,9 @@
             "$ref": "#/components/schemas/OutputTextDeltaEvent"
           },
           {
+            "$ref": "#/components/schemas/ToolOutputDeltaEvent"
+          },
+          {
             "$ref": "#/components/schemas/ReasoningStartedEvent"
           },
           {
@@ -3060,6 +3314,9 @@
           },
           {
             "$ref": "#/components/schemas/ElicitationResolvedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/BrowserActionRequestEvent"
           },
           {
             "$ref": "#/components/schemas/PolicyDeniedEvent"
@@ -3814,6 +4071,17 @@
             "description": "The user_id of the session owner, or `None` when permissions are disabled. Included so the sidebar can display the owner without a separate API call.",
             "title": "Owner"
           },
+          "parent_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Session Id"
+          },
           "pending_elicitations_count": {
             "default": 0,
             "description": "Number of approval prompts currently waiting on this session. Powers the sidebar's \"needs attention\" badge so a user with several sessions running can tell which ones are blocked on them without opening each chat. Sourced from the Omnigent server's in-memory `omnigent.runtime.pending_elicitations` index, which mirrors every `response.elicitation_request` event passing through `session_stream` and decrements when a verdict is dispatched. `0` when the session has no outstanding elicitations.",
@@ -3867,6 +4135,18 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. Matches `GET /health`'s `runner_online` value. Strict: a dead runner on a live host reads `False` here (no host-relaunch optimism folded in), unlike the legacy conflated value. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "search_snippet": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Excerpt of the chat content that matched the request's `search_query`, centered on the match with `\u2026` marking elided ends, so the search UI can show *where* a session matched in its body. Present whenever the query hit an item body (even if the title also matched); `None` on non-search reads and when only the title matched.",
+            "title": "Search Snippet"
           },
           "status": {
             "description": "Derived session lifecycle status.",
@@ -3935,6 +4215,49 @@
           "updated_at"
         ],
         "title": "SessionListItem",
+        "type": "object"
+      },
+      "SessionMcpStartupEvent": {
+        "description": "Per-MCP-server startup progress for a native harness session.\n\nA codex-native session brings up its configured MCP servers when its\nCodex thread starts; slow or failing servers previously left the web\nsession looking hung with no signal. The native forwarder mirrors\nCodex's `mcpServer/startupStatus/updated` notifications as\n`external_mcp_startup` posts, republished here so the web UI can\nshow which servers are still starting and which failed or were\ncancelled.",
+        "properties": {
+          "conversation_id": {
+            "description": "Session identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "servers": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/McpServerStartup"
+            },
+            "description": "Latest per-server startup map, e.g. `{\"safe\": {\"status\": \"starting\", \"error\": None}}`. Category: **transient** (SSE + snapshot cache). Not persisted; a client connecting mid-startup seeds from the session snapshot's `mcp_startup` field and updates live off this event.",
+            "title": "Servers",
+            "type": "object"
+          },
+          "type": {
+            "const": "session.mcp_startup",
+            "description": "Always `\"session.mcp_startup\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "servers"
+        ],
+        "title": "SessionMcpStartupEvent",
         "type": "object"
       },
       "SessionModelEvent": {
@@ -4497,6 +4820,20 @@
             ],
             "description": "The LLM model identifier from the bound agent's spec, e.g. `\"anthropic/claude-sonnet-4-6\"`. `None` when the agent has no explicit `llm:` block or the agent cannot be looked up.",
             "title": "Llm Model"
+          },
+          "mcp_startup": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/McpServerStartup"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Startup"
           },
           "model_options": {
             "description": "Codex app-server `model/list` options for codex-native sessions, including each model's supported reasoning efforts. Empty for non-codex-native sessions or while the bound runner / Codex app-server cannot answer yet.",
@@ -5244,6 +5581,35 @@
         "title": "SetCodexGoalRequest",
         "type": "object"
       },
+      "SetSharingRequest": {
+        "description": "Body for `PUT /v1/sharing`.\n\nBoth fields are optional so an admin can update either setting\nindependently; at least one must be present.",
+        "properties": {
+          "public_sharing": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Public Sharing"
+          },
+          "sharing_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sharing Mode"
+          }
+        },
+        "title": "SetSharingRequest",
+        "type": "object"
+      },
       "SkillSummary": {
         "description": "Safe subset of a discovered skill for API exposure.\n\nSurfaces the skill name and one-line description so clients\n(e.g. the web composer's slash-command menu) can list which\nskills the session has access to. The full skill `content`\nis intentionally omitted \u2014 it's only loaded server-side when\nthe harness invokes the skill, and it can be large.",
         "properties": {
@@ -5366,6 +5732,46 @@
           "kind"
         ],
         "title": "TerminalCommandData",
+        "type": "object"
+      },
+      "ToolOutputDeltaEvent": {
+        "description": "Incremental output from an in-progress function call.",
+        "properties": {
+          "call_id": {
+            "description": "Function-call correlation id.",
+            "title": "Call Id",
+            "type": "string"
+          },
+          "delta": {
+            "description": "Command stdout/stderr fragment.",
+            "title": "Delta",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "response.function_call_output.delta",
+            "description": "Always `\"response.function_call_output.delta\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "call_id",
+          "delta"
+        ],
+        "title": "ToolOutputDeltaEvent",
         "type": "object"
       },
       "TurnCancelledEvent": {
@@ -5790,7 +6196,7 @@
         "type": "object"
       },
       "UpsertMCPServerRequest": {
-        "description": "Request body for creating or updating a session agent MCP server.\n\nSecret-bearing fields (`headers` and `env`) are intentionally\nnot accepted by the UI route. Existing secrets are preserved when a\nserver is edited without changing transport.",
+        "description": "Request body for creating or updating a session agent MCP server.\n\n`env` is still excluded. `headers` is accepted for HTTP servers;\nwhen omitted, existing headers in the bundle are preserved unchanged.",
         "properties": {
           "args": {
             "items": {
@@ -5822,6 +6228,20 @@
               }
             ],
             "title": "Description"
+          },
+          "headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headers"
           },
           "name": {
             "maxLength": 128,
@@ -6671,9 +7091,51 @@
         ]
       }
     },
+    "/v1/imports": {
+      "post": {
+        "description": "Import one normalized transcript, rejecting duplicate sources.",
+        "operationId": "import_session_v1_imports_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportSessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Session",
+        "tags": [
+          "imports"
+        ]
+      }
+    },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`),\nthe short sandbox\nprovider name (`sandbox_provider`) the web UI labels the\nnew-session sandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {
@@ -7048,7 +7510,7 @@
     },
     "/v1/runners/{runner_id}/token": {
       "post": {
-        "description": "Mint a short-lived owner bearer for a managed-sandbox runner.\n\nA managed sandbox runner has no user credential of its own; it\npresents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and managed sandboxes always run\ntoken-bound (no allow-list).\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
+        "description": "Mint a short-lived owner bearer for a delegated runner.\n\nA host-launched or managed-sandbox runner does not inherit the host\nuser's credential; it presents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and delegated runners are token-bound.\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
         "operationId": "mint_runner_owner_token_v1_runners__runner_id__token_post",
         "parameters": [
           {
@@ -7853,6 +8315,59 @@
         "summary": "Update Mcp Server",
         "tags": [
           "session_mcp_servers"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/auto-title": {
+      "post": {
+        "description": "Replace the deterministic first-message title when still current.",
+        "operationId": "automatically_rename_session_v1_sessions__session_id__auto_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Automatically Rename Session",
+        "tags": [
+          "sessions"
         ]
       }
     },
@@ -9069,7 +9584,7 @@
         ]
       },
       "patch": {
-        "description": "Update a session policy's mutable fields.\n\n`type` is immutable \u2014 the caller must delete and\nre-create to change it. Requires `LEVEL_EDIT`.\n\n**Parameters**\n\n- `body` \u2014 Fields to update; `None` fields are left unchanged.\n\n**Returns:** The updated policy as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks edit permission, or 404 if the policy is not found.",
+        "description": "Update a session policy's mutable fields.\n\n`type` is immutable \u2014 the caller must delete and\nre-create to change it. Requires `LEVEL_EDIT`.\n\n**Parameters**\n\n- `body` \u2014 Fields to update; `None` fields are left unchanged.\n\n**Returns:** The updated policy as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks edit permission, 404 if the policy is not found, or 409 if renaming would collide with another policy in this session.",
         "operationId": "update_policy_v1_sessions__session_id__policies__policy_id__patch",
         "parameters": [
           {
@@ -10718,6 +11233,72 @@
         "summary": "Fork Session",
         "tags": [
           "sessions"
+        ]
+      }
+    },
+    "/v1/sharing": {
+      "get": {
+        "description": "Report both settings, whether each is editable here, and the tiers.",
+        "operationId": "get_sharing_v1_sharing_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Sharing V1 Sharing Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Sharing",
+        "tags": [
+          "sharing"
+        ]
+      },
+      "put": {
+        "description": "Set the sharing mode and/or public-access setting (admin only).\n\nUpdates only the fields present in the body; requires at least one.\nRejects an unknown mode value with 400 (no fail-open coercion \u2014 an admin\nsetting a value should learn about a typo). Rejects a write to a setting\nthe deployment manages itself (not file-backed) with 403.",
+        "operationId": "set_sharing_v1_sharing_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSharingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Sharing V1 Sharing Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Sharing",
+        "tags": [
+          "sharing"
         ]
       }
     }

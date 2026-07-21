@@ -30,6 +30,20 @@ Generate the description from the actual diff and this session's context — lea
 with the motivation, then the change. Don't pass a `--body` that skips these
 sections.
 
+## Finishing a task
+
+When you finish a task, print instructions to the user on how to test it: the
+commands to run, the inputs to provide, or the steps to reproduce so they can
+verify the result themselves. Don't leave the user guessing how to confirm the
+work — tell them exactly what to do.
+
+## Deprecating features
+
+When deprecating a feature, note the version in which it is expected to be
+removed so we can clean it up when that version ships. Call out the deprecation
+version in code (e.g. a `@deprecated` tag or comment naming the target release)
+and in the PR/commit description, so there's a clear marker to act on later.
+
 ## Code comments
 
 Keep comments short and focused on the code, not on the change history.
@@ -41,3 +55,17 @@ Keep comments short and focused on the code, not on the change history.
   *why* it exists, in terms a future reader needs. Don't reference PR numbers,
   issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
   should be clear without chasing external links.
+
+## Framework-owned instructions
+
+Keep runtime lifecycle and metadata instructions separate from portable agent
+instructions:
+
+- Agent-spec and per-request instructions are user-authored. Framework-owned
+  instructions are additive runtime behavior and are appended after them in
+  `omnigent/runtime/prompt.py`.
+- Keep the canonical instruction text and lifecycle gate in the owning framework
+  module. Harness adapters should only transport the composed instructions; do
+  not duplicate policy across adapters or add lifecycle metadata to `AgentSpec`.
+- If framework instructions grow beyond a small ordered list, introduce a
+  structured `FrameworkInstructions` value at the prompt-composition boundary.

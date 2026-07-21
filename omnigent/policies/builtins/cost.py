@@ -907,7 +907,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                 },
                 "expensive_models": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "x-enum-source": "models"},
                     "description": "Optional case-insensitive substring tokens for the model "
                     "tiers blocked once over budget. Omit (or pass []) for a true hard stop "
                     "that blocks all models; pass a non-empty list for a downgrade gate that "
@@ -943,7 +943,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                 },
                 "expensive_models": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {"type": "string", "x-enum-source": "models"},
                     "description": "Optional case-insensitive substring tokens for the model "
                     "tiers blocked once over the daily budget. Omit (or pass []) for a true "
                     "hard stop that blocks all models; pass a non-empty list for a downgrade "

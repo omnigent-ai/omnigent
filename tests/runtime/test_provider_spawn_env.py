@@ -94,6 +94,7 @@ def _make_spec(
     harness: str,
     model: str | None = None,
     profile: str | None = None,
+    use_responses: object | None = None,
     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None,
     os_env: object | None = None,
 ) -> AgentSpec:
@@ -105,6 +106,8 @@ def _make_spec(
     :param model: Spec-level model, e.g. ``"my-model"``. ``None`` omits it
         so the provider family's ``models.default`` supplies the model.
     :param profile: Legacy ``executor.config["profile"]``. ``None`` omits it.
+    :param use_responses: ``executor.config["use_responses"]``. ``None`` omits
+        it; strings model values produced by standard bundle parsing.
     :param auth: Typed auth on ``spec.executor.auth``. ``None`` omits it, so
         the no-auth global-default provider path applies.
     :returns: A populated :class:`AgentSpec`.
@@ -114,6 +117,8 @@ def _make_spec(
         config["model"] = model
     if profile is not None:
         config["profile"] = profile
+    if use_responses is not None:
+        config["use_responses"] = use_responses
     return AgentSpec(
         spec_version=1,
         name=f"test-{harness}",
@@ -424,6 +429,26 @@ def test_openai_agents_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_OPENAI_AGENTS_MODEL"] == "gpt-default-model"
     # No DATABRICKS enable flag for this harness (executor takes key directly).
     assert "HARNESS_OPENAI_AGENTS_DATABRICKS" not in env
+
+
+@pytest.mark.parametrize(
+    ("use_responses", "expected"),
+    [("False", "false"), ("True", "true")],
+)
+def test_openai_agents_provider_preserves_use_responses_flag(
+    config_home: Path, use_responses: str, expected: str
+) -> None:
+    """The provider early-return path also interprets stringified flags."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(
+        harness="openai-agents",
+        model="gpt-test",
+        use_responses=use_responses,
+    )
+
+    env = _build_openai_agents_sdk_spawn_env(spec)
+
+    assert env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] == expected
 
 
 def test_pi_uses_anthropic_global_default(config_home: Path) -> None:
@@ -1299,3 +1324,145 @@ def test_kimi_os_env_serialized(config_home: Path) -> None:
     assert "HARNESS_KIMI_OS_ENV" in env
     decoded = _json.loads(env["HARNESS_KIMI_OS_ENV"])
     assert decoded["sandbox"]["type"] == "darwin_seatbelt"
+
+
+# ---------------------------------------------------------------------------
+# harness.<canonical>.command → OMNIGENT_<NAME>_PATH (spawn-env builders)
+# ---------------------------------------------------------------------------
+
+
+def _call_builder(builder: object, spec: AgentSpec) -> dict[str, str]:  # type: ignore[explicit-any]
+    """Invoke a spawn-env builder, papering over the ``workdir`` signature split.
+
+    ``_build_kimi_spawn_env`` takes only ``cwd``; the others accept ``workdir``
+    too. Pass ``cwd=None`` / ``workdir=None`` as appropriate so the path-override
+    tests don't depend on the bundle-dir plumbing.
+    """
+    import inspect
+
+    params = inspect.signature(builder).parameters  # type: ignore[arg-type]
+    kwargs: dict[str, object] = {"cwd": None}
+    if "workdir" in params:
+        kwargs["workdir"] = None
+    return builder(spec, **kwargs)  # type: ignore[operator, return-value]
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder", "env_var"),
+    [
+        ("codex", _build_codex_spawn_env, "OMNIGENT_CODEX_PATH"),
+        ("pi", _build_pi_spawn_env, "OMNIGENT_PI_PATH"),
+        ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
+        ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
+        ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+    ],
+)
+def test_spawn_env_threads_config_command_to_path(
+    config_home: Path,
+    harness: str,
+    builder: object,
+    env_var: str,
+) -> None:
+    """A config ``harness.<canonical>.command`` lands as ``OMNIGENT_<NAME>_PATH``."""
+    cfg = _openai_default_config()
+    cfg["harness"] = {harness: {"command": "/custom/bin"}}
+    _write_config(config_home, cfg)
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    assert env[env_var] == "/custom/bin"
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder", "env_var"),
+    [
+        ("codex", _build_codex_spawn_env, "OMNIGENT_CODEX_PATH"),
+        ("pi", _build_pi_spawn_env, "OMNIGENT_PI_PATH"),
+        ("kimi", _build_kimi_spawn_env, "OMNIGENT_KIMI_PATH"),
+        ("goose", _build_goose_spawn_env, "OMNIGENT_GOOSE_PATH"),
+        ("qwen", _build_qwen_spawn_env, "OMNIGENT_QWEN_PATH"),
+    ],
+)
+def test_spawn_env_ambient_env_wins_over_config_command(
+    monkeypatch: pytest.MonkeyPatch,
+    config_home: Path,
+    harness: str,
+    builder: object,
+    env_var: str,
+) -> None:
+    """The ambient ``OMNIGENT_<NAME>_PATH`` env var wins over config ``command``."""
+    cfg = _openai_default_config()
+    cfg["harness"] = {harness: {"command": "/config/bin"}}
+    _write_config(config_home, cfg)
+    monkeypatch.setenv(env_var, "/ambient/bin")
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    # The builder does not override the ambient env var; config is skipped.
+    assert env_var not in env or env[env_var] != "/config/bin"
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder"),
+    [
+        ("codex", _build_codex_spawn_env),
+        ("pi", _build_pi_spawn_env),
+        ("kimi", _build_kimi_spawn_env),
+        ("goose", _build_goose_spawn_env),
+        ("qwen", _build_qwen_spawn_env),
+    ],
+)
+def test_spawn_env_no_command_emits_no_path(
+    config_home: Path,
+    harness: str,
+    builder: object,
+) -> None:
+    """With no config ``command`` and no ambient env var, no ``*_PATH`` is emitted."""
+    _write_config(config_home, _openai_default_config())
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    suffix = harness.upper()
+    # Neither the canonical OMNIGENT_* nor the legacy HARNESS_* is emitted.
+    assert f"OMNIGENT_{suffix}_PATH" not in env
+    assert f"HARNESS_{suffix}_PATH" not in env
+
+
+@pytest.mark.parametrize(
+    ("harness", "builder"),
+    [
+        ("codex", _build_codex_spawn_env),
+        ("pi", _build_pi_spawn_env),
+        ("kimi", _build_kimi_spawn_env),
+        ("goose", _build_goose_spawn_env),
+        ("qwen", _build_qwen_spawn_env),
+    ],
+)
+def test_spawn_env_legacy_env_wins_over_config_command(
+    monkeypatch: pytest.MonkeyPatch,
+    config_home: Path,
+    harness: str,
+    builder: object,
+) -> None:
+    """A deprecated ``HARNESS_<NAME>_PATH`` env var wins over config ``command``.
+
+    Per ``env > config``, the legacy env var must not be shadowed by config.
+    """
+    from omnigent.harness_startup_config import _LEGACY_PATH_WARNED
+
+    legacy_var = f"HARNESS_{harness.upper()}_PATH"
+    _LEGACY_PATH_WARNED.discard(legacy_var)
+    monkeypatch.delenv(f"OMNIGENT_{harness.upper()}_PATH", raising=False)
+    monkeypatch.setenv(legacy_var, "/legacy/bin")
+    cfg = _openai_default_config()
+    cfg["harness"] = {harness: {"command": "/config/bin"}}
+    _write_config(config_home, cfg)
+    spec = _make_spec(harness=harness)
+
+    env = _call_builder(builder, spec)
+
+    # The builder must not set OMNIGENT_* from config when the legacy env wins.
+    assert f"OMNIGENT_{harness.upper()}_PATH" not in env

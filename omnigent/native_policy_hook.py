@@ -201,15 +201,21 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     ``401`` — so a hook that only treats ``401`` as auth failure silently fails
     closed once the one-shot ``ap_auth_headers`` token (snapshotted at launch by
     ``build_hook_settings``) lapses with the ~1h Databricks OAuth lifetime.
-    Treat both the 401 and the OAuth-login redirect as a re-auth signal.
+    Treat the 401, 403 "Invalid Token", and the OAuth-login redirect as
+    re-auth signals.
 
     Unrelated 3xx (an application-level redirect to another resource) return
     ``False`` so the caller does not waste a token round-trip on every redirect.
 
+    Note: Databricks Apps returns 403 (not 401) with body "Invalid Token"
+    when a bearer has expired, in addition to the 302→``/oidc/`` bounce. A
+    caller that only watches for 401 and the redirect silently fails closed
+    on sessions older than ~1h.
+
     :param response: The hook's POST response to classify.
     :returns: ``True`` when the caller should re-mint a token and retry.
     """
-    if response.status_code == 401:
+    if response.status_code in (401, 403):
         return True
     if not response.is_redirect:
         return False

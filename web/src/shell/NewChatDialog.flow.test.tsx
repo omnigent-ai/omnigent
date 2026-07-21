@@ -50,7 +50,10 @@ vi.mock("@/store/chatStore", () => ({
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/hooks/useAvailableAgents", () => ({
+  useAvailableAgents: vi.fn(),
+  prefetchAvailableAgentDetails: vi.fn(),
+}));
 // The home listing is only consulted when there's no recent; the recent is
 // always set here, so keep this inert (returns no listing).
 vi.mock("@/hooks/useHostFilesystem", () => ({
@@ -228,6 +231,46 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.labels).toBeUndefined();
 
     // On success the screen routes to the freshly created session.
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
+  });
+
+  it("shows a busy spinner on the submit button while the create is in flight", async () => {
+    // The create awaits the backend (session bootstrap + worktree setup) before
+    // navigating, so the landing screen lingers for the whole round-trip. Hold
+    // the POST open with a deferred promise to freeze that window, and assert
+    // the submit button flips to a busy/spinning state so the click reads as
+    // "working", not "frozen". Without feedback the button just goes inert and
+    // the message sits in the composer, so the user thinks nothing was sent.
+    let resolveCreate!: (res: Response) => void;
+    vi.mocked(authenticatedFetch).mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolveCreate = resolve;
+      }) as ReturnType<typeof authenticatedFetch>,
+    );
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    // Before submitting, the button is idle: enabled, not busy, arrow (no spin).
+    expect(submit).not.toBeDisabled();
+    expect(submit).toHaveAttribute("aria-busy", "false");
+    expect(submit.querySelector(".animate-spin")).toBeNull();
+
+    fireEvent.click(submit);
+
+    // While the POST is pending the button is disabled + aria-busy, its label
+    // reflects the in-flight state, and the spinner icon is mounted.
+    await waitFor(() => expect(submit).toBeDisabled());
+    expect(submit).toHaveAttribute("aria-busy", "true");
+    expect(submit).toHaveAttribute("aria-label", "Starting session");
+    expect(submit.querySelector(".animate-spin")).not.toBeNull();
+    // Navigation hasn't happened yet — we're still in the "frozen" window.
+    expect(navigateMock).not.toHaveBeenCalled();
+
+    // Let the backend respond: the flow completes and navigates away.
+    resolveCreate({ ok: true, json: async () => ({ id: "conv_new" }) } as unknown as Response);
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new"));
   });
 

@@ -16,7 +16,7 @@
 
 import { useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { authenticatedFetch } from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 
@@ -26,6 +26,31 @@ function useSessionActive(conversationId: string | undefined): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   if (!conversationId || conversationId !== focusedId) return false;
   return sessionStatus === "running" || sessionStatus === "waiting";
+}
+
+/**
+ * Whether the workspace file panel can be served for this session.
+ *
+ * `false` only when we *know* neither source can answer: the runner is
+ * offline AND the host is offline or not host-bound. While either liveness
+ * is still unknown the query is allowed to fire — an offline runner with a
+ * live host is served over the host tunnel, and if the host turns out to be
+ * down the query just 503s and shows the reconnect hint anyway.
+ *
+ * Returns `false` to disable the query, or `true`/`undefined` (unknown)
+ * to let it run — matching the tri-state semantics the query `enabled`
+ * gates expect.
+ */
+export function useWorkspaceServeable(conversationId: string | undefined): boolean | undefined {
+  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const hostOnline = useSessionHostOnline(conversationId);
+  if (runnerOnline !== false) return runnerOnline; // online or unknown → serve
+  // Runner known-offline: block only when the host is *known* unavailable
+  // (`false` down, `null` not host-bound). While host liveness is still
+  // `undefined` (e.g. a stream push flipped the runner before host resolved),
+  // stay unknown so the query fires — the host may serve it.
+  if (hostOnline === undefined) return undefined;
+  return hostOnline === true;
 }
 
 /**
@@ -75,6 +100,10 @@ export interface WorkspaceChangedFile {
   status: "created" | "modified" | "deleted";
   bytes: number | null;
   modified_at: number | null;
+  /** Lines added, or null when unknown (binary, rename, numstat unavailable). */
+  lines_added: number | null;
+  /** Lines removed, or null when unknown. */
+  lines_removed: number | null;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -155,6 +184,8 @@ interface ChangedFilesResponse {
     status: "created" | "modified" | "deleted";
     bytes: number | null;
     modified_at: number | null;
+    lines_added: number | null;
+    lines_removed: number | null;
   }>;
   has_more: boolean;
 }
@@ -195,6 +226,8 @@ async function fetchWorkspaceChangedFiles(
     status: e.status,
     bytes: e.bytes,
     modified_at: e.modified_at,
+    lines_added: e.lines_added ?? null,
+    lines_removed: e.lines_removed ?? null,
   }));
   return { available: true, data };
 }
@@ -212,7 +245,7 @@ export function useWorkspaceChangedFiles(
   options: WorkspaceQueryOptions = {},
 ) {
   const queryEnabled = options.enabled ?? true;
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const serveable = useWorkspaceServeable(conversationId);
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -224,7 +257,7 @@ export function useWorkspaceChangedFiles(
     enabled:
       queryEnabled &&
       !!conversationId &&
-      runnerOnline !== false &&
+      serveable !== false &&
       environmentQuery.data?.available === true,
     // Capped-backoff retry of the runner-offline case (see
     // shouldRetryRunnerOffline). Whether the eventual error reads as
@@ -310,7 +343,7 @@ export function useWorkspaceAllFiles(
   options: WorkspaceQueryOptions = {},
 ) {
   const queryEnabled = options.enabled ?? true;
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const serveable = useWorkspaceServeable(conversationId);
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -322,7 +355,7 @@ export function useWorkspaceAllFiles(
     enabled:
       queryEnabled &&
       !!conversationId &&
-      runnerOnline !== false &&
+      serveable !== false &&
       environmentQuery.data?.available === true,
     // Capped-backoff retry of the runner-offline case (see
     // shouldRetryRunnerOffline). The asleep-vs-empty decision is made by
@@ -377,7 +410,7 @@ export function useWorkspaceFileSearch(
   exclude: string | undefined = undefined,
   options: WorkspaceQueryOptions = {},
 ) {
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const serveable = useWorkspaceServeable(conversationId);
   const trimmed = query.trim();
   const trimmedInclude = include?.trim() ?? "";
   const trimmedExclude = exclude?.trim() ?? "";
@@ -386,7 +419,7 @@ export function useWorkspaceFileSearch(
     queryFn: () =>
       fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude),
     enabled:
-      (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && runnerOnline !== false,
+      (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,
     staleTime: 5_000,
     placeholderData: (prev) => prev,
   });
@@ -552,7 +585,7 @@ export function useWorkspaceFileExists(
   path: string | null,
   trusted = false,
 ): boolean {
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const serveable = useWorkspaceServeable(conversationId);
   const candidate = path && (trusted || looksLikeWorkspaceFilePath(path)) ? path : null;
   // Parent of a root-level file (no slash) is "" — the workspace root listing.
   const parentDir = candidate
@@ -566,7 +599,7 @@ export function useWorkspaceFileExists(
     // cache entry with conflicting queryFns.
     queryKey: ["workspace-dir-listing", conversationId, parentDir],
     queryFn: () => fetchDirEntriesTolerant(conversationId!, parentDir!),
-    enabled: !!conversationId && parentDir !== null && runnerOnline !== false,
+    enabled: !!conversationId && parentDir !== null && serveable !== false,
     // Longer TTL than the root/changed-files queries (5s): a referenced file's
     // existence rarely changes mid-conversation, and this fires per inline
     // path span, so a 30s cache keeps repeated mentions from re-listing.
@@ -617,11 +650,11 @@ export function useWorkspaceEnvironment(
   conversationId: string | undefined,
   options: WorkspaceQueryOptions = {},
 ) {
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
     queryKey: ["workspace-environment", conversationId],
     queryFn: () => fetchWorkspaceEnvironment(conversationId!),
-    enabled: (options.enabled ?? true) && !!conversationId && runnerOnline !== false,
+    enabled: (options.enabled ?? true) && !!conversationId && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 60_000,
@@ -636,11 +669,11 @@ export function useWorkspaceEnvironment(
  * `dirPath` is null (collapsed or not yet requested).
  */
 export function useWorkspaceDirectory(conversationId: string | undefined, dirPath: string | null) {
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
     queryKey: ["workspace-dir", conversationId, dirPath],
     queryFn: () => fetchWorkspaceDirectory(conversationId!, dirPath!),
-    enabled: !!conversationId && !!dirPath && runnerOnline !== false,
+    enabled: !!conversationId && !!dirPath && serveable !== false,
     staleTime: 5_000,
   });
 }

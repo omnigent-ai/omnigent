@@ -64,6 +64,8 @@ def _backend_of(database_uri: str | None) -> str:
         return "sqlite"
     if database_uri.startswith("postgres"):
         return "postgres"
+    if database_uri.startswith("mysql"):
+        return "mysql"
     return "other"
 
 
@@ -108,6 +110,31 @@ async def _run_journey(
     return ("throughput" if as_throughput else "latency"), results
 
 
+def _thresholds_supplied(args: argparse.Namespace) -> bool:
+    """Whether the run requested any CI threshold gate."""
+    return any(getattr(args, name) is not None for name in ("min_rps", "max_p50_ms", "max_p99_ms"))
+
+
+def _skipped_block(journey: Journey, backend: str, exc: Exception) -> dict[str, object]:
+    """A journey block for a journey that errored out of measurement entirely.
+
+    Keeps the report shape consumers expect (``kind`` / ``backend`` /
+    ``needs_runner`` / empty ``runs`` + ``summary``) while flagging the skip so
+    the ETL and comparison tools can tell a skipped journey apart from a real
+    zero — an empty ``summary`` carries no metric keys, so it never counts as a
+    fast run, and ``compare.py`` treats it as having no baseline/candidate data.
+    """
+    return {
+        "kind": journey.kind,
+        "backend": backend,
+        "needs_runner": journey.needs_runner,
+        "runs": [],
+        "summary": {},
+        "skipped": True,
+        "error": f"{exc.__class__.__name__}: {exc}",
+    }
+
+
 async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
     """Run all selected journeys and build the report.
 
@@ -122,17 +149,45 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
     # Any full-turn journey needs the runner + mock LLM. A full env is a
     # superset — HTTP journeys still run against it — so a mixed selection just
     # boots with_runner=True. The harness label reflects what drove the turns.
+    # A host-backed journey (session_cold_start) additionally needs a host
+    # daemon; with_host is a further superset (it implies with_runner) so a
+    # mixed selection that includes it boots the host too.
     with_runner = any(j.needs_runner for j in journeys)
+    with_host = any(j.needs_host for j in journeys)
     harness = _RUNNER_HARNESS if with_runner else _HTTP_HARNESS
 
-    async with BenchEnvironment(with_runner=with_runner, database_uri=args.database_uri) as env:
+    async with BenchEnvironment(
+        with_runner=with_runner, with_host=with_host, database_uri=args.database_uri
+    ) as env:
         for journey in journeys:
             console.print(f"\n[bold]Benchmarking[/bold] {journey.name} [dim]({backend})[/dim]")
-            kind, results = await _run_journey(journey, env, args)
+            # Setup/teardown failures are already caught inside the runners and
+            # surface as failed RunResults. This guard is the outer safety net:
+            # any other unexpected error records a skipped-journey block so one
+            # broken journey never aborts the rest of the suite.
+            try:
+                kind, results = await _run_journey(journey, env, args)
+            except Exception as exc:  # noqa: BLE001 — one journey must not kill the run
+                console.print(
+                    f"  [red]SKIPPED:[/red] {journey.name} errored "
+                    f"({exc.__class__.__name__}: {exc}); excluded from summary."
+                )
+                journey_results[journey.name] = _skipped_block(journey, backend, exc)
+                # A journey that couldn't run can't confirm a requested guarantee,
+                # so a supplied threshold fails the gate; with none supplied the
+                # skip is non-fatal and the suite carries on.
+                if _thresholds_supplied(args):
+                    passed = False
+                continue
             print_results(journey.name, results)
             block = aggregate(results)
             block["kind"] = kind
             block["backend"] = backend
+            # Hardcoded per-journey mapping: HTTP journeys are False, full-turn
+            # journeys True. Sourced from the journey itself, not the run-level
+            # env, so it stays correct in a mixed selection (where with_runner
+            # is True for the whole run because *some* journey needs it).
+            block["needs_runner"] = journey.needs_runner
             journey_results[journey.name] = block
             if not check_thresholds(
                 results,
@@ -141,6 +196,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
                 max_p99_ms=args.max_p99_ms,
             ):
                 passed = False
+        resource_usage = env.resource_usage
 
     config = {
         "iterations": args.iterations,
@@ -157,6 +213,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
         generated_at=generated_at,
         config=config,
         harness=harness,
+        resource_usage=resource_usage,
     )
     return report, passed
 
@@ -178,10 +235,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--database-uri",
         default=None,
         metavar="URI",
-        help="DB the server boots against — a pre-seeded SQLite file or a "
-        "postgresql+psycopg://… instance (see seed.py). Default: a fresh "
-        "throwaway SQLite DB (empty — best-case numbers). The report's "
-        "`backend` field is derived from this.",
+        help="DB the server boots against — a pre-seeded SQLite file, a "
+        "postgresql+psycopg://… instance, or a mysql+mysqldb://… instance "
+        "(see seed.py). Default: a fresh throwaway SQLite DB (empty — "
+        "best-case numbers). The report's `backend` field is derived from this.",
     )
     parser.add_argument(
         "--iterations",

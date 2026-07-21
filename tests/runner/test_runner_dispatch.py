@@ -1511,7 +1511,9 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
         """
         Stand in for ``_build_claude_sdk_spawn_env`` and fail the way the
         no-model generic-provider path does.
@@ -1605,7 +1607,9 @@ async def test_runner_failed_status_carries_setup_error_message(
             executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
         )
 
-    def _raising_build(spec: object, *, workdir: object = None) -> dict[str, str]:
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
         """
         Fail the spawn-env build the way the no-model provider path does.
 
@@ -5394,6 +5398,8 @@ def test_native_relay_builtin_set_matches_toolmanager_gating(
     assert relayed & spawn_writes == expected_writes
     # Model awareness rides the dispatch grant: relayed iff send is.
     assert ("sys_list_models" in relayed) == ("sys_session_send" in expected_writes)
+    # Advise-models also requires a routing client; default caps have none.
+    assert "sys_advise_models" not in relayed
 
     # OS tools ride a separate unconditional relay path (overriding the
     # bridge's static versions), so they must never be in the builtin set —

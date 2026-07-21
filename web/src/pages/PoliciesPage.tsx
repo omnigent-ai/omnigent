@@ -11,9 +11,10 @@
  * themselves — client-side gating is just UX.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon, XIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
+import { ModelValueCombobox } from "@/components/ModelValueCombobox";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -32,8 +33,10 @@ import {
   type DefaultPolicy,
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
+import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 import { coercePolicyParams } from "@/lib/policyParams";
 
 // ---------------------------------------------------------------------------
@@ -42,12 +45,10 @@ import { coercePolicyParams } from "@/lib/policyParams";
 
 function AddDefaultPolicyDialog({
   registry,
-  appliedHandlers,
   open,
   onOpenChange,
 }: {
   registry: PolicyRegistryEntry[];
-  appliedHandlers: Set<string>;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -59,7 +60,7 @@ function AddDefaultPolicyDialog({
   const addPolicy = useAddDefaultPolicy();
 
   const entry = registry.find((r) => r.handler === selected);
-  const schema = entry?.params_schema as
+  const rawSchema = entry?.params_schema as
     | {
         properties?: Record<
           string,
@@ -68,7 +69,7 @@ function AddDefaultPolicyDialog({
             description?: string;
             default?: unknown;
             enum?: string[];
-            items?: { type?: string; enum?: string[] };
+            items?: { type?: string; enum?: string[]; "x-enum-source"?: string };
             uniqueItems?: boolean;
           }
         >;
@@ -76,7 +77,20 @@ function AddDefaultPolicyDialog({
       }
     | null
     | undefined;
-  const properties = schema?.properties ?? {};
+  const modelIds = useMemo(() => CLAUDE_NATIVE_MODELS.map((m) => m.id), []);
+  const properties = useMemo(() => {
+    const props = rawSchema?.properties ?? {};
+    if (!modelIds.length) return props;
+    const enriched: typeof props = {};
+    for (const [key, prop] of Object.entries(props)) {
+      if (prop.items?.["x-enum-source"] === "models" && !prop.items.enum) {
+        enriched[key] = { ...prop, items: { ...prop.items, enum: modelIds } };
+      } else {
+        enriched[key] = prop;
+      }
+    }
+    return enriched;
+  }, [rawSchema?.properties, modelIds]);
   const paramKeys = Object.keys(properties);
 
   function handleSelect(handler: string) {
@@ -142,15 +156,14 @@ function AddDefaultPolicyDialog({
         <div className="min-w-0 space-y-3 pt-1">
           {!selected &&
             (() => {
-              const available = registry.filter((r) => !appliedHandlers.has(r.handler));
               const lowerFilter = filter.toLowerCase();
               const filtered = lowerFilter
-                ? available.filter(
+                ? registry.filter(
                     (r) =>
                       r.name.toLowerCase().includes(lowerFilter) ||
                       r.description?.toLowerCase().includes(lowerFilter),
                   )
-                : available;
+                : registry;
               return (
                 <>
                   <input
@@ -180,9 +193,7 @@ function AddDefaultPolicyDialog({
                     ))}
                     {filtered.length === 0 && (
                       <p className="py-2 text-center text-xs text-muted-foreground">
-                        {available.length === 0
-                          ? "All available policies are already applied."
-                          : "No policies match your filter."}
+                        No policies match your filter.
                       </p>
                     )}
                   </div>
@@ -236,7 +247,7 @@ function AddDefaultPolicyDialog({
                         <span>
                           (
                           {prop.type === "array" && prop.items?.enum
-                            ? "select"
+                            ? "multi-select"
                             : prop.type === "array"
                               ? "comma-separated"
                               : prop.type}
@@ -289,35 +300,55 @@ function AddDefaultPolicyDialog({
                         ))}
                       </select>
                     ) : prop?.type === "array" && prop.items?.enum ? (
-                      <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-1">
-                        {prop.items.enum.map((v) => {
-                          const current = factoryParams[key]
-                            ? factoryParams[key].split(",").filter(Boolean)
-                            : Array.isArray(prop?.default)
-                              ? (prop.default as string[])
-                              : [];
-                          const checked = current.includes(v);
-                          return (
-                            <label key={v} className="flex items-center gap-1 text-sm">
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                onChange={(e) => {
-                                  const next = e.target.checked
-                                    ? [...current, v]
-                                    : current.filter((x) => x !== v);
-                                  setFactoryParams((prev) => ({
-                                    ...prev,
-                                    [key]: next.join(","),
-                                  }));
-                                }}
-                                className="rounded border-border"
-                              />
-                              <span>{v}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
+                      (() => {
+                        const current = factoryParams[key]
+                          ? factoryParams[key].split(",").filter(Boolean)
+                          : Array.isArray(prop?.default)
+                            ? (prop.default as string[])
+                            : [];
+                        return (
+                          <div className="mt-0.5 space-y-1.5">
+                            {current.length > 0 && (
+                              <div className="flex flex-wrap gap-1">
+                                {current.map((v) => (
+                                  <span
+                                    key={v}
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                  >
+                                    {v}
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const next = current.filter((x) => x !== v);
+                                        setFactoryParams((prev) => ({
+                                          ...prev,
+                                          [key]: next.join(","),
+                                        }));
+                                      }}
+                                      className="ml-0.5 text-muted-foreground hover:text-foreground"
+                                    >
+                                      <XIcon className="size-3" />
+                                    </button>
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                            <ModelValueCombobox
+                              options={prop.items.enum}
+                              selected={current}
+                              onToggle={(v) => {
+                                const next = current.includes(v)
+                                  ? current.filter((x) => x !== v)
+                                  : [...current, v];
+                                setFactoryParams((prev) => ({
+                                  ...prev,
+                                  [key]: next.join(","),
+                                }));
+                              }}
+                            />
+                          </div>
+                        );
+                      })()
                     ) : (
                       <input
                         type={
@@ -394,14 +425,10 @@ function AddDefaultPolicyDialog({
 
 export function PoliciesPage() {
   const info = useServerInfo();
-  // Plain header/single-user mode: no auth endpoints exist. server_version
-  // distinguishes a live single-user server from a failed /v1/info probe
-  // (which uses the same accounts_enabled:false / login_url:null sentinel).
-  const isSingleUser =
-    info !== "loading" &&
-    !info.accounts_enabled &&
-    info.login_url === null &&
-    info.server_version !== null;
+  // Explicit single-user local runtime: no auth endpoints exist, so skip the
+  // admin probe. A multi-user header-auth deploy (same accounts_enabled:false
+  // / login_url:null shape) is NOT single-user and keeps its admin gate.
+  const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const { data: policies = [], refetch } = useDefaultPolicies();
   const { data: registry = [] } = usePolicyRegistry();
@@ -413,7 +440,6 @@ export function PoliciesPage() {
   const [actionError, setActionError] = useState<string | null>(null);
 
   const registryByHandler = new Map(registry.map((r) => [r.handler, r]));
-  const appliedHandlers = new Set(policies.map((p) => p.handler));
 
   const refresh = useCallback(() => {
     void refetch();
@@ -441,17 +467,17 @@ export function PoliciesPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>
         <p className="text-sm text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
   async function onConfirmDelete() {
-    if (deleteCandidate === null) return;
+    if (deleteCandidate === null || deleteCandidate.id === null) return;
     setPendingAction(true);
     setActionError(null);
     deletePolicy.mutate(deleteCandidate.id, {
@@ -467,7 +493,7 @@ export function PoliciesPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold">Global Policies</h1>
@@ -487,14 +513,22 @@ export function PoliciesPage() {
             const params = p.factory_params;
             const hasParams = params != null && Object.keys(params).length > 0;
             return (
-              <div key={p.id} className="rounded-lg border border-border bg-background p-4">
+              <div
+                key={p.id ?? p.name}
+                className="rounded-lg border border-border bg-background p-4"
+              >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex items-start gap-2.5 min-w-0">
                     <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium">{p.name}</span>
-                        {!p.enabled && (
+                        {p.source === "config" && (
+                          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                            Config
+                          </span>
+                        )}
+                        {!p.enabled && p.source !== "config" && (
                           <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
                             Disabled
                           </span>
@@ -511,26 +545,30 @@ export function PoliciesPage() {
                     </div>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
-                    <Switch
-                      checked={p.enabled}
-                      onCheckedChange={(checked) =>
-                        updatePolicy.mutate({
-                          policyId: p.id,
-                          enabled: checked,
-                        })
-                      }
-                      aria-label={`Toggle ${p.name}`}
-                    />
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="size-8 text-muted-foreground hover:text-destructive"
-                      title="Remove policy"
-                      onClick={() => setDeleteCandidate(p)}
-                      disabled={pendingAction}
-                    >
-                      <TrashIcon className="size-3.5" />
-                    </Button>
+                    {p.source !== "config" ? (
+                      <>
+                        <Switch
+                          checked={p.enabled}
+                          onCheckedChange={(checked) =>
+                            updatePolicy.mutate({
+                              policyId: p.id!,
+                              enabled: checked,
+                            })
+                          }
+                          aria-label={`Toggle ${p.name}`}
+                        />
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-8 text-muted-foreground hover:text-destructive"
+                          title="Remove policy"
+                          onClick={() => setDeleteCandidate(p)}
+                          disabled={pendingAction}
+                        >
+                          <TrashIcon className="size-3.5" />
+                        </Button>
+                      </>
+                    ) : null}
                   </div>
                 </div>
                 {hasParams && (
@@ -568,12 +606,7 @@ export function PoliciesPage() {
         </Button>
       </div>
 
-      <AddDefaultPolicyDialog
-        registry={registry}
-        appliedHandlers={appliedHandlers}
-        open={addOpen}
-        onOpenChange={setAddOpen}
-      />
+      <AddDefaultPolicyDialog registry={registry} open={addOpen} onOpenChange={setAddOpen} />
 
       {/* Delete confirmation */}
       <Dialog

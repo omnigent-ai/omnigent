@@ -33,7 +33,6 @@ import json
 import logging
 import os
 import pathlib
-import shutil
 import sys
 import tempfile
 import time
@@ -43,10 +42,11 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
-from omnigent._platform import stable_user_id
+from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
@@ -71,6 +71,7 @@ from .executor import (
 )
 from .sandbox import (
     create_exec_launcher,
+    get_backend,
     resolve_sandbox,
     with_additional_read_roots,
     with_additional_write_files,
@@ -331,6 +332,118 @@ _STREAM_IDLE_WARN_SECONDS = 600.0
 # ── Multimodal content block conversion ──────────────────────
 
 
+def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ignore[explicit-any]
+    """If ``value`` contains an inline ``data:*;base64,...`` URI, return its
+    ``(media_type, base64_char_count)``; otherwise ``None``.
+
+    A resolved attachment block looks like::
+
+        {"type": "input_image",
+         "filename": "screenshot.png",
+         "image_url": "data:image/png;base64,iVBORw0KGgoAAAANS...=="}   # ~520k chars
+
+    (non-image files carry the same payload under ``file_data`` instead of
+    ``image_url``.) Returns e.g. ``("image/png", 519324)`` — the media type and
+    payload size used to build the compact
+    ``[image: screenshot.png, image/png, 519324 base64 chars]`` placeholder,
+    so the raw base64 never lands in the ``Conversation so far:`` prompt text.
+    """
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is not None:
+            return parsed.media_type, len(parsed.data)
+        return None
+    if isinstance(value, list):
+        for item in value:
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
+    """Deep-replace any whole-string inline base64 data URI with a compact
+    ``[attachment: …]`` marker, recursing through dict/list values. The fallback
+    path for values that reach ``json.dumps`` (nested dicts, non-block content)
+    so a resolver-produced base64 payload does not survive serialization. Only
+    whole-string data-URI values are redacted — not data URIs used as dict keys,
+    tuple members, or substrings embedded mid-text (the runner never emits
+    those)."""
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is None:
+            return value
+        return f"[attachment: {parsed.media_type}, {len(parsed.data)} base64 chars]"
+    if isinstance(value, list):
+        return [_redact_inline_base64(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_inline_base64(item) for key, item in value.items()}
+    return value
+
+
+def _render_prior_content(content: Any) -> str:  # type: ignore[explicit-any]
+    """Render one prior message's content for the ``Conversation so far:`` prefix
+    WITHOUT inlining attachment bytes.
+
+    Why this exists: ``_build_prompt`` only serializes prior history when
+    ``resume_session=False`` — a *fresh* SDK client that must replay existing
+    multimodal history (forked/shared sessions, sub-agents with
+    ``pass_history=True``, or a client restarted mid-session). By that point a
+    historical image/file block's ``file_id`` has already been resolved to a
+    ``data:<media>;base64,...`` URI. The previous code ``json.dumps()``-ed that
+    block verbatim, flattening the *entire* base64 payload into prompt TEXT — so
+    the model tokenizes the bytes as text instead of counting them as a
+    structured image. Seven ~390KB PNGs alone expand to ~2.5M tokens, and one
+    real shared session hit a 3.5M-token prompt against a 1M limit.
+
+    Any resolver-produced inline attachment *value* — a whole-string
+    ``data:*;base64,...`` under ``image_url`` / ``file_data``, including nested
+    in dict/list values — is redacted before it can reach this text prefix.
+    Plain-text blocks pass through unchanged; a block carrying an inline data
+    URI is replaced with a compact
+    ``[image/attachment: <id>, <media_type>, <N> base64 chars]`` marker that
+    preserves *that an attachment was present* without its bytes. (This does not
+    attempt to cover non-resolver shapes such as a data URI used as a dict key,
+    a tuple member, or a substring embedded mid-text — the runner never emits
+    those.) The latest/current message is handled separately by
+    ``_extract_latest_user_content`` and keeps its real image blocks — only
+    historical replay is de-inlined here.
+    """
+    if isinstance(content, str):
+        sanitized = _redact_inline_base64(content)
+        return str(sanitized)
+    if not isinstance(content, list):
+        return json.dumps(_redact_inline_base64(content), ensure_ascii=True)
+
+    rendered: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            text = block.get("text")
+            if block_type in ("input_text", "output_text", "text") and isinstance(text, str):
+                rendered.append(str(_redact_inline_base64(text)))
+                continue
+
+            inline_data = _get_inline_data_uri_info(block)
+            if inline_data is not None:
+                media_type, payload_chars = inline_data
+                kind = "image" if block_type == "input_image" else "attachment"
+                identifier = block.get("filename") or block.get("file_id") or block_type
+                rendered.append(
+                    f"[{kind}: {identifier}, {media_type}, {payload_chars} base64 chars]"
+                )
+                continue
+
+        rendered.append(json.dumps(_redact_inline_base64(block), ensure_ascii=True))
+    return "\n".join(rendered)
+
+
 def _parse_data_uri(uri: str) -> tuple[str, str]:
     """
     Parse a ``data:`` URI into ``(media_type, base64_data)``.
@@ -469,6 +582,11 @@ async def _multimodal_message_iter(
 # via ``create_exec_launcher``. Used to isolate whether the silent
 # connect hang is sandbox-related vs. inside the binary itself.
 _NO_SANDBOX_ENV = "OMNIGENT_CLAUDE_SDK_NO_SANDBOX"
+
+# Env override for an explicit claude binary, mirroring codex's
+# OMNIGENT_CODEX_PATH. Set this when claude lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CLAUDE_PATH_ENV = "OMNIGENT_CLAUDE_PATH"
 
 
 def _sandbox_disabled_by_env() -> bool:
@@ -684,7 +802,11 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
     if not tool_names:
         return system_prompt
 
-    examples = [name for name in ("sys_session_send", "sys_session_create") if name in tool_names]
+    examples = [
+        name
+        for name in ("sys_session_rename", "sys_session_send", "sys_session_create")
+        if name in tool_names
+    ]
     if examples:
         example_text = "; ".join(
             f"use `mcp__omnigent__{name}` when instructions say `{name}`" for name in examples
@@ -707,13 +829,16 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
 
 
 def _find_system_claude() -> str | None:
-    """Find a system-installed ``claude`` CLI binary on PATH.
+    """Find a system-installed ``claude`` CLI binary.
 
-    Returns the absolute path, or None if not found.  Prefers the system
-    install over the SDK's bundled CLI because the bundled version may be
-    older and send beta flags the Databricks gateway doesn't support.
+    Resolves via the ``OMNIGENT_CLAUDE_PATH`` override, then ``PATH``, then
+    common global install dirs — so an nvm/npm-installed claude off the host
+    daemon's frozen ``PATH`` is still found. Prefers the system install over
+    the SDK's bundled CLI because the bundled version may be older and send
+    beta flags the Databricks gateway doesn't support. Returns the absolute
+    path, or ``None`` if not found.
     """
-    return shutil.which("claude")
+    return resolve_cli_binary("claude", env_var=_CLAUDE_PATH_ENV)
 
 
 def _resolve_gateway_env(
@@ -889,11 +1014,45 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
+    """Resolve the sandbox root, rooting relative paths at the session
+    working folder rather than the runner daemon's process cwd.
+
+    A relative ``os_env.cwd`` — notably the default ``"."`` — resolved
+    against ``os.getcwd()`` lands on the runner daemon's ``$HOME`` when
+    no workspace is selected. That both roots the sandbox at the whole
+    home dir and disagrees with the tmux terminal, which uses
+    ``OMNIGENT_RUNNER_WORKSPACE``. Prefer that workspace as the base so
+    the two agree; fall back to the process cwd only when it is unset.
+    An absolute ``spec_cwd`` is honored verbatim.
+
+    :param spec_cwd: The spec's ``os_env.cwd``, or ``None``.
+    :returns: The resolved, absolute sandbox root.
+    """
+    base = os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or os.getcwd()
+    if spec_cwd:
+        path = pathlib.Path(spec_cwd)
+        if not path.is_absolute():
+            path = pathlib.Path(base) / path
+    else:
+        path = pathlib.Path(base)
+    return path.resolve(strict=False)
+
+
 def prepare_claude_cli_path(
     real_cli_path: str | None,
     spec: OSEnvSpec | None,
 ) -> PreparedClaudeCli:
     """Wrap the Claude CLI in the agent's configured sandbox when possible.
+
+    Degrades instead of crashing: when the sandbox can't be resolved or
+    the wrap can't be built (unsupported platform, un-grantable
+    interpreter layout, profile-size overflow), the CLI is returned
+    unwrapped with native tools disabled — the same confinement story
+    as ``OMNIGENT_CLAUDE_SDK_NO_SANDBOX``: file/shell access still goes
+    through the independently sandboxed ``sys_os_*`` helpers (which
+    fail closed on their own), and only the CLI supervisor process
+    runs unwrapped.
 
     :param real_cli_path: Absolute path to the system-installed Claude CLI
         binary, or ``None`` when no CLI is available.
@@ -913,8 +1072,18 @@ def prepare_claude_cli_path(
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
 
-    cwd = pathlib.Path(spec.cwd or os.getcwd()).resolve(strict=False)
-    sandbox = resolve_sandbox(spec, cwd)
+    cwd = _resolve_sandbox_cwd(spec.cwd)
+    try:
+        sandbox = resolve_sandbox(spec, cwd)
+    except (OSError, NotImplementedError) as exc:
+        logger.warning(
+            "Cannot resolve the configured sandbox for the Claude CLI wrap; "
+            "running the CLI unwrapped with native tools disabled "
+            "(file/shell access stays confined to the sandboxed sys_os_* "
+            "tools): %s",
+            exc,
+        )
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     if not sandbox.active:
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     if not sandbox.allow_network:
@@ -925,6 +1094,26 @@ def prepare_claude_cli_path(
     sandbox = with_additional_read_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+    # Dry-run the spawn-time wrap now, while degrading is still possible.
+    # The real wrap happens later inside run_launcher, where an OSError
+    # (un-grantable interpreter layout, profile-size cap, cwd-scan
+    # overflow) kills the launcher and surfaces as an opaque connect
+    # timeout. By run time native tools are already enabled, so this is
+    # the last point where "skip the wrap" is still safe.
+    try:
+        get_backend(sandbox.backend_type).wrap_launcher_argv(
+            [sys.executable, "-c", "pass"], sandbox, cwd, target=real_cli_path
+        )
+    except OSError as exc:
+        logger.warning(
+            "The configured sandbox cannot wrap the Claude CLI at %s; "
+            "running it unwrapped with native tools disabled (file/shell "
+            "access stays confined to the sandboxed sys_os_* tools). "
+            "Remediation hints in the underlying error: %s",
+            real_cli_path,
+            exc,
+        )
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
     return PreparedClaudeCli(
         cli_path=create_exec_launcher(real_cli_path, sandbox),
         enable_native_tools=True,
@@ -965,7 +1154,7 @@ def prepare_tight_cli_process_path(
         ),
     )
     try:
-        resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
+        resolved_cwd = _resolve_sandbox_cwd(cwd)
         sandbox = resolve_sandbox(spec, resolved_cwd)
     except (OSError, NotImplementedError) as exc:
         logger.warning(
@@ -1223,6 +1412,9 @@ class ClaudeSDKExecutor(Executor):
         self._clients: dict[str, _ClaudeClientState] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
+        # Force-close tasks for clients evicted on turn cancellation, kept
+        # referenced so they are not GC'd mid-close.
+        self._cancel_close_tasks: set[asyncio.Task[None]] = set()
 
         # Prefer system-installed claude over the SDK's bundled CLI.
         # The bundled CLI may be older and send beta flags that the
@@ -1469,6 +1661,16 @@ class ClaudeSDKExecutor(Executor):
         # call _force_close_client to flip transport._closed before
         # the loop tears down.
         await self._force_close_client(state.client)
+
+    def _evict_client_on_cancel(self, session_key: str) -> None:
+        state = self._clients.pop(session_key, None)
+        if state is None:
+            return
+        # Close in the background: an await here runs under an in-flight
+        # cancellation and could itself be cancelled, leaking the CLI process.
+        task = asyncio.create_task(self._force_close_client(state.client))
+        self._cancel_close_tasks.add(task)
+        task.add_done_callback(self._cancel_close_tasks.discard)
 
     async def close(self) -> None:
         session_keys = list(self._clients)
@@ -2495,6 +2697,13 @@ class ClaudeSDKExecutor(Executor):
                 if aclose is not None:
                     await aclose()
 
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so a watchdog-cancelled turn
+            # skips the boundary below. Evict the wedged client (no crash
+            # mark) so the next turn rebuilds a fresh one and replays history
+            # instead of reusing it and re-tripping the watchdog (#2109).
+            self._evict_client_on_cancel(session_key)
+            raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
             self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
@@ -2662,10 +2871,8 @@ class ClaudeSDKExecutor(Executor):
             raw_content = msg.get("content")
             if raw_content is None:
                 content = ""
-            elif isinstance(raw_content, str):
-                content = raw_content
             else:
-                content = json.dumps(raw_content, ensure_ascii=True)
+                content = _render_prior_content(raw_content)
             lines.append(f"{role}: {content}")
         lines.append("")
         lines.append(

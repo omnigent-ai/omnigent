@@ -2,7 +2,8 @@
 
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
-    Base,
+    ConversationBase,
+    OmnigentBase,
     SqlAgent,
     SqlConversation,
     SqlConversationItem,
@@ -15,7 +16,8 @@ from omnigent.db.db_models import (
 
 __all__ = [
     "DEFAULT_WORKSPACE_ID",
-    "Base",
+    "ConversationBase",
+    "OmnigentBase",
     "SqlAgent",
     "SqlConversation",
     "SqlConversationItem",

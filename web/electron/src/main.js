@@ -16,24 +16,35 @@
 const {
   app,
   BrowserWindow,
+  WebContentsView,
   Menu,
   Notification,
   clipboard,
   dialog,
   ipcMain,
   nativeImage,
+  nativeTheme,
   screen,
   session,
   shell,
   systemPreferences,
 } = require("electron");
+const { autoUpdater } = require("electron-updater");
+const { createDesktopUpdater } = require("./desktop_updater");
+const { createUpdateOverlay } = require("./update_overlay");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const { normalizeUrl, expandDatabricksWorkspaceUrl } = require("./url");
+const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
 const { registerWorkspaceChromeHide } = require("./workspace-chrome");
+const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { createBrowserViewBoundsController } = require("./browserViewBounds");
+const { registerBrowserIpc } = require("./browserIpc");
+const { registerSessionExpiryReload } = require("./session-expiry");
+const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -45,6 +56,10 @@ const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
 
 /** Absolute path to the bundled find-in-page bar page. */
 const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
+// Built by web's `build:overlay` into electron/overlay/ (shipped by
+// electron-builder). Shell-owned so the update UI is independent of the
+// connected server's web-bundle version.
+const UPDATE_OVERLAY_PAGE = path.join(__dirname, "..", "overlay", "update-overlay.html");
 
 /** The find bar's file:// URL, for verifying IPC sender frames. */
 const FIND_PAGE_URL = pathToFileURL(FIND_PAGE);
@@ -62,13 +77,10 @@ const FIND_BAR_INSET = 16;
 const ERR_ABORTED = -3;
 
 /**
- * Schemes that open externally with no confirmation: they land in the
- * user's browser / mail client, which apply their own safety UX. Anything
- * else launches an OS protocol handler (vscode://, ssh://, …) with
- * page-controlled arguments — and `shell.openExternal`, unlike a browser,
- * shows no prompt of its own — so it goes through a consent dialog first.
+ * No-op preload for OAuth popup windows — children must never inherit the
+ * shell preload's IPC bridges. See popup_preload.js.
  */
-const WEB_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
@@ -124,106 +136,6 @@ const GRANTED_PERMISSIONS = new Set([
  * localhost CORS layer trusts.
  */
 const LNA_PERMISSIONS = new Set(["local-network-access", "loopback-network"]);
-
-/**
- * Keychain access group for the WebAuthn Touch ID platform authenticator
- * (`app.configureWebAuthn`), in the form ``"<TEAM_ID>.ai.omnigent.desktop"``.
- *
- * null disables the platform authenticator: the value only works in a
- * code-signed build whose `keychain-access-groups` entitlement
- * (signing/entitlements.mac.plist) lists the SAME string, so there is no
- * meaningful default — set both places together when configuring signing.
- * External security keys (e.g. YubiKey) work regardless of this setting.
- *
- * Three pieces must agree: this constant, the `keychain-access-groups`
- * entitlement, AND the embedded Developer ID provisioning profile
- * authorizing the group — without the profile, AMFI SIGKILLs the signed
- * app at launch. Details in signing/entitlements.mac.plist.
- * @type {string | null}
- */
-const WEBAUTHN_KEYCHAIN_ACCESS_GROUP = "8RMX4WU6F8.ai.omnigent.desktop";
-
-/**
- * Enable the macOS WebAuthn platform authenticator so passkey
- * registration/sign-in shows the native Touch ID / keychain dialog instead
- * of completing invisibly. Two pieces:
- *
- *   1. `app.configureWebAuthn` (Electron ≥ 42, macOS-only) turns on the
- *      Secure-Enclave-backed authenticator. Until it's called,
- *      `PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()`
- *      resolves false in the page and sites offer only external keys.
- *   2. The `select-webauthn-account` session event fires when a
- *      `navigator.credentials.get()` matches several discoverable
- *      credentials; we show a native chooser and answer with the picked
- *      `credentialId` (answering with nothing cancels the request).
- *
- * No-ops (with a console note) when the access group isn't configured,
- * off macOS, or on an Electron without the API — external security keys
- * keep working through Chromium's built-in CTAP path in all cases.
- * Credentials are device-bound (Secure Enclave), not synced to iCloud
- * Keychain, and invisible to Safari/Chrome — and vice versa.
- */
-function registerWebAuthn() {
-  if (process.platform !== "darwin") return;
-  if (typeof app.configureWebAuthn !== "function") {
-    console.log("[omnigent] webauthn: Electron too old for configureWebAuthn; skipping");
-    return;
-  }
-  if (WEBAUTHN_KEYCHAIN_ACCESS_GROUP === null) {
-    console.log(
-      "[omnigent] webauthn: WEBAUTHN_KEYCHAIN_ACCESS_GROUP not set; " +
-        "platform passkeys (Touch ID dialog) disabled — security keys still work",
-    );
-    return;
-  }
-  // Dev runs (`electron .`) use the unsigned prebuilt Electron binary, which
-  // has no keychain-access-groups entitlement: configuring the authenticator
-  // there doesn't fail at this call, but breaks every later ceremony with an
-  // opaque NotAllowedError ("operation timed out or was not allowed"). Skip
-  // cleanly so dev keeps the silent security-key path.
-  if (!app.isPackaged) {
-    console.log(
-      "[omnigent] webauthn: dev run (unsigned, no keychain entitlement); " +
-        "platform passkeys disabled — security keys still work",
-    );
-    return;
-  }
-  app.configureWebAuthn({
-    touchID: {
-      keychainAccessGroup: WEBAUTHN_KEYCHAIN_ACCESS_GROUP,
-      // Rendered by macOS as "<app name> is trying to <promptReason>".
-      promptReason: "sign in with your passkey",
-    },
-  });
-
-  session.defaultSession.on("select-webauthn-account", (_event, details, callback) => {
-    const accounts = details.accounts ?? [];
-    const win = activeWindow();
-    if (!win || accounts.length === 0) {
-      callback(); // no UI to ask with / nothing to pick → cancel the request
-      return;
-    }
-    // Label each account by whatever name fields the credential carries;
-    // the index-based fallback is display-only (the answer is always the
-    // credentialId, never the label).
-    const labels = accounts.map((a, i) => a.userName || a.userDisplayName || `Account ${i + 1}`);
-    void dialog
-      .showMessageBox(win, {
-        type: "question",
-        message: `Choose a passkey for ${details.relyingPartyId}`,
-        buttons: [...labels, "Cancel"],
-        cancelId: labels.length,
-      })
-      .then(({ response }) => {
-        if (response >= 0 && response < accounts.length) {
-          callback(accounts[response].credentialId);
-        } else {
-          callback(); // Cancel
-        }
-      })
-      .catch(() => callback()); // dialog failure must still answer → cancel
-  });
-}
 
 /**
  * Origin of a webContents' top-level (main-frame) page, or null when the
@@ -338,11 +250,12 @@ function registerPermissions() {
  * frame through SSO/IdP origins that can't be known in advance (e.g.
  * ``abc.aws.databricksapps.com`` → an SSO domain that probes a localhost
  * helper), and this is what lets those pages reach localhost while the
- * user is actually on them. The reachable set stays narrow because
- * in-window navigation only starts from the pinned server (links and
- * window.open go to the external browser — see setWindowOpenHandler);
- * unpinned windows (the setup page) confer nothing, and an iframe never
- * matches because this checks the main frame's origin only.
+ * user is actually on them. The reachable set stays narrow because this
+ * iterates `windows`, which OAuth popups never join (they get their own,
+ * equally narrow trust — see isCurrentPopupOrigin) — and links and every
+ * other window.open leave for the external browser. Unpinned windows (the
+ * setup page) confer nothing, and an iframe never matches because this
+ * checks the main frame's origin only.
  *
  * @param {string} origin e.g. ``"https://login.example.com"``.
  * @returns {boolean}
@@ -356,14 +269,33 @@ function isCurrentWindowOrigin(origin) {
 }
 
 /**
+ * Popup counterpart of isCurrentWindowOrigin, same rationale: IdP
+ * device-trust scripts (Okta FastPass) must reach their localhost helper
+ * from inside the sign-in popup too, and fail closed when denied. Same
+ * narrowness: popups only START on allowlisted hosts (popupPolicy.js),
+ * only the main frame counts, and a closed popup confers nothing.
+ *
+ * @param {string} origin e.g. ``"https://company.okta.com"``.
+ * @returns {boolean}
+ */
+function isCurrentPopupOrigin(origin) {
+  for (const popup of oauthPopups) {
+    if (popup.isDestroyed()) continue;
+    if (originOf(popup.webContents.getURL()) === origin) return true;
+  }
+  return false;
+}
+
+/**
  * The trust predicate for localhost access, shared by the CORS injection
  * (registerLocalhostAccess) and the Local Network Access permission answer
  * (lnaPermissionGranted). An origin is trusted when it is: an origin some
  * window is pinned to (a server the user explicitly connected to), the
- * current top-level page of a pinned window (SSO/IdP pages reached via
- * auth redirects — see isCurrentWindowOrigin), or hand-listed in
- * settings.json under ``localhost_allowed_origins`` (escape hatch for
- * pages that need localhost while NOT being the visible top-level page).
+ * current top-level page of a pinned window or of a live OAuth popup
+ * (SSO/IdP pages reached via auth redirects — see isCurrentWindowOrigin /
+ * isCurrentPopupOrigin), or hand-listed in settings.json under
+ * ``localhost_allowed_origins`` (escape hatch for pages that need
+ * localhost while NOT being the visible top-level page).
  *
  * @param {string | null} origin e.g. ``"https://login.example.com"``.
  * @returns {boolean}
@@ -372,18 +304,85 @@ function isLocalhostTrustedOrigin(origin) {
   if (!origin) return false;
   if (isPinnedServerUrl(origin)) return true;
   if (isCurrentWindowOrigin(origin)) return true;
+  if (isCurrentPopupOrigin(origin)) return true;
   const extra = loadSettings().localhost_allowed_origins;
   return Array.isArray(extra) && extra.includes(origin);
+}
+
+/**
+ * True when a webContents id belongs to a live OAuth popup.
+ *
+ * @param {number} webContentsId
+ * @returns {boolean}
+ */
+function isOauthPopupWebContentsId(webContentsId) {
+  for (const popup of oauthPopups) {
+    if (!popup.isDestroyed() && popup.webContents.id === webContentsId) return true;
+  }
+  return false;
+}
+
+/**
+ * First-look response hook (composed into localhost_cors's single
+ * onHeadersReceived registration): strip COOP from main-frame responses
+ * inside tracked OAuth popups so a sign-in hop can't sever window.opener —
+ * the "first sign-in fails, retry works" flake (see
+ * OPENER_SEVERING_HEADERS in popupPolicy.js). Every other window keeps
+ * provider COOP untouched.
+ *
+ * @param {Electron.OnHeadersReceivedListenerDetails} details
+ * @returns {Electron.HeadersReceivedResponse | null}
+ */
+function popupResponseHeadersHook(details) {
+  if (details.resourceType !== "mainFrame") return null;
+  if (typeof details.webContentsId !== "number") return null;
+  if (!isOauthPopupWebContentsId(details.webContentsId)) return null;
+  const stripped = stripCrossOriginOpenerHeaders(details.responseHeaders);
+  return stripped ? { responseHeaders: stripped } : null;
 }
 
 /**
  * Allow pages on trusted origins to call localhost services (auth helpers,
  * local runners) by injecting CORS/preflight headers on localhost responses
  * — see localhost_cors.js for the mechanism and isLocalhostTrustedOrigin
- * for the trust scope.
+ * for the trust scope. The OAuth-popup COOP strip composes in here because
+ * Electron allows one onHeadersReceived listener per session.
  */
 function registerLocalhostAccess() {
-  registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin);
+  registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin, popupResponseHeadersHook);
+}
+
+// Per-window timestamp of the last expired-session reload, so a host whose SSO
+// stays expired doesn't reload-loop. An expired session redirects EVERY API
+// call to the login page (many redirects per second — and the reload itself
+// triggers fresh API calls), so a "once until next navigation" guard would
+// clear on its own reload and loop. A minimum interval caps reloads to one per
+// window per interval regardless: enough to re-run the host's auth challenge,
+// never a tight loop. In the normal case the gate full-page-redirects the
+// reload's top-level navigation to its login page, so no further API calls
+// (hence no further redirects) fire anyway.
+const _lastExpiryReloadAt = new WeakMap();
+const _EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
+
+/**
+ * Recover the desktop window when the workspace SSO session expires.
+ *
+ * When the auth gate redirects a connected server's API call to its login
+ * page, reload every window pinned to that origin so the gate can re-challenge
+ * — see session-expiry.js. A desktop user has no address bar to refresh out of
+ * the resulting "Failed to load" state manually, so the shell does it.
+ */
+function registerSessionExpiryAccess() {
+  registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
+    const now = Date.now();
+    for (const [win, state] of windows) {
+      if (state.origin !== origin || win.isDestroyed()) continue;
+      const last = _lastExpiryReloadAt.get(win) ?? 0;
+      if (now - last < _EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
+      _lastExpiryReloadAt.set(win, now);
+      win.webContents.reload();
+    }
+  });
 }
 
 /**
@@ -427,10 +426,23 @@ function applyDockIcon() {
  *   so the OS badge aggregates per distinct ORIGIN (not per window — two
  *   windows on the same server report the same number and must not be
  *   double-counted), then sums across origins.
+ * @property {ReturnType<typeof createBrowserViewRegistry>} [browserRegistry]
+ *   Per-conversation embedded-browser view registry for this window.
  *
  * @type {Map<BrowserWindow, WindowState>}
  */
 const windows = new Map();
+
+/**
+ * Live OAuth popup child windows (see hardenOauthPopup). Tracked apart
+ * from `windows` on purpose: a popup gains NO shell-window privileges —
+ * its only grant is localhost trust for its CURRENT top-level page
+ * (isCurrentPopupOrigin), because IdP device-trust checks (Okta FastPass)
+ * probe a localhost helper from inside the popup too.
+ *
+ * @type {Set<BrowserWindow>}
+ */
+const oauthPopups = new Set();
 
 /**
  * Recompute the app-wide dock/taskbar badge: take each distinct pinned
@@ -598,6 +610,44 @@ function activeWindow() {
   for (const win of windows.keys()) return win;
   return null;
 }
+
+// Desktop auto-update orchestration lives in its own module; the main process
+// only composes it with its main-process dependencies and wires the four thin
+// seams below (startup init, the Updates menu, the update IPC surface, and the
+// before-quit install handoff). Dependencies passed here are function
+// declarations (hoisted) or already-initialized bindings, so constructing at
+// module load is safe — the module never calls into them until a seam fires.
+const updater = createDesktopUpdater({
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  nativeImage,
+  autoUpdater,
+  loadSettings,
+  saveSettings,
+  isPinnedOriginSender,
+  pinnedOrigin,
+  iconPath: ICON_PNG,
+  // Dev builds always use the local dev feed (dev-app-update.yml ->
+  // 127.0.0.1:8765); packaged builds always use the baked app-update.yml.
+  // Tying this to !app.isPackaged — not an env var — closes a redirect attack:
+  // an OMNIGENT_FORCE_DEV_UPDATE_CONFIG-style env var could otherwise point a
+  // packaged (production) app at an untrusted HTTP local feed and push a
+  // malicious update. A packaged build can never be redirected to the dev feed.
+  forceDevUpdateConfig: !app.isPackaged,
+});
+
+// Shell-owned update toast: renders the reused web UpdateBanner in a transparent
+// corner window so it shows even against servers running old omnigent web.
+const updateOverlay = createUpdateOverlay({
+  BrowserWindow,
+  ipcMain,
+  nativeTheme,
+  updater,
+  overlayPage: UPDATE_OVERLAY_PAGE,
+  preloadPath: path.join(__dirname, "update_overlay_preload.js"),
+});
 
 // ---------------------------------------------------------------------------
 // Persisted settings (the saved server URL and the recently-connected server
@@ -825,19 +875,112 @@ function cascadeIfCovering(win) {
 }
 
 /**
+ * Harden an OAuth popup the window-open policy allowed (popupPolicy.js).
+ * The popup deliberately keeps `window.opener` and the opener's session —
+ * that IS the handshake — so hardening covers what a chromeless window
+ * lacks: the title always leads with the CURRENT host (the page controls
+ * document.title, never the prefix; an app-drawn URL strip is the planned
+ * upgrade), and window.open from the child leaves the shell — no popup
+ * chains, and no consent dialog for non-web schemes since a third-party
+ * page has no pinned-origin trust to anchor one. Tracked in `oauthPopups`
+ * (localhost trust only), never in `windows`.
+ *
+ * @param {BrowserWindow} child The freshly created popup window.
+ */
+function hardenOauthPopup(child) {
+  oauthPopups.add(child);
+  child.on("closed", () => oauthPopups.delete(child));
+  const stampTitle = () => {
+    if (child.isDestroyed()) return;
+    let host = "";
+    try {
+      host = new URL(child.webContents.getURL()).host;
+    } catch {
+      // about:blank / early lifecycle — no host to show yet.
+    }
+    const pageTitle = child.webContents.getTitle();
+    child.setTitle(host ? (pageTitle ? `${host} — ${pageTitle}` : host) : pageTitle || "Sign in");
+  };
+  child.webContents.on("page-title-updated", (event) => {
+    event.preventDefault(); // keep the host prefix; we compose the title
+    stampTitle();
+  });
+  child.webContents.on("did-navigate", stampTitle);
+  stampTitle();
+  child.webContents.setWindowOpenHandler(({ url }) => {
+    let scheme = null;
+    try {
+      scheme = new URL(url).protocol;
+    } catch {
+      // Unparseable URL from page content — nothing safe to open.
+    }
+    if (scheme && WEB_SCHEMES.has(scheme)) {
+      void shell.openExternal(url);
+    }
+    return { action: "deny" };
+  });
+}
+
+/**
+ * Join a basename-less SPA path (e.g. ``/c/conv_abc``) onto a server URL that
+ * may carry a workspace mount (e.g. ``https://host/ml/omnigents/``). The path
+ * is an ABSOLUTE in-app route, but it lives UNDER the server's mount —
+ * ``new URL("/c/x", serverUrl)`` would resolve against the ORIGIN and drop
+ * ``/ml/omnigents`` — so we string-concatenate: strip the server URL's trailing
+ * slash, append the path. The SPA's react-router basename then matches
+ * ``${mount}/c/:id``. Shared by createWindow (cold open) and loadServerUrl
+ * (re-pointing an existing window) so the mount-aware join is in one place.
+ *
+ * @param {string} serverUrl A normalized server URL (origin or origin+mount).
+ * @param {string} path An absolute in-app path beginning with ``/``.
+ * @returns {string}
+ */
+function resolveServerPath(serverUrl, path) {
+  return serverUrl.replace(/\/+$/, "") + (path.startsWith("/") ? path : "/" + path);
+}
+
+/**
+ * Pin an existing window to a server origin and load a (optionally
+ * path-suffixed) URL. Shared by the deep-link reuse/reload paths so the
+ * pin + identity + load sequence isn't duplicated. ``serverUrl`` is stored as
+ * the window's CLEAN server identity (no conversation path); ``path`` is joined
+ * onto it only for the load URL (see resolveServerPath).
+ *
+ * @param {BrowserWindow} win
+ * @param {string} serverUrl Clean server URL (origin or origin+mount).
+ * @param {string} [path] Optional basename-less in-app path (e.g. ``/c/<id>``).
+ * @returns {Promise<void>}
+ */
+function loadServerUrl(win, serverUrl, path) {
+  pinWindow(win, originOf(serverUrl));
+  setWindowServerUrl(win, serverUrl);
+  return win.loadURL(path ? resolveServerPath(serverUrl, path) : serverUrl);
+}
+
+/**
  * Create a shell window and load a destination, in priority order:
- *   1. `targetUrl`, when given (used by "New Window" to clone the current
+ *   1. `opts.path` joined onto `opts.serverUrl` (a deep link opening a
+ *      specific conversation on a specific server).
+ *   2. `targetUrl`, when given (used by "New Window" to clone the current
  *      window's exact URL — e.g. a specific conversation).
- *   2. the saved server URL (the normal launch path).
- *   3. the bundled setup page (first run / no server configured).
+ *   3. the saved server URL (the normal launch path).
+ *   4. the bundled setup page (first run / no server configured).
+ *
+ * `opts.serverUrl` and `opts.path` decouple the window's server IDENTITY
+ * (clean, no conversation path — used by host/server CLI commands) from the
+ * loaded URL: a deep link loads ``${serverUrl}${path}`` but stores
+ * ``serverUrl`` without the ``/c/<id>`` (see resolveServerPath). Without an
+ * explicit ``opts.serverUrl``, the identity is the loaded URL, preserving the
+ * behavior of the existing New Window / launch callers.
  *
  * @param {string} [targetUrl] Explicit http(s) URL to load instead of the
  *   saved server. Anything not http(s) is ignored (we never load file:// or
  *   internal URLs from an untrusted caller).
- * @param {{ephemeral?: boolean}} [opts] ``ephemeral: true`` creates a debug
- *   multi-server window: it opens on the setup page (ignoring the saved
- *   server) and a URL connected from it is pinned to this window only,
- *   never persisted to settings.
+ * @param {{ephemeral?: boolean, serverUrl?: string, path?: string}} [opts]
+ *   ``ephemeral: true`` creates a debug multi-server window: it opens on the
+ *   setup page (ignoring the saved server) and a URL connected from it is
+ *   pinned to this window only, never persisted to settings. ``serverUrl`` +
+ *   ``path`` open a deep-link conversation (server identity vs. load URL).
  * @returns {BrowserWindow}
  */
 function createWindow(targetUrl, opts = {}) {
@@ -876,23 +1019,41 @@ function createWindow(targetUrl, opts = {}) {
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
   const saved = loadSettings().server_url;
-  // An explicit target (New Window cloning a sibling) always wins. Otherwise
-  // ephemeral windows start on the setup page so the user can enter the
-  // alternate server, and normal windows fall back to the saved server.
-  const candidate =
-    explicit ?? (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
-  // A candidate that doesn't parse (hand-edited/corrupt settings.json) is
+  // serverUrl: the window's server IDENTITY for host/server CLI commands
+  // (``omnigent host --server``, ``omnigent login``, ``serverAuthed``) — the
+  // origin or origin+mount, WITHOUT the conversation path. Prefer an explicit
+  // override (deep link); else the explicit target (New Window cloning a
+  // sibling — preserves prior behavior); else the saved default for normal
+  // windows; else null (ephemeral windows start on the setup page).
+  const serverUrl =
+    (typeof opts.serverUrl === "string" && opts.serverUrl.length > 0 ? opts.serverUrl : null) ??
+    explicit ??
+    (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
+  // loadUrl: what the webContents actually loads. A deep-link path resolves
+  // under the server URL (mount-aware — see resolveServerPath); an explicit
+  // target (New Window) loads that exact URL; otherwise load the server URL.
+  const loadUrl =
+    (typeof opts.path === "string" && opts.path.length > 0 && serverUrl
+      ? resolveServerPath(serverUrl, opts.path)
+      : null) ??
+    explicit ??
+    serverUrl;
+  // A serverUrl that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
-  const destinationOrigin = candidate ? originOf(candidate) : null;
-  const destination = destinationOrigin ? candidate : null;
+  const destinationOrigin = serverUrl ? originOf(serverUrl) : null;
+  const destination = destinationOrigin ? loadUrl : null;
+  updateOverlay.ensureOverlay(win);
   windows.set(win, {
     // Pin to the destination's origin up front; setup-page windows stay
     // unpinned (null) until the user connects them.
     origin: destinationOrigin,
-    // Full connected URL (incl. any path) for host/server CLI commands.
-    serverUrl: destination,
+    // Clean server identity (no conversation path) for host/server CLI
+    // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
+    serverUrl: destination ? serverUrl : null,
     ephemeral,
     badgeCount: 0,
+    // Per-conversation embedded-browser view registry for this window.
+    browserRegistry: createBrowserRegistryForWindow(win),
   });
   if (destination) {
     void win.loadURL(destination);
@@ -901,32 +1062,56 @@ function createWindow(targetUrl, opts = {}) {
     // WindowState is the source of truth for persistence behavior).
     const search = new URLSearchParams();
     if (ephemeral) search.set("ephemeral", "1");
-    if (candidate && !destinationOrigin) {
+    if (serverUrl && !destinationOrigin) {
       // Fail loud on a corrupt hand-edited settings.json: show WHY the
       // window landed on setup instead of silently presenting a blank form.
       search.set("error", "saved server URL in settings.json is not a valid URL");
-      search.set("url", candidate);
+      search.set("url", serverUrl);
     }
     void win.loadFile(SETUP_PAGE, search.size > 0 ? { search: search.toString() } : undefined);
   }
 
-  // Never spawn chromeless Electron windows: web links open in the user's
-  // real browser, and any other scheme (a custom OS protocol handler like
-  // vscode://) requires explicit user consent first — see WEB_SCHEMES.
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    let scheme = null;
-    try {
-      scheme = new URL(url).protocol;
-    } catch {
-      // Unparseable URL from page content — nothing safe to open.
+  // Page-initiated window.open / target=_blank: web links open in the
+  // user's real browser and non-web schemes get a consent dialog. The one
+  // exception — an OAuth sign-in popup, whose callback needs window.opener
+  // and the opener's localStorage — opens as a hardened child window.
+  // Conditions in popupPolicy.js; hardening in hardenOauthPopup.
+  win.webContents.setWindowOpenHandler(({ url, disposition, features }) => {
+    const decision = decideWindowOpen(
+      { url, disposition, features },
+      {
+        openerOrigin: originOf(win.webContents.getURL()),
+        pinnedOrigin: pinnedOrigin(win),
+        extraPopupOrigins: loadSettings().popup_allowed_origins,
+      },
+    );
+    if (decision.kind === "popup") {
+      return {
+        action: "allow",
+        overrideBrowserWindowOptions: {
+          autoHideMenuBar: true,
+          webPreferences: {
+            // Never inherit the shell preload's IPC bridges into
+            // third-party sign-in pages.
+            preload: POPUP_PRELOAD,
+            sandbox: true,
+            contextIsolation: true,
+            nodeIntegration: false,
+          },
+        },
+      };
     }
-    if (scheme && WEB_SCHEMES.has(scheme)) {
+    if (decision.kind === "external") {
       void shell.openExternal(url);
-    } else if (scheme) {
-      void confirmExternalProtocol(win, url, scheme);
+    } else if (decision.kind === "protocol-consent") {
+      void confirmExternalProtocol(win, url, decision.scheme);
     }
+    // "ignore": unparseable URL from page content — nothing safe to open.
     return { action: "deny" };
   });
+
+  // Fires only for window.open the handler above allowed (OAuth popups).
+  win.webContents.on("did-create-window", (child) => hardenOauthPopup(child));
 
   // Server unreachable / DNS failure / TLS error → fall back to the setup
   // page with the failure shown, instead of stranding the user on Chromium's
@@ -965,6 +1150,12 @@ function createWindow(targetUrl, opts = {}) {
   // connect. Connecting is an explicit action from the host menu.
 
   win.on("closed", () => {
+    // Destroy this window's embedded-browser views, else they leak webContents.
+    try {
+      windows.get(win)?.browserRegistry?.closeAll("window-closed");
+    } catch {
+      /* registry already torn down */
+    }
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
   });
@@ -1529,8 +1720,8 @@ function buildMenu() {
     {
       id: "new_window",
       label: "New Window",
-      // Standard new-window accelerator; the role-based File menu below
-      // doesn't include one, so we own it here.
+      // Own the standard new-window accelerator here — there is no
+      // role-based File menu in this app.
       accelerator: "CmdOrCtrl+N",
       click: () => newWindow(),
     },
@@ -1547,6 +1738,68 @@ function buildMenu() {
       label: "Change Server…",
       click: () => changeServer(),
     },
+    { type: "separator" },
+    // Manual update check, surfaced as a production item here so shipped
+    // .app users can trigger it from the menubar. Download/install still
+    // flows through the in-app Settings UI / UpdateBanner (and the native
+    // consent dialog when driven from a server page).
+    {
+      id: "check_for_updates",
+      label: "Check for Updates…",
+      click: async () => {
+        // Surface the two silent outcomes of a manual menubar check with a
+        // native dialog: "no update" (otherwise only the renderer banner
+        // hears it, which the user may not be looking at) and "check failed"
+        // (the promise rejects and was previously swallowed). An available
+        // update is left to the in-app UpdateBanner to avoid a double notify.
+        try {
+          await updater.checkForUpdates({ manual: true });
+          const status = updater.getStatus();
+          if (status.state === "none") {
+            await dialog.showMessageBox(activeWindow(), {
+              type: "info",
+              title: "Omnigent",
+              message: "You're up to date!",
+              detail: `Omnigent ${app.getVersion()} is the latest version.`,
+              buttons: ["OK"],
+            });
+          }
+        } catch (err) {
+          await dialog.showMessageBox(activeWindow(), {
+            type: "warning",
+            title: "Omnigent",
+            message: "Couldn't check for updates",
+            detail: String(err?.message ?? err),
+            buttons: ["OK"],
+          });
+        }
+      },
+    },
+    {
+      id: "restart_to_update",
+      label: "Restart to Update",
+      click: async () => {
+        // Production install path: the UpdateBanner toast is dismissible (and
+        // a user may have closed it), so the menubar must still offer a way to
+        // install a downloaded update. installUpdateNow() quits the app to
+        // hand off to the installer; it returns false when nothing is ready
+        // (e.g. the toast was for an update since skipped or not downloaded),
+        // which we surface with a native dialog instead of silently no-op'ing.
+        if (!updater.installUpdateNow()) {
+          await dialog.showMessageBox(activeWindow(), {
+            type: "info",
+            title: "Omnigent",
+            message: "No update is ready to install",
+            detail: "Check for updates first, then download the new version.",
+            buttons: ["OK"],
+          });
+        }
+      },
+    },
+    { type: "separator" },
+    // `role: "close"` carries the standard CmdOrCtrl+W shortcut and closes
+    // the focused window. There is no File menu, so Close lives under Server.
+    { role: "close", label: "Close Window" },
   ];
 
   // Our custom Server menu, inserted right after the leftmost menu — index 1
@@ -1556,48 +1809,6 @@ function buildMenu() {
     submenu: serverSubmenu,
   });
 
-  // Notifications menu (macOS only — sound playback uses `afplay`): an on/off
-  // switch for the notification sound plus a picker of macOS system sounds.
-  // Selections persist in settings.json and are read live by the notify
-  // handler, so a change applies to the next notification without a relaunch.
-  if (isMac) {
-    /** @type {Electron.MenuItemConstructorOptions[]} */
-    const soundChoices = systemSoundNames().map((name) => ({
-      id: `notification_sound_${name}`,
-      label: name,
-      type: "radio",
-      checked: currentNotificationSoundName() === name,
-      click: () => {
-        const settings = loadSettings();
-        settings.notification_sound_name = name;
-        saveSettings(settings);
-        // Pick-to-preview: play the choice immediately so the user hears it,
-        // even when the sound is currently toggled off.
-        playSystemSound(name);
-      },
-    }));
-    template.push({
-      label: "Notifications",
-      submenu: [
-        {
-          id: "notification_sound_enabled",
-          label: "Play Notification Sound",
-          type: "checkbox",
-          checked: notificationSoundEnabled(),
-          click: (item) => {
-            const settings = loadSettings();
-            settings.notification_sound_enabled = item.checked;
-            saveSettings(settings);
-          },
-        },
-        { type: "separator" },
-        { label: "Sound", submenu: soundChoices },
-      ],
-    });
-  }
-
-  // Standard roles — these carry the predefined keyboard shortcuts.
-  template.push({ role: "fileMenu" });
   // The Edit roles (Undo/Redo/Cut/Copy/Paste/Select All) carry the platform
   // text-editing shortcuts; hand-rolled here instead of `role: "editMenu"`
   // only so Find… can live where users expect it.
@@ -1625,14 +1836,13 @@ function buildMenu() {
       },
     ],
   });
-  // Same items as `role: "viewMenu"`, hand-rolled so Toggle Developer
-  // Tools (and its accelerator) can be dropped from release builds.
+  // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
+  // the Debug menu (dev only), so this menu is identical in dev and release.
   template.push({
     label: "View",
     submenu: [
       { role: "reload" },
       { role: "forceReload" },
-      ...(app.isPackaged ? [] : [{ role: "toggleDevTools" }]),
       { type: "separator" },
       { role: "resetZoom" },
       { role: "zoomIn" },
@@ -1642,6 +1852,59 @@ function buildMenu() {
     ],
   });
   template.push({ role: "windowMenu" });
+
+  // Debug menu (dev only, !app.isPackaged): consolidates every debug-only /
+  // non-production affordance behind a single top-level menu — the macOS
+  // notification-sound settings (sound playback uses `afplay`, so macOS-only)
+  // and the developer tools. Restart-to-update now lives in the production
+  // Server menu (it's a needed install path, not a debug affordance, once the
+  // UpdateBanner toast is dismissible). Hidden in the shipped .app. Placed
+  // last so it never displaces the standard menus users expect.
+  if (!app.isPackaged) {
+    /** @type {Electron.MenuItemConstructorOptions[]} */
+    const debugSubmenu = [];
+
+    // macOS notification-sound settings: an on/off switch plus a picker of
+    // system sounds. Selections persist in settings.json and are read live by
+    // the notify handler, so a change applies to the next notification without
+    // a relaunch. macOS-only because playback uses `afplay`.
+    if (isMac) {
+      /** @type {Electron.MenuItemConstructorOptions[]} */
+      const soundChoices = systemSoundNames().map((name) => ({
+        id: `notification_sound_${name}`,
+        label: name,
+        type: "radio",
+        checked: currentNotificationSoundName() === name,
+        click: () => {
+          const settings = loadSettings();
+          settings.notification_sound_name = name;
+          saveSettings(settings);
+          // Pick-to-preview: play the choice immediately so the user hears it,
+          // even when the sound is currently toggled off.
+          playSystemSound(name);
+        },
+      }));
+      debugSubmenu.push(
+        { type: "separator" },
+        {
+          id: "notification_sound_enabled",
+          label: "Play Notification Sound",
+          type: "checkbox",
+          checked: notificationSoundEnabled(),
+          click: (item) => {
+            const settings = loadSettings();
+            settings.notification_sound_enabled = item.checked;
+            saveSettings(settings);
+          },
+        },
+        { label: "Sound", submenu: soundChoices },
+      );
+    }
+
+    debugSubmenu.push({ type: "separator" }, { role: "toggleDevTools" });
+
+    template.push({ label: "Debug", submenu: debugSubmenu });
+  }
 
   const menu = Menu.buildFromTemplate(template);
   Menu.setApplicationMenu(menu);
@@ -1701,6 +1964,64 @@ function isPinnedOriginSender(event) {
   if (originOf(event.senderFrame?.url ?? "") !== pinned) return false;
   // event.sender.getURL() is the webContents' main-frame URL.
   return originOf(event.sender.getURL()) === pinned;
+}
+
+// ---------------------------------------------------------------------------
+// Embedded browser pane
+//
+// The agent's `browser_*` tools drive a native WebContentsView per conversation,
+// positioned over a placeholder the SPA measures. Each window owns its own
+// registry; child views stay sandboxed (nodeIntegration:false, contextIsolation
+// + sandbox true) and detach — not destroy — on hide.
+//
+// `omnigent:browser-execute` runs JS via executeJavaScript; exposed to preload
+// for the relay's fixed templates only, never a generic agent `evaluate`.
+// See preload.js + README.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the per-conversation WebContentsView registry for a shell window
+ * (positions child views in `win.contentView`, pings back via `win.webContents`).
+ *
+ * @param {BrowserWindow} win The shell window that hosts the browser panes.
+ * @returns {ReturnType<typeof createBrowserViewRegistry>}
+ */
+function createBrowserRegistryForWindow(win) {
+  return createBrowserViewRegistry({
+    WebContentsViewCtor: (opts) => new WebContentsView(opts),
+    createBoundsController: createBrowserViewBoundsController,
+    attachToHost: (view) => win.contentView.addChildView(view),
+    detachFromHost: (view) => win.contentView.removeChildView(view),
+    sendToRenderer: (channel, payload) => {
+      try {
+        win.webContents.send(channel, payload);
+      } catch {
+        /* window torn down */
+      }
+    },
+    // Renderer measures in CSS px; convert to window DIPs using the host
+    // webContents zoom factor (Cmd+/Cmd- changes this out from under us).
+    getHostZoomFactor: () => {
+      try {
+        return win.webContents.getZoomFactor();
+      } catch {
+        return 1;
+      }
+    },
+  });
+}
+
+/**
+ * Look up the browser-view registry for the window that sent an IPC event.
+ * Returns null for unknown windows (torn-down / setup-page senders).
+ *
+ * @param {Electron.IpcMainInvokeEvent} event
+ * @returns {ReturnType<typeof createBrowserViewRegistry> | null}
+ */
+function browserRegistryForSender(event) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win) return null;
+  return windows.get(win)?.browserRegistry ?? null;
 }
 
 function registerIpc() {
@@ -2061,6 +2382,23 @@ function registerIpc() {
     return clearCliPath();
   });
 
+  // Updater IPC surface (get/set config, get status, check/download/install).
+  // The module owns the handlers and their trusted-sender + consent gates.
+  updater.registerIpc();
+  updateOverlay.registerIpc();
+
+  // Mirror the web app's in-app theme onto the native side so the update
+  // overlay, native dialogs, and menus track the theme switcher (not just the
+  // OS). Value-validated; the worst a page can do is toggle appearance. Still
+  // gated to a pinned server page like every other privileged channel, so a
+  // foreign page can't drive the shell's native appearance.
+  ipcMain.on("omnigent:set-color-scheme", (event, scheme) => {
+    if (!isPinnedOriginSender(event)) return;
+    if (scheme === "light" || scheme === "dark" || scheme === "system") {
+      nativeTheme.themeSource = scheme;
+    }
+  });
+
   // SPA → start / stop / restart this machine's host daemon for the window's
   // own server (the host selection menu's "connect this machine" action).
   ipcMain.handle("omnigent:host-control", async (event, action) => {
@@ -2106,6 +2444,315 @@ function registerIpc() {
   // polling) — the server-management module owns the subprocess and reports
   // lifecycle changes here.
   serverManager.onChange(broadcastHostStatus);
+
+  // Embedded browser pane — the `omnigent:browser-*` surface lives in
+  // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  registerBrowserIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    getRegistryForEvent: browserRegistryForSender,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Deep links (`omnigent://<hostname>/c/<session_id>`)
+//
+// An OS-clicked `omnigent://` URL opens the named session on the named server.
+// The decision logic (parse + window selection) is PURE in src/deepLink.js and
+// unit-tested there; this section owns ingestion, the queue, and the
+// orchestrator. See README "Deep links".
+//
+// Ingestion: macOS fires `open-url` (which can precede app.whenReady),
+// Windows/Linux funnel a second launch through `second-instance` (argv), and a
+// cold-start first instance also carries the URL in process.argv. All three
+// push onto one queue drained SERIALIZED (one link at a time) so two links
+// can't race two consent dialogs or two windows onto the same origin.
+// ---------------------------------------------------------------------------
+
+/**
+ * Full server URL (origin, or origin+mount) of a server the user previously
+ * connected to, whose origin matches `origin`; null when none. Reusing the
+ * recorded URL means a deep link to a KNOWN workspace server opens WITHOUT the
+ * network probe — the mount is already in the saved URL. Used both to detect
+ * "known" (for the consent gate) and to skip probe-based expansion.
+ *
+ * @param {string} origin e.g. ``"https://my-workspace.cloud.databricks.com"``.
+ * @returns {string | null}
+ */
+function findKnownServerUrl(origin) {
+  const settings = loadSettings();
+  /** @type {string[]} */
+  const candidates = [];
+  if (typeof settings.server_url === "string") candidates.push(settings.server_url);
+  if (Array.isArray(settings.recent_servers)) {
+    for (const u of settings.recent_servers) if (typeof u === "string") candidates.push(u);
+  }
+  for (const u of candidates) {
+    if (originOf(u) === origin) return u;
+  }
+  return null;
+}
+
+/**
+ * Origins of every server the user previously connected to (saved default +
+ * recent servers). The set used to tell a known server (open without consent)
+ * from a never-connected one (ask consent — pinning is a privilege grant).
+ *
+ * @returns {string[]}
+ */
+function knownOrigins() {
+  const settings = loadSettings();
+  /** @type {Set<string>} */
+  const origins = new Set();
+  if (typeof settings.server_url === "string") {
+    const o = originOf(settings.server_url);
+    if (o) origins.add(o);
+  }
+  if (Array.isArray(settings.recent_servers)) {
+    for (const u of settings.recent_servers) {
+      if (typeof u === "string") {
+        const o = originOf(u);
+        if (o) origins.add(o);
+      }
+    }
+  }
+  return [...origins];
+}
+
+/**
+ * Record a server URL at the head of the persisted recent-servers list (a
+ * user who just consented to a deep link to a new server should not have to
+ * consent again next time). Does NOT overwrite the saved default server — a
+ * clicked link never changes which server you land on at launch.
+ *
+ * @param {string} serverUrl
+ */
+function rememberServerUrl(serverUrl) {
+  const settings = loadSettings();
+  rememberRecentServer(settings, serverUrl);
+  saveSettings(settings);
+}
+
+/**
+ * Restore (if minimized) and focus a window. No-op when absent/destroyed.
+ *
+ * @param {BrowserWindow | null | undefined} win
+ */
+function focusAndRestore(win) {
+  if (!win || win.isDestroyed()) return;
+  if (win.isMinimized()) win.restore();
+  win.focus();
+}
+
+/**
+ * Tell a pinned window's SPA to navigate in-place to an in-app path
+ * (`/c/<id>`), without a reload — reuses the SPA's router, the same path a
+ * notification click routes (basename-less; the embedded build's
+ * `basenamedRouting` rebases it under the mount). Main→renderer only; the page
+ * cannot invoke it. The caller (reuse-inplace) only sends when the window's
+ * top-level page IS the pinned server (SPA listener mounted); this is
+ * defense-in-depth on top of that.
+ *
+ * @param {BrowserWindow | null | undefined} win
+ * @param {string} path
+ */
+function sendOpenPath(win, path) {
+  if (!win || win.isDestroyed()) return;
+  console.log(`[omnigent] deep-link: send open-path ${path}`);
+  try {
+    win.webContents.send("omnigent:open-path", path);
+  } catch {
+    // Window torn down between the check and the send; ignore.
+  }
+}
+
+/**
+ * Native, main-process confirmation before opening a deep link to a server
+ * the user has NEVER connected to — because pinning a new origin is a
+ * privilege grant (notifications, badge, mic), and a clicked link must not
+ * silently pin an attacker-chosen origin. Mirrors confirmHostEnrollment /
+ * confirmExternalProtocol: Cancel is the safe default, the full origin is
+ * shown so the user can see exactly what they'd connect to. The conversation
+ * id is NOT shown (it's an opaque server-owned identifier; the server is the
+ * trust decision, not the path).
+ *
+ * @param {BrowserWindow} parent The window to parent the dialog on.
+ * @param {string} targetOrigin The server origin to connect to.
+ * @returns {Promise<boolean>} True when the user chose Open.
+ */
+async function confirmOpenDeepLink(parent, targetOrigin) {
+  let host = targetOrigin;
+  try {
+    host = new URL(targetOrigin).host || targetOrigin;
+  } catch {
+    // Keep the full origin string if it somehow doesn't parse.
+  }
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  const { response } = await dialog.showMessageBox(parent, {
+    type: "warning",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: `Open this Omnigent link?`,
+    detail:
+      `This link will connect Omnigent to ${host} and open a conversation.\n\n` +
+      `Only open links from a server you trust — once connected, it can show ` +
+      `notifications and (when you allow it) manage this machine as a runner.`,
+    buttons: ["Cancel", "Open"],
+    defaultId: 0, // Cancel is the safe default
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
+/** Deep links awaiting handling, in arrival order. */
+const pendingDeepLinks = [];
+/** True while a deep link is being handled — the drain runs one at a time. */
+let deepLinkInFlight = false;
+
+/**
+ * Queue a deep link for handling. Unrecognized links (parseOmnigentDeepLink
+ * null) are dropped here so they never reach the queue. Draining is a no-op
+ * before app.whenReady (see drainPendingDeepLinks) — `open-url` can fire
+ * pre-ready on macOS, and the cold-start argv scan runs at lock time.
+ *
+ * @param {string} raw
+ */
+function enqueueDeepLink(raw) {
+  if (!parseOmnigentDeepLink(raw)) {
+    console.log(`[omnigent] deep-link: ignored unrecognized URL ${String(raw)}`);
+    return;
+  }
+  console.log(`[omnigent] deep-link: queued ${raw} (ready=${app.isReady()})`);
+  pendingDeepLinks.push(raw);
+  drainPendingDeepLinks();
+}
+
+/**
+ * Handle queued deep links one at a time. No-ops before app.isReady() (the
+ * whenReady block drains once setup is done). After a link is handled, if no
+ * window ended up open (e.g. consent was cancelled at cold start) it opens the
+ * default launch window so the app is never left windowless.
+ */
+function drainPendingDeepLinks() {
+  if (!app.isReady()) return; // queue until ready; whenReady drains
+  if (deepLinkInFlight) return;
+  const next = pendingDeepLinks.shift();
+  if (next === undefined) return;
+  deepLinkInFlight = true;
+  void handleDeepLink(next)
+    .catch((err) => console.warn("[omnigent] deep-link handling failed:", err))
+    .finally(() => {
+      deepLinkInFlight = false;
+      if (pendingDeepLinks.length > 0) {
+        drainPendingDeepLinks();
+      } else if (BrowserWindow.getAllWindows().length === 0) {
+        // A cancelled consent at cold start left no window — open the default.
+        createWindow();
+      }
+    });
+}
+
+/**
+ * Open an `omnigent://` deep link on the right window. The window-selection
+ * decision (reuse an existing window on that server in-place vs. reload it vs.
+ * open a new one vs. ask consent for an unknown server) is made by the PURE
+ * chooseDeepLinkStrategy(); this orchestrator snapshots the live windows and
+ * executes the decision. Serialized by drainPendingDeepLinks.
+ *
+ * No pre-consent network request. The decision runs on `parsed.origin`, which
+ * the link itself fixes (no fetch). A KNOWN server's recorded URL (already
+ * mount-bearing) is reused as-is. The workspace mount probe
+ * (expandDatabricksWorkspaceUrl) runs ONLY after the user consents to an
+ * UNKNOWN server — so clicking (or the OS dispatching) a link to an
+ * attacker-chosen host makes no HTTP request until the user has agreed. The
+ * probe is safe post-consent because it can only append a path (`/ml/omnigents`)
+ * under the SAME origin — it never changes the origin the user approved.
+ *
+ * @param {string} raw The raw `omnigent://...` URL.
+ * @returns {Promise<void>}
+ */
+async function handleDeepLink(raw) {
+  const parsed = parseOmnigentDeepLink(raw);
+  if (!parsed) return;
+
+  // The origin is fixed by the link itself — no network request needed for the
+  // decision. expandDatabricksWorkspaceUrl only appends a mount path under this
+  // same origin, so approving the origin is approving the server.
+  const targetOrigin = parsed.origin;
+  // A KNOWN server: reuse its recorded URL (already mount-bearing, e.g.
+  // `https://host/ml/omnigents`) so we SKIP the probe entirely. null for an
+  // unknown server — the mount is discovered AFTER consent (see consent-unknown).
+  const known = findKnownServerUrl(targetOrigin);
+
+  // Snapshot the live windows (creation order) for the pure decision.
+  const winList = [...windows.keys()];
+  const focused = BrowserWindow.getFocusedWindow();
+  const focusedIndex = focused && windows.has(focused) ? winList.indexOf(focused) : -1;
+  const decision = chooseDeepLinkStrategy({
+    targetOrigin,
+    windows: winList.map((win) => ({
+      origin: windows.get(win).origin,
+      currentOrigin: win.isDestroyed() ? null : originOf(win.webContents.getURL()),
+    })),
+    knownOrigins: knownOrigins(),
+    focusedIndex: focusedIndex < 0 ? null : focusedIndex,
+  });
+  console.log(
+    `[omnigent] deep-link: strategy=${decision.strategy} ` +
+      `target=${targetOrigin} known=${known ? "yes" : "no"} ` +
+      `windows=${winList.length}`,
+  );
+
+  switch (decision.strategy) {
+    case "reuse-inplace": {
+      const win = winList[decision.windowIndex];
+      focusAndRestore(win);
+      sendOpenPath(win, parsed.path);
+      return;
+    }
+    case "reuse-reload": {
+      const win = winList[decision.windowIndex];
+      // Reload against THIS window's own recorded server URL (authoritative for
+      // it, and correct for ephemeral windows whose origin isn't in settings —
+      // `known` would be null there). A pinned window always has a serverUrl.
+      const winServerUrl = windows.get(win).serverUrl;
+      focusAndRestore(win);
+      await loadServerUrl(win, winServerUrl, parsed.path).catch(() => {});
+      return;
+    }
+    case "open-known": {
+      const win = createWindow(undefined, { serverUrl: known, path: parsed.path });
+      focusAndRestore(win);
+      return;
+    }
+    case "consent-unknown": {
+      // Cold start to an unknown server may have no window to parent the dialog
+      // on — create the launch window first so the dialog has a parent and the
+      // app is never stranded windowless (it becomes the deep-link window on
+      // consent, or stays as the normal launch window on cancel).
+      let parent = activeWindow();
+      if (!parent) parent = createWindow();
+      if (!(await confirmOpenDeepLink(parent, targetOrigin))) return; // cancelled
+      // Consent given — NOW probe to discover the workspace mount. The origin
+      // is unchanged (the probe only appends a path under it), so the consent
+      // decision stands; the user approved connecting to this host.
+      const serverUrl = await expandDatabricksWorkspaceUrl(targetOrigin);
+      if (!originOf(serverUrl)) return; // expansion yielded an unparseable URL
+      // Reuse the just-created setup-page window instead of opening a second;
+      // if a window was already open (warm start), open a new one.
+      if (!pinnedOrigin(parent)) {
+        await loadServerUrl(parent, serverUrl, parsed.path).catch(() => {});
+        focusAndRestore(parent);
+      } else {
+        const win = createWindow(undefined, { serverUrl, path: parsed.path });
+        focusAndRestore(win);
+      }
+      // Record the newly-trusted server so the next link is frictionless.
+      rememberServerUrl(serverUrl);
+      return;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2120,11 +2767,48 @@ const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => {
-    const win = activeWindow();
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
+  // Cold-start argv scan. Windows/Linux: the OS launches the app with the
+  // omnigent:// URL as a command-line arg. macOS packaged builds get URLs via
+  // `open-url` (Apple Events), never argv — but in DEV the generic Electron.app
+  // bundle that `setAsDefaultProtocolClient` registers can't be reliably
+  // targeted by `open` (it launches a fresh Electron window instead of the
+  // running `electron .` instance), so we scan argv on ALL platforms to let
+  // `npm start -- 'omnigent://...'` exercise the real code path on macOS too.
+  // Safe: a packaged macOS launch has no omnigent:// in argv, so no double-handling.
+  for (const arg of process.argv) {
+    if (typeof arg === "string" && arg.startsWith("omnigent://")) enqueueDeepLink(arg);
+  }
+
+  // macOS: `open-url` fires for omnigent:// links, including BEFORE
+  // app.whenReady (cold start). preventDefault stops the OS from also handing
+  // the URL to the default browser; enqueueDeepLink queues it and
+  // drainPendingDeepLinks no-ops until ready, so the pre-ready race can't
+  // touch windows that don't exist yet.
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    enqueueDeepLink(url);
+  });
+
+  app.on("second-instance", (_event, argv) => {
+    // Deep-link warm start: the OS launched a second instance with the
+    // omnigent:// URL on its command line; the single-instance lock funnels
+    // it here. On Windows/Linux that's the OS dispatch; on macOS it's how a
+    // second `npm start -- 'omnigent://...'` reaches the running DEV instance
+    // (since `open` can't target the dev binary — see the cold-start argv
+    // scan above). A plain second launch (no URL) just focuses an existing window.
+    let handledUrl = false;
+    for (const arg of argv) {
+      if (typeof arg === "string" && arg.startsWith("omnigent://")) {
+        enqueueDeepLink(arg);
+        handledUrl = true;
+      }
+    }
+    if (!handledUrl) {
+      const win = activeWindow();
+      if (win) {
+        if (win.isMinimized()) win.restore();
+        win.focus();
+      }
     }
   });
 
@@ -2134,18 +2818,53 @@ if (!gotLock) {
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();
-    registerWebAuthn();
+    registerSessionExpiryAccess();
     registerIpc();
     buildMenu();
+    // Patch PATH for GUI-launched Electron on macOS/Linux:
+    // A desktop launcher inherits a minimal system PATH that omits directories like
+    // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
+    // One synchronous interactive+login shell invocation at startup (`$SHELL -ilc`)
+    // resolves the user's full PATH; we merge it into process.env so every
+    // subsequent spawn/execFile call inherits it. Runs before resolvedCliPath()
+    // (a PATH consumer) and any host spawn, so the ordering guarantee is implicit.
+    const { resolveLoginShellPath, mergePath } = require("./loginShellPath");
+    const _loginPath = resolveLoginShellPath();
+    if (_loginPath) {
+      process.env.PATH = mergePath(process.env.PATH, _loginPath);
+    }
     // Resolve the CLI path once at startup so the first status/control call is
     // instant (primes the in-memory cache in resolvedCliPath); also lets the
     // setup page / Local CLI settings pre-fill the resolved path immediately.
     resolvedCliPath();
-    createWindow();
+    // Register the omnigent:// scheme so OS clicks route to this app. The
+    // build manifest (package.json `build.protocols`) is the reliable
+    // per-install registration that survives reinstalls; this lets dev
+    // (`electron .`) clicks route to the running dev instance too. No-op
+    // (returns false) when another app is already the default handler.
+    app.setAsDefaultProtocolClient("omnigent");
+    // If a deep link arrived before ready (macOS open-url, or Windows/Linux
+    // argv), open it instead of the default launch window; the drain's
+    // fallback opens a default window if a consent is cancelled. Otherwise
+    // open the saved server (or setup page) as before.
+    if (pendingDeepLinks.length > 0) {
+      drainPendingDeepLinks();
+    } else {
+      createWindow();
+    }
+    updater.init();
 
     app.on("activate", () => {
-      // macOS: re-create the window when the dock icon is clicked and none open.
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      // macOS: re-create the window when the dock icon is clicked and none
+      // open. Skip while a deep link is being handled (or queued) — it opens
+      // its own window, and racing a default window here would double-open at
+      // cold start (whenReady skipped its own createWindow for the pending link).
+      if (
+        BrowserWindow.getAllWindows().length === 0 &&
+        !deepLinkInFlight &&
+        pendingDeepLinks.length === 0
+      )
+        createWindow();
     });
   });
 
@@ -2173,7 +2892,9 @@ if (!gotLock) {
       .catch(() => {})
       .finally(() => {
         quitCleanupDone = true;
-        app.quit();
+        // Hand off to a user-approved install if one is pending; otherwise
+        // complete the deferred quit.
+        if (!updater.quitAndInstallIfPending()) app.quit();
       });
   });
 }

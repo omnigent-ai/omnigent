@@ -36,6 +36,7 @@ PYTHON_VERSION="3.12"
 INSTALL_URL=
 NON_INTERACTIVE=false
 VERBOSE=false
+LEDGER_PROFILE=
 ESC=$(printf '\033')
 RESET=
 BOLD=
@@ -322,6 +323,8 @@ ensure_git() {
 # and fall back to a fail-with-hint on decline/non-interactive/failure.
 ensure_uv() {
   if command -v uv >/dev/null 2>&1; then
+    OMNIGENT_LEDGER_DEP_UV=preexisting
+    export OMNIGENT_LEDGER_DEP_UV
     step "uv is available"
     return
   fi
@@ -340,6 +343,8 @@ ensure_uv() {
       done
     fi
     if command -v uv >/dev/null 2>&1; then
+      OMNIGENT_LEDGER_DEP_UV=omnigent
+      export OMNIGENT_LEDGER_DEP_UV
       step "Installed uv"
       return
     fi
@@ -369,6 +374,8 @@ check_node() {
     require_or_warn "node not found — Node.js 22+ is needed for the Claude/Codex/Pi harnesses (https://nodejs.org)."
     return
   fi
+  OMNIGENT_LEDGER_DEP_NODE=preexisting
+  export OMNIGENT_LEDGER_DEP_NODE
   if node -e "process.exit(typeof require('node:worker_threads').markAsUncloneable === 'function' ? 0 : 1)" >/dev/null 2>&1; then
     step "Node.js is new enough for the harness CLIs"
   else
@@ -378,6 +385,8 @@ check_node() {
 
 check_npm() {
   if command -v npm >/dev/null 2>&1; then
+    OMNIGENT_LEDGER_DEP_NPM=preexisting
+    export OMNIGENT_LEDGER_DEP_NPM
     step "npm is available (installs the Claude/Codex/Pi harness CLIs on first run)"
   else
     require_or_warn "npm not found — needed to install the Claude/Codex/Pi harness CLIs (https://nodejs.org)."
@@ -406,6 +415,8 @@ linux_pkg_install_cmd() {
 
 check_tmux() {
   if command -v tmux >/dev/null 2>&1; then
+    OMNIGENT_LEDGER_DEP_TMUX=preexisting
+    export OMNIGENT_LEDGER_DEP_TMUX
     step "tmux is available"
     return
   fi
@@ -425,7 +436,11 @@ check_tmux() {
       if [ -n "$install_cmd" ] && prompt_yes_no "tmux is missing (needed for \`omnigent claude\` / \`omnigent codex\`). Install it now ($install_cmd)?"; then
         # Run directly (not via run_with_spinner) so sudo can prompt for a password.
         sh -c "$install_cmd" || warn "tmux install failed — run manually: $install_cmd"
-        command -v tmux >/dev/null 2>&1 && step "tmux installed"
+        if command -v tmux >/dev/null 2>&1; then
+          OMNIGENT_LEDGER_DEP_TMUX=omnigent
+          export OMNIGENT_LEDGER_DEP_TMUX
+          step "tmux installed"
+        fi
         return
       fi
       if [ -n "$install_cmd" ]; then
@@ -446,6 +461,8 @@ check_bubblewrap() {
   [ "$(uname -s)" = Linux ] || return 0
 
   if command -v bwrap >/dev/null 2>&1; then
+    OMNIGENT_LEDGER_DEP_BWRAP=preexisting
+    export OMNIGENT_LEDGER_DEP_BWRAP
     step "bubblewrap (bwrap) is available"
     return
   fi
@@ -453,6 +470,10 @@ check_bubblewrap() {
   install_cmd="$(linux_pkg_install_cmd bubblewrap)"
   if [ -n "$install_cmd" ] && prompt_yes_no "bubblewrap is missing (needed to sandbox native \`omnigent claude\` / \`omnigent codex\` terminals). Install it now ($install_cmd)?"; then
     run_with_spinner "install bubblewrap" sh -c "$install_cmd" || warn "bubblewrap install failed — run manually: $install_cmd"
+    if command -v bwrap >/dev/null 2>&1; then
+      OMNIGENT_LEDGER_DEP_BWRAP=omnigent
+      export OMNIGENT_LEDGER_DEP_BWRAP
+    fi
     return
   fi
   if [ -n "$install_cmd" ]; then
@@ -554,6 +575,7 @@ maybe_add_bin_to_path() {
 
   if [ -f "$profile" ] && grep -F "$begin_marker" "$profile" >/dev/null 2>&1; then
     if grep -F "$path_line" "$profile" >/dev/null 2>&1; then
+      LEDGER_PROFILE="$profile"
       step "PATH is already configured in $profile"
       return
     fi
@@ -571,7 +593,29 @@ maybe_add_bin_to_path() {
     printf '%s\n' "$path_line"
     printf '%s\n' "$end_marker"
   } >>"$profile"
+  LEDGER_PROFILE="$profile"
   step "Added $bin_dir to PATH in $profile"
+}
+
+write_install_ledger() {
+  bin_dir="$1"
+  cli_path="$bin_dir/omnigent"
+  if [ ! -x "$cli_path" ]; then
+    cli_path="$(command -v omnigent 2>/dev/null || true)"
+  fi
+  if [ -z "$cli_path" ]; then
+    warn "Could not write install ledger: omnigent command not found."
+    return 0
+  fi
+  if [ -n "$LEDGER_PROFILE" ]; then
+    OMNIGENT_LEDGER_PROFILE="$LEDGER_PROFILE"
+    export OMNIGENT_LEDGER_PROFILE
+  fi
+  if "$cli_path" _internal write-ledger --from-env >/dev/null 2>&1; then
+    step "Recorded install ledger"
+  else
+    warn "Could not write install ledger; uninstall can backfill it later."
+  fi
 }
 
 verify_omnigent() {
@@ -616,6 +660,8 @@ print_next_steps() {
   printf '  %somnigent codex           # Codex\n\n' "$command_prefix"
   printf 'Manage model credentials any time:\n'
   printf '  %somnigent setup\n\n' "$command_prefix"
+  printf 'Uninstall the CLI but keep local history and credentials:\n'
+  printf '  %somnigent uninstall --yes\n\n' "$command_prefix"
   printf '%sUsing a Databricks workspace as your model provider? Install the\n' "$DIM"
   printf 'Databricks CLI (https://docs.databricks.com/aws/en/dev-tools/cli/install)\n'
   printf 'and add it via: omnigent setup -> Databricks.%s\n' "$RESET"
@@ -636,6 +682,7 @@ main() {
   bin_dir="$(uv_tool_bin_dir)"
   verify_omnigent "$bin_dir"
   maybe_add_bin_to_path "$bin_dir"
+  write_install_ledger "$bin_dir"
   print_next_steps "$bin_dir"
 }
 

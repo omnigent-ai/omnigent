@@ -56,8 +56,8 @@ interface MobileSessionMenuProps {
   showShellsTab: boolean;
   /** Number of open terminals (entry badge). */
   terminalsLength: number;
-  /** Whether this is a claude-native session (gates the Tasks entry). */
-  isClaudeNative: boolean;
+  /** Whether the session publishes a todo list (gates the Tasks entry). */
+  todosSupported: boolean;
   /** Completed todo count (Tasks entry badge numerator). */
   todosCompleted: number;
   /** Total todo count (Tasks entry badge denominator + visibility). */
@@ -468,7 +468,7 @@ export function ChatHeader({
                     )}
                   </DropdownMenuItem>
                 )}
-                {mobileMenu.isClaudeNative && mobileMenu.todosTotal > 0 && (
+                {mobileMenu.todosSupported && mobileMenu.todosTotal > 0 && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenTodos}
                     className="gap-2.5 px-2.5 py-2 text-base"

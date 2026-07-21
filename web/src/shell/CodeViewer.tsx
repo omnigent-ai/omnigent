@@ -57,9 +57,11 @@ import {
   isBinaryPath,
   isImageFile,
   isNotebookPath,
+  isPdfFile,
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
+import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -72,6 +74,10 @@ import { getEmbedRoot } from "@/lib/host";
 const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
+
+// react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
+// viewed so it never enters the initial bundle.
+const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.PdfViewer })));
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
@@ -140,9 +146,19 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 };
 
-function MarkdownPreview({ content }: { content: string }) {
+function MarkdownPreview({
+  content,
+  rootRef,
+}: {
+  content: string;
+  rootRef?: RefObject<HTMLDivElement | null>;
+}) {
   return (
-    <div className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none">
+    <div
+      ref={rootRef}
+      data-preview-scroll
+      className="markdown-preview px-6 py-4 overflow-auto h-full prose dark:prose-invert prose-sm max-w-none"
+    >
       <ReactMarkdown
         remarkPlugins={MARKDOWN_REMARK_PLUGINS}
         rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
@@ -150,6 +166,51 @@ function MarkdownPreview({ content }: { content: string }) {
       >
         {content}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+// Markdown / notebook preview with find-in-file. The preview is React-owned
+// DOM, so PreviewSearchBar highlights matches via the CSS Custom Highlight API
+// (no node mutation). `contentVersion` = content string, so the match ranges
+// recompute when the rendered document changes.
+function PreviewWithSearch({
+  content,
+  isNotebook,
+  truncated,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
+}: {
+  content: string;
+  isNotebook: boolean;
+  truncated: boolean;
+  searchOpen: boolean;
+  onSearchHandled: () => void;
+  searchInputRef: RefObject<HTMLInputElement | null>;
+}) {
+  const previewRef = useRef<HTMLDivElement>(null);
+  const bar = (
+    <PreviewSearchBar
+      containerRef={previewRef}
+      contentVersion={content}
+      open={searchOpen}
+      onClose={onSearchHandled}
+      inputRef={searchInputRef}
+    />
+  );
+  const preview = isNotebook ? (
+    <NotebookPreview content={content} rootRef={previewRef} />
+  ) : (
+    <MarkdownPreview content={content} rootRef={previewRef} />
+  );
+  // The find bar sits above the preview; a truncated preview also shows the
+  // banner. The bar renders nothing when closed, so layout is unchanged then.
+  return (
+    <div className="flex h-full flex-col">
+      {bar}
+      {truncated && <TruncatedBanner />}
+      <div className="min-h-0 flex-1">{preview}</div>
     </div>
   );
 }
@@ -376,12 +437,32 @@ export function CodeViewer({
     matchLineRefs.current.get(idx)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [searchQuery, currentMatchIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Open search on Cmd+F / Ctrl+F.
-  // Don't intercept in markdown editor mode — the custom search bar isn't
-  // available there, so let the browser's native find handle it instead.
   const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
+
+  // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
+  // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
+  // also handles Escape while its input is focused, but this covers the case
+  // where focus is in the editor body.
   useEffect(() => {
-    // Skip in Monaco mode too — Monaco owns Cmd+F (native find).
+    if (!panelOpen || !isMarkdownEditor) return;
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        setSearchOpen(true);
+        setTimeout(() => searchInputRef.current?.focus(), 0);
+      } else if (e.key === "Escape" && searchOpen) {
+        e.preventDefault();
+        setSearchOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef]);
+
+  // Open search on Cmd+F / Ctrl+F in the Shiki source view.
+  useEffect(() => {
+    // Skip in Monaco mode (Monaco owns Cmd+F) and markdown editor mode (handled
+    // above with its own find bar).
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
@@ -412,9 +493,10 @@ export function CodeViewer({
     return () => window.removeEventListener("keydown", handler);
   }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // In Monaco mode the custom search bar isn't rendered; the editor opens its
-  // native find when `searchOpen` is set (once it has mounted), then calls this
-  // to reset the flag so the next Find click re-triggers it.
+  // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
+  // native find widget to `searchOpen` (open when set, close when cleared). This
+  // resets the flag when find is closed from within Monaco (Escape or the
+  // widget's ✕) so the toolbar toggle stays in sync with the visible widget.
   const handleSearchHandled = useCallback(() => setSearchOpen(false), [setSearchOpen]);
 
   // Show "Add Comment" button after the user finishes a text selection
@@ -547,6 +629,25 @@ export function CodeViewer({
   if (fileQuery.data && isImageFile(path, fileQuery.data.content_type)) {
     return <ImageViewer data={fileQuery.data} path={path} />;
   }
+  if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading…
+          </div>
+        }
+      >
+        <PdfViewer
+          data={fileQuery.data}
+          conversationId={conversationId}
+          comments={comments}
+          activeSelection={activeSelection}
+          onSetActiveSelection={onSetActiveSelection}
+        />
+      </Suspense>
+    );
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
@@ -568,6 +669,9 @@ export function CodeViewer({
         activeSelection={activeSelection}
         onSetActiveSelection={onSetActiveSelection}
         pendingBodyRef={pendingBodyRef}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
       />
     );
   }
@@ -589,19 +693,15 @@ export function CodeViewer({
   }
 
   if (viewMode === "preview" && (lang === "markdown" || isNotebookPath(path))) {
-    const preview = isNotebookPath(path) ? (
-      <NotebookPreview content={content} />
-    ) : (
-      <MarkdownPreview content={content} />
-    );
-    // A truncated preview renders incomplete content; warn the user (the editor
-    // and source surfaces already do). No layout change when not truncated.
-    if (!truncated) return preview;
     return (
-      <div className="flex h-full flex-col">
-        <TruncatedBanner />
-        <div className="min-h-0 flex-1">{preview}</div>
-      </div>
+      <PreviewWithSearch
+        content={content}
+        isNotebook={isNotebookPath(path)}
+        truncated={truncated}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
+      />
     );
   }
 

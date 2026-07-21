@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
@@ -76,7 +76,13 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostVersion: () => versionEnv.hostVersion,
 }));
 
-import { AgentInfoButton, AgentInfoContent, agentDisplayLabel } from "./AgentInfo";
+import {
+  AgentInfoButton,
+  AgentInfoContent,
+  agentDisplayLabel,
+  HOVER_CLICK_GRACE_MS,
+  HOVER_CLOSE_DELAY_MS,
+} from "./AgentInfo";
 
 afterEach(() => {
   cleanup();
@@ -177,6 +183,148 @@ describe("AgentInfoButton", () => {
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
     expect(screen.getByText("Claude")).toBeInTheDocument();
     expect(screen.queryByText("claude-native-ui")).toBeNull();
+  });
+});
+
+// Mouse pointer enter/leave. Hover-open is gated to `pointerType === "mouse"`
+// so touch/pen fall through to click-to-open; these helpers exercise the mouse
+// path. `pointerEnter`/`pointerLeave` don't bubble, matching the real events.
+function mousePointerEnter(el: Element) {
+  fireEvent.pointerEnter(el, { pointerType: "mouse" });
+}
+function mousePointerLeave(el: Element) {
+  fireEvent.pointerLeave(el, { pointerType: "mouse" });
+}
+
+describe("AgentInfoButton hover behavior", () => {
+  // The panel opens on mouse hover over the (i) icon and stays open while the
+  // pointer is on the icon or the panel, closing after a short delay once it
+  // leaves both. Click continues to toggle it. Fake timers drive the delay.
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    act(() => vi.runOnlyPendingTimers());
+    vi.useRealTimers();
+  });
+
+  it("opens the panel on mouse hover over the (i) icon", () => {
+    renderButton(AGENT_WITH_BOTH);
+    // Closed on mount: nothing rendered yet.
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+
+    mousePointerEnter(screen.getByTestId("agent-info-trigger"));
+
+    // The panel is now open — the agent name proves the content mounted.
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+    expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
+  });
+
+  it("stays open when the pointer moves from the icon onto the panel", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    mousePointerEnter(trigger);
+
+    // Leaving the icon schedules a close; entering the panel before the delay
+    // elapses must cancel it so the panel doesn't flicker shut mid-move.
+    mousePointerLeave(trigger);
+    mousePointerEnter(screen.getByTestId("agent-info-panel"));
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
+
+  it("closes after the delay once the pointer leaves both the icon and panel", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    mousePointerEnter(trigger);
+    const panel = screen.getByTestId("agent-info-panel");
+
+    mousePointerEnter(panel);
+    mousePointerLeave(panel);
+    // Still open right up to the delay boundary...
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS - 1));
+    expect(screen.queryByTestId("agent-info-panel")).toBeInTheDocument();
+    // ...then closes once it elapses.
+    act(() => vi.advanceTimersByTime(2));
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+  });
+
+  it("re-entering the icon during the close delay keeps the panel open", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    mousePointerEnter(trigger);
+
+    mousePointerLeave(trigger);
+    mousePointerEnter(trigger);
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
+
+  it("still toggles open and closed on click", () => {
+    // Click/keyboard access must survive the hover wiring — keyboard users rely
+    // on it since they never fire a pointer enter.
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+
+    fireEvent.click(trigger);
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+  });
+
+  it("ignores a touch pointer so a tap falls through to click-to-open", () => {
+    // A touch tap synthesizes pointerenter+click. If hover-open fired on touch,
+    // it would open on pointerenter only for the synthetic click to toggle it
+    // straight back shut — so a tap could never open the panel. The touch
+    // pointerenter must be a no-op, leaving the panel closed for the click to
+    // open. (Verified in a real browser via CDP touch events.)
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    fireEvent.pointerEnter(trigger, { pointerType: "touch" });
+    // Touch hover did nothing — the panel stays closed.
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+
+    // The tap's click then opens it (Radix's native toggle).
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
+
+  it("a mouse hover that then clicks lands closed (no double-open)", () => {
+    // Mouse users can hover (opens) then click the icon; the click must toggle
+    // relative to the hover-open state, ending closed rather than reopening.
+    // A deliberate click dwells past the grace window (a real hover-then-click
+    // is tens of ms apart), so the toggle-shut is honored.
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    mousePointerEnter(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+
+    act(() => vi.advanceTimersByTime(HOVER_CLICK_GRACE_MS + 10));
+    fireEvent.click(trigger);
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+  });
+
+  it("a click within the grace window of hover-open keeps the panel open", () => {
+    // A mouse click's own pointer arrival hover-opens the panel, then the
+    // click's Radix toggle fires within the same gesture. If the hover-open has
+    // already committed open=true, that toggle asks to close — but both halves
+    // land within the grace window, so the close is swallowed and the panel
+    // stays open (the click-to-open path the popover e2e drives). Model that as
+    // a pointerenter immediately followed by a click, with no time advanced.
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    mousePointerEnter(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+
+    // No timers advanced: the click lands inside HOVER_CLICK_GRACE_MS.
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
   });
 });
 
@@ -615,9 +763,100 @@ describe("SessionPoliciesSection", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the all-applied empty message when every registry policy is already added", () => {
-    // WHY: when appliedHandlers covers the whole registry the filtered list is
-    // empty AND available.length === 0, so the dialog says all are applied.
+  it("adds array (multi-select) values via the model combobox as a coerced list", () => {
+    // WHY: the expensive_models-style array param renders the single-input
+    // combobox; picking options and typing a free-form value must survive the
+    // comma-joined form state and coerce to a list[str] on submit — the
+    // behavior the checkbox→combobox refactor must not regress.
+    registryData.current = [
+      {
+        handler: "h.budget",
+        kind: "factory",
+        name: "Budget Guard",
+        description: "blocks expensive models",
+        params_schema: {
+          properties: {
+            expensive_models: {
+              type: "array",
+              items: { type: "string", enum: ["opus", "sonnet", "haiku"] },
+            },
+          },
+          required: [],
+        },
+      },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    // Open the combobox and pick two options from the list.
+    const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));
+    // Free-form typed value still works (Enter commits).
+    fireEvent.change(combo, { target: { value: "custom-tier" } });
+    fireEvent.keyDown(combo, { key: "Enter" });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+
+    expect(addMutate).toHaveBeenCalledTimes(1);
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload.handler).toBe("h.budget");
+    expect(payload.factory_params).toEqual({
+      expensive_models: ["opus", "haiku", "custom-tier"],
+    });
+  });
+
+  it("removes a picked array value via its chip", () => {
+    // WHY: selected values render as removable chips above the combobox;
+    // removing one must drop it from the submitted list.
+    registryData.current = [
+      {
+        handler: "h.budget",
+        kind: "factory",
+        name: "Budget Guard",
+        description: "blocks expensive models",
+        params_schema: {
+          properties: {
+            expensive_models: {
+              type: "array",
+              items: { type: "string", enum: ["opus", "sonnet", "haiku"] },
+            },
+          },
+          required: [],
+        },
+      },
+    ];
+    renderContent("conv_pol");
+
+    fireEvent.click(screen.getByTitle("Add policy"));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByText("Budget Guard"));
+
+    const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    fireEvent.focus(combo);
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
+    fireEvent.mouseDown(within(dialog).getByRole("button", { name: "sonnet" }));
+
+    // Remove opus via its chip's X button. The chip is a <span> holding the
+    // label text plus a remove <button>; the list option, by contrast, is a
+    // <button> — so pick the "opus" match that is itself a span with a button.
+    const opusChip = within(dialog)
+      .getAllByText("opus")
+      .map((el) => el.closest("span"))
+      .find((span) => span?.querySelector("button")) as HTMLElement;
+    fireEvent.click(within(opusChip).getByRole("button"));
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add" }));
+
+    const payload = addMutate.mock.calls[0][0];
+    expect(payload.factory_params).toEqual({ expensive_models: ["sonnet"] });
+  });
+
+  it("shows all registry policies even when already applied", () => {
     registryData.current = [
       { handler: "h.alpha", kind: "callable", name: "Alpha Guard", description: "blocks alpha" },
     ];
@@ -628,9 +867,7 @@ describe("SessionPoliciesSection", () => {
 
     fireEvent.click(screen.getByTitle("Add policy"));
     const dialog = screen.getByRole("dialog");
-    expect(
-      within(dialog).getByText("All available policies are already applied."),
-    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Alpha Guard")).toBeInTheDocument();
   });
 });
 

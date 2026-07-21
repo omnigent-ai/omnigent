@@ -23,17 +23,58 @@ defines the full public interface.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fnmatch
 import logging
+import os
 import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock.
+    fcntl = None  # type: ignore[assignment]
+
 _logger = logging.getLogger(__name__)
+
+# Wall-clock cap for git subprocesses backing the changed-files view. Large
+# repos (many untracked files, slow disk) can make `git status` slow, so this
+# is generous by default and overridable via OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS
+# for repos that need more (or less) headroom. It still bounds a genuinely hung
+# git so the panel surfaces a failure rather than blocking forever.
+_DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
+
+
+def _git_timeout_seconds() -> float:
+    """Return the git-subprocess timeout, honoring the env override.
+
+    Reads ``OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS`` on each call so operators can
+    tune it without a restart. Falls back to the default on unset/invalid/
+    non-positive values.
+    """
+    raw = os.environ.get("OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS")
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return _DEFAULT_GIT_TIMEOUT_SECONDS
+
+
+# Git roots whose ``core.untrackedCache`` we've already enabled this process, so
+# the one-shot config write doesn't repeat.  The host fallback path builds a
+# fresh registry per fs request (unlike the runner, which caches per session),
+# so without this guard every request would re-spawn the ``git config``.
+_untracked_cache_enabled: set[str] = set()
+_untracked_cache_lock = threading.Lock()
 
 
 class GitStatusUnavailable(RuntimeError):
@@ -159,6 +200,58 @@ def _find_git_root(path: Path) -> Path | None:
         if parent == current:
             return None
         current = parent
+
+
+def _git_common_dir(git_root: Path) -> Path:
+    """Return the Git directory shared by a repository and its worktrees."""
+    git_entry = git_root / ".git"
+    if git_entry.is_dir():
+        return git_entry.resolve()
+    try:
+        marker = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return git_entry
+    if not marker.startswith("gitdir:"):
+        return git_entry
+    git_dir = Path(marker.removeprefix("gitdir:").strip())
+    if not git_dir.is_absolute():
+        git_dir = git_root / git_dir
+    git_dir = git_dir.resolve()
+    try:
+        common_marker = (git_dir / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return git_dir
+    common_dir = Path(common_marker)
+    if not common_dir.is_absolute():
+        common_dir = git_dir / common_dir
+    return common_dir.resolve()
+
+
+@contextlib.contextmanager
+def _untracked_cache_repo_lock(git_root: Path) -> Iterator[None]:
+    """Serialize the optional untracked-cache setup across runner processes."""
+    if fcntl is None:
+        yield
+        return
+    fd: int | None = None
+    lock_path = _git_common_dir(git_root) / "omnigent-untracked-cache.lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        _logger.debug("could not lock untracked-cache setup for %s", git_root, exc_info=True)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _normalize_path(path: str, cwd: Path) -> str | None:
@@ -665,13 +758,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 class GitFilesystemRegistry(FilesystemRegistry):
     """Filesystem registry backed by ``git status`` and ``git show``.
 
-    Used when the workspace is inside a git repository.  No background thread
-    is started.  :meth:`list_changed_files` and :meth:`get_changed_file`
-    always reflect the current working-tree state (staged + unstaged changes
-    and untracked files relative to HEAD).  Because git tracks changes from
-    HEAD rather than from a point in time, results are not scoped to a
-    conversation start time and include changes made by any process (agent
-    tool calls, shell commands, external editors, etc.).
+    Used when the workspace is inside a git repository. :meth:`start` launches
+    optional untracked-cache setup in a daemon thread; change queries remain
+    correct before it completes. :meth:`list_changed_files` and
+    :meth:`get_changed_file` always reflect the current working-tree state.
 
     :param watch_path: The workspace directory, e.g.
         ``Path("/home/user/project")``.
@@ -687,6 +777,123 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
+        self._optimization_start_lock = threading.Lock()
+        self._optimization_started = False
+
+    def start(self) -> None:
+        """Start optional Git performance setup without blocking the caller."""
+        with self._optimization_start_lock:
+            if self._optimization_started:
+                return
+            self._optimization_started = True
+        threading.Thread(
+            target=self._enable_untracked_cache,
+            name="omnigent-git-untracked-cache",
+            daemon=True,
+        ).start()
+
+    def _enable_untracked_cache(self) -> None:
+        """Best-effort ``core.untrackedCache=true`` on this repo.
+
+        The untracked cache (upstream git ≥ 2.8) records untracked file/dir
+        mtimes in the index so ``git status --untracked-files=all`` skips
+        re-stat'ing every untracked path — the dominant cost on large repos.
+        Runs at most once per git-root per process (guarded by
+        :data:`_untracked_cache_enabled`) so the host fallback path — which
+        builds a fresh registry per fs request — doesn't re-spawn the config
+        write each time.
+
+        Gated on ``git update-index --test-untracked-cache`` (git's own
+        recommended probe): on filesystems with unreliable directory mtimes the
+        cache can return stale results — a newly-untracked file could then be
+        missing from the changed-files panel.  We only enable when the probe
+        passes.  Failures anywhere (old git, read-only .git, unsupported
+        filesystem) are ignored since the setting is a pure speedup with no
+        behavioral effect.
+        """
+        root_key = str(self._git_root.resolve())
+        with _untracked_cache_lock:
+            if root_key in _untracked_cache_enabled:
+                return
+            _untracked_cache_enabled.add(root_key)
+        with _untracked_cache_repo_lock(self._git_root):
+            if self._untracked_cache_is_enabled():
+                return
+            self._probe_and_enable_untracked_cache()
+
+    def _untracked_cache_is_enabled(self) -> bool:
+        """Return whether the shared repository config already enables the cache."""
+        started_at = time.perf_counter()
+        try:
+            result = subprocess.run(
+                ["git", "config", "--bool", "--get", "core.untrackedCache"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache config check failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - started_at) * 1000,
+            )
+            return False
+        enabled = result.returncode == 0 and result.stdout.strip().lower() == b"true"
+        _logger.info(
+            "git untracked-cache config checked: git_root=%s elapsed_ms=%.1f enabled=%s",
+            self._git_root,
+            (time.perf_counter() - started_at) * 1000,
+            enabled,
+        )
+        return enabled
+
+    def _probe_and_enable_untracked_cache(self) -> None:
+        """Probe filesystem support and enable the optional Git index extension."""
+        probe_started_at = time.perf_counter()
+        try:
+            probe = subprocess.run(
+                ["git", "update-index", "--test-untracked-cache"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache probe failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - probe_started_at) * 1000,
+            )
+            return
+        _logger.info(
+            "git untracked-cache probe completed: git_root=%s elapsed_ms=%.1f returncode=%d",
+            self._git_root,
+            (time.perf_counter() - probe_started_at) * 1000,
+            probe.returncode,
+        )
+        if probe.returncode != 0:
+            return
+
+        config_started_at = time.perf_counter()
+        try:
+            config = subprocess.run(
+                ["git", "config", "core.untrackedCache", "true"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache config failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - config_started_at) * 1000,
+            )
+            return
+        _logger.info(
+            "git untracked-cache config completed: git_root=%s elapsed_ms=%.1f returncode=%d",
+            self._git_root,
+            (time.perf_counter() - config_started_at) * 1000,
+            config.returncode,
+        )
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
@@ -704,14 +911,21 @@ class GitFilesystemRegistry(FilesystemRegistry):
         # inside a brand-new directory tree collapses to a single ``?? dir/``
         # line, so the UI would show the directory (stat'd as ~96 B) instead
         # of the added file.
+        #
+        # The ``:(exclude)`` pathspecs stop git from walking large untracked
+        # build/cache trees (node_modules/, .venv/ …) that we would discard
+        # below anyway.  With ``-uall`` git otherwise stat's every file in them,
+        # which dominates the runtime on big repos.  These mirror the
+        # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
         argv = ["git", "status", "--porcelain", "--untracked-files=all"]
+        argv.extend(self._skip_dir_pathspecs())
         started = time.monotonic()
         try:
             result = subprocess.run(
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_git_timeout_seconds(),
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -748,6 +962,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
             )
 
+        numstat = self._run_git_numstat()
         records: list[dict[str, Any]] = []
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
             parsed = _parse_git_porcelain_line(line)
@@ -764,7 +979,10 @@ class GitFilesystemRegistry(FilesystemRegistry):
             first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
             if first_component in _SKIP_DIRS:
                 continue
-            records.append(self._make_record(rel_path, operation))
+            # Counts come only from `git diff HEAD` (via numstat). Files git
+            # doesn't diff — untracked new files, binaries — get no counter.
+            counts = numstat.get(rel_path, (None, None))
+            records.append(self._make_record(rel_path, operation, counts))
 
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
@@ -802,7 +1020,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_git_timeout_seconds(),
             )
         except subprocess.TimeoutExpired as exc:
             elapsed = time.monotonic() - started
@@ -870,7 +1088,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_git_timeout_seconds(),
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
@@ -883,6 +1101,25 @@ class GitFilesystemRegistry(FilesystemRegistry):
         return None
 
     # ── Internals ─────────────────────────────────────────────────
+
+    def _skip_dir_pathspecs(self) -> list[str]:
+        """Return ``:(exclude)`` pathspecs pruning :data:`_SKIP_DIRS` from status.
+
+        The post-filter in :meth:`list_changed_files` only prunes skip dirs at
+        the *workspace root* (first path component), so the pathspecs are
+        anchored to the workspace's location within the git root to match —
+        e.g. a workspace at ``repo/sub`` yields ``:(exclude)sub/node_modules``,
+        which leaves a ``node_modules/`` elsewhere in the repo untouched.
+        Returns an empty list when the workspace escapes the git root (in which
+        case the post-filter alone still applies).
+        """
+        try:
+            prefix = self._cwd.relative_to(self._git_root)
+        except ValueError:
+            return []
+        prefix_posix = prefix.as_posix()
+        base = "" if prefix_posix == "." else f"{prefix_posix}/"
+        return [f":(exclude){base}{name}" for name in sorted(_SKIP_DIRS)]
 
     def _git_to_rel(self, git_path: str) -> str | None:
         """Convert a git-root-relative path to a cwd-relative path.
@@ -897,13 +1134,22 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
-    def _make_record(self, rel_path: str, operation: str) -> dict[str, Any]:
+    def _make_record(
+        self,
+        rel_path: str,
+        operation: str,
+        line_counts: tuple[int | None, int | None] = (None, None),
+    ) -> dict[str, Any]:
         """Build a file-record dict for *rel_path*.
 
         :param rel_path: Path relative to ``self._cwd``.
         :param operation: One of ``"created"``, ``"modified"``, ``"deleted"``.
-        :returns: File-record dict with ``path``, ``status``, ``bytes``, and
-            ``modified_at`` fields.
+        :param line_counts: ``(lines_added, lines_removed)`` for this file, each
+            ``None`` when unknown (binary file, path missing from numstat, or
+            numstat unavailable). Defaults to ``(None, None)`` so callers that
+            don't need counts (e.g. the diff endpoint) can omit them.
+        :returns: File-record dict with ``path``, ``status``, ``bytes``,
+            ``modified_at``, ``lines_added``, and ``lines_removed`` fields.
         """
         bytes_: int | None = None
         modified_at: int | None = None
@@ -914,7 +1160,66 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 modified_at = int(st.st_mtime)
             except OSError:
                 pass
-        return {"path": rel_path, "status": operation, "bytes": bytes_, "modified_at": modified_at}
+        added, removed = line_counts
+        return {
+            "path": rel_path,
+            "status": operation,
+            "bytes": bytes_,
+            "modified_at": modified_at,
+            "lines_added": added,
+            "lines_removed": removed,
+        }
+
+    def _run_git_numstat(self) -> dict[str, tuple[int | None, int | None]]:
+        """Return per-file line counts from ``git diff --numstat HEAD``.
+
+        ``--no-renames`` splits a rename into two independent entries — a full
+        add on the destination path and a full delete on the old path — so the
+        paths line up with ``git status``'s destination-only entries rather than
+        an ``old -> new`` pair. (A pure rename therefore shows ``+N`` on the
+        moved file, not ``(None, None)``.) Binary files report ``-\\t-`` →
+        ``(None, None)``. Paths are keyed cwd-relative via :meth:`_git_to_rel`.
+
+        Never raises: a numstat failure (timeout, spawn error, non-zero exit)
+        returns ``{}`` so the changed-files list still renders with counts
+        degraded to ``None``. This is the sole guard for numstat failures.
+
+        :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
+        """
+        argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.warning(
+                "GitFilesystemRegistry._run_git_numstat: %r in %s failed",
+                argv,
+                self._git_root,
+                exc_info=True,
+            )
+            return {}
+        if result.returncode != 0:
+            return {}
+        counts: dict[str, tuple[int | None, int | None]] = {}
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 3:
+                continue
+            added_s, removed_s, git_path = fields
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None:
+                continue
+            try:
+                added = None if added_s == "-" else int(added_s)
+                removed = None if removed_s == "-" else int(removed_s)
+            except ValueError:
+                continue
+            counts[rel_path] = (added, removed)
+        return counts
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
