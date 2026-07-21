@@ -39,9 +39,10 @@ class SysScheduledTaskCreateTool(Tool):
         return (
             "Create a scheduled task: a saved prompt that runs an agent session "
             "on a recurring schedule (RRULE). Provide the agent to run, the "
-            "prompt to send it, the recurrence rule, a connected host, and an "
-            "existing workspace on that host. The task fires automatically on "
-            "its schedule until deleted."
+            "prompt to send it, and the recurrence rule. Optionally pin a "
+            "connected host and an existing workspace on it for tasks that do "
+            "code work; omit both for research / summaries / chat-only tasks. "
+            "The task fires automatically on its schedule until deleted."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -91,16 +92,22 @@ class SysScheduledTaskCreateTool(Tool):
                         },
                         "workspace": {
                             "type": "string",
-                            "description": "Existing absolute path where the run's runner starts.",
+                            "description": (
+                                "Optional existing absolute path where the run's runner "
+                                "starts. Omit (with host_id) for a task that does no code "
+                                "work — research, summaries, chat-only."
+                            ),
                         },
                         "host_id": {
                             "type": "string",
                             "description": (
-                                "Connected host to run on, from the current workspace's host list."
+                                "Optional connected host to run on, from the current "
+                                "workspace's host list. Omit (with workspace) for a "
+                                "no-workspace task."
                             ),
                         },
                     },
-                    "required": ["name", "prompt", "rrule", "agent_id", "workspace", "host_id"],
+                    "required": ["name", "prompt", "rrule", "agent_id"],
                     "additionalProperties": False,
                 },
             },

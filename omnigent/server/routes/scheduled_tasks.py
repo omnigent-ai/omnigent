@@ -49,8 +49,14 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
-    workspace: str = Field(min_length=1)
-    host_id: str = Field(min_length=1)
+    # Optional: a task that does no code work (research, summaries, chat-only)
+    # needs neither a workspace nor a connected host. When both are unset the
+    # task fires as a default/no-workspace session. ``min_length=1`` still
+    # rejects an empty string (the field is unset via omission / null, not
+    # ""), mirroring the PATCH request. PATCH still cannot null an already-set
+    # workspace/host_id (see ``UpdateScheduledTaskRequest``).
+    workspace: str | None = Field(default=None, min_length=1)
+    host_id: str | None = Field(default=None, min_length=1)
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -156,12 +162,20 @@ def create_scheduled_tasks_router(
         *,
         owner: str,
         agent_id: str,
-        host_id: str,
-        workspace: str,
+        host_id: str | None,
+        workspace: str | None,
         model_override: str | None,
         reasoning_effort: str | None,
-    ) -> tuple[str, str | None, str | None]:
-        """Validate inputs that scheduled tasks persist into future sessions."""
+    ) -> tuple[str | None, str | None, str | None]:
+        """Validate inputs that scheduled tasks persist into future sessions.
+
+        A task that does no code work needs neither a workspace nor a connected
+        host: when BOTH are unset, connected-host workspace validation is
+        skipped and the canonical workspace is ``None`` (a default/no-workspace
+        session fires at run time). Supplying just one of the pair is still an
+        error — :func:`validate_existing_host_workspace` requires a workspace
+        when a host is set, and a host is required when a workspace is set.
+        """
         user_id = None if owner == RESERVED_USER_LOCAL else owner
         agent = await validate_session_agent(
             user_id=user_id,
@@ -174,6 +188,14 @@ def create_scheduled_tasks_router(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
         )
+        if host_id is None and workspace is None:
+            # No-workspace task: nothing to bind, so no connected-host check.
+            return None, validated_model, validated_effort
+        if host_id is None:
+            raise OmnigentError(
+                "host_id required when workspace is set",
+                code=ErrorCode.INVALID_INPUT,
+            )
         canonical_workspace = await validate_existing_host_workspace(
             user_id=user_id,
             host_id=host_id,

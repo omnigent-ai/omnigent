@@ -144,6 +144,40 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert got.json()["id"] == task_id
 
 
+async def test_create_no_workspace_task_persists_null_host_and_workspace(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A task that does no code work omits workspace + host_id; the row persists
+    both as null and the connected-host workspace validation is skipped."""
+    _make_user(db_uri)
+    body = _create_body()
+    del body["workspace"]
+    del body["host_id"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 200, resp.text
+    created = resp.json()
+    assert created["workspace"] is None
+    assert created["host_id"] is None
+    task_id = created["id"]
+
+    # The null binding survives a round-trip read.
+    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+    assert got.status_code == 200
+    assert got.json()["workspace"] is None
+    assert got.json()["host_id"] is None
+
+
+async def test_create_rejects_workspace_without_host(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A workspace with no host is a broken binding, not a no-workspace task."""
+    _make_user(db_uri)
+    body = _create_body()
+    del body["host_id"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 400, resp.text
+
+
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.
@@ -202,16 +236,17 @@ async def test_create_rejects_relative_workspace(
     assert resp.status_code == 400, resp.text
 
 
-async def test_create_rejects_missing_connected_host_inputs(
+async def test_create_rejects_partial_binding_host_without_workspace(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
+    """A host with no workspace is a broken connected-host binding: the shared
+    ``validate_existing_host_workspace`` requires a workspace when a host is
+    set, so this is a 400 (not a no-workspace task)."""
     _make_user(db_uri)
-    resp = await auth_client.post(
-        "/v1/scheduled-tasks",
-        json=_create_body(host_id=None),
-        headers=_headers(),
-    )
-    assert resp.status_code == 422, resp.text
+    body = _create_body()
+    del body["workspace"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 400, resp.text
 
 
 async def test_create_rejects_unsupported_public_fields(

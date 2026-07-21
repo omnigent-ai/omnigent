@@ -8,9 +8,11 @@ firing:
 #. **Re-reads the row.** The armed timer is never trusted: the row is re-read by
    id, and a row that vanished (deleted between arming and firing) or is no
    longer ``active`` (paused/deleted) is a logged no-op.
-#. **Validates the launch target.** Scheduled tasks currently support
-   connected-host execution only; missing host/workspace or an unreachable host
-   is recorded as a failed/skipped run instead of a running run.
+#. **Validates the launch target.** A task bound to a connected host must reach
+   a reachable host — a partial binding or an unreachable host is recorded as a
+   failed/skipped run instead of a running run. A task with neither a host nor a
+   workspace (research / summaries / chat-only) skips that check and fires as a
+   default/no-workspace session.
 #. **Creates a session** bound to the task's agent, carrying the stored
    ``workspace`` / ``host_id`` / ``model_override`` / ``reasoning_effort``.
 #. **Grants ownership.** The spawned session gets a ``LEVEL_OWNER`` grant for the
@@ -138,7 +140,7 @@ def build_on_fire(
     """
     preflight: ConnectedHostPreflight | None = None
     if launch_dispatch is None:
-        dispatch = _make_connected_host_dispatch(deps)
+        dispatch = _make_default_dispatch(deps)
         preflight = _make_connected_host_preflight(deps)
     else:
         dispatch = launch_dispatch
@@ -239,39 +241,49 @@ async def _run_fire_for_task(
             )
             return
 
-        input_error = _validate_connected_host_inputs(task)
-        if input_error is not None:
-            error, error_code = input_error
-            _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error=error,
-                error_code=error_code,
-            )
-            return
+        # No-workspace task: a task that does no code work (research, summaries,
+        # chat-only) binds neither a host nor a workspace, so the connected-host
+        # input check, preflight, and workspace validation are all skipped and
+        # the run fires as a default/no-workspace session. A task that specifies
+        # a host_id (with or without a workspace) is NOT no-workspace — it stays
+        # on the honest connected-host path below, which still records a
+        # failed/skipped run when that host is missing or offline.
+        no_workspace = task.host_id is None and task.workspace is None
 
-        if preflight is not None:
-            try:
-                await preflight(task)
-            except _CannotLaunchScheduledFire as exc:
-                _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
+        if not no_workspace:
+            input_error = _validate_connected_host_inputs(task)
+            if input_error is not None:
+                error, error_code = input_error
+                _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
                 await _record_run(
                     deps,
                     task,
                     None,
                     scheduled_at,
                     status="failed",
-                    error=str(exc),
-                    error_code=exc.error_code,
+                    error=error,
+                    error_code=error_code,
                 )
                 return
 
+            if preflight is not None:
+                try:
+                    await preflight(task)
+                except _CannotLaunchScheduledFire as exc:
+                    _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
+                    await _record_run(
+                        deps,
+                        task,
+                        None,
+                        scheduled_at,
+                        status="failed",
+                        error=str(exc),
+                        error_code=exc.error_code,
+                    )
+                    return
+
         validation_error = await _validate_fire_session_inputs(
-            deps, task, validate_workspace=preflight is not None
+            deps, task, validate_workspace=preflight is not None and not no_workspace
         )
         if validation_error is not None:
             error, error_code = validation_error
@@ -528,6 +540,54 @@ def _make_connected_host_preflight(deps: FireDeps) -> ConnectedHostPreflight:
 def _new_id() -> str:
     """A bare 32-char hex UUID, matching the store's id convention."""
     return uuid.uuid4().hex
+
+
+def _make_default_dispatch(deps: FireDeps) -> LaunchDispatch:
+    """Build the production dispatch that routes on the task's binding.
+
+    A task with a connected host runs on it (launch runner + dispatch prompt); a
+    no-workspace task (neither ``host_id`` nor ``workspace``) seeds its prompt
+    into a default/no-workspace session so a runner can pick it up, mirroring how
+    a CLI-initiated session with no host records its starting prompt.
+    """
+    connected_host_dispatch = _make_connected_host_dispatch(deps)
+    no_workspace_dispatch = _make_no_workspace_dispatch(deps)
+
+    async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
+        if task.host_id is None and task.workspace is None:
+            await no_workspace_dispatch(conv, task)
+        else:
+            await connected_host_dispatch(conv, task)
+
+    return _dispatch
+
+
+def _make_no_workspace_dispatch(deps: FireDeps) -> LaunchDispatch:
+    """Build the no-workspace dispatch seam.
+
+    A no-workspace task has no host to launch a runner on, so the fire seeds the
+    task's prompt as a durable user message on the freshly created session. The
+    session is already owner-visible (the grant ran before dispatch), so the
+    prompt appears as the opening turn and a runner started against this session
+    picks it up — the no-host analog of the connected-host launch+dispatch.
+    """
+
+    async def _dispatch(conv: Conversation, task: ScheduledTask) -> None:
+        from omnigent.db.utils import generate_task_id
+        from omnigent.entities import MessageData, NewConversationItem
+
+        item = NewConversationItem(
+            type="message",
+            response_id=generate_task_id(),
+            data=MessageData(
+                role="user",
+                content=[{"type": "input_text", "text": task.prompt}],
+            ),
+            created_by=task.owner_user_id,
+        )
+        await asyncio.to_thread(deps.conversation_store.append, conv.id, [item])
+
+    return _dispatch
 
 
 def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:

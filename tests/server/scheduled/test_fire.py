@@ -111,6 +111,7 @@ class FakeConversationStore:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.created: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
+        self.appended: list[tuple[str, list[Any]]] = []
         self._seq = 0
         self.fail_create = fail_create
 
@@ -134,6 +135,10 @@ class FakeConversationStore:
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
+
+    def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+        self.appended.append((conversation_id, items))
+        return items
 
 
 class FakePermissionStore:
@@ -553,9 +558,11 @@ async def test_grant_failure_records_failed_with_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_execution_inputs_record_failed_without_session() -> None:
+async def test_partial_binding_workspace_without_host_records_failed() -> None:
+    """A workspace with no host_id is a broken connected-host binding, not a
+    no-workspace task — it must still record a failed run, not silently fire."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace=None)})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace="/repo")})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -574,6 +581,66 @@ async def test_missing_execution_inputs_record_failed_without_session() -> None:
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "missing_host_id"
     assert store.runs[0]["conversation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_workspace_task_creates_session_and_records_run() -> None:
+    """A task with neither host_id nor workspace fires as a no-workspace session:
+    it creates a conversation, grants ownership, dispatches, and records a run —
+    it does NOT skip or fail the way a broken connected-host binding does."""
+    perm = FakePermissionStore()
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace=None)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # A conversation was created with no host / workspace binding.
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["agent_id"] == "ag_1"
+    assert conv_store.created[0]["host_id"] is None
+    assert conv_store.created[0]["workspace"] is None
+    # Owner grant + dispatch still ran.
+    assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
+    assert len(launched) == 1
+    # A running run was recorded.
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
+    assert store.runs[0]["conversation_id"] == "conv_1"
+
+
+@pytest.mark.asyncio
+async def test_no_workspace_task_seeds_prompt_via_default_dispatch() -> None:
+    """The production default dispatch seeds a no-workspace task's prompt as a
+    user message (no host to launch a runner on)."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(host_id=None, workspace=None, prompt="summarize the inbox")}
+    )
+
+    # No launch_dispatch override → the real _make_default_dispatch is used.
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store))
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert conv_store.appended, "expected the prompt to be seeded as a user message"
+    conversation_id, items = conv_store.appended[0]
+    assert conversation_id == "conv_1"
+    assert len(items) == 1
+    assert items[0].type == "message"
+    assert items[0].data.role == "user"
+    assert items[0].data.content[0]["text"] == "summarize the inbox"
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "running"
 
 
 @pytest.mark.asyncio
