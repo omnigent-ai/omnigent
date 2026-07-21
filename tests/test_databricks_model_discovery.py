@@ -72,7 +72,8 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
             json={
                 "data": [
                     {"id": "databricks-claude-opus-4-8"},
-                    {"id": "databricks-claude-sonnet-4-6"},
+                    {"id": "databricks-claude-3-7-sonnet"},
+                    {"id": "databricks-claude-3-5-haiku"},
                     {"id": "databricks-claude-sonnet-4-6-anthropic"},
                 ]
             },
@@ -86,7 +87,8 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
 
     assert models == {
         "opus": "databricks-claude-opus-4-8",
-        "sonnet": "databricks-claude-sonnet-4-6",
+        "sonnet": "databricks-claude-3-7-sonnet",
+        "haiku": "databricks-claude-3-5-haiku",
     }
     assert paths == [
         "/api/2.1/unity-catalog/model-services",

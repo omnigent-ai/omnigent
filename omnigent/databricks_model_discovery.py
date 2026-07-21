@@ -31,7 +31,11 @@ def _models_by_claude_family(model_ids: list[str], *, marker: str) -> dict[str, 
     """Select the newest model id for every Claude family in *model_ids*."""
     result: dict[str, str] = {}
     for family in CLAUDE_MODEL_FAMILIES:
-        candidates = [model_id for model_id in model_ids if f"{marker}{family}-" in model_id]
+        candidates = []
+        for model_id in model_ids:
+            _, separator, suffix = model_id.lower().partition(marker)
+            if separator and family in suffix.split("-"):
+                candidates.append(model_id)
         if candidates:
             result[family] = max(candidates, key=_natural_model_key)
     return result

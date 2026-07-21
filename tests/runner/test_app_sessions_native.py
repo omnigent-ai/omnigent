@@ -9908,12 +9908,10 @@ async def test_claude_native_model_options_use_session_launch_catalog(
         api_key_helper="printf token",
         model="system.ai.claude-opus-4-10",
     )
-    resolve_calls = 0
+    resolved_specs: list[AgentSpec | None] = []
 
     def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
-        nonlocal resolve_calls
-        del spec
-        resolve_calls += 1
+        resolved_specs.append(spec)
         return config
 
     monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
@@ -9974,7 +9972,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     assert first.json() == expected
     assert second.json() == expected
     # Auto-create and both UI reads shared one launch-time live query.
-    assert resolve_calls == 1
+    assert resolved_specs == [claude_spec]
 
 
 @pytest.mark.asyncio

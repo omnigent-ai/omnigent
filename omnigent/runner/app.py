@@ -8265,7 +8265,8 @@ def create_runner_app(
             from omnigent.claude_native import resolve_native_claude_config
 
             async def _load() -> ClaudeNativeUcodeConfig | None:
-                config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+                spec = await _resolve_session_agent_spec(session_id)
+                config = await asyncio.to_thread(resolve_native_claude_config, spec=spec)
                 _session_claude_launch_configs[session_id] = config
                 return config
 

@@ -525,7 +525,7 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
         fable_enabled=False,
         agents={
             "claude": UcodeAgentState(
-                model="system.ai.claude-opus-4-7",
+                model="databricks-claude-4-6-sonnet",
                 base_url="https://example.databricks.com/ai-gateway/anthropic",
                 auth_command="printf token",
             )
@@ -564,12 +564,12 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
 
     assert config is not None
     assert first_config is not None
-    assert first_config.model == "system.ai.claude-opus-4-9"
+    assert first_config.model == "system.ai.claude-sonnet-5"
     assert calls == [
         ("https://example.databricks.com", "token"),
         ("https://example.databricks.com", "token"),
     ]
-    assert config.model == "system.ai.claude-opus-4-10"
+    assert config.model == "system.ai.claude-sonnet-5"
     assert config.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "system.ai.claude-opus-4-10"
     assert config.env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "system.ai.claude-sonnet-5"
     assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in config.env
@@ -578,13 +578,13 @@ def test_ucode_config_refreshes_live_models_and_builds_picker_options(
             "id": "opus",
             "model": "system.ai.claude-opus-4-10",
             "displayName": "Opus 4.10",
-            "isDefault": True,
+            "isDefault": False,
         },
         {
             "id": "sonnet",
             "model": "system.ai.claude-sonnet-5",
             "displayName": "Sonnet 5",
-            "isDefault": False,
+            "isDefault": True,
         },
     ]
 

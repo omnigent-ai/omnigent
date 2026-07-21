@@ -1670,10 +1670,10 @@ def _ucode_config_for_profile(
             ),
             None,
         )
-        lowered_default = configured_default.lower()
+        default_parts = re.split(r"[^a-z0-9]+", configured_default.lower())
         if default_model is None:
             for tier in _UCODE_CLAUDE_TIER_TO_ENV:
-                if f"claude-{tier}-" in lowered_default and tier in claude_models:
+                if tier in default_parts and tier in claude_models:
                     default_model = claude_models[tier]
                     break
     if default_model is None:
