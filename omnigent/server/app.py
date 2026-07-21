@@ -1974,7 +1974,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | None]:
+    async def info() -> dict[str, bool | str | list[str] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -2082,6 +2082,16 @@ def create_app(
         from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
 
         harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # installable_harnesses: the exact harness ids the install route accepts
+        # (bare ids + native spellings resolving to an npm-installable family),
+        # so the SPA offers setup only where it will succeed and never has to
+        # duplicate the server's allowlist. Empty when the feature is off, so a
+        # disabled flag also blanks the set the UI keys off of.
+        from omnigent.onboarding.harness_install import ui_installable_harnesses
+
+        installable_harnesses = (
+            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+        )
         return {
             "accounts_enabled": accounts_enabled,
             "single_user": single_user,
@@ -2095,6 +2105,7 @@ def create_app(
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
             "harness_install_enabled": harness_install_enabled,
+            "installable_harnesses": installable_harnesses,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)

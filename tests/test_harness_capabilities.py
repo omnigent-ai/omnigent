@@ -165,3 +165,21 @@ def test_catalog_rows_include_capabilities() -> None:
             # JSON-serializable: values are primitives, not enums.
             for value in row["capabilities"].values():
                 assert value is None or isinstance(value, (str, bool))
+
+
+def test_catalog_rows_carry_setup_steps() -> None:
+    """Every row exposes an ordered, JSON-serializable setup checklist."""
+    rows = {row["id"]: row for row in harness_catalog()}
+    for row in rows.values():
+        assert "setup_steps" in row, row["id"]
+        assert len(row["setup_steps"]) >= 1
+        for step in row["setup_steps"]:
+            assert step["kind"] in ("install", "auth")
+            assert step["action"] in ("install", "command", "setup")
+            # JSON-serializable primitives only.
+            for value in step.values():
+                assert value is None or isinstance(value, str)
+    # Codex is a first-class harness: install (one-click) then a login command.
+    codex = rows["codex"]["setup_steps"]
+    assert [s["action"] for s in codex] == ["install", "command"]
+    assert codex[1]["command"] == "codex login"

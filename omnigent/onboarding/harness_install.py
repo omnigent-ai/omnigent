@@ -43,7 +43,7 @@ import sys
 from pathlib import Path
 
 from omnigent._platform import resolve_cli_binary
-from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -290,23 +290,154 @@ _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
 }
 
 
-def ui_installable_harnesses() -> frozenset[str]:
-    """Return the set of harness identifiers the web UI may install.
-
-    :returns: The allowlist of UI-installable harness identifiers, e.g.
-        ``{"claude", "codex", "pi", "opencode", "qwen"}``.
-    """
-    return frozenset(_UI_INSTALLABLE_HARNESS_TO_KEY)
+# Family keys the UI may install, derived once from the allowlist so the
+# executor-spelling fallback in ``ui_install_key`` can't admit a non-installable
+# family (e.g. cursor) that happens to share the name map.
+_UI_INSTALLABLE_KEYS: frozenset[str] = frozenset(_UI_INSTALLABLE_HARNESS_TO_KEY.values())
 
 
 def ui_install_key(harness: str) -> str | None:
-    """Resolve a UI-install harness identifier to its install-spec key.
+    """Resolve a harness identifier to its UI-installable install-spec key.
 
-    :param harness: A harness identifier from the web UI, e.g. ``"claude"``.
+    Accepts both the bare install ids (``"claude"``, ``"codex"``, ``"pi"``,
+    ``"opencode"``, ``"qwen"``) and the executor spellings a session actually
+    carries — the native TUI wrappers (``"codex-native"``, ``"qwen-native"``,
+    …) resolve through the shared :data:`_HARNESS_NAME_TO_KEY` map to the same
+    family key. Any harness that doesn't map onto the UI-installable family set
+    (SDK harnesses like ``"claude-sdk"``, or curl/OAuth harnesses like
+    ``"cursor"``/``"hermes"``) returns ``None`` so the caller rejects it.
+
+    :param harness: A harness identifier from the web UI, e.g. ``"claude"`` or
+        ``"codex-native"``.
     :returns: The :data:`_HARNESS_INSTALL` key (e.g. ``"anthropic"``) when the
         harness is UI-installable; ``None`` otherwise (caller rejects it).
     """
-    return _UI_INSTALLABLE_HARNESS_TO_KEY.get(harness)
+    direct = _UI_INSTALLABLE_HARNESS_TO_KEY.get(harness)
+    if direct is not None:
+        return direct
+    # Fall back to the executor-spelling map, but only accept keys that are
+    # themselves UI-installable — this keeps curl/OAuth harnesses (cursor,
+    # hermes, …) out even though they appear in _HARNESS_NAME_TO_KEY.
+    key = _all_harness_name_to_key().get(harness)
+    if key is not None and key in _UI_INSTALLABLE_KEYS:
+        return key
+    return None
+
+
+def ui_installable_harnesses() -> frozenset[str]:
+    """Return every harness identifier the web UI may install.
+
+    Includes the bare install ids and all executor spellings that resolve to a
+    UI-installable family (e.g. ``"codex-native"``, ``"qwen-native"``), so the
+    New Chat dialog can offer setup for the harness a session actually declares
+    — not just the bare ids.
+
+    :returns: The full set of accepted harness identifiers, e.g.
+        ``{"claude", "claude-native", "codex", "codex-native", "pi", ...}``.
+    """
+    resolvable = set(_UI_INSTALLABLE_HARNESS_TO_KEY)
+    for name, mapped in _all_harness_name_to_key().items():
+        if mapped in _UI_INSTALLABLE_KEYS:
+            resolvable.add(name)
+    return frozenset(resolvable)
+
+
+# How each UI-installable family authenticates, for the setup checklist. Derived
+# alongside the install step from the existing HarnessInstallSpec rather than a
+# parallel table. ``command`` steps run on the host and are status-tracked;
+# ``setup`` steps (pi/qwen: API key or gateway) can't be driven from the UI yet,
+# so M1 points at ``omnigent setup`` and does not track their status.
+#   claude/codex: subscription login via the CLI's own login command.
+#   opencode: its own `opencode auth login`.
+#   pi/qwen: a provider credential (API key or gateway) — configured by setup.
+_UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
+    ANTHROPIC_FAMILY: SetupStep(
+        kind="auth",
+        title="Sign in to Claude",
+        detail="Uses your Claude subscription — sign in on the host.",
+        action="command",
+        command="claude auth login --claudeai",
+        status_key="authed",
+    ),
+    OPENAI_FAMILY: SetupStep(
+        kind="auth",
+        title="Sign in to Codex",
+        detail="Uses your ChatGPT subscription — sign in on the host.",
+        action="command",
+        command="codex login",
+        status_key="authed",
+    ),
+    OPENCODE_KEY: SetupStep(
+        kind="auth",
+        title="Sign in to OpenCode",
+        detail="OpenCode manages its own credentials — sign in on the host.",
+        action="command",
+        command="opencode auth login",
+        status_key="authed",
+    ),
+    PI_KEY: SetupStep(
+        kind="auth",
+        title="Add a Pi credential",
+        detail="Pi needs an API key or gateway. Set it up on the host for now.",
+        action="setup",
+        command="omnigent setup",
+        status_key=None,
+    ),
+    QWEN_KEY: SetupStep(
+        kind="auth",
+        title="Add a Qwen credential",
+        detail="Qwen needs an API key or gateway. Set it up on the host for now.",
+        action="setup",
+        command="omnigent setup",
+        status_key=None,
+    ),
+}
+
+
+def ui_setup_steps(harness: str) -> list[SetupStep]:
+    """Return the ordered setup checklist for a UI harness identifier.
+
+    Mirrors what ``omnigent setup`` walks a user through for the harness: an
+    install step, then (for the five first-class families) an auth step whose
+    method matches the CLI. Derived from the harness's
+    :class:`HarnessInstallSpec` so it can't drift from the real install/login
+    commands. Harnesses outside the UI-installable set get a single generic
+    "run ``omnigent setup``" step (M1 scope).
+
+    :param harness: A harness identifier the UI holds, e.g. ``"codex"`` or the
+        native spelling ``"codex-native"`` (both resolve to the same steps).
+    :returns: Ordered :class:`SetupStep` list; never empty.
+    """
+    key = ui_install_key(harness)
+    if key is None:
+        # Not UI-installable (curl/OAuth/SDK harness): one generic step.
+        return [
+            SetupStep(
+                kind="install",
+                title="Set up on the host",
+                detail="Run omnigent setup on the host to configure this agent.",
+                action="setup",
+                command="omnigent setup",
+                status_key=None,
+            )
+        ]
+
+    spec = _all_harness_install().get(key)
+    display = spec.display if spec is not None else harness
+    steps = [
+        SetupStep(
+            kind="install",
+            title=f"Install {display}",
+            detail=f"We'll install {display} on the host for you.",
+            action="install",
+            command=None,
+            status_key="installed",
+        )
+    ]
+    auth = _UI_AUTH_STEP_BY_KEY.get(key)
+    if auth is not None:
+        steps.append(auth)
+    return steps
 
 
 def _all_harness_install() -> dict[str, HarnessInstallSpec]:
