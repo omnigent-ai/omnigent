@@ -2713,6 +2713,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     #   worktree    — the session's stored workspace (correct answer)
     runner_env = tmp_path / "runner_workspace"
     runner_env.mkdir()
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     bundle_dir = tmp_path / "runner-specs" / f"{session_id}-v1"
     bundle_dir.mkdir(parents=True)
     worktree = tmp_path / "repo-worktrees" / "feature-x"
@@ -14243,6 +14244,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     SessionStart/Stop/.../PreCompact + statusLine but no
     PermissionRequest).
     """
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -15317,6 +15319,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")

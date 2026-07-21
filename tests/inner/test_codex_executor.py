@@ -2144,6 +2144,8 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     source.mkdir()
     (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
     (source / "config.toml").write_text('[default]\nmodel = "gpt-5.4"')
+    (source / "AGENTS.md").write_text("global guidance")
+    (source / "AGENTS.override.md").write_text("global override")
     target = tmp_path / "temp_codex_home"
     target.mkdir()
 
@@ -2152,6 +2154,10 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     # auth.json: symlink so live credential refreshes propagate.
     assert (target / "auth.json").is_symlink()
     assert (target / "auth.json").read_text() == '{"auth_mode": "chatgpt"}'
+    assert (target / "AGENTS.md").is_symlink()
+    assert (target / "AGENTS.md").read_text() == "global guidance"
+    assert (target / "AGENTS.override.md").is_symlink()
+    assert (target / "AGENTS.override.md").read_text() == "global override"
     # config.toml: independent copy so /model writes stay session-local.
     assert not (target / "config.toml").is_symlink()
     assert (target / "config.toml").is_file()

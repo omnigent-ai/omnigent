@@ -117,51 +117,52 @@ async def iter_sse_events(lines: AsyncIterator[str]) -> AsyncIterator[dict[str, 
         yield event
 
 
-def is_terminal_event(event: dict[str, Any]) -> bool:
-    # A turn ends at the SESSION level, not the response level. Orchestrator
-    # agents emit a `response.completed`/`turn.completed` every time they end a
-    # turn to wait on a background sub-agent, then resume with more responses in
-    # the same turn — so treating those as terminal cuts the stream off at the
-    # first sub-agent dispatch. `session.status` is the authoritative signal:
-    # `running` -> `waiting` (parked on async work) -> `running` -> `idle`, and
-    # only `idle`/`failed` mean the turn is truly over.
-    event_type = str(event.get("type"))
-    if event_type == "session.status":
-        return str(event.get("status")) in {"idle", "failed"}
-    # Explicit turn/response failure and cancellation still end the turn; keep
-    # them as a fallback in case the session settles without an `idle` edge.
-    return event_type in {
+def session_status(event: dict[str, Any]) -> tuple[str, str | None] | None:
+    """Parse a ``session.status`` event into ``(status, response_id)``.
+
+    Returns ``None`` for any other event. ``response_id`` is ``None`` when the
+    field is absent — critically, this distinguishes the AUTHORITATIVE turn edge
+    (the Stop hook stamps the turn's ``response_id`` on the terminal
+    ``idle``/``waiting``/``failed``) from the PTY-activity watcher's mid-answer
+    flaps (bare ``idle`` with NO ``response_id``, emitted on sub-second pane
+    lulls while the agent is still generating). The turn-end rule that consumes
+    this lives in ``OmnigentClient._run_turn_once``.
+    """
+    if event.get("type") != "session.status":
+        return None
+    status = event.get("status")
+    if not isinstance(status, str):
+        return None
+    response_id = event.get("response_id")
+    return status, response_id if isinstance(response_id, str) and response_id else None
+
+
+def extract_elicitation_resolved(event: dict[str, Any]) -> str | None:
+    """Return the ``elicitation_id`` of a ``response.elicitation_resolved`` event.
+
+    The server pushes this when an elicitation is resolved — by our own Slack
+    verdict, or externally (web UI / another client). The turn loop keeps reading
+    the stream while a card is shown, so it observes resolution as a normal push
+    event (the web UI's model) rather than polling ``pending_elicitations``.
+    """
+    if event.get("type") != "response.elicitation_resolved":
+        return None
+    eid = event.get("elicitation_id")
+    return eid if isinstance(eid, str) and eid else None
+
+
+def is_hard_terminal_event(event: dict[str, Any]) -> bool:
+    """True for an explicit turn/response failure or cancellation.
+
+    These end the turn regardless of ``response_id`` tracking — a fallback for a
+    session that fails without a clean id-matched ``session.status`` edge.
+    """
+    return event.get("type") in {
         "response.failed",
         "response.cancelled",
         "turn.failed",
         "turn.cancelled",
     }
-
-
-def is_elicitation_request(event: dict[str, Any]) -> bool:
-    """True for a ``response.elicitation_request`` event.
-
-    Like a soft idle, this is an AMBIGUOUS boundary for the read loop: the
-    consumer parks (posts a card, blocks for the verdict) while it's handled, so
-    the SSE connection goes unread for as long as the user takes to answer. When
-    the loop resumes it must NOT go straight into an unbounded read — the stale
-    connection may never deliver the post-resolve events. The caller routes the
-    next read through the grace disambiguation (poll status) instead.
-    """
-    return event.get("type") == "response.elicitation_request"
-
-
-def is_soft_idle_event(event: dict[str, Any]) -> bool:
-    """True for a ``session.status: idle`` edge — an AMBIGUOUS turn boundary.
-
-    A fan-out orchestrator (e.g. ``debby``) ends its turn to wait on sub-agents
-    and settles to ``idle`` between wake cycles, then a sub-agent completion
-    re-injects a message that wakes it and it resumes. So ``idle`` means either
-    "parked, will be re-woken" or "genuinely done" — the caller disambiguates
-    with a grace window (does anything else arrive shortly?). ``failed`` and the
-    explicit cancel/fail events are NOT soft: they end the turn immediately.
-    """
-    return event.get("type") == "session.status" and event.get("status") == "idle"
 
 
 def extract_delta(event: dict[str, Any]) -> str | None:
@@ -298,6 +299,19 @@ class SessionActivity:
     @property
     def needs_user_action(self) -> bool:
         return self.pending_elicitation
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInfo:
+    """Server-authoritative session config, for the first-message summary.
+
+    ``harness`` is the runtime the session runs on (e.g. ``claude-native``);
+    ``agent_name`` is the configured agent (e.g. ``debby``). Either may be
+    ``None`` if the snapshot is unreadable or omits the field.
+    """
+
+    harness: str | None
+    agent_name: str | None
 
 
 def extract_output_file(event: dict[str, Any]) -> OutputFile | None:

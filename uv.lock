@@ -2975,6 +2975,9 @@ islo = [
 kubernetes = [
     { name = "kubernetes" },
 ]
+memory = [
+    { name = "hindsight-client" },
+]
 modal = [
     { name = "modal" },
 ]
@@ -3024,6 +3027,7 @@ requires-dist = [
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.68,<2" },
     { name = "hindsight-client", marker = "extra == 'dev'", specifier = ">=0.4.0" },
     { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = ">=0.4.0" },
+    { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "islo", marker = "extra == 'islo'", specifier = ">=0.3.5,<0.4" },
     { name = "keyring", specifier = ">=24,<26" },
@@ -3082,7 +3086,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "slack", "databricks", "dev"]
+provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "vertex", "modal", "daytona", "boxlite", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "tracing", "agents-sdk", "antigravity", "copilot", "cursor", "hindsight", "memory", "slack", "databricks", "dev"]
 
 [[package]]
 name = "omnigent-client"

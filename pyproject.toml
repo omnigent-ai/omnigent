@@ -192,6 +192,12 @@ cursor = ["cursor-sdk>=0.1.7"]
 # _reflect). The tools import the client lazily, so only users who enable a
 # Hindsight memory tool need this extra.
 hindsight = ["hindsight-client>=0.4.0"]
+# Backwards-compatibility alias: this extra was renamed to `hindsight` (see
+# above) in #2605. Keep `memory` pulling the same client so existing
+# `omnigent[memory]` / `--extra memory` invocations keep working.
+# TODO(0.70): remove this `memory` alias extra — it exists only to keep the
+# pre-rename install command working during the deprecation window.
+memory = ["hindsight-client>=0.4.0"]
 # Slack integration (`omni integration slack`). The @omnigent socket-mode bot
 # lives in the separate `omnigent-slack` package (heavy deps — slack_bolt /
 # aiohttp — kept out of the baseline install). The CLI launches it as a

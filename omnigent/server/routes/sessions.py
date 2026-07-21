@@ -208,6 +208,11 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.routes._session_create_validation import (
+    validate_existing_host_workspace,
+    validate_session_agent,
+    validate_session_model_metadata,
+)
 from omnigent.server.schemas import (
     AgentObject,
     AutomaticSessionRenameRequest,
@@ -6578,91 +6583,15 @@ async def _validate_session_workspace(
         outside boundary, missing subdir). With
         ``ErrorCode.INTERNAL_ERROR`` if ``agent_cache`` is unset.
     """
-    from omnigent.server.routes._workspace_validation import (
-        WorkspaceValidationError,
-        validate_workspace,
+    return await validate_existing_host_workspace(
+        user_id=user_id,
+        host_id=host_id,
+        workspace=workspace,
+        agent=agent,
+        agent_cache=agent_cache,
+        host_store=getattr(request.app.state, "host_store", None),
+        host_registry=getattr(request.app.state, "host_registry", None),
     )
-
-    if workspace is None:
-        raise OmnigentError(
-            "workspace required when host_id is set",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if not workspace.startswith("/"):
-        raise OmnigentError(
-            "workspace must be an absolute path starting with /",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    if agent_cache is None:
-        # Should never happen in production — the route factory
-        # always wires an agent cache. Fail loud rather than
-        # silently skipping validation, which would let bad
-        # workspaces through.
-        raise OmnigentError(
-            "workspace validation requires an agent cache",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-
-    host_registry = getattr(request.app.state, "host_registry", None)
-    if host_registry is None:
-        raise OmnigentError(
-            "host registry is not configured on this server",
-            code=ErrorCode.INTERNAL_ERROR,
-        )
-
-    # Authorize host ownership FIRST — before loading the agent spec or
-    # the host.stat round-trip below. A non-owner must be rejected
-    # (403/404 via the shared resolve_host_owner) before we touch the
-    # host or even read the agent bundle (cross-user host probe). The
-    # returned host also gives the display name for error messages.
-    from omnigent.server.routes._host_launch import resolve_host_owner
-
-    host_name: str | None = None
-    host_store_inst = getattr(request.app.state, "host_store", None)
-    if host_store_inst is not None:
-        host = await asyncio.to_thread(
-            resolve_host_owner,
-            user_id=user_id,
-            host_id=host_id,
-            host_store=host_store_inst,
-        )
-        host_name = host.name
-
-    # Read the agent's os_env.cwd — None when the spec has no
-    # os_env block (headless agents). Headless agents have no
-    # filesystem access at all but still get launched on hosts
-    # for sessions that don't need it; treat their cwd as
-    # relative-equivalent so the boundary is unrestricted.
-    spec_cwd: str | None = None
-    if agent.bundle_location is not None:
-        try:
-            loaded = await asyncio.to_thread(
-                agent_cache.load,
-                agent.id,
-                agent.bundle_location,
-            )
-            os_env = getattr(loaded.spec, "os_env", None)
-            spec_cwd = getattr(os_env, "cwd", None) if os_env is not None else None
-        except Exception as exc:
-            _logger.exception("Failed to load agent spec for workspace validation")
-            raise OmnigentError(
-                f"failed to load agent spec: {exc}",
-                code=ErrorCode.INTERNAL_ERROR,
-            ) from exc
-
-    try:
-        return await validate_workspace(
-            host_registry=host_registry,
-            host_id=host_id,
-            workspace=workspace,
-            spec_cwd=spec_cwd,
-            host_name_for_errors=host_name,
-        )
-    except WorkspaceValidationError as exc:
-        raise OmnigentError(
-            exc.message,
-            code=ErrorCode.INVALID_INPUT,
-        ) from exc
 
 
 @dataclass
@@ -12970,25 +12899,13 @@ async def _create_session_from_existing_agent(
     _reject_reserved_cost_control_label_seed(body.labels)
     _reject_server_reserved_label_seed(body.labels)
 
-    agent = await asyncio.to_thread(agent_store.get, body.agent_id)
-    if agent is None:
-        raise OmnigentError(
-            f"Agent not found: {body.agent_id!r}",
-            code=ErrorCode.NOT_FOUND,
-        )
-
-    # Session-scoped agents belong to a specific session.
-    # The caller must have at least READ access to that owning
-    # session — otherwise they can execute another user's private
-    # agent by guessing the raw agent id.
-    if agent.session_id is not None:
-        await _require_access(
-            user_id,
-            agent.session_id,
-            LEVEL_READ,
-            permission_store,
-            conversation_store,
-        )
+    agent = await validate_session_agent(
+        user_id=user_id,
+        agent_id=body.agent_id,
+        agent_store=agent_store,
+        permission_store=permission_store,
+        conversation_store=conversation_store,
+    )
 
     # Authorize parent_session_id before inheriting anything.
     # The caller must own or have READ access to the parent session;
@@ -13007,34 +12924,10 @@ async def _create_session_from_existing_agent(
     # The persisted override reaches a native CLI as a ``--model`` argv
     # element at terminal launch, so reject shell-/flag-shaped values
     # before any row or worktree exists.
-    model_override: str | None = None
-    if body.model_override is not None:
-        try:
-            model_override = validate_model_override(body.model_override)
-        except ValueError as exc:
-            raise OmnigentError(
-                f"invalid model_override: {exc}",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
-
-    # Persisted effort reaches a native CLI as a ``--effort`` argv element
-    # at terminal launch (and SDK harnesses via the spawn env). Validate
-    # against the shared vocabulary before any row exists; provider-specific
-    # support (e.g. ANTHROPIC_EFFORTS) is enforced downstream at launch,
-    # mirroring the multipart metadata create path.
-    reasoning_effort: str | None = None
-    if body.reasoning_effort is not None:
-        try:
-            reasoning_effort = validate_effort(
-                body.reasoning_effort,
-                "session metadata",
-                EFFORT_VALUES,
-            )
-        except ValueError as exc:
-            raise OmnigentError(
-                f"invalid reasoning_effort: {exc}",
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
+    model_override, reasoning_effort = validate_session_model_metadata(
+        model_override=body.model_override,
+        reasoning_effort=body.reasoning_effort,
+    )
 
     # Validated before any row exists so a bad value never creates an
     # orphan session; None (unset) defers to the spec default.

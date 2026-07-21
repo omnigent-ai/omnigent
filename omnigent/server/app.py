@@ -69,6 +69,7 @@ from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
@@ -1071,18 +1072,6 @@ def _ensure_default_polly_agent(
     )
 
 
-async def _placeholder_on_fire(scheduled_task_id: str) -> None:
-    """Default scheduler fire callback (no-op placeholder that logs).
-
-    Exercises the ``on_fire`` seam without side effects: the real fire path
-    (creating an agent session for the task) supplies its own callback.
-    """
-    _logger.info(
-        "scheduler: task %s is due (no fire path wired yet — skipping)",
-        scheduled_task_id,
-    )
-
-
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -1390,18 +1379,36 @@ def create_app(
 
         # Recurring-task scheduler: arm a timer per active
         # scheduled task and fire the injected ``on_fire`` callback on
-        # schedule. The default callback is a no-op that logs; a real fire
-        # path (creating a session) can be injected in its place.
+        # schedule. The callback (see scheduled.fire) re-reads the row,
+        # creates + owner-grants a session, launches its runner, and records
+        # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+
+            on_fire = build_on_fire(
+                FireDeps(
+                    scheduled_task_store=scheduled_task_store,
+                    agent_store=agent_store,
+                    conversation_store=conversation_store,
+                    permission_store=permission_store,
+                    host_store=host_store,
+                    host_registry=host_registry,
+                    agent_cache=agent_cache,
+                    runner_router=runner_router,
+                    tunnel_registry=tunnel_registry,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                )
+            )
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
-                on_fire=_placeholder_on_fire,
+                on_fire=on_fire,
             )
             app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
             # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error in list_active()) must not take down
-            # server boot. Log and continue with the scheduler unstarted.
+            # schedule (e.g. a DB error listing active tasks) must not take
+            # down server boot. Log and continue with the scheduler unstarted.
             try:
                 await scheduled_task_scheduler.start()
             except Exception as exc:
@@ -2240,6 +2247,19 @@ def create_app(
         prefix="/v1",
         tags=["policy_registry"],
     )
+    if scheduled_task_store is not None:
+        app.include_router(
+            create_scheduled_tasks_router(
+                scheduled_task_store,
+                agent_store=agent_store,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+                agent_cache=agent_cache,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["scheduled_tasks"],
+        )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server
     # resolves the setting from the editable file-backed default.
