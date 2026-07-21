@@ -139,6 +139,35 @@ def test_select_empty_options_raises(non_tty: None) -> None:
         interactive.select("Pick", [])
 
 
+def test_select_degrades_to_fallback_when_termios_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``select`` falls back when ``termios`` cannot be imported (Windows TTY).
+
+    On Windows a real terminal (PowerShell, Windows Terminal) reports
+    ``isatty() == True``, so the non-TTY guard does not short-circuit and
+    the function reaches ``import termios`` — a POSIX-only module that does
+    not exist there. Without the ImportError guard this raises
+    ``ModuleNotFoundError`` and crashes ``omnigent setup`` on entry.
+
+    This test reproduces that environment: stdin is a TTY, but ``termios``
+    is unimportable (``sys.modules["termios"] = None`` makes the import
+    raise ``ImportError``). ``select`` must degrade to the numbered
+    fallback rather than crash. Feeds ``"1"`` against two options and
+    expects index ``0`` back.
+    """
+    # Pretend stdin is a real TTY (the Windows Terminal case).
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    # Make ``import termios`` raise ImportError, as it does on Windows.
+    monkeypatch.setitem(sys.modules, "termios", None)
+    monkeypatch.setitem(sys.modules, "tty", None)
+
+    _feed(monkeypatch, ["1"])
+    result = interactive.select("Pick one", ["alpha", "beta"])
+    # Fell back to the numbered path instead of crashing on the import.
+    assert result == 0
+
+
 def test_select_fallback_skips_header_rows_in_numbering(
     non_tty: None,
     monkeypatch: pytest.MonkeyPatch,
