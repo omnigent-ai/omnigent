@@ -90,7 +90,11 @@ def cel_policy(
     def evaluate(event: PolicyEvent) -> PolicyResponse | None:
         try:
             result = prog.evaluate({"event": celpy.json_to_cel(event)})
-        except celpy.CELEvalError:
+        except (celpy.CELEvalError, ValueError, TypeError):
+            # CELEvalError: runtime type/field errors in the expression.
+            # ValueError/TypeError: json_to_cel rejects non-JSON-serializable
+            # fields (e.g. llm_client objects) that the engine injects into
+            # real events but tests never include.
             _log.debug(
                 "CEL policy eval error on event type %r, abstaining",
                 event.get("type"),

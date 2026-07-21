@@ -170,3 +170,15 @@ def test_invalid_syntax_raises() -> None:
     """Invalid CEL syntax is rejected at compile time."""
     with pytest.raises(ValueError, match="CEL"):
         cel_policy(expression="event.type ==== bad")
+
+
+def test_non_serializable_field_abstains() -> None:
+    """Events with non-JSON-serializable fields (e.g. llm_client) abstain."""
+
+    class _FakeLLMClient:
+        pass
+
+    evaluate = cel_policy(expression='{"result": "DENY"}')
+    # The engine injects llm_client (a live object) into every real event.
+    # json_to_cel raises ValueError on it; the policy must abstain, not crash.
+    assert evaluate({"type": "request", "llm_client": _FakeLLMClient()}) is None  # type: ignore[typeddict-unknown-key]
