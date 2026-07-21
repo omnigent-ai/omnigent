@@ -199,15 +199,19 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 moved += 1
             return moved
 
-    def list_for_session(self, conversation_id: str) -> list[SessionPermission]:
+    def list_for_session(
+        self, conversation_id: str, *, limit: int = 1000
+    ) -> list[SessionPermission]:
         """Return all grants on a session. See base class for contract."""
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlSessionPermission).where(
+                    select(SqlSessionPermission)
+                    .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.conversation_id == conversation_id,
                     )
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
@@ -237,15 +241,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
             result[entity.conversation_id].append(entity)
         return result
 
-    def list_for_user(self, user_id: str) -> list[SessionPermission]:
+    def list_for_user(self, user_id: str, *, limit: int = 1000) -> list[SessionPermission]:
         """Return all grants for a user. See base class for contract."""
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlSessionPermission).where(
+                    select(SqlSessionPermission)
+                    .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == user_id,
                     )
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
@@ -278,12 +284,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
 
-    def list_users(self) -> list[Account]:
+    def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
+                    select(SqlUser)
+                    .where(SqlUser.workspace_id == current_workspace_id())
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
@@ -318,13 +326,19 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if user_id is None:
             return False
 
-        grant = self.get(user_id, conversation_id)
-        if grant is not None and grant.level >= required_level:
-            return True
+        with self._session() as session:
+            grant = session.get(
+                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
+            )
+            if grant is not None and grant.level >= required_level:
+                return True
 
-        public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None and public_grant.level >= required_level:
-            return True
+            public_grant = session.get(
+                SqlSessionPermission,
+                (current_workspace_id(), RESERVED_USER_PUBLIC, conversation_id),
+            )
+            if public_grant is not None and public_grant.level >= required_level:
+                return True
 
         return False
 
@@ -336,14 +350,22 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Return the user's effective permission level. See base class for contract."""
         if user_id is None:
             return None
-        if self.is_admin(user_id):
-            return LEVEL_OWNER
-        grant = self.get(user_id, conversation_id)
-        if grant is not None:
-            return grant.level
-        public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
-        if public_grant is not None:
-            return public_grant.level
+
+        with self._session() as session:
+            user_row = session.get(SqlUser, (current_workspace_id(), user_id))
+            if user_row is not None and user_row.is_admin:
+                return LEVEL_OWNER
+            grant = session.get(
+                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
+            )
+            if grant is not None:
+                return grant.level
+            public_grant = session.get(
+                SqlSessionPermission,
+                (current_workspace_id(), RESERVED_USER_PUBLIC, conversation_id),
+            )
+            if public_grant is not None:
+                return public_grant.level
         return None
 
     def resolve_access(

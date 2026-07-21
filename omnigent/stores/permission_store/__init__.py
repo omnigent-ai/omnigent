@@ -77,11 +77,14 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_for_session(self, conversation_id: str) -> list[SessionPermission]:
+    def list_for_session(
+        self, conversation_id: str, *, limit: int = 1000
+    ) -> list[SessionPermission]:
         """Return all grants on a session.
 
         :param conversation_id: The session to query, e.g.
             ``"conv_abc123"``.
+        :param limit: Maximum number of grants to return (default 1000).
         :returns: List of :class:`SessionPermission` objects.
         """
         ...
@@ -105,11 +108,12 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_for_user(self, user_id: str) -> list[SessionPermission]:
+    def list_for_user(self, user_id: str, *, limit: int = 1000) -> list[SessionPermission]:
         """Return all grants for a user.
 
         :param user_id: The user to query, e.g.
             ``"alice@example.com"``.
+        :param limit: Maximum number of grants to return (default 1000).
         :returns: List of :class:`SessionPermission` objects.
         """
         ...
@@ -129,7 +133,7 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
-    def list_users(self) -> list[Account]:
+    def list_users(self, *, limit: int = 1000) -> list[Account]:
         """Return every real user row, for the admin user list.
 
         Excludes the reserved sentinels (``"__public__"`` and
@@ -140,6 +144,7 @@ class PermissionStore(ABC):
 
         Result is unordered; callers sort for display.
 
+        :param limit: Maximum number of user rows to return (default 1000).
         :returns: List of :class:`Account` rows.
         """
         ...
