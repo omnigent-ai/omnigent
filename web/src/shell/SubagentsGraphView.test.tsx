@@ -10,6 +10,7 @@ import {
   layoutTree,
   type TreeNode,
 } from "./subagentGraphLayout";
+import { activityDotClassName, childStatus, sessionStatus } from "./subagentStatus";
 import { SubagentsPanel } from "./SubagentsPanel";
 
 // ---------------------------------------------------------------------------
@@ -191,6 +192,123 @@ describe("childActivity", () => {
       childInfo({ id: "x", current_task_status: "launching", pending_elicitations_count: 1 }),
     );
     expect(result.activity).toBe("awaiting");
+  });
+
+  it("returns disconnected (not failed) for a runner-disconnect error code", () => {
+    const result = childActivity(
+      childInfo({
+        id: "x",
+        last_task_error: { code: "runner_disconnected", message: "tunnel dropped" },
+      }),
+    );
+    expect(result.activity).toBe("disconnected");
+  });
+
+  it("returns disconnected for runner_failed_to_start", () => {
+    const result = childActivity(
+      childInfo({
+        id: "x",
+        last_task_error: { code: "runner_failed_to_start", message: "exited" },
+      }),
+    );
+    expect(result.activity).toBe("disconnected");
+  });
+});
+
+// ===========================================================================
+// Unit tests: shared dot palette (list ⇄ graph parity)
+// ===========================================================================
+
+describe("activityDotClassName (shared list/graph palette)", () => {
+  // The graph view previously kept its own map that painted these grey; the
+  // shared helper is the single source of truth, so both views render blue.
+  it.each(["launching", "idle", "done"] as const)(
+    "renders %s as a blue session-active dot, not grey",
+    (activity) => {
+      const cls = activityDotClassName(activity);
+      expect(cls).toContain("bg-session-active");
+      expect(cls).not.toContain("muted-foreground");
+    },
+  );
+
+  it("renders disconnected as a grey muted-foreground dot, not destructive red", () => {
+    const cls = activityDotClassName("disconnected");
+    expect(cls).toContain("bg-muted-foreground");
+    expect(cls).not.toContain("destructive");
+  });
+
+  it("renders failed as a destructive dot", () => {
+    expect(activityDotClassName("failed")).toContain("bg-destructive");
+  });
+
+  // The list classifies via ``childStatus``; the graph classifies via
+  // ``childActivity``. Both must agree on the activity per status, and both
+  // color the dot from the same ``activityDotClassName``, so the rendered dot
+  // is identical in both views.
+  it("classifies list and graph identically for each status", () => {
+    const cases: Array<{ child: ChildSessionInfo; expected: string }> = [
+      {
+        child: childInfo({ id: "launching", current_task_status: "launching" }),
+        expected: "bg-session-active/70",
+      },
+      { child: childInfo({ id: "idle" }), expected: "bg-session-active/55" },
+      {
+        child: childInfo({ id: "done", current_task_status: "completed" }),
+        expected: "bg-session-active/55",
+      },
+      {
+        child: childInfo({ id: "other", current_task_status: "cancelled" }),
+        expected: "bg-muted-foreground/55",
+      },
+      {
+        child: childInfo({ id: "failed", current_task_status: "failed" }),
+        expected: "bg-destructive",
+      },
+      {
+        child: childInfo({
+          id: "disconnected",
+          last_task_error: { code: "runner_disconnected", message: "gone" },
+        }),
+        expected: "bg-muted-foreground",
+      },
+    ];
+    for (const { child, expected } of cases) {
+      const list = childStatus(child).activity;
+      const graph = childActivity(child).activity;
+      expect(graph).toBe(list);
+      // Neither classification lands on working/awaiting for these cases.
+      expect(activityDotClassName(graph as Exclude<typeof graph, "working" | "awaiting">)).toBe(
+        expected,
+      );
+    }
+  });
+});
+
+// ===========================================================================
+// Unit tests: sessionStatus (root/main node classification)
+// ===========================================================================
+
+describe("sessionStatus", () => {
+  it("maps launching status to launching", () => {
+    expect(sessionStatus("launching").activity).toBe("launching");
+  });
+
+  it("maps running to working and idle to idle", () => {
+    expect(sessionStatus("running").activity).toBe("working");
+    expect(sessionStatus("idle").activity).toBe("idle");
+  });
+
+  it("maps a runner-disconnect failure to disconnected, not failed", () => {
+    const result = sessionStatus("failed", {
+      code: "runner_disconnected",
+      message: "tunnel dropped",
+    });
+    expect(result.activity).toBe("disconnected");
+    expect(activityDotClassName("disconnected")).toContain("bg-muted-foreground");
+  });
+
+  it("maps a genuine failure to failed", () => {
+    expect(sessionStatus("failed", { code: "boom", message: "oops" }).activity).toBe("failed");
   });
 });
 
