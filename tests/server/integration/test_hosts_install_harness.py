@@ -414,7 +414,7 @@ async def test_install_harness_offline_host_returns_409(
     host_store.upsert_on_connect(
         host_id=_HOST_ID,
         name=_HOST_NAME,
-        owner="local",
+        user_id="local",
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
