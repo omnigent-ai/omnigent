@@ -249,6 +249,42 @@ async def test_update_mcp_server_preserves_headers_on_redacted_roundtrip(
     assert mcp_file.get("headers") == {"Authorization": "Bearer real-token"}
 
 
+async def test_update_mcp_server_clears_headers_when_empty_dict_sent(
+    client: httpx.AsyncClient,
+) -> None:
+    """Sending headers={} on update must remove all headers from the bundle."""
+    session = await create_test_session(client, name="mcp-clear-headers-agent")
+    session_id = session["id"]
+
+    create = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={
+            "name": "secure",
+            "transport": "http",
+            "url": "https://example.com/sse",
+            "headers": {"Authorization": "Bearer real-token"},
+        },
+    )
+    assert create.status_code == 200, create.text
+
+    # User removes all header rows — client sends {}.
+    update = await client.put(
+        f"/v1/sessions/{session_id}/agent/mcp-servers/secure",
+        json={
+            "name": "secure",
+            "transport": "http",
+            "url": "https://example.com/sse",
+            "headers": {},
+        },
+    )
+    assert update.status_code == 200, update.text
+    assert update.json()["headers"] == {}
+
+    bundle = await _agent_bundle(client, session_id)
+    mcp_file = _mcp_file_from_bundle(bundle, "secure.yaml")
+    assert "headers" not in mcp_file
+
+
 async def _agent_bundle(client: httpx.AsyncClient, session_id: str) -> bytes:
     """Download the session agent bundle."""
     resp = await client.get(f"/v1/sessions/{session_id}/agent/contents")

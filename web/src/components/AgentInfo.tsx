@@ -697,12 +697,16 @@ function payloadFromMcpForm(form: McpFormState): UpsertMcpServerInput {
     description: form.description.trim() || null,
   };
   if (form.transport === "http") {
-    const headers =
+    // null → "preserve existing" (used when creating a new server with no headers).
+    // {}  → "clear all headers" (user explicitly removed every row on an existing server).
+    // {…} → replace with these headers.
+    const filledHeaders =
       form.headers.length > 0
         ? Object.fromEntries(
             form.headers.filter((h) => h.key.trim()).map((h) => [h.key.trim(), h.value]),
           )
         : null;
+    const headers = filledHeaders ?? (form.originalName !== null ? {} : null);
     return {
       ...base,
       transport: "http",
