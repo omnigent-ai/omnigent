@@ -775,6 +775,39 @@ def insert_fts(
         )
 
 
+def insert_fts_bulk(
+    session: Session,
+    rows: list[tuple[str, str, str]],
+) -> None:
+    """
+    Dual-write multiple rows into the FTS5 table in a single INSERT.
+
+    On dialects without FTS5 this is a no-op. An empty ``rows`` list is also
+    a no-op.
+
+    :param session: An active SQLAlchemy session.
+    :param rows: Each tuple is ``(item_id, conversation_id, search_text)``.
+    """
+    if not rows:
+        return
+    if not (session.bind and _supports_fts5(session.bind.dialect.name)):
+        return
+    placeholders = ", ".join(f"(:item_id_{i}, :cid_{i}, :st_{i})" for i in range(len(rows)))
+    params: dict[str, str] = {}
+    for i, (item_id, conversation_id, search_text) in enumerate(rows):
+        params[f"item_id_{i}"] = item_id
+        params[f"cid_{i}"] = conversation_id
+        params[f"st_{i}"] = search_text
+    session.execute(
+        text(
+            f"INSERT INTO {_FTS_TABLE}"
+            f"(item_id, conversation_id, search_text) "
+            f"VALUES {placeholders}"
+        ),
+        params,
+    )
+
+
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     """
     Remove all FTS rows for a conversation (SQLite-family dialects only).
