@@ -286,6 +286,56 @@ def test_set_external_session_id(store: SqlAlchemyConversationStore) -> None:
     assert updated.external_session_id == "ext-uuid-123"
 
 
+# ── project membership ─────────────────────────────────
+
+
+def test_set_conversation_project_lands_in_omnigent_db(
+    omnigent_db: Path, store: SqlAlchemyConversationStore
+) -> None:
+    """``project_id`` is written to the metadata row in the Omnigent DB."""
+    project_id = "b" * 32
+    conv = store.create_conversation(title="filed")
+    filed = store.set_conversation_project(conv.id, project_id)
+    assert filed is True
+
+    stored = _col(omnigent_db, "omnigent_conversation_metadata", "project_id", f"id=X'{conv.id}'")
+    assert stored == [project_id]
+    # Reads back through the entity (which merges both DBs).
+    assert store.get_conversation(conv.id).project_id == project_id
+
+
+def test_list_conversations_project_name_filter_crosses_dbs(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+) -> None:
+    """The dual-read ``project`` (by name) filter resolves the first-class
+    member ids from the Omnigent DB (``projects`` JOIN ``conversation_metadata``,
+    both colocated there) and ORs them with the ``omni_project`` label on the AP
+    DB — the cross-DB path a single-DB test can't exercise.
+    """
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    # projects lives on the Omnigent DB, so create it against that URI.
+    project_store = SqlAlchemyProjectStore(f"sqlite:///{omnigent_db}")
+    project = project_store.create("c" * 32, "Work", None)
+
+    first_class = store.create_conversation(title="first-class")
+    labelled = store.create_conversation(title="labelled")
+    unfiled = store.create_conversation(title="loose")
+    store.set_conversation_project(first_class.id, project.id)
+    store.set_labels(labelled.id, {"omni_project": "Work"})
+
+    members = store.list_conversations(project="Work", owned_by=None)
+    assert {c.id for c in members.data} == {first_class.id, labelled.id}
+
+    # Empty string means "unfiled" — the loose session, excluding both members,
+    # even though first-class membership lives in the other physical DB.
+    unfiled_ids = {c.id for c in store.list_conversations(project="", owned_by=None).data}
+    assert unfiled.id in unfiled_ids
+    assert first_class.id not in unfiled_ids
+    assert labelled.id not in unfiled_ids
+
+
 # ── conversation items ─────────────────────────────────
 
 

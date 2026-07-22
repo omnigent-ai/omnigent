@@ -60,6 +60,22 @@ _HEADER_MAX = 65536
 # ``_handle_connect`` for the request-line-smuggling rationale.
 _MIN_PRINTABLE_BYTE = 0x20
 
+# Verbs that can never legitimately need an injected credential, so the
+# proxy refuses to attach (or swap in) the real secret on them regardless
+# of the allowlist. TRACE is a loopback diagnostic — the final recipient
+# reflects the request back to the caller, so a credential injected here
+# would be echoed straight into the sandbox. OPTIONS only negotiates
+# capabilities and has no business carrying a bound-host secret. Keeping
+# this independent of the allowlist means a permissive ``* host/**`` rule
+# can't accidentally re-open the leak.
+_CREDENTIAL_INJECTION_FORBIDDEN_METHODS = frozenset({"TRACE", "OPTIONS"})
+
+# Verbs governed by ``Max-Forwards`` (RFC 7231 §5.1.2). A conformant
+# intermediary must decrement the hop count on these before forwarding and
+# answer directly once it reaches zero; the header is ignored on every
+# other method.
+_MAX_FORWARDS_METHODS = frozenset({"TRACE", "OPTIONS"})
+
 
 def _parse_http_headers(headers_raw: bytes) -> Message:
     """
@@ -595,11 +611,6 @@ class EgressProxy:
 
             logger.info("ALLOW %s https://%s%s", inner_method, host, inner_path)
 
-            content_length = int(inner_headers.get("content-length", "0"))
-            body = b""
-            if content_length > 0:
-                body = await asyncio.wait_for(tls_reader.readexactly(content_length), timeout=30)
-
             # Forward a request line re-serialized from the parsed
             # method/path rather than the raw ``inner_first`` bytes, so
             # the upstream always receives exactly the (method, path)
@@ -607,6 +618,27 @@ class EgressProxy:
             # ``_handle_http`` (``relative_line``); closes the
             # policy-vs-forwarded byte differential.
             inner_request_line = f"{inner_method} {inner_path} HTTP/1.1\r\n".encode("latin-1")
+
+            # Max-Forwards conformance (RFC 7231 §5.1.2): terminate an
+            # exhausted TRACE / OPTIONS at the proxy over the MITM tunnel
+            # (never forwarding it into the credential-injection path);
+            # decrement a positive budget on the forwarded headers.
+            terminate, inner_headers_raw = self._apply_max_forwards(
+                inner_method, inner_headers_raw
+            )
+            if terminate:
+                logger.info(
+                    "MAX-FORWARDS-TERMINATE %s https://%s%s", inner_method, host, inner_path
+                )
+                await self._send_max_forwards_reply(
+                    tls_writer, inner_method, inner_request_line, inner_headers_raw
+                )
+                return
+
+            content_length = int(inner_headers.get("content-length", "0"))
+            body = b""
+            if content_length > 0:
+                body = await asyncio.wait_for(tls_reader.readexactly(content_length), timeout=30)
 
             await self._forward_https(
                 tls_writer,
@@ -676,7 +708,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         # Swap any synthetic credential placeholder for the real secret,
         # bound to this host (rejects cross-host replay with 403).
-        rewrite = self._rewrite_authorization(host=host, headers_raw=headers_raw)
+        rewrite = self._rewrite_authorization(method=method, host=host, headers_raw=headers_raw)
         if rewrite.error is not None:
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
@@ -802,6 +834,19 @@ class EgressProxy:
 
         logger.info("ALLOW %s http://%s%s", method, host, path)
 
+        # Max-Forwards conformance (RFC 7231 §5.1.2): a TRACE / OPTIONS
+        # request whose hop budget is exhausted terminates at the proxy —
+        # answered here as the final recipient, never forwarded (and so
+        # never reaching the credential-injection path). A positive budget
+        # is decremented on the forwarded header block.
+        terminate, headers_raw = self._apply_max_forwards(method, headers_raw)
+        if terminate:
+            logger.info("MAX-FORWARDS-TERMINATE %s http://%s%s", method, host, path)
+            await self._send_max_forwards_reply(
+                writer, method, f"{method} {path} HTTP/1.1\r\n".encode("latin-1"), headers_raw
+            )
+            return
+
         try:
             pinned_ip = await self._assert_destination_allowed(host, port)
         except PermissionError as exc:
@@ -816,7 +861,7 @@ class EgressProxy:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
-        rewrite = self._rewrite_authorization(host=host, headers_raw=headers_raw)
+        rewrite = self._rewrite_authorization(method=method, host=host, headers_raw=headers_raw)
         if rewrite.error is not None:
             logger.warning(
                 "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, rewrite.error
@@ -1081,7 +1126,9 @@ class EgressProxy:
         except Exception:  # noqa: BLE001 — response write is best-effort
             pass
 
-    def _rewrite_authorization(self, *, host: str, headers_raw: bytes) -> _AuthRewriteResult:
+    def _rewrite_authorization(
+        self, *, method: str, host: str, headers_raw: bytes
+    ) -> _AuthRewriteResult:
         """
         Attach the real credential to a bound-host request.
 
@@ -1104,11 +1151,24 @@ class EgressProxy:
         left untouched (and suppresses injection), so the proxy never
         clobbers an unrelated credential a tool deliberately sent.
 
+        No injection or swap happens on the loopback/diagnostic verbs in
+        :data:`_CREDENTIAL_INJECTION_FORBIDDEN_METHODS` (``TRACE`` /
+        ``OPTIONS``) — TRACE would reflect the injected secret back into
+        the sandbox, and neither verb can legitimately carry a bound-host
+        credential. The headers are forwarded untouched so any synthetic
+        placeholder the sandbox holds (a harmless fake) passes through
+        without being upgraded to the real secret.
+
+        :param method: HTTP method (case-insensitive), e.g. ``"GET"``.
         :param host: Upstream request host (case-insensitive).
         :param headers_raw: Raw HTTP header block (CRLF-separated).
         :returns: An :class:`_AuthRewriteResult` carrying either the
             (possibly rewritten / injected) headers or a rejection reason.
         """
+        if method.upper() in _CREDENTIAL_INJECTION_FORBIDDEN_METHODS:
+            # Independent of the allowlist and of whether a rule binds this
+            # host: these verbs never receive the real credential.
+            return _AuthRewriteResult(headers=headers_raw, error=None)
         if not self._cred_by_host:
             return _AuthRewriteResult(headers=headers_raw, error=None)
 
@@ -1372,3 +1432,125 @@ class EgressProxy:
         del msg["Keep-Alive"]
         msg["Connection"] = "close"
         return msg.as_bytes(policy=email.policy.HTTP)
+
+    @staticmethod
+    def _apply_max_forwards(method: str, headers_raw: bytes) -> tuple[bool, bytes]:
+        """
+        Enforce ``Max-Forwards`` (RFC 7231 §5.1.2) for TRACE / OPTIONS.
+
+        ``Max-Forwards`` bounds how many intermediaries a TRACE or OPTIONS
+        request may traverse. A conformant intermediary that receives one
+        of these verbs MUST inspect the header before forwarding:
+
+        - value ``0`` (or a malformed value): the proxy is the final
+          recipient and MUST NOT forward — it answers directly.
+        - value ``> 0``: decrement by one, then forward.
+
+        The header is ignored on every other method, so those requests
+        pass through untouched.
+
+        :param method: HTTP method (case-insensitive), e.g. ``"TRACE"``.
+        :param headers_raw: Raw request header block (CRLF-separated).
+        :returns: ``(terminate, headers)``. ``terminate`` is ``True`` when
+            the proxy must answer as the final recipient (the caller must
+            not forward upstream); otherwise ``headers`` is the block to
+            forward, with ``Max-Forwards`` decremented when it was present.
+        """
+        # Normalize here so the guard holds even if a future caller forgets
+        # to upper-case the verb (both current callers already do).
+        if method.upper() not in _MAX_FORWARDS_METHODS:
+            return False, headers_raw
+        msg = _parse_http_headers(headers_raw)
+        raw = msg.get("Max-Forwards")
+        if raw is None:
+            # No hop limit expressed — forward as a transparent hop.
+            return False, headers_raw
+        try:
+            remaining = int(raw.strip())
+        except ValueError:
+            # A malformed count is treated as exhausted: terminate at the
+            # proxy rather than forward an ambiguous hop budget upstream.
+            remaining = 0
+        if remaining <= 0:
+            return True, headers_raw
+        del msg["Max-Forwards"]
+        msg["Max-Forwards"] = str(remaining - 1)
+        return False, msg.as_bytes(policy=email.policy.HTTP)
+
+    @staticmethod
+    def _build_trace_echo(request_line: bytes, headers_raw: bytes) -> bytes:
+        """
+        Reflect a TRACE request as a ``message/http`` payload.
+
+        RFC 7231 §4.3.8 has the final recipient echo the received request
+        so the client can see what arrived. We drop the headers that could
+        carry a secret (``Authorization`` / ``Cookie`` /
+        ``Proxy-Authorization``) so the reflection can never hand a
+        credential back to the caller — the exact leak this hardening
+        exists to prevent.
+
+        :param request_line: The origin-form request line to echo, e.g.
+            ``b"TRACE /path HTTP/1.1\\r\\n"``.
+        :param headers_raw: Raw request header block (CRLF-separated).
+        :returns: The ``message/http`` body: the request line followed by
+            the (sensitive-stripped) header block.
+        """
+        msg = _parse_http_headers(headers_raw)
+        del msg["Authorization"]
+        del msg["Cookie"]
+        del msg["Proxy-Authorization"]
+        return request_line + msg.as_bytes(policy=email.policy.HTTP)
+
+    async def _send_max_forwards_reply(
+        self,
+        writer: asyncio.StreamWriter,
+        method: str,
+        request_line: bytes,
+        headers_raw: bytes,
+    ) -> None:
+        """
+        Answer a TRACE / OPTIONS request as the final recipient.
+
+        Called when ``Max-Forwards`` reached zero and the proxy must halt
+        the request instead of forwarding (see :meth:`_apply_max_forwards`).
+        TRACE reflects the received message (``message/http``) with any
+        sensitive headers stripped; OPTIONS reports the proxy's own
+        communication options via ``Allow``.
+
+        Any request body (e.g. an ``OPTIONS`` with ``Content-Length``) is
+        intentionally left undrained: the reply sets ``Connection: close``
+        and the caller tears the connection down, so leftover bytes are
+        discarded rather than mistaken for a pipelined request.
+
+        :param writer: Stream to write the response to (the plaintext
+            client writer, or the MITM ``tls_writer`` inside CONNECT).
+        :param method: ``"TRACE"`` or ``"OPTIONS"`` (upper-case).
+        :param request_line: Origin-form request line, echoed for TRACE.
+        :param headers_raw: Raw request header block, echoed for TRACE.
+        """
+        if method == "TRACE":
+            body = self._build_trace_echo(request_line, headers_raw)
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: message/http\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Connection: close\r\n"
+                b"\r\n" + body
+            )
+        else:  # OPTIONS
+            # This ``Allow`` list is intentionally static and proxy-scoped:
+            # it advertises the verbs the proxy itself answers for as the
+            # final recipient of a ``Max-Forwards: 0`` request, NOT the
+            # origin's capabilities (which are never queried on this path).
+            resp = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Allow: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, TRACE\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            )
+        try:
+            writer.write(resp)
+            await writer.drain()
+        except Exception:  # noqa: BLE001 — response write is best-effort
+            pass

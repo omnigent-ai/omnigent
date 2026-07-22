@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, TypedDict
@@ -119,6 +120,7 @@ async def test_serve_tunnel_backs_off_after_clean_close(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Pretend one tunnel connection closed normally.
 
@@ -180,6 +182,7 @@ async def test_serve_tunnel_resets_backoff_after_successful_connection(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Raise transient errors, then close cleanly.
 
@@ -245,6 +248,7 @@ async def test_serve_tunnel_fails_loud_on_protocol_rejection(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Raise a protocol close from the server.
 
@@ -289,6 +293,7 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Raise an HTTP auth rejection from the server.
 
@@ -402,6 +407,7 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Simulate websockets following a redirect into an OAuth URL.
 
@@ -481,6 +487,7 @@ async def test_serve_tunnel_replaces_rejected_host_bootstrap_token(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Reject the host token, then stop after observing the replacement."""
         del app, tunnel_url, server_url, runner_id, runner_version, tunnel_token
@@ -688,6 +695,196 @@ async def test_serve_tunnel_once_sends_org_header(
     headers = captured["headers"]
     assert isinstance(headers, dict)
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+@pytest.mark.asyncio
+async def test_graceful_drain_fires_hook_and_awaits_inflight_task() -> None:
+    """``_graceful_drain`` runs the drain hook, then waits for in-flight tasks.
+
+    The idle-reaper drain must (1) fire ``on_graceful_shutdown`` (which in
+    production enqueues the ``[DONE]`` sentinels) and (2) let the in-flight
+    ``GET /stream`` dispatch tasks finish emitting those end frames rather than
+    cancelling them. Model that with a dispatch task that only completes once
+    the hook has "delivered the sentinel".
+    """
+    drain_calls: list[str] = []
+    sentinel_delivered = asyncio.Event()
+
+    async def _inflight_stream() -> None:
+        """A relay stream that ends only after the drain hook releases it."""
+        await sentinel_delivered.wait()
+
+    def _on_graceful_shutdown() -> None:
+        drain_calls.append("drained")
+        sentinel_delivered.set()
+
+    task = asyncio.create_task(_inflight_stream())
+    dispatch_tasks = {"req-1": task}
+
+    await asyncio.wait_for(
+        serve_module._graceful_drain(
+            dispatch_tasks=dispatch_tasks,
+            on_graceful_shutdown=_on_graceful_shutdown,
+        ),
+        timeout=5.0,
+    )
+
+    # Hook fired, and the in-flight task ran to completion before drain returned
+    # (not left dangling) — the whole point of awaiting before the socket close.
+    assert drain_calls == ["drained"]
+    assert task.done()
+    # Non-blocking (already done); re-raises if the task failed/was cancelled.
+    assert task.result() is None
+
+
+@pytest.mark.asyncio
+async def test_graceful_drain_bounded_when_task_never_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that never drains must not wedge shutdown forever.
+
+    ``_graceful_drain`` waits only up to its drain timeout; a task still
+    running past it is left for the caller's ``_cancel_dispatch_tasks`` to
+    clean up. Pin the timeout tiny so the test is fast.
+    """
+    monkeypatch.setattr(serve_module, "_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S", 0.05)
+
+    async def _never_finishes() -> None:
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_never_finishes())
+    try:
+        # Returns despite the task never finishing — bounded by the timeout.
+        await asyncio.wait_for(
+            serve_module._graceful_drain(
+                dispatch_tasks={"req-stuck": task},
+                on_graceful_shutdown=lambda: None,
+            ),
+            timeout=2.0,
+        )
+        assert not task.done()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting the shutdown event ends the read loop and closes the socket.
+
+    Drives the real ``_serve_tunnel_once`` with a fake WS whose ``recv`` blocks
+    forever. When the shutdown event fires, the loop must cancel the pending
+    recv, run the drain hook, return cleanly, and let the context manager close
+    the connection — the clean end-of-stream that replaces an abrupt drop.
+    """
+    import websockets
+
+    shutdown_event = asyncio.Event()
+    drain_calls: list[str] = []
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, data: str) -> None:
+            del data
+
+        async def recv(self) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+    ws = _FakeWS()
+
+    class _Ctx:
+        async def __aenter__(self) -> _FakeWS:
+            return ws
+
+        async def __aexit__(self, *_exc: object) -> None:
+            ws.closed = True
+
+    def _fake_connect(url: str, **kwargs: object) -> _Ctx:
+        del url, kwargs
+        return _Ctx()
+
+    monkeypatch.setattr(websockets, "connect", _fake_connect)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+
+    # Pre-arm the shutdown so the very first recv() race resolves to shutdown
+    # (recv blocks forever). Deterministic — no real-time sleep to lose to load.
+    shutdown_event.set()
+    await asyncio.wait_for(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=shutdown_event,
+            on_graceful_shutdown=lambda: drain_calls.append("drained"),
+        ),
+        timeout=5.0,
+    )
+
+    assert drain_calls == ["drained"]
+    assert ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_stops_reconnecting_after_graceful_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a graceful shutdown, ``serve_tunnel`` returns instead of looping.
+
+    Normally ``_serve_tunnel_once`` returning triggers a reconnect. When the
+    shutdown event is set, the reconnect loop must exit instead — the idle
+    reaper is tearing the tunnel down for good.
+    """
+    shutdown_event = asyncio.Event()
+    calls = 0
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+        **_kwargs: Any,
+    ) -> None:
+        """Simulate a connection that ends via graceful shutdown."""
+        del app, tunnel_url, server_url, runner_id, runner_version
+        del auth_token, tunnel_token
+        nonlocal calls
+        calls += 1
+        shutdown_event.set()
+
+    async def _sleep(delay: float) -> None:
+        """Fail loudly if a reconnect backoff is ever reached."""
+        del delay
+        raise AssertionError("serve_tunnel should not reconnect after graceful shutdown")
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    await asyncio.wait_for(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner_graceful",
+            runner_version="0.1.0",
+            shutdown_event=shutdown_event,
+        ),
+        timeout=5.0,
+    )
+
+    # Exactly one connection attempt, then a clean return (no reconnect).
+    assert calls == 1
 
 
 @pytest.mark.parametrize(
@@ -942,6 +1139,7 @@ async def test_serve_tunnel_calls_factory_on_each_reconnect(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Record the token used for each connection attempt.
 
@@ -1015,6 +1213,7 @@ async def test_serve_tunnel_401_with_factory_retries(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """First call raises 401; second succeeds.
 
@@ -1081,6 +1280,7 @@ async def test_serve_tunnel_401_without_factory_is_fatal(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Raise 401.
 
@@ -1138,6 +1338,7 @@ async def test_serve_tunnel_403_remains_fatal_with_factory(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Raise 403.
 
@@ -1213,6 +1414,7 @@ async def test_serve_tunnel_reconnect_uses_fresh_token_not_stale(
         runner_version: str,
         auth_token: str | None = None,
         tunnel_token: str | None = None,
+        **_kwargs: Any,
     ) -> None:
         """Record the auth token used per connection, then simulate
         a clean close (disconnect).
