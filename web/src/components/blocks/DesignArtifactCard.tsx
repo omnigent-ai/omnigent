@@ -2,6 +2,7 @@ import { ChevronRightIcon, FileCode2Icon } from "lucide-react";
 import { useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { useFileViewer } from "@/shell/FileViewerContext";
+import { useArtifactViewer } from "@/shell/ArtifactViewerContext";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 export interface DesignArtifactData {
@@ -84,6 +85,7 @@ interface DesignArtifactCardProps {
 }
 
 export function DesignArtifactCard({ data }: DesignArtifactCardProps) {
+  const openArtifact = useArtifactViewer();
   const openFile = useFileViewer();
   const resourceLabel = useMemo(
     () => `${data.resourceCount} ${data.resourceCount === 1 ? "file" : "files"}`,
@@ -94,7 +96,9 @@ export function DesignArtifactCard({ data }: DesignArtifactCardProps) {
     <button
       type="button"
       data-testid="design-artifact-card"
-      onClick={() => openFile?.(data.entryPath)}
+      onClick={() =>
+        openArtifact !== null ? openArtifact(data.entryPath) : openFile?.(data.entryPath)
+      }
       className={cn(
         "not-prose my-1 flex items-center gap-3 rounded-lg border border-border bg-card px-3 py-3 text-left shadow-sm transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         TOOL_SURFACE_WIDTH_CLASS,

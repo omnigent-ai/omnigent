@@ -15,6 +15,11 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel-stub" />,
 }));
+vi.mock("./ArtifactsPanel", () => ({
+  ArtifactsPanel: ({ selectedPath }: { selectedPath: string | null }) => (
+    <div data-testid="artifacts-panel-stub">{selectedPath}</div>
+  ),
+}));
 vi.mock("./InlineTerminalsSection", () => ({
   InlineTerminalsSection: () => <div data-testid="terminals-stub" />,
 }));
@@ -46,6 +51,7 @@ function renderWorkspace(
     selectedFilePath?: string | null;
     openFiles?: string[];
     showBrowserTab?: boolean;
+    selectedArtifactPath?: string | null;
   } = {},
 ) {
   const openFileViewer = vi.fn();
@@ -71,6 +77,8 @@ function renderWorkspace(
       rootSessionId={null}
       selectedFilePath={overrides.selectedFilePath ?? null}
       openFiles={overrides.openFiles ?? []}
+      selectedArtifactPath={overrides.selectedArtifactPath ?? null}
+      onArtifactSelect={vi.fn()}
       openFileViewer={openFileViewer}
       onCloseFile={onCloseFile}
       onShowScopeView={vi.fn()}
@@ -165,6 +173,18 @@ describe("WorkspacePanel open-file tabs", () => {
 });
 
 describe("WorkspacePanel content area", () => {
+  it("renders the selected entry on the Artifacts tab", () => {
+    renderWorkspace({
+      rightRailTab: "artifacts",
+      selectedArtifactPath: "artifacts/revenue/index.html",
+    });
+
+    expect(screen.getByRole("tab", { name: /artifacts/i })).toHaveAttribute("data-state", "active");
+    expect(screen.getByTestId("artifacts-panel-stub")).toHaveTextContent(
+      "artifacts/revenue/index.html",
+    );
+  });
+
   it("renders the FileViewer for the active path (not the scope panel)", () => {
     renderWorkspace({
       openFiles: ["src/App.tsx"],

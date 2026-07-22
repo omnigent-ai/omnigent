@@ -1,9 +1,18 @@
-import { BotIcon, FileIcon, GlobeIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
+import {
+  BotIcon,
+  FileCode2Icon,
+  FileIcon,
+  GlobeIcon,
+  ListTodoIcon,
+  TerminalIcon,
+  XIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { FilesPanel } from "./FilesPanel";
+import { ArtifactsPanel } from "./ArtifactsPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -180,6 +189,10 @@ interface WorkspacePanelProps {
   selectedFilePath: string | null;
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
+  /** Selected HTML entry in the Artifacts tab. */
+  selectedArtifactPath: string | null;
+  /** Select an HTML entry for preview. */
+  onArtifactSelect: (entryPath: string) => void;
   /** Open a file in the inline viewer (adds/activates its tab). */
   openFileViewer: (path: string) => void;
   /** Close a single open file tab by path. */
@@ -242,6 +255,8 @@ export function WorkspacePanel({
   rootSessionId,
   selectedFilePath,
   openFiles,
+  selectedArtifactPath,
+  onArtifactSelect,
   openFileViewer,
   onCloseFile,
   onShowScopeView,
@@ -327,6 +342,15 @@ export function WorkspacePanel({
                     {changedCount}
                   </span>
                 )}
+              </TabsTrigger>
+            )}
+            {showFilesPanel && (
+              <TabsTrigger
+                value="artifacts"
+                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+              >
+                <FileCode2Icon className="size-4" />
+                Artifacts
               </TabsTrigger>
             )}
             <TabsTrigger
@@ -436,6 +460,13 @@ export function WorkspacePanel({
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
+          />
+        ) : rightRailTab === "artifacts" && showFilesPanel ? (
+          <ArtifactsPanel
+            conversationId={conversationId}
+            selectedPath={selectedArtifactPath}
+            onSelect={onArtifactSelect}
+            onOpenFile={openFileViewer}
           />
         ) : rightRailTab === "browser" && showBrowserTab ? (
           // Embedded browser (Electron only) — BrowserPane self-gates and
