@@ -106,7 +106,6 @@ _BACKGROUND_TITLE_HARNESS_ADAPTERS = {
     "claude-sdk": "claude-sdk",
     "claude-native": "claude-sdk",
     "codex": "codex",
-    "codex-native": "codex",
 }
 _BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
 _BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32

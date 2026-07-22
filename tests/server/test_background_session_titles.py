@@ -144,6 +144,38 @@ async def test_prepare_background_title_skips_non_initial_sessions(
     assert pending is None
 
 
+@pytest.mark.parametrize("harness_override", ["codex-native", "pi"])
+async def test_prepare_background_title_skips_unsupported_explicit_harnesses(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    harness_override: str,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(
+        title=None,
+        agent_id=uuid.uuid4().hex,
+    )
+    conversation.harness_override = harness_override
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Unused title"
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, generator),
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ),
+    )
+
+    assert pending is None
+
+
 async def test_default_seed_wait_allows_slow_native_session_startup(db_uri: str) -> None:
     store = SqlAlchemyConversationStore(db_uri)
 

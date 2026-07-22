@@ -316,7 +316,7 @@ async def test_claude_native_title_kills_process_when_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_background_title_maps_codex_native_to_codex(
+async def test_background_title_skips_codex_native_without_spawning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness_client = _FakeHarnessClient()
@@ -326,8 +326,6 @@ async def test_background_title_maps_codex_native_to_codex(
     async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str] | None]:
         override = kwargs["harness_override"]
         calls.append((override, kwargs["model_override"]))
-        if override == "codex":
-            return "codex", {"HARNESS_CODEX_MODEL": "gpt-5.4-mini"}
         return "codex-native", None
 
     monkeypatch.setattr(
@@ -349,17 +347,11 @@ async def test_background_title_maps_codex_native_to_codex(
         )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "generated"
-    assert calls == [(None, "gpt-5.4-mini"), ("codex", "gpt-5.4-mini")]
-    [(_process_key, harness, env)] = process_manager.get_client_calls
-    assert harness == "codex"
-    assert env == {
-        "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "1",
-        "HARNESS_CODEX_ENABLE_WEB_SEARCH": "0",
-        "HARNESS_CODEX_MINIMAL_CONFIG": "1",
-        "HARNESS_CODEX_MODEL": "gpt-5.4-mini",
-        "HARNESS_CODEX_SKILLS_FILTER": '"none"',
-    }
+    assert response.json() == {"status": "unsupported", "title": None}
+    assert calls == [(None, "gpt-5.4-mini")]
+    assert process_manager.get_client_calls == []
+    assert process_manager.released == []
+    assert harness_client.requests == []
 
 
 @pytest.mark.asyncio
