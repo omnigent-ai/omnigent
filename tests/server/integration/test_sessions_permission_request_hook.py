@@ -3683,6 +3683,195 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
     pending_elicitations.reset_for_tests()
 
 
+async def test_codex_hook_gap_verdict_via_ancestor_honored_on_repost(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A gap verdict posted against an ANCESTOR session reaches the
+    child's re-park.
+
+    Child elicitation cards are mirrored into ancestor streams, so a
+    parent-chat client can deliver its verdict on the parent's session
+    id. In the between-poll gap that writes the tombstone keyed under
+    the ancestor; the child's re-park must still consume it instead of
+    silently re-asking (ancestors share the child's access chain, so
+    honoring the tombstone widens nothing).
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    async def _disconnect_immediately(_request: Any) -> None:
+        """
+        Sever every hook long-poll straight away.
+
+        :param _request: Ignored FastAPI request.
+        :returns: None.
+        """
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(
+        sessions_route,
+        "_poll_request_disconnect",
+        _disconnect_immediately,
+    )
+    monkeypatch.setattr(
+        sessions_route,
+        "_HARNESS_ELICITATION_REPARK_GRACE_S",
+        0.25,
+    )
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-codex-ancestor-gap")
+    parent_id = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    child_id = store.create_conversation(
+        kind="sub_agent",
+        title="codex-child:gap",
+        parent_conversation_id=parent_id,
+        agent_id=agent["id"],
+    ).id
+
+    # Watch the PARENT stream: the mirrored card is what a parent-chat
+    # client resolves against.
+    drain_task = asyncio.create_task(_drain_until_elicitation(parent_id))
+    await asyncio.sleep(0.05)
+    first = await client.post(
+        f"/v1/sessions/{child_id}/hooks/codex-elicitation-request",
+        json=_CODEX_REPARK_PAYLOAD,
+    )
+    assert first.status_code == 200, first.text
+    assert first.content == b""
+    event = await drain_task
+    assert event["params"]["target_session_id"] == child_id
+
+    # Verdict lands in the gap, addressed to the ancestor session.
+    verdict = await _post_approval(
+        client,
+        parent_id,
+        event["elicitation_id"],
+        "accept",
+        content={"ok": "go"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    second = await client.post(
+        f"/v1/sessions/{child_id}/hooks/codex-elicitation-request",
+        json=_CODEX_REPARK_PAYLOAD,
+    )
+    assert second.status_code == 200, second.text
+    assert second.content != b"", (
+        "ancestor-keyed tombstone was not consumed on the child's "
+        "re-park — the gap verdict was dropped and the gate re-asks"
+    )
+    assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
+    # Drain the severed poll's deferred clear so it doesn't outlive the
+    # test's event loop (it no-ops the index either way).
+    for task in set(sessions_route._deferred_elicitation_clear_tasks):
+        await asyncio.wait_for(task, timeout=5.0)
+    pending_elicitations.reset_for_tests()
+
+
+async def test_codex_hook_unwind_window_verdict_tombstoned_for_repost(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A verdict landing after the wait gives up but before the hook
+    deregisters (the unwind window) survives to the retry.
+
+    The unwind's ``future in done`` check deliberately drops the
+    verdict for the dying request, but the resolving client already
+    got its 2xx — without a tombstone the click is lost and the gate
+    silently re-asks.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    unwind_entered = asyncio.Event()
+    release_unwind = asyncio.Event()
+
+    async def _stall_unwind_on_cancel(_request: Any) -> None:
+        """
+        Park until cancelled, then hold the wait's unwind open.
+
+        Swallows the cleanup's cancel (as a poller inside an anyio
+        scope unwind can) so the test lands a verdict inside the
+        window deterministically.
+
+        :param _request: Ignored FastAPI request.
+        :returns: None.
+        """
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            unwind_entered.set()
+            await release_unwind.wait()
+
+    monkeypatch.setattr(
+        sessions_route,
+        "_poll_request_disconnect",
+        _stall_unwind_on_cancel,
+    )
+    monkeypatch.setattr(
+        sessions_route,
+        "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
+        0.3,
+    )
+    monkeypatch.setattr(
+        sessions_route,
+        "_HARNESS_ELICITATION_REPARK_GRACE_S",
+        0.25,
+    )
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-codex-unwind-verdict")
+    session_id = await _create_session(client, agent["id"])
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+    )
+    event = await drain_task
+    try:
+        async with asyncio.timeout(5.0):
+            await unwind_entered.wait()
+        # The wait timed out but the future is still registered: this
+        # resolve lands in the unwind window and is acked with a 2xx.
+        verdict = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "accept",
+            content={"ok": "go"},
+        )
+        assert verdict.status_code == 202, verdict.text
+    finally:
+        release_unwind.set()
+    first = await hook_task
+    # The dying poll still fail-asks (the deliberate same-tick guard).
+    assert first.status_code == 200, first.text
+    assert first.content == b""
+
+    second = await client.post(
+        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+        json=_CODEX_REPARK_PAYLOAD,
+    )
+    assert second.status_code == 200, second.text
+    assert second.content != b"", (
+        "unwind-window verdict was not tombstoned — the acked verdict "
+        "was dropped and the gate re-asks"
+    )
+    assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
+    for task in set(sessions_route._deferred_elicitation_clear_tasks):
+        await asyncio.wait_for(task, timeout=5.0)
+    pending_elicitations.reset_for_tests()
+
+
 # ── Antigravity elicitation hook tests ──────────────────────────────────────
 
 
