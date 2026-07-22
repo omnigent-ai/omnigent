@@ -8449,8 +8449,12 @@ def create_runner_app(
         error label — so an idle-reaped session settles quietly rather than
         showing a scary error banner. Mirror of the per-session ``put(None)``
         the session-delete path already does; this is the whole-runner variant.
+
+        Snapshots the queues before iterating. The loop is synchronous (no
+        await, so nothing can interleave today), but the snapshot keeps the
+        drain robust if a queue mutation ever moves off this atomic path.
         """
-        for queue in _session_event_queues.values():
+        for queue in list(_session_event_queues.values()):
             queue.put_nowait(None)
 
     app.state.drain_session_streams = _drain_session_streams

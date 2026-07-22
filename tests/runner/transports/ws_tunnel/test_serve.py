@@ -718,7 +718,7 @@ async def test_graceful_drain_fires_hook_and_awaits_inflight_task() -> None:
         drain_calls.append("drained")
         sentinel_delivered.set()
 
-    task = asyncio.ensure_future(_inflight_stream())
+    task = asyncio.create_task(_inflight_stream())
     dispatch_tasks = {"req-1": task}
 
     await asyncio.wait_for(
@@ -752,7 +752,7 @@ async def test_graceful_drain_bounded_when_task_never_finishes(
     async def _never_finishes() -> None:
         await asyncio.Event().wait()
 
-    task = asyncio.ensure_future(_never_finishes())
+    task = asyncio.create_task(_never_finishes())
     try:
         # Returns despite the task never finishing — bounded by the timeout.
         await asyncio.wait_for(
