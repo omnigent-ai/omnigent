@@ -1198,6 +1198,11 @@ function AgentHarnessPicker({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
+        // Keep the menu inside the viewport on short mobile screens: pad the
+        // collision box so the available-height cap leaves room below the
+        // status bar, and let it flip/scroll rather than run off the top.
+        collisionPadding={12}
+        avoidCollisions
         className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
       >
         {showMore ? (
@@ -1340,12 +1345,15 @@ function ConfigRow({
   children: ReactNode;
 }) {
   return (
-    <div className="flex items-start justify-between gap-6">
-      <div className="min-w-0 pt-1">
+    // Stacked on mobile (label above a full-width control) so the label never
+    // gets squeezed into a narrow column and wraps hard; side-by-side from sm+
+    // with the control pinned to a fixed width.
+    <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
+      <div className="min-w-0 sm:pt-1">
         <div className="text-sm font-medium">{label}</div>
         {description && <div className="text-xs text-muted-foreground">{description}</div>}
       </div>
-      <div className="w-52 shrink-0">{children}</div>
+      <div className="w-full sm:w-52 sm:shrink-0">{children}</div>
     </div>
   );
 }
