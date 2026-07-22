@@ -141,4 +141,77 @@ describe("ComposerMicButton", () => {
     act(() => handlers.error?.({ error: "no-speech" }));
     expect(button).toHaveAttribute("title", "Voice dictation");
   });
+
+  it("snapshots via onVoiceStart when dictation begins", () => {
+    const onVoiceStart = vi.fn();
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceStart={onVoiceStart} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+
+    act(() => handlers.start?.({}));
+    expect(onVoiceStart).toHaveBeenCalledTimes(1);
+  });
+
+  it("Enter while listening stops dictation and keeps the text (no discard)", () => {
+    const onVoiceDiscard = vi.fn();
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    const e = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    act(() => {
+      window.dispatchEvent(e);
+    });
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(onVoiceDiscard).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("Esc while listening stops dictation and discards the text", () => {
+    const onVoiceDiscard = vi.fn();
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    const e = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => {
+      window.dispatchEvent(e);
+    });
+
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(onVoiceDiscard).toHaveBeenCalledTimes(1);
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it("drops a late transcript that arrives after an Esc discard", () => {
+    const onTranscript = vi.fn();
+    render(<ComposerMicButton onTranscript={onTranscript} onVoiceDiscard={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
+    act(() => handlers.start?.({}));
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    // A trailing final result races in before the recognizer's end event.
+    act(() => handlers.result?.(resultEvent("trailing words")));
+
+    expect(onTranscript).not.toHaveBeenCalled();
+  });
+
+  it("does not intercept Enter/Esc when not listening", () => {
+    const onVoiceDiscard = vi.fn();
+    render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);
+    // Never started listening.
+    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    const esc = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    act(() => {
+      window.dispatchEvent(enter);
+      window.dispatchEvent(esc);
+    });
+
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(onVoiceDiscard).not.toHaveBeenCalled();
+    expect(enter.defaultPrevented).toBe(false);
+    expect(esc.defaultPrevented).toBe(false);
+  });
 });

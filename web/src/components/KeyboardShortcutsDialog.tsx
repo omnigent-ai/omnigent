@@ -78,6 +78,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER] },
+      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
   },

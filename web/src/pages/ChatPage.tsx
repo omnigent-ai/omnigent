@@ -3931,6 +3931,8 @@ export function Composer({
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
+  // Composer text captured when voice dictation starts, so Esc can revert to it.
+  const voiceSnapshotRef = useRef("");
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
@@ -4878,7 +4880,14 @@ export function Composer({
               <span className="sr-only">Attach files</span>
             </Button>
             <ComposerMicButton
+              enableHotkey
               disabled={disabled || isReadOnly || hasPendingElicitation}
+              onVoiceStart={() => {
+                voiceSnapshotRef.current = value;
+              }}
+              onVoiceDiscard={() => {
+                setValue(voiceSnapshotRef.current);
+              }}
               onTranscript={(text) => {
                 setValue((prev) => (prev ? `${prev} ${text}` : text));
                 dirtyRef.current = true;

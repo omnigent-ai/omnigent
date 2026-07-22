@@ -1,6 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -57,12 +58,24 @@ export type ComposerMicButtonProps = {
   onTranscript: (text: string) => void;
   disabled?: boolean;
   lang?: string;
+  /** Bind the global ⌘⌥V dictation hotkey to this mic. Enable on exactly one
+   *  mounted mic (the primary composer) so two don't fight for the device. */
+  enableHotkey?: boolean;
+  /** Fired when dictation begins. The parent should snapshot the composer text
+   *  here so {@link onVoiceDiscard} can revert to it. */
+  onVoiceStart?: () => void;
+  /** Fired when Esc ends dictation. The parent should restore the text it
+   *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
+  onVoiceDiscard?: () => void;
 };
 
 export const ComposerMicButton = ({
   onTranscript,
   disabled,
   lang = "en-US",
+  enableHotkey = false,
+  onVoiceStart,
+  onVoiceDiscard,
 }: ComposerMicButtonProps) => {
   // null Ctor → no Web Speech support → render nothing (no server fallback).
   const [Ctor] = useState(getRecognitionCtor);
@@ -72,6 +85,14 @@ export const ComposerMicButton = ({
   // Ref so the result handler isn't re-attached on every parent re-render.
   const onTranscriptRef = useRef(onTranscript);
   onTranscriptRef.current = onTranscript;
+  // Synced refs so the mount-time listeners call the latest callbacks.
+  const onVoiceStartRef = useRef(onVoiceStart);
+  onVoiceStartRef.current = onVoiceStart;
+  const onVoiceDiscardRef = useRef(onVoiceDiscard);
+  onVoiceDiscardRef.current = onVoiceDiscard;
+  // Set by the Esc handler so late results after a discard don't repopulate the
+  // composer the parent just reverted. Cleared on the next start.
+  const discardingRef = useRef(false);
   // Synced prop ref so the recognition result handler (closure over the
   // mount-time effect) can drop late events when the composer goes
   // disabled mid-utterance.
@@ -96,8 +117,11 @@ export const ComposerMicButton = ({
 
     const handleStart = () => {
       transitionRef.current = false;
+      discardingRef.current = false;
       setError(null);
       setIsListening(true);
+      // Snapshot point: let the parent record the text so Esc can revert to it.
+      onVoiceStartRef.current?.();
     };
     const handleEnd = () => {
       transitionRef.current = false;
@@ -115,8 +139,9 @@ export const ComposerMicButton = ({
       setIsListening(false);
     };
     const handleResult = (event: Event) => {
-      // Drop late events that arrive after the composer went disabled.
-      if (disabledRef.current) return;
+      // Drop late events that arrive after the composer went disabled, or after
+      // an Esc discard the parent has already reverted.
+      if (disabledRef.current || discardingRef.current) return;
       const speechEvent = event as SpeechRecognitionEventLike;
       let finalTranscript = "";
       for (let i = speechEvent.resultIndex; i < speechEvent.results.length; i += 1) {
@@ -240,6 +265,43 @@ export const ComposerMicButton = ({
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
     }
+  }, [isListening]);
+
+  // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Gated on
+  // Ctor/disabled so the chord is inert when dictation can't run right now.
+  useVoiceDictationHotkey(toggle, enableHotkey && Boolean(Ctor) && !disabled);
+
+  // While listening, Enter commits (stop, keep the dictated text) and Esc
+  // cancels (stop, discard back to the pre-dictation snapshot). Bound in the
+  // capture phase so it preempts the composer's own Enter-sends / Esc-stops.
+  useEffect(() => {
+    if (!isListening) return;
+    const stop = () => {
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // Already stopping — the end event will reconcile state.
+      }
+    };
+    const handler = (e: globalThis.KeyboardEvent): void => {
+      if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "Enter" && !e.shiftKey) {
+        // Commit: keep the text already in the composer, just end dictation.
+        e.preventDefault();
+        e.stopPropagation();
+        stop();
+      } else if (e.key === "Escape") {
+        // Cancel: flag the discard so trailing results are dropped, revert the
+        // composer, then end dictation.
+        e.preventDefault();
+        e.stopPropagation();
+        discardingRef.current = true;
+        onVoiceDiscardRef.current?.();
+        stop();
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
   }, [isListening]);
 
   if (!Ctor) return null;

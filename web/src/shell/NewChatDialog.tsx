@@ -1827,6 +1827,8 @@ export function NewChatLandingScreen() {
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
+  // Composer text captured when voice dictation starts, so Esc can revert to it.
+  const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
@@ -3284,7 +3286,12 @@ export function NewChatLandingScreen() {
                   <span className="sr-only">Attach files</span>
                 </Button>
                 <ComposerMicButton
+                  enableHotkey
                   disabled={creating}
+                  onVoiceStart={() => {
+                    voiceSnapshotRef.current = message;
+                  }}
+                  onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
                   onTranscript={(text) => setMessage((prev) => (prev ? `${prev} ${text}` : text))}
                 />
               </div>
