@@ -2503,10 +2503,11 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
     );
-    // On a host, the create item lives in the "Custom agents" submenu and
-    // opens the dialog.
+    // With no custom agents yet, the create item is a top-level row (no
+    // "Custom agents" submenu to hide it behind) and opens the dialog.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    // No custom agents → no "Custom agents" submenu; create must be top-level.
+    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
@@ -2527,7 +2528,6 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").textContent).toContain("machine-1"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
     await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
     fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });

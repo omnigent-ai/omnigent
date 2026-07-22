@@ -1072,11 +1072,29 @@ function AgentHarnessPicker({
     [agentEntries],
   );
 
-  // The custom-agents group renders when there are custom/pending agents, or on
-  // a non-sandbox target where "Create custom agent" is reachable.
-  const hasCustomGroup = customEntries.length > 0 || pendingAgent != null || !sandboxSelected;
-  // Shared body for the custom-agents group (desktop flyout + mobile page):
-  // custom agents, the pending upload, and the create action.
+  // Existing custom / pending agents fold into a "Custom agents" submenu so a
+  // long roster doesn't crowd the recommended picks. When there are none, the
+  // submenu would hold only the create action — which is a poor place to
+  // discover it — so we surface "Create custom agent" as a top-level row
+  // instead (see below). The submenu therefore renders only when there is at
+  // least one custom / pending agent to group.
+  const hasCustomAgents = customEntries.length > 0 || pendingAgent != null;
+  // "Create custom agent" is reachable on any non-sandbox target (a managed
+  // sandbox has no create path for an uploaded bundle).
+  const canCreateAgent = !sandboxSelected;
+  const createAgentItem = canCreateAgent ? (
+    <DropdownMenuItem
+      data-testid="new-chat-landing-create-agent"
+      onSelect={onCreateCustomAgent}
+      className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
+    >
+      <PlusIcon className="size-3.5" />
+      Create custom agent
+    </DropdownMenuItem>
+  ) : null;
+  const hasCustomGroup = hasCustomAgents;
+  // Shared body for the custom-agents submenu (desktop flyout + mobile page):
+  // the custom agents, the pending upload, and the create action.
   const customAgentsBody = (
     <>
       {customEntries.map(renderEntry)}
@@ -1094,17 +1112,10 @@ function AgentHarnessPicker({
           </div>
         </DropdownMenuItem>
       )}
-      {!sandboxSelected && (
+      {canCreateAgent && (
         <>
-          {(customEntries.length > 0 || pendingAgent) && <DropdownMenuSeparator />}
-          <DropdownMenuItem
-            data-testid="new-chat-landing-create-agent"
-            onSelect={onCreateCustomAgent}
-            className="gap-2 rounded-sm px-2 py-1.5 text-13 text-muted-foreground"
-          >
-            <PlusIcon className="size-3.5" />
-            Create custom agent
-          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {createAgentItem}
         </>
       )}
     </>
@@ -1238,11 +1249,11 @@ function AgentHarnessPicker({
             {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
             <PickerSectionHeader>Agents</PickerSectionHeader>
             {bundleEntries.map(renderEntry)}
-            {/* Custom agents fold into a group — user-registered agents plus the
-            pending upload and the "Create agent" action. Always rendered (on
-            non-sandbox targets) so creation stays reachable with no custom
-            agents. A managed sandbox has no create path for an uploaded bundle,
-            so on a sandbox the group shows only if custom agents already exist. */}
+            {/* Existing custom agents fold into a "Custom agents" submenu (with
+            the pending upload and the create action). With no custom agents the
+            submenu would hold only "Create custom agent", so we surface that as
+            a top-level row instead — otherwise creation is invisible on a fresh
+            server. A managed sandbox has no create path, so neither appears. */}
             {hasCustomGroup &&
               (isMobile ? (
                 // Touch: drill into a "Custom agents" page in place (with Back).
@@ -1271,6 +1282,9 @@ function AgentHarnessPicker({
                   </DropdownMenuSubContent>
                 </DropdownMenuSub>
               ))}
+            {/* No custom agents to group: surface the create action directly so
+            it stays discoverable instead of hiding behind an empty submenu. */}
+            {!hasCustomGroup && createAgentItem}
           </>
         )}
       </DropdownMenuContent>

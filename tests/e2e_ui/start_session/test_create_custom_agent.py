@@ -180,12 +180,11 @@ async def _seed_workspace(page) -> None:
 async def _open_create_agent(page) -> None:
     """Open the agent picker and click "Create custom agent".
 
-    Custom agents (and the create action) now live in the picker's
-    "Custom agents" submenu, so open the dropdown, drill into that submenu,
-    then click the create item.
+    With no custom agents registered, the create action is a top-level row in
+    the picker (it only folds into a "Custom agents" submenu once custom agents
+    exist), so open the dropdown and click the create item directly.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()
-    await page.get_by_test_id("new-chat-landing-custom-agents").click()
     await page.get_by_test_id("new-chat-landing-create-agent").click()
 
 
@@ -216,9 +215,9 @@ async def _drive_dialog_opens(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Open the agent dropdown and drill into the "Custom agents" submenu.
+            # Open the agent dropdown. With no custom agents yet, "Create custom
+            # agent" is a top-level row (not behind a "Custom agents" submenu).
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-custom-agents").click()
 
             # "Create custom agent" item should be visible.
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
@@ -450,13 +449,14 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
 
-            # On the sandbox, "Create custom agent" is not offered. It lives in
-            # the (lazily-mounted) "Custom agents" submenu; on a sandbox that
-            # submenu omits the create action, so it's never in the DOM.
+            # On the sandbox, "Create custom agent" is not offered (a managed
+            # sandbox has no create path for an uploaded bundle), so it's never
+            # in the DOM.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
 
-            # Switch to the connected host: the group reappears and create opens.
+            # Switch to the connected host: with no custom agents yet, create is
+            # a top-level row (not behind a "Custom agents" submenu) and opens.
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
@@ -464,7 +464,6 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
             await expect(create_item).to_be_visible()
             await create_item.click()
