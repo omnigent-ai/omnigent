@@ -496,9 +496,7 @@ class SetupFlow:
         try:
             await client.views_update(
                 view_id=view_id,
-                view=login_waiting_modal(
-                    server_url, pending.verification_url, pending.user_code
-                ),
+                view=login_waiting_modal(server_url, pending.verification_url, pending.user_code),
             )
         except Exception:
             await pending.close()

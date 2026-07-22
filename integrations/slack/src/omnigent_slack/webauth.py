@@ -274,8 +274,7 @@ class WebAuthServer:
             # Replayed or expired link — the verifier is gone (single-use / TTL).
             raise _error(
                 400,
-                "This sign-in link was already used or has expired. "
-                "Start again from Slack.",
+                "This sign-in link was already used or has expired. Start again from Slack.",
             )
 
         try:
@@ -348,8 +347,7 @@ class WebAuthServer:
         if pending is None:
             raise _error(
                 400,
-                "This confirmation has expired or was already used. "
-                "Start again from Slack.",
+                "This confirmation has expired or was already used. Start again from Slack.",
             )
         enrollment = pending.enrollment
         tokens = pending.tokens

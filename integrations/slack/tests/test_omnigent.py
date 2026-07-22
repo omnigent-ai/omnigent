@@ -1211,8 +1211,7 @@ async def test_run_turn_survives_many_drops_that_each_make_progress(
             # A distinct new delta each leg (not a replay), so _reconcile_delta
             # forwards it and the leg counts as progress.
             yield (
-                'data: {"type":"response.output_text.delta",'
-                f'"delta":"part{index} "}}\n\n'
+                f'data: {{"type":"response.output_text.delta","delta":"part{index} "}}\n\n'
             ).encode()
             if last:
                 yield b'data: {"type":"session.status","status":"idle"}\n\n'

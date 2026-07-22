@@ -169,9 +169,7 @@ class DatabricksOAuthClient:
                     auth=(self._client_id, self._client_secret),
                 )
 
-    async def _token_request(
-        self, data: dict[str, str], *, want_email: bool
-    ) -> DatabricksTokens:
+    async def _token_request(self, data: dict[str, str], *, want_email: bool) -> DatabricksTokens:
         async with httpx.AsyncClient(timeout=httpx.Timeout(self._timeout)) as client:
             try:
                 resp = await client.post(

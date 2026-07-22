@@ -241,7 +241,10 @@ def test_databricks_workspace_host_rejects_plaintext_http(monkeypatch: pytest.Mo
     # http:// defeats the TLS assumption behind skipping id_token verification.
     _set_env(
         monkeypatch,
-        **{**_DATABRICKS_KNOBS, "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "http://ws.databricks.com"},
+        **{
+            **_DATABRICKS_KNOBS,
+            "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "http://ws.databricks.com",
+        },
     )
     with pytest.raises(ValidationError):
         _load()
@@ -251,7 +254,10 @@ def test_databricks_workspace_host_allows_http_loopback(monkeypatch: pytest.Monk
     # Loopback is exempt so local testing against a fake token endpoint works.
     _set_env(
         monkeypatch,
-        **{**_DATABRICKS_KNOBS, "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "http://127.0.0.1:8080"},
+        **{
+            **_DATABRICKS_KNOBS,
+            "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST": "http://127.0.0.1:8080",
+        },
     )
     assert _load().databricks_workspace_host == "http://127.0.0.1:8080"
 

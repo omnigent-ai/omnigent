@@ -286,9 +286,7 @@ class ElicitationController:
         and flagged (``delivery_failed``) WITHOUT recording the verdict, so the
         card never shows "Approved/Denied" for an answer the server never got.
         """
-        verdict = await self._coordinator.await_verdict(
-            request.session_id, request.elicitation_id
-        )
+        verdict = await self._coordinator.await_verdict(request.session_id, request.elicitation_id)
         if verdict is RESOLVED_EXTERNALLY:
             # Already resolved server-side; post nothing (the loop finalizes).
             return

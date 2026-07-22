@@ -787,9 +787,7 @@ async def test_config_command_opens_connecting_modal(tmp_path: Path) -> None:
 
 
 @respx.mock
-async def test_setup_settles_modal_before_first_update(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
+async def test_setup_settles_modal_before_first_update(tmp_path: Path, monkeypatch: Any) -> None:
     # The just-opened modal must settle on the client before the first
     # views_update, or Slack accepts the update (ok:true) while the not-yet-
     # rendered client drops it and the modal hangs on "Connecting…". Assert the

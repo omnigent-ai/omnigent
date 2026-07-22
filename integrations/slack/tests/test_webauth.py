@@ -288,9 +288,7 @@ async def test_callback_missing_code_is_400(harness) -> None:
 async def test_callback_oauth_error_param_is_400(harness) -> None:
     client, server, store, _ = harness
     state = _state_of(_issue_link(server))
-    resp = await client.get(
-        "/auth/callback", params={"state": state, "error": "access_denied"}
-    )
+    resp = await client.get("/auth/callback", params={"state": state, "error": "access_denied"})
     assert resp.status == 400
     assert await store.get("T1", "U1", "https://omnigent.example.com") is None
 

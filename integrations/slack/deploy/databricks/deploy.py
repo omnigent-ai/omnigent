@@ -327,9 +327,7 @@ def main() -> None:
         original_pyproject = _stamp_version(deploy_version)
         try:
             wheel = _build_wheel()
-            _write_uv_dependency_files(
-                wheel, deploy_version, args.index_url, args.exclude_newer
-            )
+            _write_uv_dependency_files(wheel, deploy_version, args.index_url, args.exclude_newer)
         finally:
             # Restore the working-tree version so the deploy leaves no diff.
             (_slack_root() / "pyproject.toml").write_text(original_pyproject)
