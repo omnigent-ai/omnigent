@@ -138,8 +138,24 @@ services:
       # so the operator's logs aren't cluttered with a URL they
       # can't click.
       OMNIGENT_ACCOUNTS_AUTO_OPEN: "${OMNIGENT_ACCOUNTS_AUTO_OPEN:-0}"
+
+      # ── custom-agents (opt-in) ────────────────────────────────────────────
+      # Register agents from custom-agents/ as always-available built-ins.
+      # See custom-agents/_template/README.md for how the loader works and
+      # how to add/remove agents.
+      #
+      # OMNIGENT_BUILTIN_AGENT_DIRS is a colon-separated list of EXPLICIT agent
+      # directory paths. The loader registers exactly what you list — it does NOT
+      # glob subdirectories. _template is excluded by omitting it here.
+      #
+      # To enable all custom agents: uncomment both blocks, then:
+      #   docker compose up -d omnigent
+      #
+      # OMNIGENT_BUILTIN_AGENT_DIRS: "/custom-agents/agy-flash:/custom-agents/agy-pro:/custom-agents/claude-opus:/custom-agents/claude-sonnet:/custom-agents/copilot-claude:/custom-agents/copilot-gpt:/custom-agents/opencode-claude-direct:/custom-agents/opencode-claude-copilot:/custom-agents/opencode-gemini-google-pro:/custom-agents/opencode-gemini-google-flash:/custom-agents/opencode-gemini-copilot-pro:/custom-agents/opencode-gemini-copilot-flash:/custom-agents/opencode-gpt-copilot-mini:/custom-agents/opencode-gpt-copilot-full:/custom-agents/polly-claude:/custom-agents/polly-copilot:/custom-agents/polly-agy:/custom-agents/polly-opencode"
     volumes:
       - artifact-data:/data
+      # Uncomment to mount custom-agents/ (read-only) alongside the env var above:
+      # - ../../custom-agents:/custom-agents:ro
     ports:
       - "${OMNIGENT_PORT:-8000}:8000"
 

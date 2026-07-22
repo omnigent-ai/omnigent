@@ -1,0 +1,170 @@
+spec_version: 1
+# name: <agent-name>                 # set this to the directory name
+# description: >-                    # one-line summary shown in the UI
+#   Replace with a description of this agent.
+
+# ── Executor ──────────────────────────────────────────────────────────────────
+# Pick ONE executor block and uncomment it; delete the rest.
+#
+# Claude SDK (direct Anthropic API):
+#   executor:
+#     type: omnigent
+#     model: claude-sonnet-4-6          # or claude-opus-4-8
+#     config:
+#       harness: claude-sdk
+#
+# OpenCode (any model, provider-prefixed):
+#   executor:
+#     type: omnigent
+#     model: anthropic/claude-sonnet-4-6   # or github-copilot/claude-sonnet-5
+#     config:
+#       harness: opencode-native
+#
+# Antigravity / Gemini:
+#   executor:
+#     type: omnigent
+#     model: gemini-3.5-flash           # or gemini-3.1-pro-preview
+#     config:
+#       harness: antigravity
+#
+# GitHub Copilot SDK:
+#   executor:
+#     type: omnigent
+#     model: claude-haiku-4.5           # or gpt-5-mini
+#     config:
+#       harness: copilot
+
+executor:
+  type: omnigent
+  # model: claude-sonnet-4-6
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are a general-purpose coding and analysis assistant.
+
+# ── OS / file / shell access ──────────────────────────────────────────────────
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    # darwin_seatbelt on macOS; switch to linux_bwrap on Linux hosts.
+    # Note: cwd_allow_hidden entries grant dotdir access under cwd AND under
+    # each read_paths root. However, ~/.ssh, ~/.aws etc. live under ~, not
+    # under ~/Projects, so those dotdirs are NOT accessible at runtime via
+    # read_paths: ["~/Projects"] alone. To make SSH/AWS credentials available
+    # add the specific paths (e.g. "~/.ssh", "~/.aws") to read_paths and name
+    # their basenames here. The current config is intentionally open on
+    # network (allow_network: true) but conservative on filesystem access.
+    type: darwin_seatbelt
+    read_paths:
+      - "~/Projects"        # read-only access to all local projects
+    write_paths:
+      - "."                 # writes confined to the working directory
+    cwd_allow_hidden:
+      - ".ssh"              # git+ssh: private keys + known_hosts/config
+      - ".aws"
+      - ".gitconfig"
+      - ".databrickscfg"
+      - ".config"           # covers .config/gh, .config/glab-cli, etc.
+    env_passthrough:
+      - SSH_AUTH_SOCK
+      - AWS_PROFILE
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AWS_REGION
+      - AWS_DEFAULT_REGION
+      - GITLAB_TOKEN
+      - GITLAB_API_URL
+      - DATABRICKS_HOST
+      - DATABRICKS_TOKEN
+      - DATABRICKS_CONFIG_PROFILE
+    allow_network: true     # fully open egress — git/ssh/aws/pip/curl all work
+
+# ── Built-in tool parity ──────────────────────────────────────────────────────
+async: true
+timers: true
+spawn: true
+agent_session_sharing: non-public
+
+# ── MCP servers ───────────────────────────────────────────────────────────────
+tools:
+  # Personal knowledge management (Memex).
+  memex:
+    type: mcp
+    command: uvx
+    args:
+      - --from
+      - "memex-cli[mcp] @ git+https://github.com/JasperHG90/memex.git@latest#subdirectory=packages/cli"
+      - memex
+      - mcp
+      - run
+
+  # Local document search (QMD — HTTP transport).
+  qmd:
+    type: mcp
+    transport: http
+    url: http://localhost:8181/mcp
+
+  # GitHub — VERIFIED: @modelcontextprotocol/server-github v2025.4.8
+  github:
+    type: mcp
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+    tools:
+      - search_issues
+      - get_pull_request
+      - list_pull_requests
+      - create_pull_request_comment
+
+  # GitLab — TODO: verify package name. @gitlab-org/gitlab-mcp-server not
+  # found on npm (404 as of 2026-07). Check GitLab's official MCP docs or
+  # use a community alternative before enabling this tool.
+  gitlab:
+    type: mcp
+    command: npx
+    args: [-y, "@gitlab-org/gitlab-mcp-server@latest"]
+    env:
+      GITLAB_TOKEN: ${GITLAB_TOKEN}
+      GITLAB_API_URL: ${GITLAB_API_URL}
+
+  # Databricks Unity Catalog — VERIFIED: databricks-mcp v0.9.0 on PyPI
+  databricks-uc:
+    type: mcp
+    command: uvx
+    args: ["databricks-mcp"]
+    auth:
+      type: databricks
+      profile: default    # change to your ~/.databrickscfg profile name
+
+  # Slack — VERIFIED: slack-mcp-server v1.3.0 (community-maintained by
+  # korotovsky/slack-mcp-server — no fully official Slack MCP exists yet)
+  slack:
+    type: mcp
+    command: npx
+    args: [-y, slack-mcp-server]
+    env:
+      SLACK_MCP_XOXP_TOKEN: ${SLACK_BOT_TOKEN}
+    tools:
+      - conversations_history
+      - conversations_replies
+      - conversations_search_messages
+      - channels_list
+      - users_search
+
+  # Notion — VERIFIED: @notionhq/notion-mcp-server v2.4.1 (official)
+  notion:
+    type: mcp
+    command: npx
+    args: [-y, "@notionhq/notion-mcp-server"]
+    env:
+      NOTION_TOKEN: ${NOTION_TOKEN}
+    tools:
+      - retrieve-page-markdown
+      - update-page-markdown
+      - query-data-source
+      - retrieve-a-data-source
+      - retrieve-a-database

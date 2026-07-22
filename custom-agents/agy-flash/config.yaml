@@ -1,0 +1,116 @@
+spec_version: 1
+name: agy-flash
+description: >-
+  Gemini Flash via Antigravity SDK (agy harness) — fast, cost-efficient Gemini
+  model; authenticate with GEMINI_API_KEY or Vertex AI credentials.
+
+executor:
+  type: omnigent
+  model: gemini-3.5-flash
+  config:
+    harness: antigravity
+
+prompt: |
+  You are a general-purpose coding and analysis assistant.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: darwin_seatbelt
+    read_paths:
+      - "~/Projects"
+    write_paths:
+      - "."
+    cwd_allow_hidden:
+      - ".ssh"
+      - ".aws"
+      - ".gitconfig"
+      - ".databrickscfg"
+      - ".config"
+    env_passthrough:
+      - SSH_AUTH_SOCK
+      - AWS_PROFILE
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AWS_REGION
+      - AWS_DEFAULT_REGION
+      - GITLAB_TOKEN
+      - GITLAB_API_URL
+      - DATABRICKS_HOST
+      - DATABRICKS_TOKEN
+      - DATABRICKS_CONFIG_PROFILE
+    allow_network: true
+
+async: true
+timers: true
+spawn: true
+agent_session_sharing: non-public
+
+tools:
+  memex:
+    type: mcp
+    command: uvx
+    args:
+      - --from
+      - "memex-cli[mcp] @ git+https://github.com/JasperHG90/memex.git@latest#subdirectory=packages/cli"
+      - memex
+      - mcp
+      - run
+  qmd:
+    type: mcp
+    transport: http
+    url: http://localhost:8181/mcp
+  github:
+    type: mcp
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+    tools:
+      - search_issues
+      - get_pull_request
+      - list_pull_requests
+      - create_pull_request_comment
+  gitlab:
+    type: mcp
+    command: npx
+    # TODO: verify package name — @gitlab-org/gitlab-mcp-server not found on
+    # npm as of 2026-07. Check GitLab's official MCP documentation.
+    args: [-y, "@gitlab-org/gitlab-mcp-server@latest"]
+    env:
+      GITLAB_TOKEN: ${GITLAB_TOKEN}
+      GITLAB_API_URL: ${GITLAB_API_URL}
+  databricks-uc:
+    type: mcp
+    command: uvx
+    args: ["databricks-mcp"]
+    auth:
+      type: databricks
+      profile: default
+  slack:
+    type: mcp
+    command: npx
+    # community-maintained (korotovsky/slack-mcp-server) — no official Slack MCP exists
+    args: [-y, slack-mcp-server]
+    env:
+      SLACK_MCP_XOXP_TOKEN: ${SLACK_BOT_TOKEN}
+    tools:
+      - conversations_history
+      - conversations_replies
+      - conversations_search_messages
+      - channels_list
+      - users_search
+  notion:
+    type: mcp
+    command: npx
+    args: [-y, "@notionhq/notion-mcp-server"]
+    env:
+      NOTION_TOKEN: ${NOTION_TOKEN}
+    tools:
+      - retrieve-page-markdown
+      - update-page-markdown
+      - query-data-source
+      - retrieve-a-data-source
+      - retrieve-a-database
