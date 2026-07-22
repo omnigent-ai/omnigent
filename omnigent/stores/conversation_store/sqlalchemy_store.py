@@ -3370,12 +3370,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None
-            # ``terminal_launch_args`` are CLI-specific launch flags. A fork
-            # that switches CLI family (e.g. claude-code → pi) must NOT inherit
-            # them: the source's flags are meaningless or rejected by the new
-            # CLI — Claude Code's ``--permission-mode auto`` makes ``pi`` exit 1
-            # at launch (unknown option), which surfaces as
-            # ``required_terminal_exited``. Drop them on a switching fork.
+            # ``terminal_launch_args`` are a native CLI's argv. The caller
+            # gates whether they carry over (``copy_terminal_launch_args``):
+            # kept for a same-agent fork or a switch onto the SAME CLI harness,
+            # dropped when the fork switches to a different CLI — the source's
+            # flags are then meaningless or rejected (Claude Code's
+            # ``--permission-mode auto`` makes ``pi`` exit 1 at launch, which
+            # surfaces as ``required_terminal_exited``).
             source_terminal_args = (
                 source_meta_ref.terminal_launch_args
                 if source_meta_ref and copy_terminal_launch_args
@@ -3450,6 +3451,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         new_agent_bundle_location: str,
         new_agent_description: str | None,
         copy_model_settings: bool,
+        clear_terminal_launch_args: bool = True,
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
@@ -3549,11 +3551,12 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
             if meta is not None:
                 meta.external_session_id = None
-                # Launch flags are CLI-specific: a switch to a different CLI
-                # (e.g. claude-code → pi) leaves the prior CLI's flags stale —
-                # Claude Code's ``--permission-mode`` makes pi exit 1 at launch.
-                # Clear them so the new CLI launches with its own defaults.
-                meta.terminal_launch_args = None
+                # Launch flags are the leaving CLI's argv. A switch to a
+                # different CLI (e.g. claude-code → pi) leaves them stale —
+                # Claude Code's ``--permission-mode`` makes pi exit 1 at launch —
+                # so the route clears them; a same-CLI switch keeps them valid.
+                if clear_terminal_launch_args:
+                    meta.terminal_launch_args = None
 
         conv = self.get_conversation(conversation_id)
         if conv is None:

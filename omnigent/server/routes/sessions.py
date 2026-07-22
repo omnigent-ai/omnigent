@@ -11146,6 +11146,54 @@ def _agent_provider_family(agent: Agent) -> str | None:
     return provider_family_for_harness(spec.executor.harness_kind)
 
 
+def _agent_canonical_harness(agent: Agent) -> str | None:
+    """Return the canonical harness id of an agent, or ``None``.
+
+    Loads the agent's spec to read its ``harness_kind`` and canonicalizes it
+    (so the reversed native spellings — ``native-claude`` vs ``claude-native``
+    — compare equal). Returns ``None`` when the bundle can't be loaded, which
+    callers treat as "can't confirm".
+
+    :param agent: The agent whose harness to resolve.
+    :returns: The canonical harness id, e.g. ``"claude-native"``, else ``None``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    try:
+        spec = (
+            get_agent_cache()
+            .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
+            .spec
+        )
+    except Exception:  # noqa: BLE001 — unloadable bundle → unknown harness
+        return None
+    harness = spec.executor.harness_kind
+    return canonicalize_harness(harness) or harness
+
+
+def _same_cli_harness(a: Agent, b: Agent) -> bool:
+    """Return whether two agents run the same (known) CLI harness.
+
+    ``terminal_launch_args`` are the argv handed to a native CLI in its
+    terminal (e.g. Claude Code's ``--permission-mode``); they only make sense
+    for the exact CLI that defined them. This is stricter than
+    :func:`_same_provider_family`: claude-native and claude-SDK share the
+    ``anthropic`` family but are different harnesses — the SDK target has no
+    terminal, and a different native CLI (pi, codex) rejects the source's
+    flags outright (pi exits at launch on an unknown ``--permission-mode``).
+
+    ``False`` when either harness is undeterminable, so a fork that can't
+    confirm both agents run the same CLI drops the launch args and lets the
+    target reapply its own defaults.
+
+    :param a: First agent (e.g. the fork source's agent).
+    :param b: Second agent (e.g. the switch target).
+    :returns: ``True`` when both resolve to the same non-``None`` harness.
+    """
+    harness_a = _agent_canonical_harness(a)
+    return harness_a is not None and harness_a == _agent_canonical_harness(b)
+
+
 def _same_provider_family(a: Agent, b: Agent) -> bool:
     """Return whether two agents share a (known) provider family.
 
@@ -16685,6 +16733,20 @@ def create_sessions_router(
                 _same_provider_family, source_agent, base_agent
             )
 
+        # ``terminal_launch_args`` are the argv for a native CLI's terminal and
+        # only make sense for the exact CLI that defined them. A same-agent fork
+        # always keeps them; a switch keeps them only when the target runs the
+        # SAME CLI harness (e.g. claude-native → another claude-native agent).
+        # A switch to a different CLI drops them: a different native CLI rejects
+        # the source's flags (pi exits at launch on an unknown
+        # ``--permission-mode`` → ``required_terminal_exited``), and an SDK
+        # target has no terminal to apply them to.
+        copy_terminal_launch_args = True
+        if switching_agent:
+            copy_terminal_launch_args = await asyncio.to_thread(
+                _same_cli_harness, source_agent, base_agent
+            )
+
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
         # runner carries history into the native harness. Same-family: clone
@@ -16737,12 +16799,7 @@ def create_sessions_router(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
-                # Launch flags are CLI-specific. On an agent switch the fork may
-                # bind a different CLI (e.g. claude-code → pi), whose flag set
-                # differs — Claude Code's ``--permission-mode`` makes pi exit at
-                # launch (unknown option → ``required_terminal_exited``). Only
-                # carry the source's launch args on a same-agent fork.
-                copy_terminal_launch_args=not switching_agent,
+                copy_terminal_launch_args=copy_terminal_launch_args,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
@@ -16914,6 +16971,14 @@ def create_sessions_router(
         carry_history_into_native = await asyncio.to_thread(
             _agent_carries_native_fork_history, target_agent
         )
+        # ``terminal_launch_args`` are the leaving CLI's argv. Keep them only
+        # when the switch stays on the SAME CLI harness; a switch to a different
+        # CLI (or an SDK target with no terminal) leaves them stale and — for a
+        # different native CLI — invalid (pi rejects Claude Code's
+        # ``--permission-mode`` and exits at launch), so clear them.
+        keep_terminal_launch_args = await asyncio.to_thread(
+            _same_cli_harness, current_agent, target_agent
+        )
         presentation_labels = await asyncio.to_thread(_presentation_labels_for_agent, target_agent)
 
         # Resolve the built-in the session is leaving so the UI can offer a
@@ -16946,6 +17011,7 @@ def create_sessions_router(
                 new_agent_bundle_location=target_agent.bundle_location,
                 new_agent_description=target_agent.description,
                 copy_model_settings=copy_model_settings,
+                clear_terminal_launch_args=not keep_terminal_launch_args,
                 carry_history_into_native=carry_history_into_native,
                 presentation_labels=presentation_labels,
                 previous_builtin_id=previous_builtin_id,

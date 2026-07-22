@@ -84,6 +84,7 @@ class _ConversationStore:
         new_agent_bundle_location: str,
         new_agent_description: str | None,
         copy_model_settings: bool,
+        clear_terminal_launch_args: bool = True,
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
@@ -96,6 +97,8 @@ class _ConversationStore:
         :param new_agent_bundle_location: Target bundle to clone.
         :param new_agent_description: Target description.
         :param copy_model_settings: Same-family flag from the route.
+        :param clear_terminal_launch_args: Whether to reset the leaving CLI's
+            launch args (route passes ``False`` only for a same-CLI switch).
         :param carry_history_into_native: Native-rebuild flag.
         :param presentation_labels: Target-harness ui/wrapper labels.
         :param previous_builtin_id: Built-in switched away from.
@@ -110,6 +113,7 @@ class _ConversationStore:
                 "new_agent_bundle_location": new_agent_bundle_location,
                 "new_agent_description": new_agent_description,
                 "copy_model_settings": copy_model_settings,
+                "clear_terminal_launch_args": clear_terminal_launch_args,
                 "carry_history_into_native": carry_history_into_native,
                 "presentation_labels": presentation_labels,
                 "previous_builtin_id": previous_builtin_id,

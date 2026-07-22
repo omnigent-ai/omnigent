@@ -951,6 +951,50 @@ async def test_fork_switch_model_and_carry_gating(
 
 
 @pytest.mark.asyncio
+async def test_fork_switch_same_cli_keeps_launch_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A switch onto the SAME CLI harness keeps the source's launch args.
+
+    Switching to a different claude-native agent stays on the ``claude``
+    CLI, so the source's ``terminal_launch_args`` (e.g. ``--permission-mode``)
+    are still valid and must carry over — only a cross-CLI switch drops them.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")
+            ]
+        },
+    )
+    agent_store = _switch_agent_store()
+    # Source and target both report claude-native → same CLI harness.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_agent_cache",
+        lambda: _StubAgentCache(
+            {
+                "087b7cb7ac30abf4debfaa578d052ec6": "claude-native",
+                "280d725b404d2915f9e9d6cccce91303": "claude-native",
+            }
+        ),
+    )
+    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+    )
+
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["copy_terminal_launch_args"] is True, (
+        "A switch onto the SAME CLI harness must keep the source's launch args."
+    )
+
+
+@pytest.mark.asyncio
 async def test_fork_no_switch_native_source_carries_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

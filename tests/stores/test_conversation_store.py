@@ -4095,6 +4095,44 @@ def test_switch_conversation_agent_same_family_keeps_model_settings(
     assert SWITCH_PREVIOUS_BUILTIN_LABEL_KEY not in updated.labels
 
 
+def test_switch_conversation_agent_clears_or_keeps_terminal_launch_args(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """The switch honors ``clear_terminal_launch_args``.
+
+    Launch args are the leaving CLI's argv: a cross-CLI switch clears them
+    (default) so the new CLI applies its own defaults; a same-CLI switch keeps
+    them (``clear_terminal_launch_args=False``) since they stay valid.
+    """
+    cases = (
+        (True, None, "1a2b3c4d5e6f708192a3b4c5d6e7f809"),
+        (False, ["--permission-mode", "auto"], "90fedcba9876543210abcdef01234567"),
+    )
+    for clear, expected, new_agent_id in cases:
+        created = conversation_store.create_conversation(
+            terminal_launch_args=["--permission-mode", "auto"],
+        )
+        conv_id = created.id
+        conversation_store.switch_conversation_agent(
+            conv_id,
+            new_agent_id=new_agent_id,
+            new_agent_name="target (switch)",
+            new_agent_bundle_location="06efca8dd5c2e87b8cfed1aae99cc239/hash",
+            new_agent_description=None,
+            copy_model_settings=True,
+            clear_terminal_launch_args=clear,
+            carry_history_into_native=False,
+            presentation_labels={},
+            previous_builtin_id=None,
+        )
+        fetched = conversation_store.get_conversation(conv_id)
+        assert fetched is not None
+        assert fetched.terminal_launch_args == expected, (
+            f"clear_terminal_launch_args={clear} should yield {expected!r}"
+        )
+
+
 def test_get_session_connectivity_batches_runner_and_host(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,

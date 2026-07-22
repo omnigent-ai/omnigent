@@ -1415,7 +1415,8 @@ class ConversationStore(ABC):
             an agent in a different provider family, where the source's
             model id is meaningless (a model is provider-bound).
         :param copy_terminal_launch_args: When ``True`` (default), copy the
-            source's ``terminal_launch_args``. When ``False``, the fork starts
+            source's ``terminal_launch_args`` (kept for a same-agent fork or a
+            switch onto the same CLI harness). When ``False``, the fork starts
             with none — used when the fork switches to a different CLI, where
             the source's flags are meaningless or rejected (e.g. Claude Code's
             ``--permission-mode`` would make ``pi`` exit at launch).
@@ -1467,6 +1468,7 @@ class ConversationStore(ABC):
         new_agent_bundle_location: str,
         new_agent_description: str | None,
         copy_model_settings: bool,
+        clear_terminal_launch_args: bool = True,
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
@@ -1503,6 +1505,13 @@ class ConversationStore(ABC):
             switch stays in the same provider family). When ``False``,
             both are reset to ``None`` so the new agent's defaults
             apply (a cross-family switch — a model id is provider-bound).
+        :param clear_terminal_launch_args: When ``True`` (default), reset
+            ``terminal_launch_args`` to ``None`` so the target CLI launches
+            with its own defaults. Set ``False`` by the route when the switch
+            stays on the SAME CLI harness, where the source's launch flags are
+            still valid; a switch to a different CLI leaves them stale or
+            invalid (e.g. Claude Code's ``--permission-mode`` makes pi exit at
+            launch), and an SDK target has no terminal for them.
         :param carry_history_into_native: When ``True``, stamp
             :data:`FORK_CARRY_HISTORY_LABEL_KEY` so a native target
             rebuilds its transcript from this session's own AP items on
