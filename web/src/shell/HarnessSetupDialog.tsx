@@ -24,8 +24,14 @@ import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
 import { useHarnessSetupSteps } from "@/lib/agentLabels";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useHosts, useInstallHarness, type Host } from "@/hooks/useHosts";
-import { resolveSetupSteps, setupProgress, type ResolvedSetupStep } from "@/lib/harnessSetup";
+import {
+  harnessInstallableOnHost,
+  resolveSetupSteps,
+  setupProgress,
+  type ResolvedSetupStep,
+} from "@/lib/harnessSetup";
 
 export function HarnessSetupDialog({
   open,
@@ -41,6 +47,7 @@ export function HarnessSetupDialog({
   host: Host | undefined | null;
 }) {
   const setupStepsByHarness = useHarnessSetupSteps();
+  const info = useServerInfo();
   // Re-resolve the host LIVE from the hosts query rather than trusting the
   // snapshot passed at open time: a successful install patches the ["hosts"]
   // cache, and the dialog must reflect that (flip ✓, recompute progress)
@@ -54,6 +61,12 @@ export function HarnessSetupDialog({
     harness,
     host,
   );
+  // Defence in depth: only render the one-click Install when the server's
+  // allowlist actually accepts this harness on this host. A server step with
+  // action "install" is the primary signal, but gating on the allowlist too
+  // means the UI can never offer an install the route would reject (409/400)
+  // if the two ever drift.
+  const installable = harnessInstallableOnHost(info, harness, host);
   const { done, total } = setupProgress(steps);
   const name = agentName ?? harness ?? "this agent";
   const allDone = total > 0 && done === total;
@@ -69,7 +82,20 @@ export function HarnessSetupDialog({
   const startInstall = (h: string) => {
     setInstalling((prev) => new Set(prev).add(h));
     install.mutate(h, {
-      onSuccess: () => showToast(`${name} is ready on ${host?.name}.`),
+      onSuccess: (result) => {
+        // The install succeeded, but the harness may still need a credential
+        // (e.g. Codex → "needs-auth"): the checklist shows the remaining
+        // sign-in row, so a flat "is ready" toast would contradict it. Key the
+        // toast on the refreshed readiness the install returned — "ready" only
+        // when the harness is actually launchable, otherwise "installed" with a
+        // nudge to the remaining step.
+        const ready = result.configured_harnesses[h] === true;
+        showToast(
+          ready
+            ? `${name} is ready on ${host?.name}.`
+            : `${name} installed on ${host?.name} — one more step to finish setup.`,
+        );
+      },
       onError: (err) => showToast(`Couldn't install ${name}: ${err.message}`, { duration: 0 }),
       onSettled: () =>
         setInstalling((prev) => {
@@ -100,20 +126,33 @@ export function HarnessSetupDialog({
           <DialogDescription>
             {allDone
               ? `${name} is ready on ${host?.name}.`
-              : `Complete these steps on ${host?.name} to use ${name}.`}
+              : steps.length > 0
+                ? `Complete these steps on ${host?.name} to use ${name}.`
+                : `${name} needs a bit more setup on ${host?.name}.`}
           </DialogDescription>
         </DialogHeader>
 
-        <ul className="flex flex-col gap-3 py-1">
-          {steps.map((step) => (
-            <SetupStepRow
-              key={step.kind}
-              step={step}
-              installing={installingThisHarness}
-              onInstall={startInstall}
-            />
-          ))}
-        </ul>
+        {steps.length > 0 ? (
+          <ul className="flex flex-col gap-3 py-1">
+            {steps.map((step) => (
+              <SetupStepRow
+                key={step.kind}
+                step={step}
+                installable={installable}
+                installing={installingThisHarness}
+                onInstall={startInstall}
+              />
+            ))}
+          </ul>
+        ) : (
+          // The server published no steps for this spelling (a harness the UI
+          // can't yet guide). Don't leave an empty dialog — point at the CLI.
+          <p className="py-1 text-sm text-muted-foreground" data-testid="harness-setup-empty">
+            Run{" "}
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">omnigent setup</code>{" "}
+            on {host?.name} to finish setting up {name}.
+          </p>
+        )}
         {installingThisHarness && (
           <p className="text-xs text-muted-foreground" data-testid="harness-setup-installing">
             Installing on {host?.name} — this can take a few minutes for larger agents.
@@ -150,10 +189,12 @@ function StepIcon({ status }: { status: ResolvedSetupStep["status"] }) {
 
 function SetupStepRow({
   step,
+  installable,
   installing,
   onInstall,
 }: {
   step: ResolvedSetupStep;
+  installable: boolean;
   installing: boolean;
   onInstall: (harness: string) => void;
 }) {
@@ -171,9 +212,11 @@ function SetupStepRow({
         <span className="text-sm font-medium">{step.title}</span>
         {detail && <span className="text-xs text-muted-foreground">{detail}</span>}
       </div>
-      {/* No control once the step is done. Otherwise: one-click Install for
-          server-performed steps, else the command to run on the host. */}
-      {done ? null : step.action === "install" ? (
+      {/* No control once the step is done. Otherwise: a one-click Install for a
+          server-performed step the allowlist still accepts (`installable`
+          guards against drift between the step catalog and the install route),
+          else the command to run on the host. */}
+      {done ? null : step.action === "install" && installable ? (
         <Button
           type="button"
           size="sm"

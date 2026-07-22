@@ -76,7 +76,7 @@ interface InstallHarnessResult {
  * "needs setup" badge flips to ready without waiting for the 60 s poll or a
  * reconnect. The caller passes the harness id (e.g. `"codex"`); only ids in the
  * server's `installable_harnesses` set should be offered (see
- * `canInstallHarnessFromUI`).
+ * `harnessInstallableOnHost`).
  *
  * Concurrent installs of different harnesses are supported: each `mutate()`
  * call runs independently, and callers track per-harness in-flight state via

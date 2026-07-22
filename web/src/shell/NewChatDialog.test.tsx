@@ -50,6 +50,10 @@ vi.mock("@/hooks/useHosts", () => ({
 // can be asserted without touching the real clipboard.
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+// The install flow surfaces its result via a toast; capture the text so the
+// "ready vs. one-more-step" wording can be asserted.
+const { showToastMock } = vi.hoisted(() => ({ showToastMock: vi.fn() }));
+vi.mock("@/components/ui/toast", () => ({ showToast: showToastMock }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -1216,6 +1220,91 @@ describe("NewChatLandingScreen", () => {
 
     fireEvent.click(command);
     await waitFor(() => expect(copyTextMock).toHaveBeenCalledWith("codex login"));
+  });
+
+  it("hides the Install button when the server doesn't list the harness as installable", () => {
+    // Defence in depth: the server published an install step for codex-native,
+    // but the harness is NOT in installable_harnesses (a catalog/allowlist
+    // drift). The Install button must not render — offering it would drive a
+    // POST the install route rejects. The step falls back to no control (an
+    // install step carries no copyable command).
+    mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: [], // step catalog says install; allowlist disagrees
+    });
+    selectAgent("a2");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.queryByTestId("harness-setup-install")).toBeNull();
+  });
+
+  it("toast says 'ready' only when the install returns a launchable harness", () => {
+    // The install POST returns the refreshed readiness. codex-native comes back
+    // true (ready) → the success toast says ready.
+    showToastMock.mockClear();
+    vi.mocked(useInstallHarness).mockReturnValue({
+      mutate: (harness: string, opts?: { onSuccess?: (r: unknown) => void }) =>
+        opts?.onSuccess?.({
+          object: "harness_install",
+          harness,
+          configured_harnesses: { "codex-native": true },
+        }),
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallHarness>);
+    mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectAgent("a2");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    fireEvent.click(screen.getByTestId("harness-setup-install"));
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("is ready on"));
+  });
+
+  it("toast says 'one more step' when the install leaves the harness needing auth", () => {
+    // codex installs but still needs a login → readiness comes back
+    // "needs-auth", not true. The toast must not claim "ready" (which would
+    // contradict the sign-in row the checklist still shows).
+    showToastMock.mockClear();
+    vi.mocked(useInstallHarness).mockReturnValue({
+      mutate: (harness: string, opts?: { onSuccess?: (r: unknown) => void }) =>
+        opts?.onSuccess?.({
+          object: "harness_install",
+          harness,
+          configured_harnesses: { "codex-native": "needs-auth" },
+        }),
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallHarness>);
+    mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectAgent("a2");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    fireEvent.click(screen.getByTestId("harness-setup-install"));
+    expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("one more step"));
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.stringContaining("is ready"));
+  });
+
+  it("shows a fallback message when the server published no steps for the spelling", () => {
+    // Feature on, harness unconfigured, but no setup_steps for this spelling
+    // (a1 = claude-native, which the stubbed useHarnessSetupSteps doesn't
+    // cover). The dialog must not be an empty dead-end — it points at the CLI.
+    mockHosts([{ ...host("online"), configured_harnesses: { "claude-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["claude", "claude-native"],
+    });
+    selectAgent("a1");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.getByTestId("harness-setup-empty").textContent).toContain("omnigent setup");
+    expect(screen.queryByTestId("harness-setup-install")).toBeNull();
   });
 
   it("falls back to the original setup guidance when the feature is off", () => {
