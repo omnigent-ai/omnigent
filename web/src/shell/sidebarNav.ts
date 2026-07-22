@@ -207,13 +207,9 @@ export function normalizePinnedConversationIds(
   const normalized: string[] = [];
 
   for (const id of pinnedIds) {
-    // Drop duplicates, and drop an id ONLY when we have positive evidence it's
-    // gone: it's confirmed deleted (its backfill fetch returned 404). An id
-    // that's merely absent from the loaded list is kept — absence also happens
-    // when a backfill fetch failed on a transient glitch or is still loading,
-    // and pruning then would silently unpin a live session (writing the loss
-    // back to localStorage). A genuinely deleted session surfaces in
-    // `confirmedDeletedIds` and is pruned on the pass after its 404.
+    // Prune only on positive evidence of deletion (a 404-confirmed id) or a
+    // duplicate. Mere absence is kept: a failed/pending backfill would otherwise
+    // silently unpin a live session — the drop-on-glitch bug this guards.
     if (seen.has(id) || confirmedDeletedIds.has(id)) continue;
     seen.add(id);
     normalized.push(id);

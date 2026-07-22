@@ -22,6 +22,7 @@ import {
   useNewestProjectSession,
   useProjectSessions,
   useMoveToProject,
+  usePinnedConversationBackfill,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -1095,5 +1096,49 @@ describe("useDeleteProject", () => {
     expect(err.failed).toEqual(["conv_b"]);
     expect(err.succeeded).toEqual(["conv_a"]);
     expect(err.total).toBe(2);
+  });
+});
+
+describe("usePinnedConversationBackfill", () => {
+  function renderBackfill(pinnedIds: string[], loadedIds: Set<string>) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    return renderHook(() => usePinnedConversationBackfill(pinnedIds, loadedIds), { wrapper });
+  }
+
+  it("marks a pin confirmed-deleted only on a 404, never on a transient error", async () => {
+    // Two off-page pins: one 404s (deleted), one 500s (glitch). Only the 404 is
+    // safe-to-prune evidence; the 500 must be excluded so the pin survives.
+    fetchMock.mockImplementation((url: string) =>
+      Promise.resolve(mockResponse({}, { ok: false, status: url.includes("gone") ? 404 : 500 })),
+    );
+
+    const { result } = renderBackfill(["gone", "glitch"], new Set());
+
+    await waitFor(() => expect(result.current.confirmedDeletedIds.has("gone")).toBe(true));
+    expect(result.current.confirmedDeletedIds.has("glitch")).toBe(false);
+    expect(result.current.conversations).toEqual([]);
+  });
+
+  it("returns a resolved session and no deletions when the fetch succeeds", async () => {
+    fetchMock.mockResolvedValue(
+      mockResponse({ id: "off_page", object: "conversation", title: "t", created_at: 0 }),
+    );
+
+    const { result } = renderBackfill(["off_page"], new Set());
+
+    await waitFor(() => expect(result.current.conversations).toHaveLength(1));
+    expect(result.current.conversations[0].id).toBe("off_page");
+    expect(result.current.confirmedDeletedIds.size).toBe(0);
+  });
+
+  it("skips pins already present in the loaded set", () => {
+    const { result } = renderBackfill(["loaded"], new Set(["loaded"]));
+
+    // No fetch for an id already on a loaded page, and nothing to prune.
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.current.conversations).toEqual([]);
+    expect(result.current.confirmedDeletedIds.size).toBe(0);
   });
 });

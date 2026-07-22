@@ -697,10 +697,9 @@ export interface PinnedBackfillResult {
   /** Sessions resolved by id (present on disk) that weren't in the loaded page. */
   conversations: Conversation[];
   /**
-   * Pinned ids whose backfill fetch returned 404 — positive evidence the
-   * session was deleted, so its pin is safe to prune. A fetch that failed on a
-   * transient error, or that hasn't settled yet, is deliberately NOT included:
-   * absence-without-a-404 must never drop a pin (that's the drop-on-glitch bug).
+   * Pinned ids whose backfill fetch returned 404 — positive evidence of
+   * deletion, safe to prune. A failed or still-pending fetch is deliberately
+   * excluded: absence-without-a-404 must never drop a pin (the drop-on-glitch bug).
    */
   confirmedDeletedIds: Set<string>;
 }
@@ -718,13 +717,11 @@ export function usePinnedConversationBackfill(
       retry: false,
     })),
   });
-  // Stabilize the returned value: only produce a new reference when the set of
-  // resolved ids OR confirmed-deleted ids actually changes. Without this,
-  // useQueries returns a new array object on every render → downstream memos
-  // and effects re-fire → infinite re-render loop. `fetchConversationById`
-  // resolves to `null` on a 404 (deleted) and throws on any other failure, so a
-  // settled-success-with-null result is our positive delete signal; a still
-  // fetching or errored query contributes nothing.
+  // Memo keys so the result keeps a stable reference until the resolved or
+  // confirmed-deleted sets actually change — else useQueries' per-render array
+  // re-fires downstream memos/effects into a re-render loop. A settled success
+  // with null data is a 404 (see fetchConversationById) — our delete signal;
+  // pending/errored queries contribute nothing.
   const resolvedIds = results
     .filter((r) => r.data != null)
     .map((r) => r.data!.id)

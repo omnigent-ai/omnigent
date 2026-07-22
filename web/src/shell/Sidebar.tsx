@@ -1377,12 +1377,8 @@ function ConversationList({
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
 
-  // Prune a pin only on positive evidence it's gone: a duplicate id, or one the
-  // backfill confirmed deleted (its fetch returned 404). A pin that's merely
-  // absent from the loaded pages is kept — it may live on an unloaded page, or
-  // its backfill fetch may have failed on a transient client/server glitch or
-  // be in flight. Dropping on mere absence is what silently unpinned live
-  // sessions (the loss was then written back to localStorage).
+  // Reconcile pins against confirmed deletions (see normalizePinnedConversationIds
+  // for why only 404-confirmed ids are pruned) and persist any change.
   const hasMorePages = conversationsQuery.hasNextPage;
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
   useEffect(() => {
