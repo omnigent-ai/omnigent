@@ -307,6 +307,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -2395,6 +2396,7 @@ def _build_session_list_item(
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,
         parent_session_id=conv.parent_conversation_id,
+        project_id=conv.project_id,
     )
 
 
@@ -2845,6 +2847,7 @@ def _build_session_response(
         # is not replayed on the SSE stream). Populated for native-terminal
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
+        project_id=conv.project_id,
     )
 
 
@@ -14742,6 +14745,7 @@ def create_sessions_router(
     runner_tunnel_tokens: frozenset[str] | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     host_registry: HostRegistry | None = None,
+    project_store: ProjectStore | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -14802,6 +14806,10 @@ def create_sessions_router(
         the runner is offline, so the file panel stays live without
         waking the agent. ``None`` disables the fallback (the endpoints
         then 503 on an offline runner, as before).
+    :param project_store: Store for first-class projects. Required to
+        validate ownership when ``PATCH /v1/sessions/{id}`` files a
+        session into a project. ``None`` disables the move-into-project
+        action (a non-empty ``project_id`` is then rejected as unsupported).
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -15456,6 +15464,8 @@ def create_sessions_router(
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
+        # Passing owned_by here also scopes the dual-read's first-class half:
+        # the store resolves the project NAME to the caller's own project id.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
         owned_by = user_id if project else None
@@ -16050,6 +16060,11 @@ def create_sessions_router(
             registered; 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
+        # Filing into a project is owner-only: projects are owner-private, so a
+        # session's membership is the owner organizing their own sessions — an
+        # editor must not move it. Presence is the signal (``""`` unfiles), so
+        # gate on model_fields_set, not a non-None value.
+        set_project = "project_id" in body.model_fields_set
         # Archiving/unarchiving is an owner-only lifecycle action: it pairs
         # with a client-driven, owner-gated stop, so an editor must not be
         # able to archive a session (hiding it, and via the client stopping
@@ -16057,7 +16072,7 @@ def create_sessions_router(
         # endpoint needs only edit. Owner implies edit, so a single check at
         # the level the request actually requires gates both — no redundant
         # second permission-store read for archive/unarchive.
-        required_level = LEVEL_OWNER if body.archived is not None else LEVEL_EDIT
+        required_level = LEVEL_OWNER if (body.archived is not None or set_project) else LEVEL_EDIT
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
@@ -16378,6 +16393,34 @@ def create_sessions_router(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        # File into a first-class project (owner-only, gated above). ``""``
+        # unfiles; a non-empty id must name a project the caller owns. Filing
+        # into another owner's (or a missing) project is rejected as NOT_FOUND
+        # — the same 404 the projects API returns, so we don't leak existence.
+        if set_project:
+            target_project_id = body.project_id or ""
+            if target_project_id == "":
+                await asyncio.to_thread(
+                    conversation_store.set_conversation_project, session_id, None
+                )
+            else:
+                if project_store is None:
+                    raise OmnigentError(
+                        "Filing a session into a project is not supported by this server",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                owned = await asyncio.to_thread(
+                    project_store.get, target_project_id, owner_user_id=user_id
+                )
+                if owned is None:
+                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+                filed = await asyncio.to_thread(
+                    conversation_store.set_conversation_project,
+                    session_id,
+                    target_project_id,
+                )
+                if not filed:
+                    raise _session_not_found()
         level = await _get_permission_level(user_id, session_id, permission_store)
         return await _get_session_snapshot(
             conversation_store,

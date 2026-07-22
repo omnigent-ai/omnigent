@@ -1840,6 +1840,11 @@ class SessionResponse(BaseModel):
     # opening the session mid-startup sees the startup band.
     mcp_startup: dict[str, McpServerStartup] | None = None
     active_response_id: str | None = None
+    # First-class project this session is filed under, or ``None`` when
+    # unfiled. Distinct from the legacy ``omni_project`` label (surfaced in
+    # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
+    # ``GET /v1/sessions?project=``.
+    project_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -1909,6 +1914,13 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param project_id: File this session into a first-class project (see
+        ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
+        that project; the empty string ``""`` unfiles it. ``None`` (field
+        omitted) leaves membership unchanged. Owner-only: because projects
+        are owner-private, only the session owner may file it, and only into
+        a project they own — the server verifies both. Independent of the
+        legacy ``omni_project`` label, which is set via ``labels``.
     """
 
     runner_id: str | None = None
@@ -1921,6 +1933,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    project_id: str | None = None
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")
@@ -2239,6 +2252,10 @@ class SessionListItem(BaseModel):
     viewer_unread: bool = False
     search_snippet: str | None = None
     parent_session_id: str | None = None
+    # First-class project this session is filed under, or ``None`` when
+    # unfiled. Lets the sidebar group sessions by project without a follow-up
+    # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
+    project_id: str | None = None
 
 
 class SessionList(BaseModel):

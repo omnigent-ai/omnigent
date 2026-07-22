@@ -444,11 +444,8 @@ user's memberships would be their own private metadata.
 Tracks what has actually landed vs. what remains. Updated as work ships.
 
 ### Done (Phase 1a — project container: entity + store + CRUD)
-This PR ships the project **container** only — you can create, list, rename,
-and delete empty projects. Session→project **membership** (the `project_id`
-column, conversation-store plumbing, dual-read listing) and the session-move
-HTTP surfaces are deliberately **not** here; they land in Phase 1b (next), so
-this PR ships no column or store method that nothing consumes yet.
+Shipped: the project **container** — create, list, rename, and delete empty
+projects. Session→project membership landed separately in Phase 1b (below).
 - ✅ **`projects` table** — `SqlProject` (`db_models.py`): `id` (Uuid16),
   `name`, `owner_user_id`, `created_at`, `updated_at`. Owner-scoped index; a
   UNIQUE index on `(workspace_id, owner_user_id, name)` enforces per-owner name
@@ -468,25 +465,30 @@ this PR ships no column or store method that nothing consumes yet.
 - ✅ Tests: store CRUD + owner isolation + name uniqueness (incl. DB backstop);
   route CRUD (single- + multi-user header auth); entity.
 
+### Done (Phase 1b — session membership over HTTP)
+Links sessions to projects and exposes it, completing Phase 1.
+- ✅ **Membership column + migration** — nullable `project_id` (Uuid16) on
+  `SqlConversationMetadata` (no DB FK, Rule R032; `NULL` = unfiled) via
+  `c2d3e4f5a6b7`, an add-column migration chained after `b1c2d3e4f5a6`, plus
+  `ix_conversation_metadata_project_id` and `Conversation.project_id`.
+- ✅ **Conversation-store ops** — `set_conversation_project()` (file / move /
+  unfile by id) and a **name-based dual-read** `list_conversations(project=…)`
+  filter: a session is "in project `<name>`" if it has EITHER the first-class
+  membership (`metadata.project_id` → the caller's project of that name) OR the
+  legacy `omni_project` label with that value; `""` = unfiled. Cross-DB-safe;
+  the prefetch is bounded to the caller's permission-scoped ids so the `IN` /
+  `NOT IN` list can't grow past their own sessions. This is the §13 dual-read
+  made real, so there is no coexisting pair of filters to reconcile later.
+- ✅ **Session routes** — `PATCH /v1/sessions/{id}` files/unfiles by id
+  (owner-only; target-project ownership validated → 404 otherwise) and
+  `GET /v1/sessions?project=<name>` lists a project's sessions (owner-scoped);
+  `project_id` surfaced on `SessionResponse` / `SessionListItem`; `openapi.json`
+  regenerated.
+- ✅ Tests: store membership ops + name-based dual-read (incl. unfiled and the
+  cross-DB split-DB path); route move / unfile / list, single- and multi-user
+  ownership boundaries.
+
 ### TODO
-- ⬜ **Phase 1b — session membership over HTTP.** Link sessions to projects and
-  expose it (completes Phase 1). Built and green on a follow-up branch; rebases
-  onto this once it merges. Covers:
-  - **Membership column + migration** — nullable `project_id` (Uuid16) on
-    `SqlConversationMetadata` (no DB FK, Rule R032; `NULL` = unfiled) via a
-    small add-column migration chained after `b1c2d3e4f5a6`, plus
-    `Conversation.project_id`.
-  - **Conversation-store ops** — `set_conversation_project()` (file / move /
-    unfile by id) and a **name-based dual-read** `list_conversations(project=…)`
-    filter: a session is "in project `<name>`" if it has EITHER the first-class
-    membership (`metadata.project_id` → the caller's project of that name) OR
-    the legacy `omni_project` label with that value; `""` = unfiled.
-    Cross-DB-safe. This is the §13 dual-read made real, so there is no
-    coexisting pair of filters to reconcile later.
-  - **Session routes** — `PATCH /v1/sessions/{id}` files/unfiles by id
-    (owner-only; target-project ownership validated → 404 otherwise) and
-    `GET /v1/sessions?project=<name>` lists a project's sessions (owner-scoped);
-    `project_id` surfaced on `SessionResponse` / `SessionListItem`.
 - ⬜ **Web UI** — always-visible Projects sidebar section; create empty project;
   "New session here"; session-row kebab move; rename (§5–§7). No TS client
   types regenerated yet.

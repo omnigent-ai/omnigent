@@ -642,6 +642,10 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # First-class project membership. Relates to projects.id; no DB FK
+    # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
+    # label via the store's dual-read until labels are consolidated.
+    project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -651,6 +655,8 @@ class SqlConversationMetadata(OmnigentBase):
         ),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
+        # "list sessions in project X" + per-project counts (GROUP BY project_id).
+        Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
     )
 
 

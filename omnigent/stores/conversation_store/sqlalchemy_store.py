@@ -34,6 +34,7 @@ from omnigent.db.db_models import (
     SqlConversationLabel,
     SqlConversationMetadata,
     SqlPolicy,
+    SqlProject,
     SqlSessionPermission,
     SqlUserDailyCost,
     current_workspace_id,
@@ -209,6 +210,7 @@ def _to_conversation(
             else None
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
+        project_id=meta.project_id if meta else None,
     )
 
 
@@ -1298,6 +1300,34 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(session_usage=json.dumps(usage))
             )
 
+    def set_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """
+        File a conversation into a first-class project (or unfile it).
+
+        Sets ``omnigent_conversation_metadata.project_id``. ``None`` unfiles the
+        session. The first-class counterpart to moving a session between
+        ``omni_project`` labels.
+
+        :param conversation_id: The conversation to update, e.g. ``"conv_abc"``.
+        :param project_id: The project id to file under, or ``None`` to unfile.
+        :returns: ``True`` if a metadata row was updated; ``False`` if the
+            conversation has no metadata row.
+        """
+        with self._session() as session:
+            result = session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(project_id=project_id)
+            )
+            return result.rowcount > 0
+
     def increment_session_usage(
         self,
         conversation_id: str,
@@ -2075,12 +2105,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
-        :param project: When set to a non-empty string, only return
-            sessions that have a ``conversation_labels`` row with
-            ``key="omni_project"`` and ``value=project``. When set to an
-            empty string ``""``, only return sessions with NO project
-            label (i.e., unfiled sessions). ``None`` disables the
-            filter.
+        :param project: Filter by project NAME, dual-reading both storage
+            paths. A non-empty string returns sessions that EITHER have a
+            first-class membership (``metadata.project_id`` → ``owned_by``'s
+            project of this name) OR carry the legacy ``omni_project`` label
+            with this value. ``""`` returns sessions with NEITHER (unfiled).
+            ``None`` disables the filter. The name→id resolution is scoped to
+            ``owned_by`` (projects are owner-private), so pass ``owned_by``
+            alongside a specific name for the first-class half to resolve.
         :param owned_by: When set, restrict to sessions the user owns
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
@@ -2208,25 +2240,65 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
+                # Dual-read by project NAME: a session is "in <name>" if it has
+                # EITHER the first-class membership (metadata.project_id → the
+                # owner's project of that name) OR the legacy ``omni_project``
+                # label. The label is colocated on the AP DB (inline subquery);
+                # projects + metadata are on the Omnigent DB, so member ids are
+                # resolved there first, then combined with the label subquery.
+                label_filed = select(SqlConversationLabel.conversation_id).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                )
                 if project == "":
-                    # Unfiled: sessions with no project label at all.
-                    stmt = stmt.where(
-                        SqlConversation.id.not_in(
-                            select(SqlConversationLabel.conversation_id).where(
-                                SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                            )
+                    # Unfiled: no first-class membership AND no label. Bound the
+                    # prefetch to qualifying_ids (when permission-scoped) so the
+                    # NOT IN list stays capped to the caller's own sessions.
+                    first_class_stmt = select(SqlConversationMetadata.id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.project_id.is_not(None),
+                    )
+                    if qualifying_ids is not None:
+                        first_class_stmt = first_class_stmt.where(
+                            SqlConversationMetadata.id.in_(qualifying_ids)
                         )
+                    with self._session() as meta_sess:
+                        first_class_filed = list(meta_sess.execute(first_class_stmt).scalars())
+                    stmt = stmt.where(
+                        SqlConversation.id.not_in(first_class_filed),
+                        SqlConversation.id.not_in(label_filed),
                     )
                 else:
-                    # Specific project: session must have this project label.
+                    # Resolve the owner's project of this name → its member ids
+                    # (one join). No such project yields an empty list, so the
+                    # filter collapses to the label match alone (v1 behaviour).
+                    # Bound to qualifying_ids (when permission-scoped) to cap the
+                    # IN list to the caller's own sessions.
+                    member_stmt = (
+                        select(SqlConversationMetadata.id)
+                        .join(
+                            SqlProject,
+                            SqlConversationMetadata.project_id == SqlProject.id,
+                        )
+                        .where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlProject.workspace_id == current_workspace_id(),
+                            SqlProject.owner_user_id == owned_by,
+                            SqlProject.name == project,
+                        )
+                    )
+                    if qualifying_ids is not None:
+                        member_stmt = member_stmt.where(
+                            SqlConversationMetadata.id.in_(qualifying_ids)
+                        )
+                    with self._session() as meta_sess:
+                        member_ids = list(meta_sess.execute(member_stmt).scalars())
                     stmt = stmt.where(
-                        SqlConversation.id.in_(
-                            select(SqlConversationLabel.conversation_id).where(
-                                SqlConversationLabel.workspace_id == current_workspace_id(),
-                                SqlConversationLabel.key == PROJECT_LABEL_KEY,
-                                SqlConversationLabel.value == project,
-                            )
+                        or_(
+                            SqlConversation.id.in_(member_ids),
+                            SqlConversation.id.in_(
+                                label_filed.where(SqlConversationLabel.value == project)
+                            ),
                         )
                     )
             if after:

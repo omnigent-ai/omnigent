@@ -2216,6 +2216,9 @@ def create_app(
             # workspace over the host tunnel when the runner is offline
             # (the file panel stays live without waking the agent).
             host_registry=host_registry,
+            # Validates target-project ownership when PATCH /v1/sessions/{id}
+            # files a session into a project (owner-private membership).
+            project_store=project_store,
         ),
         prefix="/v1",
         tags=["sessions"],

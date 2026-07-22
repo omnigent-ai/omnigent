@@ -4121,6 +4121,17 @@
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled.",
             "title": "Permission Level"
           },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -4918,6 +4929,17 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -6174,6 +6196,18 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "File this session into a first-class project (see `designs/PROJECTS_PRD.md`). A non-empty id moves the session into that project; the empty string `\"\"` unfiles it. `None` (field omitted) leaves membership unchanged. Owner-only: because projects are owner-private, only the session owner may file it, and only into a project they own \u2014 the server verifies both. Independent of the legacy `omni_project` label, which is set via `labels`.",
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
