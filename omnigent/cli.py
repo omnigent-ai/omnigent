@@ -31,7 +31,10 @@ from rich.console import Console
 from rich.table import Table
 
 from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
-from omnigent._startup_profile import StartupProfiler
+from omnigent.cli_common import (
+    RESUME_PICKER_SENTINEL as _RESUME_PICKER_SENTINEL,
+)
+from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
@@ -418,7 +421,6 @@ _INTERNAL_BETA_BUNDLED_AGENTS: tuple[str, ...] = (
 # _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
 # omnigent.onboarding.internal_beta (excluded from the OSS build); the
 # internal-beta setup branch and the sandbox CLI import it from there.
-_CLAUDE_STARTUP_PROFILE_ENV_VAR = "OMNIGENT_CLAUDE_STARTUP_PROFILE"
 # Brand shown for an auto-configured CLI login in the credentials callout —
 # the product the login authenticates, not the CLI name (the codex CLI logs in
 # a ChatGPT subscription). Keyed by the ambient detection name; these are the
@@ -4747,1331 +4749,6 @@ def _expand_builtin_env_vars(  # type: ignore[explicit-any]  # entries are parse
     return changed
 
 
-# Click ``flag_value`` for bare ``--resume`` (no arg). Must exist
-# before any command's decorator evaluates.
-_RESUME_PICKER_SENTINEL = "__resume_picker__"
-
-
-def _reject_native_on_windows(harness: str) -> None:
-    """Fail a native (tmux/PTY) harness command with an actionable message.
-
-    The ``omnigent claude`` / ``codex`` / ``cursor`` native wrappers drive a
-    private tmux server and PTY, which don't exist on Windows. Point users at
-    the SDK harnesses / web UI instead of letting them hit a tmux crash.
-
-    :param harness: The native command name, e.g. ``"claude"``.
-    :raises click.ClickException: Always, when running on Windows.
-    """
-    if IS_WINDOWS:
-        raise click.ClickException(
-            f"`omnigent {harness}` (native tmux/PTY terminal) is not supported on "
-            "Windows. Use an SDK-based harness via `omnigent run <agent.yaml>` "
-            "or the web UI."
-        )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Starts a local runner, binds the session, "
-        "launches Claude in a terminal resource, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to claude-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.option(
-    "--host",
-    "register_host",
-    is_flag=True,
-    default=False,
-    help=(
-        "Register this machine as a host (inline equivalent of `omnigent host`). "
-        "Requires --server."
-    ),
-)
-@click.option(
-    "--use-native-config",
-    "use_claude_config",
-    is_flag=True,
-    default=False,
-    help=(
-        "Use your existing Claude Code configuration instead of Databricks auth. "
-        "When set, any configured provider is ignored and Claude "
-        "authenticates via its own ``~/.claude/`` settings."
-    ),
-)
-@click.option(
-    "--profile-startup",
-    "profile_startup",
-    is_flag=True,
-    default=False,
-    help=(
-        "Print native Claude startup timing marks to stderr. Also enabled by "
-        f"{_CLAUDE_STARTUP_PROFILE_ENV_VAR}=1."
-    ),
-)
-@click.option(
-    "--command",
-    "claude_command",
-    default=None,
-    metavar="CMD",
-    help=(
-        "[DEPRECATED] Claude Code CLI executable to run. Use the "
-        "``OMNIGENT_CLAUDE_PATH`` env var or the "
-        "``harness.claude-native.command`` config override instead; this "
-        "flag will be removed in a future release."
-    ),
-)
-@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
-def claude(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    register_host: bool,
-    use_claude_config: bool,
-    profile_startup: bool,
-    claude_command: str | None,
-    claude_args: tuple[str, ...],
-) -> None:
-    # Param docs live in comments — Click uses the docstring for --help.
-    # :param server: Remote Omnigent server URL, or None for local.
-    # :param resume: None, picker sentinel, or a conversation id.
-    # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
-    # :param use_claude_config: When True, skip ucode/Databricks auth and use
-    #     existing Claude config.
-    # :param profile_startup: When True, print startup timing marks.
-    # :param claude_args: Pass-through args for ``claude``.
-    """Launch Claude Code in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent claude
-      omnigent claude --resume conv_abc123
-      omnigent claude --resume                  # interactive picker
-      omnigent claude --server https://<app>.databricksapps.com
-    """
-    _reject_native_on_windows("claude")
-    startup_profiler = StartupProfiler.from_env(
-        name="omnigent claude",
-        env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
-        explicit=profile_startup,
-    )
-    startup_profiler.mark("cli entered")
-
-    # Apply config defaults (same as ``run`` does).
-    cfg = _load_effective_config()
-    if server is None:
-        server = cfg.get("server")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-    startup_profiler.mark("config resolved")
-
-    # Validate option combinations BEFORE any side effects (daemon
-    # spawn, server discovery). Calling _ensure_backend first would
-    # mean a bad arg pair waits the full local-server-discover
-    # timeout (60s in CI) before surfacing the UsageError, which
-    # the test_claude_command_session_and_resume_mutually_exclusive
-    # regression caught in CI.
-    del register_host
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-    startup_profiler.mark("arguments validated")
-
-    # Ensure the host daemon (local when ``--server`` is omitted/empty,
-    # remote otherwise) and resolve the concrete Omnigent server URL. The daemon
-    # owns the runner; the CLI only connects. ``--host`` is now redundant
-    # (the daemon is always ensured) and kept only as a no-op for scripts.
-    startup_profiler.mark("ensuring backend")
-    server = _ensure_backend(server)
-    startup_profiler.mark("backend ready", detail=f"server={server}")
-
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    from omnigent.claude_native import run_claude_native
-    from omnigent.harness_startup_config import resolve_harness_command
-
-    startup_profiler.mark("native module imported")
-
-    if claude_command:
-        click.echo(
-            "omnigent: `claude --command` is deprecated; set OMNIGENT_CLAUDE_PATH "
-            "or harness.claude-native.command instead. The --command flag will "
-            "be removed in a future release.",
-            err=True,
-        )
-    resolved_command = resolve_harness_command(
-        "claude-native",
-        default="claude",
-        explicit=claude_command,
-        cfg=cfg,
-    )
-    run_claude_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        claude_args=_resolve_harness_startup_args(cfg, "claude-native", claude_args),
-        use_claude_config=use_claude_config,
-        auto_open_conversation=auto_open_conversation,
-        startup_profiler=startup_profiler,
-        command=resolved_command,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch Codex, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to codex-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.option("--model", default=None, help="Codex model to use for the native thread.")
-@click.option(
-    "-p",
-    "--prompt",
-    default=None,
-    help="Send this as the first message after the Codex TUI starts.",
-)
-@click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
-def codex(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    model: str | None,
-    prompt: str | None,
-    codex_args: tuple[str, ...],
-) -> None:
-    # Param docs live in comments — Click uses the docstring for --help.
-    # :param server: Remote Omnigent server URL, or None for local.
-    # :param resume: None, picker sentinel, or a conversation id.
-    # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
-    # :param model: Codex model id.
-    # :param prompt: Optional first prompt.
-    # :param codex_args: Pass-through args for ``codex`` before ``resume``.
-    """Launch Codex TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent codex
-      omnigent codex --resume conv_abc123
-      omnigent codex --resume                  # interactive picker
-      omnigent codex --server https://<app>.databricksapps.com
-    """
-    _reject_native_on_windows("codex")
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.codex_native import run_codex_native
-    from omnigent.harness_startup_config import resolve_harness_command
-
-    cfg = _load_effective_config()
-    if server is None:
-        server = cfg.get("server")
-    if model is None:
-        model = cfg.get("model")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    # Validate option combinations before any side effects — see
-    # the same comment in the claude command. _ensure_backend can
-    # spawn the daemon and take the full local-server-discover
-    # timeout to fail, which would make a bad arg pair look like
-    # a backend outage instead of a usage error.
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    # Ensure the host daemon (local when ``--server`` is omitted/empty,
-    # remote otherwise) and resolve the concrete Omnigent server URL. Codex follows
-    # the same ownership model as attach/run/claude: the daemon-spawned runner
-    # owns the app-server and TUI; the CLI attaches to the tmux terminal.
-    server = _ensure_backend(server)
-
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    resolved_command = resolve_harness_command(
-        "codex-native",
-        default="codex",
-        explicit=None,
-        cfg=cfg,
-    )
-    run_codex_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        codex_args=_resolve_harness_startup_args(cfg, "codex-native", codex_args),
-        model=model,
-        prompt=prompt,
-        auto_open_conversation=auto_open_conversation,
-        command=resolved_command,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch OpenCode, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to opencode-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.option("--model", default=None, help="OpenCode model to use for the native session.")
-@click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
-def opencode(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    model: str | None,
-    opencode_args: tuple[str, ...],
-) -> None:
-    # :param server: Remote Omnigent server URL, or None for local.
-    # :param resume: None, picker sentinel, or a conversation id.
-    # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
-    # :param model: OpenCode model id pinned on the wrapper spec.
-    # :param opencode_args: Pass-through args persisted for the ``opencode attach`` TUI.
-    # NOTE: no ``--command`` flag — override the opencode binary via
-    # ``OMNIGENT_OPENCODE_PATH`` or ``harness.opencode-native.command`` config.
-    # (opencode-native resolves its binary on the runner side; if a spec/env
-    # path to thread a client override through is added later, this stays
-    # consistent with the other native commands' env/config override model.)
-    """Launch OpenCode TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent opencode
-      omnigent opencode --resume conv_abc123
-      omnigent opencode --resume                  # interactive picker
-      omnigent opencode --server https://<app>.databricksapps.com
-    """
-    from omnigent.opencode_native import run_opencode_native
-
-    cfg = _load_effective_config()
-    if server is None:
-        server = cfg.get("server")
-    if model is None:
-        # Prefer the OpenCode-specific default (set in `omni setup` → OpenCode →
-        # "Set default model"); fall back to the shared `model` key for back-compat.
-        model = cfg.get("opencode_model") or cfg.get("model")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    # Validate option combinations before any side effects (see the codex
-    # command): _ensure_backend can spawn the daemon and take the full
-    # local-server-discover timeout, which would mask a bad arg pair as an
-    # outage instead of a usage error.
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    # Ensure the host daemon (local when ``--server`` is omitted/empty, remote
-    # otherwise); the daemon-spawned runner owns ``opencode serve`` + the TUI,
-    # and this CLI attaches to the tmux terminal.
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-    run_opencode_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        opencode_args=_resolve_harness_startup_args(cfg, "opencode-native", opencode_args),
-        model=model,
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch Pi, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to pi-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
-def pi(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    pi_args: tuple[str, ...],
-) -> None:
-    """Launch Pi TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent pi
-      omnigent pi --resume conv_abc123
-      omnigent pi --resume                    # interactive picker
-      omnigent pi --model local-deepseek/deepseek-v4-flash
-    """
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.harness_startup_config import resolve_harness_command
-    from omnigent.pi_native import run_pi_native
-
-    cfg = _load_effective_config()
-    # Thread ``harness.pi-native.command`` config into the runner via the
-    # canonical ``OMNIGENT_PI_PATH`` env var (set before ``_ensure_backend``
-    # so a locally-spawned daemon inherits it; a remote ``--server`` runner
-    # reads its own host env, so set the var there). No ``--command`` flag —
-    # override via ``OMNIGENT_PI_PATH`` or config.
-    _resolved = resolve_harness_command("pi-native", default="", explicit=None, cfg=cfg)
-    if _resolved:
-        os.environ["OMNIGENT_PI_PATH"] = _resolved
-    if server is None:
-        server = cfg.get("server")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    run_pi_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        pi_args=_resolve_harness_startup_args(cfg, "pi-native", pi_args),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _bundled_agent_brain_harness(name: str) -> str | None:
-    """Return the canonical brain harness of a bundled agent, or ``None``.
-
-    Reads the brain harness (``executor.config.harness``, falling back to
-    ``executor.harness`` / ``executor.type``) from the bundled agent's
-    ``config.yaml`` — e.g. polly's and debby's ``claude-sdk`` brain — so
-    credential fallback can target the model family the brain actually
-    runs on. Mirrors :func:`_peek_default_agent_harness`'s YAML-reading
-    style.
-
-    :param name: Bundled example directory name, e.g. ``"polly"``.
-    :returns: The canonical harness id, e.g. ``"claude-sdk"``, or ``None``
-        when the bundle is missing/unreadable or declares no brain harness.
-    """
-    config_path = Path(_bundled_example_path(name)) / "config.yaml"
-    if not config_path.is_file():
-        return None
-    try:
-        raw = yaml.safe_load(config_path.read_text()) or {}
-    except (OSError, yaml.YAMLError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    executor = raw.get("executor")
-    if not isinstance(executor, dict):
-        return None
-    declared: object = None
-    config_block = executor.get("config")
-    if isinstance(config_block, dict):
-        declared = config_block.get("harness")
-    if not isinstance(declared, str) or not declared:
-        declared = executor.get("harness") or executor.get("type")
-    if not isinstance(declared, str) or not declared:
-        return None
-    return canonicalize_harness(declared) or declared
-
-
-def _ensure_bundled_agent_brain_credential(name: str) -> None:
-    """Ensure the bundled agent's brain harness has a credential to launch with.
-
-    Polly and Debby launch with the *first available* credential for their
-    brain's model family rather than requiring a specific one to be marked
-    ``default: true`` up front — so users can start without manually
-    picking/configuring one. When no default provider is configured for the
-    agent's brain harness, pick the first available credential serving that
-    family and mark it the default so the downstream ``run`` resolves it —
-    printing a notice (to stderr) since this mutates the user's config on a
-    launch command, mirroring the confirmation ``setup`` / ``/model`` show.
-
-    No-op when a default is already configured, or when no credential is
-    available for the family (the harness raises its own launch error then).
-    Only an explicit default (or none) is touched — an existing default is
-    never overridden. Marking the first available credential the default
-    mirrors :func:`_add_provider_entry`'s "a first provider just works"
-    adoption (see :func:`omnigent.setup`).
-
-    :param name: Bundled example directory name, e.g. ``"polly"``.
-    """
-    from omnigent.errors import OmnigentError
-    from omnigent.onboarding.configure_models import family_label
-    from omnigent.onboarding.detected import effective_config_with_detected
-    from omnigent.onboarding.provider_config import (
-        default_provider_for_harness,
-        harness_family,
-        load_config,
-        load_providers,
-        provider_families,
-        set_default_provider,
-    )
-
-    brain_harness = _bundled_agent_brain_harness(name)
-    if brain_harness is None:
-        return
-    family = harness_family(brain_harness)
-    if family is None:
-        return
-    # Best-effort: adopting a default must never crash a launch. Any malformed
-    # or unexpected config state (corrupt YAML, ambiguous defaults, a divergent
-    # on-disk entry) degrades to a no-op — the harness then raises its own
-    # credential error.
-    try:
-        config = effective_config_with_detected(load_config())
-        if default_provider_for_harness(config, brain_harness) is not None:
-            return
-        on_disk = _load_global_config()
-        disk_block = on_disk.get("providers") if isinstance(on_disk, dict) else None
-        if not isinstance(disk_block, dict):
-            return
-        # Skip ambient-detected entries (not on disk) — auto-defaulted upstream.
-        candidates = [
-            (entry_name, entry)
-            for entry_name, entry in load_providers(config).items()
-            if family in provider_families(entry) and entry_name in disk_block
-        ]
-        if not candidates:
-            return
-        entry_name, entry = candidates[0]
-        _save_global_config({"providers": set_default_provider(disk_block, entry_name, family)})
-        family_name = family_label(family)
-        credential_name = _credential_label(entry_name, entry)
-        # Announce: this mutates the user's config on a launch command.
-        if len(candidates) > 1:
-            message = (
-                f"No default {family_name} credential set — "
-                f"using {credential_name} "
-                f"({len(candidates)} {family_name} credentials found; "
-                "pick another with: omnigent /model) and saving it as the default."
-            )
-        else:
-            message = (
-                f"No default {family_name} credential set — "
-                f"using {credential_name} and saving it as the default "
-                "(change anytime with: omnigent /model)."
-            )
-        click.echo(
-            message,
-            err=True,
-        )
-        return
-    except (OSError, yaml.YAMLError, OmnigentError):
-        return
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch the Cursor TUI, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to cursor-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.option(
-    "--mode",
-    "mode",
-    default=None,
-    type=click.Choice(["plan", "ask"]),
-    help=(
-        "Start cursor-agent in the given execution mode. "
-        "``plan``: read-only/planning (analyze, propose plans, no edits). "
-        "``ask``: Q&A style for explanations and questions (read-only)."
-    ),
-)
-@click.option(
-    "--model",
-    default=None,
-    help="Cursor model to use for the native TUI (e.g. gpt-5.2, claude-4.6-sonnet-medium).",
-)
-@click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
-def cursor(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    mode: str | None,
-    model: str | None,
-    cursor_args: tuple[str, ...],
-) -> None:
-    # Param docs live in comments — Click uses the docstring for --help.
-    # :param model: Cursor model id passed to cursor-agent as ``--model``.
-    """Launch the Cursor TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent cursor
-      omnigent cursor --model gpt-5.2
-      omnigent cursor --resume conv_abc123
-      omnigent cursor --resume                 # interactive picker
-      omnigent cursor --mode plan              # start in plan (read-only) mode
-      omnigent cursor --mode ask               # start in ask (Q&A) mode
-    """
-    _reject_native_on_windows("cursor")
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.cursor_native import run_cursor_native
-    from omnigent.harness_startup_config import resolve_harness_command
-
-    cfg = _load_effective_config()
-    # Thread ``--command`` / ``harness.cursor-native.command`` config into the
-    # runner via the canonical ``OMNIGENT_CURSOR_PATH`` env var (set before
-    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
-    # ``--server`` runner reads its own host env, so set the var there).
-    _resolved = resolve_harness_command("cursor-native", default="", explicit=None, cfg=cfg)
-    if _resolved:
-        os.environ["OMNIGENT_CURSOR_PATH"] = _resolved
-    if server is None:
-        server = cfg.get("server")
-    # Deliberately no ``cfg.get("model")`` fallback (unlike ``codex``): the
-    # global config model is a Claude/Codex catalog id, not a cursor-agent
-    # model id, and pinning it would break the cursor TUI launch. Cursor's
-    # model is explicit-only here; persistent selection rides the web /model.
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    run_cursor_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        cursor_args=_resolve_harness_startup_args(cfg, "cursor-native", cursor_args),
-        model=model,
-        auto_open_conversation=auto_open_conversation,
-        mode=mode,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch the Kiro TUI, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to kiro-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.option("--model", default=None, help="Kiro model to use for the native chat.")
-@click.option("--effort", default=None, help="Kiro effort level to use for the native chat.")
-@click.option("--agent", "kiro_agent", default=None, help="Kiro agent to use for the native chat.")
-@click.option(
-    "--trust-tools",
-    "trust_tools",
-    multiple=True,
-    metavar="TOOL",
-    help="Trust a specific Kiro tool. May be passed multiple times.",
-)
-@click.option(
-    "--trust-all-tools",
-    is_flag=True,
-    default=False,
-    help="Explicitly trust all Kiro tools for this local launch.",
-)
-@click.option(
-    "-p",
-    "--prompt",
-    default=None,
-    help="Send this as the initial Kiro chat input when the TUI starts.",
-)
-@click.argument("kiro_args", nargs=-1, type=click.UNPROCESSED)
-def kiro(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    model: str | None,
-    effort: str | None,
-    kiro_agent: str | None,
-    trust_tools: tuple[str, ...],
-    trust_all_tools: bool,
-    prompt: str | None,
-    kiro_args: tuple[str, ...],
-) -> None:
-    """Launch the Kiro TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent kiro
-      omnigent kiro --resume conv_abc123
-      omnigent kiro --resume                  # interactive picker
-      omnigent kiro --model auto -p "review this repo"
-    """
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-    _reject_reserved_kiro_resume_args(kiro_args)
-
-    from omnigent.harness_startup_config import resolve_harness_command
-    from omnigent.kiro_native import run_kiro_native
-
-    cfg = _load_effective_config()
-    # Thread ``--command`` / ``harness.kiro-native.command`` config into the
-    # runner via the canonical ``OMNIGENT_KIRO_PATH`` env var (set before
-    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
-    # ``--server`` runner reads its own host env, so set the var there).
-    _resolved = resolve_harness_command("kiro-native", default="", explicit=None, cfg=cfg)
-    if _resolved:
-        os.environ["OMNIGENT_KIRO_PATH"] = _resolved
-    if server is None:
-        server = cfg.get("server")
-    if model is None:
-        model = cfg.get("model")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-    launch_args = _build_kiro_launch_args(
-        effort=effort,
-        kiro_agent=kiro_agent,
-        trust_tools=trust_tools,
-        trust_all_tools=trust_all_tools,
-        passthrough_args=_resolve_harness_startup_args(cfg, "kiro-native", kiro_args),
-    )
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    run_kiro_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        kiro_args=launch_args,
-        model=model,
-        prompt=prompt,
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
-    """Reject Kiro-owned resume flags in passthrough args."""
-    reserved = {"--resume", "--resume-id", "--resume-picker"}
-    if any(arg == flag or arg.startswith(f"{flag}=") for arg in kiro_args for flag in reserved):
-        raise click.UsageError(
-            "Kiro resume flags are reserved for Omnigent resume handling; use "
-            "`omnigent kiro --resume [CONVERSATION]` instead."
-        )
-
-
-def _build_kiro_launch_args(
-    *,
-    effort: str | None,
-    kiro_agent: str | None,
-    trust_tools: tuple[str, ...],
-    trust_all_tools: bool,
-    passthrough_args: tuple[str, ...],
-) -> tuple[str, ...]:
-    """Build mapped Kiro CLI args for the runner-owned terminal launch."""
-    args: list[str] = []
-    if effort:
-        args.extend(["--effort", effort])
-    if kiro_agent:
-        args.extend(["--agent", kiro_agent])
-    for tool in trust_tools:
-        args.extend(["--trust-tools", tool])
-    if trust_all_tools:
-        args.append("--trust-all-tools")
-    args.extend(passthrough_args)
-    return tuple(args)
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch the Goose TUI, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to goose-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
-def goose(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    goose_args: tuple[str, ...],
-) -> None:
-    """Launch the Goose TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent goose
-      omnigent goose --resume conv_abc123
-      omnigent goose --resume                 # interactive picker
-    """
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.goose_native import run_goose_native
-    from omnigent.harness_startup_config import resolve_harness_command
-
-    cfg = _load_effective_config()
-    # Thread ``--command`` / ``harness.goose-native.command`` config into the
-    # runner via the canonical ``OMNIGENT_GOOSE_PATH`` env var (set before
-    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
-    # ``--server`` runner reads its own host env, so set the var there).
-    _resolved = resolve_harness_command("goose-native", default="", explicit=None, cfg=cfg)
-    if _resolved:
-        os.environ["OMNIGENT_GOOSE_PATH"] = _resolved
-    if server is None:
-        server = cfg.get("server")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    run_goose_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        goose_args=_resolve_harness_startup_args(cfg, "goose-native", goose_args),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch the Hermes TUI, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to hermes-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
-def hermes(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    hermes_args: tuple[str, ...],
-) -> None:
-    """Launch the Hermes TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent hermes
-      omnigent hermes --resume conv_abc123
-      omnigent hermes --resume                 # interactive picker
-    """
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.harness_startup_config import resolve_harness_command
-    from omnigent.hermes_native import run_hermes_native
-
-    cfg = _load_effective_config()
-    # Thread ``--command`` / ``harness.hermes-native.command`` config into the
-    # runner via the canonical ``OMNIGENT_HERMES_PATH`` env var (set before
-    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
-    # ``--server`` runner reads its own host env, so set the var there).
-    _resolved = resolve_harness_command("hermes-native", default="", explicit=None, cfg=cfg)
-    if _resolved:
-        os.environ["OMNIGENT_HERMES_PATH"] = _resolved
-    if server is None:
-        server = cfg.get("server")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    run_hermes_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        hermes_args=_resolve_harness_startup_args(cfg, "hermes-native", hermes_args),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, binds a runner, "
-        "launches Antigravity (agy) in a terminal resource, and attaches "
-        'this TTY. Pass --server "" to auto-spawn a persistent local '
-        "server in the background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to antigravity-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.option("--model", default=None, help="Antigravity (agy) model to use for the session.")
-@click.argument("antigravity_args", nargs=-1, type=click.UNPROCESSED)
-def antigravity(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    model: str | None,
-    antigravity_args: tuple[str, ...],
-) -> None:
-    """Launch the Antigravity (agy) TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent antigravity
-      omnigent antigravity --resume conv_abc123
-      omnigent antigravity --resume                  # interactive picker
-      omnigent antigravity --server https://<app>.databricksapps.com
-    """
-    # Validate option combinations BEFORE any side effects (daemon spawn,
-    # server discovery) -- see the same comment in the claude command.
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.antigravity_native import run_antigravity_native
-    from omnigent.harness_startup_config import resolve_harness_command
-
-    cfg = _load_effective_config()
-    if server is None:
-        server = cfg.get("server")
-    if model is None:
-        model = cfg.get("model")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    # permission_mode is left None here (parity with the claude/codex/pi CLI
-    # launchers): the attended terminal launch lets agy's own request-review
-    # prompt govern each tool, and an unattended/headless launch auto-bypasses
-    # inside run_antigravity_native. It is plumbed through build_agy_launch so a
-    # future caller CAN set it, but this human CLI path exposes no permission
-    # flag and never needs one.
-    resolved_command = resolve_harness_command(
-        "antigravity-native",
-        default="",
-        explicit=None,
-        cfg=cfg,
-    )
-    run_antigravity_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        antigravity_args=_resolve_harness_startup_args(
-            cfg, "antigravity-native", antigravity_args
-        ),
-        model=model,
-        auto_open_conversation=auto_open_conversation,
-        command=resolved_command or None,
-    )
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch the qwen TUI, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to qwen-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.argument("qwen_args", nargs=-1, type=click.UNPROCESSED)
-def qwen(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    qwen_args: tuple[str, ...],
-) -> None:
-    """Launch the qwen (Qwen Code) TUI in an Omnigent terminal.
-
-    \b
-    Examples:
-      omnigent qwen
-      omnigent qwen --resume conv_abc123
-      omnigent qwen --resume                  # interactive picker
-    """
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.harness_startup_config import resolve_harness_command
-    from omnigent.qwen_native import run_qwen_native
-
-    cfg = _load_effective_config()
-    # Thread ``--command`` / ``harness.qwen-native.command`` config into the
-    # runner via the canonical ``OMNIGENT_QWEN_PATH`` env var (set before
-    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
-    # ``--server`` runner reads its own host env, so set the var there).
-    _resolved = resolve_harness_command("qwen-native", default="", explicit=None, cfg=cfg)
-    if _resolved:
-        os.environ["OMNIGENT_QWEN_PATH"] = _resolved
-    if server is None:
-        server = cfg.get("server")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    run_qwen_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        qwen_args=_resolve_harness_startup_args(cfg, "qwen-native", qwen_args),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
-    """Forward a bundled-agent subcommand to ``run`` on its packaged path.
-
-    Implements ``omnigent polly`` / ``omnigent debby``: resolves the bundled
-    example directory and re-dispatches through the ``run`` command's own
-    parser, so every ``run`` flag (``--server``, ``-p``, ``--resume``, ...)
-    works unchanged on the agent shorthands without duplicating ``run``'s
-    option declarations.
-
-    ``prog_name`` is pinned to ``"omnigent run"`` so context-derived output —
-    usage errors and the :func:`_build_resume_parts` replay prefix — renders
-    as the canonical ``omnigent run <path>`` form, which stays valid when
-    replayed.
-
-    :param name: Bundled example directory name, e.g. ``"polly"``.
-    :param run_args: Unparsed pass-through CLI args for ``run``,
-        e.g. ``("-p", "review the last commit")``.
-    """
-    # Polly/Debby launch with the first available credential for their
-    # brain's family when no specific one is configured up front (#334).
-    _ensure_bundled_agent_brain_credential(name)
-    # standalone_mode=False propagates ClickExceptions to main()'s handler
-    # (CLI diagnostics logging + setup hint) instead of exiting inline,
-    # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
-    run.main(
-        args=[_bundled_example_path(name), *run_args],
-        prog_name="omnigent run",
-        standalone_mode=False,
-    )
-
-
 @cli.command(
     context_settings={
         "ignore_unknown_options": True,
@@ -6120,103 +4797,6 @@ def debby(run_args: tuple[str, ...]) -> None:
       omnigent debby -p "name ideas for a CLI that runs agents"
     """
     _run_bundled_agent("debby", run_args)
-
-
-@cli.command(
-    context_settings={
-        "ignore_unknown_options": True,
-        "allow_extra_args": True,
-    }
-)
-@click.option(
-    "--server",
-    default=None,
-    help=(
-        "Remote omnigent URL. Ensures the host daemon, asks the "
-        "daemon-spawned runner to launch the Kimi TUI, and attaches this TTY. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and use that instead of a remote one."
-    ),
-)
-@click.option(
-    "-r",
-    "--resume",
-    "resume",
-    is_flag=False,
-    flag_value=_RESUME_PICKER_SENTINEL,
-    default=None,
-    help=(
-        "Resume a prior Omnigent conversation. With a conversation id "
-        "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
-        "opens an interactive picker scoped to kimi-native sessions."
-    ),
-)
-@click.option(
-    "--session",
-    "session_id",
-    metavar="SESSION_ID",
-    default=None,
-    hidden=True,
-    help="Deprecated alias for ``--resume <id>``; kept for one release.",
-)
-@click.argument("kimi_args", nargs=-1, type=click.UNPROCESSED)
-def kimi(
-    server: str | None,
-    resume: str | None,
-    session_id: str | None,
-    kimi_args: tuple[str, ...],
-) -> None:
-    """Launch the Kimi Code TUI in an Omnigent terminal.
-
-    Boots Moonshot AI's interactive ``kimi`` TUI
-    (https://github.com/MoonshotAI/Kimi-Code) in a runner-owned terminal and
-    attaches your TTY — the native experience, embedded in the Omnigent web
-    UI. No Omnigent provider config is needed: kimi authenticates against its
-    own backend (``kimi login`` for OAuth, or a Moonshot API key).
-
-    For the headless SDK harness (per-turn ``kimi -p`` behind the Omnigent
-    REPL) use ``omnigent run --harness kimi`` instead.
-
-    \b
-    Examples:
-      omnigent kimi
-      omnigent kimi --resume conv_abc123
-      omnigent kimi --resume                   # interactive picker
-    """
-    choice = _split_resume_value(resume)
-    if session_id is not None and (choice.picker or choice.conversation_id is not None):
-        raise click.UsageError(
-            "--session and --resume are mutually exclusive; "
-            "prefer --resume (--session is deprecated).",
-        )
-
-    from omnigent.harness_startup_config import resolve_harness_command
-    from omnigent.kimi_native import run_kimi_native
-
-    cfg = _load_effective_config()
-    # Thread ``--command`` / ``harness.kimi-native.command`` config into the
-    # runner via the canonical ``OMNIGENT_KIMI_PATH`` env var (set before
-    # ``_ensure_backend`` so a locally-spawned daemon inherits it; a remote
-    # ``--server`` runner reads its own host env, so set the var there).
-    _resolved = resolve_harness_command("kimi-native", default="", explicit=None, cfg=cfg)
-    if _resolved:
-        os.environ["OMNIGENT_KIMI_PATH"] = _resolved
-    if server is None:
-        server = cfg.get("server")
-    auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-    server = _ensure_backend(server)
-    resolved_session_id = (
-        choice.conversation_id if choice.conversation_id is not None else session_id
-    )
-
-    run_kimi_native(
-        server=server,
-        session_id=resolved_session_id,
-        resume_picker=choice.picker,
-        kimi_args=_resolve_harness_startup_args(cfg, "kimi-native", kimi_args),
-        auto_open_conversation=auto_open_conversation,
-    )
 
 
 @cli.command()
@@ -14470,6 +13050,198 @@ def _strip_one_shot_flags(argv: list[str]) -> list[str]:
                 continue
         out.append(token)
     return out
+
+
+def _bundled_agent_brain_harness(name: str) -> str | None:
+    """Return the canonical brain harness of a bundled agent, or ``None``.
+
+    Reads the brain harness (``executor.config.harness``, falling back to
+    ``executor.harness`` / ``executor.type``) from the bundled agent's
+    ``config.yaml`` — e.g. polly's and debby's ``claude-sdk`` brain — so
+    credential fallback can target the model family the brain actually
+    runs on. Mirrors :func:`_peek_default_agent_harness`'s YAML-reading
+    style.
+
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    :returns: The canonical harness id, e.g. ``"claude-sdk"``, or ``None``
+        when the bundle is missing/unreadable or declares no brain harness.
+    """
+    config_path = Path(_bundled_example_path(name)) / "config.yaml"
+    if not config_path.is_file():
+        return None
+    try:
+        raw = yaml.safe_load(config_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    executor = raw.get("executor")
+    if not isinstance(executor, dict):
+        return None
+    declared: object = None
+    config_block = executor.get("config")
+    if isinstance(config_block, dict):
+        declared = config_block.get("harness")
+    if not isinstance(declared, str) or not declared:
+        declared = executor.get("harness") or executor.get("type")
+    if not isinstance(declared, str) or not declared:
+        return None
+    return canonicalize_harness(declared) or declared
+
+
+def _ensure_bundled_agent_brain_credential(name: str) -> None:
+    """Ensure the bundled agent's brain harness has a credential to launch with.
+
+    Polly and Debby launch with the *first available* credential for their
+    brain's model family rather than requiring a specific one to be marked
+    ``default: true`` up front — so users can start without manually
+    picking/configuring one. When no default provider is configured for the
+    agent's brain harness, pick the first available credential serving that
+    family and mark it the default so the downstream ``run`` resolves it —
+    printing a notice (to stderr) since this mutates the user's config on a
+    launch command, mirroring the confirmation ``setup`` / ``/model`` show.
+
+    No-op when a default is already configured, or when no credential is
+    available for the family (the harness raises its own launch error then).
+    Only an explicit default (or none) is touched — an existing default is
+    never overridden. Marking the first available credential the default
+    mirrors :func:`_add_provider_entry`'s "a first provider just works"
+    adoption (see :func:`omnigent.setup`).
+
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    """
+    from omnigent.errors import OmnigentError
+    from omnigent.onboarding.configure_models import family_label
+    from omnigent.onboarding.detected import effective_config_with_detected
+    from omnigent.onboarding.provider_config import (
+        default_provider_for_harness,
+        harness_family,
+        load_config,
+        load_providers,
+        provider_families,
+        set_default_provider,
+    )
+
+    brain_harness = _bundled_agent_brain_harness(name)
+    if brain_harness is None:
+        return
+    family = harness_family(brain_harness)
+    if family is None:
+        return
+    # Best-effort: adopting a default must never crash a launch. Any malformed
+    # or unexpected config state (corrupt YAML, ambiguous defaults, a divergent
+    # on-disk entry) degrades to a no-op — the harness then raises its own
+    # credential error.
+    try:
+        config = effective_config_with_detected(load_config())
+        if default_provider_for_harness(config, brain_harness) is not None:
+            return
+        on_disk = _load_global_config()
+        disk_block = on_disk.get("providers") if isinstance(on_disk, dict) else None
+        if not isinstance(disk_block, dict):
+            return
+        # Skip ambient-detected entries (not on disk) — auto-defaulted upstream.
+        candidates = [
+            (entry_name, entry)
+            for entry_name, entry in load_providers(config).items()
+            if family in provider_families(entry) and entry_name in disk_block
+        ]
+        if not candidates:
+            return
+        entry_name, entry = candidates[0]
+        _save_global_config({"providers": set_default_provider(disk_block, entry_name, family)})
+        family_name = family_label(family)
+        credential_name = _credential_label(entry_name, entry)
+        # Announce: this mutates the user's config on a launch command.
+        if len(candidates) > 1:
+            message = (
+                f"No default {family_name} credential set — "
+                f"using {credential_name} "
+                f"({len(candidates)} {family_name} credentials found; "
+                "pick another with: omnigent /model) and saving it as the default."
+            )
+        else:
+            message = (
+                f"No default {family_name} credential set — "
+                f"using {credential_name} and saving it as the default "
+                "(change anytime with: omnigent /model)."
+            )
+        click.echo(
+            message,
+            err=True,
+        )
+        return
+    except (OSError, yaml.YAMLError, OmnigentError):
+        return
+
+
+def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:
+    """Reject Kiro-owned resume flags in passthrough args."""
+    reserved = {"--resume", "--resume-id", "--resume-picker"}
+    if any(arg == flag or arg.startswith(f"{flag}=") for arg in kiro_args for flag in reserved):
+        raise click.UsageError(
+            "Kiro resume flags are reserved for Omnigent resume handling; use "
+            "`omnigent kiro --resume [CONVERSATION]` instead."
+        )
+
+
+def _build_kiro_launch_args(
+    *,
+    effort: str | None,
+    kiro_agent: str | None,
+    trust_tools: tuple[str, ...],
+    trust_all_tools: bool,
+    passthrough_args: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Build mapped Kiro CLI args for the runner-owned terminal launch."""
+    args: list[str] = []
+    if effort:
+        args.extend(["--effort", effort])
+    if kiro_agent:
+        args.extend(["--agent", kiro_agent])
+    for tool in trust_tools:
+        args.extend(["--trust-tools", tool])
+    if trust_all_tools:
+        args.append("--trust-all-tools")
+    args.extend(passthrough_args)
+    return tuple(args)
+
+
+def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
+    """Forward a bundled-agent subcommand to ``run`` on its packaged path.
+
+    Implements ``omnigent polly`` / ``omnigent debby``: resolves the bundled
+    example directory and re-dispatches through the ``run`` command's own
+    parser, so every ``run`` flag (``--server``, ``-p``, ``--resume``, ...)
+    works unchanged on the agent shorthands without duplicating ``run``'s
+    option declarations.
+
+    ``prog_name`` is pinned to ``"omnigent run"`` so context-derived output —
+    usage errors and the :func:`_build_resume_parts` replay prefix — renders
+    as the canonical ``omnigent run <path>`` form, which stays valid when
+    replayed.
+
+    :param name: Bundled example directory name, e.g. ``"polly"``.
+    :param run_args: Unparsed pass-through CLI args for ``run``,
+        e.g. ``("-p", "review the last commit")``.
+    """
+    # Polly/Debby launch with the first available credential for their
+    # brain's family when no specific one is configured up front (#334).
+    _ensure_bundled_agent_brain_credential(name)
+    # standalone_mode=False propagates ClickExceptions to main()'s handler
+    # (CLI diagnostics logging + setup hint) instead of exiting inline,
+    # matching the outer `cli(args=argv, standalone_mode=False)` dispatch.
+    run.main(
+        args=[_bundled_example_path(name), *run_args],
+        prog_name="omnigent run",
+        standalone_mode=False,
+    )
+
+
+# Native coding-agent (TUI) subcommands (claude/codex/pi/…) live in
+# omnigent.cli_native; register them on the group here, at module bottom, so the
+# shared launch helpers their bodies close over are already defined.
+_register_native_commands(cli)
 
 
 if __name__ == "__main__":
