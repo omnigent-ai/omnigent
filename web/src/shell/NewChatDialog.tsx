@@ -2261,19 +2261,23 @@ export function NewChatLandingScreen() {
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
-  // Whether the gear config modal has any knobs to show for the selected agent
+  const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
+  // Smart routing is offered in the config modal — as a Model choice for Claude,
+  // a standalone toggle otherwise — when the server enables it and the selected
+  // harness is routable.
+  const smartRoutingEligible =
+    smartRoutingEnabled && _ROUTABLE_HARNESSES.has(selectedAgent?.harness ?? "");
+  // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
-  // brain harness qualify too.
+  // brain harness qualify, as does any routing-eligible agent — Smart Routing
+  // lives only in the modal now, so an agent with just that (e.g. Pi) still
+  // needs the gear.
   const selectedAgentHasKnobs =
     supportsPermissionMode ||
     supportsApprovalMode ||
     supportsCursorMode ||
+    smartRoutingEligible ||
     (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabels);
-  const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Smart routing is offered as a Model choice in the config modal only when
-  // the server enables it and the selected harness is routable.
-  const smartRoutingEligible =
-    smartRoutingEnabled && _ROUTABLE_HARNESSES.has(selectedAgent?.harness ?? "");
   // Label/value pairs summarizing the selected agent's current run-config, for
   // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
   // user can read the active settings without opening it. "Default" = an unset

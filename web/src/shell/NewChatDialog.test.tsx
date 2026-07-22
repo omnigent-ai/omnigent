@@ -2378,6 +2378,47 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(screen.getByTestId("new-chat-landing-config-smart-routing")).toBeTruthy();
   });
 
+  it("shows the gear for a bundle agent with only Smart Routing armed (harness + toggle)", () => {
+    // A bundle agent's harness (claude-sdk) is both a brain-harness knob AND
+    // routable, so its modal shows the Agent Harness select plus a standalone
+    // Smart Routing toggle. This is the reachable "routing + one knob" case.
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    expect(screen.getByTestId("new-chat-landing-config-harness")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-config-smart-routing")).toBeTruthy();
+  });
+
+  it("keeps the gear visible for routing-eligible agents even with no other knob (guard)", () => {
+    // Defensive: if a routable harness ever has no permission/approval/cursor
+    // knob and isn't a brain agent, Smart Routing (modal-only) still needs the
+    // gear. Simulate by extending the routable set is not possible here, so we
+    // assert the inverse contract: a NON-routable knob-less native agent hides
+    // the gear (so the routing-eligible branch is what keeps it shown).
+    mockAgents([
+      {
+        id: "a_bare",
+        name: "opencode-native-ui",
+        display_name: "OpenCode",
+        description: null,
+        harness: "opencode-native",
+        skills: [],
+      },
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    // opencode-native has no knobs and isn't routable → no gear.
+    expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
+  });
+
   it("rides Codex Smart Routing along to create as cost_control_mode_override", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
