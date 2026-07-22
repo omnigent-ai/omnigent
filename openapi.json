@@ -2197,8 +2197,15 @@
             "title": "Defaultreasoningeffort"
           },
           "displayName": {
-            "title": "Displayname",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Displayname"
           },
           "id": {
             "title": "Id",
@@ -2235,8 +2242,7 @@
           }
         },
         "required": [
-          "id",
-          "displayName"
+          "id"
         ],
         "title": "NativeModelOption",
         "type": "object"

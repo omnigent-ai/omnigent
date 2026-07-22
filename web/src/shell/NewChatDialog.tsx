@@ -1984,7 +1984,10 @@ export function NewChatLandingScreen() {
             id: model.id,
             displayName: model.label,
           }))
-        : (hostClaudeModelOptions ?? []),
+        : (hostClaudeModelOptions ?? []).map((option) => ({
+            id: option.id,
+            displayName: option.displayName ?? option.id,
+          })),
     [hostClaudeModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the

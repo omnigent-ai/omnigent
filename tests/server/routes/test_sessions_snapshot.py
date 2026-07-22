@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.server.routes import sessions as _sessions_mod
@@ -47,10 +46,29 @@ async def _drain_model_options(session_id: str) -> None:
         await asyncio.sleep(0)
 
 
-def test_model_options_wire_rejects_snake_case_display_name() -> None:
-    """The API boundary enforces the camelCase model-option contract."""
-    with pytest.raises(ValidationError):
-        _sessions_mod._model_options_from_wire([{"id": "opus", "display_name": "Opus 4.10"}])
+def test_model_options_wire_keeps_rows_without_display_name() -> None:
+    """Provider rows may omit ``displayName`` — the UI falls back to ``id``.
+
+    Codex ``model/list`` and OpenCode ``/api/model`` rows are
+    provider-supplied; requiring ``displayName`` would blank the whole
+    picker when one row lacks it.
+    """
+    options = _sessions_mod._model_options_from_wire([{"id": "opencode-go/glm-5.2"}])
+    assert [option["id"] for option in options] == ["opencode-go/glm-5.2"]
+    assert "displayName" not in options[0]
+
+
+def test_model_options_wire_skips_malformed_rows_not_the_catalog() -> None:
+    """One invalid row (or non-dict) is dropped; its siblings survive."""
+    options = _sessions_mod._model_options_from_wire(
+        [
+            {"id": "opus", "displayName": "Opus 4.10"},
+            {"displayName": "no id"},
+            "not-a-dict",
+            {"id": 42},
+        ]
+    )
+    assert [option["id"] for option in options] == ["opus"]
 
 
 class _ConversationStore:

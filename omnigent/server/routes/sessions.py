@@ -22407,17 +22407,23 @@ def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
 
     :param raw_models: JSON value from the runner's
         ``{"models": [...]}`` response.
-    :returns: Raw model options for the session snapshot.
-    :raises ValueError: If the payload is not the expected list/dict
-        shape.
+    :returns: Raw model options for the session snapshot; malformed
+        rows are skipped so one bad provider row cannot blank the picker.
+    :raises ValueError: If the payload is not a list.
     """
     if not isinstance(raw_models, list):
         raise ValueError("Native model options payload must be a list")
     options: list[dict[str, Any]] = []
     for raw_model in raw_models:
+        # Skip malformed rows instead of discarding the whole catalog: one
+        # provider-supplied oddity must not blank the picker for the session.
         if not isinstance(raw_model, dict):
-            raise ValueError("Native model option must be an object")
-        option = NativeModelOption.model_validate(raw_model)
+            continue
+        try:
+            option = NativeModelOption.model_validate(raw_model)
+        except ValidationError:
+            _logger.debug("Skipping malformed native model option: %r", raw_model)
+            continue
         options.append(option.model_dump(exclude_defaults=True, exclude_none=True))
     return options
 

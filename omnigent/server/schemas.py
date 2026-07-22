@@ -176,7 +176,9 @@ class NativeModelOption(BaseModel):
 
     id: str
     model: str | None = None
-    displayName: str
+    # Optional: Codex model/list and OpenCode /api/model rows are
+    # provider-supplied and may omit it; the UI falls back to ``id``.
+    displayName: str | None = None
     defaultReasoningEffort: str | None = None
     supportedReasoningEfforts: list[NativeReasoningEffortOption] = Field(default_factory=list)
     isDefault: bool | None = None
