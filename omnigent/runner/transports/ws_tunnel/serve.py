@@ -664,8 +664,25 @@ async def _serve_tunnel_once(
                             # cancellation settles (and its error is retrieved)
                             # before we drain and close.
                             recv_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError, WebSocketException):
+                            try:
                                 await recv_task
+                            except asyncio.CancelledError:
+                                # Normal: the pending read was cancelled.
+                                pass
+                            except WebSocketException:
+                                # recv() had already failed with a close on the
+                                # same tick as the shutdown signal. We still
+                                # drain + close (below) so the exit stays quiet,
+                                # but the socket may already be dead — meaning
+                                # the [DONE] frames won't reach the server and it
+                                # will see a disconnect. Log at debug so that is
+                                # diagnosable without disturbing the quiet UX.
+                                _logger.debug(
+                                    "recv failed while settling cancelled read "
+                                    "during graceful shutdown of runner %s",
+                                    runner_id,
+                                    exc_info=True,
+                                )
                             await _graceful_drain(
                                 dispatch_tasks,
                                 on_graceful_shutdown,
