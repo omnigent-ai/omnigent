@@ -63,6 +63,7 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -170,7 +171,11 @@ const TIME_MARKER_SLOT_CLASS =
 // row-selection highlight in this file, at /5 (half the original /10) so it's a
 // gentler gray in light mode (a gentler glow in dark mode) and reads as "active
 // area" without the heavy fill. Pair with `transition-colors` so it eases in.
-const DROP_TARGET_HIGHLIGHT = "bg-primary/5";
+const SIDEBAR_HOVER_HIGHLIGHT =
+  "hover:bg-[var(--sidebar-hover)] hover:text-[var(--sidebar-active-foreground)]";
+const SIDEBAR_ACTIVE_HIGHLIGHT =
+  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]";
+const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -440,7 +445,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         // nothing lingers.
         "md:relative md:inset-auto md:translate-x-0 md:overflow-hidden",
         open
-          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-xl md:border md:border-border md:shadow-lg"
+          ? "md:m-2 md:w-[var(--sidebar-width)] md:rounded-[var(--radius-otto-md)] md:border md:border-border"
           : "md:m-0 md:w-0 md:border-0",
       )}
       style={
@@ -473,7 +478,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
       ) : (
         <>
-          <div className="flex items-center justify-between px-4 pt-3">
+          <div className="mt-1 flex h-12 shrink-0 items-center justify-between px-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -483,9 +488,14 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             <Link
               to="/"
               onClick={onNavClick}
-              className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
+              className="rounded-none transition-opacity duration-200 ease-[var(--ease-otto)] hover:opacity-70"
             >
-              Omnigent
+              <img
+                src={omnigentWordmark}
+                alt="Omnigent"
+                data-testid="sidebar-wordmark"
+                className="h-[15px] w-auto shrink-0 dark:invert"
+              />
             </Link>
             <div className="flex items-center gap-1">
               {/* Inbox lives at the top next to the collapse toggle. Rendered
@@ -498,7 +508,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     variant="ghost"
                     size="icon"
                     aria-label="Inbox"
-                    className={cn("relative rounded-full", isInboxPage && "bg-muted")}
+                    className={cn(
+                      "relative size-6 rounded-sm text-muted-foreground hover:text-foreground",
+                      isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                    )}
                     data-testid="inbox-button"
                   >
                     <Link to="/inbox" onClick={onNavClick}>
@@ -528,7 +541,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                     size="icon"
                     aria-label="Close sidebar"
                     onClick={onClose}
-                    className="rounded-full"
+                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
                   >
                     {/* panel-right-open while the sidebar IS open — this button
                     only renders in the open state (ChatHeader's PanelLeftIcon
@@ -554,8 +567,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // px-2 + gap-1 puts the icon on the sidebar's left (red) column
                 // and the label on the label (blue) column — matching section
                 // headers and project folders.
-                "w-full justify-start gap-1 px-2 text-sm",
-                isNewChatPage && "bg-muted font-semibold",
+                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] px-2 font-normal",
+                SIDEBAR_HOVER_HIGHLIGHT,
+                isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
               variant="ghost"
               data-testid="new-chat-button"
@@ -570,7 +584,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onNavClick(e);
                 }}
               >
-                <SquarePenIcon className="size-4 text-foreground" />
+                <SquarePenIcon className="size-3.5 text-muted-foreground" />
                 New session
               </Link>
             </Button>
@@ -595,7 +609,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onClick={() => onOpenSearch?.()}
                   aria-label="Search"
                   data-testid="sidebar-search-button"
-                  className="group relative flex min-h-8 flex-1 items-center rounded-full border border-input pr-2 pl-7 text-left text-sm text-muted-foreground transition hover:bg-muted focus-visible:outline-1"
+                  className={cn(
+                    "group relative flex h-7 flex-1 items-center rounded-[var(--radius-otto-button)] border border-input pr-2 pl-7 text-left text-13 text-muted-foreground transition-colors duration-200 ease-[var(--ease-otto)] focus-visible:outline-1",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                  )}
                 >
                   <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 size-3.5" />
                   <span className="flex-1 truncate">Search</span>
@@ -613,7 +630,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                       size="icon-sm"
                       aria-label="Select sessions"
                       data-testid="toggle-selection-mode"
-                      className="shrink-0 rounded-full"
+                      className="shrink-0 rounded-sm"
                       onClick={() => setSelectionMode(true)}
                     >
                       <ListChecksIcon className="size-3.5" />
@@ -631,17 +648,25 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
           scrolls. Hidden during selection mode, where the bulk-action bar owns
           this strip. */}
           {multiUser && !selectionMode && (
-            <div className="px-3 pb-2">
+            <div className="px-2 pb-2">
               <Tabs
                 value={activeTab}
                 onValueChange={(v) => setActiveTab(v as SidebarTab)}
                 className="w-full"
               >
                 <TabsList className="w-full">
-                  <TabsTrigger value="mine" data-testid="sidebar-tab-mine" className="min-w-0">
+                  <TabsTrigger
+                    value="mine"
+                    data-testid="sidebar-tab-mine"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                  >
                     <span className="min-w-0 truncate">My sessions</span>
                   </TabsTrigger>
-                  <TabsTrigger value="shared" data-testid="sidebar-tab-shared" className="min-w-0">
+                  <TabsTrigger
+                    value="shared"
+                    data-testid="sidebar-tab-shared"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                  >
                     <span className="min-w-0 truncate">Shared with me</span>
                   </TabsTrigger>
                 </TabsList>
@@ -654,7 +679,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
           flow, over the bottom-left corner). */}
           <nav
             ref={scrollContainerRef}
-            className="relative flex-1 overflow-y-auto px-3 pb-3 max-md:pb-16 [scrollbar-gutter:stable]"
+            className="relative flex-1 overflow-y-auto px-2 pb-3 max-md:pb-16 [scrollbar-gutter:stable]"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -858,7 +883,7 @@ function ProjectFolder({
     <div
       ref={setNodeRef}
       className={cn(
-        "rounded-md transition-colors",
+        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
         // Subtle background tint on drag-over — no border, no shadow.
         isOver && DROP_TARGET_HIGHLIGHT,
       )}
@@ -1444,7 +1469,7 @@ function ConversationList({
         onDragEnd={handleDragEnd}
         onDragCancel={() => setActiveDrag(null)}
       >
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-4 pr-1">
           {/* Removing a filed session from its project means dropping it back
             onto the flat "Chats" list — so the Chats section itself is the
             ungroup target (wrapped below). This top strip is only a FALLBACK
@@ -1665,7 +1690,10 @@ function ChatsDropZone({ active, children }: { active: boolean; children: ReactN
     <div
       ref={setNodeRef}
       data-testid="sidebar-chats-drop-zone"
-      className={cn("rounded-md transition-colors", active && isOver && DROP_TARGET_HIGHLIGHT)}
+      className={cn(
+        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        active && isOver && DROP_TARGET_HIGHLIGHT,
+      )}
     >
       {children}
     </div>
@@ -1688,7 +1716,10 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     <div
       ref={setNodeRef}
       data-testid="sidebar-pin-drop-zone"
-      className={cn("rounded-md transition-colors", active && isOver && DROP_TARGET_HIGHLIGHT)}
+      className={cn(
+        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        active && isOver && DROP_TARGET_HIGHLIGHT,
+      )}
     >
       {children}
     </div>
@@ -1771,7 +1802,14 @@ function SectionHeader({
         type="button"
         aria-expanded={!collapsed}
         onClick={onToggleCollapsed}
-        className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-sm text-muted-foreground transition-colors hover:text-foreground"
+        className={
+          icon
+            ? `${cn(
+                "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
+                SIDEBAR_HOVER_HIGHLIGHT,
+              )} sidebar-compact-text text-foreground`
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+        }
       >
         {icon ? (
           // Headers with a leading icon (project folders) swap the folder for a
@@ -1952,7 +1990,7 @@ function ConversationSection({
             </p>
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col gap-0.5", indentRows && "pl-3")}>
+            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0.5")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -2678,11 +2716,12 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "relative flex w-full flex-col gap-0.5 rounded-md px-2 py-2 text-left text-sm hover:bg-muted",
-        !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-16"),
+        "sidebar-compact-text relative flex min-h-7 w-full flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
+        SIDEBAR_HOVER_HIGHLIGHT,
+        !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-14"),
         selectionMode && "pr-10",
-        isActive && "bg-muted",
-        selectionMode && isSelected && "bg-primary/5",
+        isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+        selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
       onClick={(e) => {
         // Swallow the click that trails a drag so it doesn't navigate.
@@ -2820,7 +2859,7 @@ function ConversationRow({
         <Button
           type="button"
           variant="ghost"
-          size="icon-sm"
+          size="icon-xs"
           aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
           data-testid="quick-pin-conversation"
           className={cn(
@@ -2857,7 +2896,7 @@ function ConversationRow({
             <Button
               type="button"
               variant="ghost"
-              size="icon-sm"
+              size="icon-xs"
               aria-label="Conversation actions"
               data-testid="conversation-actions"
               // Absolute-positioned trigger. On mobile (no hover state)

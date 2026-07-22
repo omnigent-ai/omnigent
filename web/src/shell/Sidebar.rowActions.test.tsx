@@ -191,6 +191,13 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("quick pin/unpin hover button", () => {
+  it("uses compact 24px controls for row actions", () => {
+    renderSidebar();
+
+    expect(screen.getByTestId("quick-pin-conversation")).toHaveClass("size-6");
+    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
+  });
+
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
     renderSidebar();
 
