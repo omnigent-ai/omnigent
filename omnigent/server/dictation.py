@@ -17,6 +17,11 @@ Engines are looked up by name in a small registry
   model on disk; both are checked lazily so the base install carries no
   new dependencies.
 - ``sherpa`` — the same engine, named explicitly.
+- ``remote`` — relays takes to a dictation worker on another machine
+  (``OMNIGENT_DICTATION_REMOTE_URL``), so a small main server can borrow
+  a beefier LAN box's CPU. Falls back to the local sherpa engine (when
+  models are installed) if the worker is unreachable. See
+  :class:`RemoteDictationEngine` and ``dictation_worker.py``.
 - ``fake`` — a deterministic scripted engine used by tests and the
   Playwright e2e suite; no native dependency, no models, no microphone.
 
@@ -65,11 +70,14 @@ the default locations.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import json
 import logging
 import os
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,12 +89,20 @@ ENGINE_ENV = "OMNIGENT_DICTATION_ENGINE"
 MODEL_DIR_ENV = "OMNIGENT_DICTATION_MODEL_DIR"
 PUNCT_DIR_ENV = "OMNIGENT_DICTATION_PUNCT_DIR"
 MAX_STREAMS_ENV = "OMNIGENT_DICTATION_MAX_STREAMS"
+#: Worker stream URL for the ``remote`` engine, e.g.
+#: ``ws://venus:8100/v1/dictation/stream``.
+REMOTE_URL_ENV = "OMNIGENT_DICTATION_REMOTE_URL"
 
 #: Built-in engine names. The default (empty ``OMNIGENT_DICTATION_ENGINE``)
 #: resolves to the sherpa engine.
 ENGINE_SHERPA = "sherpa"
 ENGINE_FAKE = "fake"
+ENGINE_REMOTE = "remote"
 _DEFAULT_ENGINE = ENGINE_SHERPA
+
+#: Worker handshake budget: covers a cold model load on the worker side.
+_REMOTE_READY_TIMEOUT_S = 30.0
+_REMOTE_STOP_TIMEOUT_S = 10.0
 
 #: The one PCM format the stream route accepts: 16 kHz mono s16le.
 SAMPLE_RATE = 16000
@@ -96,6 +112,7 @@ _BYTES_PER_SECOND = SAMPLE_RATE * 2
 REASON_EXTRA_NOT_INSTALLED = "extra_not_installed"
 REASON_MODELS_MISSING = "models_missing"
 REASON_UNKNOWN_ENGINE = "unknown_engine"
+REASON_REMOTE_URL_MISSING = "remote_url_missing"
 
 DEFAULT_MAX_STREAMS = 2
 
@@ -455,6 +472,186 @@ class _SherpaStream:
         """No-op: the recognizer stream frees with the handle."""
 
 
+class RemoteDictationEngine:
+    """Relays dictation takes to a remote worker over WebSocket.
+
+    The worker is anything speaking the ``/v1/dictation/stream`` wire
+    protocol — another omnigent server or the standalone
+    ``python -m omnigent.server.dictation_worker``. Lets a small main
+    server (a mini-PC) borrow a beefier LAN box for recognition.
+
+    Fallback happens per take, at stream creation: if the worker is
+    unreachable, the lazily-built local engine (when models are
+    installed) serves the take instead. A worker dying mid-take fails
+    that take; the next one retries the worker.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        fallback_factory: Callable[[], DictationEngine] | None = None,
+    ) -> None:
+        """
+        :param url: Worker stream URL, e.g.
+            ``ws://venus:8100/v1/dictation/stream``.
+        :param fallback_factory: Builds the local fallback engine on
+            first use (lazy — its model weights cost ~real RAM), or
+            ``None`` when no local model is installed.
+        """
+        self._url = url
+        self._fallback_factory = fallback_factory
+        self._fallback: DictationEngine | None = None
+        self._fallback_lock = threading.Lock()
+
+    def create_stream(self) -> DictationStreamHandle:
+        """Connect a take to the worker, or to the local fallback."""
+        try:
+            return _RemoteStream(self._url)
+        except Exception:
+            if self._fallback_factory is None:
+                raise
+            _logger.warning(
+                "dictation worker unreachable at %s; using local fallback engine",
+                self._url,
+                exc_info=True,
+            )
+            with self._fallback_lock:
+                if self._fallback is None:
+                    self._fallback = self._fallback_factory()
+            return self._fallback.create_stream()
+
+
+class _RemoteStream:
+    """One relayed take: raw PCM up, transcript events down.
+
+    A daemon reader thread folds the worker's ``partial``/``final``
+    events into state that :meth:`feed_pcm16` returns on each call, so
+    the relay presents the same synchronous handle interface the local
+    engines do. The worker returns display-ready text already, so the
+    relay just forwards it.
+    """
+
+    def __init__(self, url: str) -> None:
+        from websockets.sync.client import connect
+
+        self._ws = connect(url, open_timeout=5)
+        try:
+            deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
+            while True:
+                message = self._ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+                if not isinstance(message, str):
+                    continue
+                event = json.loads(message)
+                if event.get("type") == "ready":
+                    break
+                if event.get("type") == "error":
+                    raise RuntimeError(f"dictation worker error: {event.get('message')}")
+        except BaseException:
+            self._ws.close()
+            raise
+        self._lock = threading.Lock()
+        self._partial = ""
+        self._finals: list[str] = []
+        self._tail = ""
+        self._dead = False
+        self._stopped = threading.Event()
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_loop(self) -> None:
+        try:
+            while True:
+                message = self._ws.recv()
+                if not isinstance(message, str):
+                    continue
+                try:
+                    event = json.loads(message)
+                except ValueError:
+                    continue
+                kind = event.get("type")
+                with self._lock:
+                    if kind == "partial":
+                        self._partial = str(event.get("text", ""))
+                    elif kind == "final":
+                        self._finals.append(str(event.get("text", "")))
+                        self._partial = ""
+                    elif kind == "stopped":
+                        self._tail = str(event.get("text", ""))
+                        break
+                    elif kind == "error":
+                        self._dead = True
+                        break
+        except Exception:  # noqa: BLE001 - any transport failure kills the take
+            with self._lock:
+                self._dead = True
+        self._stopped.set()
+
+    def feed_pcm16(self, data: bytes) -> DictationUpdate:
+        """Ship a chunk to the worker; return its latest transcript state."""
+        with self._lock:
+            if self._dead:
+                raise RuntimeError("dictation worker connection lost")
+        self._ws.send(data)
+        with self._lock:
+            finalized = " ".join(t for t in self._finals if t).strip() or None
+            self._finals.clear()
+            return DictationUpdate(partial=self._partial, finalized=finalized)
+
+    def finish(self) -> str:
+        """Ask the worker to flush; return its tail utterance."""
+        with contextlib.suppress(Exception):
+            self._ws.send(json.dumps({"type": "stop"}))
+        self._stopped.wait(timeout=_REMOTE_STOP_TIMEOUT_S)
+        self.close()
+        with self._lock:
+            return self._tail
+
+    def close(self) -> None:
+        """Close the worker socket, releasing its capacity slot.
+
+        Also unblocks the reader thread's ``recv``. Idempotent — the
+        sync websockets client tolerates repeated ``close`` calls.
+        """
+        with contextlib.suppress(Exception):
+            self._ws.close()
+
+
+def _remote_url() -> str:
+    """The configured worker stream URL (may be empty)."""
+    return os.environ.get(REMOTE_URL_ENV, "").strip()
+
+
+def _remote_available() -> tuple[bool, str | None]:
+    """Availability probe for the remote engine.
+
+    A configured worker counts as available without probing it — the
+    worker may be briefly down or still booting, and the stream route
+    degrades cleanly (local fallback, or an error frame) when a take
+    actually starts.
+    """
+    if not _remote_url():
+        return False, REASON_REMOTE_URL_MISSING
+    return True, None
+
+
+def _build_remote_engine() -> RemoteDictationEngine:
+    """Factory for the remote engine, with a lazy local fallback.
+
+    Local models, when installed, back the worker up. The fallback
+    factory is lazy so its ~650 MB of weights cost no RAM unless the
+    worker actually goes down.
+    """
+    url = _remote_url()
+    if not url:
+        raise RuntimeError(f"dictation unavailable: {REASON_REMOTE_URL_MISSING}")
+    fallback = (
+        (lambda: SherpaDictationEngine(_asr_dir(), _punct_dir()))
+        if _sherpa_available()[0]
+        else None
+    )
+    return RemoteDictationEngine(url, fallback_factory=fallback)
+
+
 #: Scripted transcript the fake engine reveals; asserted verbatim by the
 #: server route tests and the Playwright e2e test.
 FAKE_SCRIPT = "server dictation smoke test transcript"
@@ -522,4 +719,5 @@ register_engine(
     lambda: SherpaDictationEngine(_asr_dir(), _punct_dir()),
     available=_sherpa_available,
 )
+register_engine(ENGINE_REMOTE, _build_remote_engine, available=_remote_available)
 register_engine(ENGINE_FAKE, FakeDictationEngine)

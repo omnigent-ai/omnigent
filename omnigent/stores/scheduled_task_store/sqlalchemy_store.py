@@ -325,3 +325,75 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             rows = session.execute(stmt).scalars().all()
             return [_run_to_entity(r) for r in rows]
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """Transition a still-``running`` run to a terminal status.
+
+        Conditional on the current status being ``running`` so an
+        already-terminal run is never clobbered and concurrent sweeps cannot
+        double-transition (see the interface docstring).
+        """
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            if row is None or row.status != running_code:
+                return None
+            row.status = encode_scheduled_task_run_status(status)
+            row.finished_at = finished_at
+            row.error = error
+            row.error_code = error_code
+            session.flush()
+            return _run_to_entity(row)
+
+    def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
+        """Return the ``running`` run for a conversation, or ``None``.
+
+        Workspace-scoped reverse lookup for the event-driven completion hook;
+        backed by ``ix_scheduled_task_runs_conversation_id``. A conversation has
+        at most one ``running`` run, so ``.first()`` is exact rather than lossy.
+        """
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status == running_code)
+            )
+            row = session.execute(stmt).scalars().first()
+            return _run_to_entity(row) if row is not None else None
+
+    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
+        """List ``running`` runs for the given tasks in the current workspace.
+
+        Powers the lazy-on-read stale backstop on the scheduled-task LIST
+        endpoint: the route resolves the owner's tasks, then this returns their
+        still-``running`` runs (one indexed, workspace-scoped query over the
+        ``scheduled_task_id`` index) so the route can force-fail the stale ones.
+        An empty ``scheduled_task_ids`` returns an empty list without a query.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``running`` runs for those tasks, ordered
+            ``scheduled_at DESC, id DESC``.
+        """
+        if not scheduled_task_ids:
+            return []
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.scheduled_task_id.in_(scheduled_task_ids))
+                .where(SqlScheduledTaskRun.status == running_code)
+                .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_run_to_entity(r) for r in rows]

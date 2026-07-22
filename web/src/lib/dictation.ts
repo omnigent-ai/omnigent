@@ -70,11 +70,15 @@ export function parseDictationEvent(raw: string): DictationEvent | null {
 }
 
 // Client budgets must exceed the server's own worst cases or takes fail
-// spuriously right when they'd have succeeded. The dominant cost is the
-// first take's engine construction, which loads the model weights (seconds
-// on a cold server); the stop budget just needs to outlast the tail flush.
-const READY_TIMEOUT_MS = 20_000;
-const STOP_TIMEOUT_MS = 5_000;
+// spuriously right when they'd have succeeded:
+// - ready: engine construction loads model weights on the first take, and
+//   the remote-relay path allows the worker 30 s for its own cold load
+//   (_REMOTE_READY_TIMEOUT_S in omnigent/server/dictation.py).
+// - stop: the relay waits up to 10 s (_REMOTE_STOP_TIMEOUT_S) for the
+//   worker to flush the tail; resolving earlier would drop the user's
+//   last words even though they were transcribed moments later.
+const READY_TIMEOUT_MS = 40_000;
+const STOP_TIMEOUT_MS = 15_000;
 
 // How long stop() waits for the worklet to post its final partial chunk
 // before tearing the audio graph down. Message-port turnaround is

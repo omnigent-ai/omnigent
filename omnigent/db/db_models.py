@@ -1478,4 +1478,12 @@ class SqlScheduledTaskRun(OmnigentBase):
             "scheduled_at",
             "id",
         ),
+        # Reverse lookup conversation_id -> run for the event-driven completion
+        # hook (get_running_run_by_conversation), which fires on every turn's
+        # terminal edge; without this the lookup is a full-table scan.
+        Index(
+            "ix_scheduled_task_runs_conversation_id",
+            "workspace_id",
+            "conversation_id",
+        ),
     )

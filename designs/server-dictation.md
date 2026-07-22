@@ -97,7 +97,8 @@ connections (default 2, `OMNIGENT_DICTATION_MAX_STREAMS`).
 | `OMNIGENT_DICTATION_MODEL_DIR` | `~/.omnigent/models/dictation/asr` | dir containing `encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`, `tokens.txt` |
 | `OMNIGENT_DICTATION_PUNCT_DIR` | `~/.omnigent/models/dictation/punct` | optional online-punctuation model dir (`model*.onnx` + `bpe.vocab`) |
 | `OMNIGENT_DICTATION_MAX_STREAMS` | `2` | concurrent dictation WebSockets |
-| `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name; `fake` for tests |
+| `OMNIGENT_DICTATION_ENGINE` | unset (`sherpa`) | engine to use by registered name (`sherpa`, `remote`, `fake`) |
+| `OMNIGENT_DICTATION_REMOTE_URL` | unset | worker stream URL for the `remote` engine, e.g. `ws://venus:8100/v1/dictation/stream` |
 
 `scripts/fetch-dictation-models.sh` downloads a known-good pair (streaming
 Nemotron 0.6 B int8 + English online punctuation, both Apache-2.0 upstream)
@@ -132,11 +133,46 @@ recognizer output is emitted as-is), and the mic button's `lang` prop only
 affects the Web Speech path — the server path's language is decided by the
 operator's model choice.
 
-Where a mini-PC server can't run the model an operator wants at realtime, a
-follow-up adds a **remote worker**: a `RemoteDictationEngine` (registered as
-`OMNIGENT_DICTATION_ENGINE=remote`) that relays takes over this same wire
-protocol to a beefier LAN box. It slots into the registry without changing
-the route or the protocol, so it ships separately from this core PR.
+### Remote worker
+
+Where a mini-PC server can't run the model an operator wants at realtime, the
+`remote` engine relays each take to a **dictation worker** on a beefier LAN
+box. The worker is just `create_dictation_router` served on its own — it
+speaks the exact same wire protocol the browser does (PCM frames up,
+transcript events down), so no new protocol or code path was needed. The
+browser never talks to the worker; the main server authenticates the user on
+its own route, then relays over a `websockets` client.
+
+Run the worker wherever the models live (it is **unauthenticated** — bind it
+to a trusted LAN/VPN only):
+
+```
+pip install omnigent[dictation] && scripts/fetch-dictation-models.sh
+python -m omnigent.server.dictation_worker --host 0.0.0.0 --port 8100
+```
+
+Then select the `remote` engine on the main server via env vars — no CLI
+integration is required:
+
+```
+OMNIGENT_DICTATION_ENGINE=remote \
+OMNIGENT_DICTATION_REMOTE_URL=ws://<worker-host>:8100/v1/dictation/stream \
+omnigent server ...
+```
+
+`RemoteDictationEngine` registers by name like every other engine (no changes
+to the route, protocol, or selection logic). `_RemoteStream` bridges the
+worker's async push events into the synchronous handle interface via a daemon
+reader thread, and `close()` releases the worker's capacity slot promptly.
+Fallback is per take: if the worker is unreachable and local models are
+installed, a lazily-built local sherpa engine serves the take instead (its
+weights cost no RAM until the worker actually goes down); each new take
+retries the worker first.
+
+Client timeouts (`web/src/lib/dictation.ts`) are widened to exceed the
+worker's cold-load budget (`_REMOTE_READY_TIMEOUT_S` / `_REMOTE_STOP_TIMEOUT_S`
+in `dictation.py`) so a relayed take doesn't time out on the browser side just
+as the worker finishes loading its model.
 
 ### Routes — `omnigent/server/routes/dictation.py`
 

@@ -1017,14 +1017,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   maybeFlushQueuedHead: () => {
     const s = get();
-    // Only when fully idle: both the local send lifecycle AND the server-side
-    // session status. No agent → nothing to send to.
+    // Flush once the agent loop is free to take a turn. `waiting` is NOT busy:
+    // the turn already ended and only background work (background shells /
+    // sub-agents) outlives it, so the server accepts a new turn immediately —
+    // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
+    // an actively `running` turn gate the flush. No agent → nothing to send to.
     if (
       s.conversationId === null ||
       s.boundAgentId === null ||
       s.status === "streaming" ||
-      s.sessionStatus === "running" ||
-      s.sessionStatus === "waiting"
+      s.sessionStatus === "running"
     ) {
       return;
     }
@@ -2687,6 +2689,14 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  // `waiting` is a TURN-END snapshot (the turn finished; only background work
+  // outlives it), so it settles the local send lifecycle like `idle` — it must
+  // NOT reopen a streaming response. The server keeps `active_response_id`
+  // populated across `waiting` (it only pops on idle/failed), so grouping
+  // `waiting` with `running` below would re-open "streaming" on a reload/
+  // reconnect and strand the composer on the "(queued)" placeholder — re-queuing
+  // sends, the exact behavior this fix removes. `sessionStatus` stays `waiting`
+  // and `backgroundTaskCount` is recovered above, so the spinner survives.
   if (
     (session.status === "idle" || session.status === "failed") &&
     s.activeResponse?.state === "streaming"
@@ -2697,8 +2707,15 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
       error: null,
     };
     patch.status = "idle";
+  } else if (session.status === "waiting") {
+    // Turn ended, background work remains. Finalize a still-streaming response
+    // and free the local send lifecycle so the composer dispatches a new turn.
+    if (s.activeResponse?.state === "streaming") {
+      patch.activeResponse = { ...s.activeResponse, state: "completed", error: null };
+    }
+    patch.status = "idle";
   } else if (
-    (session.status === "running" || session.status === "waiting") &&
+    session.status === "running" &&
     session.activeResponseId != null &&
     s.activeResponse?.responseId !== session.activeResponseId
   ) {
@@ -4206,10 +4223,7 @@ export function handleSessionEvent(event: StreamEvent): void {
         } else if (event.status === "running" || event.status === "failed") {
           patch.backgroundTaskCount = 0;
         }
-        if (
-          event.responseId !== undefined &&
-          (event.status === "running" || event.status === "waiting")
-        ) {
+        if (event.responseId !== undefined && event.status === "running") {
           patch.status = "streaming";
           patch.activeResponse = {
             responseId: event.responseId,
@@ -4217,7 +4231,17 @@ export function handleSessionEvent(event: StreamEvent): void {
             error: null,
           };
         }
-        if (event.status === "idle" || event.status === "failed") {
+        // `waiting` is a TURN-END edge (the turn already finished; only
+        // background work — background shells / sub-agents — outlives it). It
+        // must finalize the local send lifecycle exactly like `idle`, NOT keep
+        // it "streaming": the composer's send gate and "(queued)" placeholder
+        // key off local `status`, so leaving it streaming would queue every new
+        // message until the background work ends. The claude/cursor-native Stop
+        // hook posts `waiting` WITH the ended turn's `response_id`, so it lands
+        // here rather than via a bare PTY `idle`. `sessionStatus` stays
+        // `waiting` (set above) and `backgroundTaskCount` is untouched, so the
+        // "Working…" spinner and sidebar dot keep reflecting the background work.
+        if (event.status === "idle" || event.status === "failed" || event.status === "waiting") {
           if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
             if (s.activeResponse.state !== "cancelled") {
@@ -4229,6 +4253,16 @@ export function handleSessionEvent(event: StreamEvent): void {
             }
           } else if (s.activeResponse === null) {
             patch.status = "idle";
+          } else if (event.status === "waiting") {
+            // Turn ended (background work remains) but the `waiting` edge's id
+            // doesn't match the tracked response — free the send lifecycle
+            // anyway so a new message isn't stranded behind background work,
+            // and finalize a still-streaming bubble so it doesn't linger with a
+            // spinner that no edge will ever close.
+            patch.status = "idle";
+            if (s.activeResponse?.state === "streaming") {
+              patch.activeResponse = { ...s.activeResponse, state: "completed", error: null };
+            }
           }
           // Clear ALL pending user messages on terminal status. Any
           // message still pending when the session reaches idle was

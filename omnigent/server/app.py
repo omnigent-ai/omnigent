@@ -1424,9 +1424,19 @@ def create_app(
                     exc,
                 )
 
+            # Run completion is event-driven (persist_scheduled_run_completion
+            # fires from _publish_status the instant a fired conversation's turn
+            # ends — no poll). The only orphan backstop is a lazy-on-read
+            # force-fail of stale ``running`` runs on the scheduled-task read
+            # endpoints (see routes/scheduled_tasks.py); there is no startup
+            # sweep and no periodic reconcile.
+
         try:
             yield
         finally:
+            # Run completion is event-driven (the _publish_status hook) plus a
+            # lazy-on-read stale backstop — there is no run-reconciler task to
+            # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
@@ -1556,8 +1566,11 @@ def create_app(
     set_server_runner_router(runner_router)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
-    # hold a session's runner tunnel serve the same sidebar fields.
-    session_live_state.configure(conversation_store)
+    # hold a session's runner tunnel serve the same sidebar fields. The
+    # scheduled-task store additionally enables the event-driven
+    # run-completion hook (persist_scheduled_run_completion) fired from
+    # _publish_status when a fired conversation's turn reaches terminal.
+    session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
