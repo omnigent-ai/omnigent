@@ -2289,7 +2289,26 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(tooltip.textContent).toContain("Permissions:");
     expect(tooltip.textContent).toContain("Plan");
     expect(tooltip.textContent).toContain("Model:");
-    expect(tooltip.textContent).toContain("Effort:");
+    // Unset effort reads "Default" (mirrors the modal), never the "—" sentinel.
+    expect(tooltip.textContent).toContain("Effort: Default");
+    expect(tooltip.textContent).not.toContain("—");
+  });
+
+  it("reflects Smart Routing in the gear tooltip (Model=Smart Routing, Effort=Default)", async () => {
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
+        0,
+      ),
+    );
+    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
+    expect(tooltip.textContent).toContain("Model: Smart Routing");
+    // Effort is frozen to Default under Smart Routing — the tooltip mirrors it.
+    expect(tooltip.textContent).toContain("Effort: Default");
   });
 
   it("shows the permission mode description in the dropdown footer, tracking hover", () => {

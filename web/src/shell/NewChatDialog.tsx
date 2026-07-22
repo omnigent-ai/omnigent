@@ -2276,15 +2276,21 @@ export function NewChatLandingScreen() {
     smartRoutingEnabled && _ROUTABLE_HARNESSES.has(selectedAgent?.harness ?? "");
   // Label/value pairs summarizing the selected agent's current run-config, for
   // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
-  // user can read the active settings without opening it. "—" for an unset
+  // user can read the active settings without opening it. "Default" = an unset
   // model/effort (Claude Code uses its own configured default).
+  const routingOn = costControlMode === "on";
   const configSummary = useMemo((): { label: string; value: string }[] => {
     if (supportsPermissionMode) {
-      const modelValue =
-        costControlMode === "on"
-          ? "Smart Routing"
-          : (CLAUDE_NATIVE_MODELS.find((m) => m.id === pickedModel)?.label ?? "Default");
-      const effortValue = CLAUDE_NATIVE_EFFORTS.find((e) => e.value === pickedEffort)?.label ?? "—";
+      const modelValue = routingOn
+        ? "Smart Routing"
+        : (CLAUDE_NATIVE_MODELS.find((m) => m.id === pickedModel)?.label ?? "Default");
+      // Smart Routing freezes effort to the default (the router picks per turn),
+      // so mirror the modal: show "Default" whenever routing is on or effort is
+      // unset, else the picked level.
+      const effortValue =
+        routingOn || !pickedEffort
+          ? "Default"
+          : (CLAUDE_NATIVE_EFFORTS.find((e) => e.value === pickedEffort)?.label ?? "Default");
       const permissionValue =
         CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ??
         permissionMode;
@@ -2294,6 +2300,10 @@ export function NewChatLandingScreen() {
         { label: "Permissions", value: permissionValue },
       ];
     }
+    // Non-Claude routable agents surface Smart Routing as a standalone toggle,
+    // so reflect it here when on (Claude folds it into Model above).
+    const routingRow: { label: string; value: string }[] =
+      smartRoutingEligible && routingOn ? [{ label: "Smart Routing", value: "On" }] : [];
     if (supportsApprovalMode) {
       const approvalValue =
         CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ?? approvalMode;
@@ -2302,25 +2312,29 @@ export function NewChatLandingScreen() {
       if (isCodex && bypassSandbox) {
         rows.push({ label: "Bypass", value: "On" });
       }
-      return rows;
+      return [...rows, ...routingRow];
     }
     if (supportsCursorMode) {
       const modeValue =
         CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.label ?? cursorExecMode;
-      return [{ label: "Mode", value: modeValue }];
+      return [{ label: "Mode", value: modeValue }, ...routingRow];
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabels) {
       const active = pickedHarness ?? selectedAgent.harness;
-      return [{ label: "Agent Harness", value: brainHarnessLabels[active] ?? active }];
+      return [
+        { label: "Agent Harness", value: brainHarnessLabels[active] ?? active },
+        ...routingRow,
+      ];
     }
-    return [];
+    return routingRow;
   }, [
     supportsPermissionMode,
     supportsApprovalMode,
     supportsCursorMode,
+    smartRoutingEligible,
     selectedAgent,
     brainHarnessLabels,
-    costControlMode,
+    routingOn,
     pickedModel,
     pickedEffort,
     permissionMode,
