@@ -524,7 +524,12 @@ def create_hosts_router(
         host_id: str,
         harness: str,
     ) -> dict[str, list[dict[str, Any]]]:
-        """Return pre-launch model choices resolved by the selected host."""
+        """Return pre-launch model choices resolved by the selected host.
+
+        A preview of the host's ambient default catalog, not a binding
+        snapshot: launch re-resolves with the session's agent spec, and the
+        in-session picker reflects that launch snapshot once the runner is up.
+        """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:

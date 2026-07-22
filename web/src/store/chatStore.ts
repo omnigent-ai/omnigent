@@ -2433,6 +2433,18 @@ async function bindStream(
       const effectiveBindingPatch = catalogWonBindRace
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
+      // The raced branch preserves the selection the deferred handoff
+      // applied — but only when that selection exists in the raced catalog.
+      // A sticky pick the handoff REJECTED (e.g. a removed alias) must not
+      // linger visually selected with no server override behind it.
+      const preservedModelValid =
+        !catalogWonBindRace ||
+        state.selectedModel == null ||
+        nativeModelFamily === null ||
+        isNativeModelCompatible(nativeModelFamily, state.selectedModel, {
+          ...session,
+          codexModelOptions: racedOptions!,
+        });
       const seenItemIds = new Set(
         state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
@@ -2581,13 +2593,15 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         selectedEffort: effectiveEffort,
-        selectedModel: catalogWonBindRace ? state.selectedModel : effectiveModel,
+        selectedModel:
+          catalogWonBindRace && preservedModelValid ? state.selectedModel : effectiveModel,
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: catalogWonBindRace
-          ? state.sessionModelOverride
-          : effectiveSessionOverride,
+        sessionModelOverride:
+          catalogWonBindRace && preservedModelValid
+            ? state.sessionModelOverride
+            : effectiveSessionOverride,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,

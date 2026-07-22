@@ -5547,6 +5547,85 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     window.localStorage.removeItem("omnigent.picker.model");
   });
 
+  it("drops a removed sticky alias when the resolved catalog wins the bind race", async () => {
+    // Same race as above, but the sticky pick ("fable") is absent from the
+    // raced catalog: the bind's raced branch must not leave it visually
+    // selected with no server override behind it.
+    seedSession("conv_cn_race_removed", []);
+    window.localStorage.setItem("omnigent.picker.model", "fable");
+    let resolveInitialSnapshot: ((response: Response) => void) | null = null;
+    let resolveItems: ((response: Response) => void) | null = null;
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cn_race_removed/items")) {
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          resolveItems = resolve;
+        }).then(() => response);
+      }
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_race_removed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        const response = mockResponse({
+          id: "conv_cn_race_removed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+        if (snapshotCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveInitialSnapshot = resolve;
+          });
+        }
+        return response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    const switchPromise = useChatStore.getState().switchTo("conv_cn_race_removed");
+    await tick();
+    expect(resolveInitialSnapshot).not.toBeNull();
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_race_removed",
+    });
+    resolveInitialSnapshot!(
+      mockResponse({
+        id: "conv_cn_race_removed",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        model_override: null,
+        model_options: [],
+      }),
+    );
+    await tick();
+    resolveItems!(mockResponse({}));
+    await switchPromise;
+    await tick();
+
+    expect(patchCallsFor("conv_cn_race_removed").some((patch) => "model_override" in patch)).toBe(
+      false,
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: null,
+      sessionModelOverride: null,
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
   it("does not apply a persisted Claude alias removed from the delayed catalog", async () => {
     seedSession("conv_cn_delayed_removed", []);
     window.localStorage.setItem("omnigent.picker.model", "fable");

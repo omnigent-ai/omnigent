@@ -9973,6 +9973,73 @@ async def test_claude_native_model_options_use_session_launch_catalog(
 
 
 @pytest.mark.asyncio
+async def test_claude_native_model_options_config_error_is_not_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative-empty catalog answers 424, not the retryable 503.
+
+    The AP server treats 503 as a "runner still booting" retry window; a
+    configuration failure (workspace exposes no Claude models) can't be
+    retried away, so it must use a distinct status.
+    """
+    import click
+
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    conv_id = "7b527915981fe729dd9a19a6dfcbca48"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
+        del spec
+        raise click.ClickException("Databricks profile 'p' exposes no Claude model services.")
+
+    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _fake_auto_create)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert resp.status_code == 424
+    body = resp.json()
+    assert body["error"] == "claude_native_model_options_config"
+    assert "exposes no Claude model services" in body["detail"]
+
+
+@pytest.mark.asyncio
 async def test_events_codex_native_plan_mode_requires_loaded_bridge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

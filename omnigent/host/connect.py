@@ -1701,7 +1701,14 @@ class HostProcess:
         self,
         frame: HostModelOptionsFrame,
     ) -> HostModelOptionsResultFrame:
-        """Resolve the launch picker catalog on the machine that will run it."""
+        """Resolve the launch picker catalog on the machine that will run it.
+
+        This is a pre-launch PREVIEW of the host's ambient default
+        configuration (``spec=None`` — no session exists yet, so there is no
+        agent spec to pin). A session whose spec pins a different provider
+        resolves its own catalog at launch, and the in-session picker
+        re-reads that authoritative snapshot after bind.
+        """
         if canonicalize_harness(frame.harness) != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,

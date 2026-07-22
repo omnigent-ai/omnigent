@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 import httpx
+
+_logger = logging.getLogger(__name__)
 
 CLAUDE_MODEL_FAMILIES: tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 
@@ -81,6 +84,14 @@ def _list_model_service_ids(
             raise ValueError("Databricks model-services pagination repeated a page token")
         seen_tokens.add(raw_next)
         page_token = raw_next
+    else:
+        # Exhausted the page budget with a next-page token still pending: the
+        # listing is partial, so the newest model of a family could be missed.
+        _logger.warning(
+            "Databricks model-services listing truncated after %d pages; "
+            "discovery may miss newer models",
+            _MAX_PAGES,
+        )
     return sorted(set(model_ids))
 
 
@@ -126,9 +137,12 @@ def discover_databricks_claude_models(
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param transport: Optional HTTP transport used by tests.
-    :returns: Family aliases mapped to routable model ids.
-    :raises httpx.HTTPError: When neither discovery endpoint can be queried.
-    :raises ValueError: When both endpoints return malformed responses.
+    :returns: Family aliases mapped to routable model ids. An empty mapping is
+        authoritative: at least one endpoint answered successfully and no
+        Claude models are exposed.
+    :raises httpx.HTTPError: When the primary listing fails and the fallback
+        cannot compensate (it fails too, or exposes no Claude models).
+    :raises ValueError: Same contract for malformed responses.
     """
     headers = {"Authorization": f"Bearer {token}"}
     primary_error: Exception | None = None
@@ -150,4 +164,12 @@ def discover_databricks_claude_models(
             # A successful permission-aware UC listing is authoritative even
             # when the compatibility endpoint is not enabled.
             return {}
-    return _models_by_claude_family(gateway_ids, marker="databricks-claude-")
+    gateway_models = _models_by_claude_family(gateway_ids, marker="databricks-claude-")
+    if not gateway_models and primary_error is not None:
+        # The gateway answered but routes no Claude models, and the primary
+        # listing failed — an empty result here is NOT authoritative (e.g. a
+        # transient UC 503 plus an unused legacy gateway). Surface the primary
+        # failure so callers fall back to cached models instead of treating
+        # the workspace as having none.
+        raise primary_error
+    return gateway_models

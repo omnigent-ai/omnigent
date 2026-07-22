@@ -18618,6 +18618,24 @@ def create_runner_app(
             return JSONResponse(status_code=200, content={"models": []})
         try:
             claude_config = await _resolve_session_claude_launch_config(session_id)
+        except click.ClickException as exc:
+            # Configuration failure (e.g. the workspace authoritatively
+            # exposes no Claude models) — retrying cannot fix it, so answer
+            # with a non-503 status the AP server does not treat as a
+            # "still booting" retry window. The message is the same
+            # user-facing text the terminal-launch path surfaces.
+            _logger.warning(
+                "Claude-native model options unavailable for session=%s: %s",
+                session_id,
+                exc.message,
+            )
+            return JSONResponse(
+                status_code=424,
+                content={
+                    "error": "claude_native_model_options_config",
+                    "detail": exc.message,
+                },
+            )
         except Exception as exc:  # noqa: BLE001 — retryable model-options failure
             _logger.warning(
                 "Claude-native model discovery failed for session=%s",
