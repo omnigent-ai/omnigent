@@ -136,6 +136,22 @@ def test_file_into_nonexistent_project_404(db_uri: str) -> None:
     assert resp.status_code == 404
 
 
+def test_explicit_null_project_id_is_rejected(db_uri: str) -> None:
+    """A present-but-null project_id is invalid: only "" unfiles, and omitting
+    the field leaves membership unchanged — so null must not silently unfile."""
+    _ensure_agent(db_uri)
+    conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
+    client = TestClient(_single_user_app(db_uri))
+    project = client.post("/v1/projects", json={"name": "Work"}).json()
+    client.patch(f"/v1/sessions/{conv.id}", json={"project_id": project["id"]})
+
+    resp = client.patch(f"/v1/sessions/{conv.id}", json={"project_id": None})
+    assert resp.status_code == 400
+    # Membership is untouched — the invalid PATCH didn't unfile it.
+    snap = client.get(f"/v1/sessions/{conv.id}")
+    assert snap.json()["project_id"] == project["id"]
+
+
 def test_project_filter_excludes_other_projects(db_uri: str) -> None:
     """?project=<name> returns only that project's members, not another's."""
     _ensure_agent(db_uri)

@@ -16398,7 +16398,17 @@ def create_sessions_router(
         # into another owner's (or a missing) project is rejected as NOT_FOUND
         # — the same 404 the projects API returns, so we don't leak existence.
         if set_project:
-            target_project_id = body.project_id or ""
+            # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
+            # not a valid value here (omitting the field is how you leave
+            # membership unchanged), so reject it rather than treating it as a
+            # destructive unfile.
+            if body.project_id is None:
+                raise OmnigentError(
+                    'project_id must be a project id or "" to unfile; '
+                    "omit the field to leave membership unchanged",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            target_project_id = body.project_id
             if target_project_id == "":
                 await asyncio.to_thread(
                     conversation_store.set_conversation_project, session_id, None

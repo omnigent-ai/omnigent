@@ -2251,19 +2251,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationLabel.key == PROJECT_LABEL_KEY,
                 )
                 if project == "":
-                    # Unfiled: no first-class membership AND no label. Bound the
-                    # prefetch to qualifying_ids (when permission-scoped) so the
-                    # NOT IN list stays capped to the caller's own sessions.
+                    # Unfiled: no first-class membership AND no label.
                     first_class_stmt = select(SqlConversationMetadata.id).where(
                         SqlConversationMetadata.workspace_id == current_workspace_id(),
                         SqlConversationMetadata.project_id.is_not(None),
                     )
-                    if qualifying_ids is not None:
-                        first_class_stmt = first_class_stmt.where(
-                            SqlConversationMetadata.id.in_(qualifying_ids)
-                        )
-                    with self._session() as meta_sess:
-                        first_class_filed = list(meta_sess.execute(first_class_stmt).scalars())
+                    if self._conv_engine is self._engine:
+                        # Single-DB: metadata is colocated with conversations, so
+                        # push the exclusion down as a NOT IN subquery — no need to
+                        # pull every filed id into Python.
+                        first_class_filed: Any = first_class_stmt
+                    else:
+                        # Split-DB: metadata lives elsewhere, so prefetch the ids.
+                        # Bound to qualifying_ids (when permission-scoped) so the
+                        # NOT IN list stays capped to the caller's own sessions.
+                        if qualifying_ids is not None:
+                            first_class_stmt = first_class_stmt.where(
+                                SqlConversationMetadata.id.in_(qualifying_ids)
+                            )
+                        with self._session() as meta_sess:
+                            first_class_filed = list(meta_sess.execute(first_class_stmt).scalars())
                     stmt = stmt.where(
                         SqlConversation.id.not_in(first_class_filed),
                         SqlConversation.id.not_in(label_filed),
