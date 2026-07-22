@@ -201,14 +201,20 @@ export function orderByPinnedSequence(
 
 export function normalizePinnedConversationIds(
   pinnedIds: readonly string[],
-  conversations: readonly Conversation[],
+  confirmedDeletedIds: ReadonlySet<string>,
 ): string[] {
-  const validIds = new Set(conversations.map((conversation) => conversation.id));
   const seen = new Set<string>();
   const normalized: string[] = [];
 
   for (const id of pinnedIds) {
-    if (!validIds.has(id) || seen.has(id)) continue;
+    // Drop duplicates, and drop an id ONLY when we have positive evidence it's
+    // gone: it's confirmed deleted (its backfill fetch returned 404). An id
+    // that's merely absent from the loaded list is kept — absence also happens
+    // when a backfill fetch failed on a transient glitch or is still loading,
+    // and pruning then would silently unpin a live session (writing the loss
+    // back to localStorage). A genuinely deleted session surfaces in
+    // `confirmedDeletedIds` and is pruned on the pass after its 404.
+    if (seen.has(id) || confirmedDeletedIds.has(id)) continue;
     seen.add(id);
     normalized.push(id);
   }

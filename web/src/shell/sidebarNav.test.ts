@@ -109,15 +109,30 @@ describe("pin helpers", () => {
     expect(togglePinnedConversationId(["conv_b", "conv_a"], "conv_b")).toEqual(["conv_a"]);
   });
 
-  it("drops stale and duplicate pinned ids", () => {
-    const conversations = [
-      conversation("conv_a", "A", new Date(2026, 4, 14, 9)),
-      conversation("conv_b", "B", new Date(2026, 4, 14, 8)),
-    ];
-
+  it("drops duplicate pins and pins confirmed deleted (404), keeping the rest", () => {
+    // "gone" returned 404 from its backfill (confirmed deleted) → pruned.
+    // "conv_a" is duplicated → deduped. Everything else is kept.
     expect(
-      normalizePinnedConversationIds(["conv_a", "missing", "conv_a", "conv_b"], conversations),
+      normalizePinnedConversationIds(["conv_a", "gone", "conv_a", "conv_b"], new Set(["gone"])),
     ).toEqual(["conv_a", "conv_b"]);
+  });
+
+  it("KEEPS a pin that is merely absent (glitch/loading), not confirmed deleted", () => {
+    // Regression: a pinned session missing from the loaded pages whose backfill
+    // fetch failed on a transient glitch (or is still in flight) is NOT in the
+    // confirmed-deleted set, so it must survive — never silently unpinned.
+    expect(normalizePinnedConversationIds(["conv_a", "off_page", "conv_b"], new Set())).toEqual([
+      "conv_a",
+      "off_page",
+      "conv_b",
+    ]);
+  });
+
+  it("prunes only the confirmed-deleted id while keeping a co-absent glitchy pin", () => {
+    // "deleted" 404'd (prune); "glitchy" is absent-without-a-404 (keep).
+    expect(
+      normalizePinnedConversationIds(["deleted", "glitchy", "conv_a"], new Set(["deleted"])),
+    ).toEqual(["glitchy", "conv_a"]);
   });
 });
 

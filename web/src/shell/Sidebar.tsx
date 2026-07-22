@@ -988,9 +988,14 @@ function ConversationList({
   // order, not the global paginated list which can diverge.
   const projectRenderedIdsRef = useRef<Map<string, string[]>>(new Map());
 
-  // Backfill pinned sessions that aren't in the loaded set.
+  // Backfill pinned sessions that aren't in the loaded set. `confirmedDeletedIds`
+  // are the pins whose fetch returned 404 (safe to prune); a failed/pending
+  // fetch is NOT in that set, so a transient glitch can't unpin a live session.
   const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
-  const pinnedBackfill = usePinnedConversationBackfill(pinnedConversationIds, loadedIds);
+  const { conversations: pinnedBackfill, confirmedDeletedIds } = usePinnedConversationBackfill(
+    pinnedConversationIds,
+    loadedIds,
+  );
 
   // Freeze the active chat's sort key while you're inside it so an
   // updated_at bump from sending a message doesn't reorder the row
@@ -1372,24 +1377,24 @@ function ConversationList({
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
 
-  // Only normalize pinned ids once all pages are loaded; a pin that
-  // lives on an unloaded page should not be dropped prematurely
-  // (the backfill covers it in the meantime).
+  // Prune a pin only on positive evidence it's gone: a duplicate id, or one the
+  // backfill confirmed deleted (its fetch returned 404). A pin that's merely
+  // absent from the loaded pages is kept — it may live on an unloaded page, or
+  // its backfill fetch may have failed on a transient client/server glitch or
+  // be in flight. Dropping on mere absence is what silently unpinned live
+  // sessions (the loss was then written back to localStorage).
   const hasMorePages = conversationsQuery.hasNextPage;
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
   useEffect(() => {
-    if (!conversationsQuery.data || hasMorePages || searchQuery) return;
-    const allLoaded = dedupeConversationsById([...allConversations, ...pinnedBackfill]);
-    const normalized = normalizePinnedConversationIds(pinnedConversationIds, allLoaded);
+    if (!conversationsQuery.data || searchQuery) return;
+    const normalized = normalizePinnedConversationIds(pinnedConversationIds, confirmedDeletedIds);
     if (!sameStringArray(normalized, pinnedConversationIds)) {
       onPinnedConversationIdsChange(normalized);
     }
   }, [
     conversationsQuery.data,
-    hasMorePages,
     searchQuery,
-    allConversations,
-    pinnedBackfill,
+    confirmedDeletedIds,
     pinnedConversationIds,
     onPinnedConversationIdsChange,
   ]);
