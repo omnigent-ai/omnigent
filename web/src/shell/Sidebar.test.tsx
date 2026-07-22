@@ -250,23 +250,41 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders the footer Settings as an icon-only floating control on mobile", () => {
+  it("renders Search, Settings, and Collapse as compact header actions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
+    const headerActions = screen.getByTestId("sidebar-header-actions");
+    const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
-    // Accessible name survives even though the label is visually dropped on
-    // mobile (the icon stands alone there).
+
+    expect(search).toHaveAttribute("aria-label", "Search");
+    expect(search).toHaveAttribute("data-size", "icon-xs");
+    expect(search).toHaveClass("size-6");
     expect(settings).toHaveAttribute("aria-label", "Settings");
-    // Mobile: compact square icon button, out of flow at the bottom-left.
-    expect(settings.className).toContain("max-md:size-9");
-    // The text label is desktop-only.
-    const label = within(settings).getByText("Settings");
-    expect(label.className).toContain("max-md:hidden");
+    expect(settings).toHaveAttribute("data-size", "icon-xs");
+    expect(settings).toHaveClass("size-6");
+    const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
+    expect(collapse).toHaveAttribute("data-size", "icon-xs");
+    expect(collapse).toHaveClass("size-6");
+    expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
   });
 
-  it("does NOT close the sidebar when the footer Settings is tapped", () => {
-    // No onNavClick on the footer Settings link: on mobile the overlay stays
+  it("renders Inbox as its own primary navigation row", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const primaryNav = screen.getByTestId("sidebar-primary-nav");
+    const inbox = within(primaryNav).getByTestId("inbox-button");
+
+    expect(inbox).toHaveAttribute("href", "/inbox");
+    expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
+    expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
+    expect(within(primaryNav).getByTestId("toggle-selection-mode")).toBeInTheDocument();
+  });
+
+  it("does NOT close the sidebar when the header Settings is tapped", () => {
+    // No onNavClick on the header Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto
     // the default section's content.
     mockConversations(THREE_TYPE_CONVERSATIONS);
@@ -299,7 +317,7 @@ describe("Sidebar session list", () => {
     // Active sessions still render in the Sessions list.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
-    // The footer Settings link points at the settings page.
+    // The header Settings link points at the settings page.
     expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
   });
 

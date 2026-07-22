@@ -138,7 +138,6 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import { MOD_KEY } from "@/components/KeyboardShortcutsDialog";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
@@ -497,48 +496,47 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 className="h-[15px] w-auto shrink-0 dark:invert"
               />
             </Link>
-            <div className="flex items-center gap-1">
-              {/* Inbox lives at the top next to the collapse toggle. Rendered
-              as a Link so cmd/middle-click opens it in a new tab; onNavClick
-              still closes the sidebar on a plain mobile tap. */}
+            <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    aria-label="Search"
+                    onClick={() => onOpenSearch?.()}
+                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                    data-testid="sidebar-search-button"
+                  >
+                    <SearchIcon className="size-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Search</TooltipContent>
+              </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     asChild
                     variant="ghost"
-                    size="icon"
-                    aria-label="Inbox"
-                    className={cn(
-                      "relative size-6 rounded-sm text-muted-foreground hover:text-foreground",
-                      isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-                    )}
-                    data-testid="inbox-button"
+                    size="icon-xs"
+                    aria-label="Settings"
+                    className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
                   >
-                    <Link to="/inbox" onClick={onNavClick}>
-                      <InboxIcon className="size-4" />
-                      {inboxCount > 0 && (
-                        <span
-                          aria-label={
-                            inboxCount === 1
-                              ? "1 inbox item waiting"
-                              : `${inboxCount} inbox items waiting`
-                          }
-                          className="-top-0.5 -right-0.5 absolute inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-[10px] font-medium text-warning tabular-nums"
-                        >
-                          {inboxCount}
-                        </span>
-                      )}
+                    {/* No onNavClick: on mobile, entering Settings keeps the
+                    drawer open and swaps it to the section list. */}
+                    <Link to="/settings" data-testid="settings-button">
+                      <SettingsIcon className="size-4" />
                     </Link>
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">Inbox</TooltipContent>
+                <TooltipContent side="bottom">Settings</TooltipContent>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
                     type="button"
                     variant="ghost"
-                    size="icon"
+                    size="icon-xs"
                     aria-label="Close sidebar"
                     onClick={onClose}
                     className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
@@ -556,7 +554,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="px-3 py-3">
+          <div className="flex flex-col gap-0 px-3 py-3" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -599,46 +597,49 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 onExit={exitSelectionMode}
               />
             ) : (
-              <div className="relative mt-3 flex items-center gap-1.5">
-                {/* "Search" opens the command palette (⌘K), which searches both
-                    session titles and chat content. It replaces the old inline
-                    filter box — the palette is the single search surface now.
-                    The `group` scope reveals the ⌘K badge on hover/focus. */}
-                <button
-                  type="button"
-                  onClick={() => onOpenSearch?.()}
-                  aria-label="Search"
-                  data-testid="sidebar-search-button"
+              <>
+                <Button
+                  asChild
+                  variant="ghost"
                   className={cn(
-                    "group relative flex h-7 flex-1 items-center rounded-[var(--radius-otto-button)] border border-input pr-2 pl-7 text-left text-13 text-muted-foreground transition-colors duration-200 ease-[var(--ease-otto)] focus-visible:outline-1",
+                    "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="inbox-button"
+                >
+                  <Link to="/inbox" onClick={onNavClick}>
+                    <InboxIcon className="size-3.5 text-muted-foreground" />
+                    Inbox
+                    {inboxCount > 0 && (
+                      <span
+                        aria-label={
+                          inboxCount === 1
+                            ? "1 inbox item waiting"
+                            : `${inboxCount} inbox items waiting`
+                        }
+                        className="ml-auto inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-warning/15 px-1 text-10 font-medium text-warning tabular-nums"
+                      >
+                        {inboxCount}
+                      </span>
+                    )}
+                  </Link>
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  aria-label="Select sessions"
+                  data-testid="toggle-selection-mode"
+                  className={cn(
+                    "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
                     SIDEBAR_HOVER_HIGHLIGHT,
                   )}
+                  onClick={() => setSelectionMode(true)}
                 >
-                  <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2 size-3.5" />
-                  <span className="flex-1 truncate">Search</span>
-                  {/* ⌘K hint — hidden until the button is hovered / focused,
-                      mirroring the sidebar's other hover-revealed affordances. */}
-                  <kbd className="ml-2 hidden shrink-0 items-center rounded-md border border-border bg-muted px-1.5 py-0.5 font-sans text-[10px] font-medium text-muted-foreground transition-opacity group-hover:inline-flex group-focus-visible:inline-flex">
-                    {MOD_KEY}K
-                  </kbd>
-                </button>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Select sessions"
-                      data-testid="toggle-selection-mode"
-                      className="shrink-0 rounded-sm"
-                      onClick={() => setSelectionMode(true)}
-                    >
-                      <ListChecksIcon className="size-3.5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">Select sessions</TooltipContent>
-                </Tooltip>
-              </div>
+                  <ListChecksIcon className="size-3.5 text-muted-foreground" />
+                  Select sessions
+                </Button>
+              </>
             )}
           </div>
 
@@ -674,12 +675,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           )}
 
-          {/* Mobile: extra bottom padding so the last session scrolls clear of
-          the floating Settings icon (which is absolutely positioned, out of
-          flow, over the bottom-left corner). */}
           <nav
             ref={scrollContainerRef}
-            className="relative flex-1 overflow-y-auto px-2 pb-3 max-md:pb-16 [scrollbar-gutter:stable]"
+            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-gutter:stable]"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -698,45 +696,6 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               onVisibleCountChange={setVisibleConversationCount}
             />
           </nav>
-
-          {/* Settings entry. Always present (every deploy): the full settings
-          surface — appearance, keyboard shortcuts, archived chats, and the
-          account/sign-out controls when accounts auth is on — lives behind
-          this on the /settings page.
-
-          Desktop: a full-width footer row pinned below the flex-1 nav, the
-          gear aligned with the New session / Inbox icons.
-          Mobile: pulled OUT of flow (absolute, bottom-left) so it floats over
-          the conversation list as a compact icon instead of stealing a row's
-          height from the scroll area. */}
-          <div className="md:shrink-0 md:px-3 md:pb-3 max-md:absolute max-md:bottom-3 max-md:left-3 max-md:z-10">
-            <Button
-              asChild
-              variant="ghost"
-              className={cn(
-                "gap-2 text-sm",
-                // Desktop: full-width row with label, matching New session /
-                // Inbox. Mobile: a small round icon-only button with its own
-                // surface (border + solid bg + shadow) so it reads as a
-                // floating control over the scrolling list beneath it.
-                "md:w-full md:justify-start",
-                "max-md:size-9 max-md:justify-center max-md:rounded-full max-md:border max-md:border-border max-md:bg-card-solid max-md:p-0 max-md:shadow-sm",
-              )}
-              data-testid="settings-button"
-            >
-              {/* No onNavClick here: on mobile the sidebar is a full-screen
-              overlay, and entering settings swaps it to the section list
-              (SettingsSidebarBody). Closing the overlay would skip that list
-              and drop straight onto the default section's content — instead we
-              keep it open so mobile lands on the section list, then tapping a
-              section (which DOES use onNavClick) closes it to show content. */}
-              <Link to="/settings" aria-label="Settings">
-                <SettingsIcon className="size-4 text-muted-foreground" />
-                {/* Label is desktop-only; the icon stands alone on mobile. */}
-                <span className="max-md:hidden">Settings</span>
-              </Link>
-            </Button>
-          </div>
         </>
       )}
     </aside>
