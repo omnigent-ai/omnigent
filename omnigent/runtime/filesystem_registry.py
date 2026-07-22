@@ -23,6 +23,7 @@ defines the full public interface.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fnmatch
 import logging
@@ -31,8 +32,14 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock.
+    fcntl = None  # type: ignore[assignment]
 
 _logger = logging.getLogger(__name__)
 
@@ -193,6 +200,58 @@ def _find_git_root(path: Path) -> Path | None:
         if parent == current:
             return None
         current = parent
+
+
+def _git_common_dir(git_root: Path) -> Path:
+    """Return the Git directory shared by a repository and its worktrees."""
+    git_entry = git_root / ".git"
+    if git_entry.is_dir():
+        return git_entry.resolve()
+    try:
+        marker = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return git_entry
+    if not marker.startswith("gitdir:"):
+        return git_entry
+    git_dir = Path(marker.removeprefix("gitdir:").strip())
+    if not git_dir.is_absolute():
+        git_dir = git_root / git_dir
+    git_dir = git_dir.resolve()
+    try:
+        common_marker = (git_dir / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return git_dir
+    common_dir = Path(common_marker)
+    if not common_dir.is_absolute():
+        common_dir = git_dir / common_dir
+    return common_dir.resolve()
+
+
+@contextlib.contextmanager
+def _untracked_cache_repo_lock(git_root: Path) -> Iterator[None]:
+    """Serialize the optional untracked-cache setup across runner processes."""
+    if fcntl is None:
+        yield
+        return
+    fd: int | None = None
+    lock_path = _git_common_dir(git_root) / "omnigent-untracked-cache.lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        _logger.debug("could not lock untracked-cache setup for %s", git_root, exc_info=True)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _normalize_path(path: str, cwd: Path) -> str | None:
@@ -699,13 +758,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 class GitFilesystemRegistry(FilesystemRegistry):
     """Filesystem registry backed by ``git status`` and ``git show``.
 
-    Used when the workspace is inside a git repository.  No background thread
-    is started.  :meth:`list_changed_files` and :meth:`get_changed_file`
-    always reflect the current working-tree state (staged + unstaged changes
-    and untracked files relative to HEAD).  Because git tracks changes from
-    HEAD rather than from a point in time, results are not scoped to a
-    conversation start time and include changes made by any process (agent
-    tool calls, shell commands, external editors, etc.).
+    Used when the workspace is inside a git repository. :meth:`start` launches
+    optional untracked-cache setup in a daemon thread; change queries remain
+    correct before it completes. :meth:`list_changed_files` and
+    :meth:`get_changed_file` always reflect the current working-tree state.
 
     :param watch_path: The workspace directory, e.g.
         ``Path("/home/user/project")``.
@@ -721,7 +777,20 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
-        self._enable_untracked_cache()
+        self._optimization_start_lock = threading.Lock()
+        self._optimization_started = False
+
+    def start(self) -> None:
+        """Start optional Git performance setup without blocking the caller."""
+        with self._optimization_start_lock:
+            if self._optimization_started:
+                return
+            self._optimization_started = True
+        threading.Thread(
+            target=self._enable_untracked_cache,
+            name="omnigent-git-untracked-cache",
+            daemon=True,
+        ).start()
 
     def _enable_untracked_cache(self) -> None:
         """Best-effort ``core.untrackedCache=true`` on this repo.
@@ -742,38 +811,89 @@ class GitFilesystemRegistry(FilesystemRegistry):
         filesystem) are ignored since the setting is a pure speedup with no
         behavioral effect.
         """
-        root_key = str(self._git_root)
+        root_key = str(self._git_root.resolve())
         with _untracked_cache_lock:
             if root_key in _untracked_cache_enabled:
                 return
             _untracked_cache_enabled.add(root_key)
-        try:
-            # Read-only probe: exit 0 iff the filesystem's mtime is reliable
-            # enough for the untracked cache to be correct here.
-            probe = subprocess.run(
-                ["git", "update-index", "--test-untracked-cache"],
-                cwd=root_key,
-                capture_output=True,
-                timeout=_git_timeout_seconds(),
-            )
-            if probe.returncode != 0:
-                _logger.debug(
-                    "GitFilesystemRegistry: untracked cache unsupported in %s; not enabling",
-                    self._git_root,
-                )
+        with _untracked_cache_repo_lock(self._git_root):
+            if self._untracked_cache_is_enabled():
                 return
-            subprocess.run(
-                ["git", "config", "core.untrackedCache", "true"],
-                cwd=root_key,
+            self._probe_and_enable_untracked_cache()
+
+    def _untracked_cache_is_enabled(self) -> bool:
+        """Return whether the shared repository config already enables the cache."""
+        started_at = time.perf_counter()
+        try:
+            result = subprocess.run(
+                ["git", "config", "--bool", "--get", "core.untrackedCache"],
+                cwd=str(self._git_root),
                 capture_output=True,
                 timeout=_git_timeout_seconds(),
             )
         except (subprocess.TimeoutExpired, OSError):
-            _logger.debug(
-                "GitFilesystemRegistry: could not enable core.untrackedCache in %s",
+            _logger.info(
+                "git untracked-cache config check failed: git_root=%s elapsed_ms=%.1f",
                 self._git_root,
-                exc_info=True,
+                (time.perf_counter() - started_at) * 1000,
             )
+            return False
+        enabled = result.returncode == 0 and result.stdout.strip().lower() == b"true"
+        _logger.info(
+            "git untracked-cache config checked: git_root=%s elapsed_ms=%.1f enabled=%s",
+            self._git_root,
+            (time.perf_counter() - started_at) * 1000,
+            enabled,
+        )
+        return enabled
+
+    def _probe_and_enable_untracked_cache(self) -> None:
+        """Probe filesystem support and enable the optional Git index extension."""
+        probe_started_at = time.perf_counter()
+        try:
+            probe = subprocess.run(
+                ["git", "update-index", "--test-untracked-cache"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache probe failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - probe_started_at) * 1000,
+            )
+            return
+        _logger.info(
+            "git untracked-cache probe completed: git_root=%s elapsed_ms=%.1f returncode=%d",
+            self._git_root,
+            (time.perf_counter() - probe_started_at) * 1000,
+            probe.returncode,
+        )
+        if probe.returncode != 0:
+            return
+
+        config_started_at = time.perf_counter()
+        try:
+            config = subprocess.run(
+                ["git", "config", "core.untrackedCache", "true"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache config failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - config_started_at) * 1000,
+            )
+            return
+        _logger.info(
+            "git untracked-cache config completed: git_root=%s elapsed_ms=%.1f returncode=%d",
+            self._git_root,
+            (time.perf_counter() - config_started_at) * 1000,
+            config.returncode,
+        )
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.

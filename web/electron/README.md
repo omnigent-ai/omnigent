@@ -67,15 +67,18 @@ adds native niceties:
   OS-level mic gate is open too (packaged builds ship
   `NSMicrophoneUsageDescription`).
 
-  > **Caveat — Web Speech may still not transcribe in Electron.** Granting the
+  > **Caveat — Web Speech does not transcribe in Electron.** Granting the
   > mic clears the _permission_ gate, but `SpeechRecognition` also depends on
   > Google's cloud speech backend keyed to official Google Chrome builds, which
-  > Electron's bundled Chromium does **not** ship. So recognition can still
-  > fail (typically a `network` error) even with the mic allowed. The web app
-  > degrades gracefully (the button shows "Dictation unavailable" rather than
-  > crashing). Fully reliable in-app dictation would require a MediaRecorder
-  > capture + a server-side transcription endpoint (e.g. Whisper) wired to the
-  > composer's existing `onAudioRecorded` fallback — not yet implemented.
+  > Electron's bundled Chromium does **not** ship. Electron therefore uses the
+  > **server-side dictation fallback** instead: when the connected server has
+  > the `dictation` extra and models installed (`GET /v1/info` reports
+  > `dictation_available`), a take that fails with Web Speech's `network`
+  > error falls back to streaming audio to `WS /v1/dictation/stream` and
+  > transcribing on the server — no cloud, no Chrome dependency. See
+  > `designs/server-dictation.md`. Without the server extra, the button still
+  > renders (the constructor exists) but shows "Dictation unavailable" when
+  > clicked, as before.
 
 ## How it works (zero UI duplication)
 

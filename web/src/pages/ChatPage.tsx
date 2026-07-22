@@ -86,6 +86,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import {
@@ -474,6 +475,13 @@ export function shouldShowAuthorBadge(
  * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
  * later direct send could overtake a still-queued earlier one when status
  * flickers idle mid-queue (cursor-native). A new chat always sends.
+ *
+ * ``waiting`` is NOT busy for queueing: it means the turn already ended and the
+ * agent loop is only parked on background work (background shells / sub-agents)
+ * — the server's turn gate is already free, so a new message starts a fresh
+ * turn immediately instead of stalling behind that background work. (The
+ * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
+ * reflect background activity, which is a separate concern from send gating.)
  */
 export function shouldQueueSend(
   conversationId: string | null,
@@ -482,8 +490,7 @@ export function shouldQueueSend(
   queuedMessages: QueuedMessage[],
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy =
-    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
   return isBusy || hasQueued;
 }
@@ -3798,6 +3805,7 @@ export function Composer({
   subAgentLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4880,12 +4888,17 @@ export function Composer({
             <ComposerMicButton
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onTranscript={(text) => {
-                setValue((prev) => (prev ? `${prev} ${text}` : text));
+                dictation.appendFinal(text);
                 dirtyRef.current = true;
                 // Dictation is a user-driven edit — exit prompt-recall mode
                 // so ArrowUp/ArrowDown don't clobber the dictated text.
                 resetCursor();
                 if (commandError !== null) setCommandError(null);
+              }}
+              onInterim={(text) => {
+                dictation.replaceInterim(text);
+                dirtyRef.current = true;
+                resetCursor();
               }}
             />
           </div>

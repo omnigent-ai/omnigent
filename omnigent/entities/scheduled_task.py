@@ -27,7 +27,7 @@ class ScheduledTask:
     :param rrule: The required RFC 5545 recurrence rule for the recurring
         trigger, e.g. ``"FREQ=DAILY;BYHOUR=9;BYMINUTE=0"``. Evaluated in
         ``timezone``.
-    :param owner_user_id: User the spawned session's ``LEVEL_OWNER`` grant is
+    :param user_id: User the spawned session's ``LEVEL_OWNER`` grant is
         written for, e.g. ``"alice@example.com"``. ``None`` in single-user mode.
     :param agent_id: The agent bound to this task, e.g. ``"ag_..."``.
     :param timezone: IANA timezone the trigger is evaluated in,
@@ -59,7 +59,7 @@ class ScheduledTask:
     name: str
     prompt: str
     rrule: str
-    owner_user_id: str | None
+    user_id: str | None
     agent_id: str
     timezone: str
     created_at: int

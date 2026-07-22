@@ -775,6 +775,45 @@ def insert_fts(
         )
 
 
+def insert_fts_bulk(
+    session: Session,
+    rows: list[tuple[str, str, str]],
+) -> None:
+    """
+    Dual-write multiple rows into the FTS5 table in a single INSERT.
+
+    On dialects without FTS5 this is a no-op. An empty ``rows`` list is also
+    a no-op.
+
+    :param session: An active SQLAlchemy session.
+    :param rows: Each tuple is ``(item_id, conversation_id, search_text)``.
+    """
+    if not rows:
+        return
+    if not (session.bind and _supports_fts5(session.bind.dialect.name)):
+        return
+    # 3 params per row; keep total < 999 (SQLite's safe SQLITE_MAX_VARIABLE_NUMBER
+    # on pre-3.32 builds). Newer SQLite raised the limit to 32766, but chunking at
+    # 300 is safe on all versions.
+    _CHUNK_SIZE = 300
+    for chunk_start in range(0, len(rows), _CHUNK_SIZE):
+        chunk = rows[chunk_start : chunk_start + _CHUNK_SIZE]
+        placeholders = ", ".join(f"(:item_id_{i}, :cid_{i}, :st_{i})" for i in range(len(chunk)))
+        params: dict[str, str] = {}
+        for i, (item_id, conversation_id, search_text) in enumerate(chunk):
+            params[f"item_id_{i}"] = item_id
+            params[f"cid_{i}"] = conversation_id
+            params[f"st_{i}"] = search_text
+        session.execute(
+            text(
+                f"INSERT INTO {_FTS_TABLE}"
+                f"(item_id, conversation_id, search_text) "
+                f"VALUES {placeholders}"
+            ),
+            params,
+        )
+
+
 def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
     """
     Remove all FTS rows for a conversation (SQLite-family dialects only).
@@ -790,6 +829,26 @@ def delete_fts_by_conversation(session: Session, conversation_id: str) -> None:
         session.execute(
             text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id = :cid"),
             {"cid": conversation_id},
+        )
+
+
+def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> None:
+    """
+    Remove all FTS rows for a list of conversations in a single query.
+
+    No-op when ``conv_ids`` is empty or the dialect lacks FTS5.
+
+    :param session: An active SQLAlchemy session.
+    :param conv_ids: Conversation IDs whose FTS rows should be removed.
+    """
+    if not conv_ids:
+        return
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        placeholders = ", ".join(f":cid{i}" for i in range(len(conv_ids)))
+        params = {f"cid{i}": cid for i, cid in enumerate(conv_ids)}
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE conversation_id IN ({placeholders})"),
+            params,
         )
 
 

@@ -8355,6 +8355,30 @@ def _collab_item_started_event(
     }
 
 
+def _subagent_activity_started_event(
+    *,
+    parent_thread_id: str = "thread_parent",
+    child_thread_id: str = "thread_child",
+    item_id: str = "activity_1",
+    method: str = "item/completed",
+) -> dict[str, Any]:
+    """Build the native Codex child-spawn notification."""
+    return {
+        "method": method,
+        "params": {
+            "threadId": parent_thread_id,
+            "turnId": "turn_parent",
+            "item": {
+                "type": "subAgentActivity",
+                "id": item_id,
+                "kind": "started",
+                "agentThreadId": child_thread_id,
+                "agentPath": "root/researcher",
+            },
+        },
+    }
+
+
 def _child_agent_message_event(
     *,
     child_thread_id: str = "thread_child",
@@ -8608,6 +8632,45 @@ def test_forwarder_dedupes_replay_and_live_child_item(
         f"got {len(child_posts)}. Duplicate write survived dedup."
     )
     assert child_posts[0]["data"]["item_data"]["content"][0]["text"] == "child output"
+
+
+@pytest.mark.parametrize("activity_method", ["item/started", "item/completed"])
+def test_forwarder_registers_subagent_activity_before_child_events(
+    tmp_path: Path,
+    activity_method: str,
+) -> None:
+    """A native spawn activity creates the child before its events arrive."""
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={"thread_child": _child_resume_response(text="backfilled child output")}
+    )
+    codex_client.events = [
+        _subagent_activity_started_event(method=activity_method),
+        _child_agent_message_event(item_id="child_live", text="live child output"),
+    ]
+
+    async def run() -> None:
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_parent",
+            client=codex_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        )
+
+    asyncio.run(run())
+
+    registrations = _registration_posts(posted, "conv_parent")
+    assert registrations, "subAgentActivity(kind=started) must create an Omnigent child session"
+    assert registrations[0]["data"]["thread_id"] == "thread_child"
+    child_posts = _transcript_posts(posted, "conv_child")
+    assert [post["data"]["item_data"]["content"][0]["text"] for post in child_posts] == [
+        "backfilled child output",
+        "live child output",
+    ]
 
 
 def test_forwarder_does_not_double_write_stable_id_item_delivered_twice(

@@ -58,6 +58,8 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    INSTALL_HARNESS = "host.install_harness"
+    INSTALL_HARNESS_RESULT = "host.install_harness_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
 
@@ -580,6 +582,55 @@ class HostCreateDirResultFrame:
 
 
 @dataclass
+class HostInstallHarnessFrame:
+    """Server → host: install a harness CLI on the host.
+
+    Backs ``POST /v1/hosts/{id}/harnesses/{harness}/install``, used by
+    the Web UI's New Chat dialog so a user can install a missing,
+    npm-installable harness onto a connected host without dropping to a
+    terminal. The host runs the same :func:`install_harness_cli` the
+    ``omnigent setup`` wizard uses. Only allowlisted, npm-installable
+    harnesses reach this frame — the server rejects curl/brew and
+    interactive-auth harnesses before sending it.
+
+    :param request_id: Correlates the result, e.g. ``"req_install_1"``.
+    :param harness: Harness identifier to install, e.g. ``"claude"`` or
+        ``"codex"``. The host maps it to its install-spec key.
+    """
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostInstallHarnessResultFrame:
+    """Host → server: outcome of an install request.
+
+    Carries the freshly-recomputed readiness map so the server can
+    update its view and the UI can flip the harness badge without
+    waiting for a reconnect (the ``host.hello`` handshake is the only
+    other readiness carrier, sent once per connect).
+
+    :param request_id: Correlates to the
+        :class:`HostInstallHarnessFrame`, e.g. ``"req_install_1"``.
+    :param status: ``"ok"`` when the installer ran and the binary landed
+        on ``PATH``, ``"failed"`` otherwise. A ``"failed"`` status pairs
+        with a human-readable ``error`` (e.g. ``"npm not found"``).
+    :param configured_harnesses: The host's readiness map recomputed
+        after the install attempt, e.g. ``{"claude-native": True,
+        "codex-native": "needs-auth"}``. ``None`` when the install could
+        not run (the server keeps its prior readiness view).
+    :param error: Why the install failed, e.g. ``"npm not found"`` or
+        ``"install timed out"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostFsRequestFrame:
     """Server → host: read-only workspace filesystem request.
 
@@ -903,6 +954,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostInstallHarnessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSTALL_HARNESS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostInstallHarnessResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSTALL_HARNESS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostFsRequestFrame):
         return _encode_payload(
             {
@@ -1028,6 +1097,10 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.INSTALL_HARNESS:
+            return _decode_install_harness(msg)
+        case HostFrameKind.INSTALL_HARNESS_RESULT:
+            return _decode_install_harness_result(msg)
         case HostFrameKind.FS_REQUEST:
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
@@ -1377,6 +1450,32 @@ def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         path=_optional_nullable_str(msg, "path"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_install_harness(msg: dict[str, Any]) -> HostInstallHarnessFrame:
+    """Decode a host.install_harness request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.install_harness frame.
+    """
+    return HostInstallHarnessFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+    )
+
+
+def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessResultFrame:
+    """Decode a host.install_harness_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.install_harness_result frame.
+    """
+    return HostInstallHarnessResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         error=_optional_nullable_str(msg, "error"),
     )
 

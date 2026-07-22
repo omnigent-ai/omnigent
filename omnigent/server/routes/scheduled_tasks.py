@@ -13,6 +13,7 @@ below the minimum-interval floor) is a 400.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -21,16 +22,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from omnigent.entities import ScheduledTask
+from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -49,8 +52,15 @@ class CreateScheduledTaskRequest(BaseModel):
     timezone: str = "UTC"
     model_override: str | None = None
     reasoning_effort: str | None = None
-    workspace: str = Field(min_length=1)
-    host_id: str = Field(min_length=1)
+    # Optional: no PINNED host/workspace. When both are unset the fire path
+    # resolves the owner's online host at fire time and defaults the workspace to
+    # that host's home directory (a failed run is recorded if none is online) —
+    # it does not run hostless. ``min_length=1`` still rejects an empty string
+    # (the field is unset via omission / null, not ""), mirroring the PATCH
+    # request. PATCH still cannot null an already-set workspace/host_id (see
+    # ``UpdateScheduledTaskRequest``).
+    workspace: str | None = Field(default=None, min_length=1)
+    host_id: str | None = Field(default=None, min_length=1)
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -87,7 +97,9 @@ def _to_response(task: ScheduledTask) -> dict[str, Any]:
         "name": task.name,
         "prompt": task.prompt,
         "rrule": task.rrule,
-        "owner_user_id": task.owner_user_id,
+        # JSON key preserved for API/UI stability; the DB column + entity
+        # attribute are now ``user_id``.
+        "owner_user_id": task.user_id,
         "agent_id": task.agent_id,
         "timezone": task.timezone,
         "created_at": task.created_at,
@@ -99,6 +111,24 @@ def _to_response(task: ScheduledTask) -> dict[str, Any]:
         "last_run_at": task.last_run_at,
         "last_run_conversation_id": task.last_run_conversation_id,
         "updated_at": task.updated_at,
+    }
+
+
+def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
+    """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
+
+    Excludes the free-text ``error`` blob (never SQL-queried, potentially
+    large); ``error_code`` carries the queryable failure classification.
+    """
+    return {
+        "id": run.id,
+        "scheduled_task_id": run.scheduled_task_id,
+        "status": run.status,
+        "scheduled_at": run.scheduled_at,
+        "conversation_id": run.conversation_id,
+        "fired_at": run.fired_at,
+        "finished_at": run.finished_at,
+        "error_code": run.error_code,
     }
 
 
@@ -156,12 +186,21 @@ def create_scheduled_tasks_router(
         *,
         owner: str,
         agent_id: str,
-        host_id: str,
-        workspace: str,
+        host_id: str | None,
+        workspace: str | None,
         model_override: str | None,
         reasoning_effort: str | None,
-    ) -> tuple[str, str | None, str | None]:
-        """Validate inputs that scheduled tasks persist into future sessions."""
+    ) -> tuple[str | None, str | None, str | None]:
+        """Validate inputs that scheduled tasks persist into future sessions.
+
+        Workspace is always optional. When it is unset the canonical workspace
+        persists as ``None`` and the fire path defaults it to the launch host's
+        home directory — this holds whether the host was pinned or is resolved
+        from the owner's live hosts at fire time. Only a workspace pinned WITHOUT
+        a host is an error (a path with no machine is meaningless). When both a
+        host and a workspace are supplied, the workspace is validated against the
+        host boundary here so a bad pin fails fast at create.
+        """
         user_id = None if owner == RESERVED_USER_LOCAL else owner
         agent = await validate_session_agent(
             user_id=user_id,
@@ -174,6 +213,36 @@ def create_scheduled_tasks_router(
             model_override=model_override,
             reasoning_effort=reasoning_effort,
         )
+        if workspace is None:
+            # No pinned workspace: the fire path defaults it to the launch host's
+            # HOME, so there is nothing to validate against the host boundary
+            # here (a bare host with no workspace is allowed). But a PINNED host
+            # must still be authorized at create — existence + ownership — even
+            # without a workspace, so a non-owned / nonexistent host reference
+            # fails fast with a clean 4xx instead of persisting and only
+            # surfacing as a failed run at fire time. This is a LOCAL store read
+            # (no host.stat / workspace RPC), via the same resolve_host_owner the
+            # workspace-present branch below uses inside
+            # validate_existing_host_workspace — and whose semantics
+            # fire.py:_authorize_pinned_host mirrors — so create-time and
+            # fire-time host authorization cannot drift. When user_id is None
+            # (single-user / auth disabled) resolve_host_owner skips the owner
+            # check, matching the fire path and the rest of the server.
+            if host_id is not None:
+                host_store = getattr(request.app.state, "host_store", None)
+                if host_store is not None:
+                    await asyncio.to_thread(
+                        resolve_host_owner,
+                        user_id=user_id,
+                        host_id=host_id,
+                        host_store=host_store,
+                    )
+            return None, validated_model, validated_effort
+        if host_id is None:
+            raise OmnigentError(
+                "host_id required when workspace is set",
+                code=ErrorCode.INVALID_INPUT,
+            )
         canonical_workspace = await validate_existing_host_workspace(
             user_id=user_id,
             host_id=host_id,
@@ -192,7 +261,7 @@ def create_scheduled_tasks_router(
         enumerable across users.
         """
         task = store.get(scheduled_task_id)
-        if task is None or task.owner_user_id != owner:
+        if task is None or task.user_id != owner:
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
@@ -219,7 +288,7 @@ def create_scheduled_tasks_router(
             name=body.name,
             prompt=body.prompt,
             rrule=body.rrule,
-            owner_user_id=None if owner == RESERVED_USER_LOCAL else owner,
+            user_id=None if owner == RESERVED_USER_LOCAL else owner,
             agent_id=body.agent_id,
             timezone=body.timezone,
             model_override=model_override,
@@ -234,10 +303,22 @@ def create_scheduled_tasks_router(
 
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
-        """List the caller's scheduled tasks."""
+        """List the caller's scheduled tasks.
+
+        Lazy-on-read stale backstop: before returning, force-fail any of this
+        owner's runs still ``running`` past the 6h max age (``incomplete``), so
+        a future Tasks-list "last-run status" badge never shows a stale orphan
+        as ``running``. Pure age check — one indexed, owner-scoped query for the
+        owner's running runs, then a conditional ``update_run``; NO per-run
+        conversation I/O. Young in-flight runs are untouched, and completion of
+        a normal run is handled event-driven (the ``_publish_status`` hook), not
+        here.
+        """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list() if t.owner_user_id == owner_id]
+        tasks = [t for t in store.list() if t.user_id == owner_id]
+        running = store.list_running_runs_for_tasks([t.id for t in tasks])
+        force_fail_stale_runs(store, running)
         return {"scheduled_tasks": [_to_response(t) for t in tasks]}
 
     @router.get("/scheduled-tasks/{scheduled_task_id}")
@@ -250,6 +331,33 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
         return _to_response(task)
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}/runs")
+    async def list_scheduled_task_runs(
+        request: Request,
+        scheduled_task_id: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """List the run history for one of the caller's scheduled tasks.
+
+        Owner-scoped: a task owned by someone else (or absent) 404s via
+        ``_require_owned``, so runs aren't enumerable across users. Runs come
+        back most-recent-first (``scheduled_at DESC``); an empty history is an
+        empty list.
+
+        Lazy-on-read backstop: before listing, force-fail any of this task's
+        runs still ``running`` past the 6h max age (``incomplete``). Completion
+        itself is event-driven (the ``_publish_status`` hook); this only
+        catches a genuine orphan — a run whose terminal event never fired (host
+        died mid-turn) — so the "every run eventually terminal" invariant holds
+        without a background poll or startup sweep. Pure age check (no
+        conversation I/O); a young in-flight run is untouched, and the
+        conditional ``update_run`` never clobbers an already-terminal row.
+        """
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        _require_owned(scheduled_task_id, owner_id)
+        runs = force_fail_stale_runs(store, store.list_runs(scheduled_task_id))
+        return {"runs": [_run_to_response(r) for r in runs]}
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(

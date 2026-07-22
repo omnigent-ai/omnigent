@@ -3401,6 +3401,7 @@ def server(
     _ensure_sqlite_parent_dir(db_uri)
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -3412,6 +3413,7 @@ def server(
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    project_store = SqlAlchemyProjectStore(db_uri)
     artifact_store = _create_artifact_store(art_loc)
 
     # Initialize the runtime with store references so workflow code
@@ -3563,6 +3565,7 @@ def server(
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
+        project_store=project_store,
         auth_provider=auth_provider,
         host_store=host_store,
         account_store=account_store,
@@ -6271,7 +6274,10 @@ def resume(
 @cli.command("import")
 @click.option(
     "--harness",
-    type=click.Choice(["claude", "codex"], case_sensitive=False),
+    type=click.Choice(
+        ["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"],
+        case_sensitive=False,
+    ),
     required=True,
     help="Local coding harness that owns the source session.",
 )
@@ -6304,16 +6310,20 @@ def import_session_command(
     recent_session_count: int | None,
     server: str | None,
 ) -> None:
-    """Import local Claude Code or Codex chats.
+    """Import chats from supported local coding harnesses.
 
     The source transcript is converted to ordinary Omnigent items and stored
-    as a normal session. Use --session for one chat or --last for a bounded
-    batch. A source session can only be imported once.
+    as a normal session. Qwen, Kiro, and Kimi currently preserve visible
+    messages but not native tool activity; OpenCode and Pi preserve exported
+    tool activity. Use --session for one chat or --last for a bounded batch. A
+    source session can only be imported once.
 
     \b
     Examples:
       omnigent import --harness claude --session <session-id>
       omnigent import --harness codex --session <session-id>
+      omnigent import --harness opencode --session <session-id>
+      omnigent import --harness qwen --session <session-id>
       omnigent import --harness claude --last 10
     """
     import httpx
@@ -6334,7 +6344,10 @@ def import_session_command(
     source = cast(ImportSource, harness.lower())
     is_batch = recent_session_count is not None
     if recent_session_count is not None:
-        recent_ids = list_recent_local_session_ids(source, limit=recent_session_count)
+        try:
+            recent_ids = list_recent_local_session_ids(source, limit=recent_session_count)
+        except SessionImportNotFoundError as exc:
+            raise click.ClickException(str(exc)) from exc
         if not recent_ids:
             raise click.ClickException(f"No local {source} parent sessions were found")
         source_session_ids = tuple(reversed(recent_ids))

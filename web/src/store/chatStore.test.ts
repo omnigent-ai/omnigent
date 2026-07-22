@@ -2484,8 +2484,9 @@ describe("chatStore — send while streaming (queueing)", () => {
     // The denied queued message was never persisted, so its optimistic
     // bubble must disappear even though the previous response is still live.
     expect(state.pendingUserMessages).toEqual([]);
-    // Denying the queued input must not mark the already-streaming prior
-    // response idle; that response still needs its own response_end.
+    // The denied branch of `send` only settles status when NOT already
+    // streaming, so the POST-return path leaves the prior turn's
+    // running/streaming state intact here.
     expect(state.status).toBe("streaming");
     expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
@@ -2494,17 +2495,28 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
+    // Accepted trade-off: the server's deny short-circuit still publishes a
+    // session-level running→idle pair for the denied out-of-band input, and
+    // the client now trusts `session.status` 1:1 (the guard that used to
+    // suppress this stray idle was removed to fix the fresh-session
+    // "Working…" persists bug). So this idle DOES flip `sessionStatus` to
+    // idle mid-stream. The bubble lifecycle is unaffected — `status` /
+    // `activeResponse` still defer to the streaming turn's own response_end —
+    // and the next real status edge re-asserts running, so the effect is a
+    // brief indicator blip confined to the rare deny-while-streaming case.
     handleSessionEvent({
       type: "session_status",
       conversationId: "conv_abc",
       status: "idle",
     });
     const afterIdle = useChatStore.getState();
-    // The server's deny short-circuit publishes running→idle for the
-    // queued input. That idle must not clear the prior response's
-    // running/working signal while its active response is still streaming.
+    expect(afterIdle.sessionStatus).toBe("idle");
     expect(afterIdle.status).toBe("streaming");
-    expect(afterIdle.sessionStatus).toBe("running");
+    expect(afterIdle.activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "streaming",
+      error: null,
+    });
   });
 });
 
@@ -2580,6 +2592,57 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     const state = useChatStore.getState();
     expect(state.sessionStatus).toBe("idle");
     expect(state.backgroundTaskCount).toBe(0);
+  });
+
+  it("frees the local send lifecycle on a Stop-derived waiting edge (with responseId)", () => {
+    // Regression: the claude/cursor-native Stop hook posts the turn-end
+    // `waiting` edge WITH the ended turn's `response_id`. It must finalize the
+    // local `status` to idle (the turn is done) so the composer sends the next
+    // message instead of queuing it — while `sessionStatus` stays `waiting` and
+    // the shell count sticks, keeping the "Working…" spinner lit.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      backgroundTaskCount: 0,
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      responseId: "resp_1",
+      backgroundTaskCount: 1,
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse?.state).toBe("completed");
+    expect(state.sessionStatus).toBe("waiting");
+    expect(state.backgroundTaskCount).toBe(1);
+  });
+
+  it("frees the local send lifecycle on a waiting edge whose id doesn't match", () => {
+    // A `waiting` edge that carries no id (or a stale one) with no tracked
+    // response must still free the send lifecycle so a message isn't stranded.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      backgroundTaskCount: 0,
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundTaskCount: 1,
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.sessionStatus).toBe("waiting");
+    // The stale streaming bubble is finalized so it doesn't linger spinning —
+    // no future edge names this id to close it.
+    expect(state.activeResponse?.state).toBe("completed");
   });
 
   it("clears the shell count when a new turn starts (running edge)", () => {
@@ -3209,7 +3272,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("idle preserves a still-streaming active response until response_end arrives", () => {
+    it("idle settles sessionStatus but preserves a still-streaming bubble until response_end", () => {
       useChatStore.setState({
         status: "streaming",
         sessionStatus: "running",
@@ -3223,16 +3286,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
 
       const state = useChatStore.getState();
-      // A real response bubble is closed by response_end, not by the
-      // coarser session.status signal. Clearing status here would make
-      // the bubble lifecycle disagree with the streaming reducer.
+      // sessionStatus tracks the server's session-level status 1:1 — a server
+      // idle means idle, and the "Working…" indicator (which reads only
+      // sessionStatus) must turn off. The bubble lifecycle is separate: a real
+      // response bubble is still closed by response_end, not by the coarser
+      // session.status signal, so the local `status`/`activeResponse` stay
+      // streaming until response_end lands (dropping the guard that used to
+      // strand sessionStatus at "running" — the "Working…" persists bug).
+      expect(state.sessionStatus).toBe("idle");
       expect(state.status).toBe("streaming");
       expect(state.activeResponse).toEqual({
         responseId: "resp_live",
         state: "streaming",
         error: null,
       });
-      expect(state.sessionStatus).toBe("running");
     });
 
     it("idle refetches the parent's child list when the conversation is a child", () => {
@@ -8335,6 +8402,29 @@ describe("chatStore — client-side message queue", () => {
     expect(sendSpy.mock.calls[1]!.slice(0, 2)).toEqual(["second", "agent_xyz"]);
   });
 
+  // Regression: a background shell / still-running sub-agent keeps the session
+  // in `waiting` after the turn ends, but the server's turn gate is already
+  // free. The flush must NOT treat `waiting` as busy — otherwise a queued
+  // message stays stuck until full idle even though a new turn could start now.
+  it("flushes the head on `waiting` (background work outlives the turn)", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      send: sendSpy,
+      queuedMessages: [{ queueId: "q_1", text: "first", conversationId: "conv_abc" }],
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["first", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it("does not flush a queue owned by a different conversation", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
@@ -8420,7 +8510,7 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["b1"]);
   });
 
-  it("does not flush while busy (streaming or running/waiting)", () => {
+  it("does not flush while busy (streaming or running)", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     const base = {
       conversationId: "conv_abc",
@@ -8434,9 +8524,6 @@ describe("chatStore — client-side message queue", () => {
     useChatStore.getState().maybeFlushQueuedHead();
     // Server-side turn still running.
     useChatStore.setState({ ...base, status: "idle", sessionStatus: "running" });
-    useChatStore.getState().maybeFlushQueuedHead();
-    // Draining background work.
-    useChatStore.setState({ ...base, status: "idle", sessionStatus: "waiting" });
     useChatStore.getState().maybeFlushQueuedHead();
 
     expect(sendSpy).not.toHaveBeenCalled();

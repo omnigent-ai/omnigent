@@ -134,7 +134,7 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
 | `image` | Optional runner image override (defaults to the official multi-arch amd64/arm64 host image). |
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
-| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. (arm64 note: the CEL policy module is unavailable there — `cel-expr-python` ships no aarch64 wheel — and degrades gracefully.) |
+| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
