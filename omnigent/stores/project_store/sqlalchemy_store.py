@@ -16,6 +16,20 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store import ProjectStore
 
 
+def _is_name_conflict(exc: IntegrityError) -> bool:
+    """Return whether ``exc`` is the per-owner name-UNIQUE index violation.
+
+    Only that constraint should translate to ``ALREADY_EXISTS`` — any other
+    integrity failure (unexpected PK collision, NOT NULL, etc.) must surface
+    as itself rather than a misleading "already exists". Drivers name the hit
+    constraint differently: Postgres reports the index name (``ix_projects_name``)
+    while SQLite lists the columns (``...owner_user_id, projects.name``). Match
+    either signature, keyed on the ``name`` column that is unique to this index.
+    """
+    message = str(exc.orig)
+    return "ix_projects_name" in message or "projects.name" in message
+
+
 def _to_entity(row: SqlProject) -> Project:
     """
     Convert a :class:`SqlProject` ORM row to a :class:`Project`.
@@ -96,8 +110,9 @@ class SqlAlchemyProjectStore(ProjectStore):
         friendly error (and is the only guard for NULL owners, which SQL treats
         as distinct), while the ``ix_projects_name`` UNIQUE index enforces it at
         the DB layer for non-NULL owners — catching a concurrent create that
-        slips past the check. An index violation surfaces as ``IntegrityError``,
-        which we map to the same ``ALREADY_EXISTS``.
+        slips past the check. That index violation surfaces as ``IntegrityError``
+        and maps to the same ``ALREADY_EXISTS``; any other integrity failure is
+        re-raised untranslated.
         """
         with self._session() as session:
             if self._name_taken(session, owner_user_id=owner_user_id, name=name, exclude_id=None):
@@ -116,6 +131,8 @@ class SqlAlchemyProjectStore(ProjectStore):
             try:
                 session.flush()
             except IntegrityError as exc:
+                if not _is_name_conflict(exc):
+                    raise
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
                     code=ErrorCode.ALREADY_EXISTS,
@@ -175,7 +192,9 @@ class SqlAlchemyProjectStore(ProjectStore):
                 session.flush()
             except IntegrityError as exc:
                 # A concurrent rename raced past _name_taken and hit the UNIQUE
-                # index (non-NULL owners).
+                # index (non-NULL owners); anything else is a real error.
+                if not _is_name_conflict(exc):
+                    raise
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
                     code=ErrorCode.ALREADY_EXISTS,

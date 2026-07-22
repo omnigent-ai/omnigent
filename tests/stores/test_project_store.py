@@ -9,6 +9,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
@@ -76,10 +77,7 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyProjectStore) -> Non
     store.create(_uid("p1"), "First", "alice@example.com")
     store.create(_uid("p2"), "Second", "alice@example.com")
     listed = store.list(owner_user_id="alice@example.com")
-    assert [p.name for p in listed] == ["First", "Second"] or [p.name for p in listed] == [
-        "Second",
-        "First",
-    ]
+    assert {p.name for p in listed} == {"First", "Second"}
     # Whatever the tie order, it is ascending by (created_at, id).
     keys = [(p.created_at, p.id) for p in listed]
     assert keys == sorted(keys)
@@ -179,6 +177,19 @@ def test_duplicate_name_rejected_at_db_layer_for_named_owner(
     with pytest.raises(OmnigentError) as exc:
         store.create(_uid("p2"), "Dup", "alice@example.com")
     assert exc.value.code == ErrorCode.ALREADY_EXISTS
+
+
+def test_non_name_integrity_error_is_not_masked(store: SqlAlchemyProjectStore) -> None:
+    """An integrity failure that isn't the name index re-raises untranslated.
+
+    Reusing an existing id hits the primary-key constraint, not
+    ``ix_projects_name``; that must surface as ``IntegrityError`` rather than a
+    misleading ``ALREADY_EXISTS`` name collision.
+    """
+    store.create(_uid("p1"), "Original", "alice@example.com")
+    store._name_taken = lambda *a, **k: False  # type: ignore[method-assign]
+    with pytest.raises(IntegrityError):
+        store.create(_uid("p1"), "Different name", "alice@example.com")
 
 
 # ── update ─────────────────────────────────────────────────────────────────
