@@ -298,6 +298,17 @@ const CODEX_NATIVE_APPROVAL_MODES: {
 // approval-mode presets above: when bypass is on the runner strips any
 // `--sandbox` / `--ask-for-approval` flags those presets would emit.
 const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox";
+// Bypass is the most-permissive Codex approval stance — presented as a 4th
+// option in the Codex approval dropdown (Codex only; OpenCode shares the
+// presets above but has no bypass). It rides as a conversation label, not
+// terminal_launch_args, so its `args` are empty and it's handled specially.
+const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
+const CODEX_NATIVE_BYPASS_APPROVAL_OPTION = {
+  value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  label: "Bypass approvals & sandbox",
+  description: "Runs Codex with no approval prompts and no command sandbox",
+  args: [] as string[],
+};
 
 function HostOption({ host, subtitle }: { host: Host; subtitle?: string }) {
   const isOnline = host.status === "online";
@@ -912,61 +923,6 @@ function LandingProjectPicker({
  * picker supply every required parameter. Hitting send POSTs /v1/sessions and
  * navigates to the new session — there is no modal.
  */
-/**
- * DANGEROUS full-bypass opt-in for the Codex-native agent, rendered inside
- * the Advanced settings menu in the composer footer below the approval-mode
- * rows.
- *
- * Enabling this launches Codex with
- * ``--dangerously-bypass-approvals-and-sandbox`` — no approval prompts and
- * no command sandbox. The Switch is directly flippable; while on, a
- * persistent red banner warns that approvals and the sandbox are disabled.
- *
- * @param enabled Whether full bypass is currently armed.
- * @param onEnabledChange Callback toggling the armed state.
- */
-function BypassSandboxOption({
-  enabled,
-  onEnabledChange,
-}: {
-  enabled: boolean;
-  onEnabledChange: (enabled: boolean) => void;
-}) {
-  return (
-    <div className="px-2 py-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 text-xs font-medium text-destructive">
-          <TriangleAlertIcon className="size-3.5 shrink-0" />
-          <span>Bypass approvals &amp; sandbox</span>
-        </div>
-        <Switch
-          size="sm"
-          checked={enabled}
-          data-testid="new-chat-landing-bypass-sandbox-switch"
-          aria-label="Bypass approvals and sandbox"
-          onCheckedChange={onEnabledChange}
-        />
-      </div>
-      <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
-        Runs Codex with no approval prompts and no command sandbox.
-      </p>
-      {enabled && (
-        <div
-          role="alert"
-          data-testid="new-chat-landing-bypass-sandbox-banner"
-          className="mt-1.5 flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-[11px] font-medium leading-relaxed text-destructive"
-        >
-          <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-          <span>
-            Danger: this session runs Codex with approvals and the sandbox disabled. It can edit any
-            file and run any command without asking.
-          </span>
-        </div>
-      )}
-    </div>
-  );
-}
-
 /** Group / section header inside the picker dropdown (plain div, so Radix
  * doesn't claim roving focus for it — mirrors the in-session picker). */
 function PickerSectionHeader({ children }: { children: ReactNode }) {
@@ -1369,17 +1325,21 @@ function ConfigRow({
  * @param onValueChange Selection callback.
  * @param options Value/label/description triples.
  * @param testId Trigger test id.
+ * @param ariaLabel Accessible name for the trigger (the visible ConfigRow
+ *   label is visual-only, so pass it here to name the control for AT).
  */
 function DescribedSelect({
   value,
   onValueChange,
   options,
   testId,
+  ariaLabel,
 }: {
   value: string;
   onValueChange: (value: string) => void;
   options: readonly { value: string; label: string; description: string }[];
   testId: string;
+  ariaLabel: string;
 }) {
   const [previewed, setPreviewed] = useState<string | null>(null);
   const detail = options.find((o) => o.value === (previewed ?? value))?.description;
@@ -1393,7 +1353,7 @@ function DescribedSelect({
         if (!next) setPreviewed(null);
       }}
     >
-      <SelectTrigger className="w-full" data-testid={testId}>
+      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
         <SelectValue />
       </SelectTrigger>
       {/* Pin the popup to the trigger width so a long blurb wraps in the footer
@@ -1535,8 +1495,8 @@ function HarnessConfigModal({
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModel("");
       // "Default" = no override; defer routing to the spec default (null,
-      // omitted from create) rather than emitting an explicit "off".
-      if (smartRoutingOn) setDraftRouting(null);
+      // omitted from create) — never emit an explicit "on"/"off".
+      setDraftRouting(null);
     } else {
       setDraftModel(value);
       // Picking an explicit model turns routing off (mutually exclusive).
@@ -1596,11 +1556,31 @@ function HarnessConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
+          {/* Smart Routing as a standalone toggle, first, for routable agents
+          that have no Model dropdown to fold it into (Codex, bundle agents, …).
+          Claude offers it as a Model option instead, so it's excluded here. */}
+          {smartRoutingEligible && !hasPermission && (
+            <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
+              <div className="flex h-8 items-center justify-end">
+                <Switch
+                  size="sm"
+                  checked={smartRoutingOn}
+                  data-testid="new-chat-landing-config-smart-routing"
+                  aria-label="Smart Routing"
+                  onCheckedChange={(next) => setDraftRouting(next ? "on" : "off")}
+                />
+              </div>
+            </ConfigRow>
+          )}
           {hasPermission && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
                 <Select value={modelValue} onValueChange={onModelChange}>
-                  <SelectTrigger className="w-full" data-testid="new-chat-landing-config-model">
+                  <SelectTrigger
+                    className="w-full"
+                    data-testid="new-chat-landing-config-model"
+                    aria-label="Model"
+                  >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent
@@ -1657,6 +1637,7 @@ function HarnessConfigModal({
                   onValueChange={setDraftPermission}
                   options={CLAUDE_NATIVE_PERMISSION_MODES}
                   testId="new-chat-landing-config-permission"
+                  ariaLabel="Permissions"
                 />
               </ConfigRow>
             </>
@@ -1666,14 +1647,41 @@ function HarnessConfigModal({
             <>
               <ConfigRow label="Approval" description="What the agent can do without asking">
                 <DescribedSelect
-                  value={draftApproval}
-                  onValueChange={setDraftApproval}
-                  options={CODEX_NATIVE_APPROVAL_MODES}
+                  // Codex adds the DANGEROUS full-bypass as a 4th option; when
+                  // armed the select shows it (draftBypass wins over the preset).
+                  value={
+                    isCodex && draftBypass ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE : draftApproval
+                  }
+                  onValueChange={(v) => {
+                    if (v === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
+                      setDraftBypass(true);
+                    } else {
+                      setDraftBypass(false);
+                      setDraftApproval(v);
+                    }
+                  }}
+                  options={
+                    isCodex
+                      ? [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]
+                      : CODEX_NATIVE_APPROVAL_MODES
+                  }
                   testId="new-chat-landing-config-approval"
+                  ariaLabel="Approval"
                 />
               </ConfigRow>
-              {isCodex && (
-                <BypassSandboxOption enabled={draftBypass} onEnabledChange={setDraftBypass} />
+              {/* Persistent danger banner while full-bypass is selected. */}
+              {isCodex && draftBypass && (
+                <div
+                  role="alert"
+                  data-testid="new-chat-landing-bypass-sandbox-banner"
+                  className="flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium leading-relaxed text-destructive"
+                >
+                  <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+                  <span>
+                    Danger: this session runs Codex with approvals and the sandbox disabled. It can
+                    edit any file and run any command without asking.
+                  </span>
+                </div>
               )}
             </>
           )}
@@ -1685,6 +1693,7 @@ function HarnessConfigModal({
                 onValueChange={setDraftCursor}
                 options={CURSOR_NATIVE_EXEC_MODES}
                 testId="new-chat-landing-config-cursor-mode"
+                ariaLabel="Mode"
               />
             </ConfigRow>
           )}
@@ -1692,7 +1701,11 @@ function HarnessConfigModal({
           {!hasPermission && !hasApproval && !hasCursor && brainDefault && (
             <ConfigRow label="Agent Harness" description="Underlying coding harness">
               <Select value={draftHarness ?? brainDefault} onValueChange={setDraftHarness}>
-                <SelectTrigger className="w-full" data-testid="new-chat-landing-config-harness">
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="new-chat-landing-config-harness"
+                  aria-label="Agent Harness"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent
@@ -1718,23 +1731,6 @@ function HarnessConfigModal({
                   ))}
                 </SelectContent>
               </Select>
-            </ConfigRow>
-          )}
-
-          {/* Smart Routing as a standalone toggle for routable agents that have
-          no Model dropdown to fold it into (Codex, bundle agents, …). Claude
-          offers it as a Model option instead, so it's excluded here. */}
-          {smartRoutingEligible && !hasPermission && (
-            <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
-              <div className="flex h-8 items-center">
-                <Switch
-                  size="sm"
-                  checked={smartRoutingOn}
-                  data-testid="new-chat-landing-config-smart-routing"
-                  aria-label="Smart Routing"
-                  onCheckedChange={(next) => setDraftRouting(next ? "on" : "off")}
-                />
-              </div>
             </ConfigRow>
           )}
         </div>
@@ -2373,9 +2369,16 @@ export function NewChatLandingScreen() {
   // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
   // is instance-scoped). Smart routing likewise clears: switching to an agent
   // whose modal has no routing control (or isn't routable) would otherwise
-  // leave it stuck "on" with no UI to turn it off. Keyed on the effective
-  // agent id so it also fires when a persisted pick resolves on mount.
+  // leave it stuck "on" with no UI to turn it off.
+  //
+  // Only reset on an ACTUAL agent change — not the initial resolution (null →
+  // first id, or a persisted/draft pick resolving on mount), which would wipe a
+  // costControlMode/bypass restored from the landing draft.
+  const prevAgentIdRef = useRef<string | null | undefined>(undefined);
   useEffect(() => {
+    const prev = prevAgentIdRef.current;
+    prevAgentIdRef.current = effectiveAgentId;
+    if (prev === undefined || prev === effectiveAgentId) return;
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);

@@ -329,10 +329,11 @@ async def _drive_codex_badge(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Polly auto-selects (sole agent); its brain-harness radio group lives
-            # in the picker's per-entry config submenu.
+            # Polly auto-selects (sole agent); its Agent Harness options live in
+            # the gear config modal's Select. Radix mirrors the selected item's
+            # content in the trigger, so a badge can match twice — take .first.
             await _open_entry_config(page, "ag_polly_e2e")
-            badge = page.get_by_test_id("new-chat-landing-harness-warning-codex")
+            badge = page.get_by_test_id("new-chat-landing-harness-warning-codex").first
             await expect(badge).to_be_visible(timeout=30_000)
             await expect(badge).to_contain_text("needs auth")
         finally:

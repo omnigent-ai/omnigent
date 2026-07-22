@@ -1167,15 +1167,14 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
-    """Arming the DANGEROUS Codex full-bypass toggle rides along to the create.
+    """Arming DANGEROUS Codex full-bypass rides along to the create.
 
-    The bypass switch in the Codex config modal is the first-class
-    opt-in for Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance.
-    Flipping it on and saving raises a persistent red banner under the composer
-    — surviving the modal's close. When armed, the create
-    ``POST /v1/sessions`` must carry the
-    ``omnigent.codex_native.bypass_sandbox: "1"`` conversation label so the
-    runner launches Codex with the bypass flag.
+    Bypass is the most-permissive option in the Codex config modal's Approval
+    dropdown — Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance.
+    Picking it and saving raises a persistent red banner under the composer —
+    surviving the modal's close. When armed, the create ``POST /v1/sessions``
+    must carry the ``omnigent.codex_native.bypass_sandbox: "1"`` conversation
+    label so the runner launches Codex with the bypass flag.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_bypass_sandbox(base_url, session_id))
@@ -1216,15 +1215,18 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in); the bypass opt-in lives inside
-            # its config modal, below the approval preset.
+            # Codex auto-selects (only built-in); bypass is the most-permissive
+            # option in its config-modal Approval dropdown.
             await _open_entry_config(page, "ag_codex_e2e")
 
-            # Flip the bypass Switch on, then Save to commit.
-            switch = page.get_by_test_id("new-chat-landing-bypass-sandbox-switch")
-            await expect(switch).to_have_attribute("aria-checked", "false")
-            await switch.click()
-            await expect(switch).to_have_attribute("aria-checked", "true")
+            # Pick "Bypass approvals & sandbox" in the Approval dropdown; the
+            # in-modal danger banner confirms it, then Save to commit.
+            await _pick_config_select(
+                page, "new-chat-landing-config-approval", "Bypass approvals & sandbox"
+            )
+            await expect(
+                page.get_by_test_id("new-chat-landing-bypass-sandbox-banner")
+            ).to_be_visible()
             await _save_config(page)
 
             # After the modal closes, the persistent red banner under the

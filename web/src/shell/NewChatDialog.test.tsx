@@ -1014,49 +1014,38 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("Read only")).toBeTruthy();
   });
 
-  it("arms codex full bypass by flipping the toggle and shows the warning banner", () => {
+  it("arms codex full bypass via the Approval dropdown and shows the warning banner", () => {
     renderLanding();
-    // Open Codex's (a2) config modal where the bypass opt-in lives.
+    // Open Codex's (a2) config modal; bypass is the most-permissive Approval option.
     openAgentConfig("a2");
-    const toggle = screen.getByTestId(
-      "new-chat-landing-bypass-sandbox-switch",
-    ) as HTMLButtonElement;
-    // OFF by default, directly flippable (no typed confirmation gate).
-    expect(toggle.getAttribute("aria-checked")).toBe("false");
     expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
-    fireEvent.click(toggle);
-    expect(
-      (
-        screen.getByTestId("new-chat-landing-bypass-sandbox-switch") as HTMLButtonElement
-      ).getAttribute("aria-checked"),
-    ).toBe("true");
-    // Arming renders the in-modal red danger banner.
+    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
+    // The trigger reflects the pick and the in-modal red danger banner appears.
+    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain(
+      "Bypass approvals & sandbox",
+    );
     const banner = screen.getByTestId("new-chat-landing-bypass-sandbox-banner");
     expect(banner.textContent).toContain("approvals and the sandbox disabled");
   });
 
   it("disarms the dangerous bypass when the agent changes (re-arm per context)", () => {
     renderLanding();
-    // Arm bypass on Codex (a2): open its config modal, flip the switch, Save.
+    // Arm bypass on Codex (a2): open its config modal, pick Bypass, Save.
     openAgentConfig("a2");
-    fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
+    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
     saveConfig();
     // Armed → the persistent banner is up under the composer.
     expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
 
     // Switch away to Claude (a1): the armed bypass must clear immediately, so
-    // the persistent banner disappears (Claude has no bypass toggle at all).
+    // the persistent banner disappears (Claude has no bypass option at all).
     selectAgent("a1");
     expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeNull();
 
-    // Switch back to Codex and reopen its config modal: the toggle is OFF
-    // again — the bypass must be re-armed for this fresh context. Without the
-    // reset effect it would re-render armed from stale state.
+    // Switch back to Codex and reopen its config modal: Approval is back at
+    // Default (no banner) — bypass must be re-armed for this fresh context.
     openAgentConfig("a2");
-    const toggle = screen.getByTestId(
-      "new-chat-landing-bypass-sandbox-switch",
-    ) as HTMLButtonElement;
-    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByTestId("new-chat-landing-config-approval").textContent).toContain("Default");
     expect(screen.queryByTestId("new-chat-landing-bypass-sandbox-banner")).toBeNull();
   });
 
@@ -1067,7 +1056,7 @@ describe("NewChatLandingScreen", () => {
     } as unknown as Response);
     renderLanding();
     openAgentConfig("a2");
-    fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
+    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
     // Save to commit, then submit a real task.
     saveConfig();
     // The persistent banner remains visible under the composer after the
