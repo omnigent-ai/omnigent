@@ -152,6 +152,18 @@ async def _register_routes(
         else:
             await route.continue_()
 
+    async def handle_agent_scan(route: Route) -> None:
+        # Neutralize agent discovery so only the stubbed Claude agent feeds the
+        # picker. On the shared e2e_ui server, sessions other tests left behind
+        # would otherwise leak in as discovered custom agents — flipping the
+        # picker's "Custom agents" group on and folding "Create custom agent"
+        # into a submenu, so the top-level create row this test clicks is absent.
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"data": []}),
+        )
+
     if managed:
 
         async def handle_info(route: Route) -> None:
@@ -165,6 +177,9 @@ async def _register_routes(
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
+    # Registered after the broad sessions glob so it wins the kind=any discovery
+    # scan; the bare conversation-list GET still falls through to handle_sessions.
+    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
 
 async def _seed_workspace(page) -> None:
