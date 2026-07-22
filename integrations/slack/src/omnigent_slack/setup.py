@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -45,6 +46,10 @@ WORKSPACE_ACTION = "workspace_input"
 # below that in practice, but truncate defensively so a huge server never
 # produces an invalid view payload.
 _MAX_SELECT_OPTIONS = 100
+
+# Pause after views.open before the first views_update, so the client has
+# rendered the modal and won't drop the update (see _open_connecting_modal).
+_MODAL_SETTLE_SECONDS = 0.6
 
 
 class _ViewUpdateAck:
@@ -293,6 +298,13 @@ class SetupFlow:
             return None
         view = resp.get("view") if hasattr(resp, "get") else None
         view_id = view.get("id") if isinstance(view, dict) else None
+        # Let the just-opened modal settle on the client before any views_update.
+        # views.open returns as soon as Slack's backend accepts the view, but the
+        # user's client renders it over a separate push channel; an update issued
+        # within a few hundred ms (our validate() is ~100ms) is accepted by the
+        # backend (ok:true) yet dropped by the not-yet-materialized client, so the
+        # modal stays stuck on "Connecting…". A short settle closes that window.
+        await asyncio.sleep(_MODAL_SETTLE_SECONDS)
         return str(view_id) if view_id else None
 
     async def _begin_setup(self, client: Any, *, team_id: str, user_id: str, view_id: str) -> None:

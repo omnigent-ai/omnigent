@@ -786,6 +786,65 @@ async def test_config_command_opens_connecting_modal(tmp_path: Path) -> None:
     assert client.opened_views[0]["view"]["callback_id"] == CALLBACK_SETUP_INFO
 
 
+@respx.mock
+async def test_setup_settles_modal_before_first_update(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The just-opened modal must settle on the client before the first
+    # views_update, or Slack accepts the update (ok:true) while the not-yet-
+    # rendered client drops it and the modal hangs on "Connecting…". Assert the
+    # settle sleep runs, and runs BEFORE any views_update fires.
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    events: list[str] = []
+
+    import omnigent_slack.setup as setup_mod
+
+    real_sleep = setup_mod.asyncio.sleep
+
+    async def _tracking_sleep(delay: float) -> None:
+        # Only the settle sleep (>0) is interesting; don't record 0-delay yields.
+        if delay > 0:
+            events.append(f"sleep:{delay}")
+        await real_sleep(0)
+
+    monkeypatch.setattr(setup_mod.asyncio, "sleep", _tracking_sleep)
+
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+
+    class _RecordingClient(FakeSetupClient):
+        async def views_update(self, **kwargs: Any) -> dict[str, Any]:
+            events.append("views_update")
+            return await super().views_update(**kwargs)
+
+    client = _RecordingClient()
+
+    try:
+        await flow._handle_config_command(
+            FakeAck(),
+            {"trigger_id": "tid-1", "team_id": "T1", "user_id": "U1"},
+            client,
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert f"sleep:{setup_mod._MODAL_SETTLE_SECONDS}" in events
+    # The settle sleep precedes the first views_update.
+    assert events.index(f"sleep:{setup_mod._MODAL_SETTLE_SECONDS}") < events.index("views_update")
+
+
 async def test_config_command_fails_closed_on_missing_team(tmp_path: Path) -> None:
     # An empty team_id would collapse token/config keys across workspaces, so the
     # slash-command path must fail closed (ack, then nothing) rather than proceed.
