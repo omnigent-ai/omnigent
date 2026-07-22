@@ -13275,13 +13275,26 @@ async def _create_session_from_existing_agent(
             _host_install_id: str | None = None
             if _hr is not None and conv.host_id is not None:
                 _host_install_id = _hr.get_host_installation_id(conv.host_id)
+            # Resolve harness directly from the in-scope agent + cache so
+            # the result is independent of _globals._agent_store (which is
+            # only set when the server is started via the CLI).
+            _tel_harness: str | None
+            if native_agent is not None:
+                _tel_harness = native_agent.harness
+            elif conv.harness_override:
+                _tel_harness = conv.harness_override
+            else:
+                _tel_loaded = agent_cache.load(
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                _tel_harness = _spec_harness(_tel_loaded.spec)
             _tel_emit(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
                     agent_id=agent.id,
-                    harness=native_agent.harness
-                    if native_agent is not None
-                    else _resolve_harness(conv),
+                    harness=_tel_harness,
                     surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
