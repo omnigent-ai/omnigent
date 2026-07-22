@@ -8022,6 +8022,10 @@ def create_runner_app(
                 conv_id,
                 harness_name,
             )
+            # is_alive() set instance.running=False as a side effect; restore it
+            # so close() still issues tmux kill-server (the tmux server persists
+            # with remain-on-exit even after the pane process exits).
+            instance.running = True
             await terminal_registry.close(conv_id, terminal_name, "main")
         _logger.info(
             "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
