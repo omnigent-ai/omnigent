@@ -1811,7 +1811,6 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
-  // brainHarnessLabels is re-declared after smartRoutingEnabled below.
   const { data: hosts, isLoading: hostsLoading } = useHosts();
 
   const agentList = useMemo(
