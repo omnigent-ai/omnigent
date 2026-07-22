@@ -326,19 +326,13 @@ class SqlAlchemyPermissionStore(PermissionStore):
         if user_id is None:
             return False
 
-        with self._session() as session:
-            grant = session.get(
-                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
-            )
-            if grant is not None and grant.level >= required_level:
-                return True
+        grant = self.get(user_id, conversation_id)
+        if grant is not None and grant.level >= required_level:
+            return True
 
-            public_grant = session.get(
-                SqlSessionPermission,
-                (current_workspace_id(), RESERVED_USER_PUBLIC, conversation_id),
-            )
-            if public_grant is not None and public_grant.level >= required_level:
-                return True
+        public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
+        if public_grant is not None and public_grant.level >= required_level:
+            return True
 
         return False
 
@@ -350,22 +344,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Return the user's effective permission level. See base class for contract."""
         if user_id is None:
             return None
-
-        with self._session() as session:
-            user_row = session.get(SqlUser, (current_workspace_id(), user_id))
-            if user_row is not None and user_row.is_admin:
-                return LEVEL_OWNER
-            grant = session.get(
-                SqlSessionPermission, (current_workspace_id(), user_id, conversation_id)
-            )
-            if grant is not None:
-                return grant.level
-            public_grant = session.get(
-                SqlSessionPermission,
-                (current_workspace_id(), RESERVED_USER_PUBLIC, conversation_id),
-            )
-            if public_grant is not None:
-                return public_grant.level
+        if self.is_admin(user_id):
+            return LEVEL_OWNER
+        grant = self.get(user_id, conversation_id)
+        if grant is not None:
+            return grant.level
+        public_grant = self.get(RESERVED_USER_PUBLIC, conversation_id)
+        if public_grant is not None:
+            return public_grant.level
         return None
 
     def resolve_access(
