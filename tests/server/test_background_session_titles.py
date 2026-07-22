@@ -10,6 +10,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
     RunnerBackgroundTitleGenerator,
+    background_session_titles_enabled,
     normalize_background_title,
     prepare_background_session_title,
 )
@@ -21,7 +22,7 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture(autouse=True)
 def _enable_background_titles(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
 
 
 def _seed_session(store: SqlAlchemyConversationStore, title: str) -> str:
@@ -53,6 +54,16 @@ async def test_prepare_background_title_is_disabled_by_default(
     )
 
     assert pending is None
+
+
+@pytest.mark.parametrize("value", ["", "0", "true", "yes", "on", "banana", " 1 "])
+async def test_background_titles_require_exact_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", value)
+
+    assert background_session_titles_enabled() is False
 
 
 async def test_prepare_background_title_from_message(db_uri: str) -> None:
@@ -150,7 +161,7 @@ async def test_prepare_background_title_skips_unsupported_explicit_harnesses(
     monkeypatch: pytest.MonkeyPatch,
     harness_override: str,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     store = SqlAlchemyConversationStore(db_uri)
     conversation = store.create_conversation(
         title=None,

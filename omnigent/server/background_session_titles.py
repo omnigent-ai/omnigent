@@ -22,7 +22,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-_SESSION_RENAME_TRUTHY = {"1", "true", "yes", "on"}
 # Start with harnesses whose isolated title-generation paths are verified;
 # additional harnesses can be added once they have equivalent coverage.
 _SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset({"claude-sdk", "claude-native", "codex"})
@@ -30,7 +29,7 @@ _SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset({"claude-sdk", "claude-native"
 
 def background_session_titles_enabled() -> bool:
     """Return whether automatic background titles are explicitly enabled."""
-    return os.environ.get("OMNIGENT_SESSION_RENAME", "").strip().lower() in _SESSION_RENAME_TRUTHY
+    return os.environ.get("OMNIGENT_SESSION_RENAME") == "1"
 
 
 def _background_session_title_harness_supported(harness: str | None) -> bool:
