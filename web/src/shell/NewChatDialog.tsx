@@ -1512,7 +1512,10 @@ function HarnessConfigModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const smartRoutingOn = draftRouting === "on";
+  // Only treat routing as "on" when it's actually offered for this agent —
+  // otherwise a stale costControlMode="on" (e.g. server later disabled the
+  // flag) would select the __smart__ sentinel with no matching Select item.
+  const smartRoutingOn = smartRoutingEligible && draftRouting === "on";
   const modelValue = smartRoutingOn ? MODEL_SELECT_SMART : draftModel || MODEL_SELECT_DEFAULT;
   const onModelChange = (value: string) => {
     if (value === MODEL_SELECT_SMART) {
@@ -2282,7 +2285,9 @@ export function NewChatLandingScreen() {
   // the gear icon's hover tooltip. Mirrors the modal's per-capability rows so a
   // user can read the active settings without opening it. "Default" = an unset
   // model/effort (Claude Code uses its own configured default).
-  const routingOn = costControlMode === "on";
+  // Gate on eligibility so a stale "on" (server flag off, or a non-routable
+  // agent) never shows misleading Smart Routing rows in the tooltip.
+  const routingOn = smartRoutingEligible && costControlMode === "on";
   const configSummary = useMemo((): { label: string; value: string }[] => {
     if (supportsPermissionMode) {
       const modelValue = routingOn
