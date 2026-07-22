@@ -582,7 +582,9 @@ def harness_install_command(key: str) -> list[str]:
 class HarnessInstallResult(NamedTuple):
     """Outcome of :func:`try_install_harness_cli`.
 
-    :param installed: Whether the CLI is on ``PATH`` after the attempt.
+    :param installed: Whether the CLI resolves after the attempt, via the same
+        :func:`resolve_cli_binary` ladder readiness uses (``PATH`` plus the
+        common global install dirs), not bare ``PATH`` alone.
     :param reason: Human-readable failure reason when ``installed`` is False;
         ``None`` on success.
     """
@@ -602,10 +604,10 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
-        is on ``PATH`` (including the no-op where it was already present),
-        otherwise ``(False, reason)`` naming the failure (manual-only spec,
-        missing installer, timeout, OS error, non-zero exit, or a post-install
-        binary-not-found).
+        resolves via :func:`resolve_cli_binary` (including the no-op where it
+        was already present), otherwise ``(False, reason)`` naming the failure
+        (manual-only spec, missing installer, timeout, OS error, non-zero exit,
+        or a post-install binary-not-found).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
