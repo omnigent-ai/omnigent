@@ -1434,8 +1434,9 @@ def create_app(
         try:
             yield
         finally:
-            # The run reconciler is a one-shot startup sweep (no periodic task
-            # to cancel); only the per-job scheduler needs stopping.
+            # Run completion is event-driven (the _publish_status hook) plus a
+            # lazy-on-read stale backstop — there is no run-reconciler task to
+            # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()

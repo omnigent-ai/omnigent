@@ -61,14 +61,20 @@ class _FakeScheduledTaskStore:
         return row
 
 
-def _run(seed: str, *, status: str = "running", scheduled_at: int = 100) -> _RunRow:
+def _run(
+    seed: str,
+    *,
+    status: str = "running",
+    scheduled_at: int = 100,
+    fired_at: int | None = None,
+) -> _RunRow:
     return _RunRow(
         id=f"run_{seed}",
         scheduled_task_id=f"task_{seed}",
         status=status,
         scheduled_at=scheduled_at,
         conversation_id=f"conv_{seed}",
-        fired_at=scheduled_at + 1,
+        fired_at=fired_at if fired_at is not None else scheduled_at + 1,
     )
 
 
@@ -95,6 +101,51 @@ def test_leaves_young_running_run_untouched() -> None:
     assert run.finished_at is None
     assert store.update_calls == []  # never even attempted an update
     assert out[0].status == "running"
+
+
+def test_age_measured_from_fired_at_force_fails() -> None:
+    """Age is measured from fired_at: a run fired >6h ago is force-failed."""
+    now = 10_000_000
+    # Scheduled recently but fired_at is >6h ago (e.g. a clock/late-record edge):
+    # fired_at is what counts, so this IS stale.
+    run = _run("firedstale", scheduled_at=now - 60, fired_at=now - STALE_RUN_MAX_AGE_SECONDS - 1)
+    store = _FakeScheduledTaskStore([run])
+    force_fail_stale_runs(store, [run], now=now)
+    assert run.status == "failed"
+    assert run.error_code == STALE_RUN_ERROR_CODE
+    assert run.finished_at == now
+
+
+def test_scheduled_long_ago_but_fired_recently_left_alone() -> None:
+    """A run scheduled >6h ago but fired recently is NOT force-failed.
+
+    The behavior change: the 6h window measures from fired_at (when dispatch
+    began), so a run that fired late still gets its full window and is not
+    prematurely killed.
+    """
+    now = 10_000_000
+    run = _run(
+        "firedlate",
+        scheduled_at=now - STALE_RUN_MAX_AGE_SECONDS - 3600,  # scheduled 7h+ ago
+        fired_at=now - 60,  # but only fired 60s ago
+    )
+    store = _FakeScheduledTaskStore([run])
+    force_fail_stale_runs(store, [run], now=now)
+    assert run.status == "running"
+    assert run.finished_at is None
+    assert store.update_calls == []
+
+
+def test_age_falls_back_to_scheduled_at_when_no_fired_at() -> None:
+    """A run that never recorded fired_at ages from scheduled_at (fallback)."""
+    now = 10_000_000
+    run = _run("nofire", scheduled_at=now - STALE_RUN_MAX_AGE_SECONDS - 1, fired_at=None)
+    # _run's default would set fired_at; force it None to exercise the fallback.
+    run.fired_at = None
+    store = _FakeScheduledTaskStore([run])
+    force_fail_stale_runs(store, [run], now=now)
+    assert run.status == "failed"
+    assert run.error_code == STALE_RUN_ERROR_CODE
 
 
 def test_leaves_already_terminal_run_untouched() -> None:

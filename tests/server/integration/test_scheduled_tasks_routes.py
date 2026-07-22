@@ -771,3 +771,161 @@ async def test_list_tasks_leaves_young_running_run_untouched(
     run = detail.json()["runs"][0]
     assert run["status"] == "running"
     assert run["finished_at"] is None
+
+
+# ── event-hook wiring: _publish_status -> persist_scheduled_run_completion ────
+#
+# These lock the PRIMARY completion mechanism at the _publish_status seam (not
+# by re-calling the hook directly): a real terminal edge published the way the
+# SSE relay publishes it must reach the hook and transition the run, resolving
+# under the run's workspace_scope via the shared session_live_state executor.
+# Layer exercised: the sync _publish_status(...) call (its no-subscriber
+# session_stream.publish is a no-op) → session_live_state.persist_scheduled_run_
+# completion → the ThreadPoolExecutor(max_workers=1) worker → store.update_run.
+# A full runner/relay round-trip is covered by the live E2E; this covers the
+# server-side wiring so a future _publish_status refactor can't silently break
+# scheduled-run completion.
+
+
+def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, str]:
+    """Create a task + a ``running`` run bound to ``conversation_id``.
+
+    :returns: ``(task_id, run_id)``.
+    """
+    import uuid
+
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    task_id = uuid.uuid4().hex
+    store.create(
+        scheduled_task_id=task_id,
+        name="hook-wiring",
+        prompt="p",
+        rrule="FREQ=HOURLY;BYMINUTE=0",
+        user_id=None,
+        agent_id=uuid.uuid4().hex,
+        timezone="UTC",
+    )
+    run_id = uuid.uuid4().hex
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task_id,
+        status="running",
+        scheduled_at=1000,
+        conversation_id=conversation_id,
+        fired_at=1001,
+    )
+    return task_id, run_id
+
+
+def _wait_for_run_status(
+    db_uri: str, task_id: str, run_id: str, want: str, timeout_s: float = 10.0
+):  # type: ignore[no-untyped-def]
+    """Poll the store until ``run_id`` reaches ``want`` (or timeout).
+
+    The hook write lands on session_live_state's background single-worker
+    executor, so the assertion must wait for that thread rather than read
+    synchronously.
+    """
+    import time
+
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for r in store.list_runs(task_id):
+            if r.id == run_id and r.status == want:
+                return r
+        time.sleep(0.02)
+    # Return the current row (whatever status) so the caller's assert reports it.
+    for r in store.list_runs(task_id):
+        if r.id == run_id:
+            return r
+    return None
+
+
+async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
+    db_uri: str,
+) -> None:
+    """A completed-turn edge through _publish_status flips the run to succeeded.
+
+    Drives the real _publish_status(conversation_id, "idle") the relay emits and
+    asserts the run transitions running -> succeeded with finished_at set, via
+    the hook + executor path (workspace_scope contract exercised, not bypassed).
+
+    Async to satisfy the module's ``pytestmark = pytest.mark.asyncio``; the body
+    is synchronous (the hook write lands on session_live_state's background
+    executor, polled below) — no awaits needed.
+    """
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        # The relay publishes "running" as the turn starts, then "idle" at the
+        # terminal (completed) edge. Drive the terminal edge.
+        _publish_status(conv_id, "idle")
+        row = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert row is not None
+    assert row.status == "succeeded"
+    assert row.finished_at is not None
+    assert row.error_code is None
+
+
+async def test_publish_status_failed_edge_transitions_scheduled_run_to_failed(
+    db_uri: str,
+) -> None:
+    """A failed-turn edge through _publish_status flips the run to failed+code.
+
+    Async for the module ``pytestmark`` (see the idle-edge test); body is sync.
+    """
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.server.schemas import ErrorDetail
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        _publish_status(
+            conv_id, "failed", ErrorDetail(code="runner_disconnected", message="dropped")
+        )
+        row = _wait_for_run_status(db_uri, task_id, run_id, "failed")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert row is not None
+    assert row.status == "failed"
+    assert row.finished_at is not None
+    assert row.error_code == "runner_disconnected"

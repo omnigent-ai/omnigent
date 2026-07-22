@@ -66,12 +66,17 @@ def force_fail_stale_runs(
     """Force-fail ``running`` runs older than the max age; return the list.
 
     The lazy-on-read orphan backstop, shared by the scheduled-task list and
-    detail read endpoints. Pure age check — NO conversation I/O. Only rows past
-    :data:`STALE_RUN_MAX_AGE_SECONDS` are touched; the store's conditional
-    :meth:`update_run` (``WHERE status = running``) makes it idempotent and safe
-    against a run that just transitioned via the event hook. Must be called
-    inside the runs' ``workspace_scope`` (the store filters every query on
-    ``current_workspace_id()``); the read endpoints already run there.
+    detail read endpoints. Pure age check — NO conversation I/O. The age is
+    measured from ``fired_at`` (when dispatch actually began), falling back to
+    ``scheduled_at`` when a run has no ``fired_at`` (never dispatched). Measuring
+    from ``fired_at`` means a run that fired late doesn't get a shortened
+    effective window — the 6h clock starts when the turn actually started, not
+    when it was scheduled. Only rows past :data:`STALE_RUN_MAX_AGE_SECONDS` are
+    touched; the store's conditional :meth:`update_run` (``WHERE status =
+    running``) makes it idempotent and safe against a run that just transitioned
+    via the event hook. Must be called inside the runs' ``workspace_scope`` (the
+    store filters every query on ``current_workspace_id()``); the read endpoints
+    already run there.
 
     The returned list reflects any transition (a force-failed run carries its
     new terminal state) so a caller rendering the runs stays consistent with the
@@ -87,7 +92,10 @@ def force_fail_stale_runs(
     ts = int(time.time()) if now is None else now
     result: list[ScheduledTaskRun] = []
     for run in runs:
-        if run.status == "running" and (ts - run.scheduled_at) >= STALE_RUN_MAX_AGE_SECONDS:
+        # Age from when dispatch began (fired_at); fall back to scheduled_at for
+        # a run that somehow never recorded a fire time.
+        age_from = run.fired_at if run.fired_at is not None else run.scheduled_at
+        if run.status == "running" and (ts - age_from) >= STALE_RUN_MAX_AGE_SECONDS:
             updated = store.update_run(
                 run.id,
                 status="failed",
