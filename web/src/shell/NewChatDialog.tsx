@@ -138,7 +138,11 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import { useNewestProjectSession, useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import {
+  useNewestProjectSession,
+  useProjects,
+  moveConversationToProject,
+} from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -814,7 +818,7 @@ function LandingProjectPicker({
   }, [creatingNew]);
 
   const filtered = search
-    ? projects.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
 
   function pick(project: string) {
@@ -874,10 +878,10 @@ function LandingProjectPicker({
             <span className="flex-1 truncate">No project</span>
             {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
           </button>
-          {filtered.map((name) => (
-            <button key={name} type="button" className={itemClass} onClick={() => pick(name)}>
-              <span className="flex-1 truncate">{name}</span>
-              {value === name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
+          {filtered.map((p) => (
+            <button key={p.name} type="button" className={itemClass} onClick={() => pick(p.name)}>
+              <span className="flex-1 truncate">{p.name}</span>
+              {value === p.name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
             </button>
           ))}
           {filtered.length === 0 && !creatingNew && (
@@ -3069,17 +3073,15 @@ export function NewChatLandingScreen() {
         }
         data = (await res.json()) as { id: string };
       }
-      // File the new session under the chosen project (an implicit collection
-      // stored as a conversation_labels row). Awaited so the conversations
-      // refetch below already sees the label; non-fatal if it fails — the
-      // session is created either way, just unfiled.
+      // File the new session under the chosen project (first-class membership).
+      // Awaited so the conversations refetch below already reflects it;
+      // non-fatal if it fails — the session is created either way, just unfiled.
       if (selectedProject) {
         try {
-          await authenticatedFetch(`/v1/sessions/${data.id}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: selectedProject } }),
-          });
+          // File via first-class project_id; the helper resolves the picked
+          // name to a project id, creating an empty project on demand when the
+          // name is new or label-only.
+          await moveConversationToProject(data.id, selectedProject);
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via

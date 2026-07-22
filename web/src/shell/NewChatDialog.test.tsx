@@ -1751,11 +1751,14 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("files a pre-filled project chip's selection, and invalidates project sessions", async () => {
-    // Both the create POST and the follow-up label PATCH read .ok / .json.
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
+    // Sequence: create POST → list projects (resolve name→id) → PATCH project_id.
+    authenticatedFetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "conv_new" }) } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ object: "list", data: [{ id: "p_docs", name: "docs" }] }),
+      } as Response)
+      .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
     const invalidateSpy = vi.spyOn(QueryClient.prototype, "invalidateQueries");
     // The chip only renders when a project is pre-selected (e.g. via the
     // sidebar's per-project pencil), so land with `?project=`.
@@ -1770,18 +1773,18 @@ describe("NewChatLandingScreen", () => {
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
 
-    // Create POST first, then a PATCH that sets the omni_project label on the
-    // freshly-created session id.
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
-    const [createUrl] = authenticatedFetchMock.mock.calls[0];
-    expect(createUrl).toBe("/v1/sessions");
-    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    // Create POST, then the name→id resolution, then a PATCH that files the
+    // freshly-created session via first-class project_id.
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(3));
+    expect(authenticatedFetchMock.mock.calls[0][0]).toBe("/v1/sessions");
+    expect(authenticatedFetchMock.mock.calls[1][0]).toBe("/v1/projects");
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[2];
     expect(patchUrl).toBe("/v1/sessions/conv_new");
     expect((patchInit as RequestInit).method).toBe("PATCH");
     const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
-      labels: Record<string, string>;
+      project_id: string;
     };
-    expect(patchBody.labels).toEqual({ omni_project: "docs" });
+    expect(patchBody.project_id).toBe("p_docs");
 
     // The target folder fetches its own paginated list (useProjectSessions),
     // so filing the new session must invalidate it — otherwise the row only
@@ -1811,10 +1814,13 @@ describe("NewChatLandingScreen", () => {
   it("pre-fills the project chip from the ?project= query param", async () => {
     // The sidebar's per-project "new session" pencil lands here with the
     // project pre-selected — the chip reflects it with no interaction.
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
+    authenticatedFetchMock
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: "conv_new" }) } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }),
+      } as Response)
+      .mockResolvedValue({ ok: true, json: async () => ({ id: "conv_new" }) } as Response);
     renderLanding({}, "/?project=Sprint%2042");
 
     await waitFor(() =>
@@ -1829,13 +1835,13 @@ describe("NewChatLandingScreen", () => {
     });
     fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
 
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(2));
-    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[1];
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(3));
+    const [patchUrl, patchInit] = authenticatedFetchMock.mock.calls[2];
     expect(patchUrl).toBe("/v1/sessions/conv_new");
     const patchBody = JSON.parse((patchInit as RequestInit).body as string) as {
-      labels: Record<string, string>;
+      project_id: string;
     };
-    expect(patchBody.labels).toEqual({ omni_project: "Sprint 42" });
+    expect(patchBody.project_id).toBe("p_sprint");
   });
 
   it.each([

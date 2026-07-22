@@ -151,6 +151,33 @@ async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     assert second_delete.status_code == 404
 
 
+async def test_session_projects_unions_first_class_and_labels(
+    project_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """GET /v1/sessions/projects dual-reads: first-class projects (with id,
+    even when empty) unioned with label-only projects (id=None), by name."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    # An empty first-class project — invisible to the label path, must appear.
+    empty = (await project_client.post("/v1/projects", json={"name": "Empty FC"})).json()
+    # A name that exists BOTH as first-class and as a label — one entry, fc id.
+    both = (await project_client.post("/v1/projects", json={"name": "Both"})).json()
+    conv_both = conv_store.create_conversation()
+    conv_store.set_labels(conv_both.id, {"omni_project": "Both"})
+    # A label-only project — no first-class row, id=None.
+    conv_label = conv_store.create_conversation()
+    conv_store.set_labels(conv_label.id, {"omni_project": "Label Only"})
+
+    resp = await project_client.get("/v1/sessions/projects")
+    assert resp.status_code == 200
+    assert resp.json() == [
+        {"id": both["id"], "name": "Both"},
+        {"id": empty["id"], "name": "Empty FC"},
+        {"id": None, "name": "Label Only"},
+    ]
+
+
 # ── Multi-user: projects are owner-private ─────────────────────────────
 
 

@@ -19,6 +19,8 @@ const {
   projectsMock,
   moveToProjectSpy,
   deleteProjectSpy,
+  renameProjectSpy,
+  createProjectSpy,
   fetchProjectSessionIdsMock,
   conversationsRef,
   projectSessionsMock,
@@ -26,6 +28,8 @@ const {
   projectsMock: [] as string[],
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
+  renameProjectSpy: vi.fn(),
+  createProjectSpy: vi.fn(),
   // Server-side "ids in this project" check that gates the remove
   // confirmation. Defaults to "no other sessions"; tests override per case.
   fetchProjectSessionIdsMock: vi.fn(() => Promise.resolve([] as string[])),
@@ -56,7 +60,11 @@ vi.mock("@/hooks/useConversations", () => ({
   // Project feature: the sidebar reads the project list to build project
   // sections, and rows fire useMoveToProject from the kebab menu. Both must
   // be stubbed or the Sidebar throws on render.
-  useProjects: () => ({ data: projectsMock }),
+  // Tests push project NAMES into projectsMock; expose them as first-class
+  // {id, name} folders (synthetic id per name) to match useProjects' shape.
+  useProjects: () => ({
+    data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
+  }),
   // Each project folder fetches its own sessions (server-side ?project=). Derive
   // them from the global-list fixture by label so existing tests keep seeding
   // project sessions there. Single page, no pagination, in this mock.
@@ -85,6 +93,8 @@ vi.mock("@/hooks/useConversations", () => ({
   },
   useMoveToProject: () => ({ mutate: moveToProjectSpy }),
   useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
   fetchProjectSessionIds: fetchProjectSessionIdsMock,
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -918,10 +928,13 @@ describe("Sidebar project sections", () => {
     fireEvent.click(await screen.findByTestId("delete-project"));
 
     // The confirmation makes clear it removes every session, then fires the
-    // delete with the project name.
+    // delete with the folder's { id, name }.
     expect(screen.getByText(/all of its sessions/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
-    expect(deleteProjectSpy).toHaveBeenCalledWith("Customer X", expect.anything());
+    expect(deleteProjectSpy).toHaveBeenCalledWith(
+      { id: "p_Customer X", name: "Customer X" },
+      expect.anything(),
+    );
   });
 });
 
@@ -1085,16 +1098,17 @@ describe("Sidebar move-to-project action", () => {
     expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_move", project: "Sprint 42" });
   });
 
-  it("confirms removal only when it's the project's last session", async () => {
+  it("removes a session from its project immediately, with no confirmation", async () => {
+    // A first-class project persists when emptied, so removing a session never
+    // deletes anything — it just unfiles, even if it's the last member. No
+    // last-session check, no confirmation dialog.
     projectsMock.push("Sprint 42");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
     ]);
-    // Server reports this is the only session in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed"]);
     renderSidebar();
 
-    // Expand the project folder, open the filed row's kebab → Change project.
+    // Expand the project folder, open the filed row's kebab → project submenu.
     fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
     const row = screen.getByRole("link", { name: /conv_filed/ }).closest("li")!;
     fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
@@ -1103,40 +1117,8 @@ describe("Sidebar move-to-project action", () => {
     });
     fireEvent.click(await screen.findByTestId("move-to-project"));
 
-    // Last session → "Remove from <project>" opens a confirmation that says the
-    // project will be removed too; it does NOT remove immediately.
+    // "Remove from <project>" unfiles immediately (project: "") — no dialog.
     fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
-    expect(await screen.findByText(/the project will be removed as well/i)).toBeInTheDocument();
-    expect(moveToProjectSpy).not.toHaveBeenCalled();
-
-    // Confirming fires the removal with an empty project (server deletes the
-    // label; the implicit project vanishes with its last session).
-    fireEvent.click(screen.getByRole("button", { name: "Remove from project" }));
-    expect(moveToProjectSpy).toHaveBeenCalledWith(
-      { id: "conv_filed", project: "" },
-      expect.anything(),
-    );
-  });
-
-  it("removes without confirmation when other sessions remain in the project", async () => {
-    projectsMock.push("Sprint 42");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
-    ]);
-    // Server reports another session is still in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed", "conv_other"]);
-    renderSidebar();
-
-    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
-    const row = screen.getByRole("link", { name: /conv_filed/ }).closest("li")!;
-    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("move-to-project"));
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
-
-    // Not the last session → removes straight away, no confirmation dialog.
     await waitFor(() =>
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" }),
     );

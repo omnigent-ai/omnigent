@@ -9,10 +9,11 @@ folder icon and the project name (``ConversationRow`` / ``HoverCard`` in
 Sidebar.tsx).
 
 This drives the real chain the ``Sidebar`` unit tests mock out: the live
-``PATCH /v1/sessions/{id}`` project move → the ``omni_project`` label on the
-refreshed ``GET /v1/sessions`` list → the pinned peel keeping the label →
-the hover flyout resolving the project name from it. A browser hover (which
-jsdom can't do) is what actually opens the Radix HoverCard here.
+``PATCH /v1/sessions/{id}`` project move → the ``project_id`` membership on the
+refreshed ``GET /v1/sessions`` list → the pinned peel keeping that membership →
+the hover flyout resolving the project name (``project_id`` → name via the
+project list, falling back to the legacy ``omni_project`` label). A browser
+hover (which jsdom can't do) is what actually opens the Radix HoverCard here.
 """
 
 from __future__ import annotations

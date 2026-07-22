@@ -35,6 +35,12 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { stopSession } from "@/lib/sessionsApi";
+import {
+  createProject as apiCreateProject,
+  deleteProject as apiDeleteProject,
+  listProjects as apiListProjects,
+  renameProject as apiRenameProject,
+} from "@/lib/projectsApi";
 import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
@@ -160,6 +166,13 @@ export interface Conversation {
    * invalidate the parent's child-sessions cache when the child changes.
    */
   parent_session_id?: string | null;
+  /**
+   * First-class project this session is filed under (`projects.id`), or
+   * `null`/absent when unfiled. Distinct from the legacy `omni_project`
+   * label in `labels`; the sidebar groups a folder's members by EITHER this
+   * id OR the label during the dual-read transition.
+   */
+  project_id?: string | null;
 }
 
 export interface ConversationsPage {
@@ -731,14 +744,31 @@ export function usePinnedConversationBackfill(
 // without a value import cycle; re-exported here for the existing consumers.
 export { PROJECT_LABEL_KEY };
 
-/** Fetch all project names from `GET /v1/sessions/projects`. */
+/**
+ * A sidebar project folder. During the label→first-class transition a folder
+ * is keyed by `name` (the union key that merges a first-class project and a
+ * legacy label-project of the same name into one folder). `id` is the
+ * first-class project id when one exists, or `null` for a label-only project
+ * (which has no `projects` row yet). Operations that need an id
+ * (rename/delete/file) use it, promoting label-only projects on demand.
+ */
+export interface ProjectSummary {
+  id: string | null;
+  name: string;
+}
+
+/**
+ * Fetch the caller's projects from `GET /v1/sessions/projects`, which
+ * dual-reads first-class projects (with id, incl. empty ones) and legacy
+ * label-projects (id=null), unioned by name and sorted.
+ */
 export function useProjects() {
-  return useQuery<string[]>({
+  return useQuery<ProjectSummary[]>({
     queryKey: ["projects"],
     queryFn: async () => {
       const res = await authenticatedFetch("/v1/sessions/projects");
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as string[];
+      return (await res.json()) as ProjectSummary[];
     },
     staleTime: 30_000,
   });
@@ -808,12 +838,35 @@ export function useArchivedProjectNames() {
   });
 }
 
-async function moveConversationToProject(id: string, project: string): Promise<Conversation> {
+/**
+ * Resolve a project NAME to its first-class id, creating the `projects` row on
+ * demand when only a legacy label-project of that name exists (or nothing does).
+ * This is how filing/renaming a label-only folder promotes it to first-class.
+ */
+async function resolveOrCreateProjectId(name: string): Promise<string> {
+  const projects = await apiListProjects();
+  const existing = projects.find((p) => p.name === name);
+  if (existing) return existing.id;
+  return (await apiCreateProject(name)).id;
+}
+
+/**
+ * File a session into a project (by name) or unfile it (`project === ""`), via
+ * the first-class `project_id` membership on `PATCH /v1/sessions/{id}`. A
+ * non-empty name is resolved to its project id (creating the row on demand for
+ * a label-only folder); `""` clears membership. Exported for the new-session
+ * flow, which files a freshly created session under the picked project name.
+ */
+export async function moveConversationToProject(
+  id: string,
+  project: string,
+): Promise<Conversation> {
+  const projectId = project === "" ? "" : await resolveOrCreateProjectId(project);
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    // Empty string signals "remove from project" (server deletes the label row).
-    body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: project } }),
+    // "" clears membership (unfile); a non-empty id files into that project.
+    body: JSON.stringify({ project_id: projectId }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
@@ -956,21 +1009,36 @@ export function useNewestProjectSession(project: string | null) {
   });
 }
 
+/** Archive a session AND detach it from its project (clear project_id + the
+ * legacy omni_project label) in a single PATCH — used by "Delete project". */
+async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    // project_id="" clears first-class membership; the empty omni_project label
+    // value removes the legacy label row, so the session is fully detached.
+    body: JSON.stringify({ archived: true, project_id: "", labels: { [PROJECT_LABEL_KEY]: "" } }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
 /**
- * Delete a whole project by ARCHIVING every session filed under it. The
- * sessions keep their `omni_project` label (so unarchiving restores them to
- * this project) and their history; they only leave the active sidebar. The
- * project is implicit and the server's project list excludes all-archived
- * projects, so the folder disappears once its last member is archived. Throws
- * `{ failed, succeeded, total }` if any session failed (e.g. a shared session
- * the user can't modify), leaving those sessions in place.
+ * Delete a project: archive AND unfile every member session, then delete the
+ * first-class `projects` row (when the folder has one). Sessions are never
+ * deleted — they are detached (project_id + omni_project label cleared) and
+ * archived, so they leave the sidebar but keep their history. Accepts the
+ * folder's `{ id, name }`: `name` drives the member sweep (dual-read
+ * `?project=`), `id` deletes the container (skipped for a label-only folder,
+ * which has none). Throws `{ failed, succeeded, total }` if any member failed
+ * (e.g. a shared session the user can't modify), leaving those in place.
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (project: string) => {
-      const ids = await fetchAllProjectSessionIds(project);
-      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, true)));
+    mutationFn: async ({ id, name }: ProjectSummary) => {
+      const ids = await fetchAllProjectSessionIds(name);
+      const results = await Promise.allSettled(ids.map((sid) => archiveAndUnfileConversation(sid)));
       const succeeded: string[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
@@ -985,6 +1053,10 @@ export function useDeleteProject() {
         }
       }
       if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      // All members detached — remove the first-class container if present.
+      // (A label-only folder has no row; clearing the labels above already
+      // makes it vanish from the project list.)
+      if (id !== null) await apiDeleteProject(id);
       return { succeeded, failed };
     },
     onSettled: () => {
@@ -995,6 +1067,72 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       // Deleting a project archives its members, growing the archived set.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+    },
+  });
+}
+
+/**
+ * Create an empty first-class project (`POST /v1/projects`). This is the
+ * capability the label model can't express — a project with no members. The
+ * server rejects a duplicate name (409); the error message is surfaced to the
+ * caller for inline display.
+ */
+export function useCreateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => apiCreateProject(name),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+}
+
+/**
+ * Rename a project. First-class projects rename in O(1) via
+ * `PATCH /v1/projects/{id}` (members reference the id, not the name). A
+ * label-only folder (`id === null`) has no row to rename, so it is promoted to
+ * first-class on demand — created under the new name — then its member
+ * sessions are re-filed onto the new id and their stale `omni_project` label is
+ * cleared. Members are swept via the dual-read `?project=<oldName>`.
+ */
+export function useRenameProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      oldName,
+      newName,
+    }: {
+      id: string | null;
+      oldName: string;
+      newName: string;
+    }) => {
+      if (id !== null) {
+        await apiRenameProject(id, newName);
+        return;
+      }
+      // Label-only → promote: create the row, migrate members onto it.
+      const created = await apiCreateProject(newName);
+      const memberIds = await fetchAllProjectSessionIds(oldName);
+      await Promise.all(
+        memberIds.map((sid) =>
+          authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project_id: created.id,
+              labels: { [PROJECT_LABEL_KEY]: "" },
+            }),
+          }),
+        ),
+      );
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
