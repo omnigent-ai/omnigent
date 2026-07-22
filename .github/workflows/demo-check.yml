@@ -3,10 +3,10 @@ name: Demo Check
 # Scan open contributor PRs every hour and comment on any that check the
 # "Bug fix", "Feature", or "UI / frontend change" box but have no demo
 # (screenshot / video) in the Demo section. Maintainer PRs and drafts are
-# skipped. An already-labeled `needs-demo` PR is never commented on twice, and
-# its label is cleared once the Demo section is satisfied. Never checks out or
-# runs PR code -- it reads PR metadata via the API using only the
-# default-branch script. See demo-check.js.
+# skipped. While a PR carries `needs-demo` it is not commented again; the label
+# is cleared once the Demo section is satisfied (a PR that regresses afterward
+# can be flagged afresh). Never checks out or runs PR code -- it reads PR
+# metadata via the API using only the default-branch script. See demo-check.js.
 
 on:
   schedule:

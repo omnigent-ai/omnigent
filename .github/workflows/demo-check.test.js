@@ -123,4 +123,14 @@ function assert(name, cond, detail) {
     maintainerFile: "boss\n",
   });
   assert("maintainer PR (MAINTAINER file) is skipped", eq(r.commented, []) && eq(r.added, []), JSON.stringify(r));
+
+  // 10. Truncated labels: a PR returned by the label:needs-demo search whose
+  //     labels(first: 20) list omits needs-demo (many labels) must still be
+  //     treated as labeled — no second comment or label. Otherwise the
+  //     "comment at most once" guarantee breaks for heavily-labeled PRs.
+  r = await run({
+    labeled: [pr({ number: 10, body: body({ demo: "N/A" }), labels: ["a", "b", "c"] })],
+  });
+  assert("labeled-search PR with truncated labels is treated as labeled",
+    eq(r.commented, []) && eq(r.added, []) && eq(r.removed, []), JSON.stringify(r));
 })();

@@ -3,9 +3,10 @@
 // hourly over two searches, unioned and deduped: PRs opened in the last 24
 // hours (so every new PR is seen even if opened just before a cron tick), plus
 // every open PR already labeled `needs-demo` regardless of age. Drafts and
-// maintainer PRs are skipped. A PR is commented and labeled at most once; on
-// later runs an already-labeled PR is re-evaluated and the label is cleared
-// once its Demo section is satisfied (or the change type no longer needs one).
+// maintainer PRs are skipped. While a PR carries `needs-demo` it is never
+// commented again; an already-labeled PR is re-evaluated each run and the
+// label cleared once its Demo section is satisfied (or the change type no
+// longer needs one). A PR that later regresses can be flagged afresh.
 
 const MS_PER_HOUR = 60 * 60 * 1000;
 const HOURS_TO_SCAN = 24;
@@ -163,7 +164,14 @@ module.exports = async ({ context, github, core }) => {
 
     const byNumber = new Map();
     for (const pr of await fetchPRs(recentQuery)) byNumber.set(pr.number, pr);
-    for (const pr of await fetchPRs(labeledQuery)) byNumber.set(pr.number, pr);
+    // Track which PRs the labeled search returned. Their `labels(first: 20)`
+    // list can truncate and omit needs-demo on a PR with many labels, so the
+    // search result is the source of truth for "is labeled", not that list.
+    const labeledPRs = new Set();
+    for (const pr of await fetchPRs(labeledQuery)) {
+      byNumber.set(pr.number, pr);
+      labeledPRs.add(pr.number);
+    }
     const allPRs = [...byNumber.values()];
 
     console.log(`Found ${allPRs.length} unique open PR(s) to evaluate`);
@@ -189,8 +197,10 @@ module.exports = async ({ context, github, core }) => {
         continue;
       }
 
+      // Trust the labeled search over the (possibly truncated) labels list:
+      // a PR it returned is labeled even if needs-demo fell outside first: 20.
       const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
-      const isLabeled = labels.includes(NEEDS_DEMO_LABEL);
+      const isLabeled = labeledPRs.has(pr.number) || labels.includes(NEEDS_DEMO_LABEL);
       // Requires a demo (Bug fix / Feature / UI) and none is present yet.
       const needsDemo = requiresDemo(pr.body) && !hasDemoContent(pr.body);
 
