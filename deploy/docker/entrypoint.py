@@ -421,6 +421,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         project_store=project_store,
         auth_provider=auth_provider,
         account_store=account_store,
+        policy_modules=cfg.get("policy_modules"),
         # Non-secret auth settings from the config file (admins are the
         # canonical, declarative roster; allowed_domains gates OIDC). Both
         # union with their runtime-editable files under <data_dir>.
