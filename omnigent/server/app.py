@@ -51,6 +51,11 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
+from omnigent.server.artifact_previews import (
+    ArtifactPreviewHostMiddleware,
+    ArtifactPreviewService,
+    create_artifact_preview_public_router,
+)
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -1331,6 +1336,20 @@ def create_app(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
     )
+
+    async def _artifact_preview_runner_client(session_id: str) -> Any | None:
+        try:
+            return runner_router.client_for_session_resources(session_id).client
+        except (LookupError, OmnigentError):
+            return None
+
+    artifact_preview_service = ArtifactPreviewService(
+        preview_origin=os.environ.get(
+            "OMNIGENT_ARTIFACT_PREVIEW_ORIGIN",
+            "http://preview.localhost:6767",
+        ),
+        runner_client_for_session=_artifact_preview_runner_client,
+    )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
@@ -1656,6 +1675,10 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
+    app.add_middleware(
+        ArtifactPreviewHostMiddleware,
+        preview_hostname=artifact_preview_service.preview_hostname,
+    )
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -2315,6 +2338,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            artifact_preview_service=artifact_preview_service,
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -2329,6 +2353,7 @@ def create_app(
         prefix="/v1",
         tags=["imports"],
     )
+    app.include_router(create_artifact_preview_public_router(artifact_preview_service))
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.

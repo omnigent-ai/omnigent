@@ -90,6 +90,46 @@ async def test_list_environment_root(
 
 
 @pytest.mark.asyncio
+async def test_artifact_preview_reads_relative_resource_atomically(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    artifact = workspace / "artifacts" / "revenue"
+    artifact.mkdir(parents=True)
+    (artifact / "app.js").write_text("console.log('preview')")
+
+    resp = await client.get(
+        "/v1/sessions/conv_test/artifact-preview/artifacts/revenue/app.js",
+        params={"artifact_root": "artifacts/revenue"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.text == "console.log('preview')"
+    assert resp.headers["content-type"].startswith("text/javascript")
+
+
+@pytest.mark.asyncio
+async def test_artifact_preview_rejects_symlinked_resource(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    artifact = workspace / "artifacts" / "revenue"
+    artifact.mkdir(parents=True)
+    secret = tmp_path / "secret.js"
+    secret.write_text("TOP_SECRET")
+    (artifact / "app.js").symlink_to(secret)
+
+    resp = await client.get(
+        "/v1/sessions/conv_test/artifact-preview/artifacts/revenue/app.js",
+        params={"artifact_root": "artifacts/revenue"},
+    )
+
+    assert resp.status_code == 404
+    assert "TOP_SECRET" not in resp.text
+
+
+@pytest.mark.asyncio
 async def test_list_environment_root_with_broken_symlink(
     tmp_path: Path,
 ) -> None:

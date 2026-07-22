@@ -18070,6 +18070,42 @@ def create_runner_app(
             order=order,
         )
 
+    @app.api_route(
+        "/v1/sessions/{session_id}/artifact-preview/{relative_path:path}",
+        methods=["GET", "HEAD"],
+        include_in_schema=False,
+    )
+    async def read_artifact_preview_resource(
+        request: Request,
+        session_id: str,
+        relative_path: str,
+        artifact_root: str = Query(...),
+        max_bytes: int = Query(default=10 * 1024 * 1024, ge=1, le=10 * 1024 * 1024),
+    ) -> Response:
+        """Read one preview resource with atomic no-follow confinement."""
+        from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        agent_spec = await _resolve_session_agent_spec(session_id)
+        env = resource_registry.resolve_environment(session_id, "default", agent_spec)
+        fs = CallerProcessFilesystem(env)
+        try:
+            content = await fs.read_artifact(
+                relative_path,
+                artifact_root=artifact_root,
+                max_bytes=max_bytes,
+            )
+        except (FilesystemPathNotFound, InvalidPath):
+            return Response(status_code=404)
+        media_type = mimetypes.guess_type(relative_path)[0] or "application/octet-stream"
+        return Response(
+            content=b"" if request.method == "HEAD" else content.data,
+            media_type=media_type,
+            headers={"Content-Length": str(content.bytes)},
+        )
+
     @app.put(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
