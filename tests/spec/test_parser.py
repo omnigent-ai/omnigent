@@ -1351,6 +1351,23 @@ def test_parse_tools_sandbox_yaml_beats_env_var(
     assert spec.tools.sandbox.container_runtime == "docker"
 
 
+def test_parse_tools_sandbox_null_runtime_rejected(tmp_path: Path) -> None:
+    """``container_runtime: null`` in YAML is rejected, not silently ignored."""
+    config = {
+        "spec_version": 1,
+        "name": "null-runtime",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "container_runtime": None,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(ValueError, match="container_runtime"):
+        parse(tmp_path)
+
+
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:
     """
     Tools-block entries whose ``type`` is not ``"mcp"`` are silently

@@ -472,14 +472,14 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    runtime = raw.get("container_runtime")
     image = raw.get("container_image") or raw.get("docker_image")
     kwargs: dict[str, Any] = {"container_image": image}
-    if runtime is not None:
-        if runtime not in SandboxConfig._ALLOWED_RUNTIMES:
+    if "container_runtime" in raw:
+        runtime = raw["container_runtime"]
+        if runtime not in SandboxConfig.ALLOWED_RUNTIMES:
             raise ValueError(
                 f"Unsupported container_runtime {runtime!r}; "
-                f"expected one of {sorted(SandboxConfig._ALLOWED_RUNTIMES)}."
+                f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
             )
         kwargs["container_runtime"] = runtime
     return SandboxConfig(**kwargs)

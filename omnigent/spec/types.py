@@ -780,7 +780,7 @@ class SandboxConfig:
     """
 
     _ENV_VAR = "OMNIGENT_CONTAINER_RUNTIME"
-    _ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
+    ALLOWED_RUNTIMES = frozenset({"docker", "podman"})
     _DEFAULT_RUNTIME: ClassVar[str] = "docker"
 
     container_image: str | None = None
@@ -790,9 +790,9 @@ class SandboxConfig:
     def __post_init__(self) -> None:
         if self.container_runtime is None:
             self.container_runtime = os.environ.get(self._ENV_VAR, self._DEFAULT_RUNTIME)  # type: ignore[assignment]
-        if self.container_runtime not in self._ALLOWED_RUNTIMES:
+        if self.container_runtime not in self.ALLOWED_RUNTIMES:
             raise ValueError(
-                f"container_runtime must be one of {sorted(self._ALLOWED_RUNTIMES)}, "
+                f"container_runtime must be one of {sorted(self.ALLOWED_RUNTIMES)}, "
                 f"got {self.container_runtime!r}"
             )
         # Resolve the deprecated docker_image alias: if only
