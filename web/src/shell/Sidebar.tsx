@@ -15,6 +15,7 @@ import {
   AlertTriangleIcon,
   ArchiveIcon,
   ArchiveRestoreIcon,
+  CalendarClockIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
@@ -208,13 +209,19 @@ interface SidebarProps {
  * which is `inbox` in both standalone and embedded modes. Conversation ids are
  * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
  */
-function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
+function useActiveNavItem(): {
+  isNewChatPage: boolean;
+  isInboxPage: boolean;
+  isTasksPage: boolean;
+} {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
-  const isInboxPage = useLocation().pathname.split("/").filter(Boolean).at(-1) === "inbox";
-  // Exclude inbox: it also has no `:conversationId`, so it would otherwise
-  // light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage;
-  return { isNewChatPage, isInboxPage };
+  const leaf = useLocation().pathname.split("/").filter(Boolean).at(-1);
+  const isInboxPage = leaf === "inbox";
+  const isTasksPage = leaf === "tasks";
+  // Exclude inbox/tasks: they also have no `:conversationId`, so they would
+  // otherwise light up the "New session" button.
+  const isNewChatPage = activeConversationId == null && !isInboxPage && !isTasksPage;
+  return { isNewChatPage, isInboxPage, isTasksPage };
 }
 
 /**
@@ -362,7 +369,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -563,6 +570,26 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               >
                 <SquarePenIcon className="size-4 text-foreground" />
                 New session
+              </Link>
+            </Button>
+            {/* "Scheduled" — recurring agent runs (/tasks). Second row in the
+            top nav group, directly under "New session" and above search. Same
+            full-width nav-row treatment as "New session"; a Link so
+            cmd/middle-click opens a new tab. */}
+            <Button
+              asChild
+              className={cn(
+                // Flush under "New session" (no top margin) so the two rows read
+                // as one tight nav group — matches the mockup.
+                "w-full justify-start gap-1 px-2 text-sm",
+                isTasksPage && "bg-muted font-semibold",
+              )}
+              variant="ghost"
+              data-testid="scheduled-tasks-nav"
+            >
+              <Link to="/tasks" onClick={onNavClick}>
+                <CalendarClockIcon className="size-4 text-foreground" />
+                Scheduled
               </Link>
             </Button>
             {selectionMode ? (

@@ -1288,7 +1288,7 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
  * BEFORE selecting, so the harness-switch reseed effect in the screen reads it
  * back as the same value and doesn't clobber the choice.
  */
-function AgentHarnessPicker({
+export function AgentHarnessPicker({
   agentEntries,
   harnessEntries,
   brainHarnessLabels,
@@ -1316,6 +1316,11 @@ function AgentHarnessPicker({
   setPickedModel,
   setPickedEffort,
   setPickedHarness,
+  onOpenChange,
+  contentClassName,
+  triggerClassName,
+  triggerLabelClassName,
+  contentAlign,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -1344,6 +1349,27 @@ function AgentHarnessPicker({
   setPickedModel: (model: string) => void;
   setPickedEffort: (effort: string) => void;
   setPickedHarness: (harness: string | null, agentId?: string) => void;
+  /** Notified when the picker dropdown opens/closes. Optional — lets a host
+   * (e.g. the scheduled-task Dialog) forward this into its outside-click
+   * dismiss guard so opening the picker doesn't close the surrounding modal. */
+  onOpenChange?: (open: boolean) => void;
+  /** Extra classes for the dropdown content. Optional — the landing composer
+   * relies on the default `available-height` cap (its trigger sits at the
+   * bottom of the screen), but a caller whose trigger sits at the TOP of a tall
+   * modal (the scheduled-task dialog) passes a tighter `max-h-*` so the list
+   * scrolls in a bounded popover instead of spanning the viewport. tailwind-merge
+   * lets the passed max-h win over the default. */
+  contentClassName?: string;
+  /** Extra classes for the trigger Button + its label span. Optional — the
+   * landing composer uses the default compact ghost styling; a caller inside a
+   * form (the scheduled-task dialog) passes Select-trigger-matching classes so
+   * the trigger lines up with sibling <Select> fields (full width, border,
+   * h-8). tailwind-merge lets these override the defaults. */
+  triggerClassName?: string;
+  triggerLabelClassName?: string;
+  /** DropdownMenu content alignment. Defaults to "end" (composer footer). A
+   * full-width-trigger caller (scheduled dialog) passes "start" to left-align. */
+  contentAlign?: "start" | "center" | "end";
 }) {
   // Controlled so clicking a knobbed row can commit the pick and close the
   // menu (see the sub-trigger onClick below) without diving into the submenu.
@@ -1633,6 +1659,7 @@ function AgentHarnessPicker({
       open={open}
       onOpenChange={(next) => {
         setOpen(next);
+        onOpenChange?.(next);
         if (next) {
           // Lock the open direction to whichever side has more room for the
           // tall list, so the later drill-in (shorter page) can't flip it.
@@ -1660,23 +1687,35 @@ function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-select"
           // Drop the Button's focus-visible ring/border that otherwise shows
           // when focus returns to the trigger after a pick.
-          className="h-8 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
+          className={cn(
+            "h-8 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0",
+            triggerClassName,
+          )}
         >
-          <span className="max-w-[12rem] truncate text-xs text-foreground">
+          <span
+            className={cn("max-w-[12rem] truncate text-xs text-foreground", triggerLabelClassName)}
+          >
             {hasAgents ? agentLabel : "No agents"}
           </span>
           <ChevronDownIcon className="size-3.5 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
-        align="end"
+        // Composer footer trigger is narrow + bottom-right, so `end` aligns the
+        // menu's right edge to it. A caller with a full-width trigger (the
+        // scheduled dialog) passes `align="start"` so the menu's LEFT edge lines
+        // up with the trigger instead of shifting to the right.
+        align={contentAlign ?? "end"}
         // Desktop keeps the default collision handling (the content never
         // resizes there — knobs live in hover flyouts). On mobile we force the
         // measured side and disable flipping so the in-place page swap holds
         // its direction; `--radix-..-available-height` still caps + scrolls it.
         side={isMobile ? mobileSide : "bottom"}
         avoidCollisions={!isMobile}
-        className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
+        className={cn(
+          "max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1",
+          contentClassName,
+        )}
       >
         {showMobileKnobs && mobileKnobsAgent ? (
           // Mobile knobs page: the selected agent's run-config knobs shown in

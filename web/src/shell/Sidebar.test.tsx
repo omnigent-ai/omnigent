@@ -254,6 +254,38 @@ describe("Sidebar session list", () => {
     expect(label.className).toContain("max-md:hidden");
   });
 
+  it("renders the 'Scheduled' nav row directly under 'New session' and routes to /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const scheduled = screen.getByTestId("scheduled-tasks-nav");
+    // Full-width nav ROW (a link), labeled just "Scheduled", pointing at /tasks —
+    // not the old top-right icon button.
+    expect(scheduled).toHaveAttribute("href", "/tasks");
+    expect(scheduled).toHaveTextContent("Scheduled");
+    // The removed icon-button version must be gone.
+    expect(screen.queryByTestId("scheduled-tasks-button")).toBeNull();
+
+    // It sits as the second item in the top nav group: after "New session",
+    // before the search box. Compare document order.
+    const newSession = screen.getByTestId("new-chat-button");
+    const search = screen.getByTestId("sidebar-search-button");
+    expect(newSession.compareDocumentPosition(scheduled) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(scheduled.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("marks the 'Scheduled' nav row active when on /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/tasks");
+
+    // Active/selected state uses the same `bg-muted` treatment as "New session".
+    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain("bg-muted");
+  });
+
   it("does NOT close the sidebar when the footer Settings is tapped", () => {
     // No onNavClick on the footer Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto
