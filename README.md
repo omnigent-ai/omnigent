@@ -461,52 +461,6 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 
 ---
 
-## Configuration
-
-Global config lives in `~/.omnigent/config.yaml` (user) or
-`.omnigent/config.yaml` (project, takes precedence). View it with
-`omnigent config list`; set a key with `omnigent config set <key>=<value>`.
-
-### `harness:` — default harness & per-harness startup overrides
-
-Selects the default harness for `omnigent run` and can override the
-executable (`command`) and base launch args (`args`) for each harness.
-
-```yaml
-# Legacy scalar (deprecated, still honored — auto-migrates on next write):
-harness: claude-sdk
-
-# Mapping form — a default plus per-harness overrides:
-harness:
-  default: claude-sdk
-  codex-native:
-    command: /usr/local/bin/codex
-    args: [--config, approval_policy=on-request]
-  pi-native:
-    command: /opt/bin/pi
-```
-
-- `default` (optional str): default harness id for `omnigent run`.
-- `command` (optional str): overrides the vendor CLI executable.
-- `args` (optional list[str]): base args; CLI pass-through args append after.
-
-**Precedence** (first non-empty wins): `OMNIGENT_<NAME>_PATH` env var >
-config `harness.<id>.command` > built-in default. `args` follow the same
-precedence with config `args` as the base and CLI pass-through args appended.
-
-The env var is `OMNIGENT_<NAME>_PATH` where `<NAME>` is the harness's base id
-(`-native` suffix stripped, so `pi` and `pi-native` share `OMNIGENT_PI_PATH` —
-one var per binary). The legacy `HARNESS_<NAME>_PATH` (codex/pi/kimi/goose/
-qwen/hermes) is still read as a deprecated fallback (warns on use) and will be
-removed in **v0.8.0**.
-
-The pre-existing `omnigent claude --command` flag is deprecated (warns,
-pointing to `OMNIGENT_CLAUDE_PATH` / config) and will be removed in a future
-release. No other native command has a `--command` flag — override via env
-or config.
-
----
-
 ## Write your own agent
 
 An agent is a short YAML file: your prompt, your tools — local Python
@@ -551,6 +505,17 @@ omnigent run path/to/my_agent.yaml
 The same file can declare sub-agents and reviewers. For a fuller example, see
 Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/examples/polly/), and the
 [Agent YAML spec](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md) for the full schema.
+
+---
+
+## Telemetry
+
+Omnigent collects anonymized usage data (telemetry) by default. This data
+contains no sensitive or personally identifiable information. If you're using
+Omnigent through a managed service or distribution, please consult your managed
+service agreement to determine any data collection that may impact your use of
+the service. To opt out, follow our instructions in
+[Usage Telemetry](https://omnigent.ai/docs/deploy/telemetry).
 
 ---
 

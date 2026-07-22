@@ -11,8 +11,10 @@ Events are injected via :func:`_inject`, which calls :meth:`record_change` on
 the registry so tests exercise the same code path as real tool calls.
 """
 
+import logging
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -777,16 +779,17 @@ def test_skip_dir_pathspecs_anchored_to_workspace_subdir(tmp_path: Path) -> None
     assert ":(exclude)node_modules" not in specs
 
 
-def test_untracked_cache_enabled_on_init(tmp_path: Path) -> None:
-    """The registry enables ``core.untrackedCache`` on the repo at construction.
+def test_untracked_cache_enable_helper_sets_repo_config(tmp_path: Path) -> None:
+    """The background helper enables ``core.untrackedCache`` when supported.
 
     This is the large-repo ``git status`` speedup (upstream git ≥ 2.8); the
-    registry sets it best-effort on init. Verifies the config lands.
+    The runner invokes it asynchronously after constructing the registry.
     """
     env = _git_env()
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
 
-    GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    registry._enable_untracked_cache()
 
     result = subprocess.run(
         ["git", "config", "--get", "core.untrackedCache"],
@@ -814,8 +817,8 @@ def test_untracked_cache_failure_does_not_break_init(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr("omnigent.runtime.filesystem_registry.subprocess.run", _raise_oserror)
 
-    # Construction must not raise even though the config subprocess fails.
-    GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    registry._enable_untracked_cache()
 
 
 def test_untracked_cache_config_written_once_per_root(tmp_path: Path, monkeypatch) -> None:
@@ -845,11 +848,104 @@ def test_untracked_cache_config_written_once_per_root(tmp_path: Path, monkeypatc
     monkeypatch.setattr(fsr.subprocess, "run", _counting_run)
 
     for _ in range(3):
-        GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+        registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+        registry._enable_untracked_cache()
 
     assert len(config_calls) == 1, (
         f"Expected core.untrackedCache config write exactly once, got {len(config_calls)}."
     )
+
+
+def test_untracked_cache_start_runs_once_in_daemon_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registry startup launches one non-blocking optimization worker."""
+    registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    completed = threading.Event()
+    daemon_values: list[bool] = []
+
+    def _record_worker() -> None:
+        daemon_values.append(threading.current_thread().daemon)
+        completed.set()
+
+    monkeypatch.setattr(registry, "_enable_untracked_cache", _record_worker)
+
+    registry.start()
+    registry.start()
+
+    assert completed.wait(timeout=1)
+    assert daemon_values == [True]
+
+
+def test_untracked_cache_already_enabled_skips_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner waiting on another process re-checks config and exits."""
+    from omnigent.runtime import filesystem_registry as fsr
+
+    monkeypatch.setattr(fsr, "_untracked_cache_enabled", set())
+    calls: list[tuple[str, ...]] = []
+
+    def _enabled_config(args, **_kwargs):
+        calls.append(tuple(args))
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=b"true\n", stderr=b"")
+
+    monkeypatch.setattr(fsr.subprocess, "run", _enabled_config)
+    registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+
+    registry._enable_untracked_cache()
+
+    assert calls == [("git", "config", "--bool", "--get", "core.untrackedCache")]
+
+
+def test_git_common_dir_resolves_linked_worktree(tmp_path: Path) -> None:
+    """Worktrees coordinate through a lock in their shared Git directory."""
+    from omnigent.runtime.filesystem_registry import _git_common_dir
+
+    common_dir = tmp_path / "repo" / ".git"
+    worktree_git_dir = common_dir / "worktrees" / "feature"
+    worktree_git_dir.mkdir(parents=True)
+    (worktree_git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    workspace = tmp_path / "feature"
+    workspace.mkdir()
+    (workspace / ".git").write_text(f"gitdir: {worktree_git_dir}\n", encoding="utf-8")
+
+    assert _git_common_dir(workspace) == common_dir.resolve()
+
+
+def test_untracked_cache_logs_probe_and_config_timings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Startup diagnostics time the probe and config subprocesses separately."""
+    from omnigent.runtime import filesystem_registry as fsr
+
+    monkeypatch.setattr(fsr, "_untracked_cache_enabled", set())
+    readings = iter((10.0, 10.001, 10.001, 10.007, 10.007, 10.009))
+    monkeypatch.setattr(fsr.time, "perf_counter", lambda: next(readings))
+    monkeypatch.setattr(
+        fsr.subprocess,
+        "run",
+        lambda args, **_kwargs: subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger=fsr.__name__):
+        registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+        registry._enable_untracked_cache()
+
+    assert caplog.messages == [
+        f"git untracked-cache config checked: git_root={tmp_path} elapsed_ms=1.0 enabled=False",
+        f"git untracked-cache probe completed: git_root={tmp_path} elapsed_ms=6.0 returncode=0",
+        f"git untracked-cache config completed: git_root={tmp_path} elapsed_ms=2.0 returncode=0",
+    ]
 
 
 def test_untracked_cache_not_enabled_when_probe_fails(tmp_path: Path, monkeypatch) -> None:
@@ -880,7 +976,8 @@ def test_untracked_cache_not_enabled_when_probe_fails(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(fsr.subprocess, "run", _probe_fails_run)
 
-    GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    registry = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
+    registry._enable_untracked_cache()
 
     assert config_calls == [], (
         f"Expected no config write when the probe fails, got {config_calls}."

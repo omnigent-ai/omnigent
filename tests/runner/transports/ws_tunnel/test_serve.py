@@ -450,6 +450,62 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
 
 
 @pytest.mark.asyncio
+async def test_serve_tunnel_replaces_rejected_host_bootstrap_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected host bearer activates local refresh before tunnel retry."""
+    login_url = "https://example.databricks.com/oidc/oauth2/v2.0/authorize"
+    seen_tokens: list[str | None] = []
+
+    class _BootstrapFactory:
+        """Factory double that switches token when invalidated."""
+
+        def __init__(self) -> None:
+            self.invalidated = False
+
+        def __call__(self) -> str:
+            return "runner-refreshed-token" if self.invalidated else "host-bootstrap-token"
+
+        def invalidate(self) -> bool:
+            if self.invalidated:
+                return False
+            self.invalidated = True
+            return True
+
+    async def _serve_once(
+        app: Any,
+        *,
+        tunnel_url: str,
+        server_url: str = "",
+        runner_id: str,
+        runner_version: str,
+        auth_token: str | None = None,
+        tunnel_token: str | None = None,
+    ) -> None:
+        """Reject the host token, then stop after observing the replacement."""
+        del app, tunnel_url, server_url, runner_id, runner_version, tunnel_token
+        seen_tokens.append(auth_token)
+        if len(seen_tokens) == 1:
+            raise InvalidURI(login_url, "scheme isn't ws or wss")
+        raise asyncio.CancelledError
+
+    factory = _BootstrapFactory()
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_bootstrap_refresh",
+            runner_version="0.1.0",
+            auth_token="host-bootstrap-token",
+            auth_token_factory=factory,
+        )
+
+    assert seen_tokens == ["host-bootstrap-token", "runner-refreshed-token"]
+
+
+@pytest.mark.asyncio
 async def test_serve_tunnel_once_sends_bearer_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

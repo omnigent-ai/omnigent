@@ -266,6 +266,24 @@ def _poll_for_assistant_marker(
     )
 
 
+def _poll_for_child_session(
+    client: httpx.Client,
+    *,
+    parent_session_id: str,
+    timeout: float,
+) -> dict[str, object]:
+    """Poll until a Codex-native child appears under its parent."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(f"/v1/sessions/{parent_session_id}/child_sessions")
+        if resp.status_code == 200:
+            children = resp.json().get("data", [])
+            if children:
+                return children[0]
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"No child session appeared within {timeout}s")
+
+
 def _poll_for_assistant_reply(
     client: httpx.Client,
     *,
@@ -644,6 +662,73 @@ def test_codex_native_builtin_session_round_trip(
         assert marker in _user_text(messages[first_user]), (
             f"user message text missing the prompt marker {marker!r}; "
             f"got {_user_text(messages[first_user])!r}"
+        )
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            daemon.wait()
+
+
+@pytest.mark.skipif(
+    os.environ.get("OMNIGENT_E2E_CODEX_NATIVE") != "1" or shutil.which("codex") is None,
+    reason=(
+        "codex-native subagent e2e needs `codex` on PATH and OMNIGENT_E2E_CODEX_NATIVE=1 to run"
+    ),
+)
+def test_codex_native_spawn_creates_child_session(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """A real Codex native spawn appears as an Omnigent child session."""
+    workspace = tmp_path / "codex_subagent_ws"
+    workspace.mkdir()
+    child_marker = f"CHILD_{uuid.uuid4().hex[:6].upper()}"
+    parent_marker = f"PARENT_{uuid.uuid4().hex[:6].upper()}"
+
+    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
+    try:
+        host_id = _online_host_id(http_client, timeout=30.0)
+        agent_id = _codex_native_agent_id(http_client)
+        session_id = _create_codex_host_session(
+            http_client,
+            agent_id=agent_id,
+            host_id=host_id,
+            workspace=str(workspace),
+        )
+        _send_user_text(
+            http_client,
+            session_id=session_id,
+            text=(
+                "Use your native multi-agent tool to spawn exactly one subagent. "
+                f"Ask it to reply with exactly {child_marker}. Wait for it, then reply "
+                f"with exactly {parent_marker}."
+            ),
+        )
+
+        child = _poll_for_child_session(
+            http_client,
+            parent_session_id=session_id,
+            timeout=180.0,
+        )
+        child_id = str(child["id"])
+        labels = child.get("labels", {})
+        assert isinstance(labels, dict)
+        assert labels.get("omnigent.codex_native.subagent_thread_id")
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=child_id,
+            marker=child_marker,
+            timeout=180.0,
+        )
+        _poll_for_assistant_marker(
+            http_client,
+            session_id=session_id,
+            marker=parent_marker,
+            timeout=180.0,
         )
     finally:
         daemon.send_signal(signal.SIGTERM)

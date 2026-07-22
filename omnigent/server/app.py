@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -51,6 +52,10 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
 from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.background_session_titles import (
+    BackgroundSessionTitleCoordinator,
+    RunnerBackgroundTitleGenerator,
+)
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.performance_metrics import (
@@ -65,9 +70,11 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -80,6 +87,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
@@ -93,6 +101,7 @@ from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -285,6 +294,43 @@ def _request_status_code_for_metrics(
     if failed:
         return 500
     return None
+
+
+def _load_debug_routers(
+    module_paths: list[str] | None,
+) -> list[tuple[Any, str, list[str]]]:
+    """Import each dotted module and collect its ``DEBUG_ROUTERS`` entries.
+
+    Mirrors the ``policy_modules`` load-by-name pattern: a module that fails to
+    import (e.g. an out-of-tree ``dev/`` module absent from a production
+    install) or lacks a ``DEBUG_ROUTERS`` list is logged and skipped, never
+    raised — a stray config key must not take the server down.
+
+    :param module_paths: Dotted module paths naming modules that expose a
+        ``DEBUG_ROUTERS`` list of ``(router, prefix, tags)`` tuples. ``None``
+        or empty yields no routers.
+    :returns: The flattened ``(router, prefix, tags)`` tuples to mount.
+    """
+    routers: list[tuple[Any, str, list[str]]] = []
+    for module_path in module_paths or []:
+        try:
+            mod = import_module(module_path)
+        except ImportError:
+            _logger.warning(
+                "Failed to import debug router module %s; skipping",
+                module_path,
+                exc_info=True,
+            )
+            continue
+        entries = getattr(mod, "DEBUG_ROUTERS", None)
+        if not isinstance(entries, list):
+            _logger.warning(
+                "Module %s has no DEBUG_ROUTERS list; skipping",
+                module_path,
+            )
+            continue
+        routers.extend(entries)
+    return routers
 
 
 # MCP startup warming moved to runner; see designs/RUNNER_MCP.md.
@@ -1083,11 +1129,13 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
+    debug_router_modules: list[str] | None = None,
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
@@ -1127,6 +1175,9 @@ def create_app(
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
+    :param project_store: Store for first-class projects (owner-private
+        containers that group sessions). ``None`` disables the
+        ``/v1/projects`` CRUD endpoints.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -1141,6 +1192,15 @@ def create_app(
         ``["myorg.policies.safety"]``. Sourced from the server
         config's ``policy_modules`` key. ``None`` scans only
         the built-in modules.
+    :param debug_router_modules: Dotted module paths to import and
+        scan for a ``DEBUG_ROUTERS`` list of ``(router, prefix,
+        tags)`` tuples, mounted alongside ``extra_routers``. Sourced
+        from the server config's ``debug_router_modules`` key. Exists
+        for out-of-tree diagnostic routers (e.g. the benchmark
+        harness's request-counter endpoint under ``dev/``); a module
+        that fails to import is logged and skipped, so a config key
+        naming an absent module is a no-op. Production config leaves
+        this unset. ``None`` mounts no debug routers.
     :param admins: Admin identities from the server config's
         ``admins:`` key, e.g. ``["alice@example.com"]``. Union'd with
         the runtime-editable ``<data_dir>/admins`` file; a matching
@@ -1229,6 +1289,14 @@ def create_app(
     runner_router = RunnerRouter(
         registry=tunnel_registry,
         conversation_store=conversation_store,
+    )
+    runner_session_initializer = RunnerSessionInitializer(
+        tunnel_registry,
+        server_version=_server_version(),
+    )
+    background_title_coordinator = BackgroundSessionTitleCoordinator(
+        conversation_store,
+        RunnerBackgroundTitleGenerator(runner_router),
     )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
@@ -1418,9 +1486,19 @@ def create_app(
                     exc,
                 )
 
+            # Run completion is event-driven (persist_scheduled_run_completion
+            # fires from _publish_status the instant a fired conversation's turn
+            # ends — no poll). The only orphan backstop is a lazy-on-read
+            # force-fail of stale ``running`` runs on the scheduled-task read
+            # endpoints (see routes/scheduled_tasks.py); there is no startup
+            # sweep and no periodic reconcile.
+
         try:
             yield
         finally:
+            # Run completion is event-driven (the _publish_status hook) plus a
+            # lazy-on-read stale backstop — there is no run-reconciler task to
+            # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
@@ -1433,6 +1511,7 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
             set_runner_ws_factory(None)
@@ -1456,6 +1535,8 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
+    app.state.runner_session_initializer = runner_session_initializer
+    app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
@@ -1549,8 +1630,11 @@ def create_app(
     set_server_runner_router(runner_router)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
-    # hold a session's runner tunnel serve the same sidebar fields.
-    session_live_state.configure(conversation_store)
+    # hold a session's runner tunnel serve the same sidebar fields. The
+    # scheduled-task store additionally enables the event-driven
+    # run-completion hook (persist_scheduled_run_completion) fired from
+    # _publish_status when a fired conversation's turn reaches terminal.
+    session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
@@ -1600,6 +1684,10 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
+            # Per-route tally (low-cardinality template key) for offline
+            # request-breakdown analysis, e.g. the benchmark harness's
+            # per-journey network appendix. Cheap; independent of the OTel path.
+            server_metrics.record_route(request.method, route)
             metrics_status_code = _request_status_code_for_metrics(
                 status_code,
                 failed=failed,
@@ -1974,7 +2062,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | None]:
+    async def info() -> dict[str, bool | str | list[str] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -1993,9 +2081,10 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``, ``single_user``), the short
-        sandbox provider name (``sandbox_provider``) the web UI labels
-        the new-session sandbox option with, and the installed
+        ``managed_sandboxes_enabled``, ``dictation_available``,
+        ``single_user``), the short sandbox provider name
+        (``sandbox_provider``) the web UI labels the new-session
+        sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
@@ -2071,6 +2160,34 @@ def create_app(
             )
         except ImportError:
             smart_routing_enabled = False
+        # harness_install_enabled gates the web UI's "Install" action for a
+        # missing, npm-installable harness on a connected host. Off by default
+        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
+        # out; when false the SPA keeps the prior "run omnigent setup" hint.
+        # Read live so flipping the env var takes effect without a rebuild.
+        # The env-var name is shared with the install route so the flag the UI
+        # sees and the flag the route enforces can never drift apart.
+        from omnigent.process_logging import env_truthy
+        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
+
+        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # installable_harnesses: the exact harness ids the install route accepts
+        # (bare ids + native spellings resolving to an npm-installable family),
+        # so the SPA offers setup only where it will succeed and never has to
+        # duplicate the server's allowlist. Empty when the feature is off, so a
+        # disabled flag also blanks the set the UI keys off of.
+        from omnigent.onboarding.harness_install import ui_installable_harnesses
+
+        installable_harnesses = (
+            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+        )
+        # dictation_available gates the composer mic button's server
+        # speech-to-text fallback (designs/server-dictation.md). Checks
+        # config presence only (extra installed + models on disk) — no
+        # model is loaded here.
+        from omnigent.server.dictation import engine_availability
+
+        dictation_available, _ = engine_availability()
         return {
             "accounts_enabled": accounts_enabled,
             "single_user": single_user,
@@ -2083,6 +2200,9 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "harness_install_enabled": harness_install_enabled,
+            "installable_harnesses": installable_harnesses,
+            "dictation_available": dictation_available,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
@@ -2158,6 +2278,10 @@ def create_app(
             # workspace over the host tunnel when the runner is offline
             # (the file panel stays live without waking the agent).
             host_registry=host_registry,
+            # Validates target-project ownership when PATCH /v1/sessions/{id}
+            # files a session into a project (owner-private membership).
+            project_store=project_store,
+            background_title_coordinator=background_title_coordinator,
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -2188,6 +2312,14 @@ def create_app(
         create_harnesses_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["harnesses"],
+    )
+    # Server-side speech-to-text behind the composer mic button
+    # (designs/server-dictation.md). Availability is probed lazily, so
+    # registering unconditionally is free for servers without the extra.
+    app.include_router(
+        create_dictation_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["dictation"],
     )
     app.include_router(
         create_terminal_attach_router(
@@ -2272,6 +2404,18 @@ def create_app(
         tags=["sharing"],
     )
 
+    # First-class projects (owner-private session containers). Mounted only
+    # when a project store is wired; the endpoints self-scope to the caller.
+    if project_store is not None:
+        app.include_router(
+            create_projects_router(
+                project_store=project_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["projects"],
+        )
+
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:
         """Mark sessions pinned to *this* runner as offline.
@@ -2309,6 +2453,7 @@ def create_app(
                 runner_id,
             )
             return
+        runner_session_initializer.invalidate_runner(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other
         # replicas flip offline immediately rather than after the TTL.
         session_live_state.clear_runner_liveness(runner_id)
@@ -2437,12 +2582,9 @@ def create_app(
                 )
             else:
                 try:
-                    await routed.client.post(
-                        "/v1/sessions",
-                        json={
-                            "session_id": conv.id,
-                            "agent_id": conv.agent_id,
-                        },
+                    await runner_session_initializer.initialize(
+                        conv,
+                        routed.client,
                         timeout=10.0,
                     )
                 except Exception:
@@ -2479,14 +2621,12 @@ def create_app(
             )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
-        """Owner for a server-managed sandbox runner, by its bound session.
+        """Owner for a delegated runner, by its bound session.
 
-        Managed runners authenticate with a server-minted binding token,
-        not a user session, so the runner tunnel cannot resolve their
-        owner from the handshake. The server wrote ``runner_id`` onto the
-        session row at launch (``replace_runner_id``), so the bound
-        conversation's owner is authoritative — the runner-side analog of
-        the host tunnel's ``resolve_launch_token``.
+        Host-launched and managed-sandbox runners authenticate with a binding
+        token instead of inheriting the host user's credential. The server
+        wrote ``runner_id`` onto the session row before launch, so the bound
+        conversation's owner is authoritative.
 
         :param runner_id: Token-bound runner id from the tunnel handshake.
         :returns: The session owner's user id, or ``None`` when no session
@@ -2655,11 +2795,13 @@ def create_app(
     # ``index.html`` for the literal root and directory paths, so a
     # refresh on ``/c/abc`` would 404.
     # Extra routers injected by callers (e.g. test fixtures that
-    # mount legacy routes). Registered BEFORE the SPA static-files
+    # mount legacy routes) plus any debug routers loaded by dotted
+    # module path from config. Registered BEFORE the SPA static-files
     # mount so FastAPI resolves them before the catch-all fallback.
-    if extra_routers:
-        for router, prefix, tags in extra_routers:
-            app.include_router(router, prefix=prefix, tags=tags)
+    all_extra_routers = list(extra_routers or [])
+    all_extra_routers.extend(_load_debug_routers(debug_router_modules))
+    for router, prefix, tags in all_extra_routers:
+        app.include_router(router, prefix=prefix, tags=tags)
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()

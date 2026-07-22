@@ -67,7 +67,7 @@ def _permissions(base_url: str, session_id: str) -> dict[str, int]:
         timeout=10.0,
     )
     resp.raise_for_status()
-    return {p["user_id"]: p["level"] for p in resp.json()}
+    return {p["user_id"]: p["level"] for p in resp.json()["permissions"]}
 
 
 def _wait_for(

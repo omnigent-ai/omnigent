@@ -106,37 +106,38 @@ class SqlAlchemyFileStore(FileStore):
 
     def list(
         self,
+        session_id: str,
         limit: int = 20,
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        session_id: str | None = None,
         include_unscoped: bool = False,
     ) -> PagedList[StoredFile]:
         """
-        List files with cursor-based pagination.
+        List a session's files with cursor-based pagination.
 
+        Always scoped to ``session_id`` — the query filters on it, so
+        it is served by ``ix_files_session_id_created_at``.
+
+        :param session_id: Owning session whose files to list.
         :param limit: Maximum number of files to return.
         :param after: Cursor file ID for forward pagination.
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param session_id: Filter to this session's files.
-            ``None`` lists all files.
-        :param include_unscoped: When ``True`` and ``session_id``
-            is set, also return global files (``session_id IS NULL``).
+        :param include_unscoped: When ``True``, also return global
+            files (``session_id IS NULL``).
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         with self._session() as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
             stmt = select(SqlFile).where(SqlFile.workspace_id == current_workspace_id())
-            if session_id is not None:
-                if include_unscoped:
-                    stmt = stmt.where(
-                        or_(SqlFile.session_id == session_id, SqlFile.session_id.is_(None))
-                    )
-                else:
-                    stmt = stmt.where(SqlFile.session_id == session_id)
+            if include_unscoped:
+                stmt = stmt.where(
+                    or_(SqlFile.session_id == session_id, SqlFile.session_id.is_(None))
+                )
+            else:
+                stmt = stmt.where(SqlFile.session_id == session_id)
             if after:
                 sub = (
                     select(SqlFile.created_at)

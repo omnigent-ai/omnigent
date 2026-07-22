@@ -4376,7 +4376,6 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     transcript on a fresh launch — the user would type a prompt
     and see no assistant reply mirrored to the web UI.
     """
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "on")
 
     async def _fake_create_session(
         _client: object,
@@ -4404,13 +4403,8 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         allowed_tools: tuple[str, ...] = (),
     ) -> str:
         """Return a fixed terminal id without spawning anything."""
-        from omnigent.tools.builtins.session_rename import (
-            CLAUDE_NATIVE_SESSION_RENAME_TOOL,
-            SESSION_RENAME_INSTRUCTION,
-        )
-
-        assert append_system_prompt == SESSION_RENAME_INSTRUCTION
-        assert allowed_tools == (CLAUDE_NATIVE_SESSION_RENAME_TOOL,)
+        assert append_system_prompt is None
+        assert allowed_tools == ()
         del _client, _session_id, _claude_args, command, bridge_dir, claude_config
         return "terminal_claude_main"
 

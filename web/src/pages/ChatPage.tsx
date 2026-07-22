@@ -86,6 +86,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import {
@@ -145,6 +146,7 @@ import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
+  rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -474,6 +476,13 @@ export function shouldShowAuthorBadge(
  * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
  * later direct send could overtake a still-queued earlier one when status
  * flickers idle mid-queue (cursor-native). A new chat always sends.
+ *
+ * ``waiting`` is NOT busy for queueing: it means the turn already ended and the
+ * agent loop is only parked on background work (background shells / sub-agents)
+ * — the server's turn gate is already free, so a new message starts a fresh
+ * turn immediately instead of stalling behind that background work. (The
+ * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
+ * reflect background activity, which is a separate concern from send gating.)
  */
 export function shouldQueueSend(
   conversationId: string | null,
@@ -482,8 +491,7 @@ export function shouldQueueSend(
   queuedMessages: QueuedMessage[],
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy =
-    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
   return isBusy || hasQueued;
 }
@@ -1846,6 +1854,8 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
+        hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
+        onShowReconnectHelp={onShowReconnectHelp}
         costRoutingVerdict={costRoutingVerdict}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
@@ -2578,6 +2588,18 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
+    // A `host_offline` session moves the reconnect affordance up into the
+    // composer's host badge (ComposerStatusLine), where the host is already
+    // named — so render nothing here whenever that composer is on screen
+    // (sub-agent sessions included; their badge carries it just like a normal
+    // session's). The composer is hidden only in the terminal-first *terminal*
+    // view (the PTY owns the surface); there the banner still carries the
+    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
+    // no badge).
+    const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
+    if (liveness.kind === "host_offline" && composerOnScreen) {
+      return null;
+    }
     return (
       <button
         type="button"
@@ -3381,6 +3403,15 @@ interface ComposerProps {
    * banner below is the only affordance.
    */
   unreachable?: boolean;
+  /**
+   * The session is host-bound to an offline, non-resumable host
+   * (`host_offline`): the composer's host badge turns into a clickable
+   * "Host is offline — click to reconnect" affordance (see HostBadge's
+   * `onReconnect`), replacing the separate banner below the composer.
+   */
+  hostOffline?: boolean;
+  /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
+  onShowReconnectHelp?: () => void;
   /** Latest parsed advisor verdict for the cost-routing pill; `null`/omitted when none. */
   costRoutingVerdict?: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
@@ -3601,10 +3632,18 @@ function ComposerStatusLine({
   harnessLabel,
   goal,
   isSubAgentSession,
+  onHostReconnect,
 }: {
   harnessLabel: string | null;
   goal: Goal | null;
   isSubAgentSession: boolean;
+  /**
+   * When set (`host_offline` liveness), the host badge becomes a clickable
+   * "Host is offline — click to reconnect" affordance. Also forces the tray
+   * to render even when it would otherwise be empty, so the prompt is always
+   * visible for an unreachable host.
+   */
+  onHostReconnect?: () => void;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
@@ -3631,7 +3670,15 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness) return null;
+  // The offline-host reconnect affordance lives in the host badge, so the tray
+  // must render even when every other slot is empty (an unreachable session
+  // often has no branch/ring/harness yet). Gated by `showHost`: only host-bound
+  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
+  // never host-bound — a stranded child is `local_stranded`, which keeps its
+  // banner elsewhere.
+  const showReconnect = showHost && !!onHostReconnect;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness && !showReconnect)
+    return null;
 
   return (
     <div
@@ -3653,7 +3700,9 @@ function ComposerStatusLine({
           so the right cluster stays pinned right even when both are absent;
           each item truncates to an ellipsis so the tray never wraps. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
-        {showHost && conversationId && <HostBadge sessionId={conversationId} />}
+        {showHost && conversationId && (
+          <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
+        )}
         {showBranch && (
           <span className="flex min-w-0 items-center gap-1.5">
             <GitBranchIcon className="size-3.5 shrink-0" />
@@ -3793,11 +3842,14 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
+  hostOffline = false,
+  onShowReconnectHelp,
   costRoutingVerdict = null,
   costRoutingEligible = false,
   subAgentLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -4032,9 +4084,7 @@ export function Composer({
   };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
   // keyboard nav indexes into the same list.
-  const menuMatches = menuOpen
-    ? Object.keys(slashCommands).filter((name) => name.slice(1).startsWith(menuQuery.toLowerCase()))
-    : [];
+  const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
 
   // Pre-select the first match whenever the filtered list changes — both
   // when the menu first opens (matches go [] → non-empty) and as the query
@@ -4880,12 +4930,17 @@ export function Composer({
             <ComposerMicButton
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onTranscript={(text) => {
-                setValue((prev) => (prev ? `${prev} ${text}` : text));
+                dictation.appendFinal(text);
                 dirtyRef.current = true;
                 // Dictation is a user-driven edit — exit prompt-recall mode
                 // so ArrowUp/ArrowDown don't clobber the dictated text.
                 resetCursor();
                 if (commandError !== null) setCommandError(null);
+              }}
+              onInterim={(text) => {
+                dictation.replaceInterim(text);
+                dirtyRef.current = true;
+                resetCursor();
               }}
             />
           </div>
@@ -4991,6 +5046,7 @@ export function Composer({
         harnessLabel={harnessLabel}
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
+        onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
       />
     </form>
   );

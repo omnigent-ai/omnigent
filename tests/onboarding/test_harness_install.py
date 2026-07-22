@@ -366,6 +366,74 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
     assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
 
 
+def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No npm on PATH → ``(False, reason)`` naming the missing installer.
+
+    The UI-driven install shows this reason instead of a bare failure, so the
+    user knows the host lacks npm rather than guessing.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
+    )
+    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert installed is False
+    assert reason is not None and "npm" in reason
+
+
+def test_try_install_harness_cli_manual_only() -> None:
+    """A manual-only CLI (no npm package, no install_command) → ``(False, reason)``.
+
+    Cursor installs out-of-band; the reason tells the caller it can't be
+    auto-installed so the UI can fall back to showing the install hint.
+    """
+    installed, reason = hi.try_install_harness_cli(hi.CURSOR_KEY)
+    assert installed is False
+    assert reason is not None and "automatically" in reason
+
+
+def test_try_install_harness_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-zero installer exit with the binary still absent → ``(False, reason)``.
+
+    Surfaces the installer's exit code so a failed npm install is actionable.
+    """
+
+    def _which(name: str) -> str | None:
+        return "/usr/bin/npm" if name == "npm" else None
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=1),
+    )
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+    assert installed is False
+    assert reason is not None and "code 1" in reason
+
+
+def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful install → ``(True, None)``; the bool wrapper agrees."""
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "npm":
+            return "/usr/bin/npm"
+        if name == "codex":
+            return "/usr/bin/codex" if state["installed"] else None
+        return None
+
+    def _run(argv: list[str], **k: object):
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+
+
 def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Installs via ``npm install -g <package>`` and reports the post-install
     PATH state (True once the binary appears)."""
@@ -798,3 +866,66 @@ def test_harness_cli_logged_in_false_for_harness_without_status(
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
     assert hi.harness_cli_logged_in(hi.PI_KEY) is False
+
+
+# ── UI setup-step descriptor ─────────────────────────────
+
+
+def test_ui_install_key_resolves_bare_and_native_spellings() -> None:
+    """The UI may pass either the bare id or the native executor spelling."""
+    assert hi.ui_install_key("codex") == OPENAI_FAMILY
+    assert hi.ui_install_key("codex-native") == OPENAI_FAMILY
+    assert hi.ui_install_key("qwen-native") == hi.QWEN_KEY
+    assert hi.ui_install_key("claude-native") == ANTHROPIC_FAMILY
+    # Non-installable (curl/OAuth/SDK) harnesses resolve to None.
+    assert hi.ui_install_key("cursor") is None
+    assert hi.ui_install_key("cursor-native") is None
+    assert hi.ui_install_key("claude-sdk") is None
+
+
+def test_ui_installable_harnesses_includes_native_spellings() -> None:
+    installable = hi.ui_installable_harnesses()
+    assert {"claude", "codex", "pi", "opencode", "qwen"} <= installable
+    assert {"codex-native", "qwen-native", "opencode-native"} <= installable
+    assert "cursor" not in installable
+    assert "claude-sdk" not in installable
+
+
+def test_ui_setup_steps_install_then_command_auth_for_codex() -> None:
+    """Codex: one-click install, then a status-tracked login command."""
+    steps = hi.ui_setup_steps("codex")
+    assert [s.kind for s in steps] == ["install", "auth"]
+    install, auth = steps
+    assert install.action == "install"
+    assert install.status_key == "installed"
+    assert install.command is None
+    assert auth.action == "command"
+    assert auth.command == "codex login"
+    assert auth.status_key == "authed"
+
+
+def test_ui_setup_steps_native_spelling_matches_bare() -> None:
+    """The native spelling yields the same steps as the bare id."""
+    assert [s.as_dict() for s in hi.ui_setup_steps("codex-native")] == [
+        s.as_dict() for s in hi.ui_setup_steps("codex")
+    ]
+
+
+def test_ui_setup_steps_pi_auth_is_untracked_setup_fallback() -> None:
+    """Pi's credential (API key / gateway) can't be driven from the UI yet, so
+    its auth step points at ``omnigent setup`` and is not status-tracked."""
+    steps = hi.ui_setup_steps("pi")
+    assert [s.kind for s in steps] == ["install", "auth"]
+    assert steps[1].action == "setup"
+    assert steps[1].command == "omnigent setup"
+    assert steps[1].status_key is None
+
+
+def test_ui_setup_steps_generic_for_non_installable() -> None:
+    """A non-installable harness (cursor) gets a single generic setup step."""
+    for harness in ("cursor", "claude-sdk"):
+        steps = hi.ui_setup_steps(harness)
+        assert len(steps) == 1
+        assert steps[0].action == "setup"
+        assert steps[0].command == "omnigent setup"
+        assert steps[0].status_key is None

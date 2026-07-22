@@ -27,6 +27,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
@@ -42,7 +44,9 @@ from omnigent.host.frames import (
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -93,6 +97,8 @@ async def test_handle_launch_spawns_subprocess(
     failed or the result frame construction is wrong.
     """
     host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
     workspace.mkdir()
 
@@ -142,6 +148,7 @@ async def test_handle_launch_spawns_subprocess(
     # Verify env vars passed to the subprocess.
     assert spawned_env.get("RUNNER_SERVER_URL") == "http://localhost:8000"
     assert spawned_env.get("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN") == "test_token_abc"
+    assert spawned_env.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "host-bootstrap-bearer"
     assert spawned_env.get("OMNIGENT_RUNNER_WORKSPACE") == str(workspace)
 
     # Runners must get a clean /dev/null stdin, not the daemon's inherited fd:
@@ -1418,6 +1425,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         binding_token="tok",
         workspace="/ws",
         parent_pid=42,
+        initial_auth_token="host-bootstrap-bearer",
     )
 
     # Process essentials + the locale family pass through.
@@ -1472,6 +1480,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["RUNNER_SERVER_URL"] == "http://server"
     assert env[RUNNER_ID_ENV_VAR] == "runner_abc"
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
+    assert env[RUNNER_DELEGATED_AUTH_ENV_VAR] == "1"
+    assert env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] == "host-bootstrap-bearer"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
 
@@ -2035,6 +2045,122 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.path == str(tmp_path / "scratch")
 
 
+# ── host.install_harness handler ────────────────────────
+
+
+def test_handle_install_harness_success_returns_refreshed_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A successful install returns ``ok`` and the recomputed readiness map.
+
+    The server flips the UI badge off this map, so the handler must run the
+    installer and then re-probe readiness, returning the fresh result.
+    """
+    import omnigent.host.connect as connect
+
+    # Not yet installed, so the handler runs the installer.
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
+    monkeypatch.setattr(
+        connect,
+        "configured_harness_map",
+        lambda: {"claude-native": True, "codex-native": "needs-auth"},
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i1", harness="claude")
+    )
+
+    assert isinstance(result, HostInstallHarnessResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
+
+
+def test_handle_install_harness_already_installed_skips_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An already-installed harness returns fresh readiness without running npm.
+
+    ``npm install -g`` re-resolves over the network and can take minutes even
+    when the binary is already present, so a re-request must short-circuit —
+    otherwise a user clicking Install on an installed harness waits pointlessly
+    (and can hit the request timeout).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer ran despite the harness already being installed")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i0", harness="opencode")
+    )
+
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"opencode-native": True}
+
+
+def test_handle_install_harness_failure_surfaces_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed install returns ``failed`` with the installer's reason and no
+    readiness map (the server keeps its prior view).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(
+        connect,
+        "try_install_harness_cli",
+        lambda key: (False, "npm is not available on the host"),
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i2", harness="codex")
+    )
+
+    assert result.status == "failed"
+    assert result.error == "npm is not available on the host"
+    assert result.configured_harnesses is None
+
+
+def test_handle_install_harness_rejects_non_allowlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-UI-installable harness is refused without invoking the installer.
+
+    Defence in depth: even if a stray frame reaches the daemon, a harness
+    whose installer is a ``curl | bash`` (e.g. hermes) must never run.
+    """
+    import omnigent.host.connect as connect
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer reached for a non-allowlisted harness")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i3", harness="hermes")
+    )
+
+    assert result.status == "failed"
+    assert result.error is not None and "hermes" in result.error
+    assert result.configured_harnesses is None
+
+
 # --- Fail-loud on permanent tunnel failures ----------------------------
 #
 # Before the fix, HostProcess.run() caught every connection exception and
@@ -2238,6 +2364,38 @@ def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) 
     headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
 
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+def test_build_connect_headers_retains_auth_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host reconnects and runner launches share one warm auth factory."""
+    import omnigent.runner._entry as entry_mod
+
+    factory_builds: list[str | None] = []
+    token_calls: list[int] = []
+
+    def _factory() -> str:
+        token_calls.append(1)
+        return "warm-host-token"
+
+    def _make_factory(*, server_url: str | None = None) -> object:
+        factory_builds.append(server_url)
+        return _factory
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
+
+    host = _host("https://app.example.databricksapps.com")
+    first = host._build_connect_headers()
+    second = host._build_connect_headers()
+    launch_token = host._current_auth_token(initialize=False)
+
+    assert first["Authorization"] == "Bearer warm-host-token"
+    assert second["Authorization"] == "Bearer warm-host-token"
+    assert launch_token == "warm-host-token"
+    assert factory_builds == ["https://app.example.databricksapps.com"]
+    assert token_calls == [1, 1, 1]
 
 
 async def test_run_retries_on_login_redirect(

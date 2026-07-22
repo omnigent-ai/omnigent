@@ -1987,7 +1987,7 @@ def test_create_conversation_with_parent_pointer_and_title(
 def test_create_duplicate_title_under_same_parent_raises(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """G36: partial unique index rejects ``(parent_id, title)`` duplicates."""
+    """The app-level ``(parent, title)`` check rejects sibling duplicates."""
     from omnigent.stores.conversation_store import NameAlreadyExistsError
 
     parent = conversation_store.create_conversation()
@@ -1996,11 +1996,10 @@ def test_create_duplicate_title_under_same_parent_raises(
         title="coder:auth",
         parent_conversation_id=parent.id,
     )
-    # Without the partial unique index + IntegrityError-to-
-    # NameAlreadyExistsError translation, the second create
-    # would either succeed silently (creating a duplicate row)
-    # or raise a raw sqlalchemy IntegrityError that would leak
-    # through to the LLM as an opaque error.
+    # There is no DB unique constraint: create_conversation seeks this parent's
+    # children and raises NameAlreadyExistsError when the title is already taken,
+    # so a duplicate sub-agent name surfaces cleanly instead of creating a
+    # second ambiguous row.
     with pytest.raises(NameAlreadyExistsError):
         conversation_store.create_conversation(
             kind="sub_agent",
@@ -2012,7 +2011,7 @@ def test_create_duplicate_title_under_same_parent_raises(
 def test_create_same_title_under_different_parents_succeeds(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """The unique constraint is per-parent — ``(p1, "auth")`` and ``(p2, "auth")`` coexist."""
+    """Uniqueness is per-parent — ``(p1, "auth")`` and ``(p2, "auth")`` coexist."""
     p1 = conversation_store.create_conversation()
     p2 = conversation_store.create_conversation()
     conversation_store.create_conversation(
@@ -2022,9 +2021,8 @@ def test_create_same_title_under_different_parents_succeeds(
     conversation_store.create_conversation(
         kind="sub_agent", title="coder:auth", parent_conversation_id=p2.id
     )
-    # Both children must exist; if the unique constraint were
-    # global (not partial-by-parent), the second create would
-    # raise.
+    # Both children must exist; the app-level check scopes to a single parent,
+    # so a same-title child under a different parent is never a collision.
     p1_children = conversation_store.list_conversations(
         kind="sub_agent",
         parent_conversation_id=p1.id,
@@ -2042,11 +2040,10 @@ def test_create_same_title_under_different_parents_succeeds(
 def test_create_null_parent_allows_duplicate_titles(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Top-level conversations (NULL parent) are NOT subject to the unique constraint."""
-    # Both conversations share title="" and parent=None. The unique index on
-    # (parent_conversation_id, title) still allows this: a NULL in any indexed
-    # column makes the key distinct, so top-level rows never collide even
-    # without a WHERE predicate.
+    """Top-level conversations (NULL parent) are NOT subject to the uniqueness check."""
+    # Both conversations share title="" and parent=None. The app-level check in
+    # create_conversation only runs when parent_conversation_id is set, so
+    # top-level rows may share a title freely.
     a = conversation_store.create_conversation()
     b = conversation_store.create_conversation()
     assert a.id != b.id
@@ -4775,6 +4772,65 @@ def test_list_conversations_project_none_disables_filter(
 
     ids = {c.id for c in conversation_store.list_conversations().data}
     assert ids >= {filed.id, unfiled.id}
+
+
+def test_set_conversation_project_files_and_unfiles(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``set_conversation_project`` sets and clears first-class membership."""
+    project_id = "b" * 32
+    conv = conversation_store.create_conversation()
+    assert conv.project_id is None
+
+    filed = conversation_store.set_conversation_project(conv.id, project_id)
+    assert filed is True
+    assert conversation_store.get_conversation(conv.id).project_id == project_id
+
+    # Unfile.
+    unfiled = conversation_store.set_conversation_project(conv.id, None)
+    assert unfiled is True
+    assert conversation_store.get_conversation(conv.id).project_id is None
+
+
+def test_set_conversation_project_unknown_session_returns_false(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Filing a non-existent session updates nothing and returns ``False``."""
+    result = conversation_store.set_conversation_project("f" * 32, "b" * 32)
+    assert result is False
+
+
+def test_list_conversations_filters_by_project_name_dual_read(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``list_conversations(project="Name")`` dual-reads by project NAME:
+    a session matches if it has EITHER the first-class membership (its
+    ``metadata.project_id`` points at the owner's project of that name) OR the
+    legacy ``omni_project`` label with that value. ``""`` returns sessions in
+    NEITHER (unfiled)."""
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    project_store = SqlAlchemyProjectStore(db_uri)
+    # Single-user: null owner. The route passes owned_by=None to match.
+    project = project_store.create("c" * 32, "Work", None)
+
+    first_class = conversation_store.create_conversation(title="first-class")
+    labelled = conversation_store.create_conversation(title="labelled")
+    unfiled = conversation_store.create_conversation(title="unfiled")
+    # One member via the first-class entity, one via the legacy label — both
+    # under the same name "Work".
+    conversation_store.set_conversation_project(first_class.id, project.id)
+    conversation_store.set_labels(labelled.id, {"omni_project": "Work"})
+
+    members = conversation_store.list_conversations(project="Work", owned_by=None)
+    assert {c.id for c in members.data} == {first_class.id, labelled.id}
+
+    unfiled_page = conversation_store.list_conversations(project="", owned_by=None)
+    unfiled_ids = {c.id for c in unfiled_page.data}
+    assert unfiled.id in unfiled_ids
+    assert first_class.id not in unfiled_ids
+    assert labelled.id not in unfiled_ids
 
 
 def test_list_projects_owned_by_excludes_shared_only_projects(
