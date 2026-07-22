@@ -1132,10 +1132,12 @@ class SessionsChat:
                 elif isinstance(event, SessionStatusEvent) and event.status in (
                     "waiting",
                     "idle",
+                    "runner_idle_paused",
                 ):
                     # Break on terminal status events so the async generator
                     # closes cleanly (avoids "aclose(): already running" when
-                    # asyncio.timeout fires mid-stream).
+                    # asyncio.timeout fires mid-stream). ``runner_idle_paused``
+                    # is terminal too — the idle-reaped runner ends the turn.
                     break
                 elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
                     break

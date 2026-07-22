@@ -5281,7 +5281,8 @@
               "launching",
               "running",
               "waiting",
-              "failed"
+              "failed",
+              "runner_idle_paused"
             ],
             "title": "Status",
             "type": "string"

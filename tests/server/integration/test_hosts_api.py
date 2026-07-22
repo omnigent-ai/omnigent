@@ -1216,23 +1216,23 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 ) -> None:
     """
     A ``host.runner_exited`` frame fires the ``on_runner_exited``
-    callback with ``(runner_id, error)``.
+    callback with ``(runner_id, error, idle)``.
 
     This callback is how the server marks the crashed runner's
     session(s) failed and pushes the cause to the open view (the
     runner never connected a tunnel, so the runner-tunnel disconnect
     path never fires). If the wiring breaks, a crashed runner's
     sessions stay stuck "starting" with no error — the exact desktop
-    bug this fixes.
+    bug this fixes. A crash carries ``idle=False``.
     """
     from omnigent.host.frames import HostRunnerExitedFrame
 
     registry = HostRegistry()
     host_store = HostStore(db_uri)
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, bool]] = []
 
-    async def _record(runner_id: str, error: str) -> None:
-        received.append((runner_id, error))
+    async def _record(runner_id: str, error: str, idle: bool) -> None:
+        received.append((runner_id, error, idle))
 
     app = FastAPI()
     app.include_router(
@@ -1253,5 +1253,47 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
         while not received:
             await asyncio.sleep(0.01)
 
-    # The callback got the exact runner id and error string off the frame.
-    assert received == [("runner_x", "exited with code 1")]
+    # The callback got the exact runner id, error string, and idle flag.
+    assert received == [("runner_x", "exited with code 1", False)]
+
+
+async def test_runner_exited_idle_flag_forwarded_to_callback(
+    db_uri: str,
+) -> None:
+    """
+    A benign idle exit forwards ``idle=True`` to ``on_runner_exited`` so the
+    server surfaces ``runner_idle_paused`` instead of failing the session.
+    """
+    from omnigent.host.frames import HostRunnerExitedFrame
+
+    registry = HostRegistry()
+    host_store = HostStore(db_uri)
+    received: list[tuple[str, str, bool]] = []
+
+    async def _record(runner_id: str, error: str, idle: bool) -> None:
+        received.append((runner_id, error, idle))
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, host_store, on_runner_exited=_record),
+        prefix="/v1",
+    )
+
+    _comm = await _connect_host(app, registry)
+    await _comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostRunnerExitedFrame(
+                    runner_id="runner_idle",
+                    error="runner paused after idle timeout",
+                    idle=True,
+                )
+            ),
+        }
+    )
+    async with asyncio.timeout(2.0):
+        while not received:
+            await asyncio.sleep(0.01)
+
+    assert received == [("runner_idle", "runner paused after idle timeout", True)]
