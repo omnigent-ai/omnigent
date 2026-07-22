@@ -9532,7 +9532,14 @@ async def _forward_event_to_runner(
                 runner_client=runner_client,
             )
             try:
-                _conv_updates: dict[str, Any] = {"harness_override": _auto_harness}
+                # Always clear the "auto" sentinel even when routing
+                # returned no harness (unavailable/failed) so the branch
+                # doesn't re-run on every subsequent turn.
+                _conv_updates: dict[str, Any] = (
+                    {"harness_override": _auto_harness}
+                    if _auto_harness is not None
+                    else {"_unset_harness_override": True}
+                )
                 if _auto_model is not None and effective_runner_override is None:
                     _conv_updates["model_override"] = _auto_model
                     effective_runner_override = _auto_model

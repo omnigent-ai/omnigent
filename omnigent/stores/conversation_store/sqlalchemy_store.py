@@ -2481,6 +2481,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
         harness_override: str | None = None,
+        _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
@@ -2503,8 +2504,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param _unset_cost_control_mode_override: When ``True``, clear
             ``cost_control_mode_override`` to ``None``.
         :param harness_override: Per-session brain-harness override,
-            e.g. ``"pi"``. ``None`` leaves unchanged; set once at
-            session create, no ``_unset`` variant.
+            e.g. ``"pi"``. ``None`` leaves unchanged.
+        :param _unset_harness_override: When ``True``, clear
+            ``harness_override`` to ``None`` (used to replace the
+            ``"auto"`` sentinel after first-message routing resolves).
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -2549,7 +2552,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             elif cost_control_mode_override is not None:
                 overrides["cost_control_mode_override"] = cost_control_mode_override
                 overrides_changed = True
-            if harness_override is not None:
+            if _unset_harness_override:
+                overrides["harness_override"] = None
+                overrides_changed = True
+            elif harness_override is not None:
                 overrides["harness_override"] = harness_override
                 overrides_changed = True
             if overrides_changed:
