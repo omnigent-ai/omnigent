@@ -624,16 +624,11 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
-    # This is the setup flow's own process: check bare ``PATH`` (not the
-    # resolve_cli_binary ladder), because the point of the ~/.local/bin refresh
-    # below is to make the binary reachable via ``PATH`` for this process — the
-    # subsequent harness_login/harness_cli_logged_in shell out with the bare
-    # binary name and rely on the inherited ``PATH``.
-    if shutil.which(spec.binary) is not None:
-        return HarnessInstallResult(True, None)
-
-    # uv-based vendor installers commonly place entry points here and update
-    # shell startup files, which cannot change this already-running process.
+    # uv-based vendor installers commonly place entry points in ~/.local/bin and
+    # update shell startup files, which can't change this already-running
+    # process. Prepend it to ``PATH`` so the setup wizard's later
+    # harness_login/harness_cli_logged_in (which shell out with the bare binary
+    # name and rely on the inherited ``PATH``) can find a freshly-installed CLI.
     user_bin = Path.home() / ".local" / "bin"
     candidate = user_bin / spec.binary
     if candidate.is_file() and os.access(candidate, os.X_OK):
@@ -641,11 +636,20 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         path_entries = current_path.split(os.pathsep) if current_path else []
         if str(user_bin) not in path_entries:
             os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
-    if shutil.which(spec.binary) is not None:
+    # Judge success with the SAME resolver readiness uses
+    # (:func:`resolve_cli_binary`'s full ladder — ``PATH`` plus the
+    # nvm/npm-global/homebrew fallback dirs), so the install verdict and the
+    # readiness badge can never disagree. A bare ``shutil.which`` here would
+    # report "not on PATH" for a binary the host daemon's frozen ``PATH`` omits
+    # but readiness still resolves via the ladder — surfacing a spurious
+    # "failed" toast next to a green "ready" tick.
+    if resolve_cli_binary(spec.binary) is not None:
         return HarnessInstallResult(True, None)
     if result.returncode != 0:
         return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
-    return HarnessInstallResult(False, f"installer completed but {spec.binary!r} is not on PATH")
+    return HarnessInstallResult(
+        False, f"installer completed but {spec.binary!r} could not be found"
+    )
 
 
 def install_harness_cli(key: str) -> bool:

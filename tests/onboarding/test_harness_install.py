@@ -434,6 +434,38 @@ def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> Non
     assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
 
 
+def test_try_install_harness_cli_success_when_binary_off_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A binary installed into a global dir but off bare ``PATH`` reads success.
+
+    Regression: the install verdict and the readiness badge must use the SAME
+    resolver. On a host whose frozen ``PATH`` omits the npm/nvm/homebrew bin dir,
+    npm lands the binary there — off ``PATH`` but on ``resolve_cli_binary``'s
+    fallback ladder. Judging install success with bare ``shutil.which`` reported
+    a spurious "not found" failure (red toast) while readiness resolved it via
+    the ladder (green tick) — the two verdicts disagreeing on one install.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    codex = fallback_dir / "codex"
+    codex.write_text("#!/bin/sh\n")
+    codex.chmod(0o755)
+
+    # npm is on PATH; the installed codex binary never is — only the ladder finds it.
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
+    )
+
+    # Install verdict agrees with readiness: both see it installed.
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
+
+
 def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Installs via ``npm install -g <package>`` and reports the post-install
     PATH state (True once the binary appears)."""
