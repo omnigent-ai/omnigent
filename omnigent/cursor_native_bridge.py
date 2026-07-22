@@ -303,6 +303,24 @@ def write_mcp_config(
     cursor_dir.mkdir(parents=True, exist_ok=True)
     path = cursor_dir / _MCP_CONFIG_FILE
     payload = build_mcp_config(bridge_dir, python_executable=python_executable)
+
+    # Preserve user-defined MCP servers — Cursor's mcp.json can hold
+    # multiple MCP servers alongside the Omnigent relay, and overwriting
+    # the file on every session launch would discard custom entries the
+    # user configured outside Omnigent.
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            user_servers = {
+                k: v
+                for k, v in existing.get("mcpServers", {}).items()
+                if k != _MCP_SERVER_NAME
+            }
+            if user_servers:
+                payload["mcpServers"].update(user_servers)
+        except (json.JSONDecodeError, OSError):
+            pass  # Invalid or unreadable — start fresh
+
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
