@@ -29,6 +29,8 @@ Run standalone::
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import random
 import sys
 from pathlib import Path
@@ -36,7 +38,37 @@ from pathlib import Path
 # Allow ``uv run <path>`` (no package context) to import omnigent + siblings.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from omnigent.db.utils import _get_head_db_revision, generate_agent_id
+from sqlalchemy import text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine.url import make_url
+
+from omnigent.db.db_models import (
+    LABEL_VALUE_MAX_LEN,
+    SqlAgent,
+    SqlConversation,
+    SqlConversationItem,
+    SqlConversationLabel,
+    SqlConversationMetadata,
+    SqlSessionPermission,
+    SqlUser,
+    current_workspace_id,
+)
+from omnigent.db.enum_codecs import (
+    encode_agent_kind,
+    encode_conversation_kind,
+    encode_item_status,
+    encode_item_type,
+)
+from omnigent.db.utils import (
+    _FTS_TABLE,
+    _get_head_db_revision,
+    generate_agent_id,
+    generate_conversation_id,
+    generate_item_id,
+    get_or_create_engine,
+    now_epoch,
+    strip_nul_bytes,
+)
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -48,6 +80,7 @@ _SEED_META_LABEL = "omni_bench_seed"
 
 # Fixed identifiers so the corpus is byte-stable across runs at a given config.
 _AGENT_NAME = "bench-agent"
+_AGENT_BUNDLE = "bench/seed"  # never validated on the read path
 _DEFAULT_SESSIONS = 5000
 _DEFAULT_ITEMS = 50
 _DEFAULT_RNG_SEED = 1234
@@ -66,6 +99,19 @@ _FRAGMENTS = (
     "summarize the changes in this pull request",
     "reproduce the elicitation race on reconnect",
 )
+
+# FTS5 mirror row written per item on SQLite (must match omnigent.db.utils
+# ``insert_fts`` / ``_FTS_TABLE``). Bound by name in :data:`_FTS_INSERT_SQL`.
+_FTS_INSERT_SQL = text(
+    f"INSERT INTO {_FTS_TABLE} (item_id, conversation_id, search_text) "
+    "VALUES (:item_id, :cid, :st)"
+)
+
+# Rows buffered per Core ``executemany`` flush. Only the item/FTS buffers
+# (1:1 with items) approach this; the per-session tables are held in full
+# (a few thousand rows) and inserted in one shot each. 100k keeps a 5000×200
+# corpus to ~10 flushes per table and bounds peak memory to a few tens of MB.
+_CORE_ITEM_CHUNK = 100_000
 
 
 def _meta_value(sessions: int, items_per_session: int, rng_seed: int, head: str) -> str:
@@ -99,15 +145,21 @@ def _make_items(rng: random.Random, count: int) -> list[NewConversationItem]:
     """
     items: list[NewConversationItem] = []
     for i in range(count):
-        text = f"{rng.choice(_FRAGMENTS)} (item {i})"
+        text_str = f"{rng.choice(_FRAGMENTS)} (item {i})"
         items.append(
             NewConversationItem(
                 type="message",
                 response_id=f"resp_seed_{i}",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text_str}]),
             )
         )
     return items
+
+
+def _progress(s: int, sessions: int) -> None:
+    """Print a coarse progress line every 10% (only for sizeable corpora)."""
+    if sessions >= 100 and s % (sessions // 10) == 0 and s:
+        print(f"seed: {s}/{sessions} sessions")
 
 
 def seed(
@@ -117,6 +169,7 @@ def seed(
     items_per_session: int = _DEFAULT_ITEMS,
     rng_seed: int = _DEFAULT_RNG_SEED,
     reseed: bool = False,
+    _fast: bool | None = None,
 ) -> int:
     """Seed *sessions* sessions × *items_per_session* items into *db_uri*.
 
@@ -131,10 +184,21 @@ def seed(
     :param items_per_session: Conversation items appended to each session.
     :param rng_seed: Seed for the deterministic text RNG.
     :param reseed: Seed even when a matching corpus is already present.
+    :param _fast: Override the write strategy. ``None`` (default) uses the
+        bulk-insert Core fast path for SQLite and the store-API loop for every
+        other dialect; ``True`` forces the fast path (falls back to the loop on
+        non-SQLite); ``False`` forces the store-API loop (used by the
+        byte-stability test to compare both paths on SQLite).
     :returns: The number of sessions created (0 when a matching seed is reused).
     """
     conv = SqlAlchemyConversationStore(db_uri)
-    perms = SqlAlchemyPermissionStore(db_uri)
+
+    dialect = make_url(db_uri).get_backend_name()
+    use_fast = (dialect == "sqlite") if _fast is None else bool(_fast)
+    if use_fast and dialect != "sqlite":
+        # The fast path is SQLite-only (FTS5 + single-transaction bulk insert);
+        # a forced fast request on another dialect degrades to the store loop.
+        use_fast = False
 
     # Read the current schema head at runtime (no DB contacted) and fold it into
     # the reuse marker, so a corpus from an older schema is auto-reseeded.
@@ -149,6 +213,44 @@ def seed(
             print(f"seed: existing corpus differs ({existing!r} != {want!r}); pass --reseed")
             return 0
 
+    if use_fast:
+        n = _seed_via_core(
+            db_uri,
+            sessions=sessions,
+            items_per_session=items_per_session,
+            rng_seed=rng_seed,
+            want=want,
+        )
+    else:
+        perms = SqlAlchemyPermissionStore(db_uri)
+        n = _seed_via_store(
+            conv,
+            perms,
+            sessions=sessions,
+            items_per_session=items_per_session,
+            rng_seed=rng_seed,
+            want=want,
+        )
+
+    print(f"seed: created {n} sessions × {items_per_session} items ({want})")
+    return n
+
+
+def _seed_via_store(
+    conv: SqlAlchemyConversationStore,
+    perms: SqlAlchemyPermissionStore,
+    *,
+    sessions: int,
+    items_per_session: int,
+    rng_seed: int,
+    want: str,
+) -> int:
+    """Seed through the production store ORM API (one row/commit at a time).
+
+    This is the original path and the only one used on non-SQLite dialects
+    (e.g. the nightly Postgres benchmark). It is kept verbatim so behavior
+    there stays identical.
+    """
     perms.ensure_user(RESERVED_USER_LOCAL)
     rng = random.Random(rng_seed)
 
@@ -157,7 +259,7 @@ def seed(
         created = conv.create_session_with_agent(
             agent_id=generate_agent_id(),
             agent_name=_AGENT_NAME,
-            agent_bundle_location="bench/seed",  # never validated on the read path
+            agent_bundle_location=_AGENT_BUNDLE,
             agent_description=None,
             title=f"bench session {s}: {rng.choice(_FRAGMENTS)}",
         )
@@ -166,8 +268,7 @@ def seed(
         perms.grant(RESERVED_USER_LOCAL, sid, LEVEL_OWNER)
         if items_per_session:
             conv.append(sid, _make_items(rng, items_per_session))
-        if sessions >= 100 and s % (sessions // 10) == 0 and s:
-            print(f"seed: {s}/{sessions} sessions")
+        _progress(s, sessions)
 
     # Stamp the corpus config on the LAST (newest) session — that's the one
     # ``_existing_seed_meta``'s default desc listing returns, so the reuse
@@ -175,7 +276,211 @@ def seed(
     if last_sid:
         conv.set_labels(last_sid, {_SEED_META_LABEL: want})
 
-    print(f"seed: created {sessions} sessions × {items_per_session} items ({want})")
+    return sessions
+
+
+def _seed_via_core(
+    db_uri: str,
+    *,
+    sessions: int,
+    items_per_session: int,
+    rng_seed: int,
+    want: str,
+) -> int:
+    """Seed the entire corpus in one transaction via SQLAlchemy Core.
+
+    Writes the same DB rows the store-API loop would, but batches them into a
+    handful of ``executemany`` flushes under a single ``BEGIN``/``COMMIT`` —
+    ~10 batched INSERTs and 1 commit instead of ~2M single-row INSERTs and
+    ~20k commits. The schema at head carries no FK constraints (migration
+    ``p1a2b3c4d5e6`` dropped them all), so insert order is free and the
+    engine's ``PRAGMA foreign_keys=ON`` enforces nothing.
+
+    The RNG draw order and the per-row serialization are kept identical to the
+    store path: per session, the title fragment is drawn first, then the
+    ``items_per_session`` item fragments. Item ``data`` is
+    ``strip_nul_bytes(json.dumps(...))`` (default separators) of a plain dict
+    that mirrors ``MessageData.model_dump(exclude_none=True)``, and
+    ``search_text`` mirrors ``extract_search_text``'s message branch — both
+    built directly (no pydantic) so the 1M-item Python build stays cheap. So a
+    corpus seeded here is the same shape (same ids-space, same text, same
+    positions, same labels) as one seeded through the store — only the write
+    strategy differs. ``tests/benchmarks/test_seed_fast_path.py`` pins the two
+    paths to identical corpora.
+    """
+    engine = get_or_create_engine(db_uri)
+    ws = current_workspace_id()
+    rng = random.Random(rng_seed)
+
+    # Per-session scalar rows (conversations/agents/metadata/permissions) are
+    # small (a few thousand); hold them in full and insert each in one shot.
+    conv_rows: list[dict] = []
+    agent_rows: list[dict] = []
+    meta_rows: list[dict] = []
+    perm_rows: list[dict] = []
+    # Items + FTS mirror are 1:1 with items and dominate the volume (1M+ for a
+    # full seed); stream them in chunks to bound memory while staying in the
+    # single transaction.
+    item_buf: list[dict] = []
+    fts_buf: list[dict] = []
+    last_sid = ""
+
+    with engine.begin() as conn:
+        # ensure_user("local") — ON CONFLICT DO NOTHING, mirroring the store.
+        conn.execute(
+            sqlite_insert(SqlUser)
+            .values(workspace_id=ws, id=RESERVED_USER_LOCAL, is_admin=False)
+            .on_conflict_do_nothing(index_elements=["workspace_id", "id"])
+        )
+
+        for s in range(sessions):
+            now = now_epoch()
+            agent_id = generate_agent_id()
+            sid = generate_conversation_id()
+            # RNG draw order matches the store path: title first, then items.
+            title = f"bench session {s}: {rng.choice(_FRAGMENTS)}"
+            last_sid = sid
+
+            conv_rows.append(
+                {
+                    "workspace_id": ws,
+                    "id": sid,
+                    "created_at": now,
+                    "updated_at": now,
+                    "title": title,
+                    "title_hash": hashlib.sha256(title.encode("utf-8")).digest()[:16],
+                    "parent_conversation_id": None,
+                    "root_conversation_id": sid,
+                    "next_position": items_per_session,
+                    "agent_id": agent_id,
+                    "session_overrides": None,
+                    "archived": False,
+                }
+            )
+            agent_rows.append(
+                {
+                    "workspace_id": ws,
+                    "id": agent_id,
+                    "created_at": now,
+                    "name": _AGENT_NAME,
+                    "bundle_location": _AGENT_BUNDLE,
+                    "version": 1,
+                    "kind": encode_agent_kind("session"),
+                    "description": None,
+                    "updated_at": None,
+                }
+            )
+            meta_rows.append(
+                {
+                    "workspace_id": ws,
+                    "id": sid,
+                    "kind": encode_conversation_kind("default"),
+                    "runner_id": None,
+                    "host_id": None,
+                    "sub_agent_name": None,
+                    "external_session_id": None,
+                    "session_state": None,
+                    "session_usage": None,
+                    "terminal_launch_args": None,
+                    "workspace": None,
+                    "git_branch": None,
+                    "runner_last_seen": None,
+                    "live_status": None,
+                    "pending_elicitation_count": None,
+                }
+            )
+            perm_rows.append(
+                {
+                    "workspace_id": ws,
+                    "user_id": RESERVED_USER_LOCAL,
+                    "conversation_id": sid,
+                    "level": LEVEL_OWNER,
+                }
+            )
+
+            if items_per_session:
+                # Build item payloads straight to dicts (no pydantic) so the
+                # 1M-item Python build stays cheap. The output is byte-identical
+                # to the store path: the text format mirrors ``_make_items``,
+                # the ``data`` dict mirrors ``MessageData.model_dump(exclude_none=
+                # True)``, and ``search`` mirrors ``extract_search_text``'s
+                # message branch. The byte-stability test
+                # (tests/benchmarks/test_seed_fast_path.py) pins this to the
+                # store path's rows. ``_make_items`` is still used by the slow
+                # path above, so the text format stays single-sourced there.
+                for i in range(items_per_session):
+                    text_str = f"{rng.choice(_FRAGMENTS)} (item {i})"
+                    data_dict = {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text_str}],
+                    }
+                    data = strip_nul_bytes(json.dumps(data_dict))
+                    search = strip_nul_bytes(
+                        " ".join(
+                            block["text"]
+                            for block in data_dict["content"]
+                            if isinstance(block, dict) and block.get("text")
+                        )
+                    )
+                    item_id = generate_item_id("message")
+                    item_buf.append(
+                        {
+                            "workspace_id": ws,
+                            "conversation_id": sid,
+                            "id": item_id,
+                            "response_id": f"resp_seed_{i}",
+                            "created_at": now,
+                            "status": encode_item_status("completed"),
+                            "position": i,
+                            "type": encode_item_type("message"),
+                            "data": data,
+                            "search_text": search,
+                            "created_by": None,
+                        }
+                    )
+                    fts_buf.append({"item_id": item_id, "cid": sid, "st": search})
+
+            if len(item_buf) >= _CORE_ITEM_CHUNK:
+                conn.execute(SqlConversationItem.__table__.insert(), item_buf)
+                conn.execute(_FTS_INSERT_SQL, fts_buf)
+                item_buf.clear()
+                fts_buf.clear()
+
+            _progress(s, sessions)
+
+        if item_buf:
+            conn.execute(SqlConversationItem.__table__.insert(), item_buf)
+            conn.execute(_FTS_INSERT_SQL, fts_buf)
+            item_buf.clear()
+            fts_buf.clear()
+
+        # No FKs at head → order is free; insert the per-session scalar tables
+        # now (after the streamed items) in one shot each.
+        conn.execute(SqlConversation.__table__.insert(), conv_rows)
+        conn.execute(SqlAgent.__table__.insert(), agent_rows)
+        conn.execute(SqlConversationMetadata.__table__.insert(), meta_rows)
+        conn.execute(SqlSessionPermission.__table__.insert(), perm_rows)
+
+        # Stamp the corpus config on the LAST (newest) session, matching the
+        # store path's ``set_labels`` upsert (clamped to LABEL_VALUE_MAX_LEN).
+        if last_sid:
+            label_now = now_epoch()
+            label_value = want[:LABEL_VALUE_MAX_LEN]
+            conn.execute(
+                sqlite_insert(SqlConversationLabel)
+                .values(
+                    workspace_id=ws,
+                    conversation_id=last_sid,
+                    key=_SEED_META_LABEL,
+                    value=label_value,
+                    updated_at=label_now,
+                )
+                .on_conflict_do_update(
+                    index_elements=["workspace_id", "conversation_id", "key"],
+                    set_={"value": label_value, "updated_at": label_now},
+                )
+            )
+
     return sessions
 
 

@@ -198,7 +198,7 @@ def test_system_prompt_does_not_override_collaboration_mode(
     tmp_path: Path,
 ) -> None:
     """Native startup config owns system prompts; turns preserve Codex defaults."""
-    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+    framework_instruction = "Keep framework metadata separate."
 
     _FakeCodexNativeClient.requests = []
     _FakeCodexNativeClient.created = []
@@ -223,7 +223,7 @@ def test_system_prompt_does_not_override_collaboration_mode(
         async for _event in executor.run_turn(
             [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
             [],
-            SESSION_RENAME_INSTRUCTION,
+            framework_instruction,
             None,
         ):
             pass

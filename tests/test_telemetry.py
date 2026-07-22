@@ -495,3 +495,146 @@ def test_build_record_promotes_host_installation_id() -> None:
     assert data["host_installation_id"] == "host-inst-abc"
     params = json.loads(data["params"]) if data["params"] else {}
     assert "host_installation_id" not in params
+
+
+# ── _resolve_harness ─────────────────────────────────────────────────────────
+
+
+def test_resolve_harness_none_when_conv_is_none() -> None:
+    """``None`` conversation → ``None``."""
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    assert _resolve_harness(None) is None
+
+
+def test_resolve_harness_uses_harness_override() -> None:
+    """``conv.harness_override`` is returned immediately, no store lookup."""
+    from unittest.mock import MagicMock
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = "claude-sdk"
+    assert _resolve_harness(conv) == "claude-sdk"
+
+
+def test_resolve_harness_none_when_agent_store_uninitialized() -> None:
+    """``_agent_store is None`` (runtime not started) → ``None``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_abc"
+
+    with patch("omnigent.runtime._globals._agent_store", None):
+        assert _resolve_harness(conv) is None
+
+
+def test_resolve_harness_none_when_agent_not_in_store() -> None:
+    """Agent id present but not found in the store → ``None``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_missing"
+
+    mock_store = MagicMock()
+    mock_store.get.return_value = None
+
+    with patch("omnigent.runtime._globals._agent_store", mock_store):
+        assert _resolve_harness(conv) is None
+
+
+def test_resolve_harness_sdk_via_config_key() -> None:
+    """Executor with ``config["harness"] = "claude-sdk"`` → ``"claude-sdk"``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_sdk"
+    conv.sub_agent_name = None
+
+    executor = MagicMock()
+    executor.config = {"harness": "claude-sdk"}
+    executor.type = "omnigent"
+
+    spec = MagicMock()
+    spec.executor = executor
+    spec.sub_agents = []
+
+    loaded = MagicMock()
+    loaded.spec = spec
+
+    mock_store = MagicMock()
+    mock_store.get.return_value = MagicMock(
+        id="ag_sdk", bundle_location="ag_sdk/bundle", session_id=None
+    )
+
+    mock_cache = MagicMock()
+    mock_cache.load.return_value = loaded
+
+    with (
+        patch("omnigent.runtime._globals._agent_store", mock_store),
+        patch("omnigent.runtime.get_agent_cache", return_value=mock_cache),
+    ):
+        assert _resolve_harness(conv) == "claude-sdk"
+
+
+def test_resolve_harness_sdk_via_executor_type() -> None:
+    """Executor with no ``config["harness"]`` falls back to ``executor.type``."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_sdk2"
+    conv.sub_agent_name = None
+
+    executor = MagicMock()
+    executor.config = {}  # no harness key
+    executor.type = "claude-sdk"
+
+    spec = MagicMock()
+    spec.executor = executor
+    spec.sub_agents = []
+
+    loaded = MagicMock()
+    loaded.spec = spec
+
+    mock_store = MagicMock()
+    mock_store.get.return_value = MagicMock(
+        id="ag_sdk2", bundle_location="ag_sdk2/bundle", session_id=None
+    )
+
+    mock_cache = MagicMock()
+    mock_cache.load.return_value = loaded
+
+    with (
+        patch("omnigent.runtime._globals._agent_store", mock_store),
+        patch("omnigent.runtime.get_agent_cache", return_value=mock_cache),
+    ):
+        assert _resolve_harness(conv) == "claude-sdk"
+
+
+def test_resolve_harness_returns_none_on_exception() -> None:
+    """Any exception inside the resolver degrades to ``None`` (never raises)."""
+    from unittest.mock import MagicMock, patch
+
+    from omnigent.server.routes.sessions import _resolve_harness
+
+    conv = MagicMock()
+    conv.harness_override = None
+    conv.agent_id = "ag_boom"
+
+    mock_store = MagicMock()
+    mock_store.get.side_effect = OSError("disk read error")
+
+    with patch("omnigent.runtime._globals._agent_store", mock_store):
+        assert _resolve_harness(conv) is None

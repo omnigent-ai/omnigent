@@ -143,7 +143,20 @@ export interface NativeViewModeParams {
  */
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
-  /** Desktop auto-update bridge, absent on shells older than the updater work. */
+  /**
+   * Report the web app's resolved color scheme so the shell mirrors it via
+   * nativeTheme (keeps the shell-owned update overlay, native dialogs, and
+   * menus in sync with the in-app theme). Absent on older shells.
+   */
+  setColorScheme?: (scheme: "light" | "dark" | "system") => void;
+  /**
+   * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
+   * notifications are shell-owned (native corner overlay + Server menu); this
+   * bridge is used for update preferences (mode, auto-install) + check. The
+   * shell delivers it "banner-safe": status values that would trigger the
+   * in-page UpdateBanner (available/downloaded/error-security) are collapsed to
+   * idle, so the web never shows a (duplicate) banner. Absent on older shells.
+   */
   updates?: ElectronUpdateBridge;
   /** Current server origin + recent servers, or null on a foreign page. */
   getServerPicker?: () => Promise<ServerPickerInfo | null>;
@@ -453,6 +466,21 @@ export function onNativeSidebarDrag(
  * tray notification: it makes that notification open a target and show
  * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
+/**
+ * Tell the Electron shell the web app's resolved color scheme so it can mirror
+ * it natively (nativeTheme.themeSource). No-op outside Electron or on older
+ * shells. Fire-and-forget.
+ */
+export function reportColorScheme(scheme: "light" | "dark" | "system"): void {
+  const native = electronApi();
+  if (!native?.setColorScheme) return;
+  try {
+    native.setColorScheme(scheme);
+  } catch (err) {
+    console.warn("[nativeBridge] setColorScheme failed:", err);
+  }
+}
+
 export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {
   const native = nativeApi();
   if (!native) return;

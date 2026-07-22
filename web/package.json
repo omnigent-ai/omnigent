@@ -15,7 +15,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "build:overlay": "vite build --config vite.update-overlay.config.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

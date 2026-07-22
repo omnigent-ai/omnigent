@@ -1279,7 +1279,8 @@ def test_promote_global_auth_backfills_databricks_for_existing_configs(isolated_
     defaulting both families (the config only ever had the auth: block, so
     routing already used databricks for both).
     """
-    from omnigent.cli import _promote_global_auth_to_provider, _save_global_config
+    from omnigent.cli import _save_global_config
+    from omnigent.cli_config import _promote_global_auth_to_provider
 
     _save_global_config({"auth": {"type": "databricks", "profile": "oss"}})
 
@@ -1305,7 +1306,8 @@ def test_promote_global_auth_respects_explicit_default(isolated_config) -> None:
     must NOT steal it — it only claims families with no existing default. Here
     an explicit anthropic key default is kept while databricks takes openai.
     """
-    from omnigent.cli import _promote_global_auth_to_provider, _save_global_config
+    from omnigent.cli import _save_global_config
+    from omnigent.cli_config import _promote_global_auth_to_provider
 
     _save_global_config(
         {
@@ -1335,7 +1337,8 @@ def test_promote_global_auth_respects_explicit_default(isolated_config) -> None:
 
 def test_promote_global_auth_noop_without_databricks_auth(isolated_config) -> None:
     """No databricks ``auth:`` block → nothing to backfill (returns None)."""
-    from omnigent.cli import _promote_global_auth_to_provider, _save_global_config
+    from omnigent.cli import _save_global_config
+    from omnigent.cli_config import _promote_global_auth_to_provider
 
     # An api_key auth block (not databricks) must not synthesize a databricks
     # provider, and a config with no auth: block at all is a clean no-op.
@@ -1919,7 +1922,7 @@ def test_overview_dispatches_to_correct_manager(
     """
     called: list[str] = []
     monkeypatch.setattr(
-        f"omnigent.cli.{manager_attr}", lambda *a, **k: called.append(manager_attr)
+        f"omnigent.cli_config.{manager_attr}", lambda *a, **k: called.append(manager_attr)
     )
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
     assert result.exit_code == 0, result.output

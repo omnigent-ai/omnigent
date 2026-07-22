@@ -155,8 +155,9 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE = "external_elicitation_resolved"
 # Sessions event carrying a Codex plan mapped to the todo-list schema so the
 # web TodoPanel renders it like Claude's TodoWrite output.
 _EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
-# Codex AgentControl collab-agent spawn event fields.
+# Codex AgentControl child-spawn event fields.
 _CODEX_COLLAB_AGENT_ITEM_TYPE = "collabAgentToolCall"
+_CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
 _CODEX_COLLAB_SPAWN_TOOL = "spawnAgent"
 _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
@@ -2396,6 +2397,8 @@ async def _handle_event(
         item = params.get("item")
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
+        elif isinstance(item, dict) and item.get("type") == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
+            await _handle_subagent_activity(client, params, item, forwarder_state)
         elif isinstance(item, dict) and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE:
             # Compaction started mid-turn — show the spinner.
             await _post_compaction_status(
@@ -4152,11 +4155,17 @@ async def _handle_completed_item(
         turn_id,
         item_type,
     )
-    # Collab-agent items register child sessions; they do not append transcript
-    # records and must not go through the dedup gate.
+    # Child-spawn items register sessions; they do not append transcript records
+    # and must not go through the dedup gate.
+    # Completed spawns may run on child routes so nested children attach to the
+    # root parent, matching ``collabAgentToolCall`` behavior.
     if item_type == _CODEX_COLLAB_AGENT_ITEM_TYPE:
         if forwarder_state is not None:
             await _handle_collab_item(client, params, item, forwarder_state)
+        return
+    if item_type == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
+        if forwarder_state is not None:
+            await _handle_subagent_activity(client, params, item, forwarder_state)
         return
     # A context-compaction item is a status edge, not transcript history:
     # clear the compaction spinner. Handled before the dedup gate (it never
@@ -4414,6 +4423,31 @@ async def _handle_collab_item(
     await _post_collab_agent_statuses(client, item=item, forwarder_state=forwarder_state)
 
 
+async def _handle_subagent_activity(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    item: dict[str, Any],
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Register a child announced by Codex's native activity item."""
+    if item.get("kind") != "started":
+        return
+    child_thread_id = item.get("agentThreadId")
+    if not isinstance(child_thread_id, str) or not child_thread_id:
+        return
+    parent_session_id = _parent_session_id_from_forwarder_state(forwarder_state)
+    if parent_session_id is None:
+        return
+    await _ensure_child_session(
+        client,
+        parent_session_id=parent_session_id,
+        parent_thread_id=_thread_id_from_params(params),
+        child_thread_id=child_thread_id,
+        item=item,
+        forwarder_state=forwarder_state,
+    )
+
+
 def _parent_session_id_from_forwarder_state(
     forwarder_state: _CodexForwarderState,
 ) -> str | None:
@@ -4449,7 +4483,7 @@ async def _ensure_child_session(
     :param parent_session_id: Parent Omnigent session id, e.g. ``"conv_parent"``.
     :param parent_thread_id: Parent Codex thread id, or ``None``.
     :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param item: Codex ``collabAgentToolCall`` item with spawn metadata.
+    :param item: Codex child-spawn item.
     :param forwarder_state: Mutable state for child-thread mappings.
     :returns: None.
     """
@@ -4493,7 +4527,7 @@ async def _register_child_session(
     :param parent_session_id: Parent Omnigent session id, e.g. ``"conv_parent"``.
     :param parent_thread_id: Parent Codex thread id, or ``None``.
     :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param item: Codex ``collabAgentToolCall`` item.
+    :param item: Codex child-spawn item.
     :returns: Omnigent child session id, or ``None`` on failure.
     """
     data: dict[str, Any] = {"thread_id": child_thread_id}

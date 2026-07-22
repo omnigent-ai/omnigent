@@ -22,6 +22,7 @@ from omnigent_slack.events import (
     OmnigentError,
     OutputFile,
     SessionActivity,
+    SessionInfo,
     _extract_list,
     _extract_runner_id,
     _extract_session_id,
@@ -30,14 +31,14 @@ from omnigent_slack.events import (
     extract_assistant_text,
     extract_delta,
     extract_elicitation_request,
+    extract_elicitation_resolved,
     extract_error_text,
     extract_output_file,
     extract_policy_denied,
     extract_todos,
-    is_elicitation_request,
-    is_soft_idle_event,
-    is_terminal_event,
+    is_hard_terminal_event,
     iter_sse_events,
+    session_status,
 )
 
 __all__ = [
@@ -47,6 +48,7 @@ __all__ = [
     "ElicitationOption",
     "ElicitationQuestion",
     "ElicitationRequest",
+    "HarnessNotConfiguredError",
     "HostUnavailableError",
     "OmnigentClient",
     "OmnigentClientPool",
@@ -55,27 +57,22 @@ __all__ = [
     "RunnerUnavailableError",
     "ServerUnreachableError",
     "SessionActivity",
+    "SessionInfo",
     "ValidatedServer",
     "extract_assistant_text",
     "extract_delta",
     "extract_elicitation_request",
+    "extract_elicitation_resolved",
     "extract_error_text",
     "extract_output_file",
     "extract_policy_denied",
     "extract_todos",
-    "is_elicitation_request",
-    "is_soft_idle_event",
-    "is_terminal_event",
+    "is_hard_terminal_event",
     "iter_sse_events",
+    "session_status",
 ]
 
 _logger = logging.getLogger(__name__)
-
-# Sentinels for the idle-grace disambiguation. ``_NO_RESUMPTION``: the grace
-# window elapsed and the snapshot confirms the turn is over. ``_RESUMED``: the
-# stream produced another event (or ended), so the turn continues.
-_NO_RESUMPTION = object()
-_RESUMED = object()
 
 
 class RunnerUnavailableError(OmnigentError):
@@ -100,6 +97,15 @@ class HostUnavailableError(OmnigentError):
     Raised when the server reports no online hosts, the user's preferred host is
     offline/missing, or a launched runner never comes online — cases the user
     resolves by starting a host with ``omni host --server <url>``.
+    """
+
+
+class HarnessNotConfiguredError(OmnigentError):
+    """The selected harness isn't configured on the host (HTTP 412).
+
+    A precondition failure the user resolves by running ``omnigent setup`` on the
+    host machine — a retry can't succeed without that. Carries the server's
+    curated ``error.message`` (safe to show for this specific code).
     """
 
 
@@ -472,16 +478,13 @@ class OmnigentClient:
         workspace: str | None = None,
         host_id: str | None = None,
         idle_grace_seconds: float = 600.0,
-        idle_poll_seconds: float = 5.0,
-        idle_settle_seconds: float = 2.0,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
-            async for event in self._run_turn_once(
-                session_id, text, idle_grace_seconds, idle_poll_seconds, idle_settle_seconds
-            ):
+            async for event in self._run_turn_once(session_id, text, idle_grace_seconds):
                 yield event
             return
         except RunnerUnavailableError:
+            # No runner bound to the session — launch one and retry the turn once.
             if not workspace:
                 raise
             self._logger.info(
@@ -491,9 +494,7 @@ class OmnigentClient:
             )
             await self.launch_runner(session_id, workspace=workspace, host_id=host_id)
 
-        async for event in self._run_turn_once(
-            session_id, text, idle_grace_seconds, idle_poll_seconds, idle_settle_seconds
-        ):
+        async for event in self._run_turn_once(session_id, text, idle_grace_seconds):
             yield event
 
     async def _run_turn_once(
@@ -501,55 +502,55 @@ class OmnigentClient:
         session_id: str,
         text: str,
         idle_grace_seconds: float,
-        idle_poll_seconds: float,
-        idle_settle_seconds: float,
     ) -> AsyncIterator[dict[str, Any]]:
+        # Turn-end detection is SERVER-AUTHORITATIVE and HARNESS-AGNOSTIC,
+        # mirroring the web UI's reducer. The discriminator is "is a response
+        # currently OPEN?", NOT the harness name — because `session.status`
+        # carries a `response_id` only for terminal-backed harnesses
+        # (claude-native/codex) and is id-LESS for the in-process runtime
+        # (debby/claude-sdk); the schema documents this as intentional.
+        #
+        # A response is OPEN once we see an id-bearing `running`/`waiting`
+        # (claude-native's Stop-hook edge). The turn ENDS on `idle`/`failed` when:
+        #   (a) it is id-bearing and matches the open response, OR
+        #   (b) it is id-LESS and NO id-bearing response is open — this covers the
+        #       in-process harness, whose running/waiting are all id-less so
+        #       nothing is ever "open", and whose id-less `idle` is the real end.
+        # An id-less `idle` while an id-bearing response IS open is a claude-native
+        # PTY-activity flap (mid-answer generation lull) — IGNORED, else the reply
+        # truncates at the first pause. `waiting` NEVER ends the turn (both
+        # harnesses use it for "parked on sub-agents / async work").
+        #
+        # The stream never sends `[DONE]` and never closes; heartbeats fire every
+        # ~15s. So the ONLY non-event case is a dead SOCKET (half-open) — treat a
+        # read that produces nothing for `idle_grace_seconds` as dead and end.
         async with self.stream_session_events(session_id) as events:
             await self.submit_message(session_id, text)
             iterator = events.__aiter__()
-            # A single in-flight "next event" task, reused across idle grace
-            # windows. Timing it out must NOT cancel the underlying __anext__
-            # (that would terminate the async generator), so we keep the task
-            # alive with asyncio.wait and only await it again next window.
+            # A single in-flight "next event" task. A liveness timeout must NOT
+            # cancel it (that would terminate the async generator); we keep it
+            # alive with asyncio.wait and await it again next window.
             pending: asyncio.Task[dict[str, Any]] | None = None
-            # The FIRST read is unbounded — the turn hasn't started producing yet,
-            # so a bare wait is correct (the server may be `idle` for a beat right
-            # after submit before it goes `running`). Every read AFTER the first
-            # event is disambiguated via the grace window: this makes the turn
-            # ALWAYS bounded — it can only stay alive while the server reports
-            # `running`. A stream that goes silent without a terminal/idle event
-            # (half-open connection, or an `idle` edge missed because the consumer
-            # was parked on an elicitation) would otherwise block this read
-            # forever and wedge the thread. Active streaming pays NO latency: the
-            # settle-wait returns immediately when events are flowing, so the
-            # status poll only fires after a genuine quiet gap.
-            disambiguate = False
+            open_response_id: str | None = None
+            saw_open_running = False
             try:
                 while True:
                     if pending is None:
                         pending = asyncio.ensure_future(iterator.__anext__())
 
-                    if disambiguate:
-                        # Time out the wait WITHOUT cancelling the in-flight read
-                        # (cancelling __anext__ would kill the generator); on a
-                        # quiet window consult the rolled-up snapshot — while a
-                        # sub-agent child is still running the parent reads
-                        # `running`, so keep waiting (a slow child can outlast the
-                        # grace window). Ends only when the snapshot is not running.
-                        resumed = await self._await_within_grace(
-                            pending,
-                            session_id,
+                    done, _ = await asyncio.wait({pending}, timeout=idle_grace_seconds)
+                    if not done:
+                        # No event for the whole liveness window — with 15s
+                        # heartbeats on a live connection, this means the socket
+                        # is dead (half-open). End rather than hang forever.
+                        pending.cancel()
+                        self._logger.info(
+                            "Omnigent stream silent for %ss (no heartbeat) — ending turn "
+                            "session_id=%s",
                             idle_grace_seconds,
-                            idle_poll_seconds,
-                            idle_settle_seconds,
+                            session_id,
                         )
-                        if resumed is _NO_RESUMPTION:
-                            pending.cancel()
-                            self._logger.info(
-                                "Omnigent turn settled idle with no resumption session_id=%s",
-                                session_id,
-                            )
-                            break
+                        break
 
                     try:
                         event = await pending
@@ -564,21 +565,45 @@ class OmnigentClient:
                     )
                     yield event
 
-                    # Every subsequent read is bounded by the grace disambiguation.
-                    disambiguate = True
-
-                    # A HARD terminal (failed/cancelled) ends the turn now. A soft
-                    # `idle` is NOT terminal here: a fan-out orchestrator settles
-                    # idle between wake cycles, so we DON'T break — the next
-                    # (bounded) read either resumes when more arrives or ends via
-                    # the status poll when the server is genuinely done.
-                    if is_terminal_event(event) and not is_soft_idle_event(event):
+                    if is_hard_terminal_event(event):
                         self._logger.info(
-                            "Omnigent turn reached terminal event session_id=%s type=%s",
+                            "Omnigent turn reached hard-terminal event session_id=%s type=%s",
                             session_id,
                             event.get("type"),
                         )
                         break
+
+                    parsed = session_status(event)
+                    if parsed is None:
+                        continue
+                    status, response_id = parsed
+                    if status in ("running", "waiting") and response_id is not None:
+                        # An id-bearing open edge (claude-native Stop hook). Mark a
+                        # response OPEN so a later matching terminal ends the turn
+                        # and a bare id-less idle is treated as a mid-answer flap.
+                        open_response_id = response_id
+                        saw_open_running = True
+                    elif status in ("idle", "failed"):
+                        # Terminal edge. End when:
+                        #  (a) id-bearing and matches the open response (or we saw
+                        #      no id-bearing open — some paths only stamp the end);
+                        #  (b) id-less AND no id-bearing response is open — the
+                        #      in-process (debby/claude-sdk) real end. `waiting`
+                        #      would have kept us going; only `idle`/`failed` here.
+                        # An id-less idle WHILE an id-bearing response is open is a
+                        # claude-native PTY flap → ignored (falls through).
+                        id_bearing_match = response_id is not None and (
+                            not saw_open_running or response_id == open_response_id
+                        )
+                        id_less_end = response_id is None and not saw_open_running
+                        if id_bearing_match or id_less_end:
+                            self._logger.info(
+                                "Omnigent turn ended session_id=%s status=%s response_id=%s",
+                                session_id,
+                                status,
+                                response_id,
+                            )
+                            break
             finally:
                 # Cancel and AWAIT the in-flight read so the underlying httpx
                 # stream isn't still running when the context manager closes it
@@ -588,78 +613,6 @@ class OmnigentClient:
                     pending.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await pending
-
-    async def _await_within_grace(
-        self,
-        pending: asyncio.Task[dict[str, Any]],
-        session_id: str,
-        grace_seconds: float,
-        poll_seconds: float,
-        settle_seconds: float,
-    ) -> object:
-        """After a soft ``idle``, wait for the stream to resume or confirm it ended.
-
-        Waits on the in-flight read WITHOUT cancelling it (``asyncio.wait``
-        leaves the task pending, so the async generator survives to be awaited
-        again). Returns ``_RESUMED`` when the stream produced another event (or
-        ended — the caller's ``await`` then surfaces ``StopAsyncIteration``), or
-        ``_NO_RESUMPTION`` once the turn is genuinely over.
-
-        Two timescales, because ``idle`` is doubly ambiguous:
-
-        1. **Settle wait** (``settle_seconds``, short): a claude-native turn
-           oscillates ``running``/``idle`` *while still streaming* its answer,
-           with sub-second gaps between bursts. So EVERY idle first waits a short
-           settle window for the next burst — ending here would truncate the
-           reply mid-answer. Bounded and small so a genuinely-final idle adds
-           only a brief tail.
-        2. **Snapshot + poll** (``poll_seconds``, coarse): if still quiet after
-           the settle, consult the rolled-up status. A fan-out orchestrator
-           parked between wake cycles reads ``running`` (a sub-agent is working),
-           so keep polling — a slow child can take many seconds. Only when the
-           snapshot is no longer ``running`` is the turn over.
-
-        ``grace_seconds`` caps the total wait so a stuck session can't park the
-        turn forever.
-        """
-        deadline = asyncio.get_running_loop().time() + grace_seconds
-        while True:
-            # Settle: wait briefly for the next streaming burst. Handles the
-            # mid-answer running/idle oscillation without truncating.
-            done, _ = await asyncio.wait({pending}, timeout=settle_seconds)
-            if done:
-                return _RESUMED
-            # Still quiet — is the session genuinely done, or a fan-out parent
-            # waiting on a sub-agent (rolled-up status still `running`)?
-            status = await self.get_session_status(session_id)
-            # The status fetch is a network round-trip; the next event may have
-            # arrived during it. Re-check before ending, or we'd cancel a
-            # completed read and truncate the reply.
-            if pending.done():
-                return _RESUMED
-            # Only a DEFINITIVE not-running status ends the turn. A ``None`` here
-            # is a best-effort snapshot failure (transient network/server blip) —
-            # treating it as "done" would truncate a still-live fan-out on a
-            # momentary hiccup, so keep waiting until the grace cap instead.
-            if status is not None and status != "running":
-                return _NO_RESUMPTION
-            if asyncio.get_running_loop().time() >= deadline:
-                self._logger.info(
-                    "Idle grace cap (%ss) elapsed while still running session_id=%s; "
-                    "ending turn to avoid parking forever",
-                    grace_seconds,
-                    session_id,
-                )
-                return _NO_RESUMPTION
-            # Fan-out parent still working — wait a coarser poll for resumption.
-            done, _ = await asyncio.wait({pending}, timeout=poll_seconds)
-            if done:
-                return _RESUMED
-            self._logger.debug(
-                "Idle poll quiet but session still running (sub-agent "
-                "outstanding) session_id=%s; continuing to wait",
-                session_id,
-            )
 
     async def _get_json(self, url: str, **kwargs: Any) -> dict[str, Any] | None:
         """Best-effort GET returning the JSON body as a dict, else ``None``.
@@ -677,20 +630,6 @@ class OmnigentClient:
             # ValueError covers json.JSONDecodeError (non-JSON 200 body).
             return None
         return payload if isinstance(payload, dict) else None
-
-    async def get_session_status(self, session_id: str) -> str | None:
-        """Fetch the session's rolled-up status from the snapshot.
-
-        The snapshot's ``status`` rolls direct sub-agent child activity into the
-        parent: a fan-out orchestrator parked between wake cycles reads
-        ``running`` here (a child is still working) even though its own runner
-        emitted ``idle`` on the stream. That makes this the authoritative "is the
-        turn really over?" check when a stream ``idle`` is ambiguous. Best-effort
-        — returns ``None`` on any failure so the caller falls back to the timer.
-        """
-        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
-        status = snapshot.get("status") if snapshot else None
-        return status if isinstance(status, str) else None
 
     async def get_session_activity(self, session_id: str) -> SessionActivity:
         """Snapshot of whether the SERVER considers this session busy.
@@ -713,25 +652,26 @@ class OmnigentClient:
             pending_elicitation=bool(self._parse_pending(snapshot)),
         )
 
+    async def get_session_info(self, session_id: str) -> SessionInfo:
+        """Read the session's harness + agent name from the snapshot.
+
+        For the first-message config summary. Best-effort: fields default to
+        ``None`` if the snapshot is unreadable or omits them.
+        """
+        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
+        if snapshot is None:
+            return SessionInfo(harness=None, agent_name=None)
+        harness = snapshot.get("harness")
+        agent_name = snapshot.get("agent_name")
+        return SessionInfo(
+            harness=harness if isinstance(harness, str) and harness else None,
+            agent_name=agent_name if isinstance(agent_name, str) and agent_name else None,
+        )
+
     @staticmethod
     def _parse_pending(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
         pending = snapshot.get("pending_elicitations") if snapshot else None
         return [e for e in pending if isinstance(e, dict)] if isinstance(pending, list) else []
-
-    async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
-        """Whether ``elicitation_id`` is still outstanding on the server.
-
-        Lets a Slack-side waiter detect that the elicitation was resolved
-        *elsewhere* (the web UI, another client) and stop waiting. Best-effort:
-        on a read failure returns ``True`` (assume still pending) so a transient
-        hiccup doesn't spuriously abandon the wait.
-        """
-        snapshot = await self._get_json(f"/v1/sessions/{session_id}")
-        if snapshot is None:
-            return True  # read failed — assume still pending, don't abandon.
-        return any(
-            e.get("elicitation_id") == elicitation_id for e in self._parse_pending(snapshot)
-        )
 
     async def latest_assistant_message(self, session_id: str) -> tuple[str | None, str] | None:
         """Return ``(item_id, text)`` of the newest assistant message, or None.
@@ -846,15 +786,27 @@ async def _raise_for_status(response: httpx.Response) -> None:
     try:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        error_code = _extract_error_code(response)
+        # A streaming response (the SSE tail) hasn't had its body read, so the
+        # ``.text``/``.json()`` inspection below would raise ``ResponseNotRead``
+        # and mask the real status. Pull the (small) error body in first; the
+        # classification then works the same as for an ordinary request — so a
+        # 401 on the stream still becomes AuthRequiredError, not a raw httpx error.
+        if not response.is_closed:
+            with contextlib.suppress(Exception):
+                await response.aread()
+        error_code, error_message = _extract_error(response)
         # The raw server body can carry internal paths/stack traces; log it for
         # operators but keep it out of the exception message, which surfaces to
-        # the Slack channel (visible to everyone in the thread).
+        # the Slack channel (visible to everyone in the thread). Guard the body
+        # access: if the stream couldn't be read, classify on status alone.
+        body = "<unread>"
+        with contextlib.suppress(Exception):
+            body = response.text
         _logger.warning(
             "Omnigent request failed status=%s url=%s body=%r",
             response.status_code,
             response.request.url,
-            response.text,
+            body,
         )
         if response.status_code == 503 and error_code == "runner_unavailable":
             raise RunnerUnavailableError("Omnigent runner is unavailable.") from exc
@@ -862,20 +814,40 @@ async def _raise_for_status(response: httpx.Response) -> None:
             raise AuthRequiredError(
                 f"Omnigent server requires authentication for {response.request.url}"
             ) from exc
+        if response.status_code == 412 and error_code == "harness_not_configured":
+            # A precondition failure the user CAN act on (the harness isn't set up
+            # on the host — run `omnigent setup` there). The server's structured
+            # error.message is curated actionable guidance for this code, so it's
+            # safe to surface (unlike a raw body); fall back to a generic hint.
+            raise HarnessNotConfiguredError(
+                error_message or "The selected harness isn't configured on the host."
+            ) from exc
         raise OmnigentError(
             f"Omnigent request failed with status {response.status_code}."
         ) from exc
 
 
-def _extract_error_code(response: httpx.Response) -> str | None:
+def _extract_error(response: httpx.Response) -> tuple[str | None, str | None]:
+    """Return ``(code, message)`` from a server error body, or ``(None, None)``.
+
+    The server wraps failures as ``{"error": {"code": ..., "message": ...}}``.
+    The message is only surfaced to users for specific, curated codes (see
+    ``_raise_for_status``) — never blindly, since a raw body can leak internals.
+    """
     try:
         payload = response.json()
-    except json.JSONDecodeError:
-        return None
+    except (json.JSONDecodeError, httpx.StreamError):
+        # StreamError (e.g. ResponseNotRead) when a streaming body couldn't be
+        # read — classify on status alone rather than masking it.
+        return None, None
     if not isinstance(payload, dict):
-        return None
+        return None, None
     error = payload.get("error")
     if not isinstance(error, dict):
-        return None
+        return None, None
     code = error.get("code")
-    return code if isinstance(code, str) else None
+    message = error.get("message")
+    return (
+        code if isinstance(code, str) else None,
+        message if isinstance(message, str) and message else None,
+    )

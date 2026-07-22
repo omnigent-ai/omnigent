@@ -37,6 +37,10 @@ on:
         description: "Seeded items per session"
         required: false
         default: "200"
+      network_delay_ms:
+        description: "Simulated client→server latency per request (ms; 0 = loopback)"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -51,6 +55,9 @@ env:
   RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
   SESSIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.sessions || '5000' }}
   ITEMS: ${{ github.event_name == 'workflow_dispatch' && inputs.items_per_session || '200' }}
+  # 0 on the nightly schedule (loopback, for stable trend data); dispatchable
+  # higher to model a real network hop when testing network optimizations.
+  NETWORK_DELAY_MS: ${{ github.event_name == 'workflow_dispatch' && inputs.network_delay_ms || '0' }}
 
 concurrency:
   # Never cancel a scheduled run mid-flight (each is a distinct data point).
@@ -179,6 +186,7 @@ jobs:
             --database-uri "${{ steps.db.outputs.uri }}" \
             --iterations "$ITERATIONS" \
             --runs "$RUNS" \
+            --network-delay-ms "$NETWORK_DELAY_MS" \
             --output "benchmark-results-${{ matrix.backend }}.json"
 
       - name: Upload benchmark results

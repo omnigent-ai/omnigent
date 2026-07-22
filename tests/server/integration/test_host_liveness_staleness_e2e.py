@@ -173,7 +173,9 @@ async def test_crashed_host_session_reads_host_offline(
     # The host connects: this is exactly what the tunnel handler does on
     # host.hello — upserts the row to status='online'. No live tunnel /
     # heartbeat is modeled, which is precisely the post-crash DB state.
-    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", owner=RESERVED_USER_LOCAL)
+    host_store.upsert_on_connect(
+        host_id=_HOST_ID, name="alice-laptop", user_id=RESERVED_USER_LOCAL
+    )
     conv_store.set_host_id(session_id, _HOST_ID, workspace="/tmp/ws")
 
     # Baseline: while the host is freshly online, host_online is True. If
@@ -218,7 +220,9 @@ async def test_recently_seen_host_reads_host_online(
     agent = await create_test_agent(host_aware_client)
     session_id = agent["_session_id"]
 
-    host_store.upsert_on_connect(host_id=_HOST_ID, name="alice-laptop", owner=RESERVED_USER_LOCAL)
+    host_store.upsert_on_connect(
+        host_id=_HOST_ID, name="alice-laptop", user_id=RESERVED_USER_LOCAL
+    )
     conv_store.set_host_id(session_id, _HOST_ID, workspace="/tmp/ws")
 
     # Last seen comfortably inside the window (about a third of the TTL).

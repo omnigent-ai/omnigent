@@ -10,6 +10,7 @@ website under `/releases`.
 ### Features
 
 - [UI / Feature] Added a Nord color theme (arctic frost-blue palette) to the Appearance settings palette picker.
+- [Feature] Per-harness startup command/args overrides via a polymorphic `harness:` key in `config.yaml`. The `harness:` key now accepts a mapping with a `default` plus per-harness `command`/`args` overrides (e.g. `harness: {default: claude-sdk, codex: {command: /usr/local/bin/codex, args: [--config, approval_policy=on-request]}}`). The legacy scalar form (`harness: claude-sdk`) still works and auto-migrates to the mapping form on the next config write. Harness binary-path precedence: `OMNIGENT_<NAME>_PATH` env var > config `harness.<id>.command` > built-in default; `args` follow the same precedence with config `args` as the base and CLI pass-through args appended. The `OMNIGENT_<NAME>_PATH` env var (base id, `-native` suffix stripped) is the canonical per-binary override, standardizing the headless `HARNESS_<NAME>_PATH` and native `OMNIGENT_*_PATH` conventions into one namespaced name; the legacy `HARNESS_<NAME>_PATH` is still read as a deprecated fallback that logs a one-time warning + a CLI startup notice, and is slated for removal in v0.8.0. The pre-existing `omnigent claude --command` flag is deprecated (warns on use, pointing to `OMNIGENT_CLAUDE_PATH`/config) and will be removed in a future release; no other native command gained a `--command` flag — override via env or config.
 
 ## [v0.5.0] — 2026-07-10
 
