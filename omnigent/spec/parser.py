@@ -464,7 +464,7 @@ def _parse_sandbox_config(
 
         sandbox:
           container_image: python:3.12-slim
-          container_runtime: podman  # optional, defaults to docker
+          container_runtime: podman  # optional, defaults to OMNIGENT_CONTAINER_RUNTIME or docker
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).

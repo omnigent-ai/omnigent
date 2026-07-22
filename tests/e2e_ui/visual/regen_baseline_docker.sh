@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the committed UI-snapshot baseline locally, using Docker.
+# Regenerate the committed UI-snapshot baseline locally using a container runtime.
 #
 # Visual baselines must be rendered in the SAME environment the CI gate uses, or
 # they won't match (fonts/anti-aliasing differ across renderers). This script

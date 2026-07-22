@@ -785,7 +785,7 @@ class SandboxConfig:
 
     container_image: str | None = None
     docker_image: str | None = None
-    container_runtime: Literal["docker", "podman"] = field(default=None)  # type: ignore[assignment]
+    container_runtime: Literal["docker", "podman"] | None = None
 
     def __post_init__(self) -> None:
         if self.container_runtime is None:
