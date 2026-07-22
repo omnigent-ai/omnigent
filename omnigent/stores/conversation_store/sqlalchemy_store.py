@@ -2561,6 +2561,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now
+            labels = _fetch_labels(ap_sess, conversation_id)
         if terminal_launch_args is not None:
             with self._session() as meta_sess:
                 meta = meta_sess.get(
@@ -2582,7 +2583,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     meta_sess.add(meta)
                 meta.terminal_launch_args = json.dumps(terminal_launch_args)
-        return self.get_conversation(conversation_id)
+        else:
+            meta = self._get_meta(ap_sess, conversation_id)
+        return _to_conversation(row, meta, labels)
 
     def rename_conversation_if_title_matches(
         self,
@@ -2606,6 +2609,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if result.rowcount != 1:
                 return None
+        # Bulk UPDATE leaves no in-session ORM row to reuse; re-read.
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
@@ -2759,14 +2763,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.runner_id = runner_id
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def clear_runner_id(self, conversation_id: str) -> Conversation:
         """
@@ -2787,14 +2790,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.runner_id = None
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def clear_host_binding(self, conversation_id: str) -> Conversation:
         """
@@ -2823,14 +2825,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.runner_id = None
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def list_conversations_by_runner_id(
         self,
@@ -2924,14 +2925,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.git_branch = git_branch
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def set_external_session_id(
         self,
@@ -2972,17 +2972,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             changed = existing != value
             if changed:
                 meta.external_session_id = value
-        if changed:
-            with self._conv_session() as ap_sess:
-                ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if ap_row is not None:
-                    ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+        with self._conv_session() as ap_sess:
+            ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            if changed:
+                ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def create_session_with_agent(
         self,
