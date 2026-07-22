@@ -383,6 +383,18 @@ describe("Sidebar session list", () => {
     expect(within(idleRow).queryByTestId("session-state-badge")).toBeNull();
     expect(within(idleRow).queryByText("now")).toBeNull();
   });
+
+  it("shows the full session title in a styled tooltip on hover", async () => {
+    const title = "A long session title that is truncated in the compact sidebar row";
+    mockConversations([conv("conv_tooltip", "Codex", { title })]);
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: title });
+    expect(row).not.toHaveAttribute("title");
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent(title));
+  });
 });
 
 // Sidebar grouping: the viewer's own sessions ("My sessions" tab) keep the

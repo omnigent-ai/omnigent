@@ -2700,9 +2700,7 @@ function ConversationRow({
         e.preventDefault();
         setIsEditing(true);
       }}
-      // The rich project flyout replaces the native tooltip on pinned,
-      // project-owned rows so the two don't stack; other rows keep it.
-      title={projectFlyoutName ? undefined : (conversation.title ?? conversation.id)}
+      title={isMobile ? (conversation.title ?? conversation.id) : undefined}
     >
       {/* Row 1: the session name. Status markers (working, needs-approval,
           unseen) render in the trailing session-state slot below, not inline
@@ -2753,8 +2751,15 @@ function ConversationRow({
               projectName={projectFlyoutName}
             />
           </HoverCard>
-        ) : (
+        ) : isMobile ? (
           rowLink
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+            <TooltipContent side="right" sideOffset={8} className="max-w-72 whitespace-normal">
+              {conversation.title ?? conversation.id}
+            </TooltipContent>
+          </Tooltip>
         )
       ) : projectFlyoutName ? (
         <HoverCard openDelay={150} closeDelay={0}>
@@ -2775,7 +2780,7 @@ function ConversationRow({
             projectName={projectFlyoutName}
           />
         </HoverCard>
-      ) : (
+      ) : isMobile ? (
         <ContextMenu>
           <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
           <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
@@ -2786,6 +2791,26 @@ function ConversationRow({
             />
           </ContextMenuContent>
         </ContextMenu>
+      ) : (
+        <Tooltip>
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <div className="w-full">
+                <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+              </div>
+            </ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+              <ConversationMenuItems
+                components={contextBundle}
+                setMenuOpen={() => {}}
+                {...menuItemProps}
+              />
+            </ContextMenuContent>
+          </ContextMenu>
+          <TooltipContent side="right" sideOffset={8} className="max-w-72 whitespace-normal">
+            {conversation.title ?? conversation.id}
+          </TooltipContent>
+        </Tooltip>
       )}
       {selectionMode ? (
         <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 right-2.5 flex items-center">
