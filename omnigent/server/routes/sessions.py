@@ -3075,6 +3075,39 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
         return None
 
 
+def _validated_harness_override_executor_type(agent: Agent) -> None:
+    """Validate that *agent* is an ``executor.type: omnigent`` spec.
+
+    Used by the ``"auto"`` harness path to enforce the same executor-type
+    gate as :func:`_validated_harness_override` without requiring a concrete
+    harness name (the real harness is resolved at first-message time).
+
+    :raises OmnigentError: ``invalid_input`` when the agent is not an
+        omnigent executor type or the bundle cannot be loaded.
+    """
+    from omnigent.runtime import get_agent_cache
+    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
+
+    try:
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+        raise OmnigentError(
+            f"harness_override 'auto' requires a loadable agent spec; "
+            f"agent {agent.name!r} failed to load: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    executor_type = loaded.spec.executor.type
+    if executor_type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"harness_override 'auto' only applies to executor.type "
+            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; agent {agent.name!r} "
+            f"declares executor.type {executor_type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     """
     Validate + canonicalize a session-create ``harness_override``.
@@ -9080,7 +9113,7 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None:
+    if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
 
     try:
@@ -9483,6 +9516,47 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # ── Auto-harness resolution ───────────────────────────────────────
+    # When the session was created with harness_override="auto", the real
+    # harness + model are determined here on the first message where user
+    # text is available.  After resolution the sentinel is replaced with
+    # the concrete harness so subsequent turns behave normally.
+    if conv.harness_override == "auto" and body.type == "message":
+        from omnigent.server.smart_routing import route_session_harness
+
+        _auto_text = _extract_user_text_for_routing(body)
+        if _auto_text:
+            _auto_harness, _auto_model, _auto_verdict = await route_session_harness(
+                _auto_text,
+                session_id=session_id,
+                runner_client=runner_client,
+            )
+            try:
+                _conv_updates: dict[str, Any] = {"harness_override": _auto_harness}
+                if _auto_model is not None and effective_runner_override is None:
+                    _conv_updates["model_override"] = _auto_model
+                    effective_runner_override = _auto_model
+                _updated = await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    session_id,
+                    **_conv_updates,
+                )
+                if _updated is not None:
+                    conv = _updated
+            except (OSError, ValueError):
+                _logger.warning(
+                    "auto-harness: failed to persist resolved harness for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            if _auto_model is not None and _auto_verdict is not None:
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _auto_model,
+                    _auto_verdict,
+                )
+
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
     # call the judge LLM on the FIRST message to pick the model for
@@ -9546,7 +9620,7 @@ async def _forward_event_to_runner(
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None:
+    if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
 
     # The runner's sessions-native POST returns 202 immediately
@@ -13039,9 +13113,15 @@ async def _create_session_from_existing_agent(
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's
     # --harness fail-loud rules.
-    harness_override = await asyncio.to_thread(
-        _validated_harness_override, body.harness_override, agent
-    )
+    # "auto" defers harness + model selection to the first-message routing
+    # path; validate executor type now but store the sentinel unchanged.
+    if body.harness_override == "auto":
+        await asyncio.to_thread(_validated_harness_override_executor_type, agent)
+        harness_override = "auto"
+    else:
+        harness_override = await asyncio.to_thread(
+            _validated_harness_override, body.harness_override, agent
+        )
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
