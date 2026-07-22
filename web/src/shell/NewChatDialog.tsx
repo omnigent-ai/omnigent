@@ -1702,10 +1702,18 @@ function HarnessConfigModal({
                 >
                   {brainEntries.map(([id, label]) => (
                     <SelectItem key={id} value={id} data-testid={`new-chat-landing-harness-${id}`}>
-                      {label}
-                      {harnessUnconfiguredOnHost(id, host) && (
-                        <span className="text-muted-foreground"> (needs setup)</span>
-                      )}
+                      <span className="flex items-center gap-2">
+                        {label}
+                        {harnessUnconfiguredOnHost(id, host) && (
+                          <Badge
+                            variant="outline"
+                            className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+                            data-testid={`new-chat-landing-harness-warning-${id}`}
+                          >
+                            {harnessWarningBadgeText(harnessUnavailableReasonOnHost(id, host))}
+                          </Badge>
+                        )}
+                      </span>
                     </SelectItem>
                   ))}
                 </SelectContent>

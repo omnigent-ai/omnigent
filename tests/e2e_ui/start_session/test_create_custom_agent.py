@@ -450,10 +450,10 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
 
-            # On the sandbox with no custom agents, the whole "Custom agents"
-            # group (which holds the create item) is omitted from the picker.
+            # On the sandbox, "Create custom agent" is not offered. It lives in
+            # the (lazily-mounted) "Custom agents" submenu; on a sandbox that
+            # submenu omits the create action, so it's never in the DOM.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await expect(page.get_by_test_id("new-chat-landing-custom-agents")).to_have_count(0)
             await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
 
             # Switch to the connected host: the group reappears and create opens.
