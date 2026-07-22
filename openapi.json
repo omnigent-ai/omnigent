@@ -1167,6 +1167,22 @@
         "title": "CreateDirectoryRequest",
         "type": "object"
       },
+      "CreateProjectRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /v1/projects`.",
+        "properties": {
+          "name": {
+            "description": "Human-readable project name. Trimmed; must be non-empty and at most 100 characters; unique among the caller's projects.",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "CreateProjectRequest",
+        "type": "object"
+      },
       "CreateSessionPolicyRequest": {
         "description": "Request body for `POST /v1/sessions/{session_id}/policies`.",
         "properties": {
@@ -6011,6 +6027,26 @@
         "title": "UpdateDefaultPolicyRequest",
         "type": "object"
       },
+      "UpdateProjectRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `PATCH /v1/projects/{project_id}`.\n\nAll fields optional; `None` leaves a field unchanged.",
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New project name. `None` leaves it unchanged; otherwise trimmed, non-empty, at most 100 characters.",
+            "title": "Name"
+          }
+        },
+        "title": "UpdateProjectRequest",
+        "type": "object"
+      },
       "UpdateSessionPolicyRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{session_id}/policies/{policy_id}`.\n\nAll fields are optional; `None` fields are left unchanged.\nUnknown fields (including `type`, which is immutable) are\nrejected with `422`.",
@@ -7420,6 +7456,216 @@
         "summary": "List Registry",
         "tags": [
           "policy_registry"
+        ]
+      }
+    },
+    "/v1/projects": {
+      "get": {
+        "description": "List the caller's projects.\n\n**Returns:** `{\"object\": \"list\", \"data\": [...]}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode.",
+        "operationId": "list_projects_v1_projects_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Projects V1 Projects Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Projects",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "description": "Create a new, empty project owned by the caller.\n\n**Parameters**\n\n- `body` \u2014 Project payload (name).\n\n**Returns:** The created project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 409 if the caller already has a project with this name.",
+        "operationId": "create_project_v1_projects_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Project V1 Projects Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "delete": {
+        "description": "Delete one of the caller's projects.\n\nMember sessions are not deleted; they are left for the caller to\nunfile (clearing their `project_id`).\n\n**Returns:** `{\"id\": ..., \"object\": \"project.deleted\", \"deleted\": True}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "operationId": "delete_project_v1_projects__project_id__delete",
+        "parameters": [
+          {
+            "description": "The project to delete.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Project V1 Projects  Project Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project",
+        "tags": [
+          "projects"
+        ]
+      },
+      "get": {
+        "description": "Return one of the caller's projects.\n\n**Returns:** The project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned by the caller.",
+        "operationId": "get_project_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "description": "The project to fetch.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Project V1 Projects  Project Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "description": "Update one of the caller's projects (e.g. rename).\n\n**Parameters**\n\n- `body` \u2014 Fields to change; `None` fields are left unchanged.\n\n**Returns:** The updated project as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated, 404 if not found / not owned, 409 if the new name collides with another of the caller's projects.",
+        "operationId": "update_project_v1_projects__project_id__patch",
+        "parameters": [
+          {
+            "description": "The project to update.",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Project V1 Projects  Project Id  Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Project",
+        "tags": [
+          "projects"
         ]
       }
     },
@@ -11359,6 +11605,11 @@
       "description": "Threaded comments on a session, including sending a comment to the agent.",
       "name": "comments",
       "x-displayName": "Comments"
+    },
+    {
+      "description": "First-class, owner-private containers that group sessions \u2014 create, list, rename, and delete.",
+      "name": "projects",
+      "x-displayName": "Projects"
     },
     {
       "description": "Health, version, and identity endpoints for the running server.",

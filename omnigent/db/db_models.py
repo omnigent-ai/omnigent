@@ -654,6 +654,73 @@ class SqlConversationMetadata(OmnigentBase):
     )
 
 
+class SqlProject(OmnigentBase):
+    """
+    SQLAlchemy model for the ``projects`` table.
+
+    A user-defined, owner-private container that groups sessions (see
+    ``designs/PROJECTS_PRD.md``). A project row exists independently of its
+    member sessions, so it can be empty, renamed, and carry its own config —
+    the things the implicit ``omni_project`` label could not. Session
+    membership lives on ``omnigent_conversation_metadata.project_id``, not
+    here; there is no DB foreign key (Rule R032).
+
+    Ownership is stamped on the row via ``owner_user_id`` (like
+    ``scheduled_tasks``), not derived from a permission table the way session
+    ownership is — projects have no ACL of their own and are never shared.
+
+    :param id: Uuid16 primary key (bare 32-char hex in Python).
+    :param name: Human-readable project name; unique per owner (enforced in
+        the store, since ``owner_user_id`` is NULL in single-user mode and a DB
+        unique index treats NULLs as distinct).
+    :param owner_user_id: Owning user, or ``None`` in single-user mode.
+    :param created_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    """
+
+    __tablename__ = "projects"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        # "list my projects" — prefix scan on (workspace_id, owner_user_id) with
+        # created_at in the key so the ORDER BY created_at, id is served by the
+        # index (no filesort). Server returns a stable order; reorder, if ever
+        # added, is a client-only concern, so there is no ``position`` column.
+        Index(
+            "ix_projects_owner_user_id",
+            "workspace_id",
+            "owner_user_id",
+            "created_at",
+            "id",
+        ),
+        # Enforces per-owner name uniqueness at the DB layer for NON-NULL owners
+        # (closing the store's check-then-insert race under concurrency). SQL
+        # treats NULLs as distinct, so single-user rows (owner_user_id IS NULL)
+        # can still collide on name — the store's _name_taken check covers that
+        # case. Also backs the get-by-name lookup.
+        Index(
+            "ix_projects_name",
+            "workspace_id",
+            "owner_user_id",
+            "name",
+            unique=True,
+        ),
+    )
+
+
 class SqlConversation(ConversationBase):
     """
     SQLAlchemy model for the ``conversations`` table.

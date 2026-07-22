@@ -69,6 +69,7 @@ from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
+from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
@@ -95,6 +96,7 @@ from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
@@ -1085,6 +1087,7 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1129,6 +1132,9 @@ def create_app(
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
+    :param project_store: Store for first-class projects (owner-private
+        containers that group sessions). ``None`` disables the
+        ``/v1/projects`` CRUD endpoints.
     :param auth_provider: Pre-constructed auth provider for
         identity resolution. ``None`` disables auth (anonymous
         access). **Required** when ``permission_store`` is
@@ -2308,6 +2314,18 @@ def create_app(
         prefix="/v1",
         tags=["sharing"],
     )
+
+    # First-class projects (owner-private session containers). Mounted only
+    # when a project store is wired; the endpoints self-scope to the caller.
+    if project_store is not None:
+        app.include_router(
+            create_projects_router(
+                project_store=project_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["projects"],
+        )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:
