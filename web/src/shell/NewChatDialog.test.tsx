@@ -2283,6 +2283,25 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(tooltip.textContent).not.toContain("—");
   });
 
+  it("reflects an armed Codex bypass as the Approval value in the gear tooltip", async () => {
+    renderLanding();
+    // Arm bypass on Codex (a2) via the Approval dropdown, Save.
+    openAgentConfig("a2");
+    pickSelectOption("new-chat-landing-config-approval", "Bypass approvals & sandbox");
+    saveConfig();
+    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
+        0,
+      ),
+    );
+    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
+    // Bypass is the effective Approval value (mirrors the modal's single
+    // control) — not a separate "Bypass: On" row alongside a stale preset.
+    expect(tooltip.textContent).toContain("Approval: Bypass approvals & sandbox");
+    expect(tooltip.textContent).not.toContain("Bypass: On");
+  });
+
   it("reflects Smart Routing in the gear tooltip (Model=Smart Routing, Effort=Default)", async () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentConfig("a1");

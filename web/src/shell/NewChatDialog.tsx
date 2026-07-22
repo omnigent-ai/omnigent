@@ -2342,14 +2342,17 @@ export function NewChatLandingScreen() {
     const routingRow: { label: string; value: string }[] =
       smartRoutingEligible && routingOn ? [{ label: "Smart Routing", value: "On" }] : [];
     if (supportsApprovalMode) {
-      const approvalValue =
-        CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ?? approvalMode;
       const isCodex = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness === "codex-native";
-      const rows = [{ label: "Approval", value: approvalValue }];
-      if (isCodex && bypassSandbox) {
-        rows.push({ label: "Bypass", value: "On" });
-      }
-      return [...rows, ...routingRow];
+      // Bypass is the most-permissive Approval choice, not a separate knob — so
+      // mirror the modal's single Approval control: when armed, the Approval row
+      // reads "Bypass approvals & sandbox" rather than the underlying preset
+      // (which would misleadingly imply approvals are still at e.g. "Default").
+      const approvalValue =
+        isCodex && bypassSandbox
+          ? CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label
+          : (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.label ??
+            approvalMode);
+      return [{ label: "Approval", value: approvalValue }, ...routingRow];
     }
     if (supportsCursorMode) {
       const modeValue =
