@@ -1676,6 +1676,7 @@ function MainAgentSurface({
           liveness={liveness}
           onShowReconnectHelp={onShowReconnectHelp}
           surfaceFrontmost={surfaceFrontmost}
+          isSubAgentSession={subAgentLabel != null}
         />
       </>
     );
@@ -1868,6 +1869,7 @@ function MainAgentSurface({
         liveness={liveness}
         onShowReconnectHelp={onShowReconnectHelp}
         surfaceFrontmost={surfaceFrontmost}
+        isSubAgentSession={subAgentLabel != null}
       />
     </>
   );
@@ -2542,12 +2544,17 @@ export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
   surfaceFrontmost = true,
+  isSubAgentSession = false,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
   // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
   // the native iOS bar so it doesn't float over an opened sidebar/panel.
   surfaceFrontmost?: boolean;
+  // Whether the open session is a sub-agent (child). Its composer hides the
+  // host badge (the header's child slot owns that row), so the badge can't
+  // carry the host-offline reconnect affordance — keep the banner here.
+  isSubAgentSession?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
   const keyboardVisible = useIOSNativeKeyboardVisible(
@@ -2589,13 +2596,16 @@ export function ConnectionIndicator({
   }
   if (unreachable) {
     // A `host_offline` session moves the reconnect affordance up into the
-    // composer's host badge (ComposerStatusLine), where the host is already
-    // named — so render nothing here whenever that composer is on screen.
-    // The composer is hidden only in the terminal-first *terminal* view (the
-    // PTY owns the surface); there the banner still carries the affordance.
-    // `local_stranded` keeps the banner everywhere (no host, hence no badge).
+    // composer's host badge (ComposerStatusLine) — so render nothing here
+    // whenever that badge is actually on screen. Two ways it isn't: the
+    // terminal-first *terminal* view (the PTY owns the surface, no composer),
+    // and a sub-agent session (its composer hides the host badge — the
+    // header's child slot owns that row). In both, keep the banner so the
+    // affordance survives. `local_stranded` keeps the banner everywhere (no
+    // host, hence no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
-    if (liveness.kind === "host_offline" && composerOnScreen) {
+    const badgeCarriesAffordance = composerOnScreen && !isSubAgentSession;
+    if (liveness.kind === "host_offline" && badgeCarriesAffordance) {
       return null;
     }
     return (
