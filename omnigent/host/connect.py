@@ -1284,7 +1284,8 @@ class HostProcess:
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
-        :returns: None. Returns silently for intentional stops.
+        :returns: None. Returns silently for intentional stops and clean
+            (exit-code-0) shutdowns.
         """
         handle = self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
@@ -1294,6 +1295,15 @@ class HostProcess:
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
+            return
+        if handle.proc.returncode == 0:
+            # A clean exit (code 0) is a graceful shutdown, not a crash — the
+            # idle reaper shutting an inactive runner down, or any orderly
+            # self-exit. Reporting it as host.runner_exited would attach a
+            # scary "runner process exited" error to a session the user only
+            # has to message to reactivate, so stay silent. A non-zero exit
+            # below is a genuine crash and still reports its cause.
+            _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
