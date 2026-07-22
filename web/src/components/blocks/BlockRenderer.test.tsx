@@ -219,6 +219,9 @@ describe("BlockRenderer dispatch", () => {
     expect(sections).toHaveLength(2);
     expect(sections[0]!).not.toHaveClass("mt-2");
     expect(sections[1]!).not.toHaveClass("mt-2");
+    expect(screen.getByText("See 1 step").closest('[data-slot="collapsible"]')).toHaveClass(
+      "mb-1.5",
+    );
   });
 
   it("'See N steps' counts the whole tool run, including the streaming tail", () => {
@@ -254,6 +257,9 @@ describe("BlockRenderer dispatch", () => {
     render(<BlockRenderer items={items} sessionStatus="running" />);
     expect(screen.getByText("See 5 steps")).toBeDefined();
     expect(screen.queryByText("See 2 steps")).toBeNull();
+    expect(screen.getByText("See 5 steps").closest('[data-slot="collapsible"]')).toHaveClass(
+      "mb-0",
+    );
     // The label counts the WHOLE run, but the recent tools must still be
     // visible as a tail OUTSIDE the collapsed group — the most-recent tool
     // renders (the collapsed group's content is unmounted), while an older
@@ -547,6 +553,7 @@ describe("BlockRenderer inline file-path linkification", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     const span = await screen.findByText("projects/ghost/missing.md");
     expect(span.tagName).toBe("CODE");
+    expect(span).toHaveAttribute("data-file-reference", "true");
     expect(screen.queryByRole("button", { name: "projects/ghost/missing.md" })).toBeNull();
   });
 
@@ -561,6 +568,8 @@ describe("BlockRenderer inline file-path linkification", () => {
     });
 
     const link = await screen.findByRole("button", { name: "src/app/main.ts" });
+    expect(link).toHaveAttribute("data-streamdown", "inline-code");
+    expect(link).toHaveAttribute("data-file-reference", "true");
     link.click();
     expect(openFile).toHaveBeenCalledWith("src/app/main.ts");
     // No existence check needed when the path is already a known change.
@@ -579,6 +588,7 @@ describe("BlockRenderer inline file-path linkification", () => {
 
     const span = await screen.findByText("git status");
     expect(span.tagName).toBe("CODE");
+    expect(span).not.toHaveAttribute("data-file-reference");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -643,7 +653,25 @@ describe("BlockRenderer inline file-path linkification", () => {
 
     const span = await screen.findByText("/etc/hosts");
     expect(span.tagName).toBe("CODE");
+    expect(span).toHaveAttribute("data-file-reference", "true");
     expect(screen.queryByRole("button", { name: "/etc/hosts" })).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("styles an out-of-workspace absolute CSV as a file reference without linking it", async () => {
+    const openFile = vi.fn();
+    const path = "/home/jackson.zheng/projects/data/user_data_2024.csv";
+    renderMessage(`Inspect \`${path}\`.`, {
+      openFile,
+      isChangedPath: () => false,
+      conversationId: "conv_1",
+      workspaceRoot: "/home/jackson.zheng/omnigent",
+      workspaceHome: "/home/jackson.zheng",
+    });
+
+    const span = await screen.findByText(path);
+    expect(span).toHaveAttribute("data-file-reference", "true");
+    expect(span).not.toHaveAttribute("role", "button");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

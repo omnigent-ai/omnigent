@@ -36,7 +36,7 @@ export function UserMessageNav({
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
-              className="pointer-events-auto rounded-full dark:bg-background dark:hover:bg-muted"
+              className="pointer-events-auto rounded-sm dark:bg-background dark:hover:bg-muted"
               onClick={goPrev}
               disabled={!canPrev}
               size="icon"
@@ -52,7 +52,7 @@ export function UserMessageNav({
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
-              className="pointer-events-auto rounded-full dark:bg-background dark:hover:bg-muted"
+              className="pointer-events-auto rounded-sm dark:bg-background dark:hover:bg-muted"
               onClick={goNext}
               disabled={!canNext}
               size="icon"

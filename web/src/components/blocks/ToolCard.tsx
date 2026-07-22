@@ -10,6 +10,7 @@ import {
   ChevronRightIcon,
   CircleSlashIcon,
   CopyIcon,
+  ExternalLinkIcon,
   Loader2Icon,
   Maximize2Icon,
   Minimize2Icon,
@@ -29,8 +30,13 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { iconForTool } from "@/lib/toolIcon";
-import { type ToolTitle, formatToolTitle } from "@/lib/toolTitle";
+import { type ToolTitle, type ToolTitleBodyKind, formatToolTitle } from "@/lib/toolTitle";
 import { useFileViewer } from "@/shell/FileViewerContext";
+import {
+  TRANSCRIPT_CARD_BODY_CLASS,
+  TRANSCRIPT_CARD_META_CLASS,
+  TRANSCRIPT_RAIL_CLASS,
+} from "./toolSurface";
 
 const OUTPUT_PREVIEW_LINE_LIMIT = 80;
 const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
@@ -194,7 +200,7 @@ export function ToolCard({
   const onBodyClick = openFile && rawPath ? () => openFile(rawPath) : undefined;
 
   return (
-    <Collapsible defaultOpen={false} className="group not-prose w-full">
+    <Collapsible defaultOpen={false} className="tool-call-row group not-prose w-full">
       <ToolTriggerRow
         title={title}
         name={name}
@@ -203,7 +209,12 @@ export function ToolCard({
         duration={displayDuration}
         onBodyClick={onBodyClick}
       />
-      <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+      <CollapsibleContent
+        className={cn(
+          "mt-1 ml-2.5 space-y-2 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in",
+          TRANSCRIPT_RAIL_CLASS,
+        )}
+      >
         <CodePanel
           title="Parameters"
           text={inputJson}
@@ -230,7 +241,15 @@ export function ToolCard({
  * once a streaming-tail of the most recent ones has been peeled off,
  * or all completed tools once streaming finishes).
  */
-export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?: number }) {
+export function ToolGroupSummary({
+  tools,
+  count,
+  className,
+}: {
+  tools: RenderItem[];
+  count?: number;
+  className?: string;
+}) {
   // Label the FULL contiguous run, not just the folded tools — during
   // streaming the most-recent tools render as a visible tail outside this
   // group, so counting only `tools` would undercount ("See 2 steps" when
@@ -246,12 +265,20 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
     // chevrons of inner tool cards when this outer group is open).
     // `peer` lets `BlockRenderer`'s trailing tail react to this
     // collapsible's open/closed state for the border-join effect.
-    <Collapsible defaultOpen={false} className="group/tool-summary peer not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
+    <Collapsible
+      defaultOpen={false}
+      className={cn("group/tool-summary peer not-prose mb-1.5 w-full", className)}
+    >
+      <CollapsibleTrigger className="tool-group-summary-trigger inline-flex max-w-full cursor-pointer items-center gap-1.5 py-[3px] text-left text-sm font-normal leading-[1.4] text-muted-foreground transition-colors hover:text-foreground">
         <span>{label}</span>
+        <ChevronRightIcon className="size-3 shrink-0 opacity-75 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
-      <CollapsibleContent className="mt-1 ml-2 space-y-1 border-l pl-3 pt-1 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+      <CollapsibleContent
+        className={cn(
+          "tool-group-timeline mt-1.5 space-y-1 pt-0.5 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in",
+          TRANSCRIPT_RAIL_CLASS,
+        )}
+      >
         {tools.map((item) => {
           if (item.kind === "tool") {
             return (
@@ -288,7 +315,7 @@ export function ToolGroupSummary({ tools, count }: { tools: RenderItem[]; count?
 
 /**
  * Single muted-text trigger line for a tool call. Status/category icon
- * at left, title (verb bold + dynamic body) in the middle truncated to
+ * at left, title (neutral action + subtly emphasized dynamic body) in the middle truncated to
  * one line, optional duration on the right, chevron at the far right.
  */
 function ToolTriggerRow({
@@ -304,52 +331,64 @@ function ToolTriggerRow({
   nativeToolType: string | undefined;
   state: ToolState;
   duration: number | undefined;
-  /** When set, the body text (e.g. file path) is rendered as a clickable link. */
+  /** When set, a sibling action opens the referenced workspace file. */
   onBodyClick?: () => void;
 }) {
   const tooltip =
     title.verb && title.body ? `${title.verb} ${title.body}` : (title.verb ?? title.body);
   return (
-    <CollapsibleTrigger
-      title={tooltip}
-      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
-    >
-      <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
-      <span className="min-w-0 flex-1 truncate">
-        {title.verb !== null && <span className="font-semibold text-foreground">{title.verb}</span>}
-        {title.verb !== null && title.body.length > 0 && " "}
-        {onBodyClick ? (
-          // Use <span role="link"> instead of <button> to avoid nesting
-          // interactive elements — CollapsibleTrigger already renders as
-          // a <button>, and nested buttons are invalid HTML.
+    <div className="tool-call-trigger-row inline-flex max-w-full items-center gap-1">
+      <CollapsibleTrigger
+        title={tooltip}
+        className="tool-call-trigger inline-flex min-h-11 min-w-0 max-w-full cursor-pointer items-center gap-2.5 py-[3px] text-left text-13 font-normal text-muted-foreground transition-opacity hover:opacity-80 md:min-h-0"
+      >
+        <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
+        <span className="min-w-0 truncate">
+          {title.verb !== null && <span className="font-normal text-foreground">{title.verb}</span>}
+          {title.verb !== null && title.body.length > 0 && " "}
+          <span className={toolBodyClassName(title.bodyKind)}>{title.body}</span>
+        </span>
+        {duration !== undefined && (
           <span
-            role="link"
-            tabIndex={0}
-            className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
-            onClick={(e) => {
-              e.stopPropagation();
-              onBodyClick();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault(); // prevent Space from triggering parent button's click via keyup
-                e.stopPropagation();
-                onBodyClick();
-              }
-            }}
+            className={cn("shrink-0 font-mono tabular-nums opacity-70", TRANSCRIPT_CARD_META_CLASS)}
           >
-            {title.body}
+            {formatToolDuration(duration)}
           </span>
-        ) : (
-          title.body
         )}
-      </span>
-      {duration !== undefined && (
-        <span className="shrink-0 tabular-nums opacity-70">{formatToolDuration(duration)}</span>
+        <ChevronRightIcon className="size-3 shrink-0 opacity-75 transition-transform group-data-[state=open]:rotate-90" />
+      </CollapsibleTrigger>
+      {onBodyClick && (
+        <button
+          type="button"
+          aria-label={`Open ${title.body}`}
+          title={`Open ${title.body}`}
+          className="grid size-11 shrink-0 cursor-pointer place-items-center md:size-6 rounded-[var(--radius-otto-xs)] text-file-reference opacity-70 transition-[background-color,opacity] hover:bg-muted hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          onClick={onBodyClick}
+        >
+          <ExternalLinkIcon className="size-3" />
+        </button>
       )}
-      <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
-    </CollapsibleTrigger>
+    </div>
   );
+}
+
+function toolBodyClassName(kind: ToolTitleBodyKind): string | undefined {
+  switch (kind) {
+    case "command":
+      return "inline-block max-w-full truncate rounded-[var(--radius-otto-xs)] bg-foreground/[0.065] px-1 py-px align-bottom font-mono text-[0.88em] leading-[1.35] text-foreground/85 dark:bg-foreground/[0.1]";
+    case "path":
+      return "font-mono text-[0.92em] font-normal text-file-reference";
+    case "identifier":
+      return "font-mono text-[0.92em] text-foreground/75";
+    case "metric":
+      return "font-mono text-[0.92em] tabular-nums text-foreground/75";
+    case "query":
+      return "text-foreground/75";
+    case "url":
+      return "font-mono text-[0.9em] text-foreground/70";
+    case "plain":
+      return undefined;
+  }
 }
 
 /**
@@ -370,17 +409,33 @@ function StatusIcon({
   if (state === "input-available") {
     // Slightly larger and tinted so the running indicator is the one
     // thing in the row that actively draws the eye.
-    return <Loader2Icon className="size-3.5 shrink-0 animate-spin text-info" />;
+    return (
+      <span className="tool-step-icon-node">
+        <Loader2Icon className="animate-spin text-info-foreground" />
+      </span>
+    );
   }
   if (state === "output-error") {
-    return <XCircleIcon className="size-3.5 shrink-0 text-destructive" />;
+    return (
+      <span className="tool-step-icon-node">
+        <XCircleIcon className="text-destructive" />
+      </span>
+    );
   }
   if (state === "cancelled" || state === "no-output") {
     // Turn over, no output recorded — muted slash, not the error icon.
-    return <CircleSlashIcon className="size-3.5 shrink-0" />;
+    return (
+      <span className="tool-step-icon-node">
+        <CircleSlashIcon />
+      </span>
+    );
   }
   const Icon = iconForTool(name, nativeToolType);
-  return <Icon className="size-3.5 shrink-0" />;
+  return (
+    <span className="tool-step-icon-node">
+      <Icon />
+    </span>
+  );
 }
 
 function CodePanel({
@@ -420,7 +475,7 @@ function OutputSection({ output }: { output: string }) {
     <div className="space-y-2">
       <div
         className={cn(
-          "relative rounded-md",
+          "relative rounded-[var(--radius-otto-sm)]",
           canExpand && !isExpanded && "max-h-80 overflow-hidden",
           // overflow-auto (vs overflow-y-auto) keeps long single-line output from blowing out the bubble width.
           (!canExpand || isExpanded) && "max-h-[36rem] overflow-auto",
@@ -428,11 +483,11 @@ function OutputSection({ output }: { output: string }) {
       >
         <CodePanel title="Output" text={preview.text} copyText={output} copyLabel="Copy output" />
         {canExpand && !isExpanded && (
-          <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-md bg-gradient-to-t from-background to-transparent" />
+          <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-[var(--radius-otto-sm)] bg-gradient-to-t from-background to-transparent" />
         )}
       </div>
       {canExpand && (
-        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-2 rounded-[var(--radius-otto-sm)] border border-[var(--border-otto-hairline)] bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
           <span className="min-w-0">
             {isExpanded ? "Showing full output" : "Previewing output"} (
             {formatOutputStats(isExpanded ? preview : collapsedPreview)})
@@ -459,9 +514,11 @@ function OutputSection({ output }: { output: string }) {
 
 function ToolPendingOutput({ duration }: { duration: number | undefined }) {
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 p-3">
-      <div className="flex items-center gap-2 text-muted-foreground text-sm">
-        <Loader2Icon className="size-4 animate-spin text-info" />
+    <div className="rounded-[var(--radius-otto-sm)] border border-dashed bg-muted/30 p-3">
+      <div
+        className={cn("flex items-center gap-2 text-muted-foreground", TRANSCRIPT_CARD_BODY_CLASS)}
+      >
+        <Loader2Icon className="size-4 animate-spin text-info-foreground" />
         <span>
           Waiting for output
           {duration !== undefined ? ` for ${formatToolDuration(duration)}` : ""}
@@ -484,7 +541,12 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
     message = "Tool did not return output before the response failed.";
   }
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-sm">
+    <div
+      className={cn(
+        "rounded-[var(--radius-otto-sm)] border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground",
+        TRANSCRIPT_CARD_BODY_CLASS,
+      )}
+    >
       {message}
     </div>
   );

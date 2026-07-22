@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { SYNTAX_THEMES } from "@/lib/syntaxTheme";
 import { lazyCodePlugin } from "./lazyCodePlugin";
 
 describe("lazyCodePlugin — deferred Shiki engine", () => {
@@ -7,10 +8,10 @@ describe("lazyCodePlugin — deferred Shiki engine", () => {
     expect(lazyCodePlugin.type).toBe("code-highlighter");
   });
 
-  it("returns default themes synchronously before the engine loads", () => {
+  it("returns Otto themes synchronously before the engine loads", () => {
     // getThemes() is called on the render path, so it must resolve without
     // waiting for the lazily-imported @streamdown/code module.
-    expect(lazyCodePlugin.getThemes()).toEqual(["github-light", "github-dark"]);
+    expect(lazyCodePlugin.getThemes()).toEqual(SYNTAX_THEMES);
   });
 
   it("returns null on the first highlight and resolves tokens via callback", async () => {
@@ -21,7 +22,7 @@ describe("lazyCodePlugin — deferred Shiki engine", () => {
         {
           code: "const answer = 42;",
           language: "typescript",
-          themes: ["github-light", "github-dark"],
+          themes: SYNTAX_THEMES,
         },
         (highlighted) => resolve(highlighted),
       );
@@ -39,7 +40,7 @@ describe("lazyCodePlugin — deferred Shiki engine", () => {
       {
         code: "const doubled = 1;",
         language: "typescript",
-        themes: ["github-light", "github-dark"],
+        themes: SYNTAX_THEMES,
       },
       callback,
     );

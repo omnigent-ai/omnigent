@@ -25,6 +25,16 @@ describe("ApprovalCard — binary approve/reject", () => {
       />,
     );
 
+    expect(screen.getByTestId("approval-card")).toHaveClass(
+      "rounded-lg",
+      "border-[var(--border-otto-container)]",
+    );
+    expect(screen.getByText("Approval required")).toHaveClass("text-card-title");
+    expect(
+      screen
+        .getByText("Approve running rm -rf /tmp/cache?")
+        .closest('[data-slot="alert-description"]'),
+    ).toHaveClass("text-card-body");
     expect(screen.getByRole("button", { name: /approve/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
@@ -472,6 +482,15 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     const radios = screen.getAllByRole("radio");
     expect(radios).toHaveLength(3);
     expect(radios[0]!.getAttribute("type")).toBe("radio");
+    const customInput = screen.getByRole("textbox", { name: "Custom answer for Which framework?" });
+    expect(customInput).toHaveClass(
+      "outline-none",
+      "focus-visible:ring-2",
+      "focus-visible:ring-ring/50",
+    );
+    expect(screen.getByTestId("ask-user-question-custom-toggle")).toHaveClass(
+      "accent-brand-accent",
+    );
   });
 
   it("renders checkbox inputs for a multiSelect question", () => {

@@ -237,7 +237,7 @@ export function SettingsSidebarBody({
               size="icon"
               aria-label="Close sidebar"
               onClick={onClose}
-              className="rounded-full"
+              className="rounded-sm"
             >
               <PanelRightOpenIcon className="size-4" />
             </Button>

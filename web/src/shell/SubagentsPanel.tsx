@@ -219,14 +219,7 @@ function ViewModeToggle({
 // NOT genuinely fail, so it renders a quiet, non-destructive grey dot rather
 // than the red "Failed" one.
 type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "disconnected"
-  | "idle"
-  | "other";
+  "launching" | "working" | "awaiting" | "done" | "failed" | "disconnected" | "idle" | "other";
 
 // Error codes that mean "the runner went away", not "the task failed".
 // ``runner_disconnected`` is published when the SSE relay's tunnel drops
@@ -340,14 +333,14 @@ function sessionStatus(
 // Dot color per dot-rendered state. Working uses the animated RunningDot
 // and awaiting uses the "Needs response" tag, so both are excluded here.
 // Panel-scoped palette: the quiet connected-but-not-working states
-// (launching, idle, done) read in the blue --session-active hue, while the
-// disconnected runner reads in the neutral grey --muted-foreground. Blue
+// (launching, idle, done) read in the green --session-active hue, while the
+// disconnected runner reads in the neutral grey --muted-foreground. Green
 // --session-active = session alive but not actively working; grey
-// --muted-foreground = disconnected. The global --session-active (blue) and
+// --muted-foreground = disconnected. The global --session-active (green) and
 // --muted-foreground (grey) values are unchanged.
 const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
-  // Blue, quiet — "done" is an expected outcome, so it reads as a subtle
-  // (/55) blue dot rather than a loud green one.
+  // Green, quiet — "done" is an expected outcome, so it reads as a subtle
+  // (/55) green dot rather than a loud success indicator.
   done: "bg-session-active/55",
   failed: "bg-destructive",
   // Grey, not destructive — a disconnect is a transient liveness loss, not a
@@ -488,7 +481,9 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
         data-testid="subagent-status-dot"
         className="inline-flex shrink-0 items-center text-xs"
       >
-        <Badge className="border-transparent bg-warning/15 text-warning">Needs response</Badge>
+        <Badge className="border-transparent bg-warning/15 text-warning-foreground">
+          Needs response
+        </Badge>
       </span>
     );
   }
@@ -510,7 +505,7 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
   // word) — the cause stays in the tooltip / aria-label. Distinct from the
   // red "Failed" pill above, without repurposing the shared amber --warning.
   //
-  // Launching's inline word reads in the blue --session-active hue to match
+  // Launching's inline word reads in the green --session-active hue to match
   // its dot; every other state here keeps the neutral muted text — the verbatim
   // "other" word stays grey, and idle/done/disconnected show no word at all.
   const wrapperTextClass =

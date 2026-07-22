@@ -70,15 +70,16 @@ interface FilesPanelProps {
 // HiddenFilesToggle
 // ---------------------------------------------------------------------------
 
+const FILES_HEADER_ICON_BUTTON_CLASS =
+  "inline-flex size-6 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground";
+
 function HiddenFilesToggle({
   showHidden,
   onToggle,
-  size,
   hiddenCount,
 }: {
   showHidden: boolean;
   onToggle: () => void;
-  size: "4" | "3.5";
   hiddenCount: number;
 }) {
   const hasHidden = hiddenCount > 0 && !showHidden;
@@ -88,7 +89,6 @@ function HiddenFilesToggle({
     : hasHidden
       ? `${hiddenCount} file${hiddenCount === 1 ? "" : "s"} in hidden directories. Click to show.`
       : "Show hidden files";
-  const iconSize = size === "4" ? "size-4" : "size-3.5";
   return (
     <TooltipProvider>
       <Tooltip>
@@ -97,14 +97,12 @@ function HiddenFilesToggle({
             type="button"
             aria-label={ariaLabel}
             className={cn(
-              "cursor-pointer rounded p-1 hover:bg-muted",
-              hasHidden
-                ? "text-warning hover:text-warning/80"
-                : "text-muted-foreground hover:text-foreground",
+              FILES_HEADER_ICON_BUTTON_CLASS,
+              hasHidden && "text-warning-foreground hover:text-warning-foreground/80",
             )}
             onClick={onToggle}
           >
-            {showHidden ? <EyeOffIcon className={iconSize} /> : <EyeIcon className={iconSize} />}
+            {showHidden ? <EyeOffIcon className="size-3.5" /> : <EyeIcon className="size-3.5" />}
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">{tooltipLabel}</TooltipContent>
@@ -138,7 +136,7 @@ function SortSelector({
         <button
           type="button"
           aria-label={`Sort: ${active.label}`}
-          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] text-muted-foreground text-xs hover:bg-muted hover:text-foreground"
+          className="flex shrink-0 cursor-pointer items-center gap-1 rounded-sm px-2.5 py-[4px] text-muted-foreground text-xs hover:bg-muted hover:text-foreground"
         >
           <span>Sort:</span>
           <active.Icon className="size-3.5" />
@@ -164,7 +162,7 @@ function SortSelector({
 // tree (All). One control replaces the old separate Files / Changes rail tabs.
 // ---------------------------------------------------------------------------
 
-// Leading cell in the search toolbar. Rounded-full pills match the rail tabs;
+// Leading cell in the search toolbar. Compact buttons match the rail tabs;
 // the active scope uses the same theme selection surface as the sidebar.
 function FileScopeSwitch({
   flatView,
@@ -178,7 +176,7 @@ function FileScopeSwitch({
   const changedSelected = flatView;
   const allSelected = !flatView;
   const pill =
-    "flex cursor-pointer items-center gap-[6px] rounded-full px-[14px] py-[2px] text-[13px] font-medium leading-5 transition-colors";
+    "flex cursor-pointer items-center gap-[6px] rounded-sm px-[14px] py-[2px] text-13 font-medium leading-5 transition-colors";
   const activePill = "bg-muted text-foreground";
   const idlePill = "text-muted-foreground hover:text-foreground";
   return (
@@ -393,17 +391,16 @@ export function FilesPanel({
           <HiddenFilesToggle
             showHidden={showHidden}
             onToggle={() => onShowHiddenChange(!showHidden)}
-            size={isDrawer ? "4" : "3.5"}
             hiddenCount={hiddenFilesCount}
           />
           {onClose && (
             <button
               type="button"
               aria-label="Close files"
-              className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+              className={FILES_HEADER_ICON_BUTTON_CLASS}
               onClick={onClose}
             >
-              <XIcon className="size-4" />
+              <XIcon className="size-3.5" />
             </button>
           )}
         </div>
@@ -458,7 +455,7 @@ export function FilesPanel({
                 aria-expanded={showSearchFilters}
                 title="Files to include / exclude"
                 className={cn(
-                  "flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2.5 py-[4px] hover:bg-muted",
+                  "flex shrink-0 cursor-pointer items-center gap-1 rounded-sm px-2.5 py-[4px] hover:bg-muted",
                   showSearchFilters || treeFiltersActive
                     ? "text-foreground"
                     : "text-muted-foreground hover:text-foreground",

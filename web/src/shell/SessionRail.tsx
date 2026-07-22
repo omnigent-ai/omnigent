@@ -129,7 +129,7 @@ function TerminalRow({ terminal, onOpen }: { terminal: TerminalInfo; onOpen: () 
         data-testid="terminal-row"
         data-terminal-name={terminal.name}
         data-terminal-session={terminal.session}
-        className="flex w-full cursor-pointer items-center gap-2 truncate rounded-md px-2 py-1 text-left text-xs hover:bg-muted"
+        className="flex w-full cursor-pointer items-center gap-2 truncate rounded-sm px-2 py-1 text-left text-xs hover:bg-muted"
         onClick={onOpen}
       >
         <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
@@ -220,7 +220,7 @@ function ExecutionLogRow({
       <button
         type="button"
         data-testid={testId}
-        className="flex w-full cursor-pointer items-center gap-2 truncate rounded-md px-2 py-1 text-left text-xs hover:bg-muted"
+        className="flex w-full cursor-pointer items-center gap-2 truncate rounded-sm px-2 py-1 text-left text-xs hover:bg-muted"
         onClick={onOpen}
       >
         <Icon className="size-3.5 shrink-0 text-muted-foreground" />

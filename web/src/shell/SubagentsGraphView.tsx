@@ -35,7 +35,7 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
   if (activity === "working") return <RunningDot />;
   if (activity === "awaiting") {
     return (
-      <Badge className="border-transparent bg-warning/15 text-warning text-[9px] px-1 py-0">
+      <Badge className="border-transparent bg-warning/15 text-warning-foreground text-10 px-1 py-0">
         !
       </Badge>
     );
@@ -64,7 +64,7 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
       />
       <div
         className={cn(
-          "rounded-lg border px-3 py-2 shadow-sm transition-colors hover:shadow-md cursor-pointer",
+          "cursor-pointer rounded-lg border px-3 py-2 [box-shadow:var(--elevation-otto-1)] transition-[box-shadow,border-color] hover:[box-shadow:var(--elevation-otto-2)]",
           colors.border,
           colors.bg,
           isActive && "ring-2 ring-ring ring-offset-1 ring-offset-background",

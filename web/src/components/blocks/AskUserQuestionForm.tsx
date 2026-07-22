@@ -33,6 +33,12 @@ import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-reac
 import { type ChangeEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import { cn } from "@/lib/utils";
+import {
+  TRANSCRIPT_CARD_BODY_CLASS,
+  TRANSCRIPT_CARD_META_CLASS,
+  TRANSCRIPT_CARD_TITLE_CLASS,
+} from "./toolSurface";
 
 /**
  * Map from question id/text → either a single selected label
@@ -220,12 +226,19 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
 
   return (
     <div className="flex flex-col gap-2 text-foreground" data-testid="ask-user-question-form">
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      <div
+        className={cn("flex items-center gap-2 text-muted-foreground", TRANSCRIPT_CARD_META_CLASS)}
+      >
         <span data-testid="ask-user-question-progress">
           Question {currentIndex + 1} of {questions.length}:
         </span>
         {current.header && (
-          <span className="text-muted-foreground text-xs rounded bg-muted px-1.5 py-0.5">
+          <span
+            className={cn(
+              "rounded bg-muted px-1.5 py-0.5 text-muted-foreground",
+              TRANSCRIPT_CARD_META_CLASS,
+            )}
+          >
             {current.header}
           </span>
         )}
@@ -236,7 +249,12 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
         className="flex flex-col gap-2 mb-2"
         data-testid="ask-user-question-section"
       >
-        <legend className="text-foreground text-sm font-medium flex items-center gap-2 mb-2">
+        <legend
+          className={cn(
+            "mb-2 flex items-center gap-2 font-medium text-foreground",
+            TRANSCRIPT_CARD_TITLE_CLASS,
+          )}
+        >
           {current.question}
         </legend>
         <div className="flex flex-col gap-2">
@@ -249,19 +267,24 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                 <label
                   key={opt.label}
                   htmlFor={inputId}
-                  className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                  className={cn(
+                    "flex cursor-pointer items-start gap-2 text-foreground",
+                    TRANSCRIPT_CARD_BODY_CLASS,
+                  )}
                 >
                   <input
                     type="checkbox"
                     id={inputId}
                     checked={checked}
                     onChange={() => handleMultiToggle(currentKey, opt.label)}
-                    className="mt-1"
+                    className="mt-1 accent-brand-accent"
                   />
                   <span className="flex flex-col">
                     <span>{opt.label}</span>
                     {opt.description && (
-                      <span className="text-muted-foreground text-xs">{opt.description}</span>
+                      <span className={cn("text-muted-foreground", TRANSCRIPT_CARD_META_CLASS)}>
+                        {opt.description}
+                      </span>
                     )}
                   </span>
                 </label>
@@ -273,7 +296,10 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               <label
                 key={opt.label}
                 htmlFor={inputId}
-                className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+                className={cn(
+                  "flex cursor-pointer items-start gap-2 text-foreground",
+                  TRANSCRIPT_CARD_BODY_CLASS,
+                )}
               >
                 <input
                   type="radio"
@@ -281,12 +307,14 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                   name={currentKey}
                   checked={checked}
                   onChange={() => handleSingleSelect(currentKey, opt.label)}
-                  className="mt-1"
+                  className="mt-1 accent-brand-accent"
                 />
                 <span className="flex flex-col">
                   <span>{opt.label}</span>
                   {opt.description && (
-                    <span className="text-muted-foreground text-xs">{opt.description}</span>
+                    <span className={cn("text-muted-foreground", TRANSCRIPT_CARD_META_CLASS)}>
+                      {opt.description}
+                    </span>
                   )}
                 </span>
               </label>
@@ -298,7 +326,10 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
               same way. */}
           <label
             htmlFor={customRowId}
-            className="flex items-start gap-2 cursor-pointer text-sm text-foreground"
+            className={cn(
+              "flex cursor-pointer items-start gap-2 text-foreground",
+              TRANSCRIPT_CARD_BODY_CLASS,
+            )}
           >
             <input
               type={current.multiSelect ? "checkbox" : "radio"}
@@ -310,7 +341,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                   ? handleCustomToggleMulti(currentKey)
                   : handleCustomToggleSingle(currentKey)
               }
-              className="mt-1"
+              className="mt-1 accent-brand-accent"
               data-testid="ask-user-question-custom-toggle"
             />
             {/* ``field-sizing-content`` (Tailwind v4 / CSS) auto-grows
@@ -319,11 +350,15 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
                 scrolling within a fixed single row. */}
             <textarea
               rows={1}
+              aria-label={`Custom answer for ${current.question}`}
               placeholder="Type something"
               value={customRowValue}
               onChange={(e) => handleCustomInput(currentKey, e)}
               data-testid="ask-user-question-custom-input"
-              className="field-sizing-content flex-1 resize-none bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none"
+              className={cn(
+                "field-sizing-content -mx-1 flex-1 resize-none rounded-[var(--radius-otto-xs)] bg-transparent px-1 outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/50",
+                TRANSCRIPT_CARD_BODY_CLASS,
+              )}
             />
           </label>
         </div>
@@ -332,7 +367,7 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
             {previewsToShow.map((opt) => (
               <pre
                 key={opt.label}
-                className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap"
+                className="overflow-x-auto rounded-[var(--radius-otto-xs)] bg-muted px-2 py-1 font-mono text-xs whitespace-pre-wrap"
               >
                 {opt.preview}
               </pre>

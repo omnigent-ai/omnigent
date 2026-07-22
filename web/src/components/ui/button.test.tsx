@@ -28,6 +28,15 @@ const VARIANTS = ["default", "outline", "secondary", "ghost", "destructive", "li
 const SIZES = ["default", "xs", "sm", "lg", "icon", "icon-xs", "icon-sm", "icon-lg"] as const;
 
 describe("buttonVariants translate/transform composition", () => {
+  it("uses Otto's compact control radius and buoyant timing", () => {
+    expect(buttonVariants({})).toContain("rounded-[var(--radius-otto-button)]");
+    expect(buttonVariants({})).toContain("duration-[var(--duration-otto-fast)]");
+    expect(buttonVariants({})).toContain("ease-[var(--ease-otto)]");
+    expect(buttonVariants({})).toContain(
+      "active:not-aria-[haspopup]:rounded-[calc(var(--radius-otto-button)+2px)]",
+    );
+  });
+
   it.each(VARIANTS.flatMap((variant) => SIZES.map((size) => ({ variant, size }))))(
     "emits no translate-* utility for variant=$variant size=$size",
     ({ variant, size }) => {
@@ -39,6 +48,12 @@ describe("buttonVariants translate/transform composition", () => {
       expect(offenders).toEqual([]);
     },
   );
+
+  it.each(SIZES)("keeps size=$size compact while opting into coarse-pointer targets", (size) => {
+    const classes = buttonVariants({ size });
+    expect(classes).toContain("touch-target-button");
+    expect(classes).not.toMatch(/md:(?:h|size)-/);
+  });
 
   it("keeps the pressed-state nudge on the transform property", () => {
     // The press feedback must exist and must be an arbitrary `transform:`

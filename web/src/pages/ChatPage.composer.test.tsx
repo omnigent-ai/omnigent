@@ -554,8 +554,9 @@ describe("AgentPicker trigger label", () => {
     // The harness identity ("Claude") is NOT in the trigger anymore — it
     // moved to the status tray below.
     expect(trigger).not.toHaveTextContent("Claude");
-    // Model black, effort grey.
-    expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
+    // The whole trigger uses a muted, normal-weight treatment.
+    expect(within(trigger).getByText("Opus")).not.toHaveClass("text-foreground");
+    expect(trigger).toHaveClass("font-normal", "text-muted-foreground");
     expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
@@ -663,7 +664,8 @@ describe("AgentPicker trigger label", () => {
     expect(trigger).not.toHaveTextContent("Opus 4.5");
     expect(trigger).not.toHaveTextContent("fable");
     expect(trigger).not.toHaveTextContent("Low");
-    expect(within(trigger).getByText("Composer 2.5")).toHaveClass("text-foreground");
+    expect(within(trigger).getByText("Composer 2.5")).not.toHaveClass("text-foreground");
+    expect(trigger).toHaveClass("font-normal", "text-muted-foreground");
   });
 
   it("surfaces an SDK/bundle session's model from the override, not the cross-session sticky", () => {
@@ -968,7 +970,13 @@ describe("Composer placeholder", () => {
     // Host online but runner offline — sending relaunches the runner, so the
     // composer stays writable and the placeholder is the affordance.
     render(<Composer {...composerProps({ reconnectHint: true })} />);
-    expect(textarea().placeholder).toBe("Send a message to reconnect this session");
+    expect(textarea().placeholder).toBe("Send a message to reconnect");
+    expect(textarea().disabled).toBe(false);
+  });
+
+  it("uses a one-line placeholder when a message wakes the sandbox host", () => {
+    render(<Composer {...composerProps({ reconnectHint: true, sandboxAsleepHint: true })} />);
+    expect(textarea().placeholder).toBe("Send to wake the sandbox");
     expect(textarea().disabled).toBe(false);
   });
 

@@ -90,7 +90,7 @@ function MenuRowButton({
       data-testid={`slash-menu-item-${row.name.slice(1)}`}
       data-active={active ? "true" : undefined}
       className={cn(
-        "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[13px] text-foreground hover:bg-accent",
+        "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-13 text-foreground hover:bg-accent",
         active && "bg-accent",
       )}
       // preventDefault keeps the textarea focused while the user clicks.

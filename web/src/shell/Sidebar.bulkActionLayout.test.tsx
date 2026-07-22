@@ -110,7 +110,8 @@ function renderSidebar() {
 /** Enter selection mode and select the (single) session so the
  *  Archive/Delete actions are enabled. */
 function enterSelectionModeAndSelect() {
-  fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+  fireEvent.pointerDown(screen.getByTestId("sidebar-more-button"), { button: 0 });
+  fireEvent.click(screen.getByRole("menuitem", { name: "Select sessions" }));
   // In selection mode the row link toggles selection instead of navigating.
   fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
 }

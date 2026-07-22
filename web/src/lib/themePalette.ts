@@ -4,7 +4,7 @@
 //
 //   1. MODE  — light / dark / system, owned by next-themes (toggles the
 //      `.dark` class on <html>; see components/theme/ThemeProvider.tsx).
-//   2. PALETTE — the color scheme (Omni pink, GitHub, Vercel, …), owned here.
+//   2. PALETTE — the selected color scheme, owned here.
 //
 // A palette is applied as a `data-theme` attribute on <html>, so it composes
 // with the mode class: `:root:not(.dark)[data-theme="github"]` is GitHub-light
@@ -24,6 +24,8 @@ const STORAGE_KEY = "omnigent:ui-theme-palette";
 /** Selectable color palettes. The first entry is the default (brand) look. */
 export const themePalettes = [
   "omni",
+  "omni-rose",
+  "otto-dream",
   "dracula",
   "github",
   "catppuccin",
@@ -75,13 +77,48 @@ export const PALETTES: readonly PaletteMeta[] = [
     label: "Omnigent",
     blurb: "The signature pink brand look.",
     light: {
-      bg: "#fdf7fb",
+      bg: "#fdfdfc",
       card: "#ffffff",
       accent: "#df3c85",
-      border: "#e8ecf0",
-      text: "#11171c",
+      border: "#e7e5e2",
+      text: "#464247",
     },
-    dark: { bg: "#160e24", card: "#28223a", accent: "#df3c85", border: "#2a2440", text: "#f4f5f7" },
+    dark: { bg: "#121113", card: "#242126", accent: "#df3c85", border: "#343136", text: "#f2edf0" },
+  },
+  {
+    id: "omni-rose",
+    label: "Omnigent Rose",
+    blurb: "Warm rose paper with plum ink and Otto-green accents.",
+    light: {
+      bg: "#fcfafb",
+      card: "#fffefe",
+      accent: "#df3c85",
+      border: "#e2d7dd",
+      text: "#2b252a",
+    },
+    // This palette intentionally customizes light mode only. Dark mode keeps
+    // the established Omnigent dark treatment rather than inventing a second
+    // unrequested rose-dark system.
+    dark: { bg: "#121113", card: "#242126", accent: "#df3c85", border: "#322f34", text: "#f4f5f7" },
+  },
+  {
+    id: "otto-dream",
+    label: "Otto Dream",
+    blurb: "Cotton-candy paper, plum ink, and playful Otto accents.",
+    light: {
+      bg: "#fff6fb",
+      card: "#fffdfd",
+      accent: "#f45d9c",
+      border: "#ead7e5",
+      text: "#43324f",
+    },
+    dark: {
+      bg: "#211526",
+      card: "#34243b",
+      accent: "#ff75b5",
+      border: "#59405f",
+      text: "#f8eef9",
+    },
   },
   {
     id: "dracula",

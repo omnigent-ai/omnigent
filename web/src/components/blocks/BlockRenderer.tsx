@@ -30,7 +30,11 @@ import {
   useIsChangedPath,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
-import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  looksLikeWorkspaceFilePath,
+  toWorkspaceRelativePath,
+  useWorkspaceFileExists,
+} from "@/hooks/useWorkspaceChangedFiles";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
@@ -38,6 +42,27 @@ import { SmartRoutingCard } from "./SmartRoutingCard";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
+import { TRANSCRIPT_RAIL_CLASS } from "./toolSurface";
+
+/**
+ * Visual file-reference sniff, intentionally broader than workspace linking.
+ *
+ * A path outside the current workspace still needs to read as a path rather
+ * than as a keyword chip; it simply stays inert. Link verification remains the
+ * stricter concern handled by `toWorkspaceRelativePath` + the filesystem.
+ */
+export function looksLikeFileReference(text: string): boolean {
+  if (!text || text.trim() !== text || text.includes("://")) return false;
+  if (looksLikeWorkspaceFilePath(text)) return true;
+
+  const firstSeparator = text.search(/[/\\]/);
+  if (firstSeparator >= 0) {
+    if (/\s/.test(text.slice(0, firstSeparator))) return false;
+    return !/[/\\]$/.test(text);
+  }
+
+  return /\.[a-z][a-z0-9]{0,6}(?::\d+(?::\d+)?)?$/i.test(text);
+}
 
 /**
  * Inline-`code` renderer that turns workspace file paths (e.g.
@@ -72,6 +97,7 @@ function WorkspacePathInlineCode({
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
   const text = typeof codeChildren === "string" ? codeChildren : "";
+  const isFileReference = looksLikeFileReference(text);
 
   // Collapse absolute / "~"-relative forms onto a workspace-relative path so
   // they match the changed-files list and the filesystem API. null = absolute
@@ -102,6 +128,7 @@ function WorkspacePathInlineCode({
         role="button"
         tabIndex={0}
         data-streamdown="inline-code"
+        data-file-reference="true"
         // Keep the base inline-code class/props (merge, don't replace) so the
         // link only adds the underline affordance on top of Streamdown's
         // styling and any caller-provided attributes survive.
@@ -126,8 +153,12 @@ function WorkspacePathInlineCode({
   // looks unchanged.
   return (
     <code
-      className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-sm", className)}
+      className={cn(
+        isFileReference ? "font-mono" : "rounded bg-muted px-1.5 py-0.5 font-mono text-sm",
+        className,
+      )}
       data-streamdown="inline-code"
+      data-file-reference={isFileReference ? "true" : undefined}
       {...codeProps}
     >
       {codeChildren}
@@ -345,9 +376,14 @@ export function BlockRenderer({ items, sessionStatus }: BlockRendererProps) {
         // group is expanded.
         rendered.push(
           <div key={`tool-group-with-tail:${runStart}`}>
-            <ToolGroupSummary tools={group.tools} count={group.count} />
+            <ToolGroupSummary tools={group.tools} count={group.count} className="mb-0" />
             {tail.length > 0 && (
-              <div className="mt-1 ml-2 space-y-1 border-l pl-3 py-1 peer-data-[state=open]:mt-0">
+              <div
+                className={cn(
+                  "mt-1 ml-2 space-y-1 py-1 peer-data-[state=open]:mt-0",
+                  TRANSCRIPT_RAIL_CLASS,
+                )}
+              >
                 {tail.map((fragment, idx) => renderToolRunFragment(fragment, runStart, idx))}
               </div>
             )}

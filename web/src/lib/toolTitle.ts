@@ -6,24 +6,35 @@
 // match how a human would describe the action ("ls -la", "Read
 // foo.py", "Start child session: 'researcher - auth'").
 //
-// The result is split into a `verb` (rendered bold by the trigger row
-// so the action stands out) and a `body` (the dynamic, less-important
-// payload — paths, queries, commands). Unknown tools fall back to the
-// pre-existing `name(argsSummary)` shape with no bolded verb so we
-// never lose information for tools we haven't taught this module about.
+// The result is split into a neutral `verb` and a dynamic `body`. The
+// body also carries a semantic kind so the trigger can add restrained
+// emphasis to commands, paths, identifiers, and metrics without
+// making every tool call look like a badge. Unknown tools fall back to the
+// pre-existing `name(argsSummary)` shape so we never lose information for
+// tools we haven't taught this module about.
+
+export type ToolTitleBodyKind =
+  | "plain"
+  | "command"
+  | "path"
+  | "identifier"
+  | "metric"
+  | "query"
+  | "url";
 
 /**
  * Structured title for a tool call.
  * - `verb`: the static action phrase (e.g. "Read", "Start child
- *   session:"). Rendered bold/foreground by the trigger row. `null`
- *   when there's nothing to emphasize (e.g. raw shell commands, or
- *   the fallback for unknown tools).
+ *   session:"). Rendered in the neutral foreground by the trigger row.
+ *   `null` when the body already reads as the complete action.
  * - `body`: the dynamic payload (path, command, session id). Empty
  *   string when the title is verb-only (e.g. "Read inbox").
+ * - `bodyKind`: semantic presentation tier for that dynamic payload.
  */
 export interface ToolTitle {
   verb: string | null;
   body: string;
+  bodyKind: ToolTitleBodyKind;
 }
 
 type ArgFormatter = (args: Record<string, unknown>) => ToolTitle | null;
@@ -33,7 +44,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   // alone communicates the action.
   sys_os_shell: (args) => {
     const cmd = asString(args.command);
-    return cmd === null ? null : { verb: null, body: cmd };
+    return cmd === null ? null : title(null, cmd, "command");
   },
   sys_os_read: (args) => withPath("Read", args.path),
   sys_os_write: (args) => withPath("Write", args.path),
@@ -45,18 +56,18 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     // By-session-id mode: post to an existing child by id; otherwise
     // the named (agent, title) spawn/continue form.
     const sid = asString(args.session_id);
-    if (sid !== null) return { verb: "Send to session:", body: sid };
+    if (sid !== null) return title("Send to session:", sid, "identifier");
     return sessionTitle("Start child session:", args);
   },
   sys_session_create: (args) => {
     const id = asString(args.agent_id);
-    return id === null ? verbOnly("Create session") : { verb: "Create session:", body: id };
+    return id === null ? verbOnly("Create session") : title("Create session:", id, "identifier");
   },
   sys_session_get_history: (args) => {
     const id = asString(args.conversation_id);
     return id === null
       ? verbOnly("Get session history")
-      : { verb: "Get session history:", body: id };
+      : title("Get session history:", id, "identifier");
   },
   // Intelligent routing (normally rendered by SmartRoutingCard; this covers
   // grouped/summary surfaces that fall back to the title).
@@ -64,41 +75,45 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const count = Array.isArray(args.tasks) ? args.tasks.length : null;
     return count === null
       ? verbOnly("Intelligent routing")
-      : { verb: "Intelligent routing:", body: `${count} task${count === 1 ? "" : "s"}` };
+      : title("Intelligent routing:", `${count} task${count === 1 ? "" : "s"}`, "metric");
   },
 
   sys_session_close: (args) => sessionTitle("Close child session:", args),
   sys_session_list: () => verbOnly("List child sessions"),
   sys_session_get_info: (args) => {
     const id = asString(args.session_id);
-    return id === null ? verbOnly("Get session info") : { verb: "Get session info:", body: id };
+    return id === null
+      ? verbOnly("Get session info")
+      : title("Get session info:", id, "identifier");
   },
 
   // Agent-management tools.
   sys_agent_get: (args) => {
     const id = asString(args.session_id);
-    return id === null ? verbOnly("Get agent") : { verb: "Get agent:", body: id };
+    return id === null ? verbOnly("Get agent") : title("Get agent:", id, "identifier");
   },
   sys_agent_download: (args) => {
     const id = asString(args.session_id);
-    return id === null ? verbOnly("Download agent") : { verb: "Download agent:", body: id };
+    return id === null ? verbOnly("Download agent") : title("Download agent:", id, "identifier");
   },
   sys_agent_list: () => verbOnly("List agents"),
 
   // Async dispatch + inbox.
   sys_call_async: (args) => {
     const tool = asString(args.tool);
-    return tool === null ? verbOnly("Dispatch async") : { verb: "Dispatch async:", body: tool };
+    return tool === null
+      ? verbOnly("Dispatch async")
+      : title("Dispatch async:", tool, "identifier");
   },
   sys_read_inbox: () => verbOnly("Read inbox"),
   list_tasks: () => verbOnly("List tasks"),
   sys_cancel_async: (args) => {
     const id = asString(args.handle_id);
-    return id === null ? verbOnly("Cancel async") : { verb: "Cancel async:", body: id };
+    return id === null ? verbOnly("Cancel async") : title("Cancel async:", id, "identifier");
   },
   sys_cancel_task: (args) => {
     const id = asString(args.task_id);
-    return id === null ? verbOnly("Cancel task") : { verb: "Cancel task:", body: id };
+    return id === null ? verbOnly("Cancel task") : title("Cancel task:", id, "identifier");
   },
 
   // Timers.
@@ -106,11 +121,11 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const seconds = asNumber(args.seconds);
     if (seconds === null) return null;
     const repeat = args.repeat === true ? " (repeat)" : "";
-    return { verb: "Set timer:", body: `${seconds}s${repeat}` };
+    return title("Set timer:", `${seconds}s${repeat}`, "metric");
   },
   sys_timer_cancel: (args) => {
     const id = asString(args.timer_id);
-    return id === null ? verbOnly("Cancel timer") : { verb: "Cancel timer:", body: id };
+    return id === null ? verbOnly("Cancel timer") : title("Cancel timer:", id, "identifier");
   },
 
   // Terminal multiplexer.
@@ -123,20 +138,20 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     if (id === null) return null;
     const payload = asString(args.text) ?? asString(args.keys);
     return payload === null
-      ? { verb: "Send to", body: `'${id}'` }
-      : { verb: `Send to '${id}':`, body: payload };
+      ? title("Send to", `'${id}'`, "identifier")
+      : title(`Send to '${id}':`, payload, "command");
   },
 
   // Web tools.
   web_search: (args) => {
     const q = asString(args.query);
-    return q === null ? null : { verb: "Web search:", body: `"${q}"` };
+    return q === null ? null : title("Web search:", `"${q}"`, "query");
   },
   web_fetch: (args) => {
     const q = asString(args.query);
-    if (q !== null) return { verb: "Web fetch:", body: `"${q}"` };
+    if (q !== null) return title("Web fetch:", `"${q}"`, "query");
     const url = asString(args.url);
-    if (url !== null) return { verb: "Web fetch:", body: url };
+    if (url !== null) return title("Web fetch:", url, "url");
     return null;
   },
 };
@@ -160,7 +175,7 @@ export function formatToolTitle(
   }
   const fallback =
     argsSummary !== undefined && argsSummary.length > 0 ? `${name}(${argsSummary})` : name;
-  return { verb: null, body: fallback };
+  return title(null, fallback);
 }
 
 function asString(v: unknown): string | null {
@@ -172,19 +187,19 @@ function asNumber(v: unknown): number | null {
 }
 
 function verbOnly(verb: string): ToolTitle {
-  return { verb, body: "" };
+  return title(verb, "");
 }
 
 function withPath(verb: string, raw: unknown): ToolTitle | null {
   const path = asString(raw);
-  return path === null ? null : { verb, body: path };
+  return path === null ? null : title(verb, path, "path");
 }
 
 function sessionTitle(verb: string, args: Record<string, unknown>): ToolTitle | null {
   const tool = asString(args.tool);
   const session = asString(args.session);
   if (tool === null || session === null) return null;
-  return { verb, body: `'${tool} - ${session}'` };
+  return title(verb, `'${tool} - ${session}'`, "identifier");
 }
 
 function terminalId(args: Record<string, unknown>): string | null {
@@ -196,5 +211,13 @@ function terminalId(args: Record<string, unknown>): string | null {
 
 function terminalTitle(verb: string, args: Record<string, unknown>): ToolTitle | null {
   const id = terminalId(args);
-  return id === null ? null : { verb, body: `'${id}'` };
+  return id === null ? null : title(verb, `'${id}'`, "identifier");
+}
+
+function title(
+  verb: string | null,
+  body: string,
+  bodyKind: ToolTitleBodyKind = "plain",
+): ToolTitle {
+  return { verb, body, bodyKind };
 }

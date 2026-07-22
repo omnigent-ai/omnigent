@@ -55,6 +55,7 @@ describe("SessionStateBadge — per-state rendering", () => {
     // variant (running-pulse-dot) is reserved for the running state.
     const dot = container.querySelector(".bg-brand-accent");
     expect(dot).not.toBeNull();
+    expect(dot).toHaveClass("size-1.5");
     expect(dot?.getAttribute("class")).not.toContain("running-pulse-dot");
     expect(container.querySelector(".bg-info")).toBeNull();
   });

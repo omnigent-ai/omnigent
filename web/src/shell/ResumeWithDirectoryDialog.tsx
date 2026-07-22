@@ -339,7 +339,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                   {showConflictHint && (
                     <p
-                      className="flex items-start gap-1.5 text-xs text-warning"
+                      className="flex items-start gap-1.5 text-xs text-warning-foreground"
                       data-testid="resume-dir-conflict-hint"
                     >
                       <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />
@@ -354,7 +354,7 @@ export function ResumeWithDirectoryDialog({
                   )}
                   {showMismatchWarning && (
                     <p
-                      className="flex items-start gap-1.5 text-xs text-warning"
+                      className="flex items-start gap-1.5 text-xs text-warning-foreground"
                       data-testid="resume-dir-mismatch-warning"
                     >
                       <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />

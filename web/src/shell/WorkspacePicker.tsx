@@ -454,7 +454,7 @@ export function WorkspacePicker({
 
   return (
     <div
-      className="flex max-h-80 min-h-0 flex-col rounded-md border"
+      className="flex max-h-80 min-h-0 flex-col rounded-md border border-[var(--border-otto-container)] [box-shadow:var(--elevation-otto-1)]"
       data-testid="workspace-picker"
     >
       <div className="flex shrink-0 items-center gap-1.5 border-b px-2 py-1.5">
@@ -616,7 +616,7 @@ export function WorkspacePicker({
       )}
       {occupiedCount > 0 && (
         <div
-          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-xs text-warning"
+          className="flex shrink-0 items-start gap-1.5 border-b bg-warning/10 px-3 py-2 text-xs text-warning-foreground"
           data-testid="workspace-picker-conflict"
         >
           <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" />

@@ -48,14 +48,14 @@ export type MessageContentProps = HTMLAttributes<HTMLDivElement>;
 export const MessageContent = ({ children, className, ...props }: MessageContentProps) => (
   <div
     className={cn(
-      // 15px text / 24px line-height at the 16px desktop root, in rem so the
-      // mobile root-font-size bump (index.css) still scales both. User and
-      // assistant prose share this wrapper, so they stay in lockstep.
-      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-[0.9375rem] leading-6 tracking-[-0.01em]",
-      "group-[.is-user]:ml-auto group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-border/60",
+      // User bubbles keep the compact 13px rhythm; assistant prose steps up
+      // to 14px / 20px for the primary reading surface without enlarging
+      // tool rows, code blocks, or surrounding UI chrome.
+      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-13 leading-5",
+      "group-[.is-user]:ml-auto group-[.is-user]:rounded-[var(--radius-otto-md)] group-[.is-user]:bg-user-bubble group-[.is-user]:px-3 group-[.is-user]:py-2 group-[.is-user]:text-user-bubble-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-inset group-[.is-user]:ring-user-bubble-border",
       // Tighter than the user bubble's gap-2 so muted single-line tool
       // ("See N steps") / reasoning rows don't look orphaned between prose.
-      "group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-foreground",
+      "group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-[14px] group-[.is-assistant]:leading-5 group-[.is-assistant]:text-assistant-foreground",
       className,
     )}
     {...props}
@@ -330,7 +330,7 @@ function extractCodeText(children: ReactNode): string {
 // positioning lives on the container in ChatCodeBlockPre, not here, so the
 // buttons stay layout-agnostic.
 const CODE_BLOCK_OVERLAY_BUTTON_CLASS =
-  "size-8 bg-sidebar/80 text-muted-foreground hover:text-foreground supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur";
+  "code-block-action size-6 rounded-[var(--radius-otto-xs)] border border-transparent bg-transparent text-muted-foreground hover:text-foreground";
 
 function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
   const [isCopied, setIsCopied] = useState(false);
@@ -374,7 +374,7 @@ function ChatCodeBlockCopyButton({ getCode }: { getCode: () => string }) {
       type="button"
       variant="ghost"
     >
-      <Icon size={14} />
+      <Icon className="size-3.5" />
     </Button>
   );
 }
@@ -392,7 +392,7 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
       type="button"
       variant="ghost"
     >
-      <WrapTextIcon size={14} />
+      <WrapTextIcon className="size-3.5" />
     </Button>
   );
 }
@@ -415,7 +415,7 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
       {/* Overlay actions, anchored left of Streamdown's own download button
           (which sits at the header's right edge). A flex row lets the buttons
           self-arrange, so neither needs a hardcoded horizontal offset. */}
-      <div className="absolute top-2 right-12 z-10 flex items-center gap-1">
+      <div className="absolute top-[7px] right-[27px] z-10 flex items-center gap-0.5">
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>

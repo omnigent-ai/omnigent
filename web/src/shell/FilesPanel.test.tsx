@@ -556,7 +556,14 @@ describe("FilesPanel changed files search", () => {
     });
 
     const closeButton = screen.getByRole("button", { name: "Close files" });
-    expect(closeButton).toBeInTheDocument();
+    const hiddenFilesButton = screen.getByRole("button", { name: "Show hidden files" });
+    expect(closeButton).toHaveClass("inline-flex", "size-6", "items-center", "justify-center");
+    expect(hiddenFilesButton).toHaveClass(
+      "inline-flex",
+      "size-6",
+      "items-center",
+      "justify-center",
+    );
 
     fireEvent.click(closeButton);
     expect(onClose).toHaveBeenCalledTimes(1);

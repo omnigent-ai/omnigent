@@ -68,7 +68,7 @@ describe("ToolCard rendering", () => {
   it("renders the tool title and duration in the collapsed trigger row", () => {
     // WHY: the trigger row is the always-visible summary; an unknown tool name
     // falls back to `name(argsSummary)`, and a completed duration renders.
-    renderCard({
+    const { container } = renderCard({
       name: "my_tool",
       argsSummary: "x=1",
       arguments: { x: 1 },
@@ -78,6 +78,39 @@ describe("ToolCard rendering", () => {
     });
     expect(screen.getByText("my_tool(x=1)")).toBeInTheDocument();
     expect(screen.getByText("3.3s")).toBeInTheDocument();
+    expect(container.querySelector(".tool-call-trigger")).toHaveClass(
+      "gap-2.5",
+      "text-13",
+      "font-normal",
+    );
+    expect(container.querySelector(".tool-step-icon-node")).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "sys_os_shell",
+      { command: "git status" },
+      "git status",
+      ["font-mono", "bg-foreground/[0.065]"],
+    ],
+    ["sys_os_read", { path: "/tmp/file.ts" }, "/tmp/file.ts", ["font-mono", "text-file-reference"]],
+    [
+      "sys_session_get_info",
+      { session_id: "session_42" },
+      "session_42",
+      ["font-mono", "text-foreground/75"],
+    ],
+    ["sys_timer_set", { seconds: 12 }, "12s", ["font-mono", "tabular-nums"]],
+    ["web_search", { query: "tool styling" }, '"tool styling"', ["text-foreground/75"]],
+  ] as const)("uses restrained semantic emphasis for %s", (name, args, body, classes) => {
+    renderCard({
+      name,
+      arguments: args,
+      output: "done",
+      state: "output-available",
+    });
+
+    expect(screen.getByText(body)).toHaveClass(...classes);
   });
 
   it("expands to reveal the Parameters panel and output on click", () => {
@@ -126,10 +159,9 @@ describe("ToolCard rendering", () => {
     expect(screen.getByText(message)).toBeInTheDocument();
   });
 
-  it("makes a workspace file path clickable for file-path tools inside a FileViewer", () => {
-    // WHY: sys_os_read with a relative path renders the path as a role="link"
-    // that calls the FileViewer's openFile; clicking it must not toggle the
-    // collapsible (stopPropagation).
+  it("renders file-open and expand as sibling actions", () => {
+    // WHY: the collapsible trigger is already a button. File opening must be a
+    // sibling button rather than nested interactive content inside that trigger.
     const openFile = vi.fn();
     const ctx = {
       openFile,
@@ -154,8 +186,12 @@ describe("ToolCard rendering", () => {
         ),
       ),
     );
-    const link = screen.getByRole("link", { name: "src/a.ts" });
-    fireEvent.click(link);
+    const expandButton = screen.getByRole("button", { name: /Read src\/a\.ts/i });
+    const openButton = screen.getByRole("button", { name: "Open src/a.ts" });
+    expect(expandButton.contains(openButton)).toBe(false);
+    expect(screen.queryByRole("link", { name: "src/a.ts" })).toBeNull();
+
+    fireEvent.click(openButton);
     expect(openFile).toHaveBeenCalledWith("src/a.ts");
   });
 
@@ -215,9 +251,17 @@ describe("ToolGroupSummary", () => {
       ),
     );
     expect(screen.getByText("See 2 steps")).toBeInTheDocument();
-    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    const summaryTrigger = container.querySelector<HTMLElement>(".tool-group-summary-trigger")!;
+    expect(summaryTrigger).toHaveClass("text-sm", "font-normal", "gap-1.5");
+    fireEvent.click(summaryTrigger);
     expect(screen.getByText("alpha_tool")).toBeInTheDocument();
     expect(screen.getByText("beta_tool")).toBeInTheDocument();
+    expect(container.querySelector(".tool-group-timeline")).toHaveClass(
+      "border-l",
+      "border-border/70",
+      "pl-3",
+    );
+    expect(container.querySelectorAll(".tool-step-icon-node")).toHaveLength(2);
   });
 
   it("uses the singular 'step' for one tool and honors an explicit count override", () => {

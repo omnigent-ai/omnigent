@@ -18,10 +18,12 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   GitBranchIcon,
+  GitForkIcon,
   ArrowUpIcon,
   Loader2Icon,
   FileTextIcon,
   FolderIcon,
+  FolderTreeIcon,
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
@@ -81,7 +83,6 @@ import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
 import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
-import { cn } from "@/lib/utils";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
@@ -113,6 +114,7 @@ import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import { useNewestProjectSession, useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
+import { ComposerFormSurface } from "@/components/composer/ComposerSurface";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
   buildMentionPreamble,
@@ -334,7 +336,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   return (
-    <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
+    <div className="flex flex-col gap-4 rounded-lg border border-dashed border-[var(--border-otto-container)] p-4 [box-shadow:var(--elevation-otto-1)]">
       {label && <p className="text-xs text-muted-foreground">{label}</p>}
       {databricksFeatures ? (
         <Tabs defaultValue="local">
@@ -813,16 +815,15 @@ function LandingProjectPicker({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+          className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
           data-testid="new-chat-landing-project-chip"
         >
-          <TagIcon className="size-4 shrink-0" />
+          <TagIcon className="size-3 shrink-0" />
           {/* Label collapses to icon-only on narrow viewports (mobile),
               matching the host/workspace/worktree chips. */}
-          <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
+          <span className="hidden max-w-32 truncate whitespace-nowrap sm:block">
             {value || "No project"}
           </span>
-          <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -1083,7 +1084,7 @@ function BypassSandboxOption({
         <div
           role="alert"
           data-testid="new-chat-landing-bypass-sandbox-banner"
-          className="mt-1.5 flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-[11px] font-medium leading-relaxed text-destructive"
+          className="mt-1.5 flex items-start gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-card-meta font-medium leading-relaxed text-destructive [box-shadow:var(--elevation-otto-1)]"
         >
           <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
           <span>
@@ -1662,7 +1663,7 @@ function AgentHarnessPicker({
           // when focus returns to the trigger after a pick.
           className="h-8 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
         >
-          <span className="max-w-[12rem] truncate text-xs text-foreground">
+          <span className="max-w-[12rem] truncate text-xs">
             {hasAgents ? agentLabel : "No agents"}
           </span>
           <ChevronDownIcon className="size-3.5 opacity-60" />
@@ -2350,9 +2351,6 @@ export function NewChatLandingScreen() {
   );
   const workspaceTrimmed = workspace.trim();
   const workspaceValid = isValidWorkspace(workspace);
-  const isCloudHost =
-    sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
-
   // Sessions on the selected host that have a workspace — the narrow set
   // the health poll needs to check for live directory conflicts. Much
   // smaller than all 200 directorySessions (only host-matched + workspace
@@ -2992,43 +2990,50 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <button
       type="button"
-      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
       data-testid="new-chat-landing-workspace-chip"
     >
-      <FolderIcon className="size-4 shrink-0" />
+      <FolderTreeIcon className="size-3 shrink-0" />
       {/* Label collapses to icon-only on narrow viewports (mobile). Capped
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
-      <span
-        className={`hidden max-w-40 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
-      >
-        {workspaceLabel}
-      </span>
-      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
+      <span className="hidden max-w-40 truncate whitespace-nowrap sm:block">{workspaceLabel}</span>
     </button>
   );
 
   return (
-    // pb-12 lifts the content slightly above the geometric center, where
-    // the hero reads better optically.
+    // Keep the new-session controls in the upper third rather than vertically
+    // centering them in the full workspace. The clamped desktop offset stays
+    // comfortable on both laptop and tall displays.
     <div
       ref={setLandingSurface}
-      className="flex flex-1 items-center justify-center"
+      className="flex flex-1 items-start justify-center pt-[104px] md:pt-[clamp(128px,22vh,216px)]"
       data-testid="new-chat-landing"
     >
-      {/* Padding lives inside the 840px cap, so the composer renders at
-          840 − 80 = 760px max on desktop. px-4 on phones (16px gutters)
-          keeps the composer from feeling cramped against the viewport
-          edges; widens to the full px-10 at the md breakpoint and up. */}
-      <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex flex-col items-center gap-3.5 sm:flex-row">
-          <OttoEyes className="h-18 w-auto shrink-0" />
-          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
+      {/* Keep enough outer room for the greeting, while the landing composer
+          stays narrower than the in-session column so it remains visually
+          grouped with Otto and the prompt. px-4 on phones preserves 16px
+          gutters. */}
+      <div className="flex w-full max-w-[860px] flex-col items-center gap-6 px-4 pb-16 md:select-none md:px-10">
+        <div className="flex flex-col items-center gap-0">
+          <div
+            className="buoyant-enter relative h-[88px] w-[108px] shrink-0"
+            aria-hidden="true"
+            data-testid="new-chat-landing-otto"
+          >
+            <div className="otto-landing-halo absolute inset-1 rounded-full" />
+            <span className="otto-landing-orbit otto-landing-orbit--pink absolute top-[26px] left-2 h-[34px] w-[92px] rounded-[50%] border" />
+            <span className="otto-landing-orbit otto-landing-orbit--green absolute top-[31px] left-4 h-[26px] w-[77px] rounded-[50%] border" />
+            <span className="otto-landing-satellite otto-landing-satellite--pink absolute top-6 right-3 size-1 rounded-full" />
+            <span className="otto-landing-satellite otto-landing-satellite--green absolute bottom-[21px] left-4 size-1 rounded-full" />
+            <OttoEyes className="otto-landing-mascot absolute top-5 left-[30px] h-12 w-auto" />
+          </div>
+          <h1 className="brand-display-title buoyant-enter buoyant-enter--title text-center text-brand-title font-[450] tracking-[-0.035em] text-foreground">
+            What should we build?
           </h1>
         </div>
-        <div className="relative flex w-full flex-col gap-3">
-          <form
+        <div className="buoyant-enter buoyant-enter--composer relative flex w-full max-w-[704px] flex-col gap-0">
+          <ComposerFormSurface
             onSubmit={(e) => {
               e.preventDefault();
               void handleCreate();
@@ -3037,25 +3042,10 @@ export function NewChatLandingScreen() {
             onDragOver={handleDragOver}
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
-            // Two visual states only (no hover): resting --border, and
-            // --foreground while the textarea itself has focus (has-[]
-            // scopes it so focusing footer buttons doesn't trigger it).
-            // dark:bg-card-solid: the footer tray below tucks its top
-            // edge behind this card (-mt-9), and the dark glass --card
-            // is 60% alpha — the tucked strip ghosts through a
-            // translucent card. Mirrors the chat composer card. Drag-over
-            // lifts an inset ring (overlay below).
-            className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-[0_12px_20px_-20px_rgba(0,0,0,0.14),0_20px_28px_-28px_rgba(0,0,0,0.1)] transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground",
-              isDragActive && "ring-2 ring-ring ring-inset",
-            )}
+            className="landing-reference-composer"
+            isDragActive={isDragActive}
             data-testid="new-chat-landing-composer"
           >
-            {isDragActive && (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-card/80">
-                <span className="text-sm font-medium text-ring">Drop files here</span>
-              </div>
-            )}
             {/* Skill suggestions — floats above the composer box. */}
             {slashMenuOpen && (
               <SlashCommandMenu
@@ -3168,7 +3158,7 @@ export function NewChatLandingScreen() {
               }}
               // Suppress the native placeholder when the overlay supplies its
               // own prompt text; aria-label preserves the accessible name.
-              placeholder={pillSkills.length > 0 ? "" : "Describe a task to start a new session…"}
+              placeholder={pillSkills.length > 0 ? "" : "Ask anything..."}
               aria-label="Describe a task to start a new session"
               rows={1}
               autoFocus
@@ -3176,11 +3166,10 @@ export function NewChatLandingScreen() {
               // Compose-pill text spec: SF Pro Text system stack at
               // 14px/20px. (Note: sub-16px inputs make mobile Safari
               // auto-zoom on focus — accepted tradeoff per the design.)
-              // Heights are border-box (16px top + 4px bottom padding lives
-              // inside them): min 60px = one 20px line + a spare line of
-              // breathing room; max 200px = the spec's 180px of content.
-              // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              // Six pixels of block padding centers the 20px line inside the
+              // 32px control. useAutoGrowTextarea includes that padding when
+              // measuring additional lines.
+              className="order-2 h-8 max-h-[180px] min-h-8 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent px-0 py-[6px] font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-13 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
@@ -3213,7 +3202,7 @@ export function NewChatLandingScreen() {
                 delivered as an "[Attached: <path>]" marker prepended to the
                 first message at create time. */}
             {mentionedItems.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+              <div className="order-4 flex basis-full flex-wrap gap-1.5 pt-1">
                 {mentionedItems.map((item, i) => (
                   <span
                     key={mentionItemPath(item)}
@@ -3231,7 +3220,7 @@ export function NewChatLandingScreen() {
                     <button
                       type="button"
                       onClick={() => removeMentionedItem(i)}
-                      className="ml-0.5 rounded-full hover:text-foreground"
+                      className="ml-0.5 rounded-sm hover:text-foreground"
                       aria-label={`Remove ${item.path}`}
                     >
                       <XIcon className="size-3" />
@@ -3242,7 +3231,7 @@ export function NewChatLandingScreen() {
             )}
             {/* File chips — shown below the textarea when files are attached. */}
             {files.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+              <div className="order-4 flex basis-full flex-wrap gap-1.5 pt-1">
                 {files.map((file, i) => (
                   <span
                     key={i}
@@ -3257,7 +3246,7 @@ export function NewChatLandingScreen() {
                     <button
                       type="button"
                       onClick={() => removeFile(i)}
-                      className="ml-0.5 rounded-full hover:text-foreground"
+                      className="ml-0.5 rounded-sm hover:text-foreground"
                       aria-label={`Remove ${file.name || "image.png"}`}
                     >
                       <XIcon className="size-3" />
@@ -3269,14 +3258,14 @@ export function NewChatLandingScreen() {
             {/* No own bg — the pill paints the surface. An explicit bg-card
                 here would also catch the .dark .bg-card glass rule (border +
                 shadow) and visually split the pill in half. */}
-            <div className="flex items-center justify-between pt-1 pr-4 pb-3 pl-2">
+            <div className="contents">
               {/* Attach + dictate — left side, mirroring the in-session composer. */}
-              <div className="flex items-center gap-0.5">
+              <div className="order-1 flex items-center gap-[1px]">
                 <Button
                   type="button"
                   size="icon"
                   variant="ghost"
-                  className="size-9 md:size-8"
+                  className="size-8 rounded-[var(--radius-otto-button)] text-muted-foreground hover:text-foreground"
                   disabled={creating}
                   onClick={() => fileInputRef.current?.click()}
                   title="Attach files"
@@ -3291,7 +3280,7 @@ export function NewChatLandingScreen() {
                   onInterim={dictation.replaceInterim}
                 />
               </div>
-              <div className="flex items-center gap-0.5">
+              <div className="order-3 flex items-center gap-0.5">
                 {/* Unified agent / harness picker — selects the agent or
                   harness and exposes its run-config knobs in a per-entry
                   submenu (model / effort / permission mode for Claude Code,
@@ -3345,7 +3334,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
+                          className="buoyant-send-action size-8 rounded-sm bg-foreground text-card transition-[opacity,transform] hover:opacity-80 active:rounded-[calc(var(--radius-otto-button)+2px)] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
@@ -3362,18 +3351,11 @@ export function NewChatLandingScreen() {
                 </TooltipProvider>
               </div>
             </div>
-          </form>
-          {/* Composer footer tray — host / working directory / worktree
-              selectors. Renders below the pill at z-0 while the pill sits
-              at z-10: -mt-9 cancels the wrapper's gap-3 (12px) and tucks
-              the tray's top 24px underneath the pill's rounded bottom
-              edge. Height is padding-driven (pt-8 + h-6 chips + pb-2 =
-              the same 64px as before when the chips fit one row) so the
-              chip row can wrap on narrow screens — with a fixed h-16 the
-              chips overflowed the viewport on phones, widening the whole
-              page (#sidebar-wider-than-screen on the landing page). */}
-          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl bg-tray/40 pt-8 pr-3 pb-2 pl-2">
-            <div className="flex flex-wrap items-center gap-1">
+          </ComposerFormSurface>
+          {/* Borderless context row beneath the composer: 36px tall with
+              transparent 24px controls and no inter-chip gap. */}
+          <div className="relative z-0 w-full [&_button]:hover:!bg-transparent">
+            <div className="ml-2 flex min-h-9 min-w-0 flex-nowrap items-center gap-0 overflow-hidden rounded-b-[var(--radius-otto-lg)] px-0 py-1.5">
               {/* Host chip */}
               <DropdownMenu
                 onOpenChange={(open) => {
@@ -3388,20 +3370,13 @@ export function NewChatLandingScreen() {
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
-                    {isCloudHost ? (
-                      <MonitorCloudIcon className="size-4 shrink-0" />
-                    ) : (
-                      <MonitorIcon className="size-4 shrink-0" />
-                    )}
-                    <span
-                      className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
-                    >
+                    <MonitorCloudIcon className="size-3 shrink-0" />
+                    <span className="hidden max-w-32 truncate whitespace-nowrap sm:block">
                       {hostLabel}
                     </span>
-                    <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
@@ -3552,16 +3527,13 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                       data-testid="new-chat-landing-repo-chip"
                     >
-                      <GitBranchIcon className="size-4 shrink-0" />
-                      <span
-                        className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
-                      >
+                      <GitBranchIcon className="size-3 shrink-0" />
+                      <span className="hidden max-w-40 truncate whitespace-nowrap sm:block">
                         {sandboxRepoLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent align="start" className="w-96 p-3">
@@ -3662,16 +3634,13 @@ export function NewChatLandingScreen() {
                   <PopoverTrigger asChild>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      className="flex h-6 min-w-0 max-w-full items-center gap-1 rounded-sm border border-transparent bg-transparent px-2 text-xs leading-4 font-normal text-landing-footer transition-colors hover:bg-transparent hover:text-foreground"
                       data-testid="new-chat-landing-branch-chip"
                     >
-                      <GitBranchIcon className="size-4 shrink-0" />
-                      <span
-                        className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
-                      >
+                      <GitForkIcon className="size-3 shrink-0" />
+                      <span className="hidden max-w-32 truncate whitespace-nowrap sm:block">
                         {worktreeLabel}
                       </span>
-                      <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                     </button>
                   </PopoverTrigger>
                   <PopoverContent
@@ -3870,7 +3839,7 @@ export function NewChatLandingScreen() {
           {supportsApprovalMode && bypassSandbox && (
             <p
               role="alert"
-              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive"
+              className="flex items-center gap-1.5 rounded-md border border-destructive bg-destructive/10 px-2 py-1.5 text-xs font-medium text-destructive [box-shadow:var(--elevation-otto-1)]"
               data-testid="new-chat-landing-bypass-sandbox-active-banner"
             >
               <TriangleAlertIcon className="size-3.5 shrink-0" />

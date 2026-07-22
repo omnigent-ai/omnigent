@@ -2,13 +2,7 @@ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
 
 export type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "idle"
-  | "other";
+  "launching" | "working" | "awaiting" | "done" | "failed" | "idle" | "other";
 
 export interface AgentNodeData {
   label: string;

@@ -13,7 +13,13 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { shortModelName } from "@/components/CostRoutingControl";
 import type { ToolState } from "@/lib/renderItems";
 import { cn } from "@/lib/utils";
-import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
+import {
+  COMPACT_TRANSCRIPT_CARD_CLASS,
+  TOOL_SURFACE_WIDTH_CLASS,
+  TRANSCRIPT_CARD_BODY_CLASS,
+  TRANSCRIPT_CARD_META_CLASS,
+  TRANSCRIPT_CARD_TITLE_CLASS,
+} from "./toolSurface";
 
 /** One dispatch the orchestrator planned (from the tool's `tasks` args). */
 interface PlannedTask {
@@ -165,17 +171,20 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
     <Collapsible
       defaultOpen={false}
       className={cn(
-        "group not-prose my-1 flex flex-col gap-1.5 rounded-md border border-border bg-muted/30 px-3 py-2",
+        "group not-prose my-1 flex flex-col gap-1.5 px-3 py-2",
+        COMPACT_TRANSCRIPT_CARD_CLASS,
+        failed &&
+          "border-destructive/20 bg-destructive/[0.035] dark:border-destructive/25 dark:bg-destructive/[0.06]",
         TOOL_SURFACE_WIDTH_CLASS,
       )}
       data-testid="smart-routing-card"
       data-state-kind={judging ? "judging" : failed ? "failed" : "sized"}
     >
-      <div className="flex items-center gap-1.5 text-xs">
+      <div className={cn("flex items-center gap-1.5", TRANSCRIPT_CARD_TITLE_CLASS)}>
         <BrainIcon className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="font-medium">Intelligent routing</span>
         {judging ? (
-          <Shimmer as="span" className="text-xs">
+          <Shimmer as="span" className={TRANSCRIPT_CARD_BODY_CLASS}>
             {`Weighing ${tasks.length} ${taskNoun}…`}
           </Shimmer>
         ) : (
@@ -194,7 +203,10 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
         )}
       </div>
       {failed ? (
-        <p className="text-xs text-muted-foreground" data-testid="smart-routing-error">
+        <p
+          className={cn("text-muted-foreground", TRANSCRIPT_CARD_BODY_CLASS)}
+          data-testid="smart-routing-error"
+        >
           {output ?? "No routing decision was recorded for this fan-out."}
         </p>
       ) : (
@@ -202,7 +214,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
           const rec = recommendations?.get(task.title) ?? null;
           return (
             <div key={task.title} className="flex flex-col gap-0.5">
-              <div className="flex items-center gap-2 text-xs">
+              <div className={cn("flex items-center gap-2", TRANSCRIPT_CARD_BODY_CLASS)}>
                 <span className="min-w-0 truncate font-mono text-foreground">{task.title}</span>
                 {(rec?.agent ?? task.agent).length > 0 && (
                   <span className="shrink-0 text-muted-foreground/70">
@@ -211,11 +223,16 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
                 )}
                 <span className="ml-auto shrink-0">
                   {rec !== null ? (
-                    <span className="inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground">
+                    <span
+                      className={cn(
+                        "inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono font-medium text-foreground",
+                        TRANSCRIPT_CARD_META_CLASS,
+                      )}
+                    >
                       {shortModelName(rec.model)}
                     </span>
                   ) : judging ? (
-                    <Shimmer as="span" className="text-xs">
+                    <Shimmer as="span" className={TRANSCRIPT_CARD_BODY_CLASS}>
                       {`${ROUTING_VERBS[i % ROUTING_VERBS.length]}…`}
                     </Shimmer>
                   ) : (
@@ -224,7 +241,9 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
                 </span>
               </div>
               {rec !== null && rec.rationale.length > 0 && (
-                <p className="text-xs leading-snug text-muted-foreground">{rec.rationale}</p>
+                <p className={cn("text-muted-foreground", TRANSCRIPT_CARD_BODY_CLASS)}>
+                  {rec.rationale}
+                </p>
               )}
             </div>
           );

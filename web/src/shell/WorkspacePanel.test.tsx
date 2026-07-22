@@ -89,6 +89,14 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel open-file tabs", () => {
+  it("uses the Otto structural-container radius", () => {
+    renderWorkspace();
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass(
+      "md:rounded-[var(--radius-otto-md)]",
+      "md:m-2",
+    );
+  });
+
   it("renders a tab per open file labeled by basename, next to the fixed Files tab", () => {
     renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"] });
 
@@ -188,14 +196,16 @@ describe("WorkspacePanel content area", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
-  it("renders the Browser tab only when showBrowserTab is set", () => {
+  it("enables the Browser tab when the desktop bridge is available", () => {
     renderWorkspace({ showBrowserTab: true });
-    expect(screen.getByRole("tab", { name: /browser/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Browser" })).toBeEnabled();
   });
 
-  it("omits the Browser tab when showBrowserTab is false", () => {
+  it("keeps a disabled Browser icon visible when the desktop bridge is unavailable", () => {
     renderWorkspace({ showBrowserTab: false });
-    expect(screen.queryByRole("tab", { name: /browser/i })).toBeNull();
+    expect(
+      screen.getByRole("tab", { name: "Browser — available in the desktop app" }),
+    ).toBeDisabled();
   });
 
   it("mounts the browser pane when the browser tab is selected", () => {

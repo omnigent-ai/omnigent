@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MessageResponse } from "./message";
+import { Message, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -19,6 +19,40 @@ afterEach(() => {
   } else {
     delete (Document.prototype as { execCommand?: unknown }).execCommand;
   }
+});
+
+describe("MessageContent", () => {
+  it("uses dedicated theme-specific user bubble colors", () => {
+    render(
+      <Message from="user">
+        <MessageContent>Theme-aware prompt</MessageContent>
+      </Message>,
+    );
+
+    const prompt = screen.getByText("Theme-aware prompt");
+    expect(prompt).toHaveClass(
+      "group-[.is-user]:rounded-[var(--radius-otto-md)]",
+      "group-[.is-user]:bg-user-bubble",
+      "group-[.is-user]:text-user-bubble-foreground",
+      "group-[.is-user]:ring-user-bubble-border",
+    );
+    expect(prompt).not.toHaveClass("group-[.is-user]:bg-muted", "group-[.is-user]:text-foreground");
+  });
+
+  it("uses readable theme-specific assistant typography", () => {
+    render(
+      <Message from="assistant">
+        <MessageContent>Theme-aware response</MessageContent>
+      </Message>,
+    );
+
+    const response = screen.getByText("Theme-aware response");
+    expect(response).toHaveClass(
+      "group-[.is-assistant]:text-[14px]",
+      "group-[.is-assistant]:leading-5",
+      "group-[.is-assistant]:text-assistant-foreground",
+    );
+  });
 });
 
 describe("MessageResponse", () => {
@@ -63,7 +97,14 @@ describe("MessageResponse code-block copy", () => {
       <MessageResponse>{"```ts\nconst value = 1;\nconsole.log(value);\n```"}</MessageResponse>,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "Copy Code" }));
+    const wrapButton = await screen.findByRole("button", { name: "Toggle word wrap" });
+    const copyButton = screen.getByRole("button", { name: "Copy Code" });
+    expect(wrapButton).toHaveClass("size-6");
+    expect(copyButton).toHaveClass("size-6");
+    expect(wrapButton).toHaveClass("rounded-[var(--radius-otto-xs)]");
+    expect(copyButton).toHaveClass("rounded-[var(--radius-otto-xs)]");
+
+    fireEvent.click(copyButton);
 
     await waitFor(() => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);

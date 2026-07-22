@@ -72,7 +72,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
         </div>
       )}
       {hasBody && open && (
-        <div className="mt-0.5 max-h-64 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-muted px-3 py-2 text-left text-xs text-muted-foreground">
+        <div className="mt-0.5 max-h-64 max-w-full overflow-auto whitespace-pre-wrap rounded-md border border-[var(--border-otto-hairline)] bg-muted/40 px-3 py-2 text-left text-xs text-muted-foreground [box-shadow:var(--elevation-otto-1)]">
           {message.body}
         </div>
       )}

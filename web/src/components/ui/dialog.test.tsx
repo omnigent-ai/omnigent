@@ -33,6 +33,15 @@ function renderDialog() {
 }
 
 describe("DialogContent keyboard-aware sizing", () => {
+  it("uses the major-surface Otto silhouette and elevation", () => {
+    renderDialog();
+    expect(screen.getByRole("dialog")).toHaveClass(
+      "rounded-[var(--radius-otto-lg)]",
+      "[box-shadow:var(--elevation-otto-2)]",
+      "ease-[var(--ease-otto)]",
+    );
+  });
+
   it("caps height and centering to the visible viewport inside the iOS shell", () => {
     setIOS(true);
     renderDialog();

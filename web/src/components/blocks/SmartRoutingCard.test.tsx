@@ -98,6 +98,7 @@ describe("SmartRoutingCard — judging (in-flight)", () => {
     render(<SmartRoutingCard arguments={TWO_TASK_ARGS} output={null} state="input-available" />);
     expect(card().getAttribute("data-state-kind")).toBe("judging");
     expect(card()).toHaveTextContent("Intelligent routing");
+    expect(screen.getByText("Intelligent routing").parentElement).toHaveClass("text-card-title");
     expect(card()).toHaveTextContent("Weighing 2 tasks…");
     // Rows render immediately from the args so the plan shape is visible
     // while the judge runs.
@@ -164,6 +165,7 @@ describe("SmartRoutingCard — failure", () => {
       "dispatch with your own model choices.";
     render(<SmartRoutingCard arguments={TWO_TASK_ARGS} output={error} state="output-available" />);
     expect(card().getAttribute("data-state-kind")).toBe("failed");
+    expect(card()).toHaveClass("rounded-md", "border-destructive/20", "bg-destructive/[0.035]");
     // The error text is the honest content — rendering rows would imply an
     // enforced plan exists when none was installed.
     expect(screen.getByTestId("smart-routing-error")).toHaveTextContent("judge call failed");

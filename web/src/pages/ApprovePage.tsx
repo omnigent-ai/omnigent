@@ -131,7 +131,7 @@ export function ApprovePage() {
           <AlertTitle className="flex items-center gap-2 text-sm">
             {state.action === "accept" ? (
               <>
-                <CheckIcon className="size-4 text-success" />
+                <CheckIcon className="size-4 text-success-foreground" />
                 Approved
               </>
             ) : (
@@ -148,7 +148,7 @@ export function ApprovePage() {
       {state.kind === "pending" && (
         <Alert className="flex flex-col gap-3 py-4 px-5">
           <AlertTitle className="flex items-center gap-2 text-sm">
-            <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
+            <MessageCircleQuestionMark className="size-4 text-warning-foreground" />
             Approval required
             {state.data.policy_name && (
               <span className="text-muted-foreground text-xs">· {state.data.policy_name}</span>

@@ -1,9 +1,13 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { ChatHeader } from "./ChatHeader";
+import {
+  TerminalFirstContextProvider,
+  type TerminalFirstContextValue,
+} from "./TerminalFirstContext";
 
 // Minimal mobile-menu prop block. All gating booleans are false / counts are
 // zero so the mobile FAB and three-dot menu never render — these tests only
@@ -39,37 +43,126 @@ function renderHeader(props: {
   isChildSession?: boolean;
   parentSessionId?: string;
   boundAgent?: Agent;
+  conversationId?: string;
+  sessionTitle?: string;
+  terminalFirstContext?: TerminalFirstContextValue;
 }) {
+  const header = (
+    <ChatHeader
+      sidebarOpen={props.sidebarOpen}
+      onOpenSidebar={() => {}}
+      isChildSession={props.isChildSession ?? false}
+      parentSessionId={props.parentSessionId}
+      // No active session: PresenceAvatars / AgentInfoButton / right-panel
+      // toggle / mobile FAB all gate on conversationId and stay unmounted,
+      // isolating the left-slot affordances under test.
+      conversationId={props.conversationId}
+      sessionTitle={props.sessionTitle}
+      boundAgent={props.boundAgent}
+      canShare={false}
+      onShare={() => {}}
+      hasAgentInfo={false}
+      onAgentInfo={() => {}}
+      hasHeaderMenu={false}
+      showFilesPanel={false}
+      hasRailContent={false}
+      rightPanelOpen={false}
+      onToggleRightPanel={() => {}}
+      mobileMenu={mobileMenu}
+    />
+  );
+
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <TooltipProvider>
-        <ChatHeader
-          sidebarOpen={props.sidebarOpen}
-          onOpenSidebar={() => {}}
-          isChildSession={props.isChildSession ?? false}
-          parentSessionId={props.parentSessionId}
-          // No active session: PresenceAvatars / AgentInfoButton / right-panel
-          // toggle / mobile FAB all gate on conversationId and stay unmounted,
-          // isolating the left-slot affordances under test.
-          conversationId={undefined}
-          boundAgent={props.boundAgent}
-          canShare={false}
-          onShare={() => {}}
-          hasAgentInfo={false}
-          onAgentInfo={() => {}}
-          hasHeaderMenu={false}
-          showFilesPanel={false}
-          hasRailContent={false}
-          rightPanelOpen={false}
-          onToggleRightPanel={() => {}}
-          mobileMenu={mobileMenu}
-        />
+        {props.terminalFirstContext ? (
+          <TerminalFirstContextProvider value={props.terminalFirstContext}>
+            {header}
+          </TerminalFirstContextProvider>
+        ) : (
+          header
+        )}
       </TooltipProvider>
     </MemoryRouter>,
   );
 }
 
 afterEach(cleanup);
+
+describe("ChatHeader — left-aligned session title", () => {
+  it("shows the active session title in the header", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "session-123",
+      sessionTitle: "Rethink new user onboarding",
+    });
+
+    const title = screen.getByText("Rethink new user onboarding");
+    expect(title).toBeInTheDocument();
+    expect(title).not.toHaveClass("absolute");
+    expect(title.parentElement).toHaveClass("flex-1");
+    expect(screen.getByTestId("chat-header")).toHaveClass("chat-header-session");
+    expect(screen.getByTestId("chat-header")).not.toHaveClass("md:border-b", "md:border-border");
+  });
+
+  it("does not render a title without an active session", () => {
+    renderHeader({ sidebarOpen: true, sessionTitle: "Hidden landing title" });
+
+    expect(screen.queryByText("Hidden landing title")).toBeNull();
+    expect(screen.getByTestId("chat-header")).not.toHaveClass("chat-header-session");
+  });
+});
+
+describe("ChatHeader — terminal-first view switcher", () => {
+  function makeContext(
+    overrides: Partial<TerminalFirstContextValue> = {},
+  ): TerminalFirstContextValue {
+    return {
+      isClaudeNative: true,
+      isNativeWrapper: true,
+      isTerminalFirst: true,
+      isShellView: false,
+      view: "chat",
+      terminalViewKey: null,
+      setView: vi.fn(),
+      terminalsAvailable: true,
+      terminalStartingUp: false,
+      ...overrides,
+    };
+  }
+
+  it("renders the desktop Chat/Terminal switcher and changes views", () => {
+    const setView = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "session-123",
+      terminalFirstContext: makeContext({ setView }),
+    });
+
+    const group = screen.getByRole("group", { name: "View mode" });
+    expect(group).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    expect(setView).toHaveBeenCalledWith("terminal");
+  });
+
+  it("keeps an unavailable terminal disabled and exposes its loading state", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "session-123",
+      terminalFirstContext: makeContext({
+        terminalsAvailable: false,
+        terminalStartingUp: true,
+      }),
+    });
+
+    const terminalButton = screen.getByRole("button", { name: "Terminal" });
+    expect(terminalButton).toBeDisabled();
+    expect(terminalButton).toHaveAttribute("title", expect.stringMatching(/starting up/i));
+    expect(terminalButton.querySelector(".animate-spin")).not.toBeNull();
+  });
+});
 
 describe("ChatHeader — open-sidebar toggle visibility", () => {
   it("hides the toggle entirely when the sidebar is open", () => {

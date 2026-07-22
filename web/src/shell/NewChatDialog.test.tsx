@@ -702,8 +702,19 @@ describe("NewChatLandingScreen", () => {
     // The home page offers an inline chat box rather than the old
     // "click New session in the sidebar" placeholder. If it regressed to
     // the placeholder, the composer input would be absent and this fails.
-    expect(screen.getByText("What should we do?")).toBeTruthy();
+    expect(screen.getByText("What should we build?")).toHaveClass(
+      "brand-display-title",
+      "font-[450]",
+      "tracking-[-0.035em]",
+    );
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+    expect(screen.getByPlaceholderText("Ask anything...")).toBeTruthy();
+    const otto = screen.getByTestId("new-chat-landing-otto");
+    const mascot = otto.querySelector(".otto-landing-mascot");
+    expect(mascot).toBeTruthy();
+    expect(mascot).toHaveClass("otto-landing-mascot");
+    expect(otto.querySelector(".otto-landing-halo")).toBeTruthy();
+    expect(otto.querySelectorAll(".otto-landing-orbit")).toHaveLength(2);
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
@@ -732,6 +743,20 @@ describe("NewChatLandingScreen", () => {
   it("enables submit only once a message, host, agent and valid workspace are set", async () => {
     renderLanding();
     const submit = screen.getByTestId("new-chat-landing-submit") as HTMLButtonElement;
+    expect(screen.getByTestId("new-chat-landing-otto")).toHaveClass("buoyant-enter");
+    expect(screen.getByText("What should we build?")).toHaveClass(
+      "buoyant-enter",
+      "buoyant-enter--title",
+    );
+    expect(screen.getByTestId("new-chat-landing-composer").parentElement).toHaveClass(
+      "buoyant-enter",
+      "buoyant-enter--composer",
+    );
+    expect(submit).toHaveClass(
+      "buoyant-send-action",
+      "rounded-sm",
+      "active:rounded-[calc(var(--radius-otto-button)+2px)]",
+    );
     // Host (auto-selected) + agent (default) + workspace (seeded from the
     // recent) are all present, but with no message there's no task → disabled.
     await waitFor(() =>
@@ -1035,6 +1060,7 @@ describe("NewChatLandingScreen", () => {
       ).getAttribute("aria-checked"),
     ).toBe("true");
     const banner = screen.getByTestId("new-chat-landing-bypass-sandbox-banner");
+    expect(banner).toHaveClass("rounded-md", "[box-shadow:var(--elevation-otto-1)]");
     expect(banner.textContent).toContain("approvals and the sandbox disabled");
   });
 
@@ -1050,7 +1076,10 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-bypass-sandbox-switch"));
     closeMenu();
     // Armed → the persistent banner is up under the composer.
-    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-bypass-sandbox-active-banner")).toHaveClass(
+      "rounded-md",
+      "[box-shadow:var(--elevation-otto-1)]",
+    );
 
     // Switch away to Claude (a1): the armed bypass must clear immediately, so
     // the persistent banner disappears (Claude has no bypass toggle at all).
@@ -1140,6 +1169,39 @@ describe("NewChatLandingScreen", () => {
     expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
+  });
+
+  it("uses the footer icons for host, directory, and worktree", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    expect(
+      screen.getByTestId("new-chat-landing-host-chip").querySelector("svg.lucide-monitor-cloud"),
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId("new-chat-landing-workspace-chip").querySelector("svg.lucide-folder-tree"),
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId("new-chat-landing-branch-chip").querySelector("svg.lucide-git-fork"),
+    ).toBeTruthy();
+  });
+
+  it("uses the lighter color for every landing footer badge", async () => {
+    renderLanding({}, "/?project=docs");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    for (const testId of [
+      "new-chat-landing-host-chip",
+      "new-chat-landing-project-chip",
+      "new-chat-landing-workspace-chip",
+      "new-chat-landing-branch-chip",
+    ]) {
+      expect(screen.getByTestId(testId)).toHaveClass("text-landing-footer");
+    }
   });
 
   it("suppresses the conflict banner once a git branch is named", async () => {

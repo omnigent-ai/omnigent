@@ -35,7 +35,7 @@ export function SkillPills({
               type="button"
               data-testid={`skill-pill-${skill.name}`}
               onClick={() => onPick(skill.name)}
-              className="pointer-events-auto rounded-md bg-brand-accent/10 px-2 py-1 text-13 leading-none text-brand-accent transition-colors hover:bg-brand-accent/15"
+              className="pointer-events-auto rounded-sm bg-brand-accent/10 px-2 py-1 text-13 leading-none text-brand-accent transition-colors hover:bg-brand-accent/15"
             >
               /{skill.name}
             </button>

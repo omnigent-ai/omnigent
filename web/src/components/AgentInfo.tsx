@@ -94,7 +94,7 @@ export function McpServerList({
             <PopoverTrigger asChild>
               <button
                 type="button"
-                className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                className="flex cursor-pointer items-center gap-0.5 rounded-sm border border-border bg-muted px-1.5 py-0.5 font-mono text-10 text-muted-foreground hover:bg-muted/80"
                 onClick={(e) => e.stopPropagation()}
               >
                 <ServerIcon className="size-2.5 shrink-0" />
@@ -612,7 +612,7 @@ function AddPolicyDialog({
           {(paramError || addPolicy.isError) && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
             >
               {paramError ?? addPolicy.error?.message}
             </div>
@@ -825,7 +825,7 @@ function McpServerManagerDialog({
           <DialogDescription>Add, edit, or remove MCP servers for this session.</DialogDescription>
         </DialogHeader>
         {dirty && (
-          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-400">
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 [box-shadow:var(--elevation-otto-1)] dark:text-yellow-400">
             <AlertTriangleIcon className="size-4 shrink-0" />
             Restart the session to apply your changes.
           </div>
@@ -1017,7 +1017,7 @@ function McpServerManagerDialog({
             {(formError || mutationError) && (
               <div
                 role="alert"
-                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive [box-shadow:var(--elevation-otto-1)]"
               >
                 {formError ?? mutationError}
               </div>
@@ -1171,7 +1171,7 @@ function SessionPoliciesSection({ sessionId }: { sessionId: string }) {
                 <PopoverTrigger asChild>
                   <button
                     type="button"
-                    className="flex cursor-pointer items-center gap-0.5 rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground hover:bg-muted/80"
+                    className="flex cursor-pointer items-center gap-0.5 rounded-sm border border-border bg-muted px-1.5 py-0.5 font-mono text-10 text-muted-foreground hover:bg-muted/80"
                     onClick={(e) => e.stopPropagation()}
                   >
                     <ShieldCheckIcon className="size-2.5 shrink-0" />
@@ -1529,7 +1529,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
             <Button
               type="button"
               variant="ghost"
-              size="icon"
+              size="icon-xs"
               aria-label="Agent tools and policies"
               data-testid="agent-info-trigger"
               className="hidden text-muted-foreground hover:text-foreground md:inline-flex"

@@ -254,6 +254,20 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
 
+  it("persists the sidebar timestamp visibility preference", () => {
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("sidebar-timestamps-toggle");
+
+    expect(toggle).toHaveAttribute("data-state", "checked");
+    fireEvent.click(toggle);
+    expect(localStorage.getItem("omnigent:show-sidebar-timestamps")).toBe("false");
+    expect(toggle).toHaveAttribute("data-state", "unchecked");
+
+    fireEvent.click(toggle);
+    expect(localStorage.getItem("omnigent:show-sidebar-timestamps")).toBeNull();
+    expect(toggle).toHaveAttribute("data-state", "checked");
+  });
+
   it("renders the Terminal theme radiogroup with auto selected by default", () => {
     renderPage("/settings/appearance");
     expect(screen.getByRole("radiogroup", { name: "Terminal theme" })).toBeInTheDocument();
@@ -306,6 +320,16 @@ describe("SettingsPage", () => {
     expect(select.value).toBe("github");
     expect(document.documentElement.getAttribute("data-theme")).toBe("github");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+
+    fireEvent.change(select, { target: { value: "omni-rose" } });
+    expect(select.value).toBe("omni-rose");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("omni-rose");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("omni-rose"));
+
+    fireEvent.change(select, { target: { value: "otto-dream" } });
+    expect(select.value).toBe("otto-dream");
+    expect(document.documentElement.getAttribute("data-theme")).toBe("otto-dream");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("otto-dream"));
   });
 
   it("creates and applies a custom theme when a guided color control changes", () => {

@@ -6,11 +6,12 @@
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { writeShowSidebarTimestamps } from "@/lib/sidebarTimestampPreferences";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
@@ -239,25 +240,30 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders the footer Settings as an icon-only floating control on mobile", () => {
+  it("renders the compact header controls and navigation rows", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
     const settings = screen.getByTestId("settings-button");
-    // Accessible name survives even though the label is visually dropped on
-    // mobile (the icon stands alone there).
     expect(settings).toHaveAttribute("aria-label", "Settings");
-    // Mobile: compact square icon button, out of flow at the bottom-left.
-    expect(settings.className).toContain("max-md:size-9");
-    // The text label is desktop-only.
-    const label = within(settings).getByText("Settings");
-    expect(label.className).toContain("max-md:hidden");
+    expect(settings).toHaveClass("size-6", "text-muted-foreground", "hover:text-foreground");
+    expect(screen.getByTestId("sidebar-search-button")).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Close sidebar" })).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+    expect(screen.getByRole("link", { name: "Customize" })).toHaveAttribute(
+      "href",
+      "/settings/appearance",
+    );
+    expect(screen.getByTestId("sidebar-more-button")).toHaveTextContent("More");
   });
 
-  it("does NOT close the sidebar when the footer Settings is tapped", () => {
-    // No onNavClick on the footer Settings link: on mobile the overlay stays
-    // open and swaps to the settings section list rather than collapsing onto
-    // the default section's content.
+  it("does NOT close the sidebar when the header Settings control is tapped", () => {
+    // Settings swaps to the section list without collapsing the mobile overlay.
     mockConversations(THREE_TYPE_CONVERSATIONS);
     const onClose = vi.fn();
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -282,13 +288,13 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     // There is no longer an "Archived" section in the sidebar — archived
-    // chats are surfaced on /settings, reached via the footer Settings row.
+    // chats are surfaced on /settings, reached via the header Settings control.
     expect(screen.queryByRole("button", { name: "Archived" })).toBeNull();
     expect(screen.queryByText("conv_archived")).toBeNull();
     // Active sessions still render in the Sessions list.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
-    // The footer Settings link points at the settings page.
+    // The header Settings link points at the settings page.
     expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
   });
 
@@ -356,6 +362,18 @@ describe("Sidebar session list", () => {
     // it everywhere would be an over-broad fix.
     const idleRow = screen.getByRole("link", { name: /conv_idle/ }).closest("li")!;
     expect(within(idleRow).getByText("now")).toBeInTheDocument();
+
+    act(() => writeShowSidebarTimestamps(false));
+
+    expect(within(idleRow).queryByText("now")).toBeNull();
+    expect(within(workingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "running",
+    );
+    expect(within(awaitingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "awaiting",
+    );
   });
 });
 
@@ -693,6 +711,10 @@ describe("Sidebar project sections", () => {
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_far_1")).toBeInTheDocument();
     expect(within(projectSection).getByText("conv_far_2")).toBeInTheDocument();
+    const nestedList = within(projectSection)
+      .getByRole("link", { name: /conv_far_1/ })
+      .closest("ul");
+    expect(nestedList).toHaveClass("pl-6", "gap-0");
   });
 
   it("offers a pencil that starts a new session pre-filed under the project", () => {
