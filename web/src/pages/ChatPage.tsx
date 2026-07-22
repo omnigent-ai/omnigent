@@ -3670,12 +3670,13 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  // The offline-host reconnect affordance lives in the host badge. It renders
-  // even for sub-agent sessions — they get the same reconnect path as a normal
-  // session, unlike the passive name badge (`showHost`) which stays hidden for
-  // a child. The tray must render for it even when every other slot is empty
-  // (an unreachable session often has no branch/ring/harness yet).
-  const showReconnect = !!conversationId && !!onHostReconnect;
+  // The offline-host reconnect affordance lives in the host badge, so the tray
+  // must render even when every other slot is empty (an unreachable session
+  // often has no branch/ring/harness yet). Gated by `showHost`: only host-bound
+  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
+  // never host-bound — a stranded child is `local_stranded`, which keeps its
+  // banner elsewhere.
+  const showReconnect = showHost && !!onHostReconnect;
   if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness && !showReconnect)
     return null;
 
@@ -3699,7 +3700,7 @@ function ComposerStatusLine({
           so the right cluster stays pinned right even when both are absent;
           each item truncates to an ellipsis so the tray never wraps. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
-        {(showHost || showReconnect) && conversationId && (
+        {showHost && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
         )}
         {showBranch && (
