@@ -2293,9 +2293,11 @@ export function NewChatLandingScreen() {
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // Smart routing is offered in the config modal — as a Model choice for Claude,
   // a standalone toggle otherwise — when the server enables it and the selected
-  // harness is routable.
-  const smartRoutingEligible =
-    smartRoutingEnabled && _ROUTABLE_HARNESSES.has(selectedAgent?.harness ?? "");
+  // harness is routable. Use the EFFECTIVE harness (a bundle agent's brain-
+  // harness override wins over its spec harness), so overriding Polly/Debby to a
+  // non-routable harness (e.g. Cursor) correctly drops routing eligibility.
+  const effectiveHarness = pickedHarness ?? selectedAgent?.harness ?? "";
+  const smartRoutingEligible = smartRoutingEnabled && _ROUTABLE_HARNESSES.has(effectiveHarness);
   // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
@@ -3022,8 +3024,13 @@ export function NewChatLandingScreen() {
             model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
-            // Smart routing toggle — server-side, available for any agent.
-            cost_control_mode_override: costControlMode ?? undefined,
+            // Smart routing toggle — server-side. Only send it when routing is
+            // actually eligible for the effective harness, so a stale "on" (from
+            // a since-overridden harness, or the server flag flipping off) can't
+            // ride along invisibly with no control to clear it.
+            cost_control_mode_override: smartRoutingEligible
+              ? (costControlMode ?? undefined)
+              : undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });

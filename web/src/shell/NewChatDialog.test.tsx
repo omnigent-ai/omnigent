@@ -2459,6 +2459,43 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(body.agent_id).toBe("a2");
     expect(body.cost_control_mode_override).toBeUndefined();
   });
+
+  it("drops Smart Routing when a bundle agent is overridden to a non-routable harness", async () => {
+    // A bundle agent on a routable brain harness (claude-sdk) offers both the
+    // Smart Routing toggle and the Agent Harness override. Arming routing and
+    // then overriding to a NON-routable harness (Cursor) must drop eligibility,
+    // so the create omits cost_control_mode_override — routing can't ride along
+    // invisibly for a harness that can't route.
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+    renderLanding({ smart_routing_enabled: true });
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+    // Arm routing, then override the brain harness to non-routable Cursor.
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-smart-routing"));
+    pickSelectOption("new-chat-landing-config-harness", "Cursor");
+    saveConfig();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "go" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.harness_override).toBe("cursor");
+    expect(body.cost_control_mode_override).toBeUndefined();
+  });
 });
 
 describe("NewChatLandingScreen custom-agent sandbox gating", () => {
