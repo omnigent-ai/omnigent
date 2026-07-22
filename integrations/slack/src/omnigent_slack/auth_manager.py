@@ -112,6 +112,13 @@ class AuthManager:
         self._rotator = rotator
         # Track in-flight login poll tasks so they aren't garbage collected.
         self._login_tasks: set[asyncio.Task[Any]] = set()
+        # In-flight login/enrollment poll per (team, user, server). A fresh
+        # ``/omnigent`` (or a Slack-redelivered slash command) supersedes the
+        # prior attempt: without this, each re-run stacks ANOTHER device-grant +
+        # poll, so several polls race and approving one browser code doesn't
+        # resolve the modal bound to a different, still-pending code — a stuck
+        # "waiting for approval…" modal.
+        self._login_polls: dict[tuple[str, str, str], asyncio.Task[Any]] = {}
 
     def _new_client(self, server_url: str) -> DeviceFlowClient:
         """Construct a device-flow client for a server."""
@@ -127,6 +134,29 @@ class AuthManager:
         task = asyncio.ensure_future(coro)
         self._login_tasks.add(task)
         task.add_done_callback(self._login_tasks.discard)
+
+    def _spawn_login_poll(self, key: tuple[str, str, str], coro: Awaitable[None]) -> None:
+        """Spawn a login/enrollment poll for ``key``, superseding any prior one.
+
+        Cancels an existing in-flight poll for the same (team, user, server) so a
+        re-run of setup doesn't leave a stale poll racing the new one. Tracked in
+        both ``_login_tasks`` (shutdown) and ``_login_polls`` (per-key supersede).
+        """
+        existing = self._login_polls.pop(key, None)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        task = asyncio.ensure_future(coro)
+        self._login_tasks.add(task)
+        self._login_polls[key] = task
+
+        def _cleanup(t: asyncio.Task[Any]) -> None:
+            self._login_tasks.discard(t)
+            # Only clear the map slot if it still points at THIS task (a newer
+            # poll may have already replaced it).
+            if self._login_polls.get(key) is t:
+                del self._login_polls[key]
+
+        task.add_done_callback(_cleanup)
 
     async def shutdown(self) -> None:
         """Cancel in-flight login/enrollment poll tasks (called on bot shutdown).
@@ -288,7 +318,8 @@ class AuthManager:
         ``on_failure`` runs with a human-readable reason. UI-agnostic:
         this method never touches Slack directly.
         """
-        self._spawn_tracked(
+        self._spawn_login_poll(
+            (team_id, user_id, server_url.rstrip("/")),
             self._await_authorization(
                 pending=pending,
                 team_id=team_id,
@@ -296,7 +327,7 @@ class AuthManager:
                 server_url=server_url,
                 on_success=on_success,
                 on_failure=on_failure,
-            )
+            ),
         )
 
     async def _await_authorization(
@@ -381,7 +412,8 @@ class AuthManager:
         device flow); on timeout ``on_failure`` runs so the modal doesn't hang
         forever. UI-agnostic.
         """
-        self._spawn_tracked(
+        self._spawn_login_poll(
+            (team_id, user_id, server_url.rstrip("/")),
             self._await_enrollment(
                 team_id=team_id,
                 user_id=user_id,
@@ -390,7 +422,7 @@ class AuthManager:
                 on_failure=on_failure,
                 timeout_seconds=timeout_seconds,
                 poll_interval_seconds=poll_interval_seconds,
-            )
+            ),
         )
 
     async def _await_enrollment(

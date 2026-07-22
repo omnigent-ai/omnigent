@@ -221,6 +221,11 @@ class WebAuthServer:
             raise _error(400, str(exc)) from exc
 
     def _prune_pending_confirm(self) -> None:
+        # Drop exchanged-but-unconfirmed tokens past their TTL. Only the in-memory
+        # copy is dropped — the underlying grant is NOT revoked at Databricks (it
+        # lives out its own expiry). Acceptable: it's the user's own credential,
+        # blast radius nil, and revoking here would need an async call from this
+        # sync path for no security gain.
         now = time.time()
         expired = [k for k, p in self._pending_confirm.items() if p.expires_at <= now]
         for confirm_id in expired:
@@ -235,16 +240,23 @@ class WebAuthServer:
         return pending
 
     async def _handle_callback(self, request: web.Request) -> web.Response:
-        """GET: exchange the OAuth code, then show a consent page (store nothing).
+        """GET: exchange the OAuth code, then show a consent page (persist nothing).
 
         Verifies the signed state, consumes the matching PKCE verifier, exchanges
         the authorization code (PKCE-bound, single-use) for an access + refresh
         pair, then — the confused-deputy guard — requires the OAuth-authenticated
         email to equal the email the link was issued for. On success it stashes
         the tokens under a single-use confirm id and renders a consent page naming
-        the exact Omnigent + Slack identities; the token is persisted only when
-        the user clicks Confirm (the POST). The code is single-use, so it's
-        exchanged here (not re-exchanged on the POST).
+        the exact Omnigent + Slack identities; the token is persisted to the store
+        only when the user clicks Confirm (the POST). The code is single-use, so
+        it's exchanged here (not re-exchanged on the POST).
+
+        NOTE: the exchange does mint a real, live grant at Databricks — held only
+        in ``_pending_confirm`` (never the persistent store) pre-Confirm. If the
+        user abandons the flow, prune just drops the in-memory copy and the grant
+        lives out its own expiry at Databricks (we don't revoke it). That's
+        acceptable: it's the user's OWN credential, so the blast radius is nil —
+        but it means "not persisted" is not the same as "no credential exists".
         """
         # Databricks appends ?error=access_denied when the user cancels consent.
         oauth_error = request.query.get("error")
@@ -296,9 +308,10 @@ class WebAuthServer:
                 "for. Start again from Slack and sign in as yourself.",
             )
 
-        # Exchange succeeded and the identity matches — but store NOTHING yet.
-        # Stash the tokens under a single-use confirm id and ask the user to
-        # confirm the account linkage on a page that names both identities.
+        # Exchange succeeded and the identity matches — but persist NOTHING to the
+        # store yet. Stash the (now-live) tokens under a single-use confirm id in
+        # memory and ask the user to confirm the account linkage on a page that
+        # names both identities; the store write happens only on the Confirm POST.
         self._prune_pending_confirm()
         confirm_id = new_nonce()
         self._pending_confirm[confirm_id] = _PendingConfirmation(

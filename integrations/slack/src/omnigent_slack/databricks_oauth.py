@@ -56,8 +56,12 @@ class DatabricksAuthExpiredError(DatabricksOAuthError):
 
 
 def generate_code_verifier() -> str:
-    """Generate a PKCE code verifier (43–128 URL-safe chars)."""
-    return secrets.token_urlsafe(64)[:96]
+    """Generate a PKCE code verifier.
+
+    ``token_urlsafe(64)`` yields ~86 URL-safe chars, well within RFC 7636's
+    43–128 range, so no truncation is needed.
+    """
+    return secrets.token_urlsafe(64)
 
 
 def derive_code_challenge(code_verifier: str) -> str:
@@ -265,6 +269,11 @@ def _email_from_id_token(id_token: object) -> str:
     The token is delivered over TLS directly from the workspace token endpoint
     (not via the browser), so its integrity is already assured by transport —
     we only need the claim, not a re-verification. Returns "" if absent/malformed.
+
+    LOAD-BEARING: this skips JWKS signature verification purely because the
+    transport is HTTPS. ``Settings._check_databricks_config`` enforces https on
+    the workspace host (and every dependent URL) to hold that up — if that
+    enforcement is ever relaxed, add real JWKS verification here first.
     """
     if not isinstance(id_token, str) or id_token.count(".") != 2:
         return ""

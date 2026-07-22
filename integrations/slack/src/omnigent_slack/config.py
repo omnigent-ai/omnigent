@@ -284,8 +284,10 @@ class Settings(BaseSettings):
         # The OAuth flow's security rests on TLS: the client secret rides HTTP
         # Basic on the token call, and the id_token (the confused-deputy anchor)
         # is trusted WITHOUT signature verification because it arrives directly
-        # over TLS from the token endpoint. A plaintext workspace host defeats
-        # both, so require https (loopback excepted for local testing).
+        # over TLS from the token endpoint (see databricks_oauth._email_from_id_token
+        # — this check is what lets it skip JWKS verification). A plaintext
+        # workspace host defeats both, so require https (loopback excepted for
+        # local testing).
         host = self.databricks_workspace_host or ""
         if host.startswith("http://") and not _is_loopback_url(host):
             raise ValueError(

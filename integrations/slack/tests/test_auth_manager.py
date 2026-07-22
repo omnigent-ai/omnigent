@@ -493,3 +493,72 @@ async def test_shutdown_cancels_pending_enrollment_polls(tmp_path: Path) -> None
 
     assert task.done()
     assert mgr._login_tasks == set()  # type: ignore[attr-defined]
+
+
+async def test_second_enrollment_poll_supersedes_prior_for_same_key(tmp_path: Path) -> None:
+    # A re-run of setup for the same (team, user, server) must cancel the prior
+    # in-flight poll. Otherwise each /omnigent stacks another poll, several race,
+    # and approving one leaves the modal bound to a different pending attempt
+    # stuck on "waiting…". The newer poll replaces the old one in _login_polls.
+    mgr, store = await _manager(tmp_path)
+
+    succeeded = asyncio.Event()
+
+    async def on_success() -> None:
+        succeeded.set()
+
+    async def on_failure(reason: str) -> None:
+        return None
+
+    kwargs = {
+        "team_id": "T1",
+        "user_id": "U1",
+        "server_url": _BASE,
+        "on_success": on_success,
+        "on_failure": on_failure,
+        "poll_interval_seconds": 0.01,
+    }
+    mgr.await_enrollment_in_background(**kwargs)  # type: ignore[arg-type]
+    first = mgr._login_polls[("T1", "U1", _BASE)]  # type: ignore[attr-defined]
+
+    # Second run for the same key supersedes the first.
+    mgr.await_enrollment_in_background(**kwargs)  # type: ignore[arg-type]
+    second = mgr._login_polls[("T1", "U1", _BASE)]  # type: ignore[attr-defined]
+
+    assert second is not first
+    # The prior poll is cancelled; only one poll remains tracked for the key.
+    await asyncio.sleep(0.05)
+    assert first.cancelled()
+    assert len([t for t in mgr._login_tasks if not t.done()]) == 1  # type: ignore[attr-defined]
+
+    # The surviving poll still resolves normally when the token lands.
+    await store.put("T1", "U1", _BASE, access_token="fresh", refresh_token="")
+    await asyncio.wait_for(succeeded.wait(), timeout=1.0)
+
+
+async def test_enrollment_poll_clears_map_slot_on_completion(tmp_path: Path) -> None:
+    # A completed poll removes itself from _login_polls so a later re-run for the
+    # same key isn't mistaken for a live poll (and doesn't leak the map entry).
+    mgr, store = await _manager(tmp_path)
+
+    succeeded = asyncio.Event()
+
+    async def on_success() -> None:
+        succeeded.set()
+
+    async def on_failure(reason: str) -> None:
+        return None
+
+    mgr.await_enrollment_in_background(
+        team_id="T1",
+        user_id="U1",
+        server_url=_BASE,
+        on_success=on_success,
+        on_failure=on_failure,
+        poll_interval_seconds=0.01,
+    )
+    await store.put("T1", "U1", _BASE, access_token="fresh", refresh_token="")
+    await asyncio.wait_for(succeeded.wait(), timeout=1.0)
+    # Let the done-callback run.
+    await asyncio.sleep(0.05)
+    assert ("T1", "U1", _BASE) not in mgr._login_polls  # type: ignore[attr-defined]
