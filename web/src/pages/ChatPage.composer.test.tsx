@@ -105,6 +105,27 @@ function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
 
+describe("Composer Claude goal control", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("sends the completion condition as a Claude /goal command", () => {
+    const onSend = vi.fn();
+    useChatStore.setState({ conversationId: "conv_polly" });
+    renderWithTooltips(<Composer {...composerProps({ onSend, showClaudeGoalControl: true })} />);
+
+    fireEvent.click(screen.getByTestId("goal-toggle"));
+    fireEvent.change(screen.getByTestId("goal-condition"), {
+      target: { value: "  Finish the implementation and pass tests  " },
+    });
+    fireEvent.click(screen.getByTestId("goal-start"));
+
+    expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
+
 describe("Composer slash-command menu", () => {
   beforeEach(() => {
     // Two skills so the menu has skill rows distinct from the built-ins.
