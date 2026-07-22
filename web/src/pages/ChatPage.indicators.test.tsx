@@ -82,21 +82,6 @@ describe("ConnectionIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("keeps the host_offline banner for a sub-agent session (its composer hides the badge)", () => {
-    // WHY: a sub-agent session's composer suppresses the host badge (the
-    // header's child slot owns that row), so the badge can't carry the
-    // reconnect affordance. The banner must stay or the session has no way
-    // back — the regression Polly flagged.
-    render(
-      <ConnectionIndicator
-        liveness={{ kind: "host_offline", isOwner: true }}
-        onShowReconnectHelp={onShowReconnectHelp}
-        isSubAgentSession
-      />,
-    );
-    expect(screen.getByTestId("disconnected-indicator")).toHaveTextContent(/Host is offline/);
-  });
-
   it("shows agent-disconnected copy for a local-stranded runner", () => {
     // WHY: local_stranded is the other unreachable branch and must read as the
     // agent dropping, not the host.

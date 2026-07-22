@@ -1676,7 +1676,6 @@ function MainAgentSurface({
           liveness={liveness}
           onShowReconnectHelp={onShowReconnectHelp}
           surfaceFrontmost={surfaceFrontmost}
-          isSubAgentSession={subAgentLabel != null}
         />
       </>
     );
@@ -1869,7 +1868,6 @@ function MainAgentSurface({
         liveness={liveness}
         onShowReconnectHelp={onShowReconnectHelp}
         surfaceFrontmost={surfaceFrontmost}
-        isSubAgentSession={subAgentLabel != null}
       />
     </>
   );
@@ -2544,17 +2542,12 @@ export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
   surfaceFrontmost = true,
-  isSubAgentSession = false,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
   // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
   // the native iOS bar so it doesn't float over an opened sidebar/panel.
   surfaceFrontmost?: boolean;
-  // Whether the open session is a sub-agent (child). Its composer hides the
-  // host badge (the header's child slot owns that row), so the badge can't
-  // carry the host-offline reconnect affordance — keep the banner here.
-  isSubAgentSession?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
   const keyboardVisible = useIOSNativeKeyboardVisible(
@@ -2596,16 +2589,15 @@ export function ConnectionIndicator({
   }
   if (unreachable) {
     // A `host_offline` session moves the reconnect affordance up into the
-    // composer's host badge (ComposerStatusLine) — so render nothing here
-    // whenever that badge is actually on screen. Two ways it isn't: the
-    // terminal-first *terminal* view (the PTY owns the surface, no composer),
-    // and a sub-agent session (its composer hides the host badge — the
-    // header's child slot owns that row). In both, keep the banner so the
-    // affordance survives. `local_stranded` keeps the banner everywhere (no
-    // host, hence no badge).
+    // composer's host badge (ComposerStatusLine), where the host is already
+    // named — so render nothing here whenever that composer is on screen
+    // (sub-agent sessions included; their badge carries it just like a normal
+    // session's). The composer is hidden only in the terminal-first *terminal*
+    // view (the PTY owns the surface); there the banner still carries the
+    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
+    // no badge).
     const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
-    const badgeCarriesAffordance = composerOnScreen && !isSubAgentSession;
-    if (liveness.kind === "host_offline" && badgeCarriesAffordance) {
+    if (liveness.kind === "host_offline" && composerOnScreen) {
       return null;
     }
     return (
@@ -3678,10 +3670,12 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  // The offline-host affordance lives in the host badge, so the tray must
-  // render even when every other slot is empty (an unreachable session often
-  // has no branch/ring/harness yet).
-  const showReconnect = showHost && !!onHostReconnect;
+  // The offline-host reconnect affordance lives in the host badge. It renders
+  // even for sub-agent sessions — they get the same reconnect path as a normal
+  // session, unlike the passive name badge (`showHost`) which stays hidden for
+  // a child. The tray must render for it even when every other slot is empty
+  // (an unreachable session often has no branch/ring/harness yet).
+  const showReconnect = !!conversationId && !!onHostReconnect;
   if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness && !showReconnect)
     return null;
 
@@ -3705,7 +3699,7 @@ function ComposerStatusLine({
           so the right cluster stays pinned right even when both are absent;
           each item truncates to an ellipsis so the tray never wraps. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
-        {showHost && conversationId && (
+        {(showHost || showReconnect) && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
         )}
         {showBranch && (
