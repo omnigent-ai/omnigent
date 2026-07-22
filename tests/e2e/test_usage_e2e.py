@@ -64,16 +64,17 @@ def test_usage_report_happy_path(http_client: httpx.Client) -> None:
 
     assert report["object"] == "usage_report"
     windows = [
-        report["cost_last_24h"],
+        report["cost_today"],
         report["cost_last_7d"],
         report["cost_last_30d"],
         report["total_cost_usd"],
     ]
     assert all(isinstance(v, (int, float)) for v in windows)
-    # Rolling windows nest, so each is <= the next and <= the all-time total.
+    # Windows nest (today ⊆ 7d ⊆ 30d ⊆ all-time), so each is <= the next.
     assert windows == sorted(windows)
 
     by_id = {s["id"]: s for s in report["sessions"]}
     assert session_id in by_id, "created session missing from the usage report"
-    # No turn ran, so the fresh session is priced at zero.
+    # No turn ran, so the fresh session is priced at zero with no per-model cost.
     assert by_id[session_id]["cost_usd"] == 0.0
+    assert by_id[session_id]["models"] == {}

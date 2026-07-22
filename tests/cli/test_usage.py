@@ -12,28 +12,44 @@ from click.testing import CliRunner
 from omnigent.cli import _render_usage, cli
 
 _REPORT: dict[str, Any] = {
-    "cost_last_24h": 1.5,
+    "cost_today": 1.5,
     "cost_last_7d": 3.0,
     "cost_last_30d": 9.0,
     "total_cost_usd": 9.0,
     "sessions": [
-        {"id": "conv_abc", "model": "claude-opus-4-8", "cost_usd": 1.5},
-        {"id": "conv_def", "model": "claude-opus-4-8 +2", "cost_usd": 7.5},
+        {
+            "id": "conv_abc",
+            "cost_usd": 1.5,
+            "models": {"claude-opus-4-8": 1.5},
+        },
+        {
+            "id": "conv_def",
+            "cost_usd": 6.02,
+            # Multi-model: costs deliberately don't sum to cost_usd (faithful).
+            "models": {
+                "claude-opus-4-8": 6.02,
+                "system.ai.claude-opus-4-8[1m]": 13.58,
+            },
+        },
     ],
 }
 
 
-def test_render_usage_table(capsys: pytest.CaptureFixture[str]) -> None:
+def test_render_usage_summary_and_sessions(capsys: pytest.CaptureFixture[str]) -> None:
     _render_usage(_REPORT, limit=10)
     out = capsys.readouterr().out
     assert "best-effort estimates" in out
     assert "Summary" in out
-    assert "Last 24h" in out and "$1.50" in out
-    assert "Last 30d" in out and "$9.00" in out
+    assert "Today" in out and "$1.50" in out
+    assert "Last 7 days" in out and "$3.00" in out
+    assert "Last 30 days" in out
+    assert "All time" in out and "$9.00" in out
     assert "Per session" in out and "(last 2)" in out
     assert "conv_abc" in out
+    # Both models of the multi-model session are listed verbatim (no collapse).
     assert "claude-opus-4-8" in out
-    assert "+2" in out
+    assert "system.ai.claude-opus-4-8[1m]" in out
+    assert "$13.58" in out
 
 
 def test_render_usage_limit_caps_rows(capsys: pytest.CaptureFixture[str]) -> None:
@@ -47,7 +63,7 @@ def test_render_usage_limit_caps_rows(capsys: pytest.CaptureFixture[str]) -> Non
 def test_render_usage_shows_full_id(capsys: pytest.CaptureFixture[str]) -> None:
     full_id = "conv_" + "0123456789abcdef" * 2
     _render_usage(
-        {"sessions": [{"id": full_id, "model": "opus", "cost_usd": 1.0}]},
+        {"sessions": [{"id": full_id, "cost_usd": 1.0, "models": {}}]},
         limit=10,
     )
     out = capsys.readouterr().out
@@ -113,5 +129,5 @@ def test_usage_command_json() -> None:
     result = CliRunner().invoke(cli, ["usage", "--json", "--server", "http://x"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["cost_last_24h"] == 1.5
-    assert payload["sessions"][0]["model"] == "claude-opus-4-8"
+    assert payload["cost_today"] == 1.5
+    assert payload["sessions"][0]["models"] == {"claude-opus-4-8": 1.5}
