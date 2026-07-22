@@ -6,6 +6,11 @@ Per-parent child-title uniqueness used to key a UNIQUE index on the wide
 it, so entries are a fixed 16 bytes. Uniqueness semantics are unchanged: two
 titles collide iff their digests do. These tests assert the post-migration
 shape, the backfill, and that the downgrade restores the title-keyed index.
+
+These pin to ``a2b7c3d8e4f9`` explicitly, not head: a later migration
+(``72e6dceae14f``) drops the column and index once uniqueness moved into
+application code, so the column is absent at head. Head-state coverage lives in
+``test_migration_drop_conversations_title_hash.py``.
 """
 
 from __future__ import annotations
@@ -22,7 +27,6 @@ from sqlalchemy.engine import Engine
 from omnigent.db.utils import (
     _build_alembic_config,
     clear_engine_cache,
-    get_or_create_engine,
 )
 
 _NEW_REVISION = "a2b7c3d8e4f9"
@@ -37,11 +41,17 @@ def _title_hash(title: str) -> bytes:
 
 @pytest.fixture
 def db_engine(tmp_path: Path) -> Iterator[Engine]:
-    """Fresh SQLite DB with the full alembic chain applied (at head)."""
-    engine = get_or_create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    """Fresh SQLite DB migrated to ``a2b7c3d8e4f9`` (where title_hash exists)."""
+    uri = f"sqlite:///{tmp_path / 'test.db'}"
+    cfg = _build_alembic_config(uri)
+    engine = sa.create_engine(uri)
+    with engine.begin() as conn:
+        cfg.attributes["connection"] = conn
+        command.upgrade(cfg, _NEW_REVISION)
     try:
         yield engine
     finally:
+        engine.dispose()
         clear_engine_cache()
 
 

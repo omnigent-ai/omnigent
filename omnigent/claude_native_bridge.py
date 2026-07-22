@@ -1052,6 +1052,26 @@ def read_permission_hook_config(bridge_dir: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def update_permission_hook_auth_headers(
+    bridge_dir: Path,
+    headers: dict[str, str],
+) -> bool:
+    """Atomically replace the permission hook's server auth headers.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param headers: Fresh server request headers.
+    :returns: ``True`` when the hook config existed and was updated.
+    """
+    path = bridge_dir / _PERMISSION_HOOK_FILE
+    payload = _read_json_file(path)
+    if not payload:
+        return False
+    payload["ap_auth_headers"] = dict(headers)
+    payload["updated_at"] = time.time()
+    _write_json_file(path, payload)
+    return True
+
+
 def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) -> dict[str, Any]:
     """
     Build the Claude Code MCP config for the Omnigent bridge server.

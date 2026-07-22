@@ -60,6 +60,24 @@ def compare_reports(
         c_p50 = c_summary.get("avg_p50_ms")
         c_p95 = c_summary.get("avg_p95_ms")
 
+        # A skipped journey (or one whose runs all failed) carries no metric
+        # keys. Report it as its own status instead of computing a delta off a
+        # missing value (which would read as a spurious -100% improvement).
+        if c_p50 is None:
+            rows.append(
+                {
+                    "journey": name,
+                    "status": "skipped",
+                    "b_p50": baseline_journeys.get(name, {}).get("summary", {}).get("avg_p50_ms"),
+                    "c_p50": None,
+                    "b_p95": baseline_journeys.get(name, {}).get("summary", {}).get("avg_p95_ms"),
+                    "c_p95": None,
+                    "delta_p50": None,
+                    "delta_p95": None,
+                }
+            )
+            continue
+
         if name not in baseline_journeys:
             rows.append(
                 {
@@ -122,7 +140,7 @@ def compare_reports(
 
 
 def _status_style(status: str) -> str:
-    return {"regression": "red", "new": "cyan", "ok": "green"}.get(status, "")
+    return {"regression": "red", "new": "cyan", "ok": "green", "skipped": "yellow"}.get(status, "")
 
 
 def print_table(rows: list[dict], threshold: float) -> None:
@@ -185,7 +203,7 @@ def build_markdown(rows: list[dict], threshold: float, passed: bool) -> str:
 
     for row in rows:
         status = row["status"]
-        emoji = {"regression": "🔴", "new": "🆕", "ok": "✅"}.get(status, status)
+        emoji = {"regression": "🔴", "new": "🆕", "ok": "✅", "skipped": "⚠️"}.get(status, status)
         b_p50 = _fmt_ms(row["b_p50"])
         c_p50 = _fmt_ms(row["c_p50"])
         d_p50 = _fmt_delta(row["delta_p50"])
@@ -252,10 +270,15 @@ def main(argv: list[str] | None = None) -> int:
 
     regressions = [r for r in rows if r["status"] == "regression"]
     new_journeys = [r for r in rows if r["status"] == "new"]
+    skipped = [r for r in rows if r["status"] == "skipped"]
 
     if new_journeys:
         names = ", ".join(r["journey"] for r in new_journeys)
         console.print(f"[cyan]New journeys (no baseline):[/cyan] {names}")
+
+    if skipped:
+        names = ", ".join(r["journey"] for r in skipped)
+        console.print(f"[yellow]Skipped (no candidate metrics):[/yellow] {names}")
 
     if regressions:
         console.print(

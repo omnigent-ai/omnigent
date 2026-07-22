@@ -67,7 +67,7 @@ async def test_lifespan_starts_and_stops_scheduler(
         name="nightly triage",
         prompt="triage the queue",
         rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        owner_user_id=None,
+        user_id=None,
         agent_id=_uid("agent-1"),
         timezone="America/Los_Angeles",
     )
@@ -96,7 +96,7 @@ async def test_lifespan_arms_active_task_from_non_default_workspace(
             name="tenant nightly triage",
             prompt="triage the queue",
             rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-            owner_user_id=None,
+            user_id=None,
             agent_id=_uid("agent-1"),
             timezone="America/Los_Angeles",
         )
@@ -155,7 +155,7 @@ async def test_lifespan_skips_paused_task(
         name="paused task",
         prompt="do nothing",
         rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        owner_user_id=None,
+        user_id=None,
         agent_id=_uid("agent-1"),
         timezone="UTC",
         state="paused",

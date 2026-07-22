@@ -82,6 +82,111 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
         return yaml.safe_load(f) or {}
 
 
+def _parse_model_prefixes(
+    raw: Any,  # type: ignore[explicit-any]  # str | list | None from YAML
+) -> list[str]:
+    """Normalize the ``model_prefix`` config into a list of prefixes.
+
+    Accepts a single string (``"databricks-"``) or a list
+    (``["databricks-", "system.ai."]``); blanks are dropped. Returns an
+    empty list when unset, so catalog ids are sent verbatim.
+    """
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+
+
+def _build_external_routing_client(
+    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
+) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
+    """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
+
+    Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
+    an explicit, provider-agnostic ``api_key`` (``${ENV}`` expanded) wins,
+    else the Databricks ``profile`` convenience, else unauthenticated.
+    Optional ``model_prefix`` (a single prefix or a list of prefixes) is
+    stripped from catalog model ids sent to the router (and restored on its
+    answer) — e.g. ``"databricks-"`` when serving-endpoint names carry that
+    prefix but the router keys on bare ids, or ``"system.ai."`` for Unity
+    Catalog foundation-model ids.
+
+    :param routing_cfg: The parsed ``routing:`` mapping (a dict with
+        ``provider == "external"``, per the caller).
+    :returns: A configured client, or ``None`` when required config is
+        missing (a warning is logged; routing stays off rather than raising).
+    """
+    base_url = (routing_cfg.get("base_url") or "").strip()
+    router_name = (routing_cfg.get("router_name") or "").strip()
+    api_key = (routing_cfg.get("api_key") or "").strip()
+    profile = (routing_cfg.get("profile") or "").strip()
+    model_prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
+
+    if not base_url or not router_name:
+        click.echo(
+            "routing.provider=external requires base_url and router_name; skipping",
+            err=True,
+        )
+        return None
+
+    from omnigent.server.smart_routing import _bearer_auth
+
+    # Auth precedence mirrors the ``llm:`` block: an explicit (provider-
+    # agnostic) api_key wins, else the Databricks ``profile`` convenience,
+    # else unauthenticated.
+    auth = None
+    if api_key:
+        from omnigent.spec import expand_env_vars
+
+        auth = _bearer_auth(expand_env_vars({"api_key": api_key})["api_key"])
+    elif profile:
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        try:
+            creds = resolve_databricks_workspace(profile)
+            auth = _bearer_auth(creds.token)
+        except OSError:
+            click.echo(
+                f"routing.profile={profile} could not be resolved; calling router unauthenticated",
+                err=True,
+            )
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    return ExternalRoutingClient(
+        base_url=base_url,
+        router_name=router_name,
+        auth=auth,
+        model_prefixes=model_prefixes,
+    )
+
+
+def _build_local_llm_routing_client(
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> Any | None:  # type: ignore[explicit-any]  # LLMRoutingClient | None
+    """Build the built-in :class:`LLMRoutingClient` from the ``llm:`` block.
+
+    :param server_llm: The parsed server-level ``LLMConfig``.
+    :returns: A configured client, or ``None`` when there is no ``llm:``
+        block (or its policy client can't be built).
+    """
+    if server_llm is None:
+        return None
+    from omnigent.runtime.policies.builder import (
+        _build_policy_llm_client,
+        _resolve_server_llm_connection,
+    )
+
+    conn = _resolve_server_llm_connection(server_llm)
+    policy_client = _build_policy_llm_client(server_llm, conn)
+    if policy_client is None:
+        return None
+    from omnigent.server.smart_routing import LLMRoutingClient
+
+    return LLMRoutingClient(policy_client)
+
+
 def _server_uvicorn_log_config(
     log_path: Path | None = None,
     *,
@@ -3327,23 +3432,20 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the default LLM-based routing client when BOTH the server
-    # has an ``llm:`` config AND the feature is explicitly enabled via
-    # OMNIGENT_SMART_ROUTING=1.  Hidden by default — managed deployments
-    # override RuntimeCaps.routing_client with their own implementation.
+    # Build the routing client when the feature is enabled via
+    # OMNIGENT_SMART_ROUTING=1. Two mutually-exclusive providers, chosen
+    # by ``routing.provider``:
+    #   - ``external``: call an external ``routes:select`` service.
+    #   - ``llm`` (default): the built-in judge using the ``llm:`` block.
+    # Hidden by default — managed deployments override
+    # RuntimeCaps.routing_client with their own implementation.
     routing_client = None
-    if server_llm is not None and os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
-        from omnigent.runtime.policies.builder import (
-            _build_policy_llm_client,
-            _resolve_server_llm_connection,
-        )
-
-        _conn = _resolve_server_llm_connection(server_llm)
-        _policy_client = _build_policy_llm_client(server_llm, _conn)
-        if _policy_client is not None:
-            from omnigent.server.smart_routing import LLMRoutingClient
-
-            routing_client = LLMRoutingClient(_policy_client)
+    if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
+        routing_cfg = cfg.get("routing")
+        if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+            routing_client = _build_external_routing_client(routing_cfg)
+        else:
+            routing_client = _build_local_llm_routing_client(server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),

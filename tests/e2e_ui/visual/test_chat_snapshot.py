@@ -140,6 +140,11 @@ _HEALTH_BODY = {"sessions": {_SESSION_ID: {"runner_online": True, "host_online":
 _DONE_SSE = "data: [DONE]\n\n"
 
 _BUBBLE = '[data-testid="message-bubble"]'
+# Shiki loads lazily, so the fenced block paints raw first and re-renders with
+# per-token spans (colored via the `--sdm-c` custom property) once the import
+# resolves. Span *presence* races the paint — the spans mount a frame before
+# their colors are composited — so the capture waits on the computed colors.
+_TOKEN_SPANS = '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
 
 
 @pytest.mark.visual
@@ -187,6 +192,26 @@ def test_chat_conversation_matches_baseline(
     expect(page.locator(f'{_BUBBLE}[data-role="assistant"]')).to_be_visible(timeout=30_000)
     # No live turn is in flight, so the working shimmer must be absent.
     expect(page.locator('[data-testid="working-indicator"]')).to_have_count(0)
+
+    # Shiki loads lazily: the colored token spans mount a frame after the block
+    # first paints raw. Wait until the tokens resolve more than one distinct
+    # color (the raw fallback is uniform `inherit`), then flush two animation
+    # frames so those colors are composited before the screenshot — waiting on
+    # span presence alone races the paint and captured a raw frame.
+    page.wait_for_function(
+        """(selector) => {
+            const spans = Array.from(document.querySelectorAll(selector));
+            if (spans.length < 2) return false;
+            const colors = new Set(spans.map((el) => getComputedStyle(el).color));
+            return colors.size > 1;
+        }""",
+        arg=_TOKEN_SPANS,
+        timeout=30_000,
+    )
+    page.evaluate(
+        "() => new Promise((resolve) => "
+        "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
 
     # Settle web fonts + kill the blinking caret (both time-dependent).
     settle_for_snapshot(page)

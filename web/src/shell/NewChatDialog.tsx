@@ -102,6 +102,7 @@ import {
   type AvailableAgent,
 } from "@/hooks/useAvailableAgents";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -1827,6 +1828,7 @@ export function NewChatLandingScreen() {
   useNativeServerSwitcherForMainSurface(landingSurface, true);
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
+  const dictation = useDictationInsert(setMessage);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -3292,7 +3294,8 @@ export function NewChatLandingScreen() {
                     voiceSnapshotRef.current = message;
                   }}
                   onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
-                  onTranscript={(text) => setMessage((prev) => (prev ? `${prev} ${text}` : text))}
+                  onTranscript={dictation.appendFinal}
+                  onInterim={dictation.replaceInterim}
                 />
               </div>
               <div className="flex items-center gap-0.5">

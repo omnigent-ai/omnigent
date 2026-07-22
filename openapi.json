@@ -1924,7 +1924,7 @@
         "type": "object"
       },
       "MCPServerSummary": {
-        "description": "Safe subset of an MCP server's configuration for API exposure.\n\nSecret-bearing fields (`headers`, `env`) are intentionally\nexcluded. This model is the wire shape returned inside\n`AgentObject` so clients can display which MCP servers\nan agent is connected to without leaking credentials.",
+        "description": "Safe subset of an MCP server's configuration for API exposure.\n\nHeader values are redacted (`\"[REDACTED]\"`) so callers can see\nwhich headers are configured without leaking the actual secrets.\n`env` is still fully excluded.",
         "properties": {
           "args": {
             "description": "Command-line arguments for `transport=\"stdio\"` servers, e.g. `[\"mcp-server-github\"]`. Empty list when unset.",
@@ -1957,6 +1957,14 @@
             ],
             "description": "Optional free-text description from the spec, e.g. `\"GitHub MCP server\"`. `None` when unset.",
             "title": "Description"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "HTTP headers for `transport=\"http\"` servers. Values are always `\"[REDACTED]\"`; only the key names are exposed.",
+            "title": "Headers",
+            "type": "object"
           },
           "name": {
             "description": "Server name as declared in the agent spec, e.g. `\"github\"`.",
@@ -6188,7 +6196,7 @@
         "type": "object"
       },
       "UpsertMCPServerRequest": {
-        "description": "Request body for creating or updating a session agent MCP server.\n\nSecret-bearing fields (`headers` and `env`) are intentionally\nnot accepted by the UI route. Existing secrets are preserved when a\nserver is edited without changing transport.",
+        "description": "Request body for creating or updating a session agent MCP server.\n\n`env` is still excluded. `headers` is accepted for HTTP servers;\nwhen omitted, existing headers in the bundle are preserved unchanged.",
         "properties": {
           "args": {
             "items": {
@@ -6220,6 +6228,20 @@
               }
             ],
             "title": "Description"
+          },
+          "headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headers"
           },
           "name": {
             "maxLength": 128,
@@ -7113,7 +7135,7 @@
     },
     "/v1/info": {
       "get": {
-        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `single_user`), the short\nsandbox provider name (`sandbox_provider`) the web UI labels\nthe new-session sandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
+        "description": "Runtime capabilities probe for the SPA + CLI.\n\nReturned at app boot by the frontend (and by `omnigent login` when it needs to choose between flows). Drives\nconditional route registration and chrome on the SPA side\n\u2014 when `accounts_enabled` is false, the SPA never\nregisters `/login`, `/register`, `/members` and\nnever renders the AccountMenu, so the bundle behaves\nidentically to a pre-PR-2008 build for header / OIDC\ndeploys (in particular, the internal hosted product that\nsyncs from this repo).\n\nAuthentication: this endpoint is intentionally UNAUTHED\nso the SPA can probe it before holding a session cookie.\nIt exposes no sensitive state \u2014 only the active auth\nsource, the login URL, whether first-run admin setup is\nstill pending (`needs_setup`), coarse capability\nbooleans (`databricks_features`,\n`managed_sandboxes_enabled`, `dictation_available`,\n`single_user`), the short sandbox provider name\n(`sandbox_provider`) the web UI labels the new-session\nsandbox option with, and the installed\n`server_version` (already public via `/api/version`).",
         "operationId": "info_v1_info_get",
         "responses": {
           "200": {
@@ -7488,7 +7510,7 @@
     },
     "/v1/runners/{runner_id}/token": {
       "post": {
-        "description": "Mint a short-lived owner bearer for a managed-sandbox runner.\n\nA managed sandbox runner has no user credential of its own; it\npresents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and managed sandboxes always run\ntoken-bound (no allow-list).\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
+        "description": "Mint a short-lived owner bearer for a delegated runner.\n\nA host-launched or managed-sandbox runner does not inherit the host\nuser's credential; it presents its server-minted tunnel binding token\n(`X-Omnigent-Runner-Tunnel-Token`) and the server returns a\nshort-lived owner JWT the runner then uses on its HTTP callbacks\n(which gate on `require_user`). This is the HTTP analog of the\nrunner tunnel's binding-token handshake: the same SHA-256 gate\n(`token_bound_runner_id(token) == runner_id`) and the same\nowner resolution (`resolve_managed_runner_owner`), minting a\nbearer instead of registering a tunnel.\n\nThe binding-token match is required unconditionally \u2014 the\nallow-list shortcut honored on some other runner-token checks is\ndeliberately NOT accepted here, because this endpoint issues a\nfull owner credential and delegated runners are token-bound.\n\n**Returns:** `{\"token\": <jwt>, \"expires_at\": <epoch seconds>}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 when the binding token is absent, doesn't match `runner_id`, or resolves to no managed-launch owner; 400 when the active auth mode can't mint server-side (header/proxy, or no auth provider).",
         "operationId": "mint_runner_owner_token_v1_runners__runner_id__token_post",
         "parameters": [
           {
@@ -9562,7 +9584,7 @@
         ]
       },
       "patch": {
-        "description": "Update a session policy's mutable fields.\n\n`type` is immutable \u2014 the caller must delete and\nre-create to change it. Requires `LEVEL_EDIT`.\n\n**Parameters**\n\n- `body` \u2014 Fields to update; `None` fields are left unchanged.\n\n**Returns:** The updated policy as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks edit permission, or 404 if the policy is not found.",
+        "description": "Update a session policy's mutable fields.\n\n`type` is immutable \u2014 the caller must delete and\nre-create to change it. Requires `LEVEL_EDIT`.\n\n**Parameters**\n\n- `body` \u2014 Fields to update; `None` fields are left unchanged.\n\n**Returns:** The updated policy as a serialized dict.\n\n**Raises**\n\n- `OmnigentError` \u2014 401/403 if the user lacks edit permission, 404 if the policy is not found, or 409 if renaming would collide with another policy in this session.",
         "operationId": "update_policy_v1_sessions__session_id__policies__policy_id__patch",
         "parameters": [
           {
@@ -11050,7 +11072,7 @@
     },
     "/v1/sessions/{session_id}/stream": {
       "get": {
-        "description": "Subscribe to the session's live SSE event stream.\n\nDoes NOT replay history; clients reconcile via the snapshot\nendpoint. The generator handles disconnects via a\n`try/finally` that emits the `[DONE]` sentinel in all\nexit paths \u2014 see `_stream_live_events`.\n\nHolding this stream open registers the caller as a session\n*viewer* (presence): co-viewers' streams receive\n`session.presence` events on join/leave/idle edges, and\nthis stream's snapshot-on-connect includes the current\nviewer list. Presence is scoped to the session tree's root\nconversation, so viewers of different agents/sub-agents in\none session see each other. See\n`omnigent/server/presence.py`.\n\n**Returns:** An SSE `StreamingResponse`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
+        "description": "Subscribe to the session's live SSE event stream.\n\nDoes NOT replay history; clients reconcile via the snapshot\nendpoint. The generator emits `[DONE]` on normal completion\nand uses `finally` only for presence cleanup \u2014 see\n`_stream_live_events`.\n\nHolding this stream open registers the caller as a session\n*viewer* (presence): co-viewers' streams receive\n`session.presence` events on join/leave/idle edges, and\nthis stream's snapshot-on-connect includes the current\nviewer list. Presence is scoped to the session tree's root\nconversation, so viewers of different agents/sub-agents in\none session see each other. See\n`omnigent/server/presence.py`.\n\n**Returns:** An SSE `StreamingResponse`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists.",
         "operationId": "stream_session_v1_sessions__session_id__stream_get",
         "parameters": [
           {

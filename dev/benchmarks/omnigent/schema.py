@@ -13,7 +13,10 @@ import platform
 import subprocess
 
 # Incremented on any breaking change to the report document shape below.
-SCHEMA_VERSION = 3
+# v4: per-journey ``summary`` gained ``runs_total`` / ``runs_ok`` (and omits the
+# metric keys when every run failed); a journey that errored out of measurement
+# entirely carries ``skipped: true`` + ``error`` with empty ``runs``/``summary``.
+SCHEMA_VERSION = 4
 
 
 def _git(*args: str) -> str:
