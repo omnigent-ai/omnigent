@@ -323,6 +323,31 @@ def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: st
     assert next_cursor is None
 
 
+def test_list_for_session_pagination(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """``list_for_session`` pages through grants via the user_id cursor."""
+    conv_id = _create_conversation(db_uri)
+    # Zero-padded so lexical order is deterministic and predictable.
+    user_ids = [f"user{i:02d}@test.com" for i in range(5)]
+    for uid in user_ids:
+        _ensure_user(store, uid)
+        store.grant(uid, conv_id, level=1)
+
+    # First page: limit=2 → 2 grants + a cursor (the last returned user_id).
+    page1, cursor1 = store.list_for_session(conv_id, limit=2)
+    assert [g.user_id for g in page1] == user_ids[:2]
+    assert cursor1 == user_ids[1]
+
+    # Second page continues after the cursor.
+    page2, cursor2 = store.list_for_session(conv_id, limit=2, after_user_id=cursor1)
+    assert [g.user_id for g in page2] == user_ids[2:4]
+    assert cursor2 == user_ids[3]
+
+    # Final page returns the remainder with a null cursor.
+    page3, cursor3 = store.list_for_session(conv_id, limit=2, after_user_id=cursor2)
+    assert [g.user_id for g in page3] == user_ids[4:]
+    assert cursor3 is None
+
+
 # ── list_for_user ────────────────────────────────────────────────────────────
 
 

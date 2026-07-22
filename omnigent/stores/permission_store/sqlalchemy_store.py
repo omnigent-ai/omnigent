@@ -221,8 +221,10 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 stmt = stmt.where(SqlSessionPermission.user_id > after_user_id)
             rows = session.execute(stmt).scalars().all()
         if len(rows) > limit:
-            next_cursor: str | None = rows[limit].user_id
             rows = rows[:limit]
+            # Cursor is the last returned user_id; the next page uses an
+            # exclusive ``user_id > after_user_id`` filter.
+            next_cursor: str | None = rows[-1].user_id
         else:
             next_cursor = None
         return [_to_entity(r) for r in rows], next_cursor

@@ -499,7 +499,7 @@ async def test_full_permission_lifecycle(
         user="bryan",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     # Only bryan (owner) and rice (edit) should remain.
     # corey was revoked in step 5.
@@ -1022,7 +1022,7 @@ async def test_list_permissions_shows_all_grants(
         user="user-a",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     # user-a auto-got owner on creation; user-b and user-c were
     # granted explicitly above.
@@ -1277,7 +1277,7 @@ async def test_session_creator_gets_manage_grant(
         user="owner",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     # Exactly one grant: the creator with owner level.
     assert len(grants) == 1, (
         f"Expected exactly 1 auto-grant on a fresh session, "
@@ -1328,7 +1328,7 @@ async def test_grant_upgrade_via_upsert(
         session_id,
         user="user-a",
     )
-    grant_map = {g["user_id"]: g["level"] for g in resp.json()}
+    grant_map = {g["user_id"]: g["level"] for g in resp.json()["permissions"]}
     assert grant_map["user-b"] == LEVEL_MANAGE, (
         "After upgrade, user-b should have manage level in the store."
     )
@@ -1404,7 +1404,7 @@ async def test_no_header_defaults_to_local_user_in_single_user_mode(
         user=None,
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     assert any(g["user_id"] == "local" and g["level"] == LEVEL_OWNER for g in grants), (
         "The 'local' user (default from missing header) should have "
         "an owner auto-grant on the created session."
@@ -1799,7 +1799,7 @@ async def test_owner_grant_is_immutable(
         user="bryan",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     assert grant_map == {"bryan": LEVEL_OWNER, "corey": LEVEL_MANAGE}, (
         f"Expected bryan=owner(4) and corey=manage(3), got {grant_map}."
@@ -2531,14 +2531,18 @@ async def test_read_only_collaborator_can_fork_and_owns_the_fork(
     # Fork: corey owns it, bryan has no grant on it.
     fork_perms = {
         p["user_id"]: p["level"]
-        for p in (await _list_permissions(auth_client, fork_id, user="corey")).json()
+        for p in (await _list_permissions(auth_client, fork_id, user="corey")).json()[
+            "permissions"
+        ]
     }
     assert fork_perms == {"corey": LEVEL_OWNER}
 
     # Source grants unchanged by the fork.
     src_perms = {
         p["user_id"]: p["level"]
-        for p in (await _list_permissions(auth_client, source_id, user="bryan")).json()
+        for p in (await _list_permissions(auth_client, source_id, user="bryan")).json()[
+            "permissions"
+        ]
     }
     assert src_perms == {"bryan": LEVEL_OWNER, "corey": LEVEL_READ}
 
