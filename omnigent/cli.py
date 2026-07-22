@@ -9642,7 +9642,7 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
         e.g. ``("-p", "review the last commit")``.
     """
     # Polly/Debby launch with the first available credential for their
-    # brain's family when no specific one is configured up front (#334).
+    # brain's family when no specific one is configured up front.
     _ensure_bundled_agent_brain_credential(name)
     # standalone_mode=False propagates ClickExceptions to main()'s handler
     # (CLI diagnostics logging + setup hint) instead of exiting inline,

@@ -115,8 +115,8 @@ def register_native_commands(cli: click.Group) -> None:
         is_flag=True,
         default=False,
         help=(
-            "Register this machine as a host (inline equivalent of `omnigent host`). "
-            "Requires --server."
+            "[DEPRECATED] No-op, kept for script compatibility. The host daemon is "
+            "always ensured now, so this flag does nothing."
         ),
     )
     @click.option(
@@ -337,18 +337,6 @@ def register_native_commands(cli: click.Group) -> None:
         if model is None:
             model = cfg.get("model")
         auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
-
-        # Validate option combinations before any side effects — see
-        # the same comment in the claude command. _ensure_backend can
-        # spawn the daemon and take the full local-server-discover
-        # timeout to fail, which would make a bad arg pair look like
-        # a backend outage instead of a usage error.
-        choice = _split_resume_value(resume)
-        if session_id is not None and (choice.picker or choice.conversation_id is not None):
-            raise click.UsageError(
-                "--session and --resume are mutually exclusive; "
-                "prefer --resume (--session is deprecated).",
-            )
 
         # Ensure the host daemon (local when ``--server`` is omitted/empty,
         # remote otherwise) and resolve the concrete Omnigent server URL. Codex follows
