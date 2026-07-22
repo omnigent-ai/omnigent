@@ -191,12 +191,11 @@ a network optimization.
 
 **Mind the CI time budget.** The delay applies to *every* client→server
 request, so it multiplies across the full-turn journeys' round-trips — a cold
-start makes ~12 requests/op, and the turn journeys poll `GET /session` every
-0.2s. A large delay across the whole default journey set can exceed the
-workflow's 30-min per-leg timeout (empirically, `network_delay_ms=100` over all
-journeys times out; `10` finishes in ~6 min). For a bigger delay, pair it with
-a `--journeys` subset of the HTTP journeys, where the count is 1–2/op and there
-are no poll loops to amplify.
+start makes ~12 requests/op. A large delay across the whole default journey set
+can exceed the workflow's 30-min per-leg timeout (empirically, with the older
+poll-based turn driver `network_delay_ms=100` over all journeys timed out; `10`
+finishes in ~6 min). For a bigger delay, pair it with a `--journeys` subset of
+the HTTP journeys, where the count is 1–2/op.
 
 ## Seeding a realistic corpus
 

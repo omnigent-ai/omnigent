@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import os
 import signal
 import socket
@@ -102,6 +103,30 @@ class ServerRequestSnapshot(NamedTuple):
 
     total: int
     routes: dict[str, int]
+
+
+def _sse_session_status(data: str) -> str | None:
+    """Extract the status from a ``session.status`` SSE ``data:`` payload.
+
+    Returns the status string (``"running"`` / ``"waiting"`` / ``"idle"`` /
+    ``"failed"``) for a ``session.status`` event, else ``None`` (a different
+    event, the ``[DONE]`` sentinel, or unparseable JSON). Tolerates both the
+    nested ``{"data": {"status": ...}}`` and flat ``{"status": ...}`` shapes.
+
+    :param data: The SSE ``data:`` line body, already stripped of the prefix.
+    :returns: The session status, or ``None`` when this isn't a status event.
+    """
+    if not data or data == "[DONE]":
+        return None
+    try:
+        payload = json.loads(data)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "session.status":
+        return None
+    inner = payload.get("data")
+    status = inner.get("status") if isinstance(inner, dict) else payload.get("status")
+    return status if isinstance(status, str) else None
 
 
 def _find_free_port() -> int:
@@ -839,7 +864,15 @@ class BenchEnvironment:
     async def drive_turn(
         self, session_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
     ) -> None:
-        """Post a user message and poll the session to a terminal state.
+        """Post a user message and await the turn's completion over SSE.
+
+        Subscribes to the session stream, posts the message, then returns when a
+        ``session.status`` event reports ``idle`` *after* the turn has been seen
+        ``running``/``waiting`` — the SSE equivalent of the old poll-to-idle
+        loop, but without hammering ``GET /v1/sessions/{id}`` every 200ms (which
+        polluted the per-journey request count, especially when a turn stalled).
+        The ``seen_running`` guard ensures a warm session's trailing ``idle``
+        from a *prior* turn can't end this wait early.
 
         :raises RuntimeError: If not in runner mode, the turn fails, or it does
             not settle within *timeout* seconds.
@@ -847,27 +880,64 @@ class BenchEnvironment:
         assert self.client is not None
         if not self.with_runner:
             raise RuntimeError("drive_turn requires with_runner=True")
-        body = {
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
-        }
-        posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
-        posted.raise_for_status()
 
-        deadline = time.monotonic() + timeout
-        seen_running = False
-        while time.monotonic() < deadline:
-            snap = await self.client.get(f"/v1/sessions/{session_id}")
-            snap.raise_for_status()
-            status = snap.json().get("status")
-            if status in ("running", "waiting"):
-                seen_running = True
-            elif status == "failed":
-                raise RuntimeError(f"turn failed: {snap.json().get('last_task_error')}")
-            elif status == "idle" and seen_running:
-                return
-            await asyncio.sleep(_POLL_INTERVAL_S)
-        raise RuntimeError(f"turn did not settle within {timeout}s (session {session_id})")
+        connected = asyncio.Event()
+        settled = asyncio.Event()
+        outcome: dict[str, str] = {}
+
+        async def _read_stream() -> None:
+            seen_running = False
+            try:
+                async with self.client.stream(  # type: ignore[union-attr]
+                    "GET", f"/v1/sessions/{session_id}/stream", timeout=timeout
+                ) as resp:
+                    # First line means the stream is live (server emits a ready
+                    # heartbeat on connect); post only once subscribed so no
+                    # status event for this turn can be missed.
+                    connected.set()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        status = _sse_session_status(line[len("data:") :].strip())
+                        if status is None:
+                            continue
+                        if status in ("running", "waiting"):
+                            seen_running = True
+                        elif status == "failed":
+                            outcome["failed"] = "turn failed"
+                            settled.set()
+                            return
+                        elif status == "idle" and seen_running:
+                            settled.set()
+                            return
+            except httpx.HTTPError as exc:
+                outcome["error"] = repr(exc)
+                connected.set()
+                settled.set()
+
+        reader = asyncio.create_task(_read_stream())
+        try:
+            await asyncio.wait_for(connected.wait(), timeout=timeout)
+            body = {
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            }
+            posted = await self.client.post(f"/v1/sessions/{session_id}/events", json=body)
+            posted.raise_for_status()
+            try:
+                await asyncio.wait_for(settled.wait(), timeout=timeout)
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"turn did not settle within {timeout}s (session {session_id})"
+                ) from exc
+            if "error" in outcome:
+                raise RuntimeError(f"stream error: {outcome['error']}")
+            if "failed" in outcome:
+                snap = await self.client.get(f"/v1/sessions/{session_id}")
+                last_error = snap.json().get("last_task_error") if snap.is_success else None
+                raise RuntimeError(f"turn failed: {last_error}")
+        finally:
+            reader.cancel()
 
     async def _wait_idle(self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S) -> None:
         """Poll until the session is ``idle`` (a prior turn has settled)."""

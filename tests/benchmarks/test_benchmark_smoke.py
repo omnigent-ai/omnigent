@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from dev.benchmarks.omnigent import run as bench_run
-from dev.benchmarks.omnigent.environment import BenchEnvironment
+from dev.benchmarks.omnigent.environment import BenchEnvironment, _sse_session_status
 from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency, run_throughput
 from dev.benchmarks.omnigent.measure import RunResult, aggregate, check_thresholds
 from dev.benchmarks.omnigent.schema import SCHEMA_VERSION, build_report
@@ -152,6 +152,23 @@ def test_requests_per_op_none_when_uncounted_or_no_success() -> None:
     assert failed.requests_per_op() is None
     # Counted with successes → the ratio.
     assert RunResult(latencies_ms=[1.0, 1.0], http_requests=6).requests_per_op() == 3.0
+
+
+def test_sse_session_status_parses_both_shapes_and_ignores_noise() -> None:
+    """drive_turn's SSE completion parser: status shapes + non-status lines."""
+    # Nested shape (API.md) and flat shape (observed on the wire) both work.
+    assert _sse_session_status('{"type":"session.status","data":{"status":"idle"}}') == "idle"
+    assert (
+        _sse_session_status('{"type":"session.status","status":"running","conversation_id":"x"}')
+        == "running"
+    )
+    # Non-status events, the [DONE] sentinel, empty, and non-JSON → None.
+    assert _sse_session_status('{"type":"response.completed","response":{}}') is None
+    assert _sse_session_status("[DONE]") is None
+    assert _sse_session_status("") is None
+    assert _sse_session_status("not json") is None
+    # A session.status without a usable status field → None (not a crash).
+    assert _sse_session_status('{"type":"session.status","data":{}}') is None
 
 
 def test_aggregate_excludes_fully_failed_run_from_summary() -> None:
