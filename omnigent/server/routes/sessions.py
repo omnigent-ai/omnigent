@@ -181,6 +181,7 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
+    set_managed_host_activity,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
@@ -6944,6 +6945,7 @@ async def _provision_managed_sandbox(
                 config=sandbox_config,
                 host=relaunch_host,
                 host_store=host_store,
+                session_id=session_id,
                 repo=repo,
                 on_stage=_on_stage,
             )
@@ -6951,6 +6953,7 @@ async def _provision_managed_sandbox(
             config=sandbox_config,
             owner=owner,
             host_store=host_store,
+            session_id=session_id,
             repo=repo,
             on_stage=_on_stage,
         )
@@ -20734,6 +20737,18 @@ def create_sessions_router(
                 response_id=response_id,
                 background_task_count=bg_count,
             )
+            host_store = getattr(request.app.state, "host_store", None)
+            sandbox_config = getattr(request.app.state, "sandbox_config", None)
+            if conv.host_id is not None and host_store is not None:
+                await set_managed_host_activity(
+                    conv.host_id,
+                    host_store,
+                    sandbox_config,
+                    active=(
+                        status in {"running", "waiting"}
+                        or _session_background_task_count_cache.get(session_id, 0) > 0
+                    ),
+                )
             forward_body = body.model_dump()
             forward_body["data"] = await _enrich_idle_status_with_subagent_output(
                 forward_body["data"], status, session_id, conversation_store

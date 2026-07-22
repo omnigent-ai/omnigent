@@ -160,10 +160,21 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "remote",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {
+        "modal",
+        "daytona",
+        "boxlite",
+        "cwsandbox",
+        "islo",
+        "e2b",
+        "openshell",
+        "kubernetes",
+        "remote",
+    }
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -217,6 +228,10 @@ OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # reconnects while still expiring tokens of Pods nobody deleted. A relaunch
 # mints a fresh token (and the per-Pod token Secret is replaced).
 KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Remote controllers own the backing provider lifecycle. Keep Omnigent's host
+# token bounded while allowing a stopped runtime to resume in place.
+REMOTE_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -833,6 +848,13 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             resources=_parse_kubernetes_resources(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "remote":
+        launcher_factory = _remote_launcher_factory(
+            url=_parse_provider_string(raw, "remote", "url"),
+            token_env=_parse_provider_string(raw, "remote", "token_env"),
+            env=_parse_provider_env(raw, "remote"),
+        )
+        token_ttl_s = REMOTE_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -944,6 +966,24 @@ def _daytona_launcher_factory(
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
         return DaytonaSandboxLauncher(image=image, env=env)
+
+    return _build
+
+
+def _remote_launcher_factory(
+    *,
+    url: str | None,
+    token_env: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """Build a launcher that delegates lifecycle operations over HTTP."""
+    if url is None:
+        raise ValueError("server config 'sandbox.remote.url' is required")
+
+    def _build() -> SandboxLauncher:
+        from omnigent.onboarding.sandboxes.remote import RemoteSandboxLauncher
+
+        return RemoteSandboxLauncher(url=url, token_env=token_env, env=env)
 
     return _build
 
@@ -1846,6 +1886,7 @@ async def launch_managed_host(
     config: ManagedSandboxConfig,
     owner: str,
     host_store: HostStore,
+    session_id: str | None = None,
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
@@ -1869,6 +1910,8 @@ async def launch_managed_host(
     :param host_store: Persistent host registrations — receives the
         pre-registered host row and is polled for the sandbox host
         coming online.
+    :param session_id: Canonical session id for provider-side ownership
+        metadata, when the launch is associated with a session.
     :param repo: Parsed repository-URL workspace to clone into the
         sandbox as the session's working directory, or ``None`` for
         an empty workspace. Private repositories authenticate via the
@@ -1888,6 +1931,7 @@ async def launch_managed_host(
         startup, or registration fails.
     """
     launcher = config.launcher_factory()
+    launcher.set_launch_context(owner=owner, session_id=session_id)
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -1920,6 +1964,7 @@ async def relaunch_managed_host(
     config: ManagedSandboxConfig,
     host: Host,
     host_store: HostStore,
+    session_id: str | None = None,
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> ManagedHostLaunch:
@@ -1946,6 +1991,8 @@ async def relaunch_managed_host(
     :param host: The existing managed host row to relaunch
         (``sandbox_provider`` set; callers guard on that).
     :param host_store: Persistent host registrations.
+    :param session_id: Canonical session id for provider-side ownership
+        metadata, when the relaunch is associated with a session.
     :param repo: Repository to re-clone as the workspace, or ``None``
         for an empty workspace.
     :param on_stage: Progress observer forwarded to
@@ -1965,6 +2012,7 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
+    launcher.set_launch_context(owner=host.user_id, session_id=session_id)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
@@ -2192,6 +2240,53 @@ def host_sandbox_is_running(
     if launcher is None or host.sandbox_id is None:
         return None
     return launcher.is_running(host.sandbox_id)
+
+
+def host_sandbox_exists(
+    host: Host,
+    config: ManagedSandboxConfig | None,
+) -> bool | None:
+    """Ask the matched provider whether the recorded sandbox still exists."""
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or host.sandbox_id is None:
+        return None
+    return launcher.exists(host.sandbox_id)
+
+
+async def set_managed_host_activity(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxConfig | None,
+    *,
+    active: bool,
+) -> None:
+    """Propagate turn activity to a lifecycle-aware managed sandbox.
+
+    This is best-effort by design: publishing a model status edge must never
+    fail because an optional provider policy endpoint is unavailable. The
+    platform-owned remote launcher uses the signal to extend the provider
+    safety timer while work is active and restore the normal idle timer once
+    the session is quiescent.
+    """
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_id is None:
+        return
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None:
+        return
+    try:
+        await asyncio.to_thread(
+            launcher.set_activity,
+            host.sandbox_id,
+            active=active,
+        )
+    except Exception:  # noqa: BLE001 -- optional provider boundary must soft-fail
+        _logger.warning(
+            "Could not update activity policy for managed host %s (sandbox %s)",
+            host_id,
+            host.sandbox_id,
+            exc_info=True,
+        )
 
 
 # ── Managed-host wake (resume a dormant host on demand) ─────────────────────

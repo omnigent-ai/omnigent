@@ -24,6 +24,7 @@ from omnigent.server.managed_hosts import (
     KUBERNETES_MANAGED_TOKEN_TTL_S,
     MODAL_MANAGED_TOKEN_TTL_S,
     OPENSHELL_MANAGED_TOKEN_TTL_S,
+    REMOTE_MANAGED_TOKEN_TTL_S,
     ManagedSandboxConfig,
     RepoWorkspace,
     host_resume_supported,
@@ -32,6 +33,7 @@ from omnigent.server.managed_hosts import (
     parse_sandbox_config,
     relaunch_managed_host,
     resume_managed_host,
+    set_managed_host_activity,
     terminate_managed_host,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -210,6 +212,28 @@ def test_parse_daytona_without_section_defaults(
     assert cfg.launcher_factory() is fake
     assert fake.image is None
     assert fake.env is None
+
+
+async def test_parse_remote_controller_config() -> None:
+    """Remote runtimes are a first-class managed provider with a bounded token."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "remote",
+            "server_url": "https://omnigent.example.com",
+            "remote": {
+                "url": "https://platform.example.com/",
+                "token_env": "PLATFORM_SANDBOX_RUNTIME_TOKEN",
+                "env": ["PLATFORM_GIT_BROKER_URL"],
+            },
+        }
+    )
+    assert cfg is not None
+    assert cfg.provider == "remote"
+    assert cfg.managed_launch_supported is True
+    assert cfg.token_ttl_s == REMOTE_MANAGED_TOKEN_TTL_S
+    launcher = cfg.launcher_factory()
+    assert launcher.provider == "remote"
+    assert launcher.can_resume is True
 
 
 def test_parse_valid_boxlite_cloud_config_builds_parameterized_factory(
@@ -1803,6 +1827,38 @@ class _IsloFakeLauncher(FakeSandboxLauncher):
     """Fake launcher carrying Islo's provider label for managed resume tests."""
 
     provider: ClassVar[str] = "islo"
+
+
+class _ActivityFakeLauncher(_IsloFakeLauncher):
+    """Capture lifecycle activity signals from the managed-host seam."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.activity: list[tuple[str, bool]] = []
+
+    def set_activity(self, sandbox_id: str, *, active: bool) -> None:
+        self.activity.append((sandbox_id, active))
+
+
+async def test_managed_host_activity_targets_its_bound_sandbox(db_uri: str) -> None:
+    """A status edge updates only the sandbox recorded on that host row."""
+    host_store = HostStore(db_uri)
+    host_id = "618f50482ee943a99eae16fcf1cc9158"
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-activity",
+        user_id=_OWNER,
+        token="tok-activity",
+        provider="islo",
+        sandbox_id="sb-activity",
+        token_expires_at=now_epoch() + 3600,
+    )
+    fake = _ActivityFakeLauncher()
+
+    await set_managed_host_activity(host_id, host_store, _injected_config(fake), active=True)
+    await set_managed_host_activity(host_id, host_store, _injected_config(fake), active=False)
+
+    assert fake.activity == [("sb-activity", True), ("sb-activity", False)]
 
 
 async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri: str) -> None:
