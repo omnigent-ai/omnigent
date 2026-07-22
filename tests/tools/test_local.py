@@ -22,6 +22,12 @@ from omnigent.tools.local import (
     load_local_python_tools,
 )
 
+@pytest.fixture(autouse=True)
+def _clean_container_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OMNIGENT_CONTAINER_RUNTIME never leaks from the host environment."""
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+
+
 # ─── Helpers ────────────────────────────────────────────────────────
 
 

@@ -12,6 +12,12 @@ from omnigent.spec.parser import discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
+@pytest.fixture(autouse=True)
+def _clean_container_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OMNIGENT_CONTAINER_RUNTIME never leaks from the host environment."""
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+
+
 @pytest.fixture()
 def agent_dir(tmp_path: Path) -> Path:
     """Create a minimal valid agent image directory."""
