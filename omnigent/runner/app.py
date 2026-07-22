@@ -8026,13 +8026,24 @@ def create_runner_app(
             # so close() still issues tmux kill-server (the tmux server persists
             # with remain-on-exit even after the pane process exits).
             instance.running = True
-            try:
-                await terminal_registry.close(conv_id, terminal_name, "main")
-            except Exception:
-                _logger.warning(
-                    "failed to close stale native pane for conv=%s; proceeding to re-create",
+            # Re-check the registry before closing: a concurrent ensure/recreate
+            # path may have already replaced this entry with a live pane between
+            # our get() and now.  Only close if the registry still points at the
+            # same dead instance we just probed.
+            current = terminal_registry.get(conv_id, terminal_name, "main")
+            if current is instance:
+                try:
+                    await terminal_registry.close(conv_id, terminal_name, "main")
+                except Exception:
+                    _logger.warning(
+                        "failed to close stale native pane for conv=%s; proceeding to re-create",
+                        conv_id,
+                        exc_info=True,
+                    )
+            else:
+                _logger.info(
+                    "stale entry already replaced for conv=%s; skipping close",
                     conv_id,
-                    exc_info=True,
                 )
         _logger.info(
             "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
