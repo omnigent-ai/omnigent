@@ -31,18 +31,20 @@ _BUILDERS = [
     ("_build_kiro_native_bundle", "kiro-native-ui.yaml", False),
     ("_build_debby_bundle", "config.yaml", True),
     ("_build_polly_bundle", "config.yaml", True),
+    ("_build_willy_bundle", "config.yaml", True),
 ]
 
 
 def _shipped_example_missing(builder: str) -> bool:
     """Return True when ``builder``'s shipped-example source is not packaged here.
 
-    debby/polly are only seeded when their bundle ships with the wheel; a
+    debby/polly/willy are only seeded when their bundle ships with the wheel; a
     generic deployment legitimately omits them. Skip rather than fail there.
     """
     source = {
         "_build_debby_bundle": app._DEBBY_BUNDLE_SOURCE,
         "_build_polly_bundle": app._POLLY_BUNDLE_SOURCE,
+        "_build_willy_bundle": app._WILLY_BUNDLE_SOURCE,
     }[builder]
     return not (source / "config.yaml").is_file()
 
