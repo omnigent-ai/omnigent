@@ -210,7 +210,11 @@ def create_artifact_preview_public_router(service: ArtifactPreviewService) -> AP
     """Create the unauthenticated capability responder for the preview host."""
     router = APIRouter()
 
-    @router.get("/p/{token}/{path:path}", include_in_schema=False)
+    @router.api_route(
+        "/p/{token}/{path:path}",
+        methods=["GET", "HEAD"],
+        include_in_schema=False,
+    )
     async def read_preview_resource(request: Request, token: str, path: str) -> Response:
         if (request.url.hostname or "").lower() != service.preview_hostname:
             return Response(status_code=404)

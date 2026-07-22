@@ -179,3 +179,37 @@ def test_preview_hostname_cannot_reach_application_routes() -> None:
         ).status_code
         == 404
     )
+
+
+@pytest.mark.asyncio
+async def test_preview_response_has_strict_headers_and_supports_head() -> None:
+    runner_client = _runner_client()
+
+    async def resolve(_session_id: str) -> httpx.AsyncClient:
+        return runner_client
+
+    service = ArtifactPreviewService(
+        preview_origin="http://preview.localhost:6767",
+        runner_client_for_session=resolve,
+    )
+    grant = await service.create_grant(
+        "conv_preview",
+        "artifacts/revenue/index.html",
+    )
+    app = FastAPI()
+    app.include_router(create_artifact_preview_public_router(service))
+    path = grant.url.removeprefix("http://preview.localhost:6767")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://preview.localhost:6767",
+    ) as client:
+        response = await client.get(path)
+        head = await client.head(path)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+    assert "form-action 'none'" in response.headers["content-security-policy"]
+    assert head.status_code == 200
+    assert head.content == b""
+    await runner_client.aclose()

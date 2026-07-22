@@ -1343,11 +1343,12 @@ def create_app(
         except (LookupError, OmnigentError):
             return None
 
+    artifact_preview_origin = (
+        os.environ.get("OMNIGENT_ARTIFACT_PREVIEW_ORIGIN", "").strip()
+        or "http://preview.localhost:6767"
+    )
     artifact_preview_service = ArtifactPreviewService(
-        preview_origin=os.environ.get(
-            "OMNIGENT_ARTIFACT_PREVIEW_ORIGIN",
-            "http://preview.localhost:6767",
-        ),
+        preview_origin=artifact_preview_origin,
         runner_client_for_session=_artifact_preview_runner_client,
     )
     host_registry = HostRegistry()
