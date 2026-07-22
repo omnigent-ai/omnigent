@@ -276,13 +276,14 @@ def test_list_for_session_returns_all_grants(
     store.grant("alice@test.com", conv_id, level=1)
     store.grant("bob@test.com", conv_id, level=3)
 
-    grants = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
     # Both grants must be present.
     assert len(grants) == 2, (
         f"Expected 2 grants for session, got {len(grants)}. "
         "list_for_session is not returning all grants."
     )
+    assert next_cursor is None
     user_ids = {g.user_id for g in grants}
     assert user_ids == {"alice@test.com", "bob@test.com"}, (
         f"Expected users alice and bob, got {user_ids}"
@@ -297,9 +298,10 @@ def test_list_for_session_empty(store: SqlAlchemyPermissionStore, db_uri: str) -
     """``list_for_session`` returns [] for a session with no grants."""
     conv_id = _create_conversation(db_uri)
 
-    result = store.list_for_session(conv_id)
+    grants, next_cursor = store.list_for_session(conv_id)
 
-    assert result == [], f"Expected [] for a session with no grants, got {result!r}"
+    assert grants == [], f"Expected [] for a session with no grants, got {grants!r}"
+    assert next_cursor is None
 
 
 def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
@@ -313,11 +315,12 @@ def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: st
 
     store.grant("alice@test.com", conv_a, level=2)
 
-    b_grants = store.list_for_session(conv_b)
+    b_grants, next_cursor = store.list_for_session(conv_b)
     assert b_grants == [], (
         f"Expected no grants for conv_b, got {b_grants}. "
         "Grants are leaking across session boundaries."
     )
+    assert next_cursor is None
 
 
 # ── list_for_user ────────────────────────────────────────────────────────────

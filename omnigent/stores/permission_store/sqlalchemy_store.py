@@ -200,23 +200,32 @@ class SqlAlchemyPermissionStore(PermissionStore):
             return moved
 
     def list_for_session(
-        self, conversation_id: str, *, limit: int = 1000
-    ) -> list[SessionPermission]:
-        """Return all grants on a session. See base class for contract."""
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[SessionPermission], str | None]:
+        """Return grants on a session with cursor pagination. See base class for contract."""
         with self._session() as session:
-            rows = (
-                session.execute(
-                    select(SqlSessionPermission)
-                    .where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.conversation_id == conversation_id,
-                    )
-                    .limit(limit)
+            stmt = (
+                select(SqlSessionPermission)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == conversation_id,
                 )
-                .scalars()
-                .all()
+                .order_by(SqlSessionPermission.user_id.asc())
+                .limit(limit + 1)
             )
-            return [_to_entity(r) for r in rows]
+            if after_user_id is not None:
+                stmt = stmt.where(SqlSessionPermission.user_id > after_user_id)
+            rows = session.execute(stmt).scalars().all()
+        if len(rows) > limit:
+            next_cursor: str | None = rows[limit].user_id
+            rows = rows[:limit]
+        else:
+            next_cursor = None
+        return [_to_entity(r) for r in rows], next_cursor
 
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""

@@ -78,14 +78,21 @@ class PermissionStore(ABC):
 
     @abstractmethod
     def list_for_session(
-        self, conversation_id: str, *, limit: int = 1000
-    ) -> list[SessionPermission]:
-        """Return all grants on a session.
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[SessionPermission], str | None]:
+        """Return grants on a session with cursor pagination.
 
-        :param conversation_id: The session to query, e.g.
-            ``"conv_abc123"``.
-        :param limit: Maximum number of grants to return (default 1000).
-        :returns: List of :class:`SessionPermission` objects.
+        :param conversation_id: The session to query.
+        :param limit: Max grants to return (default 100).
+        :param after_user_id: Exclusive cursor — return grants with
+            user_id > this value.
+        :returns: Tuple of (grants, next_cursor). next_cursor is the
+            user_id to pass as after_user_id on the next call, or None
+            if no more results.
         """
         ...
 

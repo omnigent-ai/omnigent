@@ -21571,20 +21571,23 @@ def create_sessions_router(
     @router.get(
         "/sessions/{session_id}/permissions",
         response_model=None,
-        responses={200: {"model": list[PermissionObject]}},
     )
     async def list_permissions(
         request: Request,
         session_id: str,
-    ) -> list[PermissionObject]:
-        """List all permission grants on a session.
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None, description="Cursor: user_id to start after"),
+    ) -> dict:
+        """List permission grants on a session with cursor pagination.
 
         Requires manage-level access.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to list grants for,
             e.g. ``"conv_abc123"``.
-        :returns: List of :class:`PermissionObject`.
+        :param limit: Max grants to return (1–1000, default 100).
+        :param after: Cursor — user_id to start after (exclusive).
+        :returns: ``{"permissions": [...], "next_cursor": str|null}``.
         :raises OmnigentError: 404 if no session or no access.
         """
         user_id = _require_user(request, auth_provider)
@@ -21596,15 +21599,20 @@ def create_sessions_router(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        grants = await asyncio.to_thread(permission_store.list_for_session, session_id)
-        return [
-            PermissionObject(
-                user_id=g.user_id,
-                conversation_id=g.conversation_id,
-                level=g.level,
-            )
-            for g in grants
-        ]
+        grants, next_cursor = await asyncio.to_thread(
+            permission_store.list_for_session, session_id, limit=limit, after_user_id=after
+        )
+        return {
+            "permissions": [
+                PermissionObject(
+                    user_id=g.user_id,
+                    conversation_id=g.conversation_id,
+                    level=g.level,
+                )
+                for g in grants
+            ],
+            "next_cursor": next_cursor,
+        }
 
     # ── Agent sub-resource ────────────────────────────────────────
     # These endpoints expose the session's bound agent metadata

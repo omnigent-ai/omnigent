@@ -9165,7 +9165,7 @@
     },
     "/v1/sessions/{session_id}/permissions": {
       "get": {
-        "description": "List all permission grants on a session.\n\nRequires manage-level access.\n\n**Returns:** List of `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
+        "description": "List permission grants on a session with cursor pagination.\n\nRequires manage-level access.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
         "operationId": "list_permissions_v1_sessions__session_id__permissions_get",
         "parameters": [
           {
@@ -9177,19 +9177,44 @@
               "title": "Session Id",
               "type": "string"
             }
+          },
+          {
+            "description": "Max grants to return (1\u20131000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
           }
         ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/PermissionObject"
-                  },
-                  "title": "Response 200 List Permissions V1 Sessions  Session Id  Permissions Get",
-                  "type": "array"
-                }
+                "schema": {}
               }
             },
             "description": "Successful Response"
