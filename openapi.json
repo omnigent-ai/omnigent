@@ -7191,7 +7191,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/model-options": {
       "get": {
-        "description": "Return pre-launch model choices resolved by the selected host.",
+        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.",
         "operationId": "get_host_model_options_v1_hosts__host_id__harnesses__harness__model_options_get",
         "parameters": [
           {
