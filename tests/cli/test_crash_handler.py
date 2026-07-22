@@ -13,6 +13,7 @@ developer's real ``~/.omnigent``.
 
 from __future__ import annotations
 
+import datetime
 import io
 import os
 import re
@@ -100,13 +101,26 @@ def test_command_line_redacts_tokens_in_argv(
 # --------------------------------------------------------------------------- #
 # Save + rotation
 # --------------------------------------------------------------------------- #
-def test_save_report_writes_and_rotates(data_dir: Path) -> None:
+def test_save_report_writes_and_rotates(data_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ch.install_crash_handler("omnigent", "omnigent-ai/omnigent", keep_reports=2)
+    # Report names carry a whole-second stamp, so five real-clock saves usually
+    # collapse onto two filenames and never exercise rotation. Step the clock a
+    # second per save to get five distinct reports.
+    ticks = iter(range(5))
+
+    class _SteppedClock(datetime.datetime):
+        @classmethod
+        def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:
+            return datetime.datetime(2026, 1, 1, tzinfo=tz) + datetime.timedelta(
+                seconds=next(ticks)
+            )
+
+    monkeypatch.setattr(ch.datetime, "datetime", _SteppedClock)
     paths = [ch._save_report(f"report {i}\n") for i in range(5)]
-    assert all(p.exists() for p in paths)
+    assert len(set(paths)) == 5
     # Only the newest 2 remain on disk.
     remaining = sorted((data_dir / "crashes").glob("crash-*.md"))
-    assert len(remaining) == 2
+    assert remaining == paths[-2:]
     # Permissions are tight.
     assert all((p.stat().st_mode & 0o077) == 0 for p in remaining)
 
