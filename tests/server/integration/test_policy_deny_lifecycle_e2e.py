@@ -203,6 +203,25 @@ async def _send_user_message(
     )
 
 
+def _tool_call_request(tool_name: str = "Bash") -> dict:
+    """Build a PHASE_TOOL_CALL policy evaluation request.
+
+    :param tool_name: Tool name, e.g. ``"Bash"``.
+    :returns: EvaluationRequest JSON dict.
+    """
+    return {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {
+                "name": tool_name,
+                "arguments": {},
+            },
+            "context": {},
+        },
+    }
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 
@@ -270,6 +289,52 @@ async def test_deny_policy_lifecycle(
     assert len(session_policies) == 0, (
         f"expected no session policies after deletion; got {session_policies}"
     )
+
+
+async def test_persisted_default_policy_enforces_for_sessions(
+    policy_client: httpx.AsyncClient,
+) -> None:
+    """A default policy created through ``/v1/policies`` is enforced.
+
+    This pins the persisted default-policy path: the CRUD route writes a
+    ``session_id IS NULL`` policy row, and the session policy-evaluate
+    endpoint must load that row into the engine's admin policy layer.
+    """
+    agent = await create_test_agent(policy_client)
+    session_id = await _create_session(policy_client, agent["id"])
+
+    create_resp = await policy_client.post(
+        "/v1/policies",
+        json={
+            "name": "deny_first_tool_call",
+            "type": "python",
+            "handler": "omnigent.policies.builtins.safety.max_tool_calls_per_session",
+            "factory_params": {"limit": 0},
+        },
+    )
+    assert create_resp.status_code == 200, (
+        f"default policy create failed: {create_resp.status_code} {create_resp.text}"
+    )
+    policy_id = create_resp.json()["id"]
+
+    denied = await policy_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Bash"),
+    )
+    assert denied.status_code == 200, denied.text
+    denied_body = denied.json()
+    assert denied_body["result"] == "POLICY_ACTION_DENY"
+    assert denied_body["reason"] == "Exceeded 0 tool calls this session"
+
+    patch_resp = await policy_client.patch(f"/v1/policies/{policy_id}", json={"enabled": False})
+    assert patch_resp.status_code == 200, patch_resp.text
+
+    allowed = await policy_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Bash"),
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["result"] == "POLICY_ACTION_ALLOW"
 
 
 async def test_deny_policy_only_blocks_matching_phase(
