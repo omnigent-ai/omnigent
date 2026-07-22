@@ -167,6 +167,10 @@ from omnigent.server.auth import (
     local_single_user_enabled,
     workspace_sharing_blocked,
 )
+from omnigent.server.background_session_titles import (
+    BackgroundSessionTitleCoordinator,
+    prepare_background_session_title,
+)
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -5302,6 +5306,7 @@ async def _persist_external_conversation_item(
     body: SessionEventInput,
     conversation_store: ConversationStore,
     created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -5365,8 +5370,15 @@ async def _persist_external_conversation_item(
             skipped,
             conversation_store,
         )
+    pending_background_title = prepare_background_session_title(
+        coordinator=background_title_coordinator,
+        conversation=conv,
+        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+    )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
+    if pending_background_title is not None:
+        pending_background_title.schedule()
     persisted = persisted_items[0]
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
@@ -9129,6 +9141,8 @@ def _title_content_from_item(
     if not isinstance(item.data, MessageData):
         return []
     if item.data.role != "user":
+        return []
+    if item.data.is_meta:
         return []
     return item.data.content
 
@@ -12948,6 +12962,7 @@ async def _create_session_from_existing_agent(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -13262,13 +13277,26 @@ async def _create_session_from_existing_agent(
             _host_install_id: str | None = None
             if _hr is not None and conv.host_id is not None:
                 _host_install_id = _hr.get_host_installation_id(conv.host_id)
+            # Resolve harness directly from the in-scope agent + cache so
+            # the result is independent of _globals._agent_store (which is
+            # only set when the server is started via the CLI).
+            _tel_harness: str | None
+            if native_agent is not None:
+                _tel_harness = native_agent.harness
+            elif conv.harness_override:
+                _tel_harness = conv.harness_override
+            else:
+                _tel_loaded = agent_cache.load(
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                _tel_harness = _spec_harness(_tel_loaded.spec)
             _tel_emit(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
                     agent_id=agent.id,
-                    harness=native_agent.harness
-                    if native_agent is not None
-                    else _resolve_harness(conv),
+                    harness=_tel_harness,
                     surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
@@ -13311,6 +13339,11 @@ async def _create_session_from_existing_agent(
             # Dispatch (not a plain forward) so native-terminal sessions take the
             # single-writer bypass — otherwise the forwarder's echo duplicates the kickoff.
             for item in body.initial_items:
+                pending_background_title = prepare_background_session_title(
+                    coordinator=background_title_coordinator,
+                    conversation=conv,
+                    event=item,
+                )
                 await _dispatch_session_event_to_runner(
                     conv.id,
                     conv,
@@ -13323,6 +13356,8 @@ async def _create_session_from_existing_agent(
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
                 )
+                if pending_background_title is not None:
+                    pending_background_title.schedule()
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
     # built, so a fresh read is what keeps the create response current.
@@ -14746,6 +14781,7 @@ def create_sessions_router(
     runner_exit_reports: RunnerExitReports | None = None,
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -14810,6 +14846,9 @@ def create_sessions_router(
         validate ownership when ``PATCH /v1/sessions/{id}`` files a
         session into a project. ``None`` disables the move-into-project
         action (a non-empty ``project_id`` is then rejected as unsupported).
+    :param background_title_coordinator: Optional app-owned coordinator for
+        semantic title generation after first-turn forwarding. ``None`` disables
+        background titles in focused router tests.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -14904,6 +14943,7 @@ def create_sessions_router(
             liveness_lookup=liveness_lookup,
             file_store=file_store,
             artifact_store=artifact_store,
+            background_title_coordinator=background_title_coordinator,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -20507,6 +20547,7 @@ def create_sessions_router(
                 body,
                 conversation_store,
                 created_by=_attribution_user(user_id),
+                background_title_coordinator=background_title_coordinator,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -21077,6 +21118,11 @@ def create_sessions_router(
                     session_id,
                     exc_info=True,
                 )
+        pending_background_title = prepare_background_session_title(
+            coordinator=background_title_coordinator,
+            conversation=conv,
+            event=body,
+        )
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(
@@ -21093,6 +21139,8 @@ def create_sessions_router(
                 has_mcp_servers=_has_mcp_servers,
                 created_by=_attribution_user(user_id),
             )
+            if pending_background_title is not None:
+                pending_background_title.schedule()
             return {"queued": True, "item_id": item_id}
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
@@ -21108,6 +21156,8 @@ def create_sessions_router(
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
         )
+        if pending_background_title is not None:
+            pending_background_title.schedule()
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id

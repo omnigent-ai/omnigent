@@ -24,8 +24,6 @@ from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _NATIVE_TERMINAL_DISPATCH_SPECS,
-    _adopt_ambient_credentials,
-    _announce_auto_configured_credentials,
     _bundle,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
@@ -37,16 +35,9 @@ from omnigent.cli import (
     _is_removed_ad_hoc_invocation,
     _is_run_shorthand,
     _load_global_config,
-    _manage_goose_harness,
-    _manage_hermes_harness,
-    _manage_kimi_harness,
-    _manage_qwen_harness,
     _materialize_harness_launcher_file,
-    _node_dependency_problem,
-    _node_version,
     _pick_first_run_harness,
     _preregister_agent,
-    _qwen_auth_configured,
     _resolve_auto_open_conversation_from_config,
     _resolve_auto_open_conversation_setting,
     _resolve_bundle_env_vars,
@@ -56,8 +47,19 @@ from omnigent.cli import (
     _save_local_config,
     _server_uvicorn_log_config,
     _start_cli_runner_process,
-    _warn_missing_harness_dependencies,
     cli,
+)
+from omnigent.cli_config import (
+    _adopt_ambient_credentials,
+    _announce_auto_configured_credentials,
+    _manage_goose_harness,
+    _manage_hermes_harness,
+    _manage_kimi_harness,
+    _manage_qwen_harness,
+    _node_dependency_problem,
+    _node_version,
+    _qwen_auth_configured,
+    _warn_missing_harness_dependencies,
 )
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.ambient import DetectedProvider
@@ -2955,8 +2957,8 @@ def test_run_without_agent_drops_into_configure_when_unconfigured(
     # first-run plan resolves to "nothing configured".
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured
@@ -5083,8 +5085,8 @@ def test_resolve_first_run_plan_does_not_persist_derived_default(
     Claude→polly yet no global ``harness`` / ``default_agent`` was written.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for("claude-sdk"),
@@ -5114,8 +5116,8 @@ def test_resolve_first_run_plan_re_derives_when_creds_change(
     pick would pin the user to codex and fail the second half.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
 
     # 1) Only Codex configured → codex REPL, no example agent.
     monkeypatch.setattr(
@@ -5145,8 +5147,8 @@ def test_resolve_first_run_plan_drops_into_configure_when_empty(
     return of None signals the caller to exit cleanly rather than error.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured, before and after configure
@@ -5227,8 +5229,10 @@ def test_adopt_ambient_credentials_announces_only_what_was_adopted(
     A regression that stopped calling the callout (or announced credentials
     that were not actually adopted) fails here.
     """
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=["anthropic"]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr(
+        "omnigent.cli_config._adopt_detected_providers", Mock(return_value=["anthropic"])
+    )
     monkeypatch.setattr(
         "omnigent.onboarding.ambient.detect_providers",
         lambda: [
@@ -5744,7 +5748,7 @@ def test_manage_qwen_harness_declines_install_returns(
     install = Mock()
     monkeypatch.setattr(hi, "install_harness_cli", install)
     launch = Mock()
-    monkeypatch.setattr("omnigent.cli._launch_qwen_auth", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_qwen_auth", launch)
     # The install prompt offers [install, no, show-command]; pick "No".
     monkeypatch.setattr(it, "select", lambda *a, **k: 1)
 
@@ -5766,10 +5770,10 @@ def test_manage_qwen_harness_back_does_not_launch(
     import omnigent.onboarding.interactive as it
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
-    monkeypatch.setattr("omnigent.cli._qwen_auth_configured", lambda: False)
+    monkeypatch.setattr("omnigent.cli_config._qwen_auth_configured", lambda: False)
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock(return_value="x")
-    monkeypatch.setattr("omnigent.cli._launch_qwen_auth", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_qwen_auth", launch)
     # rows = [Open Qwen to run /auth, Show auth options, ← Back]; pick Back (2).
     monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
@@ -5835,7 +5839,7 @@ def test_manage_goose_harness_missing_cli_shows_hint_returns(
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock()
-    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_goose_configure", launch)
     # Should never reach the select() menu when the CLI is absent.
     monkeypatch.setattr(it, "select", Mock(side_effect=AssertionError("select called")))
 
@@ -5860,7 +5864,7 @@ def test_manage_goose_harness_back_does_not_launch(
     )
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock(return_value="x")
-    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_goose_configure", launch)
     # rows = [Run goose configure, Show configuration options, ← Back]; pick Back (2).
     monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
@@ -5885,7 +5889,7 @@ def test_manage_goose_harness_configure_launches(
     )
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock(return_value="✓ provider configured: anthropic")
-    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_goose_configure", launch)
     # First iteration: pick "Run goose configure" (0); second: "← Back" (2).
     choices = iter([0, 2])
     monkeypatch.setattr(it, "select", lambda *a, **k: next(choices))

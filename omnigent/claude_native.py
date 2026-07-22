@@ -3214,11 +3214,6 @@ async def _prepare_claude_terminal(
             startup_progress=startup_progress,
             progress_message="Starting Claude terminal...",
         )
-        from omnigent.tools.builtins.session_rename import (
-            session_rename_allowed_tools,
-            session_rename_instruction,
-        )
-
         terminal_id = await _launch_claude_terminal(
             client,
             session_id,
@@ -3226,8 +3221,6 @@ async def _prepare_claude_terminal(
             command=command,
             bridge_dir=bridge_dir,
             claude_config=claude_config,
-            append_system_prompt=session_rename_instruction(initial_session=not cold_resumed),
-            allowed_tools=session_rename_allowed_tools(initial_session=not cold_resumed),
         )
         _mark_startup_step(
             startup_profiler,

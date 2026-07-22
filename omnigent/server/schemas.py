@@ -1956,6 +1956,25 @@ class AutomaticSessionRenameResponse(BaseModel):
     reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
 
 
+class BackgroundSessionTitleRequest(BaseModel):
+    """Private runner request for isolated background title inference."""
+
+    prompt: str = Field(min_length=1, max_length=20_000)
+    agent_id: str | None = None
+    model_override: str | None = None
+    harness_override: str | None = None
+    sub_agent_name: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BackgroundSessionTitleResponse(BaseModel):
+    """Private runner result for background title inference."""
+
+    status: Literal["generated", "unsupported"]
+    title: str | None = None
+
+
 class CodexGoalObject(BaseModel):
     """
     Current Codex goal state for a Codex-native session.
