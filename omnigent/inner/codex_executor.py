@@ -117,6 +117,7 @@ _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
 # shared ``~/.codex/config.toml``. This keeps model selection and cost-policy
 # enforcement isolated between concurrent sessions.
 _CODEX_HOME_COPY_FILES = ("config.toml",)
+_CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -716,7 +717,15 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     if not source_dir.is_dir():
         return
 
-    for filename in (*_CODEX_HOME_SYMLINK_FILES, *_CODEX_HOME_GLOBAL_INSTRUCTION_FILES):
+    minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    symlink_files = _CODEX_HOME_SYMLINK_FILES
+    if not minimal_config:
+        symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
+    for filename in symlink_files:
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -740,6 +749,19 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
             continue
         dest_path = target_dir / filename
         if dest_path.exists() or dest_path.is_symlink():
+            continue
+        if minimal_config and filename == "config.toml":
+            import tomlkit
+
+            # The title worker needs custom-provider routing, but copying the
+            # full user config also starts unrelated MCPs/plugins and can exceed
+            # its timeout. auth.json alone cannot supply these provider tables.
+            source_config = tomlkit.parse(source_file.read_text())
+            minimal_document = tomlkit.document()
+            for key in ("model_provider", "model_providers", "profiles"):
+                if key in source_config:
+                    minimal_document[key] = source_config[key]
+            dest_path.write_text(tomlkit.dumps(minimal_document))
             continue
         shutil.copy2(source_file, dest_path)
 
@@ -1485,32 +1507,49 @@ class _CodexAppServerSession:
             turn_input = _to_codex_input_items(prompt)
         else:
             turn_input = [{"type": "text", "text": prompt}]
-        # Apply reasoning effort via ``thread/settings/update``: Codex's
-        # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
-        # ``turn/start`` is silently dropped by serde and never takes effect.
-        # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
-        # the same path the TUI ``/model`` picker uses. Request a detailed
-        # summary too; effort controls internal work, while summary controls
-        # whether observable reasoning events are emitted. Deduped against the
-        # last value applied on this thread to avoid a redundant per-turn RPC.
+        # Newer Codex app-server builds apply reasoning effort through
+        # ``thread/settings/update``. Older supported builds reject that RPC but
+        # accept the same ``effort`` / ``summary`` fields on ``turn/start``.
+        # Prefer the persistent thread setting and fall back only for that
+        # explicit protocol-version mismatch.
+        effort_via_turn_start = False
         if reasoning_effort and reasoning_effort != self._applied_effort:
-            await self._request(
-                "thread/settings/update",
-                {
-                    "threadId": self.thread_id,
-                    "effort": reasoning_effort,
-                    "summary": "detailed",
-                },
-            )
-            self._applied_effort = reasoning_effort
+            try:
+                await self._request(
+                    "thread/settings/update",
+                    {
+                        "threadId": self.thread_id,
+                        "effort": reasoning_effort,
+                        "summary": "detailed",
+                    },
+                )
+            except RuntimeError as exc:
+                error_text = str(exc)
+                unsupported_settings_update = (
+                    "thread/settings/update" in error_text and "unknown variant" in error_text
+                )
+                if not unsupported_settings_update:
+                    raise
+                logger.info(
+                    "Codex app-server does not support thread/settings/update; "
+                    "falling back to turn/start effort."
+                )
+                effort_via_turn_start = True
+            else:
+                self._applied_effort = reasoning_effort
         turn_params: CodexParams = {
             "threadId": self.thread_id,
             "input": turn_input,
         }
+        if effort_via_turn_start:
+            turn_params["effort"] = reasoning_effort
+            turn_params["summary"] = "detailed"
         start_response = await self._request(
             "turn/start",
             turn_params,
         )
+        if effort_via_turn_start:
+            self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
         if not isinstance(raw_active_turn_id, str) or not raw_active_turn_id:
             yield ExecutorError(message="Codex App Server did not return a turn id")

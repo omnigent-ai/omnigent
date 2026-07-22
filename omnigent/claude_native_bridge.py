@@ -677,8 +677,10 @@ def _ensure_secure_dir(target: Path) -> None:
     each ancestor from that trusted parent down to ``target``,
     creating new ones with mode 0o700 and rejecting any existing
     ancestor that is a symlink, not a directory, owned by a different
-    uid, or has group/other permission bits set. Wrong-but-repairable
-    modes on dirs we own are reset to 0o700.
+    uid, or has group/other permission bits set where POSIX uid/mode
+    semantics are available. Wrong-but-repairable POSIX modes on dirs we own
+    are reset to 0o700. On Windows, where Python exposes no POSIX uid/mode
+    ownership model, directory protection relies on the OS ACLs instead.
 
     :param target: Final bridge directory path to ensure, e.g.
         ``Path("/tmp/omnigent-501/claude-native/abc")``.
@@ -694,7 +696,8 @@ def _ensure_secure_dir(target: Path) -> None:
     if cur != trusted_parent:
         raise RuntimeError(f"bridge dir {target!s} is not under trusted parent {trusted_parent!s}")
     ancestors.reverse()
-    my_uid = getattr(os, "getuid", lambda: -1)()
+    getuid = getattr(os, "getuid", None)
+    my_uid = getuid() if getuid is not None else None
     for ancestor in ancestors:
         try:
             os.mkdir(ancestor, mode=0o700)
@@ -706,12 +709,12 @@ def _ensure_secure_dir(target: Path) -> None:
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
         if not stat.S_ISDIR(st.st_mode):
             raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if st.st_uid != my_uid:
+        if my_uid is not None and st.st_uid != my_uid:
             raise RuntimeError(
                 f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
                 f"{st.st_uid}, not current user ({my_uid})"
             )
-        if (st.st_mode & 0o077) != 0:
+        if my_uid is not None and (st.st_mode & 0o077) != 0:
             os.chmod(ancestor, 0o700)
 
 
@@ -4389,6 +4392,11 @@ _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-std
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 _BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+_TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
+    "<task-notification>",
+    "<task-id>",
+    "</task-notification>",
+)
 
 # Markers that prefix a ``role=user`` record produced by Claude
 # Code's CLI scaffolding (not user-typed content). ``<command-
@@ -4503,6 +4511,13 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     stdout_match = _COMMAND_STDOUT_RE.search(content)
     output = stdout_match.group(1) if stdout_match else None
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
+
+
+def _is_task_notification_text(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("<task-notification>") and all(
+        marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
+    )
 
 
 def _local_command_transcript_items_from_entry(
@@ -4699,6 +4714,20 @@ def _user_transcript_items_from_entry(
         # of leaking as user bubbles.
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
+        if _is_task_notification_text(content):
+            items.append(
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "message"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "is_meta": True,
+                        "content": [{"type": "input_text", "text": content}],
+                    },
+                    response_id=fallback_response_id,
+                )
+            )
+            return None, items
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, 0, "message"),
@@ -4737,6 +4766,22 @@ def _user_transcript_items_from_entry(
             if "<command-name>" in stripped or any(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
             ):
+                continue
+            if _is_task_notification_text(text):
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, item_index, "message"),
+                        item_type="message",
+                        data={
+                            "role": "user",
+                            "is_meta": True,
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                        response_id=fallback_response_id,
+                    )
+                )
+                item_index += 1
+                saw_user_text = True
                 continue
             user_blocks.append({"type": "input_text", "text": text})
             saw_user_text = True

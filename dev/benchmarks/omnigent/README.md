@@ -44,7 +44,8 @@ Key flags (`--help` for all): `--journeys A,B`, `--database-uri URI` (seeded
 corpus / Postgres; default: throwaway empty SQLite), `--iterations N` (per
 latency run), `--requests N` / `--concurrency N` (throughput), `--runs N`,
 `--warmup N`, `--output FILE`, `--min-rps` / `--max-p50-ms` / `--max-p99-ms`
-(CI thresholds).
+(CI thresholds), `--network-delay-ms MS` (simulated client↔server latency,
+see *Network* below).
 
 ## Journeys
 
@@ -113,6 +114,89 @@ dispatch/streaming/cancel overhead, not model latency.
 Add a journey by registering a `Journey` in `journeys.py` (set `needs_runner`
 for full-turn journeys).
 
+## Network requests + simulated delay
+
+Two related knobs for reasoning about **network cost** — the round-trips a
+journey makes and what they'd cost over a real network, both of which loopback
+otherwise hides.
+
+### Requests-per-op (`http_requests` / `avg_http_requests_per_op`)
+
+Every run reports how many HTTP requests **the server handled** during its
+timed region, divided by successful ops → requests-per-op. This is the
+deterministic, noise-free signal: a change that adds or removes a round-trip
+moves the count directly, independent of timing jitter.
+
+The value is the *server-side* count, not just what the benchmark process
+issues — so for the full-turn (`needs_runner`) journeys it also captures the
+cross-process traffic a client-side hook can't see (runner → server callbacks,
+host → server). That's where the count is genuinely unknown and interesting; for
+the HTTP/API journeys it's known by construction (`list_sessions` = 1,
+`create_session` = 2 for the POST + inline DELETE, etc.).
+
+How it works, and why it never ships in production:
+
+- The server already tracks a cumulative request counter
+  (`ServerPerformanceMetrics.total_started`), but it lives in the server
+  subprocess's memory and is only pushed to OTel. The harness needs to *read*
+  it, so a tiny router (`debug_router.py`) exposes it at
+  `GET /debug/server-metrics`.
+- That router lives under `dev/`, which `pyproject.toml` excludes from the wheel
+  (`include = ["omnigent*"]`) — a production install can't even import it.
+- It's mounted only via the `debug_router_modules` config key, which mirrors the
+  existing `policy_modules` load-by-dotted-path seam (`create_app` →
+  `_load_debug_routers`). The harness's generated `server.yaml` sets it;
+  production config never does. A module that fails to import is logged and
+  skipped, so a stray key is a no-op where `dev/` is absent.
+- The harness (`environment.py`) reads the endpoint around each run's timed
+  region and diffs it (subtracting its own closing poll). Counting is
+  best-effort: if the endpoint is unreachable the run still reports latency,
+  just with `http_requests: null`.
+
+**Per-route appendix (`network_routes`).** Beyond the single per-op number, the
+endpoint also returns a per-route tally (keyed by the low-cardinality FastAPI
+template, e.g. `POST /v1/sessions`), so each journey's `summary` carries a
+`network_routes` breakdown — every endpoint the journey hit, its total request
+count, and per-op count, sorted chattiest-first. Since the count is near
+identical across runs, it's summed across the summary runs and grouped by route.
+This is what makes the count *actionable*: for `session_cold_start` it names
+which endpoints the ~12 requests/op are spread across (including the
+cross-process runner→server / host→server calls), not just the total. The
+harness's own counter-poll route is filtered out. The raw per-run map is in each
+run's `route_requests`.
+
+**Tunnel round-trips are not counted.** Steady-state server↔runner traffic is
+frames multiplexed over one long-lived WebSocket tunnel, not fresh HTTP requests
+— so neither this counter nor an HTTP hook sees them as "requests." Counting
+tunnel frames would need instrumenting the tunnel transport; it's out of scope
+for v1.
+
+### Simulated network delay (`--network-delay-ms`)
+
+Loopback has ~zero latency, so the benchmark can't tell a chatty journey (many
+round-trips) from a lean one on wall-clock alone. `--network-delay-ms MS`
+(default `0`) injects an artificial sleep before **every request the benchmark
+client sends**, via an httpx request event hook — modelling a real client↔server
+network hop. Combined with the per-op request count, `delay × requests-per-op`
+is the wall-clock cost those round-trips add, so the two features reinforce each
+other when testing a network optimization.
+
+**Scope note (v1):** the delay models the **client↔server** hop only — the hop
+the benchmark process owns. The cross-process server↔runner tunnel and
+server→mock-LLM hops are *not* delayed (they'd need injecting sleep into the
+runner's client / the tunnel transport, in separate processes). Documented
+follow-up. The nightly and PR workflows run at `0` for stable, comparable trend
+data; dispatch the workflow with a higher `network_delay_ms` when investigating
+a network optimization.
+
+**Mind the CI time budget.** The delay applies to *every* client→server
+request, so it multiplies across the full-turn journeys' round-trips — a cold
+start makes ~12 requests/op. A large delay across the whole default journey set
+can exceed the workflow's 30-min per-leg timeout (empirically, with the older
+poll-based turn driver `network_delay_ms=100` over all journeys timed out; `10`
+finishes in ~6 min). For a bigger delay, pair it with a `--journeys` subset of
+the HTTP journeys, where the count is 1–2/op.
+
 ## Seeding a realistic corpus
 
 `seed.py` writes a sizeable, deterministic corpus directly through the store
@@ -173,7 +257,7 @@ document without running the harness.
 
 ```jsonc
 {
-  "schema_version": 4,
+  "schema_version": 6,
   "generated_at": "<ISO-8601 UTC>",
   "git_sha": "<HEAD sha>",
   "git_branch": "<branch>",
@@ -181,7 +265,7 @@ document without running the harness.
   "harness": "http-only",
   "config": {"iterations": 100, "requests": 500, "concurrency": 1,
              "runs": 3, "warmup": 10, "with_runner": false,
-             "backend": "sqlite"},
+             "backend": "sqlite", "network_delay_ms": 0.0},
   "journeys": {
     "<journey name>": {
       "kind": "latency" | "throughput",
@@ -190,11 +274,18 @@ document without running the harness.
       "runs": [                       // one per --runs
         {"n_success": N, "n_failures": N, "failures": {"HTTP 500": 1},
          "wall_time_s": …, "mean_ms": …, "p50_ms": …, "p95_ms": …,
-         "p99_ms": …, "max_ms": …, "rps": …}
+         "p99_ms": …, "max_ms": …, "rps": …,
+         "http_requests": N,          // server HTTP requests during the timed region; null if uncounted
+         "http_requests_per_op": …,   // http_requests / n_success; null if uncounted
+         "route_requests": {"POST /v1/sessions": N, ...}}  // per-route breakdown; {} if uncounted
       ],
       "summary": {"runs_total": 3, "runs_ok": 3,   // how many runs the averages cover
                   "avg_mean_ms": …, "avg_p50_ms": …, "avg_p95_ms": …,
-                  "avg_p99_ms": …, "avg_rps": …}    // averaged over the runs_ok runs
+                  "avg_p99_ms": …, "avg_rps": …,   // averaged over the runs_ok runs
+                  "avg_http_requests_per_op": …,   // present only when a run was counted
+                  "network_routes": [              // per-route appendix, sorted by per_op desc
+                    {"route": "POST /v1/sessions", "requests": N, "per_op": …}
+                  ]}                               // present only when a run recorded routes
     }
     // A journey that errored out of measurement entirely instead carries:
     //   {"kind", "backend", "needs_runner", "runs": [], "summary": {},
@@ -202,6 +293,10 @@ document without running the harness.
   }
 }
 ```
+
+The `http_requests*` / `route_requests` / `network_routes` fields are the
+server-side request count and its per-endpoint breakdown (see *Network* above);
+`network_delay_ms` records the simulated client↔server latency the run used.
 
 The per-journey `summary` + `runs` shape mirrors MLflow's gateway benchmark, so
 the same ETL flatten works — keyed by `journey` and `backend`. Bump
@@ -227,9 +322,10 @@ couldn't be verified.
 | `run.py` | CLI orchestrator + entrypoint |
 | `seed.py` | deterministic corpus seeder (store API) |
 | `journeys.py` | `Journey` dataclass, latency/throughput runners, registry |
-| `environment.py` | server (± runner + mock LLM) lifecycle; `--database-uri` |
+| `environment.py` | server (± runner + mock LLM) lifecycle; `--database-uri`; request-count read + network-delay hook |
 | `measure.py` | `RunResult`, percentile, aggregation, thresholds, tables |
 | `schema.py` | `SCHEMA_VERSION`, `build_report`, git/host metadata |
+| `debug_router.py` | CI-only `GET /debug/server-metrics` plugin router (never shipped in the wheel) |
 | `sample_output.json` | committed example of the JSON contract |
 
 The smoke test is `tests/benchmarks/test_benchmark_smoke.py` (boots the server
@@ -275,4 +371,15 @@ seeding.
 - **Simulated provider latency.** The mock LLM returns at ~zero latency, which
   is what isolates omnigent overhead. A fixed per-response delay knob would let
   turns model end-user wall-clock instead; it's a small change behind the
-  `configure_mock` / `set_mock_fallback` seam if that's ever wanted.
+  `configure_mock` / `set_mock_fallback` seam if that's ever wanted. (Distinct
+  from `--network-delay-ms`, which models the *client↔server* hop — see
+  *Network* above.)
+- **Wider network-delay coverage.** `--network-delay-ms` v1 delays only the
+  client↔server hop (the one the benchmark process owns). Extending it to the
+  server↔runner tunnel and server→mock-LLM hops would need injecting the delay
+  into the runner's httpx client and the tunnel transport in their own
+  processes.
+- **Tunnel round-trip counting.** `http_requests` counts HTTP the server
+  handles, not frames on the persistent server↔runner WebSocket tunnel.
+  Counting those (for a true per-turn round-trip figure) would mean
+  instrumenting the tunnel transport's `RequestFrame` dispatch.

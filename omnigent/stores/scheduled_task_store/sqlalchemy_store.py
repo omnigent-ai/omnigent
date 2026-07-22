@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import asc, delete, desc, select
+from sqlalchemy import and_, asc, delete, desc, or_, select, tuple_
 
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
@@ -91,6 +91,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     the SQLAlchemy ORM.
     """
 
+    # Keyset page size for the scheduler-boot full scan. An instance attribute
+    # so tests can shrink it to exercise multi-page pagination cheaply.
+    _active_boot_batch_size = 10_000
+
     def __init__(self, storage_location: str) -> None:
         """
         Initialize the SQLAlchemy scheduled-task store.
@@ -157,14 +161,19 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             return _to_entity(row)
 
-    def list(self) -> list[ScheduledTask]:
-        """List all scheduled tasks ordered by ``created_at ASC, id ASC``."""
+    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+        """List all scheduled tasks ordered by ``created_at ASC, id ASC``.
+
+        When *owner_user_id* is given, only tasks owned by that user are returned.
+        """
         with self._session() as session:
             stmt = (
                 select(SqlScheduledTask)
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
                 .order_by(asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id))
             )
+            if owner_user_id is not None:
+                stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
@@ -181,19 +190,47 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return [_to_entity(r) for r in rows]
 
     def list_active_all_workspaces(self) -> list[ScheduledTask]:
-        """List active scheduled tasks across every workspace for scheduler boot."""
+        """List active scheduled tasks across every workspace for scheduler boot.
+
+        Pages internally by ``(workspace_id, created_at, id)`` keyset in
+        batches so the scheduler arms *every* active task — no silent cap that
+        would leave tasks beyond a fixed limit un-armed and never firing.
+        """
+        batch_size = self._active_boot_batch_size
+        active_code = encode_scheduled_task_state("active")
+        tasks: list[ScheduledTask] = []
+        cursor: tuple[str, int, str] | None = None
         with self._session() as session:
-            stmt = (
-                select(SqlScheduledTask)
-                .where(SqlScheduledTask.state == encode_scheduled_task_state("active"))
-                .order_by(
-                    asc(SqlScheduledTask.workspace_id),
-                    asc(SqlScheduledTask.created_at),
-                    asc(SqlScheduledTask.id),
+            while True:
+                stmt = (
+                    select(SqlScheduledTask)
+                    .where(SqlScheduledTask.state == active_code)
+                    .order_by(
+                        asc(SqlScheduledTask.workspace_id),
+                        asc(SqlScheduledTask.created_at),
+                        asc(SqlScheduledTask.id),
+                    )
+                    .limit(batch_size)
                 )
-            )
-            rows = session.execute(stmt).scalars().all()
-            return [_to_entity(r) for r in rows]
+                if cursor is not None:
+                    ws, created, tid = cursor
+                    stmt = stmt.where(
+                        tuple_(
+                            SqlScheduledTask.workspace_id,
+                            SqlScheduledTask.created_at,
+                            SqlScheduledTask.id,
+                        )
+                        > (ws, created, tid)
+                    )
+                rows = session.execute(stmt).scalars().all()
+                if not rows:
+                    break
+                tasks.extend(_to_entity(r) for r in rows)
+                if len(rows) < batch_size:
+                    break
+                last = rows[-1]
+                cursor = (last.workspace_id, last.created_at, last.id)
+        return tasks
 
     def update(
         self,
@@ -314,8 +351,27 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             session.flush()
             return _run_to_entity(row)
 
-    def list_runs(self, scheduled_task_id: str) -> list[ScheduledTaskRun]:
-        """List a task's runs ordered by ``scheduled_at DESC, id DESC``."""
+    def list_runs(
+        self,
+        scheduled_task_id: str,
+        *,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> tuple[list[ScheduledTaskRun], str | None]:
+        """List a task's runs ordered by ``scheduled_at DESC, id DESC``.
+
+        Cursor-paginated: fetches ``limit`` runs and returns
+        ``(runs, next_cursor)`` where ``next_cursor`` is the id of the last
+        returned run when a further page exists, else ``None``. Run ids are
+        random UUIDs (not monotonic), so the keyset resolves the cursor row's
+        ``scheduled_at`` and compares the full ``(scheduled_at, id)`` tuple —
+        an id-only keyset would be incorrect under the compound DESC order.
+
+        :param scheduled_task_id: The task whose runs to return.
+        :param limit: Maximum number of runs per page.
+        :param after_id: Return runs ordered after this run id (exclusive).
+        :returns: ``(runs, next_cursor)``.
+        """
         with self._session() as session:
             stmt = (
                 select(SqlScheduledTaskRun)
@@ -323,8 +379,30 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
                 .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
             )
-            rows = session.execute(stmt).scalars().all()
-            return [_run_to_entity(r) for r in rows]
+            if after_id is not None:
+                cursor_scheduled_at = (
+                    select(SqlScheduledTaskRun.scheduled_at)
+                    .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                    .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
+                    .where(SqlScheduledTaskRun.id == after_id)
+                    .scalar_subquery()
+                )
+                # DESC order: the next page holds rows whose (scheduled_at, id)
+                # sorts strictly *after* the cursor, i.e. is strictly smaller.
+                stmt = stmt.where(
+                    or_(
+                        SqlScheduledTaskRun.scheduled_at < cursor_scheduled_at,
+                        and_(
+                            SqlScheduledTaskRun.scheduled_at == cursor_scheduled_at,
+                            SqlScheduledTaskRun.id < after_id,
+                        ),
+                    )
+                )
+            rows = session.execute(stmt.limit(limit + 1)).scalars().all()
+            has_more = len(rows) > limit
+            page = list(rows[:limit])
+            next_cursor = page[-1].id if has_more else None
+            return [_run_to_entity(r) for r in page], next_cursor
 
     def update_run(
         self,

@@ -39,6 +39,50 @@ export function isSlashCommandText(text: string): boolean {
   return SLASH_COMMAND_RE.test(text.trim());
 }
 
+/**
+ * True when `query` is a case-insensitive substring of the command name
+ * (sans the leading `/`). Matches on the name only — not the description —
+ * because the web menu never shows descriptions inline, so a
+ * description-driven match would look unexplained. `name` is expected to
+ * carry the leading `/` (the leading char is dropped before matching).
+ */
+export function slashCommandMatches(name: string, query: string): boolean {
+  return name.slice(1).toLowerCase().includes(query.toLowerCase());
+}
+
+/**
+ * Filter `commands` to those matching `query`, then rank them for display:
+ * built-in commands before skills (so the "Commands" section stays above
+ * "Skills" and the flat keyboard index walks the same order that's
+ * rendered), and within each group, prefix matches before mid-string
+ * matches. The sort is stable, so commands that tie keep their insertion
+ * order. Returns the ranked, slash-prefixed names.
+ *
+ * Prefix-priority matters because the first match is auto-highlighted and
+ * Tab/Enter acts on it — executing no-arg built-ins immediately. Without
+ * it a short query like `e` would highlight `/context` (it contains "e")
+ * ahead of `/effort` (a prefix), so Enter could run an unrelated command
+ * as a side effect. Shared by the menu render filter here and the two
+ * composers' keyboard-nav filters (ChatPage `menuMatches`, NewChatDialog
+ * `slashMenuMatches`) so the visible list and the keyboard index stay
+ * aligned.
+ */
+export function rankedSlashCommandNames(commands: Record<string, string>, query: string): string[] {
+  const q = query.toLowerCase();
+  // Lower rank sorts first: built-in (0) before skill (2), and within each,
+  // prefix (0) before mid-string (1). Skills are anything not in the
+  // built-in map (the landing menu passes skills only, so all rank equally
+  // there — prefix-vs-substring still applies).
+  const rank = (name: string): number => {
+    const group = name in BUILTIN_SLASH_COMMANDS ? 0 : 2;
+    const prefix = name.slice(1).toLowerCase().startsWith(q) ? 0 : 1;
+    return group + prefix;
+  };
+  return Object.keys(commands)
+    .filter((name) => slashCommandMatches(name, query))
+    .sort((a, b) => rank(a) - rank(b));
+}
+
 interface SlashCommandMenuProps {
   /** The text typed after the leading ``/``, used to filter suggestions. */
   query: string;
@@ -115,7 +159,8 @@ function MenuRowButton({
  * layout: a narrow panel with "Commands" / "Skills" section headers and
  * icon + name rows, plus a detail card beside the panel showing the
  * highlighted entry's full description (hidden on small screens).
- * Only commands whose name starts with the current query are shown.
+ * Only commands whose name (sans ``/``) contains the current query as a
+ * case-insensitive substring are shown.
  * Positioned via ``absolute bottom-full`` relative to the rounded
  * composer container. Exported for direct unit testing.
  */
@@ -125,8 +170,7 @@ export function SlashCommandMenu({
   onSelect,
   commands,
 }: SlashCommandMenuProps) {
-  const lower = query.toLowerCase();
-  const matches = Object.entries(commands).filter(([name]) => name.slice(1).startsWith(lower));
+  const matchedNames = rankedSlashCommandNames(commands, query);
   const listRef = useRef<HTMLDivElement>(null);
   // Keep the keyboard-highlighted row visible as the user arrows past the
   // visible window of this capped-height, scrollable list. Without this the
@@ -136,15 +180,15 @@ export function SlashCommandMenu({
     if (activeIndex < 0 || !listRef.current) return;
     listRef.current.querySelector('[data-active="true"]')?.scrollIntoView({ block: "nearest" });
   }, [activeIndex]);
-  if (matches.length === 0) return null;
+  if (matchedNames.length === 0) return null;
 
-  // Split into sections WITHOUT reordering: the flat match order drives the
-  // caller's keyboard index, and built-ins are inserted before skills (the
-  // landing menu passes skills only), so the partition is contiguous and
-  // rendering Commands above Skills preserves the visual = keyboard order.
-  const rows: MenuRow[] = matches.map(([name, description], flatIndex) => ({
+  // The flat match order (from rankedSlashCommandNames) drives the caller's
+  // keyboard index. It ranks built-ins before skills, so the partition below
+  // stays contiguous and rendering Commands above Skills preserves the
+  // visual = keyboard order.
+  const rows: MenuRow[] = matchedNames.map((name, flatIndex) => ({
     name,
-    description,
+    description: commands[name] ?? "",
     flatIndex,
   }));
   const builtinRows = rows.filter((r) => r.name in BUILTIN_SLASH_COMMANDS);

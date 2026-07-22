@@ -497,6 +497,100 @@ class ExternalRoutingClient:
 
 # ── Public API ──────────────────────────────────────────────────────────────
 
+# SDK harnesses offered as candidates when the user picks "auto" harness.
+# Native harnesses are excluded: they require CLI binaries that may not be
+# installed, and they bake the model at terminal launch rather than per-turn.
+_AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "pi", "codex")
+
+
+async def route_session_harness(
+    user_message: str,
+    *,
+    session_id: str | None = None,
+    runner_client: httpx.AsyncClient | None = None,
+) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    """Pick the best harness + model for a new session via the routing client.
+
+    Builds a candidate set from the live runner catalog when *session_id* and
+    *runner_client* are provided, falling back to the static ``infer_models``
+    table for any harness not represented in the live data.  Only harnesses in
+    :data:`_AUTO_ROUTING_HARNESSES` are offered as candidates.
+
+    :param user_message: The user's first message text, used to size the task.
+    :param session_id: Session id for the live catalog fetch (optional).
+    :param runner_client: HTTP client pointed at the runner (optional).
+    :returns: ``(harness, model, verdict)`` on success; ``(None, None, None)``
+        when routing is unavailable, the message is empty, or the router fails.
+    """
+    if not user_message:
+        return None, None, None
+    try:
+        from omnigent.runtime._globals import _caps
+    except ImportError:
+        return None, None, None
+
+    if _caps is None or _caps.routing_client is None:
+        return None, None, None
+
+    # Fetch live catalog and restrict to our known SDK harnesses.
+    live_catalog: dict[str, list[str]] | None = None
+    if session_id and runner_client is not None:
+        live_catalog = await fetch_runner_models(session_id, runner_client)
+
+    harness_models: dict[str, list[str]] = {}
+    for h in _AUTO_ROUTING_HARNESSES:
+        if live_catalog is not None:
+            if h in live_catalog:
+                harness_models[h] = live_catalog[h]
+        else:
+            models = infer_models(h)
+            if models:
+                harness_models[h] = models
+
+    if not harness_models:
+        return None, None, None
+
+    try:
+        result = await _caps.routing_client.route(user_message, harness_models)
+    except Exception:  # routing failures must not block session creation
+        _logger.exception("smart_routing: route_session_harness failed")
+        return None, None, None
+
+    if result is None:
+        return None, None, None
+
+    # Use the router's harness pick only when it names one of our candidates
+    # AND the chosen model is in that harness's list (avoids mismatches).
+    if result.harness in harness_models and result.model in harness_models[result.harness]:
+        chosen_harness = result.harness
+    else:
+        if result.harness and result.harness not in harness_models:
+            _logger.debug(
+                "smart_routing: router harness %r not in candidate set; "
+                "falling back to model-ownership lookup",
+                result.harness,
+            )
+        elif result.harness and result.model not in harness_models.get(result.harness, []):
+            _logger.debug(
+                "smart_routing: router harness %r does not own model %r; "
+                "falling back to model-ownership lookup",
+                result.harness,
+                result.model,
+            )
+        chosen_harness = None
+        for h, models in harness_models.items():
+            if result.model in models:
+                chosen_harness = h
+                break
+
+    _logger.info(
+        "smart_routing: auto-harness harness=%s model=%s rationale=%s",
+        chosen_harness,
+        result.model,
+        result.rationale,
+    )
+    return chosen_harness, result.model, {"model": result.model, "rationale": result.rationale}
+
 
 async def route_turn(
     harness: str | None,

@@ -1840,6 +1840,11 @@ class SessionResponse(BaseModel):
     # opening the session mid-startup sees the startup band.
     mcp_startup: dict[str, McpServerStartup] | None = None
     active_response_id: str | None = None
+    # First-class project this session is filed under, or ``None`` when
+    # unfiled. Distinct from the legacy ``omni_project`` label (surfaced in
+    # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
+    # ``GET /v1/sessions?project=``.
+    project_id: str | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -1909,6 +1914,14 @@ class UpdateSessionRequest(BaseModel):
         session from the default sidebar listing), ``False`` unarchives,
         ``None`` leaves unchanged. Owner-only (unlike ``title``, which
         needs only edit access).
+    :param project_id: File this session into a first-class project (see
+        ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
+        that project; the empty string ``""`` unfiles it. **Omitting** the
+        field leaves membership unchanged; an explicit ``null`` is rejected
+        (400) so it can't silently unfile. Owner-only: because projects are
+        owner-private, only the session owner may file it, and only into a
+        project they own — the server verifies both. Independent of the
+        legacy ``omni_project`` label, which is set via ``labels``.
     """
 
     runner_id: str | None = None
@@ -1921,6 +1934,7 @@ class UpdateSessionRequest(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     archived: bool | None = None
+    project_id: str | None = None
     silent: bool = False
 
     model_config = ConfigDict(extra="forbid")
@@ -1940,6 +1954,25 @@ class AutomaticSessionRenameResponse(BaseModel):
     renamed: bool
     title: str | None = None
     reason: Literal["not_top_level", "no_seed", "title_changed"] | None = None
+
+
+class BackgroundSessionTitleRequest(BaseModel):
+    """Private runner request for isolated background title inference."""
+
+    prompt: str = Field(min_length=1, max_length=20_000)
+    agent_id: str | None = None
+    model_override: str | None = None
+    harness_override: str | None = None
+    sub_agent_name: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class BackgroundSessionTitleResponse(BaseModel):
+    """Private runner result for background title inference."""
+
+    status: Literal["generated", "unsupported"]
+    title: str | None = None
 
 
 class CodexGoalObject(BaseModel):
@@ -2239,6 +2272,10 @@ class SessionListItem(BaseModel):
     viewer_unread: bool = False
     search_snippet: str | None = None
     parent_session_id: str | None = None
+    # First-class project this session is filed under, or ``None`` when
+    # unfiled. Lets the sidebar group sessions by project without a follow-up
+    # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
+    project_id: str | None = None
 
 
 class SessionList(BaseModel):
@@ -4098,3 +4135,97 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
 
 
 HarnessStreamEvent = ServerStreamEvent | InjectionConsumedEvent | PolicyEvaluationRequestEvent
+
+
+# ── Projects ──────────────────────────────────────────────────────
+
+
+class ProjectObject(BaseModel):
+    """
+    A first-class project (see ``designs/PROJECTS_PRD.md``).
+
+    :param id: Project id (bare 32-char hex).
+    :param object: Discriminator; always ``"project"``.
+    :param name: Human-readable project name, unique per owner.
+    :param created_at: Unix epoch seconds at creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    """
+
+    id: str
+    object: Literal["project"] = "project"
+    name: str
+    created_at: int
+    updated_at: int | None = None
+
+
+class ProjectList(BaseModel):
+    """Response for ``GET /v1/projects``.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The caller's projects.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[ProjectObject]
+
+
+class CreateProjectRequest(BaseModel):
+    """
+    Request body for ``POST /v1/projects``.
+
+    :param name: Human-readable project name. Trimmed; must be non-empty and
+        at most 100 characters; unique among the caller's projects.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        """Trim and bound the project name.
+
+        :param value: The raw name from the request.
+        :returns: The trimmed name.
+        :raises ValueError: If empty/whitespace-only or over 100 chars.
+        """
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name must not be empty")
+        if len(trimmed) > 100:
+            raise ValueError("name must be at most 100 characters")
+        return trimmed
+
+
+class UpdateProjectRequest(BaseModel):
+    """
+    Request body for ``PATCH /v1/projects/{project_id}``.
+
+    All fields optional; ``None`` leaves a field unchanged.
+
+    :param name: New project name. ``None`` leaves it unchanged; otherwise
+        trimmed, non-empty, at most 100 characters.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str | None) -> str | None:
+        """Trim and bound the project name when provided.
+
+        :param value: The raw name from the request, or ``None``.
+        :returns: The trimmed name, or ``None``.
+        :raises ValueError: If provided but empty/whitespace-only or over 100.
+        """
+        if value is None:
+            return None
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("name must not be empty")
+        if len(trimmed) > 100:
+            raise ValueError("name must be at most 100 characters")
+        return trimmed

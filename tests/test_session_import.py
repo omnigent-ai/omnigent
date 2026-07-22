@@ -13,12 +13,14 @@ from omnigent.kiro_native_session_forwarder import (
     KiroConversationMessage,
     parse_kiro_jsonl_line,
 )
+from omnigent.session_import import local as local_import
 from omnigent.session_import.local import (
     list_recent_local_session_ids,
     load_claude_session,
     load_codex_session,
     load_kimi_session,
     load_kiro_session,
+    load_opencode_session,
     load_pi_session,
     load_qwen_session,
 )
@@ -166,6 +168,140 @@ def test_long_source_ids_get_distinct_bounded_response_ids(
     assert len(response_ids) == 2
     assert response_ids[0] != response_ids[1]
     assert all(len(response_id) <= 64 for response_id in response_ids)
+
+
+def test_list_recent_opencode_sessions_uses_public_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenCode batch discovery uses its supported JSON listing command."""
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(*arguments: str, opencode_path: str | None = None) -> object:
+        assert opencode_path is None
+        calls.append(arguments)
+        return [
+            {"id": "ses_old", "updated": 10, "directory": "/old"},
+            {"id": "ses_child", "updated": 30, "parentID": "ses_parent"},
+            {"id": "ses_new", "updated": 20, "directory": "/new"},
+        ]
+
+    monkeypatch.setattr(local_import, "_run_opencode_json", fake_run)
+
+    assert list_recent_local_session_ids("opencode", limit=2) == ("ses_new", "ses_old")
+    assert calls == [("session", "list", "--format", "json", "--pure")]
+
+
+def test_list_recent_opencode_sessions_rejects_schema_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed public listing schema reports a contract error."""
+    monkeypatch.setattr(local_import, "_run_opencode_json", lambda *arguments: {})
+
+    with pytest.raises(SessionImportNotFoundError, match="invalid session list"):
+        list_recent_local_session_ids("opencode", limit=1)
+
+
+def test_load_opencode_session_preserves_messages_files_and_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public export maps ordered parts to durable Omnigent items."""
+    export = {
+        "info": {
+            "id": "ses_import",
+            "directory": "/repo",
+            "version": "1.17.18",
+        },
+        "messages": [
+            {
+                "info": {"id": "msg_user", "role": "user"},
+                "parts": [
+                    {"type": "text", "text": "inspect TODO.md"},
+                    {
+                        "type": "file",
+                        "mime": "image/png",
+                        "url": "data:image/png;base64,AAAA",
+                    },
+                ],
+            },
+            {
+                "info": {"id": "msg_assistant", "role": "assistant"},
+                "parts": [
+                    {"type": "reasoning", "text": "private reasoning"},
+                    {"type": "text", "text": "Checking."},
+                    {
+                        "type": "tool",
+                        "callID": "call_1",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "rg TODO"},
+                            "output": "",
+                            "metadata": {"output": "TODO.md:1:item"},
+                        },
+                    },
+                    {"type": "text", "text": "Done."},
+                ],
+            },
+        ],
+    }
+
+    def fake_run(*arguments: str, opencode_path: str | None = None) -> object:
+        assert arguments == ("export", "ses_import", "--pure")
+        assert opencode_path is None
+        return export
+
+    monkeypatch.setattr(local_import, "_run_opencode_json", fake_run)
+
+    imported = load_opencode_session("ses_import")
+    dumped = [item.data.model_dump(mode="json", exclude_none=True) for item in imported.items]
+
+    assert imported.source == "opencode"
+    assert imported.external_session_id == "ses_import"
+    assert imported.workspace == "/repo"
+    assert [item.type for item in imported.items] == [
+        "message",
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert dumped[0] == {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "inspect TODO.md"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ],
+    }
+    assert dumped[1]["content"] == [{"type": "output_text", "text": "Checking."}]
+    assert dumped[1]["agent"] == "opencode-native-ui"
+    assert dumped[2] == {
+        "agent": "opencode-native-ui",
+        "name": "bash",
+        "arguments": '{"command":"rg TODO"}',
+        "call_id": "call_1",
+    }
+    assert dumped[3] == {"call_id": "call_1", "output": "TODO.md:1:item"}
+    assert dumped[4]["content"] == [{"type": "output_text", "text": "Done."}]
+    assert {item.response_id for item in imported.items[1:]} == {"opencode:msg_assistant"}
+
+
+def test_load_opencode_session_rejects_invalid_or_mismatched_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unsafe CLI arguments and mismatched exports cannot claim an import id."""
+    with pytest.raises(SessionImportNotFoundError, match="was not found"):
+        load_opencode_session("--help")
+
+    monkeypatch.setattr(
+        local_import,
+        "_run_opencode_json",
+        lambda *arguments, opencode_path=None: {
+            "info": {"id": "ses_other"},
+            "messages": [],
+        },
+    )
+    with pytest.raises(SessionImportNotFoundError, match="did not match"):
+        load_opencode_session("ses_expected")
 
 
 def test_load_claude_session_normalizes_parent_transcript(tmp_path: Path) -> None:

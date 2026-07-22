@@ -12,6 +12,7 @@ import respx
 from click.testing import CliRunner
 
 from omnigent.cli import _CLICK_SUBCOMMANDS, cli
+from omnigent.session_import.models import SessionImportNotFoundError
 
 _BASE = "http://localhost:6767"
 
@@ -134,6 +135,57 @@ def test_import_command_accepts_qwen_session(tmp_path: Path) -> None:
     assert payload["source"] == "qwen"
     assert payload["external_session_id"] == f"-repo:{session_id}"
     assert "conv_qwen" in result.output
+
+
+@respx.mock
+def test_import_command_accepts_opencode_export() -> None:
+    """The CLI accepts OpenCode and uploads its public export representation."""
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_opencode", "status": "imported", "item_count": 1},
+        )
+    )
+    export = {
+        "info": {"id": "ses_cli", "directory": "/repo"},
+        "messages": [
+            {
+                "info": {"id": "msg_user", "role": "user"},
+                "parts": [{"type": "text", "text": "hello"}],
+            }
+        ],
+    }
+
+    with (
+        patch("omnigent.cli._resolve_attach_server", return_value=_BASE),
+        patch("omnigent.session_import.local._run_opencode_json", return_value=export),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "opencode", "--session", "ses_cli"],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(route.calls.last.request.content)
+    assert payload["source"] == "opencode"
+    assert payload["external_session_id"] == "ses_cli"
+    assert payload["workspace"] == "/repo"
+    assert "conv_opencode" in result.output
+
+
+def test_import_command_reports_opencode_discovery_failure() -> None:
+    """Batch discovery surfaces a missing or broken OpenCode CLI cleanly."""
+    with patch(
+        "omnigent.session_import.local._run_opencode_json",
+        side_effect=SessionImportNotFoundError("opencode CLI not found on PATH"),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "opencode", "--last", "1"],
+        )
+
+    assert result.exit_code == 1
+    assert "opencode CLI not found on PATH" in result.output
 
 
 @respx.mock
