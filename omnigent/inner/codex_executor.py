@@ -753,6 +753,9 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
         if minimal_config and filename == "config.toml":
             import tomlkit
 
+            # The title worker needs custom-provider routing, but copying the
+            # full user config also starts unrelated MCPs/plugins and can exceed
+            # its timeout. auth.json alone cannot supply these provider tables.
             source_config = tomlkit.parse(source_file.read_text())
             minimal_document = tomlkit.document()
             for key in ("model_provider", "model_providers", "profiles"):
