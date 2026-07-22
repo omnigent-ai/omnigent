@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 
 export interface Host {
@@ -58,5 +58,59 @@ export function useHosts(options: UseHostsOptions = {}) {
     // Host status is pushed via WS (hosts_changed frame in SessionUpdatesProvider).
     // 60 s fallback poll catches any missed events (tab backgrounded, reconnect gap).
     refetchInterval: enabled ? 60_000 : false,
+  });
+}
+
+interface InstallHarnessResult {
+  object: "harness_install";
+  harness: string;
+  configured_harnesses: Record<string, boolean | string>;
+}
+
+/**
+ * Install a missing harness onto a connected host from the UI.
+ *
+ * POSTs to the flag-gated install endpoint; the server drives the same
+ * installer `omnigent setup` uses and returns the host's refreshed readiness.
+ * On success we write that map straight into every cached host list so the
+ * "needs setup" badge flips to ready without waiting for the 60 s poll or a
+ * reconnect. The caller passes the harness id (e.g. `"codex"`); only ids in the
+ * server's `installable_harnesses` set should be offered (see
+ * `canInstallHarnessFromUI`).
+ *
+ * Concurrent installs of different harnesses are supported: each `mutate()`
+ * call runs independently, and callers track per-harness in-flight state via
+ * the call's own `onSettled` (see `HarnessSetupDialog`) rather than the shared
+ * observer's `isPending`, which only reflects the latest call.
+ */
+export function useInstallHarness(hostId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (harness: string): Promise<InstallHarnessResult> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
+      );
+      if (!res.ok) {
+        let detail = `${res.status} ${res.statusText}`;
+        try {
+          const err = (await res.json()) as { detail?: string };
+          if (typeof err.detail === "string" && err.detail) detail = err.detail;
+        } catch {
+          // Non-JSON error body — keep the status-line detail.
+        }
+        throw new Error(detail);
+      }
+      return (await res.json()) as InstallHarnessResult;
+    },
+    onSuccess: (result) => {
+      // Patch the refreshed readiness into every ["hosts", …] cache entry
+      // (filtered + unfiltered) so the badge updates immediately.
+      queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
+        hosts?.map((h) =>
+          h.host_id === hostId ? { ...h, configured_harnesses: result.configured_harnesses } : h,
+        ),
+      );
+    },
   });
 }

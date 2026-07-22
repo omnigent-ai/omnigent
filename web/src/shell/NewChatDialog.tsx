@@ -53,6 +53,16 @@ import { authenticatedFetch } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
+import {
+  harnessUnavailableReasonOnHost,
+  harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  isCodexHarness,
+} from "@/lib/harnessSetup";
+
+// Re-exported for tests that import the readiness helpers from this module.
+export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { sandboxOptionLabel } from "@/lib/capabilities";
 import { isSlashCommandText, SlashCommandMenu } from "@/components/SlashCommandMenu";
 import { setPendingInitialPrompt } from "@/store/chatStore";
@@ -520,85 +530,21 @@ export async function describeCreateError(res: Response): Promise<string> {
 }
 
 /**
- * Whether an agent's harness is known to be unconfigured on a host.
+ * The pre-feature "run omnigent setup" guidance (ReactNode), shown under the
+ * composer when the UI-driven setup feature is OFF.
  *
- * Warning-only signal for the agent picker: `true` only when the host
- * explicitly reported the harness as not ready (CLI missing or no
- * default credential — see `omnigent setup`). A missing readiness map
- * (older host build) or an unknown harness yields `false`, so unknown
- * never warns; the host re-checks authoritatively at launch time.
- *
- * @param harness The agent's harness id as returned by `/v1/agents`,
- *   e.g. `"claude-sdk"` or `"codex"`. `null` when the agent has none.
- * @param host The selected host, or `undefined`/`null` when no
- *   connected host is selected (e.g. sandbox).
- * @returns `true` when the host explicitly reports the harness as
- *   unconfigured.
+ * The ``needs-auth`` / ``binary-missing`` copy is Codex-specific ("run codex
+ * login" / "set OMNIGENT_CODEX_PATH"), so it's gated on {@link isCodexHarness}.
+ * Other harnesses that report those structured reasons (claude-native /
+ * opencode-native now do) fall through to the generic "run omnigent setup"
+ * message — matching the pre-feature behavior, where only Codex ever produced
+ * these reasons and everything else showed the generic text.
  */
-export function harnessUnconfiguredOnHost(
-  harness: string | null | undefined,
-  host: Host | undefined | null,
-): boolean {
-  return harnessUnavailableReasonOnHost(harness, host) !== null;
-}
-
-function isCodexHarness(harness: string): boolean {
-  return harness === "codex" || harness === "codex-native" || harness === "native-codex";
-}
-
-function isNativeCursorHarness(harness: string): boolean {
-  return harness === "cursor-native" || harness === "native-cursor";
-}
-
-export function harnessUnavailableReasonOnHost(
-  harness: string | null | undefined,
-  host: Host | undefined | null,
-): string | null {
-  if (!harness || !host?.configured_harnesses) return null;
-  const availability = host.configured_harnesses[harness];
-  if (availability === false) {
-    if (isCodexHarness(harness)) return "binary-missing";
-    if (isNativeCursorHarness(harness)) return "cursor-cli-missing";
-    return "unconfigured";
-  }
-  if (
-    isCodexHarness(harness) &&
-    (availability === "binary-missing" || availability === "needs-auth")
-  ) {
-    return availability;
-  }
-  // Unknown future reason strings fall through to no warning until the UI knows their copy.
-  return null;
-}
-
-export function harnessWarningBadgeText(reason: string | null): string {
-  if (reason === "binary-missing") return "binary missing";
-  if (reason === "needs-auth") return "needs auth";
-  if (reason === "cursor-cli-missing") return "install & login";
-  return "needs setup";
-}
-
-export function harnessWarningMessageText(
-  agentName: string | undefined,
-  hostName: string | undefined,
-  reason: string | null,
-): string {
-  if (reason === "cursor-cli-missing") {
-    return `${agentName} needs cursor-agent on ${hostName} — install it with \`curl https://cursor.com/install -fsS | bash\`, then run \`cursor-agent login\`.`;
-  }
-  if (reason === "needs-auth") {
-    return `${agentName} needs Codex authentication on ${hostName} — run codex login on that machine.`;
-  }
-  if (reason === "binary-missing") {
-    return `${agentName} can't find the Codex binary on ${hostName} — if codex is installed, restart the host with omnigent host so it picks up your PATH, or set OMNIGENT_CODEX_PATH. Otherwise run omnigent setup.`;
-  }
-  return `${agentName} isn't configured on ${hostName} — run omnigent setup on that machine.`;
-}
-
 function harnessWarningMessage(
   agentName: string | undefined,
   hostName: string | undefined,
   reason: string | null,
+  harness: string | null | undefined,
 ): ReactNode {
   if (reason === "cursor-cli-missing") {
     return (
@@ -609,7 +555,8 @@ function harnessWarningMessage(
       </>
     );
   }
-  if (reason === "needs-auth") {
+  const isCodex = !!harness && isCodexHarness(harness);
+  if (reason === "needs-auth" && isCodex) {
     return (
       <>
         {agentName} needs Codex authentication on {hostName} — run <code>codex login</code> on that
@@ -617,7 +564,7 @@ function harnessWarningMessage(
       </>
     );
   }
-  if (reason === "binary-missing") {
+  if (reason === "binary-missing" && isCodex) {
     return (
       <>
         {agentName} can&apos;t find the Codex binary on {hostName} — if codex is installed, restart
@@ -631,6 +578,60 @@ function harnessWarningMessage(
       {agentName} isn&apos;t configured on {hostName} — run <code>omnigent setup</code> on that
       machine.
     </>
+  );
+}
+
+/**
+ * Amber "harness not ready on this host" notice under the composer, for the
+ * currently-selected agent (case A: surfaced without opening the picker).
+ *
+ * Gated on the setup feature: when OFF, renders the original "run omnigent
+ * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
+ * <agent>" action that opens the shared {@link HarnessSetupDialog}.
+ */
+function HarnessSetupNotice({
+  agentName,
+  hostName,
+  harness,
+  reason,
+  featureEnabled,
+  onSetup,
+}: {
+  agentName: string | undefined;
+  hostName: string | undefined;
+  harness: string | null | undefined;
+  reason: string | null;
+  featureEnabled: boolean;
+  onSetup: () => void;
+}) {
+  return (
+    <p
+      // pl-2 lines the icon up with the chips tray directly above (which has
+      // pl-2), so the notice reads as part of the composer, not indented left.
+      className="flex items-center gap-2 pl-2 text-xs text-amber-600 dark:text-amber-500"
+      data-testid="new-chat-landing-harness-warning"
+    >
+      <TriangleAlertIcon className="size-3.5 shrink-0" />
+      {featureEnabled ? (
+        <>
+          <span>
+            {agentName} isn&apos;t ready on {hostName}.
+          </span>
+          {/* Compact bordered chip — small enough to sit on the sentence's line
+              (h-5, text-xs), so it reads as part of the notice. */}
+          <button
+            type="button"
+            data-testid="new-chat-landing-harness-setup"
+            className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-xs font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
+            onClick={onSetup}
+          >
+            Set up {agentName}
+          </button>
+        </>
+      ) : (
+        <span>{harnessWarningMessage(agentName, hostName, reason, harness)}</span>
+      )}
+    </p>
   );
 }
 
@@ -1164,6 +1165,10 @@ function BrainHarnessOptions({
   labels: Record<string, string>;
   hideUnconfigured: boolean;
 }) {
+  const info = useServerInfo();
+  // Feature ON → collapse the badge to a single "needs setup"; OFF → per-reason
+  // text (the original pre-feature label).
+  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
   // With "hide unconfigured harnesses" on, drop brain options that can't launch
   // on the host — except the current selection, which stays so the radio group
   // still reflects the active pick.
@@ -1193,7 +1198,7 @@ function BrainHarnessOptions({
                 className="border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
                 data-testid={`new-chat-landing-harness-warning-${id}`}
               >
-                {harnessWarningBadgeText(harnessUnavailableReasonOnHost(id, host))}
+                {harnessWarningBadgeText(harnessUnavailableReasonOnHost(id, host), collapsedBadge)}
               </Badge>
             )}
           </DropdownMenuRadioItem>
@@ -1349,6 +1354,9 @@ function AgentHarnessPicker({
   // menu (see the sub-trigger onClick below) without diving into the submenu.
   const [open, setOpen] = useState(false);
   const queryClient = useQueryClient();
+  const info = useServerInfo();
+  // Feature ON → single "needs setup" badge; OFF → per-reason original text.
+  const collapsedBadge = info !== "loading" && info.harness_install_enabled;
 
   // Touch devices can't hover, so the desktop knob flyout (a Radix sub-menu
   // that opens on hover) is unreachable there. On mobile we instead swap the
@@ -1411,7 +1419,10 @@ function AgentHarnessPicker({
         className="ml-auto self-center border-amber-300 bg-amber-50 text-[11px] text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
         data-testid={`new-chat-landing-agent-warning-${agent.id}`}
       >
-        {harnessWarningBadgeText(harnessUnavailableReasonOnHost(agent.harness, host))}
+        {harnessWarningBadgeText(
+          harnessUnavailableReasonOnHost(agent.harness, host),
+          collapsedBadge,
+        )}
       </Badge>
     ) : null;
 
@@ -1882,6 +1893,10 @@ export function NewChatLandingScreen() {
   const info = useServerInfo();
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
+  // Gates the whole UI-driven setup experience (Set up affordance + dialog +
+  // collapsed badge). OFF → the composer/picker fall back to the original
+  // "run omnigent setup" guidance, so a disabled flag is a no-op on the UI.
+  const harnessInstallEnabled = info !== "loading" && info.harness_install_enabled;
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
@@ -2032,6 +2047,13 @@ export function NewChatLandingScreen() {
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
+  // Harness "Set up" dialog target, opened from the composer notice or a picker
+  // row; null when closed. One dialog serves every entry point.
+  const [setupTarget, setSetupTarget] = useState<{
+    agentName: string | undefined;
+    harness: string | null;
+    host: Host | undefined | null;
+  } | null>(null);
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -2341,10 +2363,6 @@ export function NewChatLandingScreen() {
   // call surfaces a specific error if the harness really can't run.
   const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   const selectedAgentUnconfigured = harnessUnconfiguredOnHost(
-    selectedAgent?.harness,
-    harnessWarningHost,
-  );
-  const selectedAgentUnavailableReason = harnessUnavailableReasonOnHost(
     selectedAgent?.harness,
     harnessWarningHost,
   );
@@ -3847,19 +3865,20 @@ export function NewChatLandingScreen() {
               really can't run. Normal-flow directly under the composer
               (like the createError line below) so it reads as part of it. */}
           {selectedAgentUnconfigured && (
-            <p
-              className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-500"
-              data-testid="new-chat-landing-harness-warning"
-            >
-              <TriangleAlertIcon className="size-3.5 shrink-0" />
-              <span>
-                {harnessWarningMessage(
-                  selectedAgent?.display_name,
-                  harnessWarningHost?.name,
-                  selectedAgentUnavailableReason,
-                )}
-              </span>
-            </p>
+            <HarnessSetupNotice
+              agentName={selectedAgent?.display_name}
+              hostName={harnessWarningHost?.name}
+              harness={selectedAgent?.harness ?? null}
+              reason={harnessUnavailableReasonOnHost(selectedAgent?.harness, harnessWarningHost)}
+              featureEnabled={harnessInstallEnabled}
+              onSetup={() =>
+                setSetupTarget({
+                  agentName: selectedAgent?.display_name,
+                  harness: selectedAgent?.harness ?? null,
+                  host: harnessWarningHost,
+                })
+              }
+            />
           )}
 
           {/* Persistent danger banner — stays under the composer while full
@@ -3902,6 +3921,19 @@ export function NewChatLandingScreen() {
           />
         </DialogContent>
       </Dialog>
+
+      {/* Harness "Set up" dialog — the single home for install/login (and later
+          API key / gateway) setup, opened from the composer notice or a picker
+          row's "Set up →". */}
+      <HarnessSetupDialog
+        open={setupTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setSetupTarget(null);
+        }}
+        agentName={setupTarget?.agentName}
+        harness={setupTarget?.harness ?? null}
+        host={setupTarget?.host}
+      />
 
       {/* Create custom agent dialog — opened from the agent picker dropdown. */}
       <CreateAgentDialog

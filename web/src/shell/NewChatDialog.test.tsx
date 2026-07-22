@@ -10,8 +10,6 @@ import {
   describeCreateError,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
-  harnessWarningBadgeText,
-  harnessWarningMessageText,
   isValidSandboxRepoUrl,
   isValidWorkspace,
   matchSkillInvocation,
@@ -24,7 +22,7 @@ import {
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHosts, useInstallHarness, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -42,7 +40,16 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/identity")>()),
   authenticatedFetch: vi.fn(),
 }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  // The setup dialog mounts these; default to an inert mutation + not-installing
+  // so tests that don't exercise install don't need to wire them up.
+  useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+}));
+// The setup dialog's copyable command rows call copyText; stub it so a click
+// can be asserted without touching the real clipboard.
+const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -83,6 +90,28 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     pi: "Pi",
     antigravity: "Antigravity",
     copilot: "Copilot",
+  }),
+  // The setup dialog reads server-authored steps from here; stub codex-native's
+  // two-step flow (install → login) so the dialog renders without a real fetch.
+  useHarnessSetupSteps: () => ({
+    "codex-native": [
+      {
+        kind: "install",
+        title: "Install Codex",
+        detail: "We'll install Codex on the host for you.",
+        action: "install",
+        command: null,
+        status_key: "installed",
+      },
+      {
+        kind: "auth",
+        title: "Sign in to Codex",
+        detail: "Uses your ChatGPT subscription — sign in on the host.",
+        action: "command",
+        command: "codex login",
+        status_key: "authed",
+      },
+    ],
   }),
 }));
 // Partial mock: only spy on the first-message handoff so the "@"-mention
@@ -449,39 +478,11 @@ describe("harnessUnconfiguredOnHost", () => {
     expect(harnessUnconfiguredOnHost("claude-sdk", testHost)).toBe(false);
   });
 
-  it("keeps legacy non-codex false availability generic", () => {
-    const testHost = hostWith({ "claude-native": false });
-    const reason = harnessUnavailableReasonOnHost("claude-native", testHost);
-    expect(reason).toBe("unconfigured");
-    expect(harnessWarningBadgeText(reason)).toBe("needs setup");
-    expect(harnessWarningMessageText("Claude Code", "laptop", reason)).toBe(
-      "Claude Code isn't configured on laptop — run omnigent setup on that machine.",
-    );
-  });
-
-  it("shows native Cursor's install and login steps before launch", () => {
-    const testHost = hostWith({ "cursor-native": false });
-    const reason = harnessUnavailableReasonOnHost("cursor-native", testHost);
-    expect(reason).toBe("cursor-cli-missing");
-    expect(harnessWarningBadgeText(reason)).toBe("install & login");
-    expect(harnessWarningMessageText("Cursor", "laptop", reason)).toBe(
-      "Cursor needs cursor-agent on laptop — install it with `curl https://cursor.com/install -fsS | bash`, then run `cursor-agent login`.",
-    );
-  });
-
-  it("surfaces structured codex unavailable reasons", () => {
+  it("classifies structured codex reasons (bare + native spellings)", () => {
     const testHost = hostWith({ codex: "needs-auth", "codex-native": "binary-missing" });
     expect(harnessUnconfiguredOnHost("codex", testHost)).toBe(true);
     expect(harnessUnavailableReasonOnHost("codex", testHost)).toBe("needs-auth");
     expect(harnessUnavailableReasonOnHost("codex-native", testHost)).toBe("binary-missing");
-    expect(harnessWarningBadgeText("needs-auth")).toBe("needs auth");
-    expect(harnessWarningMessageText("Codex", "laptop", "needs-auth")).toBe(
-      "Codex needs Codex authentication on laptop — run codex login on that machine.",
-    );
-    expect(harnessWarningBadgeText("binary-missing")).toBe("binary missing");
-    expect(harnessWarningMessageText("Codex", "laptop", "binary-missing")).toBe(
-      "Codex can't find the Codex binary on laptop — if codex is installed, restart the host with omnigent host so it picks up your PATH, or set OMNIGENT_CODEX_PATH. Otherwise run omnigent setup.",
-    );
   });
 
   it("ignores unknown future reason strings", () => {
@@ -653,6 +654,8 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    harness_install_enabled: false,
+    installable_harnesses: [],
     dictation_available: false,
     ...infoOverrides,
   };
@@ -1140,6 +1143,95 @@ describe("NewChatLandingScreen", () => {
     expect(label("new-chat-landing-host-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-project-chip")?.className).toContain("max-w-32");
     expect(label("new-chat-landing-branch-chip")?.className).toContain("max-w-32");
+  });
+
+  it("opens the setup dialog and installs an installable harness from it", () => {
+    // host_1 reports codex-native (agent a2) as not set up; the server accepts
+    // that harness, so the composer notice offers a "Set up Codex" action that
+    // opens the dialog, and the dialog's Install button fires the install.
+    const installMutate = vi.fn();
+    vi.mocked(useInstallHarness).mockReturnValue({
+      mutate: installMutate,
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallHarness>);
+    mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectAgent("a2");
+
+    // The composer action is labelled with the agent, not "the harness".
+    const setup = screen.getByTestId("new-chat-landing-harness-setup");
+    expect(setup.textContent).toBe("Set up Codex");
+    fireEvent.click(setup);
+    // Dialog opens with a one-click Install (codex-native is installable).
+    fireEvent.click(screen.getByTestId("harness-setup-install"));
+    expect(installMutate).toHaveBeenCalledWith("codex-native", expect.anything());
+  });
+
+  it("marks its Install button loading while THIS harness's install is pending", () => {
+    // The dialog tracks in-flight installs in a local set driven by mutate()'s
+    // onSettled. Hold the mutation pending (never settle) → clicking Install
+    // flips this harness's button to the loading/disabled state.
+    vi.mocked(useInstallHarness).mockReturnValue({
+      // mutate never invokes its options callbacks → install stays in flight.
+      mutate: vi.fn(),
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallHarness>);
+    mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectAgent("a2");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    const button = screen.getByTestId("harness-setup-install") as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    // Clicking starts the install; the button shows the pending state (disabled)
+    // because codex-native was added to the dialog's installing set.
+    fireEvent.click(button);
+    expect((screen.getByTestId("harness-setup-install") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("copies the login command (no Install) for a codex needs-auth state", async () => {
+    // Binary present, just not logged in → dialog shows the `codex login`
+    // instruction as a click-to-copy command, never an Install button (a
+    // reinstall wouldn't add the login).
+    copyTextMock.mockClear();
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
+    ]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectAgent("a2");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    const command = screen.getByTestId("harness-setup-command");
+    expect(command.textContent).toContain("codex login");
+    expect(screen.queryByTestId("harness-setup-install")).toBeNull();
+
+    fireEvent.click(command);
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledWith("codex login"));
+  });
+
+  it("falls back to the original setup guidance when the feature is off", () => {
+    // Flag OFF (renderLanding default) → the pre-feature UI: the warning shows
+    // the descriptive "run omnigent setup" message, NOT the "Set up" action or
+    // dialog. This is the no-op-when-disabled contract.
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
+    ]);
+    renderLanding();
+    selectAgent("a2");
+
+    const warning = screen.getByTestId("new-chat-landing-harness-warning");
+    expect(warning.textContent).toContain("codex login");
+    // No "Set up" affordance and no dialog trigger when the feature is off.
+    expect(screen.queryByTestId("new-chat-landing-harness-setup")).toBeNull();
   });
 
   it("suppresses the conflict banner once a git branch is named", async () => {

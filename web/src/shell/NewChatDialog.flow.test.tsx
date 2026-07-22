@@ -49,7 +49,10 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -93,6 +96,9 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  // Stub so the setup dialog's hook doesn't fire its own /v1/harnesses fetch
+  // (which would skew the create-flow call-count assertions here).
+  useHarnessSetupSteps: () => ({}),
 }));
 
 function host(overrides: Partial<Host> = {}): Host {
