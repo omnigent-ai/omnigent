@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import math
 import statistics
+import sys
 from dataclasses import dataclass, field
 
 from rich.console import Console
 from rich.table import Table
 
-console = Console()
+# Rich auto-detects terminal width, but falls back to 80 columns when stdout is
+# not a TTY (CI logs, piped output) — which truncates the wider table columns
+# (e.g. ``HTTP/op`` → ``HTTP…``). Give the non-interactive path a comfortable
+# floor so every header renders in full; real terminals keep auto-detection.
+_NONINTERACTIVE_WIDTH = 160
+console = Console(width=None if sys.stdout.isatty() else _NONINTERACTIVE_WIDTH)
 
 
 @dataclass
@@ -32,12 +38,17 @@ class RunResult:
         run's timed region (from the server-side counter, cross-process traffic
         included), or ``None`` when the counter was unavailable. Divided by
         successful ops to report requests-per-op.
+    :param route_requests: Per-route breakdown of ``http_requests`` —
+        ``"METHOD /route/{template}"`` mapped to how many the server handled
+        during the timed region. Empty when uncounted. Feeds the report's
+        per-journey network appendix.
     """
 
     latencies_ms: list[float] = field(default_factory=list)
     failures: dict[str, int] = field(default_factory=dict)
     wall_time: float = 0.0
     http_requests: int | None = None
+    route_requests: dict[str, int] = field(default_factory=dict)
 
     @property
     def n_success(self) -> int:
@@ -105,7 +116,36 @@ def _run_to_dict(result: RunResult) -> dict[str, object]:
         "rps": result.throughput,
         "http_requests": result.http_requests,
         "http_requests_per_op": result.requests_per_op(),
+        "route_requests": dict(result.route_requests),
     }
+
+
+def _route_appendix(ok: list[RunResult]) -> list[dict[str, object]]:
+    """Per-route request breakdown across the counted summary runs.
+
+    Sums each route's requests over the runs that recorded a breakdown and
+    divides by those runs' successful ops, giving per-op counts grouped by
+    endpoint. Sorted by ``per_op`` descending (ties broken by route name) so
+    the chattiest endpoints lead. Empty when no run recorded routes.
+
+    :param ok: Summary-eligible runs (at least one success each).
+    :returns: ``[{"route", "requests", "per_op"}]`` rows, or ``[]`` when
+        uncounted.
+    """
+    counted = [r for r in ok if r.route_requests]
+    if not counted:
+        return []
+    totals: dict[str, int] = {}
+    for r in counted:
+        for route, count in r.route_requests.items():
+            totals[route] = totals.get(route, 0) + count
+    ops = sum(r.n_success for r in counted)
+    rows = [
+        {"route": route, "requests": count, "per_op": (count / ops if ops else 0.0)}
+        for route, count in totals.items()
+    ]
+    rows.sort(key=lambda row: (-float(row["per_op"]), str(row["route"])))
+    return rows
 
 
 def _summary_runs(results: list[RunResult]) -> list[RunResult]:
@@ -157,6 +197,11 @@ def aggregate(results: list[RunResult]) -> dict[str, object]:
         per_op = [rpo for r in ok if (rpo := r.requests_per_op()) is not None]
         if per_op:
             summary["avg_http_requests_per_op"] = statistics.mean(per_op)
+        # Per-route appendix: which endpoints the journey's requests hit, per op.
+        # Grouped by route since the count is near-identical across runs.
+        appendix = _route_appendix(ok)
+        if appendix:
+            summary["network_routes"] = appendix
     return {"runs": runs, "summary": summary}
 
 

@@ -21,7 +21,11 @@ import subprocess
 # endpoint; ``null`` when uncounted); ``summary`` gains
 # ``avg_http_requests_per_op`` when any run was counted; ``config`` gains
 # ``network_delay_ms``.
-SCHEMA_VERSION = 5
+# v6: each run row gained ``route_requests`` (per-route breakdown of
+# ``http_requests``, ``"METHOD /route" -> count``); ``summary`` gains a
+# ``network_routes`` appendix (``[{route, requests, per_op}]`` sorted by
+# ``per_op`` desc) when any run recorded a breakdown.
+SCHEMA_VERSION = 6
 
 
 def _git(*args: str) -> str:

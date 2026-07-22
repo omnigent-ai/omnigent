@@ -114,6 +114,35 @@ def test_aggregate_includes_network_block_when_counted() -> None:
     assert run_rows[0]["http_requests_per_op"] == 2.0
 
 
+def test_aggregate_route_appendix_groups_and_orders() -> None:
+    """The per-route appendix sums across runs, divides by ops, sorts by per_op."""
+    # 2 ops/run × 2 runs = 4 ops. GET seen 2×/run (→4 total → 1.0/op),
+    # POST 1×/run (→2 → 0.5/op).
+    runs = [
+        RunResult(
+            latencies_ms=[5.0, 6.0],
+            wall_time=1.0,
+            http_requests=6,
+            route_requests={"GET /v1/sessions/{id}": 2, "POST /v1/sessions": 1},
+        )
+        for _ in range(2)
+    ]
+    summary = _d(aggregate(runs)["summary"])
+    appendix = cast(list[dict[str, object]], summary["network_routes"])
+    assert [r["route"] for r in appendix] == ["GET /v1/sessions/{id}", "POST /v1/sessions"]
+    assert appendix[0]["requests"] == 4 and appendix[0]["per_op"] == 1.0
+    assert appendix[1]["requests"] == 2 and appendix[1]["per_op"] == 0.5
+    # Per-run row carries its own raw breakdown.
+    run_rows = cast(list[dict[str, object]], aggregate(runs)["runs"])
+    assert run_rows[0]["route_requests"] == {"GET /v1/sessions/{id}": 2, "POST /v1/sessions": 1}
+
+
+def test_aggregate_no_route_appendix_when_uncounted() -> None:
+    """No route breakdown recorded → no network_routes key (not an empty list)."""
+    runs = [RunResult(latencies_ms=[5.0], wall_time=1.0) for _ in range(2)]
+    assert "network_routes" not in _d(aggregate(runs)["summary"])
+
+
 def test_requests_per_op_none_when_uncounted_or_no_success() -> None:
     """requests_per_op distinguishes uncounted (None) from a real zero."""
     assert RunResult(latencies_ms=[5.0]).requests_per_op() is None  # http_requests unset
@@ -399,6 +428,11 @@ async def test_benchmark_smoke_end_to_end() -> None:
         per_op = _d(block["summary"]).get("avg_http_requests_per_op")
         assert per_op is not None, f"{name} produced no request count"
         assert cast(float, per_op) >= 1.0, f"{name}: {per_op} requests/op"
+        # Per-route appendix: at least one endpoint attributed, and its
+        # per-op figures sum to roughly the aggregate per-op count.
+        routes = cast(list[dict[str, object]], _d(block["summary"]).get("network_routes", []))
+        assert routes, f"{name} produced no route breakdown"
+        assert all(cast(float, r["per_op"]) > 0.0 for r in routes)
 
 
 @pytest.mark.timeout(180)

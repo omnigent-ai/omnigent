@@ -1654,6 +1654,10 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
+            # Per-route tally (low-cardinality template key) for offline
+            # request-breakdown analysis, e.g. the benchmark harness's
+            # per-journey network appendix. Cheap; independent of the OTel path.
+            server_metrics.record_route(request.method, route)
             metrics_status_code = _request_status_code_for_metrics(
                 status_code,
                 failed=failed,

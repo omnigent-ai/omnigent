@@ -33,7 +33,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import IO
+from typing import IO, NamedTuple
 
 import httpx
 import yaml
@@ -89,6 +89,19 @@ _POLICY_ALLOW = '{"action": "allow", "reason": ""}'
 # expose ``GET /debug/server-metrics`` for per-journey request counting.
 _DEBUG_ROUTER_MODULE = "dev.benchmarks.omnigent.debug_router"
 _SERVER_METRICS_PATH = "/debug/server-metrics"
+
+
+class ServerRequestSnapshot(NamedTuple):
+    """A point-in-time read of the server's cumulative request counters.
+
+    :param total: ``total_started`` — every HTTP request the server has handled
+        since process start.
+    :param routes: ``"METHOD /route/{template}"`` mapped to its cumulative
+        count, for attributing a journey's requests to specific endpoints.
+    """
+
+    total: int
+    routes: dict[str, int]
 
 
 def _find_free_port() -> int:
@@ -339,22 +352,23 @@ class BenchEnvironment:
             },
         }
 
-    async def server_request_count(self) -> int:
-        """Return the server's cumulative ``total_started`` HTTP request count.
+    async def server_request_snapshot(self) -> ServerRequestSnapshot:
+        """Read the server's cumulative request counters (total + per-route).
 
         Reads the CI-only ``GET /debug/server-metrics`` endpoint the server
-        mounts from ``debug_router_modules``. The counter is monotonic since
+        mounts from ``debug_router_modules``. The counters are monotonic since
         the server process started; callers diff two reads to get the requests
         the server handled during a window — including cross-process traffic
         (runner → server callbacks, host → server) invisible to a client-side
         hook in the benchmark process.
 
         The count-poll request itself hits the server, so it increments the
-        counter; the caller accounts for its own polls when computing per-op
+        counters; the caller accounts for its own polls when computing per-op
         volume. Uses a short-lived client so it never carries the simulated
         network delay wired onto ``self.client``.
 
-        :returns: ``total_started`` from the server's metrics snapshot.
+        :returns: A :class:`ServerRequestSnapshot` of ``total_started`` and the
+            per-route breakdown.
         :raises RuntimeError: If the debug endpoint is unreachable, which means
             the debug router did not load (a benchmark misconfiguration).
         """
@@ -367,7 +381,11 @@ class BenchEnvironment:
                 f"server debug metrics endpoint {_SERVER_METRICS_PATH} unreachable "
                 f"({exc!r}); is the debug router loaded? logs in {self._tmp}"
             ) from exc
-        return int(resp.json()["total_started"])
+        body = resp.json()
+        return ServerRequestSnapshot(
+            total=int(body["total_started"]),
+            routes={str(k): int(v) for k, v in body.get("route_counts", {}).items()},
+        )
 
     # ── spawns ───────────────────────────────────────────────
 

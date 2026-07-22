@@ -153,6 +153,18 @@ How it works, and why it never ships in production:
   best-effort: if the endpoint is unreachable the run still reports latency,
   just with `http_requests: null`.
 
+**Per-route appendix (`network_routes`).** Beyond the single per-op number, the
+endpoint also returns a per-route tally (keyed by the low-cardinality FastAPI
+template, e.g. `POST /v1/sessions`), so each journey's `summary` carries a
+`network_routes` breakdown — every endpoint the journey hit, its total request
+count, and per-op count, sorted chattiest-first. Since the count is near
+identical across runs, it's summed across the summary runs and grouped by route.
+This is what makes the count *actionable*: for `session_cold_start` it names
+which endpoints the ~12 requests/op are spread across (including the
+cross-process runner→server / host→server calls), not just the total. The
+harness's own counter-poll route is filtered out. The raw per-run map is in each
+run's `route_requests`.
+
 **Tunnel round-trips are not counted.** Steady-state server↔runner traffic is
 frames multiplexed over one long-lived WebSocket tunnel, not fresh HTTP requests
 — so neither this counter nor an HTTP hook sees them as "requests." Counting
@@ -246,7 +258,7 @@ document without running the harness.
 
 ```jsonc
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "generated_at": "<ISO-8601 UTC>",
   "git_sha": "<HEAD sha>",
   "git_branch": "<branch>",
@@ -265,12 +277,16 @@ document without running the harness.
          "wall_time_s": …, "mean_ms": …, "p50_ms": …, "p95_ms": …,
          "p99_ms": …, "max_ms": …, "rps": …,
          "http_requests": N,          // server HTTP requests during the timed region; null if uncounted
-         "http_requests_per_op": …}   // http_requests / n_success; null if uncounted
+         "http_requests_per_op": …,   // http_requests / n_success; null if uncounted
+         "route_requests": {"POST /v1/sessions": N, ...}}  // per-route breakdown; {} if uncounted
       ],
       "summary": {"runs_total": 3, "runs_ok": 3,   // how many runs the averages cover
                   "avg_mean_ms": …, "avg_p50_ms": …, "avg_p95_ms": …,
                   "avg_p99_ms": …, "avg_rps": …,   // averaged over the runs_ok runs
-                  "avg_http_requests_per_op": …}   // present only when a run was counted
+                  "avg_http_requests_per_op": …,   // present only when a run was counted
+                  "network_routes": [              // per-route appendix, sorted by per_op desc
+                    {"route": "POST /v1/sessions", "requests": N, "per_op": …}
+                  ]}                               // present only when a run recorded routes
     }
     // A journey that errored out of measurement entirely instead carries:
     //   {"kind", "backend", "needs_runner", "runs": [], "summary": {},
@@ -279,7 +295,8 @@ document without running the harness.
 }
 ```
 
-The `http_requests*` fields are the server-side request count (see *Network* above);
+The `http_requests*` / `route_requests` / `network_routes` fields are the
+server-side request count and its per-endpoint breakdown (see *Network* above);
 `network_delay_ms` records the simulated client↔server latency the run used.
 
 The per-journey `summary` + `runs` shape mirrors MLflow's gateway benchmark, so

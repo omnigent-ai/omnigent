@@ -29,23 +29,31 @@ router = APIRouter()
 
 
 @router.get("/server-metrics")
-async def server_metrics(request: Request) -> dict[str, int]:
+async def server_metrics(request: Request) -> dict[str, object]:
     """Return the server's cumulative HTTP request counters.
 
     Reads the process-local :class:`ServerPerformanceMetrics` tracker stashed on
     ``app.state.server_metrics``. The counters are monotonic since process
     start; the harness diffs two reads to get a journey's request volume.
 
+    ``route_counts`` additionally breaks the total down by low-cardinality
+    route template (``"METHOD /v1/sessions/{session_id}"`` → count), letting the
+    harness attribute a journey's requests to specific endpoints — including the
+    cross-process runner → server / host → server calls a client-side hook can't
+    see.
+
     :param request: Incoming request, used to reach ``app.state``.
     :returns: ``total_started`` / ``total_completed`` / ``total_failed`` /
-        ``in_flight`` from the current metrics snapshot.
+        ``in_flight`` plus a ``route_counts`` map from the current metrics.
     """
-    snapshot = request.app.state.server_metrics.snapshot()
+    metrics = request.app.state.server_metrics
+    snapshot = metrics.snapshot()
     return {
         "total_started": snapshot.total_started,
         "total_completed": snapshot.total_completed,
         "total_failed": snapshot.total_failed,
         "in_flight": snapshot.in_flight,
+        "route_counts": metrics.route_counts(),
     }
 
 
