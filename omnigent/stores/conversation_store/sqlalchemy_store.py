@@ -2277,10 +2277,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 else:
                     # Resolve the owner's project of this name → its member ids
-                    # (one join). No such project yields an empty list, so the
+                    # (one join). No such project yields an empty match, so the
                     # filter collapses to the label match alone (v1 behaviour).
-                    # Bound to qualifying_ids (when permission-scoped) to cap the
-                    # IN list to the caller's own sessions.
                     member_stmt = (
                         select(SqlConversationMetadata.id)
                         .join(
@@ -2294,15 +2292,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlProject.name == project,
                         )
                     )
-                    if qualifying_ids is not None:
-                        member_stmt = member_stmt.where(
-                            SqlConversationMetadata.id.in_(qualifying_ids)
-                        )
-                    with self._session() as meta_sess:
-                        member_ids = list(meta_sess.execute(member_stmt).scalars())
+                    if self._conv_engine is self._engine:
+                        # Single-DB: metadata + projects are colocated with
+                        # conversations, so use the SELECT as an IN subquery — no
+                        # need to pull member ids into Python.
+                        member_match: Any = member_stmt
+                    else:
+                        # Split-DB: resolve member ids first, bounded to
+                        # qualifying_ids (when permission-scoped) so the IN list
+                        # stays capped to the caller's own sessions.
+                        if qualifying_ids is not None:
+                            member_stmt = member_stmt.where(
+                                SqlConversationMetadata.id.in_(qualifying_ids)
+                            )
+                        with self._session() as meta_sess:
+                            member_match = list(meta_sess.execute(member_stmt).scalars())
                     stmt = stmt.where(
                         or_(
-                            SqlConversation.id.in_(member_ids),
+                            SqlConversation.id.in_(member_match),
                             SqlConversation.id.in_(
                                 label_filed.where(SqlConversationLabel.value == project)
                             ),

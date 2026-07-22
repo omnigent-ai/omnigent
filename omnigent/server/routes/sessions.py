@@ -16410,9 +16410,11 @@ def create_sessions_router(
                 )
             target_project_id = body.project_id
             if target_project_id == "":
-                await asyncio.to_thread(
+                unfiled = await asyncio.to_thread(
                     conversation_store.set_conversation_project, session_id, None
                 )
+                if not unfiled:
+                    raise _session_not_found()
             else:
                 if project_store is None:
                     raise OmnigentError(

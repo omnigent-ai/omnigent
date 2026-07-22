@@ -1916,10 +1916,11 @@ class UpdateSessionRequest(BaseModel):
         needs only edit access).
     :param project_id: File this session into a first-class project (see
         ``designs/PROJECTS_PRD.md``). A non-empty id moves the session into
-        that project; the empty string ``""`` unfiles it. ``None`` (field
-        omitted) leaves membership unchanged. Owner-only: because projects
-        are owner-private, only the session owner may file it, and only into
-        a project they own — the server verifies both. Independent of the
+        that project; the empty string ``""`` unfiles it. **Omitting** the
+        field leaves membership unchanged; an explicit ``null`` is rejected
+        (400) so it can't silently unfile. Owner-only: because projects are
+        owner-private, only the session owner may file it, and only into a
+        project they own — the server verifies both. Independent of the
         legacy ``omni_project`` label, which is set via ``labels``.
     """
 

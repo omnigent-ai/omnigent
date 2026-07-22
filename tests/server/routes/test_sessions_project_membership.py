@@ -152,6 +152,15 @@ def test_explicit_null_project_id_is_rejected(db_uri: str) -> None:
     assert snap.json()["project_id"] == project["id"]
 
 
+def test_unfile_unknown_session_404(db_uri: str) -> None:
+    """Unfiling a session with no metadata row is a 404, mirroring the file
+    path — a PATCH that changed nothing must not report success."""
+    _ensure_agent(db_uri)
+    client = TestClient(_single_user_app(db_uri))
+    resp = client.patch("/v1/sessions/" + "f" * 32, json={"project_id": ""})
+    assert resp.status_code == 404
+
+
 def test_project_filter_excludes_other_projects(db_uri: str) -> None:
     """?project=<name> returns only that project's members, not another's."""
     _ensure_agent(db_uri)
