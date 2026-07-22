@@ -59,7 +59,11 @@ def test_community_harness_contribution_is_merged(monkeypatch: pytest.MonkeyPatc
     assert (
         hp.spawn_env_builders()["foo"] == "omnigent.community.harness.foo.plugin:build_spawn_env"
     )
-    assert {"id": "foo", "label": "Foo"} in hp.harness_catalog()
+    foo_row = next((row for row in hp.harness_catalog() if row["id"] == "foo"), None)
+    assert foo_row is not None
+    assert foo_row["label"] == "Foo"
+    # Every catalog row now also carries a setup_steps checklist.
+    assert "setup_steps" in foo_row
 
 
 def test_community_harness_rejects_non_community_import_path(

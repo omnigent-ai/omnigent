@@ -5828,6 +5828,25 @@ def _publish_status(
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
     session_live_state.persist_live_status(session_id, status)
+    # Event-driven scheduled-run completion. A terminal edge (idle = the turn
+    # completed; failed = it errored/disconnected) flips the conversation's
+    # still-``running`` scheduled_task_run to succeeded/failed. This is the
+    # primary FU-1 mechanism: the run transitions the instant the turn ends,
+    # driven by the same terminal event that persists live_status — no poll.
+    # The event's own ``error`` carries the failure classification, so no label
+    # re-read is needed (and none of the race that would imply). A no-op for
+    # the common case: interactive (non-scheduled) conversations have no
+    # running run, and the reverse lookup cheaply returns None. running/waiting
+    # edges are skipped entirely so the hot path pays nothing mid-turn.
+    if status == "idle":
+        session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
+    elif status == "failed":
+        session_live_state.persist_scheduled_run_completion(
+            session_id,
+            "failed",
+            error_code=error.code if error is not None else None,
+            error=error.message if error is not None else None,
+        )
     # Track the in-flight response id for snapshot-based reconnect (see
     # _session_active_response_cache). A running/waiting edge that names a
     # turn opens it; any idle/failed edge closes it.

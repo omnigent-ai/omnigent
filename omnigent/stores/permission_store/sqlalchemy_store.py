@@ -173,30 +173,44 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 .scalars()
                 .all()
             )
-            for row in rows:
-                conversation_id = row.conversation_id
-                if (
-                    session.get(
-                        SqlSessionPermission,
-                        (current_workspace_id(), to_user_id, conversation_id),
+            if not rows:
+                return 0
+            conversation_ids = [r.conversation_id for r in rows]
+            # Single query: which conversation_ids does to_user already hold?
+            existing_to = set(
+                session.execute(
+                    select(SqlSessionPermission.conversation_id).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == to_user_id,
+                        SqlSessionPermission.conversation_id.in_(conversation_ids),
                     )
-                    is not None
-                ):
-                    # Destination already has access — drop the duplicate.
-                    session.delete(row)
-                    continue
-                # user_id is part of the PK, so repoint with a targeted Core
-                # UPDATE rather than mutating the ORM object's primary key.
+                ).scalars()
+            )
+            # Partition into duplicates (to_user already has access) vs. reassigns.
+            duplicate_ids = [cid for cid in conversation_ids if cid in existing_to]
+            reassign_ids = [cid for cid in conversation_ids if cid not in existing_to]
+            # Bulk delete duplicates (to_user already has the grant).
+            if duplicate_ids:
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.conversation_id.in_(duplicate_ids),
+                    )
+                )
+            # Bulk UPDATE reassigns in one statement.
+            if reassign_ids:
+                # user_id is part of the PK, so use a Core UPDATE.
                 session.execute(
                     update(SqlSessionPermission)
                     .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
-                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.conversation_id.in_(reassign_ids),
                     )
                     .values(user_id=to_user_id)
                 )
-                moved += 1
+                moved = len(reassign_ids)
             return moved
 
     def list_for_session(self, conversation_id: str) -> list[SessionPermission]:

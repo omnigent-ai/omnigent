@@ -208,3 +208,76 @@ class ScheduledTaskStore(ABC):
         :returns: List of :class:`ScheduledTaskRun` instances.
         """
         ...
+
+    @abstractmethod
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """
+        Transition a still-``running`` run to a terminal status.
+
+        Idempotent and conditional: the update only applies to a run whose
+        current status is ``running`` (guarded by ``WHERE status = running``),
+        so a run already advanced to a terminal state (a fire-time
+        ``skipped``/``failed``, or a prior reconciliation) is never clobbered
+        and two concurrent sweeps cannot double-transition it.
+
+        :param run_id: The run to transition.
+        :param status: The terminal status to set — ``succeeded`` or
+            ``failed``.
+        :param finished_at: Unix epoch seconds the run reached the terminal
+            state.
+        :param error: Optional failure detail (only for ``failed``).
+        :param error_code: Optional short failure classification (only for
+            ``failed``), e.g. ``"incomplete"``.
+        :returns: The updated :class:`ScheduledTaskRun` if a ``running`` run
+            was transitioned; ``None`` if no matching ``running`` run existed
+            (not found, or already terminal).
+        """
+        ...
+
+    @abstractmethod
+    def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
+        """
+        Return the ``running`` run for a conversation, or ``None``.
+
+        The event-driven completion hook (fired when a conversation's turn
+        reaches a terminal state) uses this reverse lookup to find the
+        scheduled-task run to transition. Workspace-scoped like every other
+        store read (filters on ``current_workspace_id()``), so the caller must
+        run it inside the run's ``workspace_scope``. Backed by the
+        ``ix_scheduled_task_runs_conversation_id`` index on
+        ``(workspace_id, conversation_id)``.
+
+        A conversation maps to at most one ``running`` run (a fire creates one
+        run per conversation), so this returns a single row rather than a list.
+
+        :param conversation_id: The fired conversation to look up.
+        :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
+            ``None`` if the conversation has no run, or its run is already
+            terminal.
+        """
+        ...
+
+    @abstractmethod
+    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
+        """
+        List ``running`` runs for the given tasks in the current workspace.
+
+        Powers the lazy-on-read stale backstop on the scheduled-task LIST
+        endpoint: the route resolves the owner's tasks, then this returns their
+        still-``running`` runs so the route can force-fail the ones past the max
+        age. Workspace-scoped (filters on ``current_workspace_id()``) like every
+        other read; an empty id list returns an empty list.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``running`` :class:`ScheduledTaskRun` instances for those
+            tasks, ordered ``scheduled_at DESC, id DESC``.
+        """
+        ...

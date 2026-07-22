@@ -1424,9 +1424,19 @@ def create_app(
                     exc,
                 )
 
+            # Run completion is event-driven (persist_scheduled_run_completion
+            # fires from _publish_status the instant a fired conversation's turn
+            # ends — no poll). The only orphan backstop is a lazy-on-read
+            # force-fail of stale ``running`` runs on the scheduled-task read
+            # endpoints (see routes/scheduled_tasks.py); there is no startup
+            # sweep and no periodic reconcile.
+
         try:
             yield
         finally:
+            # Run completion is event-driven (the _publish_status hook) plus a
+            # lazy-on-read stale backstop — there is no run-reconciler task to
+            # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
@@ -1556,8 +1566,11 @@ def create_app(
     set_server_runner_router(runner_router)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
-    # hold a session's runner tunnel serve the same sidebar fields.
-    session_live_state.configure(conversation_store)
+    # hold a session's runner tunnel serve the same sidebar fields. The
+    # scheduled-task store additionally enables the event-driven
+    # run-completion hook (persist_scheduled_run_completion) fired from
+    # _publish_status when a fired conversation's turn reaches terminal.
+    session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
@@ -1981,7 +1994,7 @@ def create_app(
         return {"version": _server_version()}
 
     @app.get("/v1/info")
-    async def info() -> dict[str, bool | str | None]:
+    async def info() -> dict[str, bool | str | list[str] | None]:
         """Runtime capabilities probe for the SPA + CLI.
 
         Returned at app boot by the frontend (and by ``omnigent
@@ -2079,6 +2092,27 @@ def create_app(
             )
         except ImportError:
             smart_routing_enabled = False
+        # harness_install_enabled gates the web UI's "Install" action for a
+        # missing, npm-installable harness on a connected host. Off by default
+        # (OMNIGENT_HARNESS_INSTALL_ENABLED=1 opts in) while the feature rolls
+        # out; when false the SPA keeps the prior "run omnigent setup" hint.
+        # Read live so flipping the env var takes effect without a rebuild.
+        # The env-var name is shared with the install route so the flag the UI
+        # sees and the flag the route enforces can never drift apart.
+        from omnigent.process_logging import env_truthy
+        from omnigent.server.routes.hosts import HARNESS_INSTALL_ENABLED_ENV
+
+        harness_install_enabled = env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV))
+        # installable_harnesses: the exact harness ids the install route accepts
+        # (bare ids + native spellings resolving to an npm-installable family),
+        # so the SPA offers setup only where it will succeed and never has to
+        # duplicate the server's allowlist. Empty when the feature is off, so a
+        # disabled flag also blanks the set the UI keys off of.
+        from omnigent.onboarding.harness_install import ui_installable_harnesses
+
+        installable_harnesses = (
+            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+        )
         # dictation_available gates the composer mic button's server
         # speech-to-text fallback (designs/server-dictation.md). Checks
         # config presence only (extra installed + models on disk) — no
@@ -2098,6 +2132,8 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "harness_install_enabled": harness_install_enabled,
+            "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,
         }
 

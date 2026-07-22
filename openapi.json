@@ -1759,7 +1759,11 @@
           "source": {
             "enum": [
               "claude",
-              "codex"
+              "codex",
+              "kimi",
+              "kiro",
+              "pi",
+              "qwen"
             ],
             "title": "Source",
             "type": "string"
@@ -6630,13 +6634,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": {
-                    "items": {
-                      "additionalProperties": true,
-                      "type": "object"
-                    },
-                    "type": "array"
-                  },
+                  "additionalProperties": true,
                   "title": "Response List Harnesses V1 Harnesses Get",
                   "type": "object"
                 }
@@ -6979,6 +6977,62 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/{harness}/install": {
+      "post": {
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` (default off): when disabled it\nreturns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline, 502 on a host-side install failure, 504 on host timeout.",
+        "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Harness identifier to install, e.g. `\"claude\"`.",
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Install Host Harness V1 Hosts  Host Id  Harnesses  Harness  Install Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Install Host Harness",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/runners": {
       "post": {
         "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
@@ -7149,6 +7203,12 @@
                       },
                       {
                         "type": "string"
+                      },
+                      {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
                       },
                       {
                         "type": "null"

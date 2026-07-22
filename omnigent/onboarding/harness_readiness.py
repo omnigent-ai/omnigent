@@ -289,12 +289,49 @@ def harness_is_configured(harness: str) -> bool:
     return True
 
 
+# Native CLI harnesses that authenticate via their own login command and can
+# report auth state locally, so the picker map can distinguish "installed but
+# not signed in" (``needs-auth``) from "not installed" (``binary-missing``) —
+# the same two-step signal Codex already provides. This is picker-facing ONLY;
+# the launch gate (:func:`harness_is_configured`) stays binary-only, so a
+# not-signed-in harness is never blocked from launching (its login surfaces at
+# run time). Pi / Qwen are absent on purpose: they auth via a provider
+# credential the daemon can't probe, so they report binary presence only.
+_AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
+    "claude-native": "anthropic",
+    "native-claude": "anthropic",
+    "opencode-native": OPENCODE_KEY,
+}
+
+
+def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailability:
+    """Two-step availability for a login-command CLI harness.
+
+    :returns: ``"binary-missing"`` when the CLI isn't installed,
+        ``"needs-auth"`` when installed but not signed in, else ``True``.
+    """
+    if not harness_cli_installed(install_key):
+        return "binary-missing"
+    if install_key == OPENCODE_KEY:
+        from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+        return True if opencode_auth_summary().has_provider else "needs-auth"
+    # claude: `claude auth status` (subprocess) — same probe the setup wizard
+    # uses; runs off the event loop on the throttled readiness refresh path.
+    from omnigent.onboarding.harness_install import harness_cli_logged_in
+
+    return True if harness_cli_logged_in(install_key) else "needs-auth"
+
+
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if _is_codex_family_harness(canonical):
         from omnigent.codex_native import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
+    install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
+    if install_key is not None:
+        return _cli_family_availability(canonical, install_key)
     return harness_is_configured(canonical)
 
 

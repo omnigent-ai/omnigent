@@ -901,11 +901,20 @@ def harness_catalog() -> list[dict[str, Any]]:
 
     Each row carries ``id`` and ``label``; rows for harnesses with declared
     capabilities also carry a ``capabilities`` object (see
-    :meth:`HarnessCapabilities.as_dict`), so the ``/v1/harnesses`` catalog can
-    surface the feature matrix to clients.
+    :meth:`HarnessCapabilities.as_dict`). ``setup_steps`` lists the ordered
+    requirements to get the harness ready on a host (install + auth), so the
+    web UI can render a "set up this agent" checklist that mirrors
+    ``omnigent setup``; the host reports each step's status in its readiness map.
     """
     labels = harness_labels()
     capabilities = harness_capabilities()
+    # Lazy import for the same reason as the acp rows below: keep this registry
+    # importable without pulling in the onboarding/config stack at module load.
+    try:
+        from omnigent.onboarding.harness_install import ui_setup_steps
+    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+        _logger.debug("setup-step metadata unavailable", exc_info=True)
+        ui_setup_steps = None  # type: ignore[assignment]
     rows: list[dict[str, Any]] = []
     for harness in sorted(labels, key=lambda key: labels[key].lower()):
         if harness not in valid_harnesses():
@@ -914,6 +923,8 @@ def harness_catalog() -> list[dict[str, Any]]:
         capability = capabilities.get(harness)
         if capability is not None:
             row["capabilities"] = capability.as_dict()
+        if ui_setup_steps is not None:
+            row["setup_steps"] = [step.as_dict() for step in ui_setup_steps(harness)]
         rows.append(row)
 
     # Dynamic rows: one per user-configured generic-ACP agent, id ``acp:<slug>``.
@@ -933,6 +944,34 @@ def harness_catalog() -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 — a malformed acp: block must never break the catalog
         _logger.debug("acp catalog rows skipped", exc_info=True)
     return rows
+
+
+def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, Any]]]:
+    """Map every harness spelling to its ordered UI setup steps.
+
+    The web setup dialog looks steps up by the harness a *session* declares —
+    which is often a native wrapper (``codex-native``) or an installable id
+    that is not a picker row (``opencode``/``qwen``), neither of which appears
+    in :func:`harness_catalog`. Keying by spelling here lets the dialog resolve
+    steps for whatever id it holds. Values mirror ``harness_catalog``'s
+    ``setup_steps`` (same :func:`ui_setup_steps` source), so the two can't
+    drift.
+
+    :returns: ``{spelling: [step.as_dict(), ...]}`` for every accepted spelling;
+        empty when the onboarding stack can't be imported (fail-open).
+    """
+    try:
+        from omnigent.onboarding.harness_install import ui_installable_harnesses, ui_setup_steps
+    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+        _logger.debug("setup-step metadata unavailable", exc_info=True)
+        return {}
+    # Cover the picker ids (catalog rows) plus every installable spelling
+    # (bare + native), so a session's declared harness always resolves.
+    spellings: set[str] = set(valid_harnesses())
+    spellings.update(ui_installable_harnesses())
+    return {
+        spelling: [step.as_dict() for step in ui_setup_steps(spelling)] for spelling in spellings
+    }
 
 
 def load_object(import_path: str) -> Any:

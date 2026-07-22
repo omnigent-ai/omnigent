@@ -1274,14 +1274,20 @@ describe("shouldQueueSend", () => {
     expect(shouldQueueSend(null, "streaming", "running", [])).toBe(false);
   });
 
-  it("queues while the session is busy (streaming or running/waiting)", () => {
+  it("queues while the session is busy (streaming or running)", () => {
     expect(shouldQueueSend("conv_a", "streaming", "idle", [])).toBe(true);
     expect(shouldQueueSend("conv_a", "idle", "running", [])).toBe(true);
-    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(true);
   });
 
   it("sends directly when idle and nothing is queued for this conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [])).toBe(false);
+  });
+
+  it("sends directly on `waiting` (turn ended, only background work remains)", () => {
+    // A background shell / still-running sub-agent keeps the session in
+    // `waiting`, but the server's turn gate is already free — a new message
+    // must start a fresh turn rather than stalling in the client queue.
+    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(false);
   });
 
   it("queues when idle but this conversation already has a queued message", () => {

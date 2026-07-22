@@ -32,6 +32,7 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
@@ -602,6 +603,18 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "path": frame.path,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostInstallHarnessResultFrame):
+            install_future = conn.pending_installs.pop(frame.request_id, None)
+            if install_future is not None and not install_future.done():
+                install_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
                         "error": frame.error,
                     }
                 )

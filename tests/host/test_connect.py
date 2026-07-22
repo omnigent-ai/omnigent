@@ -27,6 +27,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
@@ -2041,6 +2043,122 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.status == "ok"
     assert (tmp_path / "scratch").is_dir()
     assert result.path == str(tmp_path / "scratch")
+
+
+# ── host.install_harness handler ────────────────────────
+
+
+def test_handle_install_harness_success_returns_refreshed_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A successful install returns ``ok`` and the recomputed readiness map.
+
+    The server flips the UI badge off this map, so the handler must run the
+    installer and then re-probe readiness, returning the fresh result.
+    """
+    import omnigent.host.connect as connect
+
+    # Not yet installed, so the handler runs the installer.
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
+    monkeypatch.setattr(
+        connect,
+        "configured_harness_map",
+        lambda: {"claude-native": True, "codex-native": "needs-auth"},
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i1", harness="claude")
+    )
+
+    assert isinstance(result, HostInstallHarnessResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
+
+
+def test_handle_install_harness_already_installed_skips_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An already-installed harness returns fresh readiness without running npm.
+
+    ``npm install -g`` re-resolves over the network and can take minutes even
+    when the binary is already present, so a re-request must short-circuit —
+    otherwise a user clicking Install on an installed harness waits pointlessly
+    (and can hit the request timeout).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer ran despite the harness already being installed")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i0", harness="opencode")
+    )
+
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"opencode-native": True}
+
+
+def test_handle_install_harness_failure_surfaces_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed install returns ``failed`` with the installer's reason and no
+    readiness map (the server keeps its prior view).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(
+        connect,
+        "try_install_harness_cli",
+        lambda key: (False, "npm is not available on the host"),
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i2", harness="codex")
+    )
+
+    assert result.status == "failed"
+    assert result.error == "npm is not available on the host"
+    assert result.configured_harnesses is None
+
+
+def test_handle_install_harness_rejects_non_allowlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-UI-installable harness is refused without invoking the installer.
+
+    Defence in depth: even if a stray frame reaches the daemon, a harness
+    whose installer is a ``curl | bash`` (e.g. hermes) must never run.
+    """
+    import omnigent.host.connect as connect
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer reached for a non-allowlisted harness")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i3", harness="hermes")
+    )
+
+    assert result.status == "failed"
+    assert result.error is not None and "hermes" in result.error
+    assert result.configured_harnesses is None
 
 
 # --- Fail-loud on permanent tunnel failures ----------------------------

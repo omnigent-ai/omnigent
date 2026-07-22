@@ -475,6 +475,13 @@ export function shouldShowAuthorBadge(
  * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
  * later direct send could overtake a still-queued earlier one when status
  * flickers idle mid-queue (cursor-native). A new chat always sends.
+ *
+ * ``waiting`` is NOT busy for queueing: it means the turn already ended and the
+ * agent loop is only parked on background work (background shells / sub-agents)
+ * — the server's turn gate is already free, so a new message starts a fresh
+ * turn immediately instead of stalling behind that background work. (The
+ * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
+ * reflect background activity, which is a separate concern from send gating.)
  */
 export function shouldQueueSend(
   conversationId: string | null,
@@ -483,8 +490,7 @@ export function shouldQueueSend(
   queuedMessages: QueuedMessage[],
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy =
-    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
   return isBusy || hasQueued;
 }
