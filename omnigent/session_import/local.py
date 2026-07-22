@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from hashlib import sha256
 from pathlib import Path
 
@@ -20,6 +21,11 @@ from omnigent.kiro_native_session_forwarder import (
     kiro_cli_sessions_dir,
     parse_kiro_jsonl_line,
 )
+from omnigent.opencode_native_app_server import (
+    OpenCodeCliNotFoundError,
+    find_opencode_cli,
+)
+from omnigent.opencode_native_forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
@@ -27,8 +33,10 @@ from omnigent.session_import.models import (
 )
 
 _PI_IMPORT_SESSION_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+_OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
 _MAX_RESPONSE_ID_LENGTH = 64
+_OPENCODE_COMMAND_TIMEOUT_SECONDS = 120
 
 
 def _bounded_response_id(response_id: str) -> str:
@@ -93,6 +101,43 @@ def _is_safe_pi_import_session_id(session_id: str) -> bool:
     )
 
 
+def _is_safe_opencode_import_session_id(session_id: str) -> bool:
+    """Accept native OpenCode ids without permitting CLI option injection."""
+    return (
+        len(session_id) <= _MAX_EXTERNAL_SESSION_ID_LENGTH
+        and _OPENCODE_IMPORT_SESSION_ID_RE.fullmatch(session_id) is not None
+    )
+
+
+def _run_opencode_json(
+    *arguments: str,
+    opencode_path: str | None = None,
+) -> object:
+    """Run one public OpenCode JSON command and decode stdout."""
+    try:
+        cli = find_opencode_cli(opencode_path)
+    except OpenCodeCliNotFoundError as exc:
+        raise SessionImportNotFoundError(str(exc)) from exc
+    try:
+        completed = subprocess.run(
+            [cli, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_OPENCODE_COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SessionImportNotFoundError(f"OpenCode export could not run: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise SessionImportNotFoundError(f"OpenCode command failed{suffix}")
+    try:
+        return json.loads(completed.stdout)
+    except ValueError as exc:
+        raise SessionImportNotFoundError("OpenCode returned invalid JSON") from exc
+
+
 def _qwen_session_locator(path: Path) -> str:
     """Qualify a Qwen id by project while staying within API limits."""
     project = path.parent.parent.name
@@ -139,6 +184,35 @@ def list_recent_local_session_ids(
             if path.is_file() and path.with_suffix(".json").is_file()
         ]
         return _recent_unique_session_ids(candidates, limit=limit)
+
+    if source == "opencode":
+        payload = _run_opencode_json(
+            "session",
+            "list",
+            "--format",
+            "json",
+            "--pure",
+        )
+        if not isinstance(payload, list):
+            raise SessionImportNotFoundError("OpenCode returned an invalid session list")
+        updated_by_id: dict[str, int | float] = {}
+        for entry in payload:
+            if not isinstance(entry, dict) or isinstance(entry.get("parentID"), str):
+                continue
+            session_id = entry.get("id")
+            updated = entry.get("updated")
+            if not isinstance(session_id, str) or not _is_safe_opencode_import_session_id(
+                session_id
+            ):
+                continue
+            timestamp = updated if isinstance(updated, (int, float)) else 0
+            updated_by_id[session_id] = max(updated_by_id.get(session_id, 0), timestamp)
+        ordered = sorted(
+            updated_by_id,
+            key=lambda session_id: (updated_by_id[session_id], session_id),
+            reverse=True,
+        )
+        return tuple(ordered[:limit])
 
     if source == "pi":
         configured_home = os.environ.get("PI_CODING_AGENT_DIR")
@@ -940,6 +1014,189 @@ def load_kimi_session(
     )
 
 
+def _opencode_file_content(
+    part: dict[str, object],
+    *,
+    role: str,
+) -> dict[str, object] | None:
+    """Convert one exported OpenCode file part to a durable content block."""
+    mime = part.get("mime")
+    url = part.get("url")
+    if isinstance(mime, str) and mime.startswith("image/") and isinstance(url, str) and url:
+        return {
+            "type": "input_image" if role == "user" else "output_image",
+            "image_url": url,
+        }
+    filename = part.get("filename")
+    label = filename if isinstance(filename, str) and filename else mime
+    if not isinstance(label, str) or not label:
+        label = "attachment"
+    return {
+        "type": "input_text" if role == "user" else "output_text",
+        "text": f"[attachment: {label}]",
+    }
+
+
+def _opencode_message_items(
+    message: dict[str, object],
+    *,
+    message_number: int,
+) -> tuple[NewConversationItem, ...]:
+    """Normalize one exported OpenCode message while preserving part order."""
+    info = message.get("info")
+    parts = message.get("parts")
+    if not isinstance(info, dict) or not isinstance(parts, list):
+        return ()
+    role = info.get("role")
+    if role not in {"user", "assistant"}:
+        return ()
+    message_id = info.get("id")
+    native_id = message_id if isinstance(message_id, str) and message_id else str(message_number)
+    response_id = _bounded_response_id(f"opencode:{native_id}")
+    items: list[NewConversationItem] = []
+    pending_content: list[dict[str, object]] = []
+
+    def flush_content() -> None:
+        if not pending_content:
+            return
+        data: dict[str, object] = {"role": role, "content": list(pending_content)}
+        if role == "assistant":
+            data["agent"] = "opencode-native-ui"
+        items.append(
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=parse_item_data("message", data),
+            )
+        )
+        pending_content.clear()
+
+    for raw_part in parts:
+        if not isinstance(raw_part, dict):
+            continue
+        part: dict[str, object] = raw_part
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                pending_content.append(
+                    {
+                        "type": "input_text" if role == "user" else "output_text",
+                        "text": text,
+                    }
+                )
+            continue
+        if part_type == "file":
+            content = _opencode_file_content(part, role=role)
+            if content is not None:
+                pending_content.append(content)
+            continue
+        if part_type == "step-finish":
+            flush_content()
+            continue
+        if part_type != "tool" or role != "assistant":
+            continue
+        flush_content()
+        call_id = part.get("callID")
+        name = part.get("tool")
+        state = part.get("state")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(state, dict)
+        ):
+            continue
+        arguments = state.get("input")
+        serialized_arguments = (
+            arguments
+            if isinstance(arguments, str)
+            else json.dumps(
+                arguments if arguments is not None else {},
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        )
+        items.append(
+            NewConversationItem(
+                type="function_call",
+                response_id=response_id,
+                data=parse_item_data(
+                    "function_call",
+                    {
+                        "agent": "opencode-native-ui",
+                        "name": name,
+                        "arguments": serialized_arguments,
+                        "call_id": call_id,
+                    },
+                ),
+            )
+        )
+        status = state.get("status")
+        output: str | None = None
+        if status == "completed":
+            output = opencode_tool_output_text(state)
+        elif status == "error":
+            error = state.get("error")
+            output = f"[error] {error}" if error else "[error]"
+        if output is not None:
+            items.append(
+                NewConversationItem(
+                    type="function_call_output",
+                    response_id=response_id,
+                    data=parse_item_data(
+                        "function_call_output",
+                        {"call_id": call_id, "output": output},
+                    ),
+                )
+            )
+    flush_content()
+    return tuple(items)
+
+
+def load_opencode_session(
+    session_id: str,
+    *,
+    opencode_path: str | None = None,
+) -> LocalSessionImport:
+    """Load one session through OpenCode's supported JSON export command."""
+    if not _is_safe_opencode_import_session_id(session_id):
+        raise SessionImportNotFoundError(f"OpenCode session {session_id!r} was not found")
+    payload = _run_opencode_json("export", session_id, "--pure", opencode_path=opencode_path)
+    if not isinstance(payload, dict):
+        raise SessionImportNotFoundError(
+            f"OpenCode session {session_id!r} returned an invalid export"
+        )
+    info = payload.get("info")
+    exported_id = info.get("id") if isinstance(info, dict) else None
+    if exported_id != session_id:
+        raise SessionImportNotFoundError(
+            f"OpenCode export id {exported_id!r} did not match {session_id!r}"
+        )
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    items = tuple(
+        item
+        for message_number, message in enumerate(messages, start=1)
+        if isinstance(message, dict)
+        for item in _opencode_message_items(message, message_number=message_number)
+    )
+    if not items:
+        raise SessionImportNotFoundError(
+            f"OpenCode session {session_id!r} has no importable history"
+        )
+    workspace_value = info.get("directory") if isinstance(info, dict) else None
+    workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    return LocalSessionImport(
+        source="opencode",
+        external_session_id=session_id,
+        workspace=workspace or None,
+        items=items,
+    )
+
+
 def load_local_session(source: ImportSource, session_id: str) -> LocalSessionImport:
     """Load one local session from the selected first-party harness."""
     if source == "claude":
@@ -954,6 +1211,8 @@ def load_local_session(source: ImportSource, session_id: str) -> LocalSessionImp
         return load_pi_session(session_id)
     if source == "kimi":
         return load_kimi_session(session_id)
+    if source == "opencode":
+        return load_opencode_session(session_id)
     raise ValueError(f"Unsupported import source: {source}")
 
 
@@ -964,6 +1223,7 @@ __all__ = [
     "load_kimi_session",
     "load_kiro_session",
     "load_local_session",
+    "load_opencode_session",
     "load_pi_session",
     "load_qwen_session",
 ]

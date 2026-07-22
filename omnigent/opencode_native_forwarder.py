@@ -619,7 +619,9 @@ class OpenCodeNativeForwarder:
         status = state.get("status")
         if status == "completed" and self.state.mark(self._key("tool-out", call_id)):
             await self._post_tool_output(
-                call_id, _tool_output_text(state), message_id=response_message_id
+                call_id,
+                opencode_tool_output_text(state),
+                message_id=response_message_id,
             )
         elif status == "error" and self.state.mark(self._key("tool-out", call_id)):
             error = state.get("error")
@@ -925,9 +927,9 @@ class OpenCodeNativeForwarder:
         return map_verdict_to_decision(verdict)
 
 
-def _tool_output_text(state: Mapping[str, Any]) -> str:
+def opencode_tool_output_text(state: Mapping[str, Any]) -> str:
     """
-    Extract a string tool output from a completed tool part's ``state``.
+    Extract shared durable output from a completed OpenCode tool state.
 
     :param state: The opencode tool part ``state`` (``output`` /
         ``metadata.output``).

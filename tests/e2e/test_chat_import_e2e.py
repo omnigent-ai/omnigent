@@ -141,6 +141,64 @@ def _write_jsonl_import_fixture(home: Path, harness: str) -> str:
     return f"-repo:{session_id}" if harness == "qwen" else session_id
 
 
+def _write_opencode_cli_fixture(home: Path) -> tuple[Path, str]:
+    """Write a fake public OpenCode CLI and return its bin dir plus session id."""
+    session_id = "ses_import_e2e"
+    listing = [
+        {
+            "id": session_id,
+            "title": "OpenCode import",
+            "updated": 1784247215390,
+            "created": 1784247214912,
+            "directory": "/repo",
+        }
+    ]
+    export = {
+        "info": {"id": session_id, "directory": "/repo", "version": "1.17.18"},
+        "messages": [
+            {
+                "info": {"id": "msg_user", "role": "user"},
+                "parts": [{"type": "text", "text": "inspect TODO.md"}],
+            },
+            {
+                "info": {"id": "msg_assistant", "role": "assistant"},
+                "parts": [
+                    {
+                        "type": "tool",
+                        "callID": "call_1",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "rg TODO"},
+                            "output": "TODO.md:1:item",
+                        },
+                    },
+                    {"type": "text", "text": "Done."},
+                ],
+            },
+        ],
+    }
+    bin_dir = home / "bin"
+    executable = bin_dir / "opencode"
+    bin_dir.mkdir(parents=True)
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import sys\n"
+        f"listing = {listing!r}\n"
+        f"export = {export!r}\n"
+        "if sys.argv[1:3] == ['session', 'list']:\n"
+        "    print(json.dumps(listing))\n"
+        f"elif sys.argv[1:] == ['export', '{session_id}', '--pure']:\n"
+        "    print(json.dumps(export))\n"
+        "else:\n"
+        "    raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return bin_dir, session_id
+
+
 def test_cli_imports_claude_chat_into_live_server(live_server: str, tmp_path: Path) -> None:
     """The real CLI and server create a readable session from Claude JSONL."""
     source_session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
@@ -447,3 +505,70 @@ def test_cli_imports_jsonl_harness_chat_end_to_end(
         "Done.",
     ]
     assert item_data[1]["model"] == f"{harness}-native-ui"
+
+
+def test_cli_imports_opencode_export_end_to_end(
+    live_server: str,
+    tmp_path: Path,
+) -> None:
+    """The real CLI discovers and imports OpenCode's public JSON export."""
+    bin_dir, source_session_id = _write_opencode_cli_fixture(tmp_path)
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(tmp_path),
+            "PATH": f"{bin_dir}{os.pathsep}{env.get('PATH', '')}",
+            "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "omnigent",
+            "import",
+            "--harness",
+            "opencode",
+            "--last",
+            "1",
+            "--server",
+            live_server,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+
+    match = re.search(
+        rf"Imported 4 item\(s\) from {source_session_id} into (\S+)\.",
+        result.stdout,
+    )
+    assert match is not None, result.stdout
+    imported_session_id = match.group(1)
+    session = httpx.get(
+        f"{live_server}/v1/sessions/{imported_session_id}",
+        params={"include_items": "false", "include_liveness": "false"},
+        timeout=10,
+    )
+    session.raise_for_status()
+    session_data = session.json()
+    assert session_data["external_session_id"] == source_session_id
+    assert session_data["workspace"] == "/repo"
+    assert session_data["title"] == "inspect TODO.md"
+    items = httpx.get(
+        f"{live_server}/v1/sessions/{imported_session_id}/items",
+        timeout=10,
+    )
+    items.raise_for_status()
+    item_data = items.json()["data"]
+    assert [item["type"] for item in item_data] == [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert item_data[1]["model"] == "opencode-native-ui"

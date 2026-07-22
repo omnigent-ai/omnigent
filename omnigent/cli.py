@@ -6271,7 +6271,10 @@ def resume(
 @cli.command("import")
 @click.option(
     "--harness",
-    type=click.Choice(["claude", "codex", "kimi", "kiro", "pi", "qwen"], case_sensitive=False),
+    type=click.Choice(
+        ["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"],
+        case_sensitive=False,
+    ),
     required=True,
     help="Local coding harness that owns the source session.",
 )
@@ -6308,13 +6311,15 @@ def import_session_command(
 
     The source transcript is converted to ordinary Omnigent items and stored
     as a normal session. Qwen, Kiro, and Kimi currently preserve visible
-    messages but not native tool activity. Use --session for one chat or --last
-    for a bounded batch. A source session can only be imported once.
+    messages but not native tool activity; OpenCode and Pi preserve exported
+    tool activity. Use --session for one chat or --last for a bounded batch. A
+    source session can only be imported once.
 
     \b
     Examples:
       omnigent import --harness claude --session <session-id>
       omnigent import --harness codex --session <session-id>
+      omnigent import --harness opencode --session <session-id>
       omnigent import --harness qwen --session <session-id>
       omnigent import --harness claude --last 10
     """
@@ -6336,7 +6341,10 @@ def import_session_command(
     source = cast(ImportSource, harness.lower())
     is_batch = recent_session_count is not None
     if recent_session_count is not None:
-        recent_ids = list_recent_local_session_ids(source, limit=recent_session_count)
+        try:
+            recent_ids = list_recent_local_session_ids(source, limit=recent_session_count)
+        except SessionImportNotFoundError as exc:
+            raise click.ClickException(str(exc)) from exc
         if not recent_ids:
             raise click.ClickException(f"No local {source} parent sessions were found")
         source_session_ids = tuple(reversed(recent_ids))
