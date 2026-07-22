@@ -7977,6 +7977,20 @@ def _truncate_child_preview(text: str) -> str:
 _session_timers: dict[str, dict[str, asyncio.Task[None]]] = {}
 
 
+def _has_live_async_tasks(
+    session_async_tasks: Mapping[
+        str,
+        Mapping[str, tuple[asyncio.Task[Any], asyncio.Event]],
+    ],
+) -> bool:
+    """Return whether an async-tool registry contains unfinished work."""
+    return any(
+        not task.done()
+        for handles in session_async_tasks.values()
+        for task, _cancel_event in handles.values()
+    )
+
+
 def register_timer(
     session_id: str,
     timer_id: str,
@@ -8315,21 +8329,47 @@ def create_runner_app(
 
     def _has_active_work() -> bool:
         """
-        Return whether this runner is currently executing agent work.
+        Return whether this runner must stay up for in-flight work.
 
-        Used by the out-of-process runner's inactivity watchdog. The
-        closure-local ``_active_turns`` catches turns owned directly by
-        ``runner/app.py``; ``process_manager.has_active_turn`` catches
-        in-flight responses tracked by the harness subprocess manager.
+        Used by the out-of-process runner's inactivity watchdog. Counts:
 
-        :returns: ``True`` while any session has an active agent turn.
+        * Foreground turns in ``_active_turns``.
+        * Live ``sys_call_async`` tasks in ``_session_async_tasks`` (not
+          ``done()``) — their results still need to land in the inbox.
+        * Live ``sys_timer_set`` tasks in ``_session_timers`` — firing
+          must POST into the session; shutdown would drop the schedule.
+        * Parked approval Futures in ``pending_approvals`` — the human
+          gate is still open.
+        * Harness turns via ``process_manager.has_active_turn``.
+
+        Explicitly excluded (must not pin the runner forever):
+
+        * Completed / cancelled tasks and other stale registry entries
+          (``task.done()`` / ``Future.done()``).
+        * ``_background_tasks`` (mixes short wake POSTs with unrelated
+          housekeeping).
+        * ``_subagent_wake_pending`` (debounce flag outlives delivery
+          until the parent turn starts or idles).
+        * Non-empty inboxes (results wait for the next turn; unread
+          items must not block idle shutdown).
+
+        :returns: ``True`` while delivery-critical work is outstanding.
         """
         if _active_turns:
             return True
-        if process_manager is None:
-            return False
-        session_ids = set(_session_start_cache) | set(_session_agent_ids)
-        return any(process_manager.has_active_turn(session_id) for session_id in session_ids)
+        if _has_live_async_tasks(_session_async_tasks):
+            return True
+        for timers in _session_timers.values():
+            for timer_task in timers.values():
+                if not timer_task.done():
+                    return True
+        if pending_approvals.has_any_pending():
+            return True
+        if process_manager is not None:
+            session_ids = set(_session_start_cache) | set(_session_agent_ids)
+            if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
+                return True
+        return False
 
     app.state.has_active_work = _has_active_work
 

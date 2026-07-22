@@ -646,3 +646,237 @@ def test_delete_does_not_remove_other_tasks_runs(store: SqlAlchemyScheduledTaskS
     remaining = store.list_runs(_uid("st_b_scope"))
     assert len(remaining) == 1
     assert remaining[0].id == _uid("sr_st_b_scope")
+
+
+# ── update_run (terminal transition + idempotency) ───────────────────────────
+
+
+def _seed_running_run(store: SqlAlchemyScheduledTaskStore, seed: str) -> str:
+    """Create a task + a ``running`` run for it; return the run id."""
+    store.create(
+        scheduled_task_id=_uid(f"task_{seed}"),
+        name=seed,
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    run_id = _uid(f"run_{seed}")
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=_uid(f"task_{seed}"),
+        status="running",
+        scheduled_at=100,
+        conversation_id=_uid(f"conv_{seed}"),
+        fired_at=101,
+    )
+    return run_id
+
+
+def test_update_run_transitions_running_to_succeeded(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update_run`` flips a ``running`` run to ``succeeded`` with finished_at."""
+    run_id = _seed_running_run(store, "ok")
+    updated = store.update_run(run_id, status="succeeded", finished_at=202)
+    assert updated is not None
+    assert updated.status == "succeeded"
+    assert updated.finished_at == 202
+    assert updated.error is None and updated.error_code is None
+
+
+def test_update_run_transitions_running_to_failed_with_code(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update_run`` flips a ``running`` run to ``failed`` carrying error detail."""
+    run_id = _seed_running_run(store, "bad")
+    updated = store.update_run(
+        run_id, status="failed", finished_at=303, error="boom", error_code="incomplete"
+    )
+    assert updated is not None
+    assert updated.status == "failed"
+    assert updated.finished_at == 303
+    assert updated.error == "boom"
+    assert updated.error_code == "incomplete"
+
+
+def test_update_run_is_idempotent_on_already_terminal(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A second ``update_run`` on an already-terminal run is a no-op (returns None).
+
+    The conditional ``WHERE status = running`` guard means a run advanced to a
+    terminal state — by a prior sweep or a fire-time write — is never
+    clobbered, and two concurrent sweeps cannot double-transition it.
+    """
+    run_id = _seed_running_run(store, "once")
+    first = store.update_run(run_id, status="succeeded", finished_at=202)
+    assert first is not None and first.status == "succeeded"
+    # Second attempt (e.g. a racing sweep) must not overwrite it.
+    second = store.update_run(run_id, status="failed", finished_at=999, error_code="incomplete")
+    assert second is None
+    # State is unchanged from the first transition.
+    run = store.list_runs(_uid("task_once"))[0]
+    assert run.status == "succeeded"
+    assert run.finished_at == 202
+    assert run.error_code is None
+
+
+def test_update_run_unknown_run_returns_none(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update_run`` on a missing run id returns ``None``."""
+    assert store.update_run(_uid("nope"), status="succeeded", finished_at=1) is None
+
+
+# ── list_running_runs_for_tasks (lazy-on-read LIST backstop source) ──────────
+
+
+def test_list_running_runs_for_tasks_filters_status_and_tasks(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Returns only ``running`` runs, and only for the requested tasks.
+
+    Powers the LIST endpoint's lazy stale backstop: the route passes the
+    owner's task ids and gets back their still-``running`` runs to age-check.
+    """
+    for seed in ("a", "b"):
+        store.create(
+            scheduled_task_id=_uid(f"task_{seed}"),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+    # task_a: one running + one terminal run.
+    store.create_run(
+        run_id=_uid("run_a_running"),
+        scheduled_task_id=_uid("task_a"),
+        status="running",
+        scheduled_at=100,
+    )
+    store.create_run(
+        run_id=_uid("run_a_done"),
+        scheduled_task_id=_uid("task_a"),
+        status="succeeded",
+        scheduled_at=90,
+        finished_at=95,
+    )
+    # task_b: one running run.
+    store.create_run(
+        run_id=_uid("run_b_running"),
+        scheduled_task_id=_uid("task_b"),
+        status="running",
+        scheduled_at=200,
+    )
+
+    got = store.list_running_runs_for_tasks([_uid("task_a"), _uid("task_b")])
+    ids = {r.id for r in got}
+    assert ids == {_uid("run_a_running"), _uid("run_b_running")}  # terminal excluded
+    # Ordered scheduled_at DESC (run_b scheduled_at=200 > run_a=100).
+    assert got[0].id == _uid("run_b_running")
+
+
+def test_list_running_runs_for_tasks_empty_ids_returns_empty(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An empty task-id list short-circuits to an empty result (no query)."""
+    assert store.list_running_runs_for_tasks([]) == []
+
+
+def test_list_running_runs_for_tasks_is_workspace_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A task's running run is invisible from another workspace."""
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_w11"),
+            name="w11",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_w11"),
+            scheduled_task_id=_uid("task_w11"),
+            status="running",
+            scheduled_at=100,
+        )
+    # Default workspace cannot see the workspace-11 run.
+    assert store.list_running_runs_for_tasks([_uid("task_w11")]) == []
+    with workspace_scope(11):
+        got = store.list_running_runs_for_tasks([_uid("task_w11")])
+        assert [r.id for r in got] == [_uid("run_w11")]
+
+
+# ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
+
+
+def test_get_running_run_by_conversation_returns_running_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The reverse lookup finds the ``running`` run for a conversation."""
+    run_id = _seed_running_run(store, "hook")
+    found = store.get_running_run_by_conversation(_uid("conv_hook"))
+    assert found is not None
+    assert found.id == run_id
+    assert found.status == "running"
+
+
+def test_get_running_run_by_conversation_none_when_terminal(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Once the run is terminal the reverse lookup returns ``None`` (hook no-op).
+
+    This is what makes the event hook idempotent: a second terminal edge finds
+    no ``running`` run to transition.
+    """
+    run_id = _seed_running_run(store, "term")
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    assert store.get_running_run_by_conversation(_uid("conv_term")) is None
+
+
+def test_get_running_run_by_conversation_none_for_unknown_conversation(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An interactive (non-scheduled) conversation has no run → ``None``."""
+    assert store.get_running_run_by_conversation(_uid("conv_absent")) is None
+
+
+def test_get_running_run_by_conversation_is_workspace_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The lookup filters on the current workspace, like every other store read.
+
+    A run seeded in workspace 11 is invisible from the default workspace and
+    visible only inside its own ``workspace_scope`` — the property the event
+    hook relies on to write to the fired run's workspace.
+    """
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_ws"),
+            name="ws",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_ws"),
+            scheduled_task_id=_uid("task_ws"),
+            status="running",
+            scheduled_at=100,
+            conversation_id=_uid("conv_ws"),
+        )
+    # Default workspace cannot see the workspace-11 run.
+    assert store.get_running_run_by_conversation(_uid("conv_ws")) is None
+    # Inside its own scope it resolves.
+    with workspace_scope(11):
+        found = store.get_running_run_by_conversation(_uid("conv_ws"))
+        assert found is not None and found.id == _uid("run_ws")

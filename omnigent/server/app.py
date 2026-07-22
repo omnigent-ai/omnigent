@@ -65,6 +65,7 @@ from omnigent.server.performance_metrics import (
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
+from omnigent.server.routes.dictation import create_dictation_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -1423,9 +1424,19 @@ def create_app(
                     exc,
                 )
 
+            # Run completion is event-driven (persist_scheduled_run_completion
+            # fires from _publish_status the instant a fired conversation's turn
+            # ends — no poll). The only orphan backstop is a lazy-on-read
+            # force-fail of stale ``running`` runs on the scheduled-task read
+            # endpoints (see routes/scheduled_tasks.py); there is no startup
+            # sweep and no periodic reconcile.
+
         try:
             yield
         finally:
+            # Run completion is event-driven (the _publish_status hook) plus a
+            # lazy-on-read stale backstop — there is no run-reconciler task to
+            # cancel. Only the per-job scheduler holds timers that need stopping.
             if scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
             metrics_publish_task.cancel()
@@ -1555,8 +1566,11 @@ def create_app(
     set_server_runner_router(runner_router)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
-    # hold a session's runner tunnel serve the same sidebar fields.
-    session_live_state.configure(conversation_store)
+    # hold a session's runner tunnel serve the same sidebar fields. The
+    # scheduled-task store additionally enables the event-driven
+    # run-completion hook (persist_scheduled_run_completion) fired from
+    # _publish_status when a fired conversation's turn reaches terminal.
+    session_live_state.configure(conversation_store, scheduled_task_store)
     pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
 
     @app.middleware("http")
@@ -1999,9 +2013,10 @@ def create_app(
         source, the login URL, whether first-run admin setup is
         still pending (``needs_setup``), coarse capability
         booleans (``databricks_features``,
-        ``managed_sandboxes_enabled``, ``single_user``), the short
-        sandbox provider name (``sandbox_provider``) the web UI labels
-        the new-session sandbox option with, and the installed
+        ``managed_sandboxes_enabled``, ``dictation_available``,
+        ``single_user``), the short sandbox provider name
+        (``sandbox_provider``) the web UI labels the new-session
+        sandbox option with, and the installed
         ``server_version`` (already public via ``/api/version``).
         """
         from omnigent.server.auth import UnifiedAuthProvider, local_single_user_enabled
@@ -2077,6 +2092,13 @@ def create_app(
             )
         except ImportError:
             smart_routing_enabled = False
+        # dictation_available gates the composer mic button's server
+        # speech-to-text fallback (designs/server-dictation.md). Checks
+        # config presence only (extra installed + models on disk) — no
+        # model is loaded here.
+        from omnigent.server.dictation import engine_availability
+
+        dictation_available, _ = engine_availability()
         return {
             "accounts_enabled": accounts_enabled,
             "single_user": single_user,
@@ -2089,6 +2111,7 @@ def create_app(
             "public_sharing_enabled": public_sharing_enabled,
             "server_version": _server_version(),
             "smart_routing_enabled": smart_routing_enabled,
+            "dictation_available": dictation_available,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
@@ -2194,6 +2217,14 @@ def create_app(
         create_harnesses_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["harnesses"],
+    )
+    # Server-side speech-to-text behind the composer mic button
+    # (designs/server-dictation.md). Availability is probed lazily, so
+    # registering unconditionally is free for servers without the extra.
+    app.include_router(
+        create_dictation_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["dictation"],
     )
     app.include_router(
         create_terminal_attach_router(
