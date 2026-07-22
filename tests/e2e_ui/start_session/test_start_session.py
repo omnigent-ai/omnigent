@@ -1012,9 +1012,10 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await expect(effort).to_contain_text("Default")
 
             # Pick model + effort in the same modal visit (each select commits to
-            # a local draft; Save commits both at once).
-            await _pick_config_select(page, "new-chat-landing-config-model", "Opus")
-            await expect(model).to_contain_text("Opus")
+            # a local draft; Save commits both at once). The model rows carry the
+            # host catalog's live display names, not the static alias labels.
+            await _pick_config_select(page, "new-chat-landing-config-model", "Opus 4.8")
+            await expect(model).to_contain_text("Opus 4.8")
             await _pick_config_select(page, "new-chat-landing-config-effort", "High")
             await expect(effort).to_contain_text("High")
             await _save_config(page)
