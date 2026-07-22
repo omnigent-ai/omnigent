@@ -463,6 +463,31 @@ describe("ComposerMicButton (server dictation)", () => {
     expect(onVoiceStart).toHaveBeenCalledTimes(1);
   });
 
+  it("in Electron goes straight to the server, skipping the doomed Web Speech take", async () => {
+    // Electron HAS a SpeechRecognition constructor but no backend: a Web Speech
+    // take always fails with "network" and only then falls back, a visible ~1s
+    // stall. With the server available the button must skip it entirely.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
+    try {
+      render(
+        <CapabilitiesContext.Provider value={DICTATION_INFO}>
+          <ComposerMicButton onTranscript={vi.fn()} />
+        </CapabilitiesContext.Provider>,
+      );
+      await clickMic();
+
+      // Server path taken directly; the Web Speech recognizer never started.
+      expect(sessionStartMock).toHaveBeenCalledTimes(1);
+      expect(startSpy).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    } finally {
+      delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+    }
+  });
+
   it("Enter while listening ends the server take via stop (keeps the tail)", async () => {
     const onVoiceDiscard = vi.fn();
     sessionStopMock = vi.fn(async () => "tail words");

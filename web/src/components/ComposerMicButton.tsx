@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -393,7 +394,12 @@ export const ComposerMicButton = ({
       void toggleServer();
       return;
     }
-    if (!Ctor) {
+    // In Electron the SpeechRecognition constructor exists but has no backend,
+    // so a Web Speech take always fails with "network" and only THEN falls back
+    // to the server — a visible ~1s "fail then recover" on every first take.
+    // When the server can serve, go straight to it and skip the doomed attempt.
+    // (Real browsers keep Web Speech primary; it genuinely works there.)
+    if (!Ctor || (serverAvailable && isElectronShell())) {
       if (serverAvailable) void toggleServer();
       return;
     }
