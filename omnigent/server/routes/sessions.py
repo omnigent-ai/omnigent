@@ -5828,6 +5828,25 @@ def _publish_status(
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
     session_live_state.persist_live_status(session_id, status)
+    # Event-driven scheduled-run completion. A terminal edge (idle = the turn
+    # completed; failed = it errored/disconnected) flips the conversation's
+    # still-``running`` scheduled_task_run to succeeded/failed. This is the
+    # primary FU-1 mechanism: the run transitions the instant the turn ends,
+    # driven by the same terminal event that persists live_status — no poll.
+    # The event's own ``error`` carries the failure classification, so no label
+    # re-read is needed (and none of the race that would imply). A no-op for
+    # the common case: interactive (non-scheduled) conversations have no
+    # running run, and the reverse lookup cheaply returns None. running/waiting
+    # edges are skipped entirely so the hot path pays nothing mid-turn.
+    if status == "idle":
+        session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
+    elif status == "failed":
+        session_live_state.persist_scheduled_run_completion(
+            session_id,
+            "failed",
+            error_code=error.code if error is not None else None,
+            error=error.message if error is not None else None,
+        )
     # Track the in-flight response id for snapshot-based reconnect (see
     # _session_active_response_cache). A running/waiting edge that names a
     # turn opens it; any idle/failed edge closes it.
@@ -10899,9 +10918,29 @@ async def _ensure_runner_relay_ready(
     return handle
 
 
-# Per-session compaction locks so concurrent ``/compact`` POSTs
-# don't race.
-_COMPACT_LOCKS: dict[str, asyncio.Lock] = {}
+# Weak values bound the per-session lock registry without splitting waiters
+# across different lock objects during eviction.
+_COMPACT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+
+
+def _compact_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock serializing explicit compaction for one session.
+
+    Concurrent ``/compact`` events for the same session must not overlap;
+    different sessions get distinct locks so they may compact concurrently.
+    Get-or-create is race-free because there is no ``await`` between the
+    lookup and the insert (single event loop).
+
+    :param session_id: Session/conversation id being compacted.
+    :returns: A process-wide :class:`asyncio.Lock` shared by every concurrent
+        caller for the same ``session_id``.
+    """
+    lock = _COMPACT_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _COMPACT_LOCKS[session_id] = lock
+    return lock
 
 
 async def _run_compact_locked(
@@ -10918,67 +10957,71 @@ async def _run_compact_locked(
     :param agent_store: Agent store for spec lookup.
     :param agent_cache: Agent cache for bundle loading.
     """
-    if conv.agent_id is None:
-        raise OmnigentError("Session has no agent binding", code=ErrorCode.INTERNAL_ERROR)
-    if agent_cache is None:
-        raise OmnigentError(
-            "Compaction is unavailable: agent cache is not configured",
-            code=ErrorCode.INTERNAL_ERROR,
+    lock = _compact_lock(session_id)
+    async with lock:
+        if conv.agent_id is None:
+            raise OmnigentError("Session has no agent binding", code=ErrorCode.INTERNAL_ERROR)
+        if agent_cache is None:
+            raise OmnigentError(
+                "Compaction is unavailable: agent cache is not configured",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        # Recheck after acquiring — a turn may have started while waiting.
+        if _session_status_cache.get(session_id) in ("running", "waiting"):
+            raise OmnigentError(
+                "Cannot compact while a turn is running; cancel or wait for it to finish first",
+                code=ErrorCode.CONFLICT,
+            )
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+        if agent is None or agent.bundle_location is None:
+            raise OmnigentError(
+                f"Agent not found: {conv.agent_id!r}",
+                code=ErrorCode.NOT_FOUND,
+            )
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
-    # Check live status via cache; tasks table has been removed.
-    if _session_status_cache.get(session_id) in ("running", "waiting"):
-        raise OmnigentError(
-            "Cannot compact while a turn is running; cancel or wait for it to finish first",
-            code=ErrorCode.CONFLICT,
-        )
-    agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
-    if agent is None or agent.bundle_location is None:
-        raise OmnigentError(
-            f"Agent not found: {conv.agent_id!r}",
-            code=ErrorCode.NOT_FOUND,
-        )
-    loaded = agent_cache.load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
-    spec = loaded.spec
-    if spec.llm is not None:
-        llm_config = spec.llm
-    elif spec.executor.model is not None:
-        from omnigent.spec.types import LLMConfig
+        spec = loaded.spec
+        if spec.llm is not None:
+            llm_config = spec.llm
+        elif spec.executor.model is not None:
+            from omnigent.spec.types import LLMConfig
 
-        llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
-    else:
-        harness = spec.executor.harness_kind
-        raise OmnigentError(
-            f"/compact is unavailable for this {harness} session because the agent "
-            "does not declare an LLM model for server-side compaction. Configure "
-            "`llm.model` or `executor.model`, or use a harness-native compaction "
-            "control when one is available.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    task_id = f"compact_{int(time.time() * 1000)}"
-    _publish_status(session_id, "running")
-    # compact() publishes its own in_progress / completed SSE events
-    # when conversation_id is set — don't double-publish here.
-    from omnigent.runtime.workflow import compact_conversation_now
+            llm_config = LLMConfig(model=spec.executor.model, connection=spec.executor.connection)
+        else:
+            harness = spec.executor.harness_kind
+            raise OmnigentError(
+                f"/compact is unavailable for this {harness} session because the agent "
+                "does not declare an LLM model for server-side compaction. Configure "
+                "`llm.model` or `executor.model`, or use a harness-native compaction "
+                "control when one is available.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        task_id = f"compact_{int(time.time() * 1000)}"
+        _publish_status(session_id, "running")
+        # compact() publishes its own in_progress / completed SSE events
+        # when conversation_id is set — don't double-publish here.
+        from omnigent.runtime.workflow import compact_conversation_now
 
-    try:
-        await compact_conversation_now(
-            task_id=task_id,
-            conversation_id=session_id,
-            spec=spec,
-            llm_config=llm_config,
-            tool_schemas=[],
-            preserve_recent_window=1,
-        )
-    except Exception as exc:
-        _logger.exception("Explicit session compaction failed for %s", session_id)
-        detail = str(exc) or repr(exc)
-        _publish_compaction_failed(session_id)
+        try:
+            await compact_conversation_now(
+                task_id=task_id,
+                conversation_id=session_id,
+                spec=spec,
+                llm_config=llm_config,
+                tool_schemas=[],
+                preserve_recent_window=1,
+            )
+        except Exception as exc:
+            _logger.exception("Explicit session compaction failed for %s", session_id)
+            detail = str(exc) or repr(exc)
+            _publish_compaction_failed(session_id)
+            _publish_status(session_id, "idle")
+            raise OmnigentError(
+                f"Compaction failed while generating a summary: {detail}",
+                code=ErrorCode.INTERNAL_ERROR,
+            ) from exc
         _publish_status(session_id, "idle")
-        raise OmnigentError(
-            f"Compaction failed while generating a summary: {detail}",
-            code=ErrorCode.INTERNAL_ERROR,
-        ) from exc
-    _publish_status(session_id, "idle")
 
 
 def _agent_provider_family(agent: Agent) -> str | None:
@@ -12172,13 +12215,19 @@ async def _stream_live_events(
     reconcile pre-subscribe state via the snapshot endpoint
     (``GET /v1/sessions/{id}``) and dedupe by item id.
 
-    On client disconnect the subscribe loop breaks; the ``finally`` block
-    emits a ``[DONE]`` sentinel so well-behaved SSE consumers see a clean
-    stream termination. A subscriber-queue overflow instead ends without
-    ``[DONE]`` so clients treat it as a dropped transport, reconnect, and
-    reconcile from the persisted snapshot. The pub-sub layer auto-cleans
-    this generator's subscriber slot in its own ``finally`` when iteration
-    exits.
+    On normal completion (subscribe ends or the disconnect check
+    breaks the loop) this generator emits a ``[DONE]`` sentinel so
+    well-behaved SSE consumers see a clean stream termination. A
+    subscriber-queue overflow instead ends without ``[DONE]`` so clients
+    treat it as a dropped transport, reconnect, and reconcile from the
+    persisted snapshot.
+
+    ``finally`` is cleanup-only (presence deregistration): yielding
+    from ``finally`` during client ``aclose`` / ``GeneratorExit``
+    raises ``RuntimeError: async generator ignored GeneratorExit``.
+    The subscribe iterator is wrapped in ``contextlib.aclosing`` so
+    outer ``aclose`` tears down the pub-sub subscriber slot
+    immediately (a bare ``async for`` would defer that to GC).
 
     Each emitted dict is validated against
     :data:`ServerStreamEvent` at the wire boundary so a runtime
@@ -12238,35 +12287,42 @@ async def _stream_live_events(
         presence_token = presence.connect(
             presence_root_id, session_id, viewer_user_id, viewer_idle
         )
-    subscriber_overflowed = False
     try:
-        async for event in session_stream.subscribe(
-            session_id,
-            heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
-            ready_event={"type": "session.heartbeat"},
-            # In-flight text replay must be captured synchronously at slot
-            # registration (before ``ready_event`` suspends), not in the
-            # async ``on_subscribed`` hook, or window deltas double-render.
-            # Resource state stays in ``on_subscribed`` — it needs
-            # awaits and is not dedup-sensitive.
-            pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
-            on_subscribed=on_subscribed,
-        ):
-            if await request.is_disconnected():
-                break
-            event_type = event.get("type")
-            if not isinstance(event_type, str):
-                raise ValueError(
-                    f"session stream event missing string ``type`` field: {event!r}",
-                )
-            validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
-            yield _format_sse(event_type, validated.model_dump())
+        # ``aclosing`` propagates outer ``aclose`` into ``subscribe``;
+        # a bare ``async for`` would leave the subscriber slot until GC.
+        async with contextlib.aclosing(
+            session_stream.subscribe(
+                session_id,
+                heartbeat_interval_s=_SESSION_STREAM_HEARTBEAT_INTERVAL_S,
+                ready_event={"type": "session.heartbeat"},
+                # In-flight text replay must be captured synchronously at slot
+                # registration (before ``ready_event`` suspends), not in the
+                # async ``on_subscribed`` hook, or window deltas double-render.
+                # Resource state stays in ``on_subscribed`` — it needs
+                # awaits and is not dedup-sensitive.
+                pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
+                on_subscribed=on_subscribed,
+            )
+        ) as live_events:
+            async for event in live_events:
+                if await request.is_disconnected():
+                    break
+                event_type = event.get("type")
+                if not isinstance(event_type, str):
+                    raise ValueError(
+                        f"session stream event missing string ``type`` field: {event!r}",
+                    )
+                validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
+                yield _format_sse(event_type, validated.model_dump())
     except session_stream.SubscriberOverflowError:
-        subscriber_overflowed = True
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
             session_id,
         )
+    else:
+        # Normal completion only — never yield from ``finally`` (aclose /
+        # GeneratorExit would raise ``async generator ignored GeneratorExit``).
+        yield "data: [DONE]\n\n"
     finally:
         # The non-None checks besides presence_token's are type
         # narrowing only: a minted token implies both were set above.
@@ -12276,8 +12332,6 @@ async def _stream_live_events(
             and presence_root_id is not None
         ):
             presence.disconnect(presence_root_id, viewer_user_id, presence_token)
-        if not subscriber_overflowed:
-            yield "data: [DONE]\n\n"
 
 
 # Bounds for per-session native-terminal pass-through args
@@ -21048,9 +21102,9 @@ def create_sessions_router(
         Subscribe to the session's live SSE event stream.
 
         Does NOT replay history; clients reconcile via the snapshot
-        endpoint. The generator handles disconnects via a
-        ``try/finally`` that emits the ``[DONE]`` sentinel in all
-        exit paths — see :func:`_stream_live_events`.
+        endpoint. The generator emits ``[DONE]`` on normal completion
+        and uses ``finally`` only for presence cleanup — see
+        :func:`_stream_live_events`.
 
         Holding this stream open registers the caller as a session
         *viewer* (presence): co-viewers' streams receive
