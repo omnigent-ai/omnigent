@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _SESSION_RENAME_TRUTHY = {"1", "true", "yes", "on"}
+# Start with harnesses whose isolated title-generation paths are verified;
+# additional harnesses can be added once they have equivalent coverage.
 _SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset({"claude-sdk", "claude-native", "codex"})
 
 
