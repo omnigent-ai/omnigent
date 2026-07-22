@@ -44,4 +44,3 @@ or dashboard artifact.
 
 Leave the artifact as working files under `artifacts/`. Do not publish it yet;
 the `review-product-ui` skill must run first.
-

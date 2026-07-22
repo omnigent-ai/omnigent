@@ -1,5 +1,6 @@
 import { FileCode2Icon, Loader2Icon, RefreshCwIcon } from "lucide-react";
 import { useMemo } from "react";
+import { useArtifactPreview } from "@/hooks/useArtifactPreview";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { useWorkspaceFileSearch } from "@/hooks/useWorkspaceChangedFiles";
 import { Button } from "@/components/ui/button";
@@ -10,6 +11,8 @@ export interface ArtifactEntry {
   title: string;
   modifiedAt: number | null;
 }
+
+const ARTIFACT_PREVIEW_SANDBOX = "allow-scripts allow-same-origin";
 
 function titleFromSlug(slug: string): string {
   return slug
@@ -55,6 +58,7 @@ export function ArtifactsPanel({
   const query = useWorkspaceFileSearch(conversationId, ".html", "artifacts/**");
   const entries = useMemo(() => artifactEntriesFromFiles(query.data ?? []), [query.data]);
   const selected = entries.find((entry) => entry.entryPath === selectedPath) ?? null;
+  const preview = useArtifactPreview(conversationId, selected?.entryPath ?? null);
 
   if (query.isLoading) {
     return (
@@ -97,7 +101,7 @@ export function ArtifactsPanel({
       <div className="border-b border-border px-3 py-2">
         <p className="text-xs font-medium text-muted-foreground">Design artifacts</p>
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+      <div className={cn("overflow-y-auto p-2", selected === null ? "min-h-0 flex-1" : "max-h-40")}>
         <div className="space-y-1">
           {entries.map((entry) => (
             <button
@@ -121,15 +125,39 @@ export function ArtifactsPanel({
         </div>
       </div>
       {selected !== null && (
-        <div className="border-t border-border p-3">
-          <Button
-            className="w-full"
-            variant="outline"
-            size="sm"
-            onClick={() => onOpenFile(selected.entryPath)}
-          >
-            Open file
-          </Button>
+        <div className="flex min-h-0 flex-1 flex-col border-t border-border">
+          <div className="flex items-center justify-between gap-2 px-3 py-2">
+            <p className="truncate text-xs font-medium">{selected.title}</p>
+            <Button variant="outline" size="sm" onClick={() => onOpenFile(selected.entryPath)}>
+              Open file
+            </Button>
+          </div>
+          <div className="relative min-h-0 flex-1 bg-muted/30">
+            {preview.isLoading ? (
+              <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+                <Loader2Icon className="size-4 animate-spin" />
+                Starting preview…
+              </div>
+            ) : preview.isError || preview.data === undefined ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+                <p className="text-sm font-medium">Browser preview is unavailable</p>
+                <p className="text-xs text-muted-foreground">
+                  The runner may be asleep, or this host may not provide an isolated preview origin.
+                </p>
+                <Button variant="outline" size="sm" onClick={() => void preview.refetch()}>
+                  <RefreshCwIcon className="size-3.5" />
+                  Retry
+                </Button>
+              </div>
+            ) : (
+              <iframe
+                title={`${selected.title} preview`}
+                src={preview.data.url}
+                sandbox={ARTIFACT_PREVIEW_SANDBOX}
+                className="h-full w-full border-0 bg-white"
+              />
+            )}
+          </div>
         </div>
       )}
     </div>

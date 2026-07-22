@@ -28,4 +28,3 @@ Use this skill after the artifact exists and before publishing it.
 
 Do not publish a design merely because the files exist. Publishing is the
 explicit signal that browser review and required fixes are complete.
-
