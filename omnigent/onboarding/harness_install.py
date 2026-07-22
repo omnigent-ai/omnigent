@@ -626,26 +626,24 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
-    # uv-based vendor installers commonly place entry points in ~/.local/bin and
-    # update shell startup files, which can't change this already-running
-    # process. Prepend it to ``PATH`` so the setup wizard's later
-    # harness_login/harness_cli_logged_in (which shell out with the bare binary
-    # name and rely on the inherited ``PATH``) can find a freshly-installed CLI.
-    user_bin = Path.home() / ".local" / "bin"
-    candidate = user_bin / spec.binary
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        current_path = os.environ.get("PATH", "")
-        path_entries = current_path.split(os.pathsep) if current_path else []
-        if str(user_bin) not in path_entries:
-            os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
-    # Judge success with the SAME resolver readiness uses
-    # (:func:`resolve_cli_binary`'s full ladder — ``PATH`` plus the
-    # nvm/npm-global/homebrew fallback dirs), so the install verdict and the
-    # readiness badge can never disagree. A bare ``shutil.which`` here would
-    # report "not on PATH" for a binary the host daemon's frozen ``PATH`` omits
-    # but readiness still resolves via the ladder — surfacing a spurious
-    # "failed" toast next to a green "ready" tick.
-    if resolve_cli_binary(spec.binary) is not None:
+    # Resolve the freshly-installed binary via the SAME ladder readiness uses
+    # (:func:`resolve_cli_binary` — ``PATH`` plus the nvm/npm-global/homebrew
+    # fallback dirs), so the install verdict and the readiness badge can never
+    # disagree. A bare ``shutil.which`` here would report "not found" for a
+    # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
+    # via the ladder — the spurious "failed" toast next to a green "ready" tick.
+    resolved = resolve_cli_binary(spec.binary)
+    if resolved is not None:
+        # Put the resolving dir on ``PATH`` for this process so the setup
+        # wizard's *later* steps — harness_login / harness_cli_logged_in /
+        # harness_logout — which shell out with the bare binary name and only
+        # bare ``shutil.which``, can find it too. Without this, an install that
+        # succeeded via a fallback dir (nvm/homebrew/…) would be followed by a
+        # login step that can't locate the very binary just installed.
+        resolved_dir = str(Path(resolved).resolve().parent)
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        if resolved_dir not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
         return HarnessInstallResult(True, None)
     if result.returncode != 0:
         return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
