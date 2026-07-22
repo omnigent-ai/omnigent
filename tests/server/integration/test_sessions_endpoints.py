@@ -143,7 +143,6 @@ async def test_create_session_without_title_returns_none(
 async def test_first_message_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,
-    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first user turn returns normally while title generation runs separately."""
@@ -197,11 +196,9 @@ async def test_first_message_schedules_background_semantic_title(
         await fake_runner.aclose()
 
     assert response.status_code == 202, response.text
-    store = SqlAlchemyConversationStore(db_uri)
-    store.update_conversation(
-        session["id"],
-        title="please investigate the authentication timeout",
-    )
+    # The events endpoint seeds the title synchronously before returning, so the
+    # coordinator observes the expected seed and renames it. Writing our own seed
+    # here would race that rename and clobber it, so rely on the endpoint's seed.
     await asyncio.wait_for(generated.wait(), timeout=5)
     await coordinator.wait_for_idle()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
