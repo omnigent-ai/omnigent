@@ -2061,7 +2061,7 @@ def test_handle_install_harness_success_returns_refreshed_readiness(
 
     # Not yet installed, so the handler runs the installer.
     monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
-    monkeypatch.setattr(connect, "install_harness_cli_with_reason", lambda key: (True, None))
+    monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
     monkeypatch.setattr(
         connect,
         "configured_harness_map",
@@ -2097,7 +2097,7 @@ def test_handle_install_harness_already_installed_skips_installer(
     def _must_not_install(key: str) -> tuple[bool, str | None]:
         raise AssertionError("installer ran despite the harness already being installed")
 
-    monkeypatch.setattr(connect, "install_harness_cli_with_reason", _must_not_install)
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
     monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
 
     host = _make_host_process()
@@ -2121,7 +2121,7 @@ def test_handle_install_harness_failure_surfaces_reason(
     monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
     monkeypatch.setattr(
         connect,
-        "install_harness_cli_with_reason",
+        "try_install_harness_cli",
         lambda key: (False, "npm is not available on the host"),
     )
 
@@ -2149,7 +2149,7 @@ def test_handle_install_harness_rejects_non_allowlisted(
     def _must_not_install(key: str) -> tuple[bool, str | None]:
         raise AssertionError("installer reached for a non-allowlisted harness")
 
-    monkeypatch.setattr(connect, "install_harness_cli_with_reason", _must_not_install)
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
 
     host = _make_host_process()
     result = host._handle_install_harness(

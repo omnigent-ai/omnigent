@@ -97,6 +97,23 @@ def _hello_text(name: str = _HOST_NAME) -> str:
     )
 
 
+async def _connect_mock_host(app: FastAPI, registry: HostRegistry) -> ApplicationCommunicator:
+    """Open a tunnel, complete the hello handshake, and wait for registration.
+
+    :param app: The wired FastAPI app (tunnel + REST routers).
+    :param registry: The registry the tunnel registers the connection into.
+    :returns: The connected ``ApplicationCommunicator`` (caller drains it).
+    """
+    comm = ApplicationCommunicator(app, _websocket_scope(f"/v1/hosts/{_HOST_ID}/tunnel"))
+    await comm.send_input({"type": "websocket.connect"})
+    accepted = await comm.receive_output(timeout=1.0)
+    assert accepted["type"] == "websocket.accept"
+    await comm.send_input({"type": "websocket.receive", "text": _hello_text()})
+    while registry.get(_HOST_ID) is None:
+        await asyncio.sleep(0.01)
+    return comm
+
+
 @pytest.fixture()
 def install_app(
     db_uri: str,
@@ -149,14 +166,7 @@ async def install_setup(
     :returns: Async iterator yielding the wired-up state.
     """
     app, registry, _hs, _cs = install_app
-    path = f"/v1/hosts/{_HOST_ID}/tunnel"
-    comm = ApplicationCommunicator(app, _websocket_scope(path))
-    await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
-    assert accepted["type"] == "websocket.accept"
-    await comm.send_input({"type": "websocket.receive", "text": _hello_text()})
-    while registry.get(_HOST_ID) is None:
-        await asyncio.sleep(0.01)
+    comm = await _connect_mock_host(app, registry)
 
     conn = registry.get(_HOST_ID)
     assert conn is not None
@@ -281,6 +291,105 @@ async def test_install_harness_codex_reports_needs_auth_not_ready(
     assert resp.status_code == 200
     body = resp.json()
     assert body["configured_harnesses"]["codex"] == "needs-auth"
+
+
+# ── Coalescing concurrent installs ──────────────────────
+
+
+async def test_install_coalesces_concurrent_same_family(
+    install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Two overlapping installs of one family reach the host as a single frame.
+
+    ``codex`` and ``codex-native`` both resolve to the ``openai`` install key,
+    so a user who fires both (a double-click, or two spellings) must not drive
+    two concurrent global ``npm install -g`` runs — npm's global writes aren't
+    race-safe. The route coalesces them onto one in-flight task keyed on the
+    resolved family, so exactly one ``host.install_harness`` frame is sent and
+    both HTTP callers get the same result.
+    """
+    app, registry, _hs, _cs = install_app
+    comm = await _connect_mock_host(app, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+
+    install_frames: list[str] = []
+    release = asyncio.Event()
+    stop_drain = asyncio.Event()
+
+    async def _drain_holding_reply() -> None:
+        """Record each install frame, then reply once ``release`` is set.
+
+        Holding the reply keeps the shared task in flight so a second
+        request lands while the first is still pending — exactly the
+        window coalescing must cover.
+        """
+        while not stop_drain.is_set():
+            try:
+                output = await comm.receive_output(timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if output.get("type") != "websocket.send":
+                continue
+            text = output.get("text")
+            if not isinstance(text, str):
+                continue
+            frame = decode_host_frame(text)
+            if not isinstance(frame, HostInstallHarnessFrame):
+                continue
+            install_frames.append(frame.harness)
+            await release.wait()
+            await comm.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostInstallHarnessResultFrame(
+                            request_id=frame.request_id,
+                            status="ok",
+                            configured_harnesses={frame.harness: "needs-auth"},
+                        )
+                    ),
+                }
+            )
+
+    drain_task = asyncio.create_task(_drain_holding_reply())
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # Fire the first request and wait until its task is registered
+            # in-flight before firing the second, so the second provably hits
+            # the coalescing branch instead of racing task creation.
+            first = asyncio.create_task(
+                client.post(f"/v1/hosts/{_HOST_ID}/harnesses/codex/install")
+            )
+            while "openai" not in conn.inflight_installs:
+                await asyncio.sleep(0.01)
+            second = asyncio.create_task(
+                client.post(f"/v1/hosts/{_HOST_ID}/harnesses/codex-native/install")
+            )
+            # Let the second request reach the coalescing branch (it only has to
+            # clear an in-memory host lookup) before releasing the held reply.
+            await asyncio.sleep(0.1)
+            release.set()
+            resp_first, resp_second = await asyncio.gather(first, second)
+    finally:
+        stop_drain.set()
+        release.set()
+        try:
+            await asyncio.wait_for(drain_task, timeout=1.0)
+        except asyncio.TimeoutError:
+            drain_task.cancel()
+
+    # Exactly one frame reached the host despite two concurrent requests.
+    assert install_frames == ["codex"]
+    assert resp_first.status_code == 200
+    assert resp_second.status_code == 200
+    # Both callers echo their own requested harness but share the one coalesced
+    # readiness map (keyed on the harness that actually reached the host).
+    assert resp_first.json()["harness"] == "codex"
+    assert resp_second.json()["harness"] == "codex-native"
+    assert resp_first.json()["configured_harnesses"]["codex"] == "needs-auth"
+    assert resp_second.json()["configured_harnesses"]["codex"] == "needs-auth"
 
 
 # ── Feature flag ────────────────────────────────────────

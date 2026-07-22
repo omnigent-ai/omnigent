@@ -37,7 +37,7 @@ from omnigent.host.frames import (
     HostListDirFrame,
     encode_host_frame,
 )
-from omnigent.onboarding.harness_install import ui_installable_harnesses
+from omnigent.onboarding.harness_install import ui_install_key, ui_installable_harnesses
 from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
@@ -1069,14 +1069,21 @@ def create_hosts_router(
         if conn is None:
             raise HTTPException(status_code=409, detail="host is offline")
 
-        # Coalesce a concurrent install of the same harness onto the in-flight
-        # request so a double-click doesn't launch two global npm installs
-        # (npm's global writes aren't race-safe). The map lives on the
-        # connection, so it's discarded when the host disconnects.
-        existing = conn.inflight_installs.get(harness)
-        if existing is not None:
-            result = await asyncio.shield(existing)
-        else:
+        # Coalesce concurrent installs of the same harness FAMILY onto one
+        # in-flight request so a double-click (or `codex` + `codex-native`, which
+        # resolve to the same npm package) can't launch two global npm installs
+        # (npm's global writes aren't race-safe). Keyed on the resolved install
+        # key, not the raw spelling. The map lives on the connection, so it's
+        # discarded when the host disconnects.
+        #
+        # Cleanup is tied to the task's completion (add_done_callback), not the
+        # awaiter, and every caller awaits under a shield: if this request is
+        # cancelled (client disconnect) mid-install, the shared task keeps
+        # running to completion and stays in the map, so a follow-up request
+        # coalesces onto it instead of starting a second npm install.
+        install_key = ui_install_key(harness) or harness
+        existing = conn.inflight_installs.get(install_key)
+        if existing is None:
             task = asyncio.create_task(
                 _proxy_install_harness(
                     host_registry=host_registry,
@@ -1084,11 +1091,10 @@ def create_hosts_router(
                     harness=harness,
                 )
             )
-            conn.inflight_installs[harness] = task
-            try:
-                result = await task
-            finally:
-                conn.inflight_installs.pop(harness, None)
+            conn.inflight_installs[install_key] = task
+            task.add_done_callback(lambda _t: conn.inflight_installs.pop(install_key, None))
+            existing = task
+        result = await asyncio.shield(existing)
 
         if result.get("status") == "failed":
             raise HTTPException(

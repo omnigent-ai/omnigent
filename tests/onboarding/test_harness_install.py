@@ -366,7 +366,7 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
     assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
 
 
-def test_install_harness_cli_with_reason_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
     """No npm on PATH → ``(False, reason)`` naming the missing installer.
 
     The UI-driven install shows this reason instead of a bare failure, so the
@@ -378,23 +378,23 @@ def test_install_harness_cli_with_reason_missing_npm(monkeypatch: pytest.MonkeyP
         "run",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
     )
-    installed, reason = hi.install_harness_cli_with_reason(ANTHROPIC_FAMILY)
+    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
     assert installed is False
     assert reason is not None and "npm" in reason
 
 
-def test_install_harness_cli_with_reason_manual_only() -> None:
+def test_try_install_harness_cli_manual_only() -> None:
     """A manual-only CLI (no npm package, no install_command) → ``(False, reason)``.
 
     Cursor installs out-of-band; the reason tells the caller it can't be
     auto-installed so the UI can fall back to showing the install hint.
     """
-    installed, reason = hi.install_harness_cli_with_reason(hi.CURSOR_KEY)
+    installed, reason = hi.try_install_harness_cli(hi.CURSOR_KEY)
     assert installed is False
     assert reason is not None and "automatically" in reason
 
 
-def test_install_harness_cli_with_reason_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_try_install_harness_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     """A non-zero installer exit with the binary still absent → ``(False, reason)``.
 
     Surfaces the installer's exit code so a failed npm install is actionable.
@@ -409,12 +409,12 @@ def test_install_harness_cli_with_reason_nonzero_exit(monkeypatch: pytest.Monkey
         "run",
         lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=1),
     )
-    installed, reason = hi.install_harness_cli_with_reason(OPENAI_FAMILY)
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
     assert installed is False
     assert reason is not None and "code 1" in reason
 
 
-def test_install_harness_cli_with_reason_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful install → ``(True, None)``; the bool wrapper agrees."""
     state = {"installed": False}
 
@@ -431,7 +431,7 @@ def test_install_harness_cli_with_reason_success(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(hi.shutil, "which", _which)
     monkeypatch.setattr(hi.subprocess, "run", _run)
-    assert hi.install_harness_cli_with_reason(OPENAI_FAMILY) == (True, None)
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
 
 
 def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPatch) -> None:

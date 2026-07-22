@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
@@ -269,18 +270,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
 
 
 # UI-installable harnesses: the identifiers the web UI's New Chat dialog may
-# request an install for, mapped to their :data:`_HARNESS_INSTALL` key. This is
-# the single source of truth shared by the host install handler (which resolves
-# the key to run the installer) and the server route (which allowlists the
-# request). Deliberately a small, explicit map rather than a reuse of
-# ``_HARNESS_NAME_TO_KEY``: that map is keyed on *executor* spellings and maps
-# the bare ``claude`` / ``codex`` / ``opencode`` spellings to SDK harnesses with
-# no CLI (``claude`` → ``claude-sdk``), whereas the UI install surface wants the
-# npm-installable CLI family. Scope: npm-installable, key/env-auth harnesses
-# only — curl/brew-installer harnesses (cursor, kimi, kiro, antigravity, goose)
-# and shell-installer harnesses (hermes, whose ``install_command`` would run a
-# ``curl | bash``) are intentionally absent, so an install request for them is
-# rejected before any installer runs.
+# request an install for, mapped to their :data:`_HARNESS_INSTALL` key. Single
+# source of truth for both the host install handler (which runs the installer)
+# and the server route (which allowlists the request). Scope is deliberately
+# narrow — npm-installable, key/env-auth harnesses only; curl/brew/shell
+# installers (cursor, kimi, hermes, …) are absent, so an install request for
+# them is rejected before any installer runs.
 _UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
     "claude": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
@@ -584,37 +579,48 @@ def harness_install_command(key: str) -> list[str]:
     return ["npm", "install", "-g", package]
 
 
-def install_harness_cli_with_reason(key: str) -> tuple[bool, str | None]:
-    """Install the harness CLI; return ``(installed, failure_reason)``.
+class HarnessInstallResult(NamedTuple):
+    """Outcome of :func:`try_install_harness_cli`.
 
-    Same behavior and side effects as :func:`install_harness_cli` — the
-    installer's own output still streams to this process (no capture) so a
-    failing install stays visible in the setup terminal or the host daemon
-    log — but returns a human-readable reason when the install does not land.
-    A UI-driven install surfaces that reason instead of a bare boolean, so a
-    user sees "npm is not available on the host" rather than a silent failure.
+    :param installed: Whether the CLI is on ``PATH`` after the attempt.
+    :param reason: Human-readable failure reason when ``installed`` is False;
+        ``None`` on success.
+    """
+
+    installed: bool
+    reason: str | None
+
+
+def try_install_harness_cli(key: str) -> HarnessInstallResult:
+    """Install the harness CLI, returning whether it landed and why not.
+
+    Same behavior and side effects as :func:`install_harness_cli` (the
+    installer's output streams to this process, uncaptured, so failures stay
+    visible in the setup terminal / host log), but returns a human-readable
+    reason so a UI-driven install can surface "npm is not available on the
+    host" instead of a silent boolean failure.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: ``(True, None)`` when the CLI is on ``PATH`` after the install
-        attempt (including the no-op case where the installer reports success
-        but the binary was already present); otherwise ``(False, reason)``,
-        where *reason* names the failure (manual-only spec, missing installer,
-        timeout, OS error, non-zero exit, or a post-install binary-not-found).
+    :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
+        is on ``PATH`` (including the no-op where it was already present),
+        otherwise ``(False, reason)`` naming the failure (manual-only spec,
+        missing installer, timeout, OS error, non-zero exit, or a post-install
+        binary-not-found).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
     if spec is not None and spec.package is None and spec.install_command is None:
         # Manual-only CLI (e.g. cursor-agent): caller shows install_hint.
-        return False, f"{spec.binary!r} is not installable automatically"
+        return HarnessInstallResult(False, f"{spec.binary!r} is not installable automatically")
     cmd = harness_install_command(key)
     if shutil.which(cmd[0]) is None:
-        return False, f"{cmd[0]!r} is not available on the host"
+        return HarnessInstallResult(False, f"{cmd[0]!r} is not available on the host")
     try:
         result = subprocess.run(cmd, check=False, timeout=300)
     except subprocess.TimeoutExpired:
-        return False, "install timed out after 300s"
+        return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
-        return False, f"install command failed to run: {exc}"
+        return HarnessInstallResult(False, f"install command failed to run: {exc}")
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
@@ -624,7 +630,7 @@ def install_harness_cli_with_reason(key: str) -> tuple[bool, str | None]:
     # subsequent harness_login/harness_cli_logged_in shell out with the bare
     # binary name and rely on the inherited ``PATH``.
     if shutil.which(spec.binary) is not None:
-        return True, None
+        return HarnessInstallResult(True, None)
 
     # uv-based vendor installers commonly place entry points here and update
     # shell startup files, which cannot change this already-running process.
@@ -636,25 +642,24 @@ def install_harness_cli_with_reason(key: str) -> tuple[bool, str | None]:
         if str(user_bin) not in path_entries:
             os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
     if shutil.which(spec.binary) is not None:
-        return True, None
+        return HarnessInstallResult(True, None)
     if result.returncode != 0:
-        return False, f"installer exited with code {result.returncode}"
-    return False, f"installer completed but {spec.binary!r} is not on PATH"
+        return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
+    return HarnessInstallResult(False, f"installer completed but {spec.binary!r} is not on PATH")
 
 
 def install_harness_cli(key: str) -> bool:
     """Install the harness CLI; return whether it landed on ``PATH``.
 
-    Thin wrapper over :func:`install_harness_cli_with_reason` that discards the
-    failure reason, preserving the boolean contract the setup wizard relies on.
+    Thin wrapper over :func:`try_install_harness_cli` that discards the failure
+    reason, preserving the boolean contract the setup wizard relies on.
 
     :param key: A harness family or :data:`PI_KEY`.
     :returns: ``True`` when the CLI is on ``PATH`` after the install attempt,
         ``False`` if the installer is missing or the install failed.
     :raises KeyError: If *key* has no install spec.
     """
-    installed, _reason = install_harness_cli_with_reason(key)
-    return installed
+    return try_install_harness_cli(key).installed
 
 
 def harness_cli_logged_in(key: str) -> bool:

@@ -66,7 +66,7 @@ from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.onboarding.harness_install import (
     harness_cli_installed,
     harness_setup_hint,
-    install_harness_cli_with_reason,
+    try_install_harness_cli,
     ui_install_key,
 )
 from omnigent.onboarding.harness_readiness import (
@@ -1570,22 +1570,12 @@ class HostProcess:
     ) -> HostInstallHarnessResultFrame:
         """Handle a ``host.install_harness`` request from the server.
 
-        Runs the same :func:`install_harness_cli_with_reason` the ``omnigent
-        setup`` wizard uses, then recomputes readiness so the result frame can
-        carry a fresh ``configured_harnesses`` map — letting the UI flip the
-        harness badge without waiting for a reconnect. Both the install and the
-        readiness recompute shell out / probe ``PATH``, so they run off the
-        event loop.
-
-        The server already allowlists the harness before sending this frame;
-        the extra ``ui_install_key`` guard here is defence in depth so a stray
-        or spoofed frame can never drive the installer for a non-allowlisted
-        harness (e.g. one whose installer is a ``curl | bash``).
-
-        Idempotent: when the CLI is already on ``PATH`` the installer is
-        skipped entirely — ``npm install -g`` re-resolves the package over the
-        network and can take minutes even for an already-present binary, so a
-        re-request just recomputes and returns readiness.
+        Runs the same installer :func:`try_install_harness_cli` (hence
+        ``omnigent setup``) uses, then recomputes readiness so the result frame
+        carries a fresh ``configured_harnesses`` map. The ``ui_install_key``
+        guard re-checks the allowlist as defence in depth against a spoofed
+        frame. Idempotent: an already-installed CLI skips the install. Runs off
+        the event loop (it shells out / probes ``PATH``).
 
         :param frame: The install request frame. ``frame.harness`` is a UI
             harness identifier, e.g. ``"claude"``.
@@ -1608,7 +1598,7 @@ class HostProcess:
                 status="ok",
                 configured_harnesses=configured_harness_map(),
             )
-        installed, reason = install_harness_cli_with_reason(key)
+        installed, reason = try_install_harness_cli(key)
         if not installed:
             return HostInstallHarnessResultFrame(
                 request_id=frame.request_id,
