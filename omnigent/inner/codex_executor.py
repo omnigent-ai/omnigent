@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
@@ -108,6 +109,7 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
@@ -115,6 +117,7 @@ _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
 # shared ``~/.codex/config.toml``. This keeps model selection and cost-policy
 # enforcement isolated between concurrent sessions.
 _CODEX_HOME_COPY_FILES = ("config.toml",)
+_CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -280,8 +283,15 @@ def _kill_process_tree(process: _Process | None) -> None:
     _proc.kill_tree(process)
 
 
+# Env override for an explicit codex binary, mirroring goose's
+# OMNIGENT_GOOSE_PATH. Set this when codex lives on a PATH the host
+# daemon doesn't inherit (e.g. an nvm-managed global bin dir).
+_CODEX_PATH_ENV = "OMNIGENT_CODEX_PATH"
+
+
 def _find_codex_cli() -> str | None:
-    return shutil.which("codex")
+    """Resolve the ``codex`` CLI binary (override → ``PATH`` → global dirs)."""
+    return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -685,9 +695,9 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     The executor overrides ``CODEX_HOME`` to a per-conversation temp
     directory so session data (conversation history, etc.) stays isolated
     from the user's ``~/.codex/``. However, the codex CLI also reads
-    authentication tokens (``auth.json``) and provider configuration
-    (``config.toml``) from ``$CODEX_HOME``. This helper bridges those
-    files into the temp directory:
+    authentication tokens (``auth.json``), provider configuration
+    (``config.toml``) and instructions (``AGENTS.md``, ``AGENTS.override.md``)
+    from ``$CODEX_HOME``. This helper bridges those files into the temp directory:
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
@@ -695,6 +705,8 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
       enforcement isolated between concurrent sessions.
+    - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
+      are respected.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
@@ -705,7 +717,15 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     if not source_dir.is_dir():
         return
 
-    for filename in _CODEX_HOME_SYMLINK_FILES:
+    minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    symlink_files = _CODEX_HOME_SYMLINK_FILES
+    if not minimal_config:
+        symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
+    for filename in symlink_files:
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -729,6 +749,19 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
             continue
         dest_path = target_dir / filename
         if dest_path.exists() or dest_path.is_symlink():
+            continue
+        if minimal_config and filename == "config.toml":
+            import tomlkit
+
+            # The title worker needs custom-provider routing, but copying the
+            # full user config also starts unrelated MCPs/plugins and can exceed
+            # its timeout. auth.json alone cannot supply these provider tables.
+            source_config = tomlkit.parse(source_file.read_text())
+            minimal_document = tomlkit.document()
+            for key in ("model_provider", "model_providers", "profiles"):
+                if key in source_config:
+                    minimal_document[key] = source_config[key]
+            dest_path.write_text(tomlkit.dumps(minimal_document))
             continue
         shutil.copy2(source_file, dest_path)
 
@@ -1474,32 +1507,49 @@ class _CodexAppServerSession:
             turn_input = _to_codex_input_items(prompt)
         else:
             turn_input = [{"type": "text", "text": prompt}]
-        # Apply reasoning effort via ``thread/settings/update``: Codex's
-        # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
-        # ``turn/start`` is silently dropped by serde and never takes effect.
-        # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
-        # the same path the TUI ``/model`` picker uses. Request a detailed
-        # summary too; effort controls internal work, while summary controls
-        # whether observable reasoning events are emitted. Deduped against the
-        # last value applied on this thread to avoid a redundant per-turn RPC.
+        # Newer Codex app-server builds apply reasoning effort through
+        # ``thread/settings/update``. Older supported builds reject that RPC but
+        # accept the same ``effort`` / ``summary`` fields on ``turn/start``.
+        # Prefer the persistent thread setting and fall back only for that
+        # explicit protocol-version mismatch.
+        effort_via_turn_start = False
         if reasoning_effort and reasoning_effort != self._applied_effort:
-            await self._request(
-                "thread/settings/update",
-                {
-                    "threadId": self.thread_id,
-                    "effort": reasoning_effort,
-                    "summary": "detailed",
-                },
-            )
-            self._applied_effort = reasoning_effort
+            try:
+                await self._request(
+                    "thread/settings/update",
+                    {
+                        "threadId": self.thread_id,
+                        "effort": reasoning_effort,
+                        "summary": "detailed",
+                    },
+                )
+            except RuntimeError as exc:
+                error_text = str(exc)
+                unsupported_settings_update = (
+                    "thread/settings/update" in error_text and "unknown variant" in error_text
+                )
+                if not unsupported_settings_update:
+                    raise
+                logger.info(
+                    "Codex app-server does not support thread/settings/update; "
+                    "falling back to turn/start effort."
+                )
+                effort_via_turn_start = True
+            else:
+                self._applied_effort = reasoning_effort
         turn_params: CodexParams = {
             "threadId": self.thread_id,
             "input": turn_input,
         }
+        if effort_via_turn_start:
+            turn_params["effort"] = reasoning_effort
+            turn_params["summary"] = "detailed"
         start_response = await self._request(
             "turn/start",
             turn_params,
         )
+        if effort_via_turn_start:
+            self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
         if not isinstance(raw_active_turn_id, str) or not raw_active_turn_id:
             yield ExecutorError(message="Codex App Server did not return a turn id")
@@ -2139,7 +2189,11 @@ class CodexExecutor(Executor):
         self._skills_filter = skills_filter
         resolved_codex = codex_path or _find_codex_cli()
         if not resolved_codex:
-            raise ImportError("CodexExecutor requires the 'codex' CLI on PATH.")
+            raise ImportError(
+                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+                "installed on a PATH the host daemon didn't inherit (e.g. an "
+                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+            )
         self._codex_path = resolved_codex
         self._env = _clean_codex_env(_declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI

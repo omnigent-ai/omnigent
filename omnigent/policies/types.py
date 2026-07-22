@@ -30,12 +30,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from omnigent.spec.types import Phase, PolicyAction, StateUpdate
-
-if TYPE_CHECKING:
-    from omnigent.entities import ConversationItem
 
 _log = logging.getLogger(__name__)
 
@@ -190,7 +187,6 @@ class EvaluationContext:
     phase: Phase
     content: Any
     tool_name: str | None = None
-    trajectory: list[ConversationItem] | None = None
     actor: dict[str, str] | None = None
     request_data: Any = None
     session_state: dict[str, Any] | None = None

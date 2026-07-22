@@ -17,6 +17,10 @@ on:
     - cron: "37 7 * * *" # 07:37 UTC nightly (off-peak, off the :00 mark)
   workflow_dispatch:
     inputs:
+      checkout_sha:
+        description: "Commit SHA to benchmark (blank = branch HEAD)"
+        required: false
+        default: ""
       iterations:
         description: "Requests per run"
         required: false
@@ -33,6 +37,10 @@ on:
         description: "Seeded items per session"
         required: false
         default: "200"
+      network_delay_ms:
+        description: "Simulated client→server latency per request (ms; 0 = loopback)"
+        required: false
+        default: "0"
 
 permissions:
   contents: read
@@ -47,11 +55,15 @@ env:
   RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
   SESSIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.sessions || '5000' }}
   ITEMS: ${{ github.event_name == 'workflow_dispatch' && inputs.items_per_session || '200' }}
+  # 0 on the nightly schedule (loopback, for stable trend data); dispatchable
+  # higher to model a real network hop when testing network optimizations.
+  NETWORK_DELAY_MS: ${{ github.event_name == 'workflow_dispatch' && inputs.network_delay_ms || '0' }}
 
 concurrency:
-  # Never cancel a scheduled run mid-flight (each is a distinct data point);
-  # coalesce manual dispatches per ref.
-  group: benchmark-${{ github.event_name }}-${{ github.ref }}
+  # Never cancel a scheduled run mid-flight (each is a distinct data point).
+  # Manual dispatches get a per-run group (unique run_id) so repeated ad-hoc
+  # runs — even on the same ref and same pinned sha — never cancel each other.
+  group: benchmark-${{ github.event_name }}-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
@@ -98,6 +110,10 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # Pin the benchmarked code to a specific commit when dispatched with
+          # checkout_sha; the workflow definition still comes from the trusted
+          # dispatch ref. Blank falls back to the ref's HEAD (schedule/default).
+          ref: ${{ inputs.checkout_sha || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -170,6 +186,7 @@ jobs:
             --database-uri "${{ steps.db.outputs.uri }}" \
             --iterations "$ITERATIONS" \
             --runs "$RUNS" \
+            --network-delay-ms "$NETWORK_DELAY_MS" \
             --output "benchmark-results-${{ matrix.backend }}.json"
 
       - name: Upload benchmark results

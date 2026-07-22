@@ -14,7 +14,7 @@ This guide covers the Omnigent-specific OpenShell setup:
 - configure CLI-launched or server-managed sandboxes.
 
 ```bash
-pip install 'omnigent[openshell]'
+uv pip install 'omnigent[openshell]'
 ```
 
 Omnigent uses OpenShell two ways:
@@ -58,9 +58,9 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 > **The gateway host must be amd64 Linux.** OpenShell's supervisor
 > (Landlock/seccomp/netns) does not run reliably under emulation — on an arm64
 > host (e.g. Apple Silicon via colima) the sandbox never reaches READY. The
-> official host image now publishes multi-arch (amd64 + arm64), but its arm64
-> variant omits `cel-expr-python` (no linux-arm64 wheel — CEL policies degrade to
-> unavailable there), so the amd64 variant is the one to run with OpenShell. On an
+> official host image now publishes multi-arch (amd64 + arm64). CEL policies are
+> available on all architectures (cel-python is pure Python), so the amd64 variant
+> is the one to run with OpenShell for supervisor reasons. On an
 > Apple-Silicon laptop, point the gateway at a remote **amd64 Linux** box (and the
 > server at that gateway) rather than the local Docker VM.
 
@@ -187,6 +187,18 @@ sandbox:
   provider: openshell
   server_url: https://your-host    # public URL sandboxes dial back to
 ```
+
+A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
+in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
+block routing a harness through a self-hosted gateway — installed into
+the sandbox before `omnigent host` starts. The block is server-managed:
+entries injected by a previous launch are replaced or removed on the
+next launch/resume, while config created inside the sandbox survives.
+Keep secrets out via
+`api_key_ref: env:VAR` (resolved in the sandbox against the injected
+env). See the [sandbox-runners config
+table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-configyaml)
+for the shape.
 
 `provider` + `server_url` is a complete config. Sessions created with
 `host_type: "managed"` (the API call or the Web UI's New Sandbox option) then run
@@ -392,6 +404,6 @@ upload, foreground streaming, attach, terminate, env passthrough, error handling
 and the managed-config parsing:
 
 ```bash
-pip install -e '.[openshell,dev]'
+uv pip install -e '.[openshell,dev]'
 pytest tests/onboarding/sandboxes/test_openshell.py tests/server/test_managed_hosts.py
 ```

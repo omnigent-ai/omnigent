@@ -43,17 +43,23 @@ class _ForwardState:
 
 
 @dataclass(frozen=True)
-class _KiroConversationMessage:
-    """One conversation message parsed from Kiro's JSONL store."""
+class KiroConversationMessage:
+    """Stable parsed-message contract shared by forwarding and offline import."""
 
     message_id: str
     role: str
     text: str
 
 
-def _kiro_cli_sessions_dir(home: Path | None = None) -> Path:
+_KiroConversationMessage = KiroConversationMessage
+
+
+def kiro_cli_sessions_dir(home: Path | None = None) -> Path:
     """Return Kiro CLI's session directory for this user."""
     return (home or Path.home()) / ".kiro" / "sessions" / "cli"
+
+
+_kiro_cli_sessions_dir = kiro_cli_sessions_dir
 
 
 def _read_state(bridge_dir: Path) -> _ForwardState:
@@ -161,7 +167,7 @@ def _discover_kiro_session_jsonl(
     The resume/fork path doesn't reach here: when the Kiro id is already known the
     caller binds it directly via :func:`_kiro_session_jsonl_for_id`.
     """
-    root = sessions_dir or _kiro_cli_sessions_dir()
+    root = sessions_dir or kiro_cli_sessions_dir()
     if not root.is_dir():
         return None
     floor_ms = max(0, launch_epoch_ms - _DISCOVERY_SKEW_MS)
@@ -198,7 +204,7 @@ def _kiro_session_jsonl_for_id(
     sessions_dir: Path | None = None,
 ) -> Path | None:
     """Return the JSONL path for a known Kiro session id, if it is usable."""
-    root = sessions_dir or _kiro_cli_sessions_dir()
+    root = sessions_dir or kiro_cli_sessions_dir()
     metadata_path = root / f"{session_id}.json"
     jsonl_path = root / f"{session_id}.jsonl"
     if not jsonl_path.is_file():
@@ -215,9 +221,9 @@ def _kiro_session_jsonl_for_id(
 def _read_new_kiro_messages(
     jsonl_path: Path,
     byte_offset: int,
-) -> tuple[list[_KiroConversationMessage], int]:
+) -> tuple[list[KiroConversationMessage], int]:
     """Read conversation messages after *byte_offset* from Kiro's JSONL file."""
-    messages: list[_KiroConversationMessage] = []
+    messages: list[KiroConversationMessage] = []
     try:
         with jsonl_path.open("rb") as handle:
             handle.seek(byte_offset)
@@ -235,7 +241,7 @@ def _read_new_kiro_messages(
                     line = raw_line.decode("utf-8")
                 except UnicodeDecodeError:
                     continue
-                message = _parse_kiro_jsonl_line(line)
+                message = parse_kiro_jsonl_line(line)
                 if message is not None:
                     messages.append(message)
             return messages, offset
@@ -243,8 +249,8 @@ def _read_new_kiro_messages(
         return [], byte_offset
 
 
-def _parse_kiro_jsonl_line(line: str) -> _KiroConversationMessage | None:
-    """Parse one Kiro JSONL line into a mirrorable conversation message."""
+def parse_kiro_jsonl_line(line: str) -> KiroConversationMessage | None:
+    """Parse one Kiro JSONL line into the stable shared message contract."""
     try:
         record = json.loads(line)
     except ValueError:
@@ -267,7 +273,10 @@ def _parse_kiro_jsonl_line(line: str) -> _KiroConversationMessage | None:
     text = _kiro_content_text(data.get("content")).strip()
     if not text:
         return None
-    return _KiroConversationMessage(message_id=message_id, role=role, text=text)
+    return KiroConversationMessage(message_id=message_id, role=role, text=text)
+
+
+_parse_kiro_jsonl_line = parse_kiro_jsonl_line
 
 
 def _kiro_content_text(content: object) -> str:
@@ -292,7 +301,7 @@ async def _post_conversation_message(
     *,
     session_id: str,
     agent_name: str,
-    message: _KiroConversationMessage,
+    message: KiroConversationMessage,
 ) -> None:
     """POST one Kiro message as an external conversation item."""
     if message.role == "assistant":

@@ -21,6 +21,8 @@ import {
   BotIcon,
   Code2Icon,
   CompassIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
   CornerDownRightIcon,
   FileTextIcon,
   FlaskConicalIcon,
@@ -102,6 +104,10 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   const { children, isLoading, error } = useChildSessions(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
+  const toggleCollapsedRow = (id: string) => {
+    setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
+  };
 
   // Loading/error states only surface when there's no cached data to
   // show alongside the "main" row.
@@ -152,7 +158,14 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
         {children.map((child) => (
-          <SubagentRow key={child.id} child={child} depth={1} conversationId={conversationId} />
+          <SubagentRow
+            key={child.id}
+            child={child}
+            depth={1}
+            conversationId={conversationId}
+            collapsedRows={collapsedRows}
+            onToggleCollapsed={toggleCollapsedRow}
+          />
         ))}
       </ul>
       {/* Mounted only while open so a closed rail issues no /v1/agents
@@ -684,18 +697,28 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
 // as a tree.
 const ROW_BASE_PADDING_PX = 24;
 const ROW_DEPTH_STEP_PX = 14;
+const ROW_TOGGLE_SIZE_PX = 16;
+
+function rowPaddingLeft(depth: number): number {
+  return ROW_BASE_PADDING_PX + (depth - 1) * ROW_DEPTH_STEP_PX;
+}
 
 function SubagentRow({
   child,
   depth,
   conversationId,
+  collapsedRows,
+  onToggleCollapsed,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
   depth: number;
   /** The conversation currently rendered in main, for row highlighting. */
   conversationId: string;
+  collapsedRows: Record<string, boolean>;
+  onToggleCollapsed: (id: string) => void;
 }) {
+  const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = railLinkSearch(useLocation().search);
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
@@ -704,12 +727,31 @@ function SubagentRow({
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
-  // Disabled (null id) at the depth cap so the fan-out is bounded;
-  // ``useChildSessions`` skips the query entirely for null.
+  // This child's own sub-agents, rendered as the next tree level.
+  // Disabled (null id) at the depth cap so the fan-out of fetches is
+  // bounded; ``useChildSessions`` skips the query entirely for null.
   const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
+  const hasGrandchildren = grandchildren.length > 0;
+  const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
   return (
     <>
-      <li>
+      <li className="relative">
+        {hasGrandchildren && (
+          <button
+            type="button"
+            data-testid="subagent-collapse-toggle"
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? "Expand subagents" : "Collapse subagents"}
+            style={{ left: rowPaddingLeft(depth) - ROW_TOGGLE_SIZE_PX }}
+            className="absolute top-2 z-10 flex size-4 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleCollapsed(child.id);
+            }}
+          >
+            <ToggleIcon aria-hidden="true" className="size-3.5" />
+          </button>
+        )}
         <Link
           // See MainRow: drop session-scoped params on rail navigation
           // (preserving global ones like ``?debug=1``) so a sticky
@@ -720,7 +762,7 @@ function SubagentRow({
           data-depth={depth}
           // Left gutter (depth-stepped) + connector glyph nests this row
           // under its parent, signaling where it sits in the tree.
-          style={{ paddingLeft: ROW_BASE_PADDING_PX + (depth - 1) * ROW_DEPTH_STEP_PX }}
+          style={{ paddingLeft: rowPaddingLeft(depth) }}
           className={cn(
             "flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left hover:bg-accent/60",
             isActive && "bg-accent",
@@ -728,12 +770,16 @@ function SubagentRow({
           )}
         >
           <div className="flex w-full items-center gap-1">
-            <CornerDownRightIcon
-              // Decorative nesting connector — the role icon beside it carries
-              // the meaning, so hide this from the accessibility tree.
-              aria-hidden="true"
-              className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
-            />
+            {hasGrandchildren ? (
+              <span aria-hidden="true" className="-ml-3 size-3 shrink-0" />
+            ) : (
+              <CornerDownRightIcon
+                // Decorative nesting connector — the role icon beside it carries
+                // the meaning, so hide this from the accessibility tree.
+                aria-hidden="true"
+                className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
+              />
+            )}
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-xs font-medium">{primary}</span>
             <span className="flex-1" />
@@ -750,14 +796,17 @@ function SubagentRow({
           )}
         </Link>
       </li>
-      {grandchildren.map((grandchild) => (
-        <SubagentRow
-          key={grandchild.id}
-          child={grandchild}
-          depth={depth + 1}
-          conversationId={conversationId}
-        />
-      ))}
+      {!collapsed &&
+        grandchildren.map((grandchild) => (
+          <SubagentRow
+            key={grandchild.id}
+            child={grandchild}
+            depth={depth + 1}
+            conversationId={conversationId}
+            collapsedRows={collapsedRows}
+            onToggleCollapsed={onToggleCollapsed}
+          />
+        ))}
     </>
   );
 }

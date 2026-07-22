@@ -1165,3 +1165,53 @@ async def test_mint_token_endpoint_header_mode_unsupported_returns_400() -> None
     response = await _post_mint_token(app, runner_id, token=token)
 
     assert response.status_code == 400
+
+
+async def test_ping_loop_restamps_runner_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-connection ping loop re-stamps ``runner_last_seen``.
+
+    Runner liveness is refreshed from the tunnel's own ping loop (not a
+    central lifespan sweep) so the write runs inside the handler's
+    ``workspace_scope`` — the same reason the host tunnel heartbeats from
+    its ping loop. Here we shrink the ping interval and lift the miss
+    threshold (so the loop never declares the runner dead), wire a
+    recording live-state store, and assert the loop stamps this runner's
+    id within a couple of intervals.
+
+    :returns: None.
+    """
+    import omnigent.server.routes.runner_tunnel as tunnel_mod
+    from omnigent.server import session_live_state
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    # Never trip the ping-timeout path during the test.
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+
+    touches: list[list[str]] = []
+
+    class _RecordingStore:
+        def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
+            del now
+            touches.append(runner_ids)
+
+    session_live_state.configure(_RecordingStore())  # type: ignore[arg-type]
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry)
+        # The loop should re-stamp within a couple of shortened intervals.
+        # A recorded touch means the executor already applied the write
+        # (the recording store appends inside the store call), so the poll
+        # loop breaking is itself the completion signal — no drain needed.
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while not touches and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+        assert touches, "ping loop never re-stamped runner liveness"
+        assert all(ids == [_RUNNER_ID] for ids in touches)
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        with contextlib.suppress(asyncio.TimeoutError):
+            await communicator.wait(timeout=1.0)
+        session_live_state.configure(None)

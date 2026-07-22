@@ -105,6 +105,20 @@ repos:
         files: ^uv\.lock$
         pass_filenames: true
 
+      # Local `npm install` rewrites every `resolved` URL in
+      # package-lock.json to whatever registry is configured on the
+      # developer's machine (e.g. the Databricks npm proxy via a global
+      # ~/.npmrc). This OSS repo must always commit the public npm registry
+      # (registry.npmjs.org), so normalize it back before it lands — a
+      # proxy URL would make `npm ci` time out on public CI runners. Fixer:
+      # re-stage if it changes. Mirrors normalize-uv-lock-registry above.
+      - id: normalize-package-lock-registry
+        name: normalize package-lock.json registry to npmjs.org
+        language: system
+        entry: .venv/bin/python scripts/normalize_package_lock_registry.py
+        files: ^(web|web/electron|editors/vscode)/package-lock\.json$
+        pass_filenames: true
+
       # Fail if routing.proto changed without regenerating the committed
       # bindings (or vice versa). Verify-only, not a fixer: regen needs
       # grpcio-tools, so CI's `uv sync --extra dev` enforces it (like ktlint).

@@ -76,6 +76,28 @@ def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> Non
     assert conversation_store.get_conversation("c55a64c3f6f954fe0fc8738ba3f45f26") is None
 
 
+def test_rename_conversation_if_title_matches_is_atomic(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation(title="original request title")
+
+    renamed = conversation_store.rename_conversation_if_title_matches(
+        conv.id,
+        "original request title",
+        "Debug request timeout",
+    )
+    stale = conversation_store.rename_conversation_if_title_matches(
+        conv.id,
+        "original request title",
+        "Overwrite manual title",
+    )
+
+    assert renamed is not None
+    assert renamed.title == "Debug request timeout"
+    assert stale is None
+    assert conversation_store.get_conversation(conv.id).title == "Debug request timeout"  # type: ignore[union-attr]
+
+
 def test_get_conversations_bulk(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -657,20 +679,18 @@ def test_position_ordering(conversation_store: SqlAlchemyConversationStore) -> N
     assert texts == ["First", "Second"]
 
 
-def test_unique_position_constraint(
+def test_position_not_enforced_by_db(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     """
-    The (conversation_id, position, created_at) tuple has a unique index.
+    The position index is plain (non-unique): the DB permits duplicate positions.
 
-    created_at joined the index for partition-readiness (unique indexes must
-    contain a partition key), so the DB safety net blocks duplicate positions
-    only within the same epoch second — which still covers the concurrent
-    double-append race. Slower duplicates are prevented by the next_position
-    allocator, not the index.
+    Strict position uniqueness is owned by the ``next_position`` allocator under
+    ``_lock_conversation`` (proven by
+    ``test_concurrent_appends_do_not_collide_on_position``), not the index — no
+    code catches a position IntegrityError. This documents that raw
+    duplicate-position inserts are accepted at the DB level.
     """
-    from sqlalchemy.exc import IntegrityError
-
     from omnigent.db.db_models import SqlConversationItem
     from omnigent.db.enum_codecs import encode_item_status, encode_item_type
     from omnigent.db.utils import generate_item_id
@@ -704,13 +724,10 @@ def test_unique_position_constraint(
             search_text="",
         )
 
-    # Same second (the double-append race shape): the index rejects it.
-    with pytest.raises(IntegrityError):
-        with conversation_store._session() as session:
-            session.add(_duplicate_position_row(existing_created_at))
-
-    # A different second slips past the index; only the next_position
-    # allocator prevents this in real appends.
+    # Neither a same-second nor a later-second duplicate is rejected now: the
+    # index is not UNIQUE, and distinct ids keep the PK unique so both persist.
+    with conversation_store._session() as session:
+        session.add(_duplicate_position_row(existing_created_at))
     with conversation_store._session() as session:
         session.add(_duplicate_position_row(existing_created_at + 1))
 
@@ -1970,7 +1987,7 @@ def test_create_conversation_with_parent_pointer_and_title(
 def test_create_duplicate_title_under_same_parent_raises(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """G36: partial unique index rejects ``(parent_id, title)`` duplicates."""
+    """The app-level ``(parent, title)`` check rejects sibling duplicates."""
     from omnigent.stores.conversation_store import NameAlreadyExistsError
 
     parent = conversation_store.create_conversation()
@@ -1979,11 +1996,10 @@ def test_create_duplicate_title_under_same_parent_raises(
         title="coder:auth",
         parent_conversation_id=parent.id,
     )
-    # Without the partial unique index + IntegrityError-to-
-    # NameAlreadyExistsError translation, the second create
-    # would either succeed silently (creating a duplicate row)
-    # or raise a raw sqlalchemy IntegrityError that would leak
-    # through to the LLM as an opaque error.
+    # There is no DB unique constraint: create_conversation seeks this parent's
+    # children and raises NameAlreadyExistsError when the title is already taken,
+    # so a duplicate sub-agent name surfaces cleanly instead of creating a
+    # second ambiguous row.
     with pytest.raises(NameAlreadyExistsError):
         conversation_store.create_conversation(
             kind="sub_agent",
@@ -1995,7 +2011,7 @@ def test_create_duplicate_title_under_same_parent_raises(
 def test_create_same_title_under_different_parents_succeeds(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """The unique constraint is per-parent — ``(p1, "auth")`` and ``(p2, "auth")`` coexist."""
+    """Uniqueness is per-parent — ``(p1, "auth")`` and ``(p2, "auth")`` coexist."""
     p1 = conversation_store.create_conversation()
     p2 = conversation_store.create_conversation()
     conversation_store.create_conversation(
@@ -2005,9 +2021,8 @@ def test_create_same_title_under_different_parents_succeeds(
     conversation_store.create_conversation(
         kind="sub_agent", title="coder:auth", parent_conversation_id=p2.id
     )
-    # Both children must exist; if the unique constraint were
-    # global (not partial-by-parent), the second create would
-    # raise.
+    # Both children must exist; the app-level check scopes to a single parent,
+    # so a same-title child under a different parent is never a collision.
     p1_children = conversation_store.list_conversations(
         kind="sub_agent",
         parent_conversation_id=p1.id,
@@ -2025,11 +2040,10 @@ def test_create_same_title_under_different_parents_succeeds(
 def test_create_null_parent_allows_duplicate_titles(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Top-level conversations (NULL parent) are NOT subject to the unique constraint."""
-    # Both conversations share title="" and parent=None. The unique index on
-    # (parent_conversation_id, title) still allows this: a NULL in any indexed
-    # column makes the key distinct, so top-level rows never collide even
-    # without a WHERE predicate.
+    """Top-level conversations (NULL parent) are NOT subject to the uniqueness check."""
+    # Both conversations share title="" and parent=None. The app-level check in
+    # create_conversation only runs when parent_conversation_id is set, so
+    # top-level rows may share a title freely.
     a = conversation_store.create_conversation()
     b = conversation_store.create_conversation()
     assert a.id != b.id
@@ -3185,6 +3199,43 @@ def test_fork_conversation_copies_items(
         assert fork_item.response_id == src_item.response_id
         # Data content is identical.
         assert fork_item.data == src_item.data
+
+
+def test_fork_copies_terminal_launch_args_by_default(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A same-agent fork inherits the source's launch args.
+
+    A plain fork keeps the same CLI, so its launch flags stay valid and must
+    carry over (e.g. a Claude Code fork keeps ``--permission-mode``).
+    """
+    source = conversation_store.create_conversation(
+        terminal_launch_args=["--permission-mode", "auto"],
+    )
+    fork = conversation_store.fork_conversation(source.id)
+    fetched = conversation_store.get_conversation(fork.id)
+    assert fetched is not None
+    assert fetched.terminal_launch_args == ["--permission-mode", "auto"]
+
+
+def test_fork_drops_terminal_launch_args_when_switching_agent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A CLI-switching fork must NOT inherit the source's launch args.
+
+    Forking a Claude Code session onto ``pi`` carried the source's
+    ``--permission-mode auto`` into the pi argv; pi rejects the unknown option
+    and exits 1 at launch, surfacing as ``required_terminal_exited``. With
+    ``copy_terminal_launch_args=False`` the fork starts with clean args so the
+    new CLI launches with its own defaults.
+    """
+    source = conversation_store.create_conversation(
+        terminal_launch_args=["--permission-mode", "auto"],
+    )
+    fork = conversation_store.fork_conversation(source.id, copy_terminal_launch_args=False)
+    fetched = conversation_store.get_conversation(fork.id)
+    assert fetched is not None
+    assert fetched.terminal_launch_args is None
 
 
 def test_fork_conversation_preserves_created_by(
@@ -4723,6 +4774,65 @@ def test_list_conversations_project_none_disables_filter(
     assert ids >= {filed.id, unfiled.id}
 
 
+def test_set_conversation_project_files_and_unfiles(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``set_conversation_project`` sets and clears first-class membership."""
+    project_id = "b" * 32
+    conv = conversation_store.create_conversation()
+    assert conv.project_id is None
+
+    filed = conversation_store.set_conversation_project(conv.id, project_id)
+    assert filed is True
+    assert conversation_store.get_conversation(conv.id).project_id == project_id
+
+    # Unfile.
+    unfiled = conversation_store.set_conversation_project(conv.id, None)
+    assert unfiled is True
+    assert conversation_store.get_conversation(conv.id).project_id is None
+
+
+def test_set_conversation_project_unknown_session_returns_false(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Filing a non-existent session updates nothing and returns ``False``."""
+    result = conversation_store.set_conversation_project("f" * 32, "b" * 32)
+    assert result is False
+
+
+def test_list_conversations_filters_by_project_name_dual_read(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``list_conversations(project="Name")`` dual-reads by project NAME:
+    a session matches if it has EITHER the first-class membership (its
+    ``metadata.project_id`` points at the owner's project of that name) OR the
+    legacy ``omni_project`` label with that value. ``""`` returns sessions in
+    NEITHER (unfiled)."""
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    project_store = SqlAlchemyProjectStore(db_uri)
+    # Single-user: null owner. The route passes owned_by=None to match.
+    project = project_store.create("c" * 32, "Work", None)
+
+    first_class = conversation_store.create_conversation(title="first-class")
+    labelled = conversation_store.create_conversation(title="labelled")
+    unfiled = conversation_store.create_conversation(title="unfiled")
+    # One member via the first-class entity, one via the legacy label — both
+    # under the same name "Work".
+    conversation_store.set_conversation_project(first_class.id, project.id)
+    conversation_store.set_labels(labelled.id, {"omni_project": "Work"})
+
+    members = conversation_store.list_conversations(project="Work", owned_by=None)
+    assert {c.id for c in members.data} == {first_class.id, labelled.id}
+
+    unfiled_page = conversation_store.list_conversations(project="", owned_by=None)
+    unfiled_ids = {c.id for c in unfiled_page.data}
+    assert unfiled.id in unfiled_ids
+    assert first_class.id not in unfiled_ids
+    assert labelled.id not in unfiled_ids
+
+
 def test_list_projects_owned_by_excludes_shared_only_projects(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
@@ -4786,3 +4896,130 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
         ).data
     }
     assert ids == {mine.id}
+
+
+def test_live_state_columns_round_trip_without_bumping_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The live-state writes persist and never touch ``updated_at``.
+
+    ``updated_at`` drives sidebar ordering, so the tunnel replica's
+    per-tunnel liveness stamps and per-transition status/pending writes
+    must not reorder the list. Round-trips all three columns:
+    ``runner_last_seen`` (bulk by runner, cleared on disconnect),
+    ``live_status`` (enum round-trip), ``pending_elicitation_count``.
+    """
+    from omnigent.stores.conversation_store import runner_seen_is_fresh
+
+    conv_a = conversation_store.create_conversation(title="a")
+    conv_b = conversation_store.create_conversation(title="b")
+    other = conversation_store.create_conversation(title="other")
+    assert conversation_store.set_runner_id(conv_a.id, "runner_live")
+    assert conversation_store.set_runner_id(conv_b.id, "runner_live")
+    assert conversation_store.set_runner_id(other.id, "runner_other")
+    before = conversation_store.get_conversation(conv_a.id)
+    assert before is not None
+
+    # Bulk liveness stamp covers every session bound to the runner —
+    # and only those.
+    conversation_store.touch_runner_liveness(["runner_live"], now=1_000_000)
+    connectivity = conversation_store.get_session_connectivity([conv_a.id, conv_b.id, other.id])
+    assert connectivity[conv_a.id].runner_last_seen == 1_000_000
+    assert connectivity[conv_b.id].runner_last_seen == 1_000_000
+    assert connectivity[other.id].runner_last_seen is None
+
+    # Freshness derivation: inside the TTL reads live, past it stale.
+    assert runner_seen_is_fresh(1_000_000, now=1_000_089)
+    assert not runner_seen_is_fresh(1_000_000, now=1_000_091)
+    assert not runner_seen_is_fresh(None, now=1_000_000)
+
+    # Graceful disconnect clears the stamp immediately.
+    conversation_store.clear_runner_liveness("runner_live")
+    connectivity = conversation_store.get_session_connectivity([conv_a.id])
+    assert connectivity[conv_a.id].runner_last_seen is None
+
+    # Status + pending count round-trip through the entity.
+    conversation_store.set_session_live_status(conv_a.id, "running")
+    conversation_store.set_pending_elicitation_count(conv_a.id, 2)
+    updated = conversation_store.get_conversation(conv_a.id)
+    assert updated is not None
+    assert updated.live_status == "running"
+    assert updated.pending_elicitation_count == 2
+
+    # None of the live-state writes moved updated_at.
+    assert updated.updated_at == before.updated_at
+
+    # Empty runner list is a no-op (no query, no error).
+    conversation_store.touch_runner_liveness([], now=1)
+
+
+def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Live-state writes reach the row under a NON-zero workspace scope.
+
+    Regression test for the cross-replica mirror silently no-oping on a
+    multi-tenant replica. The ``session_live_state`` chokepoint enqueues
+    each write on a background ``ThreadPoolExecutor``; the store filters
+    every write ``WHERE workspace_id == current_workspace_id()``. A bare
+    ``submit`` runs the worker at the default workspace (0), so on a
+    non-zero-workspace request every ``UPDATE`` matches no rows and
+    ``runner_last_seen`` / ``live_status`` / ``pending_elicitation_count``
+    are never persisted — even though the read path (``to_thread``) is
+    correctly scoped, so reads and writes disagree.
+
+    This drives the writes through the real chokepoint (executor +
+    ``copy_context``) inside ``workspace_scope(WS)`` and reads them back
+    under the same scope. On the pre-fix code the reads return ``None`` /
+    unchanged; with context propagation they observe the writes.
+    """
+    import time
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.server import session_live_state
+
+    ws = 987654  # any non-default (non-zero) workspace
+    try:
+        with workspace_scope(ws):
+            conv = conversation_store.create_conversation(title="scoped")
+            assert conversation_store.set_runner_id(conv.id, "runner_scoped")
+
+            session_live_state.configure(conversation_store)
+            session_live_state.touch_runner_liveness(["runner_scoped"])
+            session_live_state.persist_live_status(conv.id, "running")
+            session_live_state.persist_pending_count(conv.id, 3)
+
+            # All three writes land on the chokepoint's ordered single-worker
+            # executor, so poll the row (under the SAME scope) until ALL of
+            # them are observed — not just the first. Waiting only on
+            # ``runner_last_seen`` (the first enqueued) races the later two:
+            # on a loaded runner the read can beat the ``live_status`` /
+            # ``pending`` writes still queued behind it. On the buggy path the
+            # writes land at workspace 0, so these stay None at workspace
+            # ``ws`` and the wait times out into the assertions below.
+            def _all_persisted() -> bool:
+                conn = conversation_store.get_session_connectivity([conv.id]).get(conv.id)
+                row = conversation_store.get_conversation(conv.id)
+                return (
+                    conn is not None
+                    and conn.runner_last_seen is not None
+                    and row is not None
+                    and row.live_status == "running"
+                    and row.pending_elicitation_count == 3
+                )
+
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not _all_persisted():
+                time.sleep(0.02)
+
+            connectivity = conversation_store.get_session_connectivity([conv.id])
+            assert connectivity[conv.id].runner_last_seen is not None, (
+                "runner_last_seen not persisted under non-zero workspace — "
+                "write ran at the default workspace (context not propagated)"
+            )
+            updated = conversation_store.get_conversation(conv.id)
+            assert updated is not None
+            assert updated.live_status == "running"
+            assert updated.pending_elicitation_count == 3
+    finally:
+        session_live_state.configure(None)

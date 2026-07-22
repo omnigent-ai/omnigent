@@ -240,6 +240,9 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       switch (frame.type) {
         case "heartbeat":
           return;
+        case "hosts_changed":
+          void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+          return;
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();

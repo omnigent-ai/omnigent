@@ -32,6 +32,20 @@ final class SettingsStore: ObservableObject {
     recentServers = Array(deduped.prefix(maxRecentServers))
   }
 
+  /// The full server URL (origin, or origin + workspace mount) of a server the
+  /// user previously connected to whose origin matches `origin`; nil when none.
+  /// Reusing the recorded URL means a deep link to a KNOWN workspace server opens
+  /// WITHOUT the network probe — the mount is already in the saved URL. Mirrors
+  /// the desktop shell's `findKnownServerUrl` (web/electron/src/main.js).
+  func knownServerURL(forOrigin origin: String) -> URL? {
+    let candidates = (serverURL.map { [$0] } ?? []) + recentServers
+    for value in candidates {
+      guard let url = URL(string: value), url.omnigentOrigin == origin else { continue }
+      return url
+    }
+    return nil
+  }
+
   func isProtocolAllowed(_ scheme: String, from origin: String) -> Bool {
     allowedProtocols()[origin]?.contains(scheme.lowercased()) == true
   }

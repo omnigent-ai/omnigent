@@ -9,11 +9,13 @@ by the caller, never by this module.
 Design notes:
 
 * **Source of truth is the DB.** :meth:`ScheduledTaskScheduler.start` loads every
-  active task via ``store.list_active()`` and arms a timer for each. There is no
-  in-memory schedule state beyond the live timers. Missed fires (server was
-  down) are **not** replayed — only the next future occurrence is armed.
-* **Overlap policy is SKIP.** If a task's previous fire is still running when
-  the next tick arrives, the tick is dropped (``max_instances=1``).
+  active task via ``store.list_active_all_workspaces()`` and arms a timer for
+  each. There is no in-memory schedule state beyond the live timers. Missed
+  fires (server was down) are **not** replayed — only the next future occurrence
+  is armed.
+* **Timer overlap policy is SKIP.** If an ``on_fire`` callback for the same job
+  is still running when the next tick arrives, the tick is dropped. The fire
+  path also tracks its own longer-running session creation work.
 * **Misfire grace.** A tick that arrives more than :data:`MISFIRE_GRACE_TIME_S`
   after its scheduled time (e.g. the event loop was blocked) is skipped.
 * **Long-delay safety.** A single timer is capped at :data:`_MAX_TIMER_DELAY_S`
@@ -56,15 +58,16 @@ _MAX_TIMER_DELAY_S = 24 * 24 * 60 * 60
 # the scheduled time.
 _DUE_TOLERANCE_S = 1.0
 
-# ``on_fire(scheduled_task_id)`` — invoked when a task is due. The caller
-# creates the agent session; the default callback is a no-op that logs.
-OnFire = Callable[[str], Awaitable[None]]
+# ``on_fire(workspace_id, scheduled_task_id)`` — invoked when a task is due. The
+# caller creates the agent session under the provided workspace scope.
+OnFire = Callable[[int, str], Awaitable[None]]
+_JobKey = tuple[int, str]
 
 
 class _ActiveTaskSource(Protocol):
     """The slice of ``ScheduledTaskStore`` the scheduler reads."""
 
-    def list_active(self) -> list[ScheduledTask]: ...
+    def list_active_all_workspaces(self) -> list[ScheduledTask]: ...
 
 
 @dataclass
@@ -72,13 +75,14 @@ class _Job:
     """One registered task's live scheduling state."""
 
     task_id: str
+    workspace_id: int
     trigger: RRuleTrigger
     tz: ZoneInfo
     next_run: datetime | None = None
     next_run_epoch: float | None = None
     timer: Any = None
     armed_capped: bool = False
-    running: bool = False  # max_instances=1 — drop overlapping fires
+    running: bool = False  # Drop overlapping on_fire callbacks.
 
 
 def _resolve_tz(name: str | None) -> ZoneInfo:
@@ -96,10 +100,11 @@ class ScheduledTaskScheduler:
     """Arms one self-rearming timer per active scheduled task and fires the
     injected ``on_fire`` callback when each is due.
 
-    :param store: Provides ``list_active()`` for the boot-time schedule load.
-    :param on_fire: Async callback invoked with the ``scheduled_task_id`` when a
-        task is due. Exceptions are caught and logged so a failing fire never
-        stops the timer from re-arming.
+    :param store: Provides ``list_active_all_workspaces()`` for the boot-time
+        schedule load.
+    :param on_fire: Async callback invoked with ``(workspace_id,
+        scheduled_task_id)`` when a task is due. Exceptions are caught and
+        logged so a failing fire never stops the timer from re-arming.
     :param now: Returns the current epoch seconds. Injectable for tests;
         defaults to :func:`time.time`.
     :param schedule_call: Arms a timer: ``(delay_s, factory) -> handle`` where
@@ -123,7 +128,7 @@ class ScheduledTaskScheduler:
         self._now = now
         self._schedule_call = schedule_call or _default_schedule_call
         self._cancel_call = cancel_call or _default_cancel_call
-        self._jobs: dict[str, _Job] = {}
+        self._jobs: dict[_JobKey, _Job] = {}
         self._started = False
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -139,7 +144,7 @@ class ScheduledTaskScheduler:
         if self._started:
             _logger.debug("scheduler: start() called but already started; ignoring")
             return
-        for task in self._store.list_active():
+        for task in self._store.list_active_all_workspaces():
             try:
                 self._register(task)
             except RRuleValidationError as exc:
@@ -183,9 +188,11 @@ class ScheduledTaskScheduler:
 
     def remove(self, task_id: str) -> None:
         """Cancel and forget a task's timer. Idempotent."""
-        job = self._jobs.pop(task_id, None)
-        if job is not None and job.timer is not None:
-            self._cancel_call(job.timer)
+        for key, job in list(self._jobs.items()):
+            if job.task_id == task_id:
+                self._jobs.pop(key, None)
+                if job.timer is not None:
+                    self._cancel_call(job.timer)
 
     # ── introspection ─────────────────────────────────────────────────────────
 
@@ -201,7 +208,7 @@ class ScheduledTaskScheduler:
 
     def next_run_at(self, task_id: str) -> str | None:
         """ISO-8601 timestamp of a task's next fire, or ``None`` if not armed."""
-        job = self._jobs.get(task_id)
+        job = next((j for j in self._jobs.values() if j.task_id == task_id), None)
         if job is None or job.next_run is None:
             return None
         return job.next_run.isoformat()
@@ -217,7 +224,7 @@ class ScheduledTaskScheduler:
         :param task_id: The task to fire.
         :returns: ``True`` if fired, ``False`` if skipped or unknown.
         """
-        job = self._jobs.get(task_id)
+        job = next((j for j in self._jobs.values() if j.task_id == task_id), None)
         if job is None:
             return False
         return await self._fire_job(job, scheduled_epoch=self._now())
@@ -228,8 +235,13 @@ class ScheduledTaskScheduler:
         """Validate the task's rrule and arm its timer, replacing any existing."""
         trigger = validate_rrule(task.rrule)
         self.remove(task.id)  # replace_existing semantics
-        job = _Job(task_id=task.id, trigger=trigger, tz=_resolve_tz(task.timezone))
-        self._jobs[task.id] = job
+        job = _Job(
+            task_id=task.id,
+            workspace_id=task.workspace_id,
+            trigger=trigger,
+            tz=_resolve_tz(task.timezone),
+        )
+        self._jobs[(task.workspace_id, task.id)] = job
         self._arm(job)
 
     def _arm(self, job: _Job) -> None:
@@ -269,7 +281,7 @@ class ScheduledTaskScheduler:
         finally:
             # Only re-arm if the job is still registered (it may have been
             # removed mid-fire).
-            if self._jobs.get(job.task_id) is job:
+            if self._jobs.get((job.workspace_id, job.task_id)) is job:
                 self._arm(job)
 
     async def _fire_job(self, job: _Job, *, scheduled_epoch: float) -> bool:
@@ -290,7 +302,7 @@ class ScheduledTaskScheduler:
             return False
         job.running = True
         try:
-            await self._on_fire(job.task_id)
+            await self._on_fire(job.workspace_id, job.task_id)
             return True
         except Exception:
             _logger.exception("scheduler: on_fire for task %s failed", job.task_id)

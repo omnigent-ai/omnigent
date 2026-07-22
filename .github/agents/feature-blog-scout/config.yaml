@@ -22,7 +22,8 @@ spec_version: 1
 name: feature-blog-scout
 description: >-
   Selects which features from a release's merged PRs (if any) are big enough to
-  warrant a feature-blog post. Applies a signal-based bar, caps at the top 2–3,
+  warrant a feature-blog post. Applies a signal-based bar, caps at the requested
+  limit (default top 2–3),
   and emits a ranked BLOG_CANDIDATES JSON block (often empty). No tools, no
   sub-agents — a pure selection turn.
 
@@ -72,8 +73,9 @@ prompt: |
     thin to show.
   - Collapse related PRs into ONE feature (as release notes do) — a feature is a
     theme, not a PR.
-  - **Cap: the top 2–3, ranked strongest-first.** Even if more clear the bar,
-    return at most 3.
+  - **Cap: rank strongest-first and return at most the number of features the
+    run asks for** (the run prompt states the limit; default is the top 2–3).
+    Even if more clear the bar, never exceed that limit.
   - **Final self-check per candidate — drop it if it fails:** can you picture the
     15–30s demo, and does a benefit headline beat naming the mechanism? (Signal 3
     and this check are the same demo test — apply it as a filter and as a veto.)

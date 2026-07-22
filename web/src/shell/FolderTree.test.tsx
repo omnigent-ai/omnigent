@@ -150,7 +150,15 @@ describe("FolderTree file size / download alignment", () => {
     renderTree({
       files: [dir("src")],
       changedFiles: [
-        { path: "src/app.ts", name: "app.ts", status: "modified", bytes: 1, modified_at: null },
+        {
+          path: "src/app.ts",
+          name: "app.ts",
+          status: "modified",
+          bytes: 1,
+          modified_at: null,
+          lines_added: null,
+          lines_removed: null,
+        },
       ],
     });
 

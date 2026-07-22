@@ -7,6 +7,7 @@
 # Generated file -- do not hand-edit; it is replaced wholesale on every sync.
 
 REQUIRED=(
+  "DCO"
   "Pre-commit checks"
   "Docker build"
   "Pytest (runtime-harnesses)"

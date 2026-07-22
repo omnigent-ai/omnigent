@@ -155,6 +155,11 @@
   --omnigent-native-bottom-bar: 0px; /* set by native bridge (px) */
   --omnigent-top-bar-visible: 0; /* web-owned 0|1 */
   --omnigent-bottom-bar-visible: 0; /* web-owned 0|1 */
+  /* Android floating server-switcher pill footprint (margin + height).
+     Used by the Android scroll-fade gradient so it starts at the pill
+     bottom. Set once; if the pill size changes, update both values. */
+  --omnigent-android-switcher-margin: 8px;
+  --omnigent-android-switcher-height: 25px;
   --omnigent-inset-top: var(--omnigent-safe-top);
   --omnigent-inset-bottom: calc(
     var(--omnigent-safe-bottom) + var(--omnigent-native-bottom-bar) *
@@ -581,6 +586,26 @@
       to bottom,
       transparent calc(48px + var(--omnigent-inset-top)),
       black calc(80px + var(--omnigent-inset-top))
+    );
+  }
+
+  /* Android: the floating server-switcher pill sits at the top. Start the
+     fade at the pill bottom (safe-top + margin + height) so content scrolls
+     smoothly into view below it. */
+  [data-android-native] .chat-scroll-fade {
+    --fade-start: calc(
+      var(--omnigent-safe-top) + var(--omnigent-android-switcher-margin) +
+        var(--omnigent-android-switcher-height)
+    );
+    mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px)
+    );
+    -webkit-mask-image: linear-gradient(
+      to bottom,
+      transparent var(--fade-start),
+      black calc(var(--fade-start) + 32px)
     );
   }
 

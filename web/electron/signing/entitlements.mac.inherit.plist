@@ -4,10 +4,10 @@
   Entitlements inherited by helper processes (GPU, renderer, plugin
   helpers) — electron-builder `mac.entitlementsInherit`.
 
-  Keep this MINIMAL: helpers must NOT carry restricted entitlements like
-  keychain-access-groups. AMFI kills any helper whose restricted
-  entitlements aren't backed by a provisioning profile, which presents as
-  an endless "GPU process exited unexpectedly: exit_code=9" loop.
+  Keep this MINIMAL: helpers must NOT carry any restricted entitlements
+  (ones that require a provisioning profile). AMFI kills any helper whose
+  restricted entitlements aren't backed by a provisioning profile, which
+  presents as an endless "GPU process exited unexpectedly: exit_code=9" loop.
 -->
 <plist version="1.0">
   <dict>

@@ -17,6 +17,11 @@ name: Publish Changelog
 # Cross-repo writes can't use the workflow's own GITHUB_TOKEN (scoped to this
 # repo), so we mint a short-lived token from the omnigent-ci GitHub App scoped to
 # omnigent-site — the same App used by sync-openapi-to-site.yml.
+#
+# Manual dispatch with `dry_run: true` previews only — it renders the site page
+# and prints it to the run log + job summary, mints no token, and opens no PR (so
+# it runs from a fork too). Use it to eyeball the narrative reflow before a real
+# publish.
 
 on:
   release:
@@ -27,6 +32,13 @@ on:
         description: Final release tag to (re)publish, e.g. v0.3.0
         required: true
         type: string
+      dry_run:
+        description: >-
+          Preview only: render the site page and print it to the run log +
+          job summary, but do NOT mint a token or open any PR.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,6 +54,7 @@ jobs:
     outputs:
       tag: ${{ steps.r.outputs.tag }}
       is_final: ${{ steps.r.outputs.is_final }}
+      dry_run: ${{ steps.r.outputs.dry_run }}
     steps:
       - name: Resolve tag and finality
         id: r
@@ -49,10 +62,17 @@ jobs:
           EVENT_TAG: ${{ github.event.release.tag_name }}
           PRERELEASE: ${{ github.event.release.prerelease }}
           INPUT_TAG: ${{ inputs.tag }}
+          # Only a manual dispatch can request dry-run; a real published release
+          # is never a preview.
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$EVENT_TAG}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+          dry_run=false
+          [ "${INPUT_DRY_RUN}" = "true" ] && dry_run=true
+          echo "dry_run=${dry_run}" >> "$GITHUB_OUTPUT"
 
           is_final=true
           # Only final vX.Y.Z tags; exclude rc/dev/alpha/beta and the
@@ -68,22 +88,29 @@ jobs:
             is_final=false
           fi
           echo "is_final=${is_final}" >> "$GITHUB_OUTPUT"
-          echo "Resolved tag=${tag} is_final=${is_final}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Resolved tag=${tag} is_final=${is_final} dry_run=${dry_run}" | tee -a "$GITHUB_STEP_SUMMARY"
 
   publish:
     name: Open release-post PR (omnigent-site)
     needs: resolve
     runs-on: ubuntu-latest
-    # Canonical repo only; skip cleanly where the App isn't configured.
+    # Canonical repo only, and only where the App is configured — EXCEPT a
+    # dry-run, which just renders + prints (no cross-repo write), so it runs
+    # anywhere (e.g. a fork) to preview the page.
     if: >-
       needs.resolve.outputs.is_final == 'true' &&
-      github.repository == 'omnigent-ai/omnigent' &&
-      vars.OMNIGENT_BOT_APP_ID != ''
+      (needs.resolve.outputs.dry_run == 'true' ||
+       (github.repository == 'omnigent-ai/omnigent' &&
+        vars.OMNIGENT_BOT_APP_ID != ''))
     env:
       TAG: ${{ needs.resolve.outputs.tag }}
+      DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
       SOURCE_REPO: ${{ github.repository }}
       SITE_REPO: ${{ github.repository_owner }}/omnigent-site
       RELEASES_BRANCH: auto/releases/${{ needs.resolve.outputs.tag }}
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
     steps:
       - name: Checkout omnigent (for the render script)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -95,7 +122,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Render the curated release body to MDX
+      - name: Read the curated release body
         working-directory: omnigent
         # The release read uses the workflow's own token (scoped to this repo);
         # only the cross-repo site write needs the App token, minted below.
@@ -110,14 +137,180 @@ jobs:
             --json body,publishedAt > /tmp/release.json
           jq -r '.body' /tmp/release.json > /tmp/release_body.md
           date="$(jq -r '.publishedAt' /tmp/release.json | cut -c1-10)"
+          echo "RELEASE_DATE=${date}" >> "$GITHUB_ENV"
+          # The site post is the narrative reflow; the raw release body is the
+          # fallback if the formatter agent is unavailable or fails.
+          cp /tmp/release_body.md /tmp/site_body.md
+
+      # --- AI reflow (primary; degrades to the raw release body) ---
+      # The GitHub Release itself is untouched — this rewrites its body into the
+      # website's narrative, prose-driven post for the site page ONLY.
+      - name: Check LLM credentials
+        id: creds
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          if [ -z "${LLM_API_KEY:-}" ]; then
+            echo "::warning::No LLM credentials — publishing the raw release body."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::add-mask::${LLM_API_KEY}"
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Build a docs index (URL + title, one per line) from the live site so the
+      # formatter can link each feature to a real /docs page — or omit the link
+      # when nothing fits. omnigent-site is public; a blobless partial + sparse
+      # checkout of app/docs pulls only the page.mdx tree, no token needed. Best
+      # effort: on any failure the index is empty and every "Learn more" is dropped.
+      - name: Build docs index
+        if: steps.creds.outputs.available == 'true'
+        env:
+          SITE_REPO: ${{ env.SITE_REPO }}
+        run: |
+          set -euo pipefail
+          : > /tmp/docs_index.txt
+          tmp="$(mktemp -d)"
+          if git clone --depth 1 --filter=blob:none --sparse \
+              "https://github.com/${SITE_REPO}.git" "$tmp" 2>/dev/null \
+             && git -C "$tmp" sparse-checkout set app/docs 2>/dev/null; then
+            python3 -u - "$tmp" <<'PYEOF'
+          import pathlib, re, sys
+          root = pathlib.Path(sys.argv[1])
+          docs = root / "app" / "docs"
+
+          def slugify(text):
+              # Mirror components/HeadingAnchors.js so #anchors resolve on the site.
+              text = text.lower()
+              text = re.sub(r"[^a-z0-9\s-]", "", text)
+              text = re.sub(r"\s+", "-", text)
+              text = re.sub(r"-+", "-", text)
+              return text.strip()
+
+          lines, pages = [], 0
+          for page in sorted(docs.rglob("page.mdx")):
+              url = "/" + page.relative_to(root).parent.as_posix().removeprefix("app/")
+              title, sections, in_fence = "", [], False
+              for ln in page.read_text(encoding="utf-8", errors="replace").splitlines():
+                  if ln.lstrip().startswith("```"):  # skip fenced code blocks
+                      in_fence = not in_fence
+                      continue
+                  if in_fence:
+                      continue
+                  m = re.match(r"(#{1,3})\s+(.*\S)", ln)  # only h1-h3 get anchors
+                  if not m:
+                      continue
+                  level, text = len(m.group(1)), m.group(2).strip()
+                  # Reduce `[label](url)` to `label`: the site slugs rendered text.
+                  text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+                  if level == 1 and not title:
+                      title = text
+                  elif level > 1:
+                      sections.append((slugify(text), text))
+              pages += 1
+              lines.append(f"{url}\t{title}" if title else url)
+              for slug, text in sections:
+                  lines.append(f"  {url}#{slug}\t{text}")
+          pathlib.Path("/tmp/docs_index.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
+          print(f"Indexed {pages} docs pages, {len(lines) - pages} sections.")
+          PYEOF
+          else
+            echo "::warning::Could not fetch omnigent-site docs — 'Learn more' links will be omitted."
+          fi
+          rm -rf "$tmp"
+
+      - name: Build formatter prompt
+        if: steps.creds.outputs.available == 'true'
+        env:
+          TAG: ${{ env.TAG }}
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import os, pathlib
+          tag = os.environ["TAG"]
+          # `omnigent run -p` passes the whole prompt as one argv string, capped at
+          # ~128 KiB on Linux (MAX_ARG_STRLEN). A release body is far smaller, but
+          # cap defensively; the raw body is the fallback if the agent can't run.
+          MAX = 100_000
+          body = pathlib.Path("/tmp/release_body.md").read_text(encoding="utf-8", errors="replace")[:MAX]
+          docs = pathlib.Path("/tmp/docs_index.txt")
+          docs_index = docs.read_text(encoding="utf-8", errors="replace").strip() if docs.is_file() else ""
+          docs_block = docs_index if docs_index else "(none available — omit every \"Learn more\" line)"
+          prompt = f"""Reformat the {tag} release notes into the website post.
+
+          ## Curated GitHub Release body (rewrite this — do not add or drop facts)
+          {body}
+
+          ## Available docs pages and sections (URL <TAB> title; indented = a
+          ## #section anchor within the page above) — link features to these only
+          {docs_block}
+
+          Produce the RELEASE_POST block per your instructions."""
+          pathlib.Path("/tmp/format_prompt.txt").write_text(prompt)
+          PYEOF
+
+      # Runs the tools-less formatter and secret-scans its output; degrades to the
+      # raw release body (below) if the agent can't run. Omnigent is checked out
+      # into omnigent/, so the action's workdir is that subdir.
+      - name: Run release-post formatter
+        id: format
+        if: steps.creds.outputs.available == 'true'
+        uses: ./omnigent/.github/actions/run-omnigent-agent
+        with:
+          workdir: omnigent
+          agent: release-post-formatter
+          prompt-file: /tmp/format_prompt.txt
+          output-file: /tmp/format_out.txt
+          stderr-file: /tmp/format-stderr.log
+          gateway-base-url: ${{ secrets.GATEWAY_BASE_URL }}
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+
+      - name: Extract narrative post (fall back to raw body)
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          python3 -u <<'PYEOF'
+          import pathlib, re
+          raw = pathlib.Path("/tmp/format_out.txt").read_text(encoding="utf-8", errors="replace") \
+              if pathlib.Path("/tmp/format_out.txt").is_file() else ""
+          m = re.search(r"<!--\s*RELEASE_POST\s*-->(.*?)<!--\s*/RELEASE_POST\s*-->", raw, re.DOTALL)
+          post = (m.group(1).strip() if m else "")
+          if post:
+              pathlib.Path("/tmp/site_body.md").write_text(post + "\n")
+              print("Using AI-formatted narrative release post.")
+          else:
+              print("::warning::No RELEASE_POST block parsed — publishing the raw release body.")
+          PYEOF
+
+      - name: Render the release post to MDX
+        working-directory: omnigent
+        run: |
+          set -euo pipefail
           mkdir -p /tmp/site_page
           python3 .github/scripts/changelog/release_to_mdx.py \
-            --tag "$TAG" --repo "$SOURCE_REPO" --date "$date" \
-            --body-file /tmp/release_body.md \
+            --tag "$TAG" --repo "$SOURCE_REPO" --date "$RELEASE_DATE" \
+            --body-file /tmp/site_body.md \
             --out "/tmp/site_page/page.mdx"
+
+      # Dry-run stops here: print the generated page (and the intermediate
+      # narrative body) to the log and the job summary. No token is minted and no
+      # PR is opened — every step below is gated on DRY_RUN != 'true'.
+      - name: Preview rendered page (dry-run)
+        if: env.DRY_RUN == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Dry-run — release post for \`${TAG}\` at \`/releases/${VERSION}\`"
+            echo "### Narrative body (pre-MDX)"
+            echo '```markdown'; cat /tmp/site_body.md; echo '```'
+            echo "### Rendered \`app/releases/${VERSION}/page.mdx\`"
+            echo '```mdx'; cat /tmp/site_page/page.mdx; echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Dry-run: no token minted, no PR opened."
 
       - name: Mint App token (omnigent-site)
         id: app-token
+        if: env.DRY_RUN != 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
@@ -126,6 +319,7 @@ jobs:
           repositories: omnigent-site
 
       - name: Checkout omnigent-site (sync target)
+        if: env.DRY_RUN != 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ env.SITE_REPO }}
@@ -133,6 +327,7 @@ jobs:
           path: site
 
       - name: Open or update the release-post PR (omnigent-site)
+        if: env.DRY_RUN != 'true'
         working-directory: site
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -158,7 +353,7 @@ jobs:
             echo "Release-post PR already open for ${RELEASES_BRANCH} — force-push updated it."
             exit 0
           fi
-          body="$(printf 'Publishes the **%s** release post at `/releases/%s`, mirroring the curated GitHub Release notes.\n\nGenerated by omnigent `.github/workflows/publish-changelog.yml`. Edit the GitHub Release, not this file.' "$TAG" "$VERSION")"
+          body="$(printf 'Publishes the **%s** release post at `/releases/%s` — the curated GitHub Release notes reformatted into the site'"'"'s narrative, prose-driven style.\n\nGenerated by omnigent `.github/workflows/publish-changelog.yml`. Edit the GitHub Release, not this file.' "$TAG" "$VERSION")"
           gh pr create \
             --repo "$SITE_REPO" \
             --base main \
@@ -173,6 +368,7 @@ jobs:
       # when the branch doesn't exist or carries nothing beyond main (e.g. a patch
       # release with no staged docs).
       - name: Open docs-branch → main PR (omnigent-site)
+        if: env.DRY_RUN != 'true'
         working-directory: site
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -206,3 +402,38 @@ jobs:
             --head "$DOCS_BRANCH" \
             --title "docs: publish ${VERSION%.*} docs to the live site" \
             --body "$body"
+
+      # ::add-mask:: redacts rendered logs, not artifact files — scrub the key
+      # from artifacts (incl. the unscanned stderr) before upload.
+      - name: Redact secrets from artifacts
+        if: always() && steps.creds.outputs.available == 'true'
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${LLM_API_KEY:-}" ] || exit 0
+          python3 - <<'PYEOF'
+          import os, pathlib
+          key = os.environ.get("LLM_API_KEY", "")
+          for f in ["/tmp/format-stderr.log", "/tmp/format_out.txt",
+                    "/tmp/format_prompt.txt", "/tmp/site_body.md"]:
+              p = pathlib.Path(f)
+              if not p.is_file() or not key:
+                  continue
+              t = p.read_text(encoding="utf-8", errors="replace")
+              if key in t:
+                  p.write_text(t.replace(key, "***REDACTED***"), encoding="utf-8")
+                  print(f"redacted key from {f}")
+          PYEOF
+
+      - name: Upload logs on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: publish-changelog-${{ env.TAG }}-${{ github.run_id }}
+          path: |
+            /tmp/format-stderr.log
+            /tmp/format_out.txt
+            /tmp/site_body.md
+          retention-days: 7
+          if-no-files-found: ignore

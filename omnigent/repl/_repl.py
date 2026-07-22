@@ -4771,6 +4771,7 @@ async def _cmd_effort(
 
 
 _MODEL_CLEAR_ALIASES = {"default", "off", "reset"}
+_MODEL_SHOW_ALIASES = {"show", "list", "status", "current"}
 
 
 def _model_readout_harness(active_model: str | None) -> str:
@@ -5059,8 +5060,7 @@ async def _cmd_model(
     """
     from rich.text import Text
 
-    value = arg.strip()
-    if not value:
+    def _emit_model_readout() -> None:
         from omnigent.onboarding.detected import effective_config_with_detected
         from omnigent.onboarding.provider_config import load_config
 
@@ -5071,6 +5071,12 @@ async def _cmd_model(
         config = effective_config_with_detected(load_config())
         for line in _build_model_readout_lines(config, harness, current):
             host.output(Text.from_markup(f"  [{fmt.muted}]{line}[/{fmt.muted}]"))
+
+    value = arg.strip()
+    # Bare `/model` and the display keywords both just show the readout — never
+    # persist `show`/`list`/`status`/`current` as a literal model override.
+    if not value or value.lower() in _MODEL_SHOW_ALIASES:
+        _emit_model_readout()
         return
 
     if value.lower() in _MODEL_CLEAR_ALIASES:
@@ -8301,12 +8307,32 @@ class _SlashCommandCompleter(Completer):
         if "/" in text_before[1:]:
             return
 
-        prefix = text_before.lower()
+        # Match the web UI's rule (slashCommandMatches in
+        # SlashCommandMenu.tsx): a case-insensitive substring of the
+        # command name (sans the leading "/"), so a namespaced skill is
+        # reachable by its leaf name (``/using-superpowers`` ->
+        # ``/superpowers:using-superpowers``). Name only, not the
+        # description — kept identical to the web menu, which never shows
+        # descriptions inline.
+        #
+        # Prefix matches rank ahead of mid-string matches (mirrors the web
+        # menu's ``rankedSlashCommandNames``): ``/e`` surfaces ``/effort``
+        # (a prefix) before ``/context`` (which merely contains "e"), so
+        # the first, auto-selectable completion is the intended one. Each
+        # tier keeps ``COMMANDS`` insertion order (an empty query — lone
+        # "/" — puts every command in the prefix tier, unchanged).
+        query = text_before[1:].lower()
+        prefix_hits: list[tuple[str, str]] = []
+        substring_hits: list[tuple[str, str]] = []
         for name, (desc, _) in COMMANDS.items():
             if name in _SLASH_COMMAND_ALIASES:
                 continue
-            if not name.startswith(prefix):
-                continue
+            body = name[1:].lower()
+            if body.startswith(query):
+                prefix_hits.append((name, desc))
+            elif query in body:
+                substring_hits.append((name, desc))
+        for name, desc in (*prefix_hits, *substring_hits):
             yield Completion(
                 text=name,
                 # Replace everything typed so far so the splice

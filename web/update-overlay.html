@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Omnigent Update</title>
+    <style>
+      /* The overlay lives in a transparent, frameless shell window sized to the
+         card, so the page itself paints nothing — only the UpdateBanner card
+         (its own bg/border/shadow) is visible. */
+      html,
+      body {
+        margin: 0;
+        background: transparent;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="update-overlay-root"></div>
+    <script type="module" src="/src/update-overlay.tsx"></script>
+  </body>
+</html>

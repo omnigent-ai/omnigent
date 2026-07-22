@@ -62,6 +62,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
+        "sys_session_rename",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -72,6 +73,14 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Scheduled-task management tools are always auto-registered
+        # so agents can create, list, update, and delete recurring
+        # runs without spec opt-in. They are runner-dispatched via
+        # the Omnigent server's REST API.
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -108,6 +117,12 @@ def _non_lifecycle_schemas(
             and fn.get("name") in _ALWAYS_PRESENT_TOOLS
         )
     ]
+
+
+def test_session_rename_is_registered_for_every_agent() -> None:
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert "sys_session_rename" in names
 
 
 @pytest.fixture()
@@ -384,7 +399,7 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     ``sys_session_list`` / ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
-    mutating session tools (``sys_session_send`` /
+    opt-in session-spawn tools (``sys_session_send`` /
     ``sys_session_close`` / ``sys_session_create`` /
     ``sys_session_share``) are NOT registered without an opt-in
     (``tools.agents`` or top-level ``spawn: true``). A regression that

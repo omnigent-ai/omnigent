@@ -54,7 +54,9 @@ export function useHosts(options: UseHostsOptions = {}) {
     queryKey: ["hosts", { includeSandbox }],
     queryFn: () => fetchHosts(includeSandbox),
     enabled,
-    staleTime: 10_000,
-    refetchInterval: enabled ? 10_000 : false,
+    staleTime: 30_000,
+    // Host status is pushed via WS (hosts_changed frame in SessionUpdatesProvider).
+    // 60 s fallback poll catches any missed events (tab backgrounded, reconnect gap).
+    refetchInterval: enabled ? 60_000 : false,
   });
 }

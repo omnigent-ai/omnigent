@@ -657,6 +657,60 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+def _is_utf8_locale_value(value: str | None) -> bool:
+    """Whether a locale string names a UTF-8 codeset.
+
+    A POSIX locale looks like ``language[_TERRITORY][.codeset][@modifier]``;
+    the codeset after the dot is what selects the encoding (``en_US.UTF-8``,
+    ``C.UTF-8``). Bare ``C`` / ``POSIX`` and empty values are not UTF-8.
+    Matching is case- and separator-insensitive (``utf8`` == ``UTF-8``).
+
+    :param value: A locale string such as ``"C.UTF-8"``, or ``None``.
+    :returns: ``True`` when the codeset is UTF-8.
+    """
+    if not value:
+        return False
+    codeset = value.split("@", 1)[0]
+    codeset = codeset.rsplit(".", 1)[-1] if "." in codeset else ""
+    return codeset.replace("-", "").lower() == "utf8"
+
+
+def _has_utf8_locale(env: dict[str, str]) -> bool:
+    """Whether the env already carries a UTF-8 signal the TUI CLIs honor.
+
+    The CLIs that mis-decode (opencode/pi/hermes) read ``LC_ALL`` / ``LANG``
+    directly rather than calling ``setlocale``, so only those two vars count
+    here; a UTF-8 ``LC_CTYPE`` alone does not help them. Per POSIX precedence
+    a non-empty ``LC_ALL`` overrides ``LANG``.
+
+    :param env: The prospective terminal spawn environment.
+    :returns: ``True`` when the effective ``LC_ALL``/``LANG`` names UTF-8.
+    """
+    lc_all = env.get("LC_ALL")
+    if lc_all:
+        return _is_utf8_locale_value(lc_all)
+    return _is_utf8_locale_value(env.get("LANG"))
+
+
+def _apply_utf8_locale_default(env: dict[str, str]) -> None:
+    """Force ``LANG=LC_ALL=C.UTF-8`` when the env lacks a UTF-8 locale signal.
+
+    Mutates ``env`` in place. No-op on Windows (tmux terminals are POSIX-only)
+    and when the operator already supplied a UTF-8 ``LC_ALL``/``LANG`` (that
+    value is preserved). A pinned non-UTF-8 ``LC_ALL`` (e.g. ``C``) is
+    corrected. ``C.UTF-8`` is chosen because it needs no locale archive and so
+    is present on minimal container images where ``en_US.UTF-8`` is not.
+
+    :param env: The terminal spawn environment to normalize.
+    """
+    if IS_WINDOWS:
+        return
+    if _has_utf8_locale(env):
+        return
+    env["LANG"] = "C.UTF-8"
+    env["LC_ALL"] = "C.UTF-8"
+
+
 def _tmux_available() -> bool:
     """Check if tmux is installed."""
     return shutil.which("tmux") is not None
@@ -1059,6 +1113,13 @@ class TerminalInstance:
         # this tmux pane, so the binding token must never reach it.
         # After ``env.update`` so ``self.env`` can't re-admit it.
         env = strip_runner_auth_secrets(env)
+        # Force a UTF-8 locale into the pane env when the inherited env
+        # carries no UTF-8 signal in the vars the native TUI CLIs actually
+        # read (LC_ALL/LANG). Without it, CLIs that read LC_ALL/LANG directly
+        # (opencode/pi/hermes) instead of calling setlocale fall back to an
+        # ASCII/Latin-1 codeset and re-encode their UTF-8 output byte-by-byte,
+        # rendering multibyte characters as mojibake in the pane (issue #2427).
+        _apply_utf8_locale_default(env)
 
         # Build the command to run inside tmux. If a sandbox policy
         # is configured, wrap the command in the sandbox launcher so

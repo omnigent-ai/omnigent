@@ -25,12 +25,17 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusFrame,
+    HostRunnerStatusResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -39,7 +44,9 @@ from omnigent.host.frames import (
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -90,6 +97,8 @@ async def test_handle_launch_spawns_subprocess(
     failed or the result frame construction is wrong.
     """
     host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
     workspace.mkdir()
 
@@ -139,6 +148,7 @@ async def test_handle_launch_spawns_subprocess(
     # Verify env vars passed to the subprocess.
     assert spawned_env.get("RUNNER_SERVER_URL") == "http://localhost:8000"
     assert spawned_env.get("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN") == "test_token_abc"
+    assert spawned_env.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "host-bootstrap-bearer"
     assert spawned_env.get("OMNIGENT_RUNNER_WORKSPACE") == str(workspace)
 
     # Runners must get a clean /dev/null stdin, not the daemon's inherited fd:
@@ -460,6 +470,102 @@ class _FakeTunnel:
         :raises ConnectionError: Always — ends the serve loop.
         """
         raise ConnectionError("test disconnect")
+
+
+class _ReadinessChangingTunnel(_FakeTunnel):
+    """Trigger one idle refresh before disconnecting the fake tunnel."""
+
+    def __init__(self) -> None:
+        """Initialize the frame log and receive counter."""
+        super().__init__()
+        self.recv_count = 0
+
+    async def recv(self) -> str:
+        """Simulate one idle interval followed by a disconnect."""
+        self.recv_count += 1
+        if self.recv_count == 1:
+            await asyncio.Future()
+        raise ConnectionError("test disconnect")
+
+
+async def test_live_host_refreshes_harness_readiness_without_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A setup completed after connect must replace the advertised readiness."""
+    readiness = iter(({"pi": False}, {"pi": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_is_configured",
+        lambda harness: harness == "pi",
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    hello = decode_host_frame(tunnel.sent[0])
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"pi": False}
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"pi": True}
+
+
+async def test_live_host_full_refresh_detects_auth_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The full-refresh fallback catches readiness changes beyond binary installs."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 2
+    refresh = decode_host_frame(tunnel.sent[1])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+
+
+async def test_live_host_does_not_repeat_unchanged_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A periodic full refresh sends nothing when the readiness map is unchanged."""
+    readiness = iter(({"codex": "needs-auth"}, {"codex": "needs-auth"}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: next(readiness),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    tunnel = _ReadinessChangingTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert len(tunnel.sent) == 1
+    assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
 
 
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
@@ -805,6 +911,77 @@ def test_handle_stop_unknown_runner() -> None:
     assert isinstance(result, HostStopRunnerResultFrame)
     assert result.status == "failed"
     assert "unknown runner" in (result.error or "")
+
+
+def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``alive`` for a tracked
+    runner whose process is still running.
+
+    This is the still-booting / still-serving case: the server must wait
+    for this runner's tunnel rather than relaunch a healthy process.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["sleep", "60"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        host._runners["runner_live"] = _RunnerHandle(
+            proc=proc, log_path=tmp_path / "runner-live.log"
+        )
+        result = host._handle_runner_status(
+            HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
+        )
+        assert isinstance(result, HostRunnerStatusResultFrame)
+        assert result.request_id == "req_rs"
+        assert result.status == "alive"
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_handle_runner_status_dead_for_exited_process(tmp_path: Path) -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``dead`` for a tracked
+    runner whose process has exited.
+
+    A tracked-but-exited runner will never connect its tunnel, so the
+    server must relaunch immediately instead of burning the connect
+    grace on it.
+    """
+    host = _make_host_process()
+    proc = subprocess.Popen(
+        ["true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait()  # ensure the process has exited before we query
+    host._runners["runner_gone"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner-gone.log")
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_gone")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "dead"
+
+
+def test_handle_runner_status_unknown_for_untracked_runner() -> None:
+    """
+    Verify ``_handle_runner_status`` reports ``unknown`` for a runner
+    this host has no record of.
+
+    Covers a runner that was stopped (``_handle_stop`` popped it) and a
+    fresh post-restart host that never spawned it — the exact
+    host-restart case that used to strand the server on a full connect
+    grace. Both must read ``unknown`` so the server relaunches at once.
+    """
+    host = _make_host_process()
+    result = host._handle_runner_status(
+        HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_never_seen")
+    )
+    assert isinstance(result, HostRunnerStatusResultFrame)
+    assert result.status == "unknown"
 
 
 def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
@@ -1309,6 +1486,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         binding_token="tok",
         workspace="/ws",
         parent_pid=42,
+        initial_auth_token="host-bootstrap-bearer",
     )
 
     # Process essentials + the locale family pass through.
@@ -1363,6 +1541,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["RUNNER_SERVER_URL"] == "http://server"
     assert env[RUNNER_ID_ENV_VAR] == "runner_abc"
     assert env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] == "tok"
+    assert env[RUNNER_DELEGATED_AUTH_ENV_VAR] == "1"
+    assert env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] == "host-bootstrap-bearer"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
 
@@ -1926,6 +2106,122 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.path == str(tmp_path / "scratch")
 
 
+# ── host.install_harness handler ────────────────────────
+
+
+def test_handle_install_harness_success_returns_refreshed_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A successful install returns ``ok`` and the recomputed readiness map.
+
+    The server flips the UI badge off this map, so the handler must run the
+    installer and then re-probe readiness, returning the fresh result.
+    """
+    import omnigent.host.connect as connect
+
+    # Not yet installed, so the handler runs the installer.
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(connect, "try_install_harness_cli", lambda key: (True, None))
+    monkeypatch.setattr(
+        connect,
+        "configured_harness_map",
+        lambda: {"claude-native": True, "codex-native": "needs-auth"},
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i1", harness="claude")
+    )
+
+    assert isinstance(result, HostInstallHarnessResultFrame)
+    assert result.status == "ok"
+    assert result.error is None
+    assert result.configured_harnesses == {"claude-native": True, "codex-native": "needs-auth"}
+
+
+def test_handle_install_harness_already_installed_skips_installer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An already-installed harness returns fresh readiness without running npm.
+
+    ``npm install -g`` re-resolves over the network and can take minutes even
+    when the binary is already present, so a re-request must short-circuit —
+    otherwise a user clicking Install on an installed harness waits pointlessly
+    (and can hit the request timeout).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: True)
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer ran despite the harness already being installed")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"opencode-native": True})
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i0", harness="opencode")
+    )
+
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"opencode-native": True}
+
+
+def test_handle_install_harness_failure_surfaces_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failed install returns ``failed`` with the installer's reason and no
+    readiness map (the server keeps its prior view).
+    """
+    import omnigent.host.connect as connect
+
+    monkeypatch.setattr(connect, "harness_cli_installed", lambda key: False)
+    monkeypatch.setattr(
+        connect,
+        "try_install_harness_cli",
+        lambda key: (False, "npm is not available on the host"),
+    )
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i2", harness="codex")
+    )
+
+    assert result.status == "failed"
+    assert result.error == "npm is not available on the host"
+    assert result.configured_harnesses is None
+
+
+def test_handle_install_harness_rejects_non_allowlisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-UI-installable harness is refused without invoking the installer.
+
+    Defence in depth: even if a stray frame reaches the daemon, a harness
+    whose installer is a ``curl | bash`` (e.g. hermes) must never run.
+    """
+    import omnigent.host.connect as connect
+
+    def _must_not_install(key: str) -> tuple[bool, str | None]:
+        raise AssertionError("installer reached for a non-allowlisted harness")
+
+    monkeypatch.setattr(connect, "try_install_harness_cli", _must_not_install)
+
+    host = _make_host_process()
+    result = host._handle_install_harness(
+        HostInstallHarnessFrame(request_id="i3", harness="hermes")
+    )
+
+    assert result.status == "failed"
+    assert result.error is not None and "hermes" in result.error
+    assert result.configured_harnesses is None
+
+
 # --- Fail-loud on permanent tunnel failures ----------------------------
 #
 # Before the fix, HostProcess.run() caught every connection exception and
@@ -2129,6 +2425,38 @@ def test_build_connect_headers_adds_org_header(monkeypatch: pytest.MonkeyPatch) 
     headers = _host("https://acme.databricks.com/api/2.0/omnigent")._build_connect_headers()
 
     assert headers["X-Databricks-Org-Id"] == "2850744067564480"
+
+
+def test_build_connect_headers_retains_auth_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host reconnects and runner launches share one warm auth factory."""
+    import omnigent.runner._entry as entry_mod
+
+    factory_builds: list[str | None] = []
+    token_calls: list[int] = []
+
+    def _factory() -> str:
+        token_calls.append(1)
+        return "warm-host-token"
+
+    def _make_factory(*, server_url: str | None = None) -> object:
+        factory_builds.append(server_url)
+        return _factory
+
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", _make_factory)
+
+    host = _host("https://app.example.databricksapps.com")
+    first = host._build_connect_headers()
+    second = host._build_connect_headers()
+    launch_token = host._current_auth_token(initialize=False)
+
+    assert first["Authorization"] == "Bearer warm-host-token"
+    assert second["Authorization"] == "Bearer warm-host-token"
+    assert launch_token == "warm-host-token"
+    assert factory_builds == ["https://app.example.databricksapps.com"]
+    assert token_calls == [1, 1, 1]
 
 
 async def test_run_retries_on_login_redirect(

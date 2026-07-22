@@ -50,6 +50,9 @@ _LATER_PK_OVERRIDES: dict[str, list[str]] = {
     # between workspace_id and id; z8a2b3c4d5e6 appended created_at for
     # partition-readiness.
     "conversation_items": ["workspace_id", "conversation_id", "id", "created_at"],
+    # a7f3c1b9e2d4 widened comments to insert conversation_id between
+    # workspace_id and id (dropping the now-redundant conversation index).
+    "comments": ["workspace_id", "conversation_id", "id"],
 }
 
 

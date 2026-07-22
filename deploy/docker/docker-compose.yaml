@@ -101,6 +101,10 @@ services:
       # without API Access Management) that omit the claim for
       # directory-provisioned users. Off unless set; see .env.example.
       OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION: "${OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION:-}"
+      # Read the email identity from a different id_token claim — for
+      # IdPs (e.g. Microsoft Entra ID) that issue preferred_username
+      # instead of email. Empty means the default (email); see .env.example.
+      OMNIGENT_OIDC_EMAIL_CLAIM: "${OMNIGENT_OIDC_EMAIL_CLAIM:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

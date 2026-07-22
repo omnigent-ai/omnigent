@@ -86,6 +86,7 @@ import { usePermissions } from "@/hooks/usePermissions";
 import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
+import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useIOSNativeKeyboardVisible } from "@/hooks/useIOSNativeKeyboardInset";
 import type { MessageContentBlock } from "@/lib/blocks";
 import {
@@ -145,6 +146,7 @@ import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
+  rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -172,12 +174,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCliServerUrl } from "@/lib/host";
 import { SessionImage } from "@/components/SessionImage";
-import {
-  CodexGoalControl,
-  CodexGoalStatusPill,
-  useCodexGoalState,
-  type CodexGoal,
-} from "@/components/codex";
+import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/components/goal";
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -479,6 +476,13 @@ export function shouldShowAuthorBadge(
  * if it reads idle: the direct-send and queue-drain paths aren't ordered, so a
  * later direct send could overtake a still-queued earlier one when status
  * flickers idle mid-queue (cursor-native). A new chat always sends.
+ *
+ * ``waiting`` is NOT busy for queueing: it means the turn already ended and the
+ * agent loop is only parked on background work (background shells / sub-agents)
+ * — the server's turn gate is already free, so a new message starts a fresh
+ * turn immediately instead of stalling behind that background work. (The
+ * "Working…" spinner and sidebar dot still treat ``waiting`` as active — those
+ * reflect background activity, which is a separate concern from send gating.)
  */
 export function shouldQueueSend(
   conversationId: string | null,
@@ -487,8 +491,7 @@ export function shouldQueueSend(
   queuedMessages: QueuedMessage[],
 ): boolean {
   if (conversationId === null) return false;
-  const isBusy =
-    status === "streaming" || sessionStatus === "running" || sessionStatus === "waiting";
+  const isBusy = status === "streaming" || sessionStatus === "running";
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
   return isBusy || hasQueued;
 }
@@ -929,8 +932,20 @@ export function ChatPage() {
   // session, so a host-bound, host-down session whose host is a resumable
   // managed host classifies as `host_asleep` (composer open, send wakes it)
   // instead of dead-ending on `host_offline`.
+  //
+  // Also prefer the snapshot's `permissionLevel` over the sidebar row's when
+  // it's resolved: the hook derives `host_offline`'s `isOwner` from this
+  // level, and a deployment whose session list is owner-only (the caller's
+  // effective level omitted, e.g. the Databricks-managed server) leaves the
+  // row's `permission_level` null — which would read permissively as "owner"
+  // and offer a non-owner the host-reconnect path. The single-session
+  // snapshot always carries the authoritative level.
   const livenessRow: LivenessRow | null = activeConv
-    ? { ...activeConv, host_resumable: activeSession?.hostResumable ?? false }
+    ? {
+        ...activeConv,
+        permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
+        host_resumable: activeSession?.hostResumable ?? false,
+      }
     : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
     turnActive: status === "streaming",
@@ -1114,7 +1129,7 @@ export function ChatPage() {
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showCodexGoal={shouldShowCodexGoalControl(capabilitySource)}
+      showGoalControl={shouldShowGoalControl(capabilitySource)}
       costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
@@ -1345,8 +1360,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
-  /** Show the Codex Goal control. */
-  showCodexGoal?: boolean;
+  /** Show the session Goal control. */
+  showGoalControl?: boolean;
   /** Latest advisor verdict for the cost-routing pill; null when none. */
   costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
@@ -1420,7 +1435,7 @@ function MainAgentSurface({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal = false,
+  showGoalControl = false,
   costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
@@ -1830,7 +1845,7 @@ function MainAgentSurface({
         modelPickerKind={modelPickerKind}
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
-        showCodexGoal={showCodexGoal}
+        showGoalControl={showGoalControl}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
@@ -1839,6 +1854,8 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
+        hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
+        onShowReconnectHelp={onShowReconnectHelp}
         costRoutingVerdict={costRoutingVerdict}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
@@ -2571,6 +2588,18 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
+    // A `host_offline` session moves the reconnect affordance up into the
+    // composer's host badge (ComposerStatusLine), where the host is already
+    // named — so render nothing here whenever that composer is on screen
+    // (sub-agent sessions included; their badge carries it just like a normal
+    // session's). The composer is hidden only in the terminal-first *terminal*
+    // view (the PTY owns the surface); there the banner still carries the
+    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
+    // no badge).
+    const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
+    if (liveness.kind === "host_offline" && composerOnScreen) {
+      return null;
+    }
     return (
       <button
         type="button"
@@ -3337,8 +3366,8 @@ interface ComposerProps {
   codexModelOptions: readonly CodexModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
-  /** Show the Codex Goal control. */
-  showCodexGoal?: boolean;
+  /** Show the session Goal control. */
+  showGoalControl?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -3374,6 +3403,15 @@ interface ComposerProps {
    * banner below is the only affordance.
    */
   unreachable?: boolean;
+  /**
+   * The session is host-bound to an offline, non-resumable host
+   * (`host_offline`): the composer's host badge turns into a clickable
+   * "Host is offline — click to reconnect" affordance (see HostBadge's
+   * `onReconnect`), replacing the separate banner below the composer.
+   */
+  hostOffline?: boolean;
+  /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
+  onShowReconnectHelp?: () => void;
   /** Latest parsed advisor verdict for the cost-routing pill; `null`/omitted when none. */
   costRoutingVerdict?: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
@@ -3592,12 +3630,20 @@ export function composerHarnessLabel(
  */
 function ComposerStatusLine({
   harnessLabel,
-  codexGoal,
+  goal,
   isSubAgentSession,
+  onHostReconnect,
 }: {
   harnessLabel: string | null;
-  codexGoal: CodexGoal | null;
+  goal: Goal | null;
   isSubAgentSession: boolean;
+  /**
+   * When set (`host_offline` liveness), the host badge becomes a clickable
+   * "Host is offline — click to reconnect" affordance. Also forces the tray
+   * to render even when it would otherwise be empty, so the prompt is always
+   * visible for an unreachable host.
+   */
+  onHostReconnect?: () => void;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
@@ -3620,11 +3666,19 @@ function ComposerStatusLine({
   // control that changes them.
   const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
-  const showGoal = !!conversationId && codexGoal != null;
+  const showGoal = !!conversationId && goal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness) return null;
+  // The offline-host reconnect affordance lives in the host badge, so the tray
+  // must render even when every other slot is empty (an unreachable session
+  // often has no branch/ring/harness yet). Gated by `showHost`: only host-bound
+  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
+  // never host-bound — a stranded child is `local_stranded`, which keeps its
+  // banner elsewhere.
+  const showReconnect = showHost && !!onHostReconnect;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness && !showReconnect)
+    return null;
 
   return (
     <div
@@ -3646,7 +3700,9 @@ function ComposerStatusLine({
           so the right cluster stays pinned right even when both are absent;
           each item truncates to an ellipsis so the tray never wraps. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
-        {showHost && conversationId && <HostBadge sessionId={conversationId} />}
+        {showHost && conversationId && (
+          <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
+        )}
         {showBranch && (
           <span className="flex min-w-0 items-center gap-1.5">
             <GitBranchIcon className="size-3.5 shrink-0" />
@@ -3667,7 +3723,7 @@ function ComposerStatusLine({
             <span>Plan mode</span>
           </span>
         )}
-        {showGoal && codexGoal && <CodexGoalStatusPill goal={codexGoal} />}
+        {showGoal && goal && <GoalStatusPill goal={goal} />}
         {showHarness && harnessLabel && (
           <span
             data-testid="composer-harness"
@@ -3780,17 +3836,20 @@ export function Composer({
   modelPickerKind,
   codexModelOptions,
   showCodexPlanMode,
-  showCodexGoal = false,
+  showGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
+  hostOffline = false,
+  onShowReconnectHelp,
   costRoutingVerdict = null,
   costRoutingEligible = false,
   subAgentLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
@@ -3899,10 +3958,7 @@ export function Composer({
     unreachable,
     maybeFlushQueuedHead,
   ]);
-  const { goal: codexGoal, setGoal: setCodexGoal } = useCodexGoalState(
-    conversationId,
-    showCodexGoal,
-  );
+  const { goal, setGoal: setGoalState } = useGoalState(conversationId, showGoalControl);
   // "@"-file-mention is scoped to the native coding-agent harnesses: their
   // vendor CLIs run in the workspace and read an on-disk file from an
   // attachment marker the executor already emits. In-process SDK sessions
@@ -4028,9 +4084,7 @@ export function Composer({
   };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
   // keyboard nav indexes into the same list.
-  const menuMatches = menuOpen
-    ? Object.keys(slashCommands).filter((name) => name.slice(1).startsWith(menuQuery.toLowerCase()))
-    : [];
+  const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
 
   // Pre-select the first match whenever the filtered list changes — both
   // when the menu first opens (matches go [] → non-empty) and as the query
@@ -4876,12 +4930,17 @@ export function Composer({
             <ComposerMicButton
               disabled={disabled || isReadOnly || hasPendingElicitation}
               onTranscript={(text) => {
-                setValue((prev) => (prev ? `${prev} ${text}` : text));
+                dictation.appendFinal(text);
                 dirtyRef.current = true;
                 // Dictation is a user-driven edit — exit prompt-recall mode
                 // so ArrowUp/ArrowDown don't clobber the dictated text.
                 resetCursor();
                 if (commandError !== null) setCommandError(null);
+              }}
+              onInterim={(text) => {
+                dictation.replaceInterim(text);
+                dirtyRef.current = true;
+                resetCursor();
               }}
             />
           </div>
@@ -4931,12 +4990,13 @@ export function Composer({
                 </TooltipContent>
               </Tooltip>
             )}
-            {showCodexGoal && (
-              <CodexGoalControl
+            {showGoalControl && (
+              <GoalControl
                 conversationId={conversationId}
                 readOnly={isReadOnly}
-                goal={codexGoal}
-                onGoalChange={setCodexGoal}
+                goal={goal}
+                onGoalChange={setGoalState}
+                backendLabel="Codex"
               />
             )}
             <AgentPicker
@@ -4984,8 +5044,9 @@ export function Composer({
       </div>
       <ComposerStatusLine
         harnessLabel={harnessLabel}
-        codexGoal={codexGoal}
+        goal={goal}
         isSubAgentSession={subAgentLabel != null}
+        onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
       />
     </form>
   );
@@ -5281,13 +5342,14 @@ export function shouldShowCodexPlanModeControl(
 }
 
 /**
- * True when the Codex Goal control should be visible.
+ * True when the session Goal control should be visible.
  *
  * @param conv - Session or sidebar row carrying labels. ``null`` or missing
  *   labels fail closed.
- * @returns True only for Codex-native wrapper sessions.
+ * @returns True only for Codex-native wrapper sessions until the server
+ *   advertises a generic goal capability.
  */
-export function shouldShowCodexGoalControl(
+export function shouldShowGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);

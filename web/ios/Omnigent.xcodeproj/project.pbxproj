@@ -13,6 +13,7 @@
 		B10000000000000000000004 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DesignTokens.swift */; };
 		B10000000000000000000005 /* SettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* SettingsStore.swift */; };
 		B10000000000000000000006 /* ServerURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* ServerURL.swift */; };
+		B10000000000000000000014 /* DeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* DeepLink.swift */; };
 		B10000000000000000000007 /* WorkspaceURLExpander.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* WorkspaceURLExpander.swift */; };
 		B10000000000000000000008 /* NativeNotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000008 /* NativeNotificationManager.swift */; };
 		B10000000000000000000009 /* WebShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* WebShellView.swift */; };
@@ -27,6 +28,7 @@
 		B20000000000000000000001 /* ServerURLTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ServerURLTests.swift */; };
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
+		B20000000000000000000004 /* DeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* DeepLinkTests.swift */; };
 		B40000000000000000000001 /* OmnigentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000001 /* OmnigentUITests.swift */; };
 		B40000000000000000000002 /* SnapshotHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000002 /* SnapshotHelper.swift */; };
 /* End PBXBuildFile section */
@@ -55,6 +57,7 @@
 		A10000000000000000000004 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
 		A10000000000000000000005 /* SettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000006 /* ServerURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURL.swift; sourceTree = "<group>"; };
+		A10000000000000000000014 /* DeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLink.swift; sourceTree = "<group>"; };
 		A10000000000000000000007 /* WorkspaceURLExpander.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpander.swift; sourceTree = "<group>"; };
 		A10000000000000000000008 /* NativeNotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeNotificationManager.swift; sourceTree = "<group>"; };
 		A10000000000000000000009 /* WebShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebShellView.swift; sourceTree = "<group>"; };
@@ -71,6 +74,7 @@
 		A20000000000000000000001 /* ServerURLTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURLTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000004 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
 		A30000000000000000000003 /* OmnigentUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000001 /* OmnigentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentUITests.swift; sourceTree = "<group>"; };
 		A40000000000000000000002 /* SnapshotHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotHelper.swift; sourceTree = "<group>"; };
@@ -133,6 +137,7 @@
 				A10000000000000000000004 /* DesignTokens.swift */,
 				A10000000000000000000005 /* SettingsStore.swift */,
 				A10000000000000000000006 /* ServerURL.swift */,
+				A10000000000000000000014 /* DeepLink.swift */,
 				A10000000000000000000007 /* WorkspaceURLExpander.swift */,
 				A10000000000000000000008 /* NativeNotificationManager.swift */,
 				A10000000000000000000009 /* WebShellView.swift */,
@@ -155,6 +160,7 @@
 				A20000000000000000000001 /* ServerURLTests.swift */,
 				A20000000000000000000002 /* SettingsStoreTests.swift */,
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
+				A20000000000000000000004 /* DeepLinkTests.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -313,6 +319,7 @@
 				B10000000000000000000004 /* DesignTokens.swift in Sources */,
 				B10000000000000000000005 /* SettingsStore.swift in Sources */,
 				B10000000000000000000006 /* ServerURL.swift in Sources */,
+				B10000000000000000000014 /* DeepLink.swift in Sources */,
 				B10000000000000000000007 /* WorkspaceURLExpander.swift in Sources */,
 				B10000000000000000000008 /* NativeNotificationManager.swift in Sources */,
 				B10000000000000000000009 /* WebShellView.swift in Sources */,
@@ -331,6 +338,7 @@
 				B20000000000000000000001 /* ServerURLTests.swift in Sources */,
 				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
+				B20000000000000000000004 /* DeepLinkTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

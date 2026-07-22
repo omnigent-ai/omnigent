@@ -3,9 +3,12 @@ name: Electron Build
 # Manually-triggered build of the Electron desktop shell (web/electron) for
 # Linux and Windows. Each platform packages on its own native runner —
 # electron-builder does not reliably cross-compile installers — and uploads the
-# installers as downloadable workflow artifacts. Unsigned: no signing creds are
+# installers PLUS the electron-updater feed manifests (latest-linux.yml /
+# latest.yml) as downloadable workflow artifacts. Unsigned: no signing creds are
 # wired here, so `CSC_IDENTITY_AUTO_DISCOVERY=false` forces an unsigned build
-# rather than failing when a cert is absent. No publishing / release upload.
+# rather than failing when a cert is absent. No publishing to a provider / no
+# release upload (`--publish never`): the artifacts are captured here for manual
+# placement onto the omnigent.ai update feed (omnigent-site repo + artifact host).
 #
 # Run it from the Actions tab (Run workflow). macOS is intentionally omitted —
 # its signed/notarized build lives elsewhere.
@@ -59,9 +62,30 @@ jobs:
           node-version: "22"
           cache-dependency-path: web/electron/package-lock.json
 
+      - name: Verify lockfile uses public registry
+        # Fail fast (in seconds, not minutes) if any package-lock.json
+        # resolved URL points at an internal proxy that public CI runners
+        # can't reach — e.g. npm-proxy.cloud.databricks.com. Without this
+        # guard, npm ci silently times out mid-install on Windows/Linux.
+        # Uses the shared normalize_package_lock_registry.py script (same
+        # one wired into pre-commit) so CI and local checks stay in sync.
+        working-directory: web/electron
+        shell: bash
+        run: |
+          python3 ../../scripts/normalize_package_lock_registry.py --check package-lock.json
+
       - name: Install dependencies
         working-directory: web/electron
         run: npm ci --no-audit --no-fund
+
+      # The shell-owned update overlay reuses the web UpdateBanner component; it
+      # is built from the web app into electron/overlay/ (gitignored) and shipped
+      # by electron-builder (build.files). The build:<platform> scripts run it
+      # automatically via their `prebuild:*` hook (see web/electron/package.json)
+      # — this step only needs to install the web app's deps so that hook works.
+      - name: Install web deps (for the update overlay build)
+        working-directory: web
+        run: npm ci --legacy-peer-deps --no-audit --no-fund
 
       - name: Build ${{ matrix.platform }} app
         working-directory: web/electron
@@ -74,15 +98,43 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: npm run ${{ matrix.build-script }} -- --publish never
 
-      - name: Upload installers
+      # One artifact per platform bundling the COMPLETE electron-updater feed —
+      # the installer(s), the .blockmap electron-updater needs for differential
+      # downloads (referenced by path inside latest*.yml; the .deb has no
+      # blockmap since debs aren't differentially updated), and the feed
+      # manifest (latest-linux.yml / latest.yml). upload-artifact zips all
+      # matched files into a single download, so each platform yields one zip
+      # whose contents can be dropped straight onto a feed root (local HTTP
+      # server for testing, or public/_desktop/updates/ on the artifact host).
+      # Ship only the distributables + feed files, not electron-builder's
+      # unpacked intermediates (dist/*-unpacked).
+      #
+      # electron-builder writes the latest*.yml manifests to dist/ even under
+      # --publish never (a publish config exists in build.*.publish, so
+      # update-info generation runs; --publish only skips the provider upload).
+      # The manifest lists each artifact with sha512 + size + relative url.
+
+      - name: Upload Linux feed
+        if: matrix.platform == 'linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: omnigent-desktop-${{ matrix.platform }}
-          # Ship only the distributables, not electron-builder's unpacked
-          # intermediates (dist/linux-unpacked, dist/win-unpacked, blockmaps).
+          name: omnigent-desktop-linux
           path: |
             web/electron/dist/*.AppImage
+            web/electron/dist/*.AppImage.blockmap
             web/electron/dist/*.deb
+            web/electron/dist/latest-linux.yml
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows feed
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: omnigent-desktop-win
+          path: |
             web/electron/dist/*.exe
+            web/electron/dist/*.exe.blockmap
+            web/electron/dist/latest.yml
           if-no-files-found: error
           retention-days: 14

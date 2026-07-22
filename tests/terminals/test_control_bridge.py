@@ -279,14 +279,23 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
     await asyncio.sleep(0.2)
 
     ws = _FakeWebSocket(inbound=[], send_delay_s=0.005)
+    reader_done = asyncio.Event()
+    forward_done = asyncio.Event()
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
+            ws,
+            socket_path=str(sock),
+            tmux_target=target,
+            read_only=False,
+            reader_done=reader_done,
+            forward_done=forward_done,
         )
     )
-    # Wait past attach + burst + the bounded drain (coalesced to ~100 frames of
-    # ~20 KB, so ~0.5 s of 5 ms sends; generous margin below).
-    await asyncio.sleep(10.0)
+    # Deterministically wait until the reader has queued the whole backlog plus
+    # the EOF sentinel, then until the forwarder has fully drained it — no
+    # arbitrary wall-clock sleep. Timeouts are generous backstops, not timing.
+    await asyncio.wait_for(reader_done.wait(), timeout=20.0)
+    await asyncio.wait_for(forward_done.wait(), timeout=20.0)
 
     total_y = sum(f.count(b"Y") for f in ws.sent)
     assert total_y >= payload_len, (

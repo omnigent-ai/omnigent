@@ -42,6 +42,7 @@ from omnigent.spec.types import (
     FunctionRef,
     LabelDef,
     LLMConfig,
+    Phase,
     PolicySpec,
 )
 from omnigent.stores.conversation_store import ConversationStore
@@ -231,6 +232,51 @@ def _load_user_daily_cost(
     )
     state["user_id"] = owner
     return state
+
+
+def any_policies_apply(
+    *,
+    spec: AgentSpec,
+    conversation_id: str,
+    default_policies: list[PolicySpec] | None,
+    policy_store: PolicyStore | None,
+    phase: Phase | None = None,
+    tool_name: str | None = None,
+) -> bool:
+    """Return ``True`` when at least one policy would run for this evaluation.
+
+    Cheaper than building a full :class:`PolicyEngine`: only checks whether
+    the combined policy list is non-empty. Used as a fast-path guard in
+    ``POST /policies/evaluate`` to skip the engine build (and the associated
+    conversation-store reads for labels/state/usage) when nothing would fire.
+
+    Reads from the same caches as :func:`build_policy_engine`, so the check
+    is O(1) for warm cache hits.
+
+    :param spec: The agent's parsed spec.
+    :param conversation_id: Conversation id, e.g. ``"conv_abc123"``.
+    :param default_policies: Server-wide policies from ``RuntimeCaps``.
+    :param policy_store: Session-scoped policy store; ``None`` means no DB
+        policies are configured.
+    :param phase: The evaluation phase, if known.
+    :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
+    :returns: ``False`` when the engine would have an empty policy list and
+        ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
+    """
+    # The engine unconditionally injects _ASK_ON_ADD_POLICY_SPEC so agents
+    # cannot silently install session policies. Never fast-path sys_add_policy
+    # TOOL_CALL events — they must always reach the engine for that gate.
+    if phase == Phase.TOOL_CALL and tool_name == "sys_add_policy":
+        return True
+    if spec.guardrails and spec.guardrails.policies:
+        return True
+    if default_policies:
+        return True
+    # Session policies are LRU-cached per (workspace_id, conversation_id) —
+    # this is a cache hit on any call after the first for this session.
+    if _load_session_policy_specs(conversation_id, policy_store):
+        return True
+    return False
 
 
 def build_policy_engine(

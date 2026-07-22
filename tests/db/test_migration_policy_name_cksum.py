@@ -58,12 +58,10 @@ def test_name_indexes_key_on_checksum(db_engine: Engine) -> None:
     assert "ix_policies_default_name" not in indexes
 
     uniques = {u["name"]: u for u in inspector.get_unique_constraints("policies")}
-    assert "uq_policies_session_id_name_cksum" in uniques
-    assert uniques["uq_policies_session_id_name_cksum"]["column_names"] == [
-        "workspace_id",
-        "session_id",
-        "name_cksum",
-    ]
+    # The (session_id, name_cksum) unique key was dropped (d4c1b9e6f3a2);
+    # session-name uniqueness now lives in the store, keyed on name_cksum
+    # via the plain ix_policies_name_cksum index checked above.
+    assert "uq_policies_session_id_name_cksum" not in uniques
     assert "uq_policies_session_id_name" not in uniques
 
 

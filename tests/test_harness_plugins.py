@@ -59,7 +59,11 @@ def test_community_harness_contribution_is_merged(monkeypatch: pytest.MonkeyPatc
     assert (
         hp.spawn_env_builders()["foo"] == "omnigent.community.harness.foo.plugin:build_spawn_env"
     )
-    assert {"id": "foo", "label": "Foo"} in hp.harness_catalog()
+    foo_row = next((row for row in hp.harness_catalog() if row["id"] == "foo"), None)
+    assert foo_row is not None
+    assert foo_row["label"] == "Foo"
+    # Every catalog row now also carries a setup_steps checklist.
+    assert "setup_steps" in foo_row
 
 
 def test_community_harness_rejects_non_community_import_path(
@@ -182,13 +186,13 @@ def test_community_harness_readiness_uses_install_metadata(
 
     from omnigent.onboarding import harness_readiness as readiness
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda _binary: None)
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda _binary: None)
     assert readiness.harness_is_configured("foo") is False
     configured = readiness.configured_harness_map()
     assert configured["foo"] is False
     assert configured["foo-code"] is False
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda binary: f"/usr/bin/{binary}")
     assert readiness.harness_is_configured("foo") is True
 
 
