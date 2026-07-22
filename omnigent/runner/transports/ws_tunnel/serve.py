@@ -656,6 +656,13 @@ async def _serve_tunnel_once(
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         if shutdown_wait in done:
+                            # Shutdown wins the race even if a frame landed on the
+                            # same tick: that last frame is dropped. Acceptable —
+                            # this only runs on idle-reaper teardown, and a
+                            # host-bound session replays/relaunches on the next
+                            # message. Cancel the pending read and await it so the
+                            # cancellation settles (and its error is retrieved)
+                            # before we drain and close.
                             recv_task.cancel()
                             with contextlib.suppress(asyncio.CancelledError, WebSocketException):
                                 await recv_task
