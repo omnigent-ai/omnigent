@@ -1,0 +1,135 @@
+name: UI Benchmark
+
+# Nightly run of the end-to-end UI performance benchmark
+# (dev/benchmarks/omnigent_ui). Boots a real server + runner against a
+# zero-latency mock LLM, builds & serves the web SPA, drives real browser
+# journeys with Playwright, and uploads the JSON report as an artifact —
+# per-journey latency plus network-request counts (by resource type and by
+# method+path). Same artifact contract as the HTTP benchmark (benchmark.yml),
+# so the workspace ETL notebook can ingest it the same way.
+#
+# Scheduled -> runs on the trusted default branch with the repo GITHUB_TOKEN;
+# it reads no PR-authored code. Also dispatchable for an ad-hoc run.
+
+on:
+  schedule:
+    - cron: "43 7 * * *" # 07:43 UTC nightly (just after the HTTP benchmark)
+  workflow_dispatch:
+    inputs:
+      checkout_sha:
+        description: "Commit SHA to benchmark (blank = branch HEAD)"
+        required: false
+        default: ""
+      iterations:
+        description: "Timed browser ops per run (clamped per journey)"
+        required: false
+        default: "8"
+      runs:
+        description: "Timed runs per journey"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+env:
+  # No SPA build during `uv sync`: a dedicated step builds the bundle, and the
+  # setup.py build otherwise times out on public npm.
+  OMNIGENT_SKIP_WEB_UI: "true"
+  # Scrub harness credentials the benchmark server must not pick up
+  # (OPENAI_* are overridden to the mock inside the spawned server/runner env).
+  ANTHROPIC_API_KEY: ""
+  DATABRICKS_TOKEN: ""
+  UV_INDEX_URL: https://pypi.org/simple
+  PIP_INDEX_URL: https://pypi.org/simple
+  # Root/container Chromium refuses to start without --no-sandbox; the harness
+  # adds the flag when this is set (matches the e2e_ui suite).
+  OMNIGENT_PW_NO_SANDBOX: "1"
+  ITERATIONS: ${{ github.event_name == 'workflow_dispatch' && inputs.iterations || '8' }}
+  RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
+
+concurrency:
+  # Never cancel a scheduled run mid-flight (each is a distinct data point).
+  # Manual dispatches get a per-run group so repeated ad-hoc runs never cancel.
+  group: ui-benchmark-${{ github.event_name }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  ui-benchmark:
+    name: Run UI benchmark
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          # Pin the benchmarked code to a specific commit when dispatched with
+          # checkout_sha; the workflow definition still comes from the trusted
+          # dispatch ref. Blank falls back to the ref's HEAD (schedule/default).
+          ref: ${{ inputs.checkout_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up Node 20
+        uses: ./.github/actions/setup-node
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --extra all --extra dev
+
+      - name: Install bubblewrap + tmux
+        # The runner opens terminals under os_env, whose linux_bwrap backend
+        # needs `bwrap`; the apparmor sysctl mirrors the e2e-ui workflow
+        # (Ubuntu 24.04 blocks the user namespaces bwrap's unshare needs).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap tmux
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Build web SPA
+        # Build BEFORE the benchmark: Vite's emptyOutDir clobbers the static
+        # dir, so it must never run alongside the live server. The harness then
+        # runs with --skip-build to reuse this bundle.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          cd web
+          npm ci --legacy-peer-deps --no-audit --no-fund
+          npm run build
+
+      - name: Run UI benchmark
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent_ui/run.py \
+            --skip-build \
+            --iterations "$ITERATIONS" \
+            --runs "$RUNS" \
+            --output ui-benchmark-results.json
+
+      - name: Upload UI benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: ui-benchmark-results-${{ github.run_id }}
+          path: ui-benchmark-results.json
+          retention-days: 90
+          if-no-files-found: warn
