@@ -360,6 +360,150 @@ def test_clear_screen_emits_clear_sequence_only_on_a_tty(monkeypatch: pytest.Mon
     assert pipe.getvalue() == ""  # no escape sequences leak into non-TTY output
 
 
+class _FakeMsvcrt:
+    """Stand-in for the ``msvcrt`` module that replays scripted keypresses.
+
+    Lets the Windows raw-key path be driven from a POSIX test runner: the
+    real console bytes are well-defined, so replaying them proves the
+    decoding without a Windows box.
+    """
+
+    def __init__(self, keys: list[bytes]) -> None:
+        self._keys = iter(keys)
+
+    def getch(self) -> bytes:
+        return next(self._keys)
+
+
+def _win_reader(keys: list[bytes]) -> object:
+    """Build the Windows key reader over a scripted byte stream."""
+    return interactive._windows_key_reader(_FakeMsvcrt(keys).getch)
+
+
+def test_windows_key_reader_decodes_arrow_prefix() -> None:
+    """Both msvcrt arrow prefixes (``\\x00`` and ``\\xe0``) decode to up/down.
+
+    A Windows console reports arrows as a two-byte sequence: a ``\\x00`` or
+    ``\\xe0`` prefix followed by a scan code (``H`` up, ``P`` down). Getting
+    this wrong means arrow keys silently do nothing on Windows.
+    """
+    read = _win_reader([b"\xe0", b"H"])
+    assert read() == "up"
+    read = _win_reader([b"\x00", b"P"])
+    assert read() == "down"
+
+
+def test_windows_key_reader_ignores_unknown_prefixed_codes() -> None:
+    """A prefixed non-arrow scan code (e.g. ← ) consumes both bytes and is ignored.
+
+    If the prefix byte were not paired with its scan code, the trailing
+    ``K`` would be re-read as a literal key and mis-navigate the menu.
+    """
+    read = _win_reader([b"\xe0", b"K"])
+    assert read() == "ignore"
+
+
+def test_windows_key_reader_decodes_enter_cancel_and_vi_keys() -> None:
+    """Enter confirms; Esc / Ctrl-C / Ctrl-D abort; j/k move — same as POSIX.
+
+    The Windows branch must honor the exact key contract the POSIX branch
+    documents, otherwise the menu behaves differently per platform.
+    """
+    assert _win_reader([b"\r"])() == "enter"
+    assert _win_reader([b"\n"])() == "enter"
+    assert _win_reader([b"\x1b"])() == "cancel"
+    assert _win_reader([b"\x03"])() == "cancel"
+    assert _win_reader([b"\x04"])() == "cancel"
+    assert _win_reader([b"k"])() == "up"
+    assert _win_reader([b"K"])() == "up"
+    assert _win_reader([b"j"])() == "down"
+    assert _win_reader([b"J"])() == "down"
+    assert _win_reader([b"x"])() == "ignore"
+
+
+def test_key_loop_skips_header_rows_and_returns_selection() -> None:
+    """The platform-free key loop glides ↑/↓ over headers and Enter confirms.
+
+    Mask ``[F, T, T, F, T]`` starting at index 1: two downs must land on 2
+    then 4 (skipping the header at 3), and Enter returns that row without
+    cancelling.
+    """
+    keys = iter(["down", "down", "enter"])
+    redraws = []
+    selected, cancelled = interactive._run_key_loop(
+        lambda: next(keys),
+        lambda: redraws.append(1),
+        [False, True, True, False, True],
+        1,
+    )
+    assert (selected, cancelled) == (4, False)
+    # One redraw per move; Enter does not redraw.
+    assert len(redraws) == 2
+
+
+def test_key_loop_cancel_returns_cancelled() -> None:
+    """A ``cancel`` key aborts the loop so ``select`` can return ``-1``."""
+    keys = iter(["down", "cancel"])
+    _selected, cancelled = interactive._run_key_loop(
+        lambda: next(keys), lambda: None, [True, True], 0
+    )
+    assert cancelled is True
+
+
+def test_key_loop_eof_confirms_current_row() -> None:
+    """An exhausted input stream confirms the highlighted row, as POSIX does today."""
+    keys = iter(["eof"])
+    selected, cancelled = interactive._run_key_loop(
+        lambda: next(keys), lambda: None, [True, True], 1
+    )
+    assert (selected, cancelled) == (1, False)
+
+
+def test_select_on_win32_uses_msvcrt_and_never_imports_termios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``select`` on a Windows TTY drives msvcrt instead of the POSIX modules.
+
+    This is the direct regression for ``omnigent setup`` crashing with
+    ``ModuleNotFoundError: No module named 'termios'``: ``termios``/``tty``
+    are poisoned in ``sys.modules`` to mimic a Windows interpreter where
+    they do not exist. Feeding ``↓`` then Enter must return index 1 — if
+    ``select`` still reaches for a POSIX-only module, this raises instead.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setitem(sys.modules, "termios", None)
+    monkeypatch.setitem(sys.modules, "tty", None)
+    monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt([b"\xe0", b"P", b"\r"]))
+    monkeypatch.setattr(interactive, "_enable_windows_vt", lambda: True, raising=False)
+
+    result = interactive.select("Pick one", ["alpha", "beta", "gamma"])
+
+    assert result == 1
+
+
+def test_select_on_win32_falls_back_when_ansi_cannot_be_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A console that refuses VT mode gets the numbered fallback, not escape garbage.
+
+    The in-place redraw is pure ANSI, so on a legacy console that cannot be
+    switched into VT mode the menu would render as literal escape codes.
+    Degrade to the numbered prompt instead.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setitem(sys.modules, "termios", None)
+    monkeypatch.setitem(sys.modules, "tty", None)
+    monkeypatch.setitem(sys.modules, "msvcrt", _FakeMsvcrt([]))
+    monkeypatch.setattr(interactive, "_enable_windows_vt", lambda: False, raising=False)
+    _feed(monkeypatch, ["2"])
+
+    result = interactive.select("Pick one", ["alpha", "beta", "gamma"])
+
+    assert result == 1
+
+
 def test_render_menu_windows_long_list_to_viewport() -> None:
     """``max_visible`` renders only the window slice + scroll markers."""
     options = [f"item-{i}" for i in range(20)]
