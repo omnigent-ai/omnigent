@@ -187,24 +187,21 @@ async def _register_routes(
 
 
 async def _open_entry_config(page, agent_id: str) -> None:
-    """Open the agent/harness picker and drill into one entry's config submenu.
+    """Select one agent and open its Agent Harness select in the config modal.
 
-    The redesigned composer replaces the old harness trigger with a single
-    agent/harness dropdown (``new-chat-landing-agent-select``). A bundle agent's
-    brain-harness radios (the "Agent Harness" group, with the per-row readiness
-    badges) live in its per-entry **submenu**. A plain *click* on a knobbed row
-    COMMITS that agent and closes the menu, so this hovers the row and nudges it
-    with ``ArrowRight`` to open the submenu without committing — the Playwright
-    counterpart of the unit test's ``openAgentConfig`` helper.
+    A bundle agent's brain-harness options (the "Agent Harness" group, with the
+    per-row readiness badges) now live in the gear-icon config modal's Select,
+    not a picker submenu. Select the agent from the dropdown, open its config
+    modal via the gear, then open the harness Select so the badged options
+    render.
 
     :param page: The Playwright page (the landing picker is already mounted).
-    :param agent_id: The stubbed agent id whose submenu to open, e.g.
-        ``"ag_polly_e2e"``.
+    :param agent_id: The stubbed agent id to configure, e.g. ``"ag_polly_e2e"``.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()
-    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
-    await row.hover()
-    await row.press("ArrowRight")
+    await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+    await page.get_by_test_id("new-chat-landing-config-gear").click()
+    await page.get_by_test_id("new-chat-landing-config-harness").click()
 
 
 def test_codex_needs_auth_warns_and_clears_when_available(

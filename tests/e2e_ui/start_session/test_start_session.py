@@ -2266,22 +2266,22 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             # Open the agent picker dropdown.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
-            # The real built-in Claude Code is offered...
+            # The real built-in Claude Code is offered inline...
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
             ).to_be_visible(timeout=30_000)
-            # ...the genuinely custom agent survives...
-            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
             # ...and BOTH fork clones of the built-in are dropped. Pre-fix the
             # fork-of-fork (ag_forkfork) rendered as a duplicate "Claude Code".
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_fork1")).to_have_count(0)
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Three options total: the built-in + the one custom agent +
-            # the "Create custom agent" action — no duplicate "Claude Code"
-            # sneaks in via a leaked clone.
-            await expect(page.get_by_role("menuitem")).to_have_count(3)
+            # Top level: the built-in Claude row + the "Custom agents" submenu
+            # trigger — no duplicate "Claude Code" sneaks in via a leaked clone.
+            await expect(page.get_by_role("menuitem")).to_have_count(2)
+            # The genuinely custom agent survives, inside the Custom agents submenu.
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:
             await browser.close()
 

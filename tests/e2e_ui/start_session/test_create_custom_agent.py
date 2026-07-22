@@ -177,6 +177,18 @@ async def _seed_workspace(page) -> None:
     )
 
 
+async def _open_create_agent(page) -> None:
+    """Open the agent picker and click "Create custom agent".
+
+    Custom agents (and the create action) now live in the picker's
+    "Custom agents" submenu, so open the dropdown, drill into that submenu,
+    then click the create item.
+    """
+    await page.get_by_test_id("new-chat-landing-agent-select").click()
+    await page.get_by_test_id("new-chat-landing-custom-agents").click()
+    await page.get_by_test_id("new-chat-landing-create-agent").click()
+
+
 # ── Tests ──────────────────────────────────────────────────────────
 
 
@@ -204,8 +216,9 @@ async def _drive_dialog_opens(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Open the agent dropdown.
+            # Open the agent dropdown and drill into the "Custom agents" submenu.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
 
             # "Create custom agent" item should be visible.
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
@@ -251,8 +264,7 @@ async def _drive_create_and_submit(base_url: str, session_id: str) -> None:
             )
 
             # Open dropdown → Create custom agent.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
 
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
@@ -314,8 +326,7 @@ async def _drive_mcp_server(base_url: str, session_id: str) -> None:
             )
 
             # Open dropdown → Create custom agent.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
 
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
@@ -378,8 +389,7 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             )
 
             # Open dropdown → Create custom agent.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
 
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
@@ -440,11 +450,13 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
 
-            # On the sandbox, the create item is omitted from the picker.
+            # On the sandbox with no custom agents, the whole "Custom agents"
+            # group (which holds the create item) is omitted from the picker.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await expect(page.get_by_test_id("new-chat-landing-custom-agents")).to_have_count(0)
             await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
 
-            # Switch to the connected host: the item reappears and opens.
+            # Switch to the connected host: the group reappears and create opens.
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
@@ -452,6 +464,7 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             create_item = page.get_by_test_id("new-chat-landing-create-agent")
             await expect(create_item).to_be_visible()
             await create_item.click()
@@ -495,8 +508,7 @@ async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> N
             # Switch to the connected host, then create + submit a pending agent.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
             await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
             await page.get_by_test_id("create-agent-name").fill("pending-agent")
             await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
