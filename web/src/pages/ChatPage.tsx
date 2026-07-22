@@ -5061,14 +5061,14 @@ export function computeShowsWorking(
  *
  * The prompt is the optional first message the landing composer hands off via
  * the shared chatStore. It is sent exactly once per conversation, and only once
- * the session is ready: hydrated (snapshot loaded / stream bound) and an
- * agent resolved.
+ * the session is ready: history hydrated / stream bound and an agent resolved.
  *
  * We intentionally do NOT gate on runner liveness. The stream-bind gate
  * (``loadingConversation``) is load-bearing — the session stream is
- * live-tail with no replay buffer, so POSTing before ``bindStream``
- * connects would lose the turn's events ("no response"). But the runner
- * itself need not be online yet: the server's ``POST /events`` handler
+ * live-tail with no replay buffer, so POSTing before the stream pump
+ * starts would lose the turn's events ("no response"). The gate clears
+ * once history hydrates (snapshot metadata may still be in flight). The
+ * runner itself need not be online yet: the server's ``POST /events`` handler
  * holds the request open while a host-bound runner is spinning up (a 3s
  * connect grace, then a relaunch + 30s wait — see ``post_event`` in
  * ``sessions.py``), and only 503s if no runner ever comes online. So the
@@ -5090,7 +5090,7 @@ export function computeShowsWorking(
  *   ChatPage) does not block.
  * @param params.conversationId Active session id from the URL, or
  *   ``null``/``undefined`` on the new-chat landing, e.g. ``"conv_abc"``.
- * @param params.loadingConversation ``true`` while the snapshot hydrates.
+ * @param params.loadingConversation ``true`` while history hydrates.
  * @param params.agentId Resolved agent id, or ``null`` before agents
  *   load, e.g. ``"ag_abc123"``.
  * @returns ``true`` only when every gate passes.

@@ -7,19 +7,24 @@
 // useful client-side error trail.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
 import {
   approve,
   bindOnlyOnlineRunner,
   createSession,
+  extendInitialHistoryWindow,
+  fetchInitialHistoryFirstPage,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
   forkSession,
   getSession,
   getSessionSlim,
+  initialHistoryQueryKey,
   interrupt,
   listRunners,
   openSessionStream,
   postEvent,
+  prefetchSessionForSwitch,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -924,6 +929,72 @@ describe("fetchInitialHistoryWindow", () => {
   });
 });
 
+describe("fetchInitialHistoryFirstPage", () => {
+  it("fetches a single page for fast first paint", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [{ id: "msg_2" }, { id: "msg_1" }],
+        first_id: "msg_2",
+        last_id: "msg_1",
+        has_more: true,
+      }),
+    );
+
+    const page = await fetchInitialHistoryFirstPage("conv_fast");
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(page.items.map((i) => i.id)).toEqual(["msg_1", "msg_2"]);
+    expect(page.hasMore).toBe(true);
+  });
+});
+
+describe("extendInitialHistoryWindow", () => {
+  function userWire(id: string) {
+    return {
+      id,
+      response_id: `resp_${id}`,
+      type: "message",
+      role: "user",
+      status: "completed",
+      content: [{ type: "input_text", text: id }],
+    };
+  }
+  function asstWire(id: string) {
+    return {
+      id,
+      response_id: `resp_${id}`,
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      model: "agent_xyz",
+      content: [{ type: "output_text", text: id }],
+    };
+  }
+
+  it("extends a one-user first page to include previous user prompt", async () => {
+    const seed = {
+      items: [userWire("u_last"), ...Array.from({ length: 19 }, (_, i) => asstWire(`a${i}`))],
+      hasMore: true,
+    };
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        object: "list",
+        data: [asstWire("a_prev"), userWire("u_prev")],
+        first_id: "a_prev",
+        last_id: "u_prev",
+        has_more: true,
+      }),
+    );
+
+    const page = await extendInitialHistoryWindow("conv_ext", seed);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(page.items[0]!.id).toBe("u_prev");
+    expect(page.items.some((i) => i.id === "u_last")).toBe(true);
+  });
+});
+
 describe("postEvent", () => {
   it("POSTs the event body verbatim and returns {queued, itemId}", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: true, item_id: "ci_123" }));
@@ -1037,5 +1108,24 @@ describe("approve", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/elicitations/elic_xyz/resolve");
     expect(JSON.parse(init.body as string)).toEqual({ action: "decline" });
+  });
+});
+
+describe("prefetchSessionForSwitch", () => {
+  it("prefetches the session snapshot and initial history window", () => {
+    const queryClient = new QueryClient();
+    const prefetchSpy = vi.spyOn(queryClient, "prefetchQuery");
+
+    prefetchSessionForSwitch(queryClient, "conv_prefetch");
+
+    expect(prefetchSpy).toHaveBeenCalledTimes(2);
+    expect(prefetchSpy.mock.calls[0]![0]).toMatchObject({
+      queryKey: ["session", "conv_prefetch"],
+    });
+    expect(prefetchSpy.mock.calls[1]![0]).toMatchObject({
+      queryKey: initialHistoryQueryKey("conv_prefetch"),
+    });
+    const historyQuery = prefetchSpy.mock.calls[1]![0] as { queryFn?: () => unknown };
+    expect(historyQuery.queryFn).toBeDefined();
   });
 });

@@ -62,9 +62,12 @@ import {
   approve as approveElicitation,
   bindOnlyOnlineRunner,
   createSession,
+  extendInitialHistoryWindow,
+  fetchInitialHistoryFirstPage,
   getSessionSlim,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
+  initialHistoryQueryKey,
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
@@ -2255,6 +2258,192 @@ async function refreshSessionBinding(id: string): Promise<void> {
 }
 
 /**
+ * Merge hydrated history blocks into live pump blocks, deduping by item id.
+ */
+function mergeHistoryIntoBlocks(state: ChatState, snapshotBlocks: AnyBlock[]): AnyBlock[] {
+  const seenItemIds = new Set(
+    state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+  );
+  const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
+  return [...unique, ...state.blocks];
+}
+
+/** Fire-and-forget sticky effort/model writes for native sessions on cold bind. */
+function runStickyPrefHandoff(session: Session, id: string, get: Getter): void {
+  const nativeModelFamily = nativeModelFamilyForSession(session);
+  const isSubAgentSession = session.parentSessionId != null;
+  const canApplyEffort = supportsEffortControl(session);
+  const stickyEffort = get().selectedEffort;
+  const stickyModel = get().selectedModel;
+  const compatibleStickyModel =
+    nativeModelFamily !== null && stickyModel != null
+      ? isNativeModelCompatible(nativeModelFamily, stickyModel, session)
+        ? stickyModel
+        : null
+      : stickyModel;
+  // Intelligent routing owns first-turn model selection on routing-enabled sessions.
+  // Do not auto-apply sticky model overrides in that mode.
+  const routingOn = session.costControlModeOverride === "on";
+  const willApplyStickyModel =
+    !isSubAgentSession &&
+    !routingOn &&
+    nativeModelFamily !== null &&
+    session.modelOverride == null &&
+    compatibleStickyModel != null;
+  if (
+    !isSubAgentSession &&
+    canApplyEffort &&
+    session.reasoningEffort == null &&
+    stickyEffort != null
+  ) {
+    updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
+      console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
+    });
+  }
+  if (willApplyStickyModel) {
+    updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
+      (err: unknown) => {
+        console.warn(
+          `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
+          err,
+        );
+      },
+    );
+  }
+}
+
+function stickySelectionFromSession(
+  session: Session,
+  get: Getter,
+): {
+  effectiveEffort: ChatState["selectedEffort"];
+  effectiveModel: ChatState["selectedModel"];
+  effectiveSessionOverride: ChatState["sessionModelOverride"];
+} {
+  const nativeModelFamily = nativeModelFamilyForSession(session);
+  const canApplyEffort = supportsEffortControl(session);
+  const stickyEffort = get().selectedEffort;
+  const stickyModel = get().selectedModel;
+  const effectiveEffort = canApplyEffort
+    ? (session.reasoningEffort ?? stickyEffort ?? null)
+    : stickyEffort;
+  const compatibleStickyModel =
+    nativeModelFamily !== null && stickyModel != null
+      ? isNativeModelCompatible(nativeModelFamily, stickyModel, session)
+        ? stickyModel
+        : null
+      : stickyModel;
+  const effectiveModel =
+    nativeModelFamily !== null ? (session.modelOverride ?? compatibleStickyModel) : stickyModel;
+  const isSubAgentSession = session.parentSessionId != null;
+  const routingOn = session.costControlModeOverride === "on";
+  const willApplyStickyModel =
+    !isSubAgentSession &&
+    !routingOn &&
+    nativeModelFamily !== null &&
+    session.modelOverride == null &&
+    compatibleStickyModel != null;
+  const effectiveSessionOverride =
+    session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
+  return { effectiveEffort, effectiveModel, effectiveSessionOverride };
+}
+
+/**
+ * Apply snapshot-only hydration after history has painted: binding metadata,
+ * pending inputs, elicitations, and session status fields.
+ */
+function snapshotHydrationPatch(
+  session: Session,
+  state: ChatState,
+  id: string,
+  hydratePending: boolean,
+  selections: ReturnType<typeof stickySelectionFromSession>,
+): Partial<ChatState> {
+  const bindingPatch = sessionBindingPatch(session);
+  const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
+  const seenElicitationIds = new Set(
+    state.blocks
+      .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
+      .map((b) => b.elicitationId),
+  );
+  const uniquePendingElicitations = pendingElicitationBlocks.filter(
+    (b) => b.type !== "elicitation" || !seenElicitationIds.has(b.elicitationId),
+  );
+  const allBlocks = [...state.blocks, ...uniquePendingElicitations];
+  const hasErrorBlock = allBlocks.some((b) => b.type === "error");
+  const toPending = (p: PendingInput): PendingUserMessage => ({
+    tempId: p.pendingId,
+    content: p.content,
+    ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
+  });
+  let candidatePending: PendingUserMessage[];
+  if (!hydratePending) {
+    candidatePending = state.pendingUserMessages;
+  } else {
+    const serverPending = (session.pendingInputs ?? []).map(toPending);
+    const unmatchedServer = serverPending.map((p) => contentKeyOf(p.content));
+    const unknownToServer = state.pendingUserMessages.filter((p) => {
+      const i = unmatchedServer.indexOf(contentKeyOf(p.content));
+      if (i === -1) return true;
+      unmatchedServer.splice(i, 1);
+      return false;
+    });
+    candidatePending = [...serverPending, ...unknownToServer];
+  }
+  const dedupePending = hydratePending && candidatePending.length > 0;
+  const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
+  const stashBaseline = state.pendingByConversation[id]?.committedTexts ?? [];
+  const countEndsWith = (texts: string[], suffix: string): number =>
+    texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
+  const snapshotPending: PendingUserMessage[] = dedupePending
+    ? candidatePending.filter((p) => {
+        const text = messageContentText(p.content);
+        if (text === "") return true;
+        const baseline = p.tempId.startsWith("pend_") ? countEndsWith(stashBaseline, text) : 0;
+        return countEndsWith(committedUserTexts, text) <= baseline;
+      })
+    : candidatePending;
+  const prunedStash = hydratePending
+    ? (() => {
+        const own = snapshotPending.filter((p) => p.tempId.startsWith("pend_"));
+        const next = { ...state.pendingByConversation };
+        if (own.length > 0) next[id] = { messages: own, committedTexts: committedUserTexts };
+        else delete next[id];
+        return next;
+      })()
+    : state.pendingByConversation;
+  const syntheticError: ErrorBlock | null =
+    session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
+      ? {
+          type: "error",
+          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+          message: session.lastTaskError.message,
+          source: "",
+          code: session.lastTaskError.code,
+        }
+      : null;
+  return {
+    ...bindingPatch,
+    blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
+    pendingUserMessages: snapshotPending,
+    pendingByConversation: prunedStash,
+    sessionStatus: session.status,
+    backgroundTaskCount: session.backgroundTaskCount ?? 0,
+    selectedEffort: selections.effectiveEffort,
+    selectedModel: selections.effectiveModel,
+    sessionModelOverride: selections.effectiveSessionOverride,
+    tokensUsed: session.lastTotalTokens ?? null,
+    sessionCostUsd: session.totalCostUsd ?? null,
+    sessionUsageByModel: session.usageByModel ?? null,
+    todos: (session.todos ?? []) as Array<{
+      content: string;
+      status: "pending" | "in_progress" | "completed";
+      activeForm: string;
+    }>,
+  };
+}
+
+/**
  * Start the session SSE stream, kick off the pump in the background
  * once the stream connects, then fetch metadata plus the most recent
  * page of item history and merge it into state.blocks.
@@ -2267,6 +2456,10 @@ async function refreshSessionBinding(id: string): Promise<void> {
  * elicitations must still replay on refresh while the stream is
  * connecting. Dedupe by item id on merge so stream-delivered
  * persisted items don't double-render alongside hydrated ones.
+ *
+ * History hydrates first so messages paint without waiting on the
+ * slower session snapshot (runner-backed refresh_state round-trips).
+ * Snapshot metadata follows in a second pass.
  */
 async function bindStream(
   id: string,
@@ -2295,277 +2488,134 @@ async function bindStream(
     });
   }
 
-  // Snapshot the session metadata and hydrate the most recent page of
-  // item history. The pump may have already pushed blocks by the time
-  // this resolves — dedupe by item id.
-  // Always refetch the snapshot on bind. A cached session snapshot can
-  // be stale after the agent commits new items while the user is viewing
-  // another conversation; reusing it drops messages until a page refresh.
-  // History is windowed to max(one page, back-to-previous-user-message)
-  // so opening a long transcript stays fast while still showing the last
-  // full turn and its preceding prompt; `loadMoreHistory` pages older on
-  // scroll-up. See `fetchInitialHistoryWindow`.
+  // Hydrate history first so messages paint without waiting on the slower
+  // session snapshot (runner-backed refresh_state round-trips). Snapshot
+  // metadata follows in a second pass. If hover prefetch already warmed
+  // React Query, consume cached history/snapshot immediately.
   // `retry: false` because the most common failure here is "invalid conv
   // id in URL" (not transient).
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
-  try {
-    const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
-        staleTime: 0,
-        retry: false,
-      }),
-      fetchInitialHistoryWindow(id),
-    ]);
-    if (get().conversationId !== id) return;
-    const items = page.items;
-
-    // Sticky-pref handoff for CLI-created sessions with no override.
-    const nativeModelFamily = nativeModelFamilyForSession(session);
-    // Binding-derived fields (isNativeTerminalSession, bound agent,
-    // model/skills metadata) — shared with the session.agent_changed
-    // refresh path; see sessionBindingPatch.
-    const bindingPatch = sessionBindingPatch(session);
-    // Sub-agents inherit orchestrator choices.
-    const isSubAgentSession = session.parentSessionId != null;
-    const canApplyEffort = supportsEffortControl(session);
-    const stickyEffort = get().selectedEffort;
-    const stickyModel = get().selectedModel;
-    // Apply sticky effort only where the Web UI control is meaningful.
-    const effectiveEffort = canApplyEffort
-      ? (session.reasoningEffort ?? stickyEffort ?? null)
-      : stickyEffort;
-    // Non-native: don't auto-apply the model, but keep the sticky pick so
-    // navigating back to a native session restores it.
-    const compatibleStickyModel =
-      nativeModelFamily !== null && stickyModel != null
-        ? isNativeModelCompatible(nativeModelFamily, stickyModel, session)
-          ? stickyModel
-          : null
-        : stickyModel;
-    const effectiveModel =
-      nativeModelFamily !== null ? (session.modelOverride ?? compatibleStickyModel) : stickyModel;
-    // The session's REAL effective override: the server's stored value,
-    // plus the sticky model the native handoff is about to apply. Unlike
-    // `effectiveModel`/`selectedModel` (which hold the unapplied sticky
-    // pick for non-native sessions), this is the session truth the `/model`
-    // readout shows, so a non-applied sticky pick is never mislabeled as
-    // an active "(override)".
-    // Intelligent routing owns model selection: never carry a sticky model
-    // onto a routing-enabled session. Leaving model_override null is what lets
-    // the server-side judge pick on the first turn; a silent sticky PATCH here
-    // would re-pin the session (e.g. to the last-used Opus) and trip the
-    // server's ``model_override is None`` routing guard. effectiveSessionOverride
-    // then resolves to null too, so the /model readout doesn't mislabel it.
-    const routingOn = session.costControlModeOverride === "on";
-    const willApplyStickyModel =
-      !isSubAgentSession &&
-      !routingOn &&
-      nativeModelFamily !== null &&
-      session.modelOverride == null &&
-      compatibleStickyModel != null;
-    const effectiveSessionOverride =
-      session.modelOverride ?? (willApplyStickyModel ? compatibleStickyModel : null);
-    if (
-      !isSubAgentSession &&
-      canApplyEffort &&
-      session.reasoningEffort == null &&
-      stickyEffort != null
-    ) {
-      updateSession(id, { reasoningEffort: stickyEffort }).catch((err: unknown) => {
-        console.warn(`Failed to apply sticky effort=${stickyEffort} to session ${id}:`, err);
-      });
-    }
-    if (willApplyStickyModel) {
-      updateSession(id, { modelOverride: compatibleStickyModel, silent: true }).catch(
-        (err: unknown) => {
-          console.warn(
-            `Failed to apply sticky model=${compatibleStickyModel} to session ${id}:`,
-            err,
-          );
-        },
-      );
-    }
-
-    const snapshotBlocks = itemsToBlocks(items);
-    // Replay outstanding elicitation prompts from the snapshot.
-    // The live SSE stream has no buffer, so a prompt that fired
-    // before this chat was opened wouldn't render otherwise.
-    const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
-    const oldestItemId = items[0]?.id ?? null;
+  const applyHistoryWindow = (page: SessionItemsPage, incrementGeneration: boolean): boolean => {
+    if (get().conversationId !== id) return false;
+    const snapshotBlocks = itemsToBlocks(page.items);
+    const oldestItemId = page.items[0]?.id ?? null;
     set((state) => {
-      const seenItemIds = new Set(
-        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
-      );
-      const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
-      // Dedupe against any elicitation blocks already produced by
-      // the live pump (the snapshot may race ahead of or behind
-      // the SSE event — match by elicitationId).
-      const seenElicitationIds = new Set(
-        state.blocks
-          .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
-          .map((b) => b.elicitationId),
-      );
-      const uniquePendingElicitations = pendingElicitationBlocks.filter(
-        (b) => b.type !== "elicitation" || !seenElicitationIds.has(b.elicitationId),
-      );
-      // Synthesize a visible error block when the session failed and no error
-      // block was already produced by itemsToBlocks. The `response.error` SSE
-      // event is transient (published to the in-memory session stream which
-      // has no replay), so clients that connect after the task has already
-      // failed never receive it. `last_task_error` on the snapshot is the
-      // durable equivalent — use it to ensure the failure reason is always
-      // visible on historical load.
-      // Pending elicitations land after the historical blocks (and any
-      // live blocks the pump already inserted) so the ApprovalCard
-      // appears at the bottom of the chat — same position the live
-      // stream would have given it.
-      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
-      const hasErrorBlock = allBlocks.some((b) => b.type === "error");
-      // Decide the optimistic user bubbles to render after this bind, and
-      // (on cold load) keep the per-conversation stash consistent.
-      //
-      // Rebind (``hydratePending=false``): the live ``pendingUserMessages``
-      // are authoritative — keep them untouched. Deduping/merging here would
-      // flink the live bubble; they clear via the consumed FIFO path.
-      //
-      // Cold load (``hydratePending=true``): the server's ``pending_inputs``
-      // is the source of truth for queued-but-unpersisted messages — replay
-      // ALL of it (the viewer's own and collaborators' alike). The only
-      // client-side additions are the bubbles ``switchTo`` restored from
-      // the stash: own sends whose POST hadn't settled at navigate-away,
-      // which the server can't replay because it hasn't been told about
-      // them yet. A restored bubble the server turns out to know
-      // after all (its record landed while the POST response was still in
-      // transit) is dropped in favor of its content-identical
-      // ``pending_inputs`` twin: the server entry carries the durable
-      // pending id, so the eventual consumed event clears it precisely —
-      // keeping both would double-render and strand one of them.
-      const toPending = (p: PendingInput): PendingUserMessage => ({
-        tempId: p.pendingId,
-        content: p.content,
-        ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
-      });
-      let candidatePending: PendingUserMessage[];
-      if (!hydratePending) {
-        candidatePending = state.pendingUserMessages;
-      } else {
-        const serverPending = (session.pendingInputs ?? []).map(toPending);
-        // One-to-one consumption so two identical queued sends still match
-        // pairwise. Content (not text) equality so image-only messages
-        // correlate too.
-        const unmatchedServer = serverPending.map((p) => contentKeyOf(p.content));
-        const unknownToServer = state.pendingUserMessages.filter((p) => {
-          const i = unmatchedServer.indexOf(contentKeyOf(p.content));
-          if (i === -1) return true;
-          unmatchedServer.splice(i, 1);
-          return false;
-        });
-        // pending_inputs is FIFO-ordered and sends are serialized through
-        // the send chain, so server-known entries precede in-flight ones.
-        candidatePending = [...serverPending, ...unknownToServer];
-      }
-      // Dedupe on a COLD LOAD only: drop any candidate whose message already
-      // committed — a snapshot-replayed ghost the server never drained, or a
-      // restored stash bubble whose message persisted while the user was
-      // away. Without this the bubble double-renders beside the committed
-      // item. Native has no id to correlate the POST with the mirrored item,
-      // so dedupe by text; the transcript prepends markers/blockquotes,
-      // leaving the POSTed text at the end, so match with endsWith.
-      // Image-only entries (no text) are kept.
-      //
-      // Baseline-aware so an optimistic bubble whose text coincides with an
-      // OLDER message already in history isn't wrongly dropped: a stashed own
-      // bubble (``pend_`` id) is deduped only against committed copies that
-      // are NEW since it was stashed — i.e. the snapshot now has MORE copies
-      // of that text than the stash's committedTexts baseline. Foreign /
-      // server-replayed entries (server ids) have no baseline (it stays 0),
-      // so they dedupe against all committed copies as before. Without this,
-      // re-sending text that already appears in a resumed/disconnected
-      // session's history makes the new bubble vanish until it commits (the
-      // "disappears then reappears" report).
-      const dedupePending = hydratePending && candidatePending.length > 0;
-      const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
-      const stashBaseline = state.pendingByConversation[id]?.committedTexts ?? [];
-      const countEndsWith = (texts: string[], suffix: string): number =>
-        texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
-      const snapshotPending: PendingUserMessage[] = dedupePending
-        ? candidatePending.filter((p) => {
-            const text = messageContentText(p.content);
-            if (text === "") return true;
-            const baseline = p.tempId.startsWith("pend_") ? countEndsWith(stashBaseline, text) : 0;
-            return countEndsWith(committedUserTexts, text) <= baseline;
-          })
-        : candidatePending;
-      // Keep the stash consistent with what survived dedupe on cold load: a
-      // restored bubble whose message committed while away is now dropped, so
-      // prune it from the stash too (else it lingers until the next
-      // switch-away). Only this client's own bubbles (``pend_`` ids) belong
-      // in the stash — foreign entries are re-served by pending_inputs. Reset
-      // the baseline to the now-current committed texts so a subsequent
-      // navigate-away/back compares against history as it stands after this
-      // bind.
-      const prunedStash = hydratePending
-        ? (() => {
-            const own = snapshotPending.filter((p) => p.tempId.startsWith("pend_"));
-            const next = { ...state.pendingByConversation };
-            if (own.length > 0) next[id] = { messages: own, committedTexts: committedUserTexts };
-            else delete next[id];
-            return next;
-          })()
-        : state.pendingByConversation;
-      const syntheticError: ErrorBlock | null =
-        session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
-          ? {
-              type: "error",
-              ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-              message: session.lastTaskError.message,
-              source: "",
-              code: session.lastTaskError.code,
-            }
-          : null;
+      const merged = mergeHistoryIntoBlocks(state, snapshotBlocks);
       return {
-        ...bindingPatch,
-        blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
-        pendingUserMessages: snapshotPending,
-        pendingByConversation: prunedStash,
+        blocks: merged,
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
-        // The window cursor was reset: void any in-flight loadMoreHistory.
-        historyGeneration: state.historyGeneration + 1,
-        // The voided page's stale early-return skips its own flag clear.
+        historyGeneration: incrementGeneration
+          ? state.historyGeneration + 1
+          : state.historyGeneration,
         loadingMoreHistory: false,
-        sessionStatus: session.status,
-        // Re-show "N background tasks still running" after a reload/navigate-back: the
-        // live SSE edge that set this is long gone, so the count rides in on
-        // the snapshot (server keeps it sticky past the trailing PTY `idle`).
-        backgroundTaskCount: session.backgroundTaskCount ?? 0,
-        selectedEffort: effectiveEffort,
-        selectedModel: effectiveModel,
-        // Session truth for the `/model` readout — overrides the snapshot
-        // value spread via `...bindingPatch` so the claude-native sticky
-        // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: effectiveSessionOverride,
-        tokensUsed: session.lastTotalTokens ?? null,
-        sessionCostUsd: session.totalCostUsd ?? null,
-        sessionUsageByModel: session.usageByModel ?? null,
-        todos: (session.todos ?? []) as Array<{
-          content: string;
-          status: "pending" | "in_progress" | "completed";
-          activeForm: string;
-        }>,
       };
     });
+    return true;
+  };
+  const applySessionSnapshot = (session: Session): boolean => {
+    if (get().conversationId !== id) return false;
+    runStickyPrefHandoff(session, id, get);
+    const selections = stickySelectionFromSession(session, get);
+    set((state) => snapshotHydrationPatch(session, state, id, hydratePending, selections));
+    return true;
+  };
+
+  let firstPage: SessionItemsPage | null = null;
+  const cachedHistory = queryClient.getQueryData<SessionItemsPage>(initialHistoryQueryKey(id));
+  if (cachedHistory) {
+    firstPage = cachedHistory;
+    applyHistoryWindow(cachedHistory, true);
+  }
+  if (hydratePending) {
+    try {
+      const freshFirstPage = await queryClient.fetchQuery({
+        queryKey: initialHistoryQueryKey(id),
+        queryFn: () => fetchInitialHistoryFirstPage(id),
+        staleTime: 0,
+        retry: false,
+      });
+      firstPage = freshFirstPage;
+      if (!applyHistoryWindow(freshFirstPage, true)) return;
+    } catch (err) {
+      if (get().conversationId !== id) return;
+      set({
+        loadingConversation: false,
+        conversationLoadError: err instanceof Error ? err : new Error(String(err)),
+      });
+      return;
+    }
+  } else if (!firstPage) {
+    try {
+      const fetchedFirstPage = await queryClient.fetchQuery({
+        queryKey: initialHistoryQueryKey(id),
+        queryFn: () => fetchInitialHistoryFirstPage(id),
+        staleTime: 60_000,
+        retry: false,
+      });
+      firstPage = fetchedFirstPage;
+      if (!applyHistoryWindow(fetchedFirstPage, true)) return;
+    } catch (err) {
+      if (get().conversationId !== id) return;
+      set({
+        loadingConversation: false,
+        conversationLoadError: err instanceof Error ? err : new Error(String(err)),
+      });
+      return;
+    }
+  }
+  if (!firstPage) return;
+
+  if (hydratePending) {
+    try {
+      const expanded = await extendInitialHistoryWindow(id, firstPage);
+      queryClient.setQueryData(initialHistoryQueryKey(id), expanded);
+      if (
+        expanded.items.length !== firstPage.items.length ||
+        expanded.hasMore !== firstPage.hasMore
+      ) {
+        applyHistoryWindow(expanded, true);
+      }
+    } catch (err) {
+      if (get().conversationId !== id) return;
+      console.warn(`bindStream: history expansion failed for ${id}:`, err);
+    }
+  } else {
+    void (async () => {
+      try {
+        const expanded = await extendInitialHistoryWindow(id, firstPage);
+        queryClient.setQueryData(initialHistoryQueryKey(id), expanded);
+        if (
+          expanded.items.length === firstPage.items.length &&
+          expanded.hasMore === firstPage.hasMore
+        ) {
+          return;
+        }
+        applyHistoryWindow(expanded, true);
+      } catch (err) {
+        if (get().conversationId !== id) return;
+        console.warn(`bindStream: background history expansion failed for ${id}:`, err);
+      }
+    })();
+  }
+
+  const cachedSession = queryClient.getQueryData<Session>(["session", id]);
+  if (cachedSession) applySessionSnapshot(cachedSession);
+
+  try {
+    const session = await queryClient.fetchQuery({
+      queryKey: ["session", id],
+      queryFn: () => getSessionSlim(id, { refreshState: true }),
+      staleTime: 0,
+      retry: false,
+    });
+    applySessionSnapshot(session);
   } catch (err) {
     if (get().conversationId !== id) return;
-    set({
-      loadingConversation: false,
-      conversationLoadError: err instanceof Error ? err : new Error(String(err)),
-    });
+    console.warn(`bindStream: snapshot hydration failed for ${id}:`, err);
   }
 }
 

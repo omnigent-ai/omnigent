@@ -10,6 +10,7 @@
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
+import type { QueryClient } from "@tanstack/react-query";
 import type { ConversationItem } from "./conversationItems";
 import { isMessageItem } from "./conversationItems";
 import type { MessageContentBlock } from "./blocks";
@@ -823,6 +824,47 @@ function isUserPrompt(item: ConversationItem): boolean {
   return isMessageItem(item) && item.role === "user" && !item.is_meta;
 }
 
+function initialHistoryBoundaryReached(items: ConversationItem[], hasMore: boolean): boolean {
+  if (!hasMore) return true;
+  const userCount = items.filter(isUserPrompt).length;
+  return items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2;
+}
+
+/**
+ * Fetch exactly one newest history page for fast first paint on switch.
+ */
+export function fetchInitialHistoryFirstPage(sessionId: string): Promise<SessionItemsPage> {
+  return fetchSessionItemsPage(sessionId);
+}
+
+/**
+ * Continue paging older history until the previous-user boundary is reached.
+ *
+ * Starts from a first page (typically already rendered) so callers can paint
+ * immediately and expand the initial window asynchronously.
+ */
+export async function extendInitialHistoryWindow(
+  sessionId: string,
+  seedPage: SessionItemsPage,
+): Promise<SessionItemsPage> {
+  let items = [...seedPage.items];
+  let hasMore = seedPage.hasMore;
+  if (initialHistoryBoundaryReached(items, hasMore)) return { items, hasMore };
+
+  for (let pages = 1; pages < MAX_INITIAL_PAGES; pages++) {
+    const cursor = items[0]?.id;
+    if (!cursor) break;
+    // Cursor pagination is stateful; each request depends on the prior page.
+    // eslint-disable-next-line no-await-in-loop
+    const page = await fetchSessionItemsPage(sessionId, { olderThan: cursor });
+    items = [...page.items, ...items]; // prepend the older page
+    hasMore = page.hasMore;
+    if (initialHistoryBoundaryReached(items, hasMore)) break;
+  }
+
+  return { items, hasMore };
+}
+
 /**
  * Hydrate the initial conversation window: at least
  * `SESSION_HISTORY_PAGE_SIZE` items, but extended further back when
@@ -845,22 +887,8 @@ function isUserPrompt(item: ConversationItem): boolean {
  * so callers feed `oldestItemId` / `hasMoreHistory` from it unchanged.
  */
 export async function fetchInitialHistoryWindow(sessionId: string): Promise<SessionItemsPage> {
-  let items: ConversationItem[] = [];
-  let hasMore = true;
-  for (let pages = 0; pages < MAX_INITIAL_PAGES; pages++) {
-    const cursor = items[0]?.id;
-    const page = await fetchSessionItemsPage(sessionId, cursor ? { olderThan: cursor } : {});
-    items = [...page.items, ...items]; // prepend the older page
-    hasMore = page.hasMore;
-    if (!hasMore) break; // reached the start of the conversation
-    const userCount = items.filter(isUserPrompt).length;
-    if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
-    if (!items[0]?.id) break; // no cursor to page further; avoid a spin
-  }
-  // If the cap stopped us before the previous user prompt (a pathological
-  // single turn spanning >MAX_INITIAL_PAGES pages), `hasMore` stays true so
-  // the rest remains reachable via scroll-up — same fallback as the default.
-  return { items, hasMore };
+  const firstPage = await fetchInitialHistoryFirstPage(sessionId);
+  return extendInitialHistoryWindow(sessionId, firstPage);
 }
 
 /**
@@ -995,4 +1023,32 @@ export async function approve(
   return postEventResponseFromWire(
     await readJsonOrThrow<{ queued: boolean; item_id?: string }>(res),
   );
+}
+
+/** React Query key for the initial history window prefetched on sidebar hover. */
+export function initialHistoryQueryKey(sessionId: string): readonly [string, string, string] {
+  return ["session", sessionId, "initialHistory"];
+}
+
+/**
+ * Warm the session snapshot and initial history cache before a sidebar click.
+ * TanStack dedupes in-flight prefetches with `bindStream`'s fetches.
+ */
+export function prefetchSessionForSwitch(queryClient: QueryClient, sessionId: string): void {
+  const snapshotState = queryClient.getQueryState(["session", sessionId]);
+  if (snapshotState?.fetchStatus !== "fetching") {
+    void queryClient.prefetchQuery({
+      queryKey: ["session", sessionId],
+      queryFn: () => getSessionSlim(sessionId, { refreshState: true }),
+      staleTime: 30_000,
+    });
+  }
+  const historyState = queryClient.getQueryState(initialHistoryQueryKey(sessionId));
+  if (historyState?.fetchStatus !== "fetching") {
+    void queryClient.prefetchQuery({
+      queryKey: initialHistoryQueryKey(sessionId),
+      queryFn: () => fetchInitialHistoryFirstPage(sessionId),
+      staleTime: 60_000,
+    });
+  }
 }

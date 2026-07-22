@@ -30,7 +30,7 @@ import type {
 import type { ConversationItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
-import { SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import { initialHistoryQueryKey, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type {
   SessionCreatedEvent,
@@ -448,6 +448,119 @@ describe("chatStore — switchTo", () => {
     expect(user.content).toEqual([{ type: "input_text", text: "hello" }]);
     expect(state.loadingConversation).toBe(false);
     expect(state.conversationLoadError).toBeNull();
+  });
+
+  it("paints history before the session snapshot resolves", async () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "hello"),
+      assistantMessage("resp_1", "hi there"),
+    ];
+    seedSession("conv_slow_snap", items);
+    let releaseSnapshot: (() => void) | null = null;
+    const snapshotReady = new Promise<void>((resolve) => {
+      releaseSnapshot = () => resolve();
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0]!;
+      if (path === "/v1/sessions/conv_slow_snap" && (init?.method ?? "GET") === "GET") {
+        return snapshotReady.then(() => defaultFetchHandler(input, init));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switchPromise = useChatStore.getState().switchTo("conv_slow_snap");
+    await tick();
+    const mid = useChatStore.getState();
+    expect(mid.loadingConversation).toBe(false);
+    expect(mid.blocks).toHaveLength(2);
+    expect(mid.boundAgentId).toBeNull();
+
+    releaseSnapshot!();
+    await switchPromise;
+
+    const final = useChatStore.getState();
+    expect(final.boundAgentId).toBe("agent_xyz");
+    expect(final.blocks).toHaveLength(2);
+  });
+
+  it("uses prefetched initial-history cache on switch without re-fetching items", async () => {
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "hello"),
+      assistantMessage("resp_1", "hi there"),
+    ];
+    seedSession("conv_cached", items);
+    client.setQueryData(initialHistoryQueryKey("conv_cached"), { items, hasMore: false });
+    let releaseItemsFetch: (() => void) | null = null;
+    const itemsReady = new Promise<void>((resolve) => {
+      releaseItemsFetch = () => resolve();
+    });
+    let itemsCalls = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cached/items")) {
+        itemsCalls += 1;
+        return itemsReady.then(() => defaultFetchHandler(input, init));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switchPromise = useChatStore.getState().switchTo("conv_cached");
+    await tick();
+
+    expect(itemsCalls).toBe(1);
+    const mid = useChatStore.getState();
+    expect(mid.loadingConversation).toBe(false);
+    expect(mid.blocks).toHaveLength(2);
+
+    releaseItemsFetch!();
+    await switchPromise;
+  });
+
+  it("renders first history page, then prepends older boundary pages in background", async () => {
+    const firstPageTail = Array.from({ length: 19 }, (_, i) =>
+      assistantMessage(`resp_t${i}`, `t${i}`),
+    );
+    const firstPage: ConversationItem[] = [
+      ...firstPageTail,
+      userMessage("resp_last", "latest prompt"),
+    ];
+    const fullItems: ConversationItem[] = [
+      userMessage("resp_prev", "previous prompt"),
+      assistantMessage("resp_prev", "previous assistant"),
+      ...firstPage,
+    ];
+    seedSession("conv_bg_hist", fullItems);
+    let releaseSecondPage: (() => void) | null = null;
+    const secondPageReady = new Promise<void>((resolve) => {
+      releaseSecondPage = () => resolve();
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/v1/sessions/conv_bg_hist/items") && url.includes("after=")) {
+        return secondPageReady.then(() => defaultFetchHandler(input, init));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switchPromise = useChatStore.getState().switchTo("conv_bg_hist");
+    await tick();
+
+    const mid = useChatStore.getState();
+    expect(mid.loadingConversation).toBe(false);
+    expect(
+      mid.blocks.some((b) => b.type === "user_message" && b.ctx.responseId === "resp_prev"),
+    ).toBe(false);
+
+    releaseSecondPage!();
+    await switchPromise;
+    await tick();
+    await tick();
+
+    const final = useChatStore.getState();
+    expect(
+      final.blocks.some((b) => b.type === "user_message" && b.ctx.responseId === "resp_prev"),
+    ).toBe(true);
   });
 
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {
