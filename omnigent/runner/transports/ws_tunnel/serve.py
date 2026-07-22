@@ -647,10 +647,10 @@ async def _serve_tunnel_once(
                 # Race reads against the shutdown signal. When it fires,
                 # gracefully drain in-flight streams and close the socket so
                 # the server sees a clean end-of-stream, not an abrupt drop.
-                shutdown_wait = asyncio.ensure_future(shutdown_event.wait())
+                shutdown_wait = asyncio.create_task(shutdown_event.wait())
                 try:
                     while True:
-                        recv_task = asyncio.ensure_future(ws.recv())
+                        recv_task = asyncio.create_task(ws.recv())
                         done, _pending = await asyncio.wait(
                             {recv_task, shutdown_wait},
                             return_when=asyncio.FIRST_COMPLETED,

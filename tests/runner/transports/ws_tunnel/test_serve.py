@@ -733,7 +733,8 @@ async def test_graceful_drain_fires_hook_and_awaits_inflight_task() -> None:
     # (not left dangling) — the whole point of awaiting before the socket close.
     assert drain_calls == ["drained"]
     assert task.done()
-    await task
+    # Non-blocking (already done); re-raises if the task failed/was cancelled.
+    assert task.result() is None
 
 
 @pytest.mark.asyncio
@@ -811,12 +812,9 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
     monkeypatch.setattr(websockets, "connect", _fake_connect)
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
 
-    async def _trigger_shutdown() -> None:
-        # Let the serve loop enter its recv() race first, then request shutdown.
-        await asyncio.sleep(0.01)
-        shutdown_event.set()
-
-    trigger = asyncio.ensure_future(_trigger_shutdown())
+    # Pre-arm the shutdown so the very first recv() race resolves to shutdown
+    # (recv blocks forever). Deterministic — no real-time sleep to lose to load.
+    shutdown_event.set()
     await asyncio.wait_for(
         _serve_tunnel_once(
             _noop_app,
@@ -830,7 +828,6 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
         ),
         timeout=5.0,
     )
-    await trigger
 
     assert drain_calls == ["drained"]
     assert ws.closed is True
