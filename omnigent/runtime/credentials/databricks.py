@@ -113,12 +113,19 @@ def _databricks_sdk_importable() -> bool:
     the failure message: "install the extra" vs. "fix your OAuth
     session".
 
-    :returns: ``True`` when ``databricks.sdk.config`` imports, else
-        ``False``.
+    :returns: ``True`` when ``databricks.sdk.config`` actually imports,
+        else ``False``.
     """
-    import importlib.util
-
-    return importlib.util.find_spec("databricks.sdk.config") is not None
+    # A real import (not importlib.util.find_spec): find_spec can return
+    # a spec for an SDK whose transitive deps are missing, and can even
+    # raise on a partial ``databricks`` install where the ``sdk``
+    # subpackage is absent. Import-and-catch matches what the resolver
+    # itself does and never escapes as an uncaught error.
+    try:
+        import databricks.sdk.config  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 def _databrickscfg_path() -> Path:
@@ -177,7 +184,16 @@ class _SectionNeedsSdk(Exception):
     :class:`_SectionPresentButInvalid` lets the resolver emit an
     honest, actionable error rather than telling the user to "fix or
     remove" a perfectly valid profile.
+
+    Carries the offending section's ``auth_type`` so the resolver can
+    tailor remediation: ``databricks-cli`` (OAuth-U2M) is fixed with
+    ``databricks auth login``, whereas other SDK-only auth types
+    (``azure-cli``, metadata-service, etc.) are not.
     """
+
+    def __init__(self, message: str, auth_type: str) -> None:
+        super().__init__(message)
+        self.auth_type = auth_type
 
 
 def _read_section(config: configparser.ConfigParser, section: str) -> WorkspaceCreds | None:
@@ -253,7 +269,7 @@ def _read_section(config: configparser.ConfigParser, section: str) -> WorkspaceC
     # an actionable error about the SDK path having failed.
     auth_type = values.get("auth_type", "").strip().lower()
     if host and not token and auth_type and auth_type != "pat":
-        raise _SectionNeedsSdk(f"auth_type={auth_type!r}, no static token")
+        raise _SectionNeedsSdk(f"auth_type={auth_type!r}, no static token", auth_type)
     missing = [k for k in ("host", "token") if not values.get(k)]
     raise _SectionPresentButInvalid(
         f"section [{section}] is missing required field(s) {missing}; "
@@ -480,29 +496,39 @@ def resolve_databricks_workspace(profile: str | None) -> WorkspaceCreds:
             "and that the file exists."
         ) from None
     except _SectionNeedsSdk as exc:
-        # Well-formed OAuth profile the plaintext path can't resolve.
+        # Well-formed SDK-only profile the plaintext path can't resolve.
         # Reaching here means the SDK path (step 1) already failed. The
         # fix differs by cause: if databricks-sdk isn't even installed
         # (it lives in the `databricks` extra, not the base install),
         # tell the user to install it; otherwise the SDK is present but
-        # couldn't complete OAuth, so point at the CLI / login session.
+        # couldn't complete auth.
         if not _databricks_sdk_importable():
             remediation = (
                 "the databricks-sdk package is not installed — it ships in the "
                 "`databricks` extra, not the base install. Reinstall with the extra "
                 "(e.g. `pip install 'omnigent[databricks]'`, or `uv run --extra "
-                "databricks ...`) so OAuth profiles can be resolved."
+                "databricks ...`) so this profile can be resolved."
             )
-        else:
+        elif exc.auth_type == "databricks-cli":
+            # OAuth-U2M: the CLI-managed session is the thing to refresh.
             remediation = (
                 "the databricks-sdk path could not mint a token for it. Ensure the "
                 "`databricks` CLI is installed and on PATH, and that the OAuth "
                 f"session is valid (run `databricks auth login --profile "
                 f"{effective_profile}`). See the cli-*.log for the underlying SDK error."
             )
+        else:
+            # Other SDK-only auth types (azure-cli, metadata-service,
+            # oauth-m2m, etc.) — `databricks auth login` does NOT apply.
+            remediation = (
+                "the databricks-sdk path could not mint a token for it. Ensure the "
+                f"credentials for auth_type={exc.auth_type!r} are valid and available "
+                "in this environment. See the cli-*.log for the underlying SDK error."
+            )
         raise OSError(
-            f"Databricks profile [{effective_profile}] in {cfg_path} is an OAuth "
-            f"profile ({exc}), and {remediation}"
+            f"Databricks profile [{effective_profile}] in {cfg_path} is a token-less "
+            f"profile ({exc}) that only the databricks-sdk can resolve, and "
+            f"{remediation}"
         ) from exc
     except _SectionPresentButInvalid as exc:
         raise OSError(
