@@ -3449,13 +3449,105 @@ def test_parse_credential_proxy_https_env_optional(tmp_path: Path) -> None:
     assert entry.inject_env == []
 
 
+def test_parse_credential_proxy_databricks_cli(tmp_path: Path) -> None:
+    """A ``databricks_cli`` entry parses into a profile-keyed policy.
+
+    Unlike the host-keyed types it lands on ``credential_proxy.databricks``
+    (not ``entries``), preserving the profile list and default. If this
+    broke, the runtime would never materialize the ``.databrickscfg`` or
+    resolve the profiles.
+    """
+    config = _credential_proxy_config(
+        [
+            {
+                "type": "databricks_cli",
+                "profiles": ["dbc-adb7b1a3-9097", "oss"],
+                "default": "dbc-adb7b1a3-9097",
+            }
+        ]
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    assert proxy.entries == []
+    assert proxy.databricks is not None
+    assert [b.profile for b in proxy.databricks.profiles] == ["dbc-adb7b1a3-9097", "oss"]
+    assert proxy.databricks.default == "dbc-adb7b1a3-9097"
+
+
+@pytest.mark.parametrize(
+    "entry,match",
+    [
+        # ``default`` must name one of the listed profiles.
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "default": "b"},
+            r"'default' 'b' must be one of 'profiles'",
+        ),
+        # Empty ``profiles`` list.
+        ({"type": "databricks_cli", "profiles": []}, r"non-empty 'profiles' list"),
+        # A host-keyed field doesn't apply.
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "target": "h.example.com"},
+            r"databricks_cli does not accept 'target'",
+        ),
+        # ``source`` doesn't apply (resolved from the profile).
+        (
+            {"type": "databricks_cli", "profiles": ["a"], "source": {"env": "X"}},
+            r"databricks_cli does not accept 'source'",
+        ),
+        # Duplicate profile within one entry.
+        (
+            {"type": "databricks_cli", "profiles": ["a", "a"]},
+            r"more than once",
+        ),
+    ],
+)
+def test_parse_credential_proxy_databricks_cli_fail_loud(
+    tmp_path: Path, entry: dict[str, object], match: str
+) -> None:
+    """Malformed ``databricks_cli`` entries fail loudly at parse time."""
+    config = _credential_proxy_config([entry])
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path) -> None:
+    """``databricks_cli`` is rejected on macOS (``darwin_seatbelt``).
+
+    The ``databricks`` CLI is a Go binary and Go on macOS ignores
+    ``SSL_CERT_FILE`` (the var the egress MITM proxy uses to publish its
+    CA), so every call would fail with an opaque TLS error. Fail loud at
+    parse time instead.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-dbx-macos",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "darwin_seatbelt",
+                "egress_rules": ["* corp.example.com/**"],
+                "credential_proxy": [{"type": "databricks_cli", "profiles": ["a"]}],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"databricks_cli' does not work\s+on macOS"):
+        parse(tmp_path)
+
+
 @pytest.mark.parametrize(
     "entries,match",
     [
         # Unknown ``type`` — caught by the pydantic ``Literal``.
         ([{"type": "bogus", "source": {"env": "X"}}], r"type: Input should be"),
-        # Missing ``source`` — pydantic ``Field required``.
-        ([{"type": "https_bearer", "target": "h.example.com"}], r"source: Field required"),
+        # Missing ``source`` — required for the host-keyed types (the
+        # field is optional at the pydantic layer because ``databricks_cli``
+        # forbids it, so the requirement is enforced in the model validator).
+        ([{"type": "https_bearer", "target": "h.example.com"}], r"source is required"),
         # ``source`` as a bare string (the old surface) is now rejected —
         # it must be a nested ``{env|file|command: ...}`` mapping.
         (
