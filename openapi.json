@@ -4121,6 +4121,17 @@
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled.",
             "title": "Permission Level"
           },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -4918,6 +4929,17 @@
             ],
             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
             "title": "Permission Level"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -6174,6 +6196,18 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "File this session into a first-class project (see `designs/PROJECTS_PRD.md`). A non-empty id moves the session into that project; the empty string `\"\"` unfiles it. **Omitting** the field leaves membership unchanged; an explicit `null` is rejected (400) so it can't silently unfile. Owner-only: because projects are owner-private, only the session owner may file it, and only into a project they own \u2014 the server verifies both. Independent of the legacy `omni_project` label, which is set via `labels`.",
+            "title": "Project Id"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -9494,7 +9528,7 @@
     },
     "/v1/sessions/{session_id}/permissions": {
       "get": {
-        "description": "List all permission grants on a session.\n\nRequires manage-level access.\n\n**Returns:** List of `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
+        "description": "List permission grants on a session with cursor pagination.\n\nRequires manage-level access.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
         "operationId": "list_permissions_v1_sessions__session_id__permissions_get",
         "parameters": [
           {
@@ -9506,19 +9540,44 @@
               "title": "Session Id",
               "type": "string"
             }
+          },
+          {
+            "description": "Max grants to return (1\u20131000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
           }
         ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/PermissionObject"
-                  },
-                  "title": "Response 200 List Permissions V1 Sessions  Session Id  Permissions Get",
-                  "type": "array"
-                }
+                "schema": {}
               }
             },
             "description": "Successful Response"

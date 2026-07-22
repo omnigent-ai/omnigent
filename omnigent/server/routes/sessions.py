@@ -167,6 +167,10 @@ from omnigent.server.auth import (
     local_single_user_enabled,
     workspace_sharing_blocked,
 )
+from omnigent.server.background_session_titles import (
+    BackgroundSessionTitleCoordinator,
+    prepare_background_session_title,
+)
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
@@ -307,6 +311,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -2395,6 +2400,7 @@ def _build_session_list_item(
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,
         parent_session_id=conv.parent_conversation_id,
+        project_id=conv.project_id,
     )
 
 
@@ -2845,6 +2851,7 @@ def _build_session_response(
         # is not replayed on the SSE stream). Populated for native-terminal
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
+        project_id=conv.project_id,
     )
 
 
@@ -3066,6 +3073,39 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
         return canonicalize_harness(harness) or harness
     except (KeyError, AttributeError, ValueError, ImportError, OSError):
         return None
+
+
+def _validated_harness_override_executor_type(agent: Agent) -> None:
+    """Validate that *agent* is an ``executor.type: omnigent`` spec.
+
+    Used by the ``"auto"`` harness path to enforce the same executor-type
+    gate as :func:`_validated_harness_override` without requiring a concrete
+    harness name (the real harness is resolved at first-message time).
+
+    :raises OmnigentError: ``invalid_input`` when the agent is not an
+        omnigent executor type or the bundle cannot be loaded.
+    """
+    from omnigent.runtime import get_agent_cache
+    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
+
+    try:
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+        raise OmnigentError(
+            f"harness_override 'auto' requires a loadable agent spec; "
+            f"agent {agent.name!r} failed to load: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    executor_type = loaded.spec.executor.type
+    if executor_type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"harness_override 'auto' only applies to executor.type "
+            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; agent {agent.name!r} "
+            f"declares executor.type {executor_type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
@@ -5299,6 +5339,7 @@ async def _persist_external_conversation_item(
     body: SessionEventInput,
     conversation_store: ConversationStore,
     created_by: str | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -5362,8 +5403,15 @@ async def _persist_external_conversation_item(
             skipped,
             conversation_store,
         )
+    pending_background_title = prepare_background_session_title(
+        coordinator=background_title_coordinator,
+        conversation=conv,
+        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+    )
     persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
+    if pending_background_title is not None:
+        pending_background_title.schedule()
     persisted = persisted_items[0]
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
@@ -9065,7 +9113,7 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None:
+    if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
 
     try:
@@ -9126,6 +9174,8 @@ def _title_content_from_item(
     if not isinstance(item.data, MessageData):
         return []
     if item.data.role != "user":
+        return []
+    if item.data.is_meta:
         return []
     return item.data.content
 
@@ -9466,6 +9516,54 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # ── Auto-harness resolution ───────────────────────────────────────
+    # When the session was created with harness_override="auto", the real
+    # harness + model are determined here on the first message where user
+    # text is available.  After resolution the sentinel is replaced with
+    # the concrete harness so subsequent turns behave normally.
+    if conv.harness_override == "auto" and body.type == "message":
+        from omnigent.server.smart_routing import route_session_harness
+
+        _auto_text = _extract_user_text_for_routing(body)
+        if _auto_text:
+            _auto_harness, _auto_model, _auto_verdict = await route_session_harness(
+                _auto_text,
+                session_id=session_id,
+                runner_client=runner_client,
+            )
+            try:
+                # Always clear the "auto" sentinel even when routing
+                # returned no harness (unavailable/failed) so the branch
+                # doesn't re-run on every subsequent turn.
+                _conv_updates: dict[str, Any] = (
+                    {"harness_override": _auto_harness}
+                    if _auto_harness is not None
+                    else {"_unset_harness_override": True}
+                )
+                if _auto_model is not None and effective_runner_override is None:
+                    _conv_updates["model_override"] = _auto_model
+                    effective_runner_override = _auto_model
+                _updated = await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    session_id,
+                    **_conv_updates,
+                )
+                if _updated is not None:
+                    conv = _updated
+            except (OSError, ValueError):
+                _logger.warning(
+                    "auto-harness: failed to persist resolved harness for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            if _auto_model is not None and _auto_verdict is not None:
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _auto_model,
+                    _auto_verdict,
+                )
+
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
     # call the judge LLM on the FIRST message to pick the model for
@@ -9529,7 +9627,7 @@ async def _forward_event_to_runner(
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None:
+    if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
 
     # The runner's sessions-native POST returns 202 immediately
@@ -12945,6 +13043,7 @@ async def _create_session_from_existing_agent(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> SessionResponse:
     """
     Create a session bound to an already-registered agent.
@@ -13021,9 +13120,15 @@ async def _create_session_from_existing_agent(
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's
     # --harness fail-loud rules.
-    harness_override = await asyncio.to_thread(
-        _validated_harness_override, body.harness_override, agent
-    )
+    # "auto" defers harness + model selection to the first-message routing
+    # path; validate executor type now but store the sentinel unchanged.
+    if body.harness_override == "auto":
+        await asyncio.to_thread(_validated_harness_override_executor_type, agent)
+        harness_override = "auto"
+    else:
+        harness_override = await asyncio.to_thread(
+            _validated_harness_override, body.harness_override, agent
+        )
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
@@ -13259,13 +13364,26 @@ async def _create_session_from_existing_agent(
             _host_install_id: str | None = None
             if _hr is not None and conv.host_id is not None:
                 _host_install_id = _hr.get_host_installation_id(conv.host_id)
+            # Resolve harness directly from the in-scope agent + cache so
+            # the result is independent of _globals._agent_store (which is
+            # only set when the server is started via the CLI).
+            _tel_harness: str | None
+            if native_agent is not None:
+                _tel_harness = native_agent.harness
+            elif conv.harness_override:
+                _tel_harness = conv.harness_override
+            else:
+                _tel_loaded = agent_cache.load(
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                _tel_harness = _spec_harness(_tel_loaded.spec)
             _tel_emit(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
                     agent_id=agent.id,
-                    harness=native_agent.harness
-                    if native_agent is not None
-                    else _resolve_harness(conv),
+                    harness=_tel_harness,
                     surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
@@ -13308,6 +13426,11 @@ async def _create_session_from_existing_agent(
             # Dispatch (not a plain forward) so native-terminal sessions take the
             # single-writer bypass — otherwise the forwarder's echo duplicates the kickoff.
             for item in body.initial_items:
+                pending_background_title = prepare_background_session_title(
+                    coordinator=background_title_coordinator,
+                    conversation=conv,
+                    event=item,
+                )
                 await _dispatch_session_event_to_runner(
                     conv.id,
                     conv,
@@ -13320,6 +13443,8 @@ async def _create_session_from_existing_agent(
                     created_by=_attribution_user(user_id),
                     runner_router=runner_router,
                 )
+                if pending_background_title is not None:
+                    pending_background_title.schedule()
     # Re-read rather than reusing the local ``conv``: the label-only branch
     # above and ``_forward_event_to_runner`` can mutate the row after it was
     # built, so a fresh read is what keeps the create response current.
@@ -14742,6 +14867,8 @@ def create_sessions_router(
     runner_tunnel_tokens: frozenset[str] | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     host_registry: HostRegistry | None = None,
+    project_store: ProjectStore | None = None,
+    background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -14802,6 +14929,13 @@ def create_sessions_router(
         the runner is offline, so the file panel stays live without
         waking the agent. ``None`` disables the fallback (the endpoints
         then 503 on an offline runner, as before).
+    :param project_store: Store for first-class projects. Required to
+        validate ownership when ``PATCH /v1/sessions/{id}`` files a
+        session into a project. ``None`` disables the move-into-project
+        action (a non-empty ``project_id`` is then rejected as unsupported).
+    :param background_title_coordinator: Optional app-owned coordinator for
+        semantic title generation after first-turn forwarding. ``None`` disables
+        background titles in focused router tests.
     :returns: A configured :class:`APIRouter` exposing the
         ``/sessions`` endpoints.
     """
@@ -14896,6 +15030,7 @@ def create_sessions_router(
             liveness_lookup=liveness_lookup,
             file_store=file_store,
             artifact_store=artifact_store,
+            background_title_coordinator=background_title_coordinator,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -15456,6 +15591,8 @@ def create_sessions_router(
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
+        # Passing owned_by here also scopes the dual-read's first-class half:
+        # the store resolves the project NAME to the caller's own project id.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
         owned_by = user_id if project else None
@@ -16050,6 +16187,11 @@ def create_sessions_router(
             registered; 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
+        # Filing into a project is owner-only: projects are owner-private, so a
+        # session's membership is the owner organizing their own sessions — an
+        # editor must not move it. Presence is the signal (``""`` unfiles), so
+        # gate on model_fields_set, not a non-None value.
+        set_project = "project_id" in body.model_fields_set
         # Archiving/unarchiving is an owner-only lifecycle action: it pairs
         # with a client-driven, owner-gated stop, so an editor must not be
         # able to archive a session (hiding it, and via the client stopping
@@ -16057,7 +16199,7 @@ def create_sessions_router(
         # endpoint needs only edit. Owner implies edit, so a single check at
         # the level the request actually requires gates both — no redundant
         # second permission-store read for archive/unarchive.
-        required_level = LEVEL_OWNER if body.archived is not None else LEVEL_EDIT
+        required_level = LEVEL_OWNER if (body.archived is not None or set_project) else LEVEL_EDIT
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
@@ -16378,6 +16520,46 @@ def create_sessions_router(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        # File into a first-class project (owner-only, gated above). ``""``
+        # unfiles; a non-empty id must name a project the caller owns. Filing
+        # into another owner's (or a missing) project is rejected as NOT_FOUND
+        # — the same 404 the projects API returns, so we don't leak existence.
+        if set_project:
+            # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
+            # not a valid value here (omitting the field is how you leave
+            # membership unchanged), so reject it rather than treating it as a
+            # destructive unfile.
+            if body.project_id is None:
+                raise OmnigentError(
+                    'project_id must be a project id or "" to unfile; '
+                    "omit the field to leave membership unchanged",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            target_project_id = body.project_id
+            if target_project_id == "":
+                unfiled = await asyncio.to_thread(
+                    conversation_store.set_conversation_project, session_id, None
+                )
+                if not unfiled:
+                    raise _session_not_found()
+            else:
+                if project_store is None:
+                    raise OmnigentError(
+                        "Filing a session into a project is not supported by this server",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                owned = await asyncio.to_thread(
+                    project_store.get, target_project_id, owner_user_id=user_id
+                )
+                if owned is None:
+                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+                filed = await asyncio.to_thread(
+                    conversation_store.set_conversation_project,
+                    session_id,
+                    target_project_id,
+                )
+                if not filed:
+                    raise _session_not_found()
         level = await _get_permission_level(user_id, session_id, permission_store)
         return await _get_session_snapshot(
             conversation_store,
@@ -20452,6 +20634,7 @@ def create_sessions_router(
                 body,
                 conversation_store,
                 created_by=_attribution_user(user_id),
+                background_title_coordinator=background_title_coordinator,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -21022,6 +21205,11 @@ def create_sessions_router(
                     session_id,
                     exc_info=True,
                 )
+        pending_background_title = prepare_background_session_title(
+            coordinator=background_title_coordinator,
+            conversation=conv,
+            event=body,
+        )
         if body.type == _SLASH_COMMAND_TYPE:
             if _agent is None:
                 raise OmnigentError(
@@ -21038,6 +21226,8 @@ def create_sessions_router(
                 has_mcp_servers=_has_mcp_servers,
                 created_by=_attribution_user(user_id),
             )
+            if pending_background_title is not None:
+                pending_background_title.schedule()
             return {"queued": True, "item_id": item_id}
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
@@ -21053,6 +21243,8 @@ def create_sessions_router(
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
         )
+        if pending_background_title is not None:
+            pending_background_title.schedule()
         response: dict[str, Any] = {"queued": True}
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id
@@ -21625,20 +21817,23 @@ def create_sessions_router(
     @router.get(
         "/sessions/{session_id}/permissions",
         response_model=None,
-        responses={200: {"model": list[PermissionObject]}},
     )
     async def list_permissions(
         request: Request,
         session_id: str,
-    ) -> list[PermissionObject]:
-        """List all permission grants on a session.
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None, description="Cursor: user_id to start after"),
+    ) -> dict:
+        """List permission grants on a session with cursor pagination.
 
         Requires manage-level access.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to list grants for,
             e.g. ``"conv_abc123"``.
-        :returns: List of :class:`PermissionObject`.
+        :param limit: Max grants to return (1–1000, default 100).
+        :param after: Cursor — user_id to start after (exclusive).
+        :returns: ``{"permissions": [...], "next_cursor": str|null}``.
         :raises OmnigentError: 404 if no session or no access.
         """
         user_id = _require_user(request, auth_provider)
@@ -21650,15 +21845,20 @@ def create_sessions_router(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        grants = await asyncio.to_thread(permission_store.list_for_session, session_id)
-        return [
-            PermissionObject(
-                user_id=g.user_id,
-                conversation_id=g.conversation_id,
-                level=g.level,
-            )
-            for g in grants
-        ]
+        grants, next_cursor = await asyncio.to_thread(
+            permission_store.list_for_session, session_id, limit=limit, after_user_id=after
+        )
+        return {
+            "permissions": [
+                PermissionObject(
+                    user_id=g.user_id,
+                    conversation_id=g.conversation_id,
+                    level=g.level,
+                )
+                for g in grants
+            ],
+            "next_cursor": next_cursor,
+        }
 
     # ── Agent sub-resource ────────────────────────────────────────
     # These endpoints expose the session's bound agent metadata

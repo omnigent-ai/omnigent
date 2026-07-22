@@ -213,20 +213,35 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 moved = len(reassign_ids)
             return moved
 
-    def list_for_session(self, conversation_id: str) -> list[SessionPermission]:
-        """Return all grants on a session. See base class for contract."""
+    def list_for_session(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[SessionPermission], str | None]:
+        """Return grants on a session with cursor pagination. See base class for contract."""
         with self._session() as session:
-            rows = (
-                session.execute(
-                    select(SqlSessionPermission).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.conversation_id == conversation_id,
-                    )
+            stmt = (
+                select(SqlSessionPermission)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == conversation_id,
                 )
-                .scalars()
-                .all()
+                .order_by(SqlSessionPermission.user_id.asc())
+                .limit(limit + 1)
             )
-            return [_to_entity(r) for r in rows]
+            if after_user_id is not None:
+                stmt = stmt.where(SqlSessionPermission.user_id > after_user_id)
+            rows = session.execute(stmt).scalars().all()
+        if len(rows) > limit:
+            rows = rows[:limit]
+            # Cursor is the last returned user_id; the next page uses an
+            # exclusive ``user_id > after_user_id`` filter.
+            next_cursor: str | None = rows[-1].user_id
+        else:
+            next_cursor = None
+        return [_to_entity(r) for r in rows], next_cursor
 
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""
@@ -251,15 +266,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
             result[entity.conversation_id].append(entity)
         return result
 
-    def list_for_user(self, user_id: str) -> list[SessionPermission]:
+    def list_for_user(self, user_id: str, *, limit: int = 1000) -> list[SessionPermission]:
         """Return all grants for a user. See base class for contract."""
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlSessionPermission).where(
+                    select(SqlSessionPermission)
+                    .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == user_id,
                     )
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
@@ -292,12 +309,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
 
-    def list_users(self) -> list[Account]:
+    def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
+                    select(SqlUser)
+                    .where(SqlUser.workspace_id == current_workspace_id())
+                    .limit(limit)
                 )
                 .scalars()
                 .all()

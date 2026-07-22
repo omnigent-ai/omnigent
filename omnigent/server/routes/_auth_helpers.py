@@ -396,7 +396,7 @@ def get_session_owner_id(
     """
     if permission_store is None:
         return None
-    grants = permission_store.list_for_session(conversation_id)
+    grants, _ = permission_store.list_for_session(conversation_id, limit=1000)
     for g in grants:
         if g.level >= LEVEL_OWNER:
             return g.user_id

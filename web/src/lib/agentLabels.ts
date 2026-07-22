@@ -44,13 +44,23 @@ async function fetchHarnessLabels(): Promise<Record<string, string>> {
   return labels;
 }
 
-export function useBrainHarnessLabels(): Record<string, string> {
+/**
+ * Sentinel value sent as ``harness_override`` when the user picks "auto".
+ * The server resolves it to a real harness + model via the intelligent router
+ * and never persists this string literal.
+ */
+export const AUTO_HARNESS_ID = "auto";
+
+export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<string, string> {
   const { data } = useQuery({
     queryKey: ["harness-labels"],
     queryFn: fetchHarnessLabels,
     staleTime: 30_000,
   });
-  return data ?? BRAIN_HARNESS_LABELS;
+  const base = data ?? BRAIN_HARNESS_LABELS;
+  if (!smartRoutingEnabled) return base;
+  // Prepend the "auto" sentinel so it appears first in the picker.
+  return { [AUTO_HARNESS_ID]: "Auto", ...base };
 }
 
 /**

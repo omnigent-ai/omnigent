@@ -644,12 +644,16 @@ class ConversationStore(ABC):
             conversations are excluded. When ``True``, archived and
             non-archived conversations are both returned (the caller
             groups them). Powers the sidebar's "Show archived" toggle.
-        :param project: When set to a non-empty string, only return
-            sessions that have a ``conversation_labels`` row with
-            ``key="omni_project"`` and ``value=project`` (the sidebar's
-            per-project folder fetch). When set to an empty string
-            ``""``, only return sessions with NO project label (unfiled
-            sessions). ``None`` disables the filter.
+        :param project: Filter by project NAME, dual-reading the
+            first-class projects entity and the legacy ``omni_project``
+            label (the sidebar's per-project folder fetch). A non-empty
+            string returns sessions that EITHER have a first-class
+            membership (``metadata.project_id`` → ``owned_by``'s project of
+            this name) OR carry the ``omni_project`` label with this value.
+            ``""`` returns sessions with NEITHER (unfiled). ``None`` disables
+            the filter. The name→id resolution is owner-scoped (projects are
+            owner-private), so pass ``owned_by`` alongside a specific name.
+            See ``designs/PROJECTS_PRD.md``.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in
@@ -696,15 +700,17 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
         harness_override: str | None = None,
+        _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
 
-        For ``reasoning_effort``, ``model_override``, and
-        ``cost_control_mode_override``, ``None`` means "leave
-        unchanged". To explicitly clear them back to ``None``, pass
+        For ``reasoning_effort``, ``model_override``,
+        ``cost_control_mode_override``, and ``harness_override``,
+        ``None`` means "leave unchanged". To explicitly clear them
+        back to ``None``, pass
         the matching ``_unset_*`` flag.
 
         :param conversation_id: Unique conversation identifier,
@@ -899,6 +905,26 @@ class ConversationStore(ABC):
             ``{"input_tokens": 1500, "output_tokens": 350,
             "total_tokens": 1850}``. May carry a nested ``"by_model"``
             sub-dict (per-model token/cost buckets), hence ``Any``.
+        """
+        ...
+
+    @abstractmethod
+    def set_conversation_project(
+        self,
+        conversation_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """
+        File a conversation into a first-class project (or unfile it).
+
+        Sets ``omnigent_conversation_metadata.project_id``; ``None`` unfiles
+        the session. The first-class counterpart to moving a session between
+        ``omni_project`` labels (see ``designs/PROJECTS_PRD.md``).
+
+        :param conversation_id: The conversation to update, e.g. ``"conv_abc"``.
+        :param project_id: The project id to file under, or ``None`` to unfile.
+        :returns: ``True`` if a metadata row was updated; ``False`` if the
+            conversation has no metadata row.
         """
         ...
 

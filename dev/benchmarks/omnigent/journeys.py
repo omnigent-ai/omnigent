@@ -47,7 +47,7 @@ from typing import Literal, cast
 
 import httpx
 
-from .environment import BenchEnvironment
+from .environment import BenchEnvironment, ServerRequestSnapshot
 from .measure import RunResult
 
 # Per-journey context returned by ``setup`` and threaded to ``measure``. Its
@@ -149,7 +149,54 @@ def _setup_failed_result(exc: Exception) -> RunResult:
     return result
 
 
-# ── timed operation (shared by both runners) ─────────────────
+# ── server request counting (shared by both runners) ─────────
+
+# Route key for the harness's own counter-poll (see environment.py's debug
+# endpoint). Filtered out of the per-journey route appendix — it's
+# instrumentation overhead, not the journey's traffic.
+_METRICS_ROUTE_KEY = "GET /debug/server-metrics"
+
+
+async def _count_start(env: BenchEnvironment) -> ServerRequestSnapshot | None:
+    """Snapshot the server request counters before a run's timed region.
+
+    Returns ``None`` (counting disabled for the run) if the counter is
+    unreachable, so a benchmark against a server without the debug router still
+    produces latency numbers — it just omits the network block.
+    """
+    try:
+        return await env.server_request_snapshot()
+    except Exception:  # noqa: BLE001 — counting is best-effort, never fatal
+        return None
+
+
+async def _count_finish(
+    env: BenchEnvironment, start: ServerRequestSnapshot | None, result: RunResult
+) -> None:
+    """Record server HTTP requests handled during the run's timed region.
+
+    Diffs the counters against *start* and stores the total + per-route
+    breakdown on *result*. The closing poll itself hits the server and lands
+    inside the window, so subtract it (1) from the total to leave only the
+    journey's own requests plus any cross-process traffic (runner → server,
+    host → server). The poll targets the debug-metrics route, a bucket no
+    journey uses, so it never pollutes the per-route diff. A negative or
+    unavailable value leaves ``http_requests`` as ``None``.
+    """
+    if start is None:
+        return
+    end = await _count_start(env)
+    if end is None:
+        return
+    result.http_requests = max(0, end.total - start.total - 1)
+    result.route_requests = {
+        route: delta
+        for route, count in end.routes.items()
+        # Exclude the harness's own counter-poll route so the appendix reflects
+        # only the journey's traffic (the total above already backs it out).
+        if route != _METRICS_ROUTE_KEY
+        if (delta := count - start.routes.get(route, 0)) > 0
+    }
 
 
 async def _timed(
@@ -189,6 +236,7 @@ async def run_latency(
                 await journey.run_prepare(env, ctx)
                 await journey.measure(env, ctx)
         result = RunResult()
+        count_start = await _count_start(env)
         wall_start = time.perf_counter()
         for _ in range(iterations):
             try:
@@ -198,6 +246,7 @@ async def run_latency(
                 continue
             await _timed(journey, env, ctx, result)
         result.wall_time = time.perf_counter() - wall_start
+        await _count_finish(env, count_start, result)
         return result
     finally:
         with contextlib.suppress(Exception):  # teardown failure must not abort the suite
@@ -247,9 +296,11 @@ async def run_throughput(
             await asyncio.gather(*[_one(False, throwaway) for _ in range(warmup)])
 
         result = RunResult()
+        count_start = await _count_start(env)
         wall_start = time.perf_counter()
         await asyncio.gather(*[_one(True, result) for _ in range(requests)])
         result.wall_time = time.perf_counter() - wall_start
+        await _count_finish(env, count_start, result)
         return result
     finally:
         with contextlib.suppress(Exception):  # teardown failure must not abort the suite

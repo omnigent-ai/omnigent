@@ -584,7 +584,52 @@ async def test_list_runs_empty_for_task_with_no_runs(
     ).json()
     resp = await auth_client.get(f"/v1/scheduled-tasks/{created['id']}/runs", headers=_headers())
     assert resp.status_code == 200, resp.text
-    assert resp.json()["runs"] == []
+    body = resp.json()
+    assert body["runs"] == []
+    assert body["next_cursor"] is None
+
+
+async def test_list_runs_cursor_pagination(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    """Paging through runs via ``limit`` + ``after`` yields every run once, in
+    order, with a null cursor on the final page."""
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    total = 25
+    # scheduled_at ascending with i so newest-first order is deterministic.
+    seeded_newest_first: list[str] = []
+    for i in range(total):
+        rid = uuid.uuid4().hex
+        _seed_run(db_uri, task_id, rid, scheduled_at=1000 + i, conversation_id=uuid.uuid4().hex)
+        seeded_newest_first.insert(0, rid)
+
+    collected: list[str] = []
+    after: str | None = None
+    pages = 0
+    while True:
+        params = {"limit": 10}
+        if after is not None:
+            params["after"] = after
+        resp = await auth_client.get(
+            f"/v1/scheduled-tasks/{task_id}/runs", params=params, headers=_headers()
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        collected.extend(r["id"] for r in body["runs"])
+        pages += 1
+        after = body["next_cursor"]
+        if after is None:
+            break
+        assert pages < 10, "pagination did not terminate"
+
+    # No gaps, no dupes, correct newest-first order across pages.
+    assert collected == seeded_newest_first
+    assert len(collected) == total
 
 
 async def test_list_runs_404_for_nonexistent_task(
@@ -839,7 +884,7 @@ def _wait_for_run_status(
     store = SqlAlchemyScheduledTaskStore(db_uri)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        for r in store.list_runs(task_id):
+        for r in store.list_runs(task_id)[0]:
             if r.id == run_id and r.status == want:
                 return r
         time.sleep(0.02)
