@@ -653,6 +653,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    dictation_available: false,
     ...infoOverrides,
   };
   return render(

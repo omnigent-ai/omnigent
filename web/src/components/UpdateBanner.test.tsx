@@ -59,9 +59,8 @@ describe("UpdateBanner", () => {
     });
     render(<UpdateBanner />);
 
-    expect(await screen.findByText("Omnigent 0.4.0 is available.")).toBeInTheDocument();
+    expect(await screen.findByText("Omnigent 0.4.0 is available")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Update now" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Later" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Skip this version" })).toBeInTheDocument();
     expect(screen.getByText("Release notes")).toBeInTheDocument();
     expect(vi.mocked(bridge.getStatus).mock.invocationCallOrder[0]).toBeLessThan(
@@ -74,11 +73,9 @@ describe("UpdateBanner", () => {
     expect(screen.queryByRole("button", { name: "Skip this version" })).toBeNull();
 
     emit({ state: "downloaded", info: { version: "0.4.0" } });
-    expect(await screen.findByText("Omnigent 0.4.0 is ready to install.")).toBeInTheDocument();
+    expect(await screen.findByText("Omnigent 0.4.0 is ready to install")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Restart to update" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Later — install on next quit" }),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Installs automatically on next quit.")).toBeInTheDocument();
   });
 
   it("does not promise install-on-quit when auto install is off", async () => {
@@ -92,9 +89,9 @@ describe("UpdateBanner", () => {
 
     render(<UpdateBanner />);
 
-    expect(await screen.findByText("Omnigent 0.4.0 is ready to install.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Later" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Later — install on next quit" })).toBeNull();
+    expect(await screen.findByText("Omnigent 0.4.0 is ready to install")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Restart to update" })).toBeInTheDocument();
+    expect(screen.queryByText("Installs automatically on next quit.")).toBeNull();
   });
 
   it("unsubscribes from update status events when it unmounts", async () => {
@@ -104,7 +101,7 @@ describe("UpdateBanner", () => {
     });
 
     const { unmount } = render(<UpdateBanner />);
-    expect(await screen.findByText("Omnigent 0.4.0 is available.")).toBeInTheDocument();
+    expect(await screen.findByText("Omnigent 0.4.0 is available")).toBeInTheDocument();
 
     unmount();
 
@@ -123,12 +120,12 @@ describe("UpdateBanner", () => {
     vi.mocked(bridge.setConfig).mockResolvedValueOnce(skippedConfig);
 
     render(<UpdateBanner />);
-    expect(await screen.findByText("Omnigent 0.4.0 is available.")).toBeInTheDocument();
+    expect(await screen.findByText("Omnigent 0.4.0 is available")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Skip this version" }));
     await waitFor(() => {
       expect(bridge.setConfig).toHaveBeenCalledWith({ skippedVersion: "0.4.0" });
-      expect(screen.queryByText("Omnigent 0.4.0 is available.")).toBeNull();
+      expect(screen.queryByText("Omnigent 0.4.0 is available")).toBeNull();
     });
   });
 });

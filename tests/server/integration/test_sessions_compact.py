@@ -22,7 +22,9 @@ HTTP response and asserting whether the AP-side compaction ran.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections import defaultdict
 from typing import Any
 
 import httpx
@@ -232,6 +234,157 @@ async def test_compact_model_less_sdk_harness_returns_clear_unavailable_message(
     assert "openai-agents" in resp.text
     assert "llm.model" in resp.text
     assert "executor.model" in resp.text
+
+
+async def test_compact_single_flight_per_session(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Explicit compaction is single-flight per session, not globally.
+
+    Two ``/compact`` POSTs for one session must never overlap inside
+    ``compact_conversation_now``. Different sessions may overlap. A
+    failed compaction must release the lock so a later request can run.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_routes
+
+    active: dict[str, int] = defaultdict(int)
+    max_active: dict[str, int] = defaultdict(int)
+    simultaneous_sessions = 0
+    entered: dict[str, asyncio.Event] = {}
+    release: dict[str, asyncio.Event] = {}
+    fail_once: set[str] = set()
+    calls: list[str] = []
+    lock_requests: dict[str, int] = defaultdict(int)
+    second_lock_requested: dict[str, asyncio.Event] = {}
+
+    real_compact_lock = sessions_routes._compact_lock
+
+    def _instrumented_compact_lock(session_id: str) -> asyncio.Lock:
+        lock_requests[session_id] += 1
+        if lock_requests[session_id] == 2:
+            second_lock_requested.setdefault(session_id, asyncio.Event()).set()
+        return real_compact_lock(session_id)
+
+    monkeypatch.setattr(sessions_routes, "_compact_lock", _instrumented_compact_lock)
+
+    async def _gated(**kwargs: Any) -> CompactionResult:
+        """Hold inside compaction until the test releases this session."""
+        nonlocal simultaneous_sessions
+        cid = kwargs["conversation_id"]
+        assert isinstance(cid, str)
+        calls.append(cid)
+        active[cid] += 1
+        max_active[cid] = max(max_active[cid], active[cid])
+        simultaneous_sessions = max(
+            simultaneous_sessions,
+            sum(1 for count in active.values() if count > 0),
+        )
+        entered.setdefault(cid, asyncio.Event()).set()
+        try:
+            if cid in fail_once:
+                fail_once.discard(cid)
+                raise RuntimeError("injected compact failure")
+            await release.setdefault(cid, asyncio.Event()).wait()
+            return CompactionResult(messages=[], summary_metadata=None, total_tokens=1)
+        finally:
+            active[cid] -= 1
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.compact_conversation_now",
+        _gated,
+    )
+
+    runner, _captured = _fake_runner_returning(204)
+    set_runner_client(runner)
+    try:
+        agent = await create_test_agent(client)
+        sid_a = await _create_session(client, agent["id"])
+        sid_b = await _create_session(client, agent["id"])
+        release[sid_a] = asyncio.Event()
+        release[sid_b] = asyncio.Event()
+        entered[sid_a] = asyncio.Event()
+        entered[sid_b] = asyncio.Event()
+        second_lock_requested[sid_a] = asyncio.Event()
+
+        # Same session: second request must wait outside compact_conversation_now
+        # until the first releases — never overlap.
+        first_a = asyncio.create_task(
+            client.post(f"/v1/sessions/{sid_a}/events", json={"type": "compact", "data": {}})
+        )
+        await asyncio.wait_for(entered[sid_a].wait(), timeout=5.0)
+        entered[sid_a].clear()
+        second_a = asyncio.create_task(
+            client.post(f"/v1/sessions/{sid_a}/events", json={"type": "compact", "data": {}})
+        )
+        await asyncio.wait_for(second_lock_requested[sid_a].wait(), timeout=5.0)
+        assert active[sid_a] == 1, (
+            f"Same-session compact overlapped inside compact_conversation_now; "
+            f"active={active[sid_a]}."
+        )
+        assert not entered[sid_a].is_set(), (
+            "Second same-session compact entered before the first released."
+        )
+        release[sid_a].set()
+        resp_a1, resp_a2 = await asyncio.wait_for(
+            asyncio.gather(first_a, second_a),
+            timeout=5.0,
+        )
+        assert resp_a1.status_code == 202, resp_a1.text
+        assert resp_a2.status_code == 202, resp_a2.text
+        assert max_active[sid_a] == 1, (
+            f"Same-session compact overlapped; max_active={max_active[sid_a]}."
+        )
+
+        # Different sessions may hold compact_conversation_now concurrently.
+        release[sid_a].clear()
+        release[sid_b].clear()
+        entered[sid_a].clear()
+        entered[sid_b].clear()
+        task_a = asyncio.create_task(
+            client.post(f"/v1/sessions/{sid_a}/events", json={"type": "compact", "data": {}})
+        )
+        task_b = asyncio.create_task(
+            client.post(f"/v1/sessions/{sid_b}/events", json={"type": "compact", "data": {}})
+        )
+        await asyncio.wait_for(
+            asyncio.gather(entered[sid_a].wait(), entered[sid_b].wait()),
+            timeout=5.0,
+        )
+        assert simultaneous_sessions >= 2, (
+            "Different sessions failed to overlap inside compact_conversation_now; "
+            f"simultaneous_sessions={simultaneous_sessions}."
+        )
+        release[sid_a].set()
+        release[sid_b].set()
+        resp_cross_a, resp_cross_b = await asyncio.wait_for(
+            asyncio.gather(task_a, task_b),
+            timeout=5.0,
+        )
+        assert resp_cross_a.status_code == 202, resp_cross_a.text
+        assert resp_cross_b.status_code == 202, resp_cross_b.text
+
+        # Failure must release the lock so a later compact can run.
+        fail_once.add(sid_a)
+        release[sid_a].set()
+        fail_resp = await client.post(
+            f"/v1/sessions/{sid_a}/events",
+            json={"type": "compact", "data": {}},
+        )
+        assert fail_resp.status_code == 500, fail_resp.text
+        retry_resp = await client.post(
+            f"/v1/sessions/{sid_a}/events",
+            json={"type": "compact", "data": {}},
+        )
+        assert retry_resp.status_code == 202, retry_resp.text
+        assert calls.count(sid_a) >= 4, (
+            f"Expected failed compact plus successful retry for {sid_a}; calls={calls!r}."
+        )
+    finally:
+        await runner.aclose()
+        set_runner_client(None)
 
 
 async def test_compact_errors_when_runner_injection_fails(

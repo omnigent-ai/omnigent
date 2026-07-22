@@ -150,7 +150,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
         )
         s.add(
             SqlHost(
-                owner="alice",
+                user_id="alice",
                 name="laptop",
                 host_id="a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
                 status=encode_host_status("offline"),
@@ -164,7 +164,10 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
 
     with Session(engine) as s:
         assert (
-            s.get(SqlComment, (0, "747618b4b2dd94383e50ddf180ceddc3")).created_by
+            s.get(
+                SqlComment,
+                (0, "8af356d908005a65f872c246158c6293", "747618b4b2dd94383e50ddf180ceddc3"),
+            ).created_by
             == "alice@example.com"
         )
         assert (
@@ -172,7 +175,7 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
             == "alice@example.com"
         )
         assert s.get(SqlAccountToken, (0, "tok_1")).created_by == "alice@example.com"
-        host_owners = s.execute(select(SqlHost.owner)).scalars().all()
+        host_owners = s.execute(select(SqlHost.user_id)).scalars().all()
         assert host_owners == ["alice@example.com"]
 
 

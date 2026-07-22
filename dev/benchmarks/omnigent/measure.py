@@ -91,28 +91,48 @@ def _run_to_dict(result: RunResult) -> dict[str, object]:
     }
 
 
+def _summary_runs(results: list[RunResult]) -> list[RunResult]:
+    """Runs eligible for the summary — those with at least one success.
+
+    A run in which every operation failed records only ``0.0`` latencies /
+    throughput. Averaging those zeros in would drag the summary toward zero
+    (a fully-failed run looks like an infinitely fast one), so they are
+    excluded from the averages while still kept in the per-run ``runs`` detail.
+    """
+    return [r for r in results if r.n_success > 0]
+
+
 def aggregate(results: list[RunResult]) -> dict[str, object]:
     """Fold per-run results into ``{"runs": [...], "summary": {...}}``.
 
-    The ``summary`` averages each metric across runs. Its keys mirror
-    MLflow's gateway benchmark (``avg_mean_ms`` / ``avg_p50_ms`` /
+    The ``summary`` averages each metric across the runs that produced at
+    least one successful sample (see :func:`_summary_runs`). Its metric keys
+    mirror MLflow's gateway benchmark (``avg_mean_ms`` / ``avg_p50_ms`` /
     ``avg_p99_ms`` / ``avg_rps``) plus ``avg_p95_ms``, so the workspace ETL
-    that flattens ``summary`` works unchanged.
+    that flattens ``summary`` works unchanged; ``runs_total`` / ``runs_ok``
+    record how many runs the averages are based on.
 
     :param results: One :class:`RunResult` per timed run (warmup excluded).
     :returns: A dict with a per-run ``runs`` list and an averaged
-        ``summary`` (empty ``summary`` when *results* is empty).
+        ``summary``. ``summary`` is ``{}`` when *results* is empty; when runs
+        exist but all failed, it carries only ``runs_total`` / ``runs_ok`` (no
+        metric keys), so a fully-failed journey never fabricates fast numbers.
     """
     runs = [_run_to_dict(r) for r in results]
     if not results:
         return {"runs": runs, "summary": {}}
-    summary = {
-        "avg_mean_ms": statistics.mean(r.mean_ms() for r in results),
-        "avg_p50_ms": statistics.mean(r.percentile(50) for r in results),
-        "avg_p95_ms": statistics.mean(r.percentile(95) for r in results),
-        "avg_p99_ms": statistics.mean(r.percentile(99) for r in results),
-        "avg_rps": statistics.mean(r.throughput for r in results),
-    }
+    ok = _summary_runs(results)
+    summary: dict[str, object] = {"runs_total": len(results), "runs_ok": len(ok)}
+    if ok:
+        summary.update(
+            {
+                "avg_mean_ms": statistics.mean(r.mean_ms() for r in ok),
+                "avg_p50_ms": statistics.mean(r.percentile(50) for r in ok),
+                "avg_p95_ms": statistics.mean(r.percentile(95) for r in ok),
+                "avg_p99_ms": statistics.mean(r.percentile(99) for r in ok),
+                "avg_rps": statistics.mean(r.throughput for r in ok),
+            }
+        )
     return {"runs": runs, "summary": summary}
 
 
@@ -130,13 +150,26 @@ def check_thresholds(
     :param max_p50_ms: Fail if average p50 latency exceeds this (ms).
     :param max_p99_ms: Fail if average p99 latency exceeds this (ms).
     :returns: ``True`` when every supplied threshold passes (vacuously
-        true when none are supplied or *results* is empty).
+        true when none are supplied or *results* is empty). Fully-failed runs
+        are excluded from the averages; if a threshold is supplied but no run
+        produced a successful sample, the guarantee can't be verified, so this
+        fails rather than passing on fabricated zeros.
     """
     if not results:
         return True
-    avg_rps = statistics.mean(r.throughput for r in results)
-    avg_p50 = statistics.mean(r.percentile(50) for r in results)
-    avg_p99 = statistics.mean(r.percentile(99) for r in results)
+    have_thresholds = min_rps is not None or max_p50_ms is not None or max_p99_ms is not None
+    ok = _summary_runs(results)
+    if not ok:
+        if have_thresholds:
+            console.print(
+                "  [red]THRESHOLD FAILED:[/red] every run failed — no successful"
+                " sample to check thresholds against."
+            )
+            return False
+        return True
+    avg_rps = statistics.mean(r.throughput for r in ok)
+    avg_p50 = statistics.mean(r.percentile(50) for r in ok)
+    avg_p99 = statistics.mean(r.percentile(99) for r in ok)
     passed = True
 
     if min_rps is not None and avg_rps < min_rps:
@@ -196,21 +229,30 @@ def print_results(journey_name: str, results: list[RunResult]) -> None:
             fail_str,
         )
 
-    if len(results) > 1:
+    # Average only the runs that produced a successful sample, so a
+    # fully-failed run doesn't drag the row toward zero (it matches the
+    # summary in aggregate()).
+    ok = _summary_runs(results)
+    if len(results) > 1 and ok:
         table.add_section()
         table.add_row(
             "[bold]avg[/bold]",
-            f"[bold]{statistics.mean(r.mean_ms() for r in results):.1f}[/bold]",
-            f"[bold]{statistics.mean(r.percentile(50) for r in results):.1f}[/bold]",
-            f"[bold]{statistics.mean(r.percentile(95) for r in results):.1f}[/bold]",
-            f"[bold]{statistics.mean(r.percentile(99) for r in results):.1f}[/bold]",
-            f"[bold]{statistics.mean(r.max_ms() for r in results):.1f}[/bold]",
-            f"[bold]{statistics.mean(r.throughput for r in results):.0f}[/bold]",
+            f"[bold]{statistics.mean(r.mean_ms() for r in ok):.1f}[/bold]",
+            f"[bold]{statistics.mean(r.percentile(50) for r in ok):.1f}[/bold]",
+            f"[bold]{statistics.mean(r.percentile(95) for r in ok):.1f}[/bold]",
+            f"[bold]{statistics.mean(r.percentile(99) for r in ok):.1f}[/bold]",
+            f"[bold]{statistics.mean(r.max_ms() for r in ok):.1f}[/bold]",
+            f"[bold]{statistics.mean(r.throughput for r in ok):.0f}[/bold]",
             "",
         )
 
     console.print()
     console.print(table)
+    if len(ok) < len(results):
+        console.print(
+            f"  [yellow]avg over {len(ok)}/{len(results)} runs[/yellow]"
+            " — fully-failed runs excluded."
+        )
 
     combined: dict[str, int] = {}
     for r in results:
