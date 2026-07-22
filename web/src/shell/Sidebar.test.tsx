@@ -348,9 +348,9 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("shows the session-state badge OR the timestamp, never both", () => {
-    // Fresh updated_at → relativeTime renders "now", reproducing the
-    // reported bug: a status marker AND "now" side by side.
+  it("shows session-state badges without rendering session timestamps", () => {
+    // Fresh updated_at would render "now" if timestamps leaked back into
+    // session rows.
     const freshSeconds = Math.floor(Date.now() / 1000);
     mockConversations([
       conv("conv_working", "Codex", { status: "running", updated_at: freshSeconds }),
@@ -362,9 +362,7 @@ describe("Sidebar session list", () => {
     ]);
     renderSidebar();
 
-    // Working row: the running dot takes the time-marker slot and the
-    // redundant "now" is suppressed. Both appearing = the either/or rule
-    // regressed.
+    // Working rows keep their lifecycle badge without a timestamp.
     const workingRow = screen.getByRole("link", { name: /conv_working/ }).closest("li")!;
     expect(within(workingRow).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
@@ -372,8 +370,7 @@ describe("Sidebar session list", () => {
     );
     expect(within(workingRow).queryByText("now")).toBeNull();
 
-    // Awaiting row: same rule for the "Needs response" tag — any non-null
-    // session state replaces the timestamp, not just the working dot.
+    // Awaiting rows keep the "Needs response" badge without a timestamp.
     const awaitingRow = screen.getByRole("link", { name: /conv_awaiting/ }).closest("li")!;
     expect(within(awaitingRow).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
@@ -381,10 +378,10 @@ describe("Sidebar session list", () => {
     );
     expect(within(awaitingRow).queryByText("now")).toBeNull();
 
-    // Idle row: no badge, so the timestamp must still render — suppressing
-    // it everywhere would be an over-broad fix.
+    // Idle rows render neither a lifecycle badge nor a timestamp.
     const idleRow = screen.getByRole("link", { name: /conv_idle/ }).closest("li")!;
-    expect(within(idleRow).getByText("now")).toBeInTheDocument();
+    expect(within(idleRow).queryByTestId("session-state-badge")).toBeNull();
+    expect(within(idleRow).queryByText("now")).toBeNull();
   });
 });
 

@@ -137,7 +137,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
-import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
@@ -158,11 +157,10 @@ import {
   togglePinnedConversationId,
 } from "./sidebarNav";
 
-// Positioning shared by both occupants of a row's trailing time-marker slot
-// (the session-state badge or the relative timestamp). On desktop the slot
-// fades out on hover/focus so the pin + kebab controls can take its place;
-// on mobile it sits left of the always-visible controls (right-[4.5rem]).
-const TIME_MARKER_SLOT_CLASS =
+// Positioning for a row's trailing session-state badge. On desktop the badge
+// fades out on hover/focus so the pin + kebab controls can take its place; on
+// mobile it sits left of the always-visible controls (right-[4.5rem]).
+const SESSION_STATE_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-2 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
 
 // Highlight applied to a drop target while a draggable session hovers it: a
@@ -2707,10 +2705,9 @@ function ConversationRow({
       title={projectFlyoutName ? undefined : (conversation.title ?? conversation.id)}
     >
       {/* Row 1: the session name. Status markers (working, needs-approval,
-          unseen) render in the trailing time-marker slot below, replacing
-          the timestamp — not inline here. Leading icons (agent type, pin,
-          shared) were removed to keep rows text-clean; pinned rows still
-          group under "Pinned". */}
+          unseen) render in the trailing session-state slot below, not inline
+          here. Leading icons (agent type, pin, shared) were removed to keep
+          rows text-clean; pinned rows still group under "Pinned". */}
       <div className="flex w-full items-center gap-1.5">
         <span className="relative min-w-0 truncate">
           {label}
@@ -2799,18 +2796,10 @@ function ConversationRow({
           )}
         </span>
       ) : sessionState !== null ? (
-        <span className={TIME_MARKER_SLOT_CLASS}>
+        <span className={SESSION_STATE_SLOT_CLASS}>
           <SessionStateBadge state={sessionState} />
         </span>
-      ) : (
-        <span
-          className={cn(TIME_MARKER_SLOT_CLASS, "text-xs tabular-nums text-muted-foreground")}
-          aria-label={absoluteTime(conversation.updated_at * 1000)}
-          title={absoluteTime(conversation.updated_at * 1000)}
-        >
-          {relativeTime(conversation.updated_at * 1000)}
-        </span>
-      )}
+      ) : null}
       {/* Archived rows omit the pin entirely: pinning is meaningless there
           (archive outranks pin), so there's no pin action even on hover. Also
           hidden while selecting (bulk mode owns the row controls). */}
