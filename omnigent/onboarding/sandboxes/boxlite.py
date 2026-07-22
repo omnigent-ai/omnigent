@@ -372,8 +372,9 @@ class BoxliteSandboxLauncher(SandboxLauncher):
         """
         Create a new BoxLite box from the host image.
 
-        The box is persistent (``auto_remove=False``); the managed-session
-        machinery owns its teardown (session delete / relaunch → ``terminate``).
+        The box is detached and persistent (``detach=True``,
+        ``auto_remove=False``); the managed-session machinery owns its teardown
+        (session delete / relaunch → ``terminate``).
         Network defaults to full egress (boxlite ``NetworkSpec`` default
         ``Enabled``) so the in-box host can reach ``server_url``.
 
@@ -398,6 +399,7 @@ class BoxliteSandboxLauncher(SandboxLauncher):
                 memory_mib=_SANDBOX_MEMORY_MIB,
                 env=env,
                 auto_remove=False,
+                detach=True,
             )
             box = await runtime.create(options, name=name)
             return str(box.id)

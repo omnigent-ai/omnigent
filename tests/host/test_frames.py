@@ -14,7 +14,10 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -194,6 +197,58 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_harness_readiness_frame_round_trip() -> None:
+    """Verify a live readiness refresh survives encode and decode."""
+    original = HostHarnessReadinessFrame(
+        configured_harnesses={"pi": True, "codex": "needs-auth"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHarnessReadinessFrame)
+    assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+def test_harness_readiness_frame_rejects_unknown_availability() -> None:
+    """Unknown readiness states cannot partially replace the live map."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {
+                "pi": "future-state",
+                "codex": "needs-auth",
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="unsupported availability state"):
+        decode_host_frame(encoded)
+
+
+def test_harness_readiness_frame_requires_object_map() -> None:
+    """A malformed live refresh is rejected instead of clearing known readiness."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": ["pi"],
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a configured_harnesses object"):
+        decode_host_frame(encoded)
+
+
+def test_harness_readiness_frame_rejects_empty_map() -> None:
+    """An empty refresh cannot erase the host's last complete readiness map."""
+    encoded = json.dumps(
+        {
+            "kind": "host.harness_readiness",
+            "configured_harnesses": {},
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires a non-empty configured_harnesses map"):
+        decode_host_frame(encoded)
 
 
 def test_hello_frame_legacy_payload_decodes_unknown_harnesses() -> None:
@@ -1028,6 +1083,70 @@ def test_create_dir_result_error_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.path is None
     assert decoded.error == "directory already exists"
+
+
+def test_install_harness_frame_round_trip() -> None:
+    """
+    Verify HostInstallHarnessFrame survives encode → decode.
+
+    The host maps ``harness`` to an install-spec key; a garbled value
+    would install (or reject) the wrong harness.
+    """
+    original = HostInstallHarnessFrame(
+        request_id="req_install_1",
+        harness="claude",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessFrame)
+    assert decoded.request_id == "req_install_1"
+    assert decoded.harness == "claude"
+
+
+def test_install_harness_result_success_round_trip() -> None:
+    """
+    Verify a successful install result round-trips with the refreshed
+    readiness map intact.
+
+    The server flips the UI badge off this map, so a dropped or garbled
+    ``configured_harnesses`` would leave a stale "binary missing" badge
+    after a successful install. The map mixes bool and string values
+    (``"needs-auth"`` for an installed-but-unauthed harness), so both
+    must survive the wire.
+    """
+    original = HostInstallHarnessResultFrame(
+        request_id="req_install_2",
+        status="ok",
+        configured_harnesses={"claude-native": True, "codex-native": "needs-auth"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessResultFrame)
+    assert decoded.status == "ok"
+    assert decoded.configured_harnesses == {
+        "claude-native": True,
+        "codex-native": "needs-auth",
+    }
+    assert decoded.error is None
+
+
+def test_install_harness_result_failure_round_trip() -> None:
+    """
+    Verify a failed install round-trips the reason and leaves the
+    readiness map ``None``.
+
+    The dialog surfaces ``error`` inline so the user sees why the
+    install failed; when the installer never ran there is no fresh
+    readiness to report, so the server keeps its prior view.
+    """
+    original = HostInstallHarnessResultFrame(
+        request_id="req_install_3",
+        status="failed",
+        error="npm not found",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessResultFrame)
+    assert decoded.status == "failed"
+    assert decoded.configured_harnesses is None
+    assert decoded.error == "npm not found"
 
 
 def test_fs_request_round_trip() -> None:

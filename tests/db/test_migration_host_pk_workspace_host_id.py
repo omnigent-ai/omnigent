@@ -1,7 +1,7 @@
 """Tests for the hosts PK migration to (workspace_id, host_id) (v1a2b3c4d5e6).
 
 Verifies that after upgrade the PK is (workspace_id, host_id) with
-uq_hosts_workspace_owner_name in place, and that downgrade restores the
+uq_hosts_workspace_user_id_name in place, and that downgrade restores the
 original (workspace_id, owner, name) PK with uq_hosts_host_id.
 """
 
@@ -42,15 +42,15 @@ def test_pk_is_workspace_id_and_host_id(db_engine: Engine) -> None:
     )
 
 
-def test_unique_constraint_on_workspace_owner_name(db_engine: Engine) -> None:
-    """After upgrade uq_hosts_workspace_owner_name must exist."""
+def test_unique_constraint_on_workspace_user_id_name(db_engine: Engine) -> None:
+    """After upgrade uq_hosts_workspace_user_id_name must exist."""
     uqs = sa.inspect(db_engine).get_unique_constraints("hosts")
     names = {u["name"] for u in uqs}
-    assert "uq_hosts_workspace_owner_name" in names, (
-        f"Expected uq_hosts_workspace_owner_name; found {names}"
+    assert "uq_hosts_workspace_user_id_name" in names, (
+        f"Expected uq_hosts_workspace_user_id_name; found {names}"
     )
-    uq = next(u for u in uqs if u["name"] == "uq_hosts_workspace_owner_name")
-    assert set(uq["column_names"]) == {"workspace_id", "owner", "name"}
+    uq = next(u for u in uqs if u["name"] == "uq_hosts_workspace_user_id_name")
+    assert set(uq["column_names"]) == {"workspace_id", "user_id", "name"}
 
 
 def test_old_unique_constraint_dropped(db_engine: Engine) -> None:
@@ -72,7 +72,7 @@ def test_data_survives_upgrade(tmp_path: Path) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
-                "(workspace_id, owner, name, host_id, status, created_at, updated_at) "
+                "(workspace_id, user_id, name, host_id, status, created_at, updated_at) "
                 "VALUES (0, 'alice@example.com', 'laptop', 'abb32306b80732bdfa6153b2f5f6eb92', 1, "
                 "1700000000, 1700000001)"
             )
@@ -83,7 +83,7 @@ def test_data_survives_upgrade(tmp_path: Path) -> None:
         engine.connect()
         .execute(
             sa.text(
-                "SELECT owner, name, host_id FROM hosts"
+                "SELECT user_id, name, host_id FROM hosts"
                 " WHERE host_id = 'abb32306b80732bdfa6153b2f5f6eb92'"
             )
         )
@@ -110,7 +110,7 @@ def test_downgrade_restores_old_pk(tmp_path: Path) -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO hosts "
-                "(workspace_id, owner, name, host_id, status, created_at, updated_at) "
+                "(workspace_id, user_id, name, host_id, status, created_at, updated_at) "
                 "VALUES (0, 'bob@example.com', 'workstation',"
                 " '2173662ad94ab46f03cfbdd5f968d22b', 2, "
                 "1700000002, 1700000003)"

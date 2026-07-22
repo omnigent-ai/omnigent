@@ -414,8 +414,12 @@ jobs:
     # Combines per-shard coverage into a coverage-summary artifact. Runs in the
     # unprivileged pull_request context (read-only); code-coverage.yml consumes
     # the artifact and posts the status. Report-only.
+    #
+    # Only runs when every pytest shard passed: a failed shard drops its covered
+    # lines from the combine, so coverage off partial data would be misleading —
+    # and a red run gets re-run anyway, re-triggering this.
     needs: pytest
-    if: ${{ !cancelled() && !github.event.pull_request.draft }}
+    if: ${{ success() && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -405,3 +405,311 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
         )
     # Still routes — fell back to static infer_models
     assert model == "databricks-claude-haiku-4-5"
+
+
+# ── ExternalRoutingClient ─────────────────────────────────────────────
+
+
+def _patch_httpx(transport: Any) -> Any:
+    """Patch httpx.AsyncClient to use a MockTransport."""
+    import httpx
+
+    real = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> Any:
+        kwargs["transport"] = transport
+        return real(*args, **kwargs)
+
+    return patch("httpx.AsyncClient", factory)
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_sends_snake_case_and_parses() -> None:
+    """available_models -> snake_case route_options; response -> RoutingResult."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "route_selection": [
+                    {"route_option": {"model": "claude-opus-4-8", "harness": "claude"}}
+                ],
+                "rationale": "task_v0 matched rule 'bugfix_to_opus'.",
+            },
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/ai-gateway/routing/v1", router_name="task_v0"
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "fix this code: x = y + 2",
+            {"claude": ["claude-opus-4-8"], "codex": ["gpt-5-5"]},
+        )
+
+    assert result is not None
+    assert result.model == "claude-opus-4-8"
+    assert result.harness == "claude"
+    assert result.rationale == "task_v0 matched rule 'bugfix_to_opus'."
+    assert captured["url"] == "https://host/ai-gateway/routing/v1/routes:select"
+    body = captured["body"]
+    assert body["route_selector"]["router_name"] == "task_v0"  # snake_case
+    assert body["task"]["prompt"] == "fix this code: x = y + 2"
+    assert body["route_options"] == [
+        {"model": "claude-opus-4-8", "harness": "claude"},
+        {"model": "gpt-5-5", "harness": "codex"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_roundtrips_provider_prefix() -> None:
+    """Send bare ids out; recover the exact catalog id from the bare answer.
+
+    A Databricks catalog carries a ``databricks-`` prefix the router doesn't
+    want, so we send bare ids and map the router's (bare) pick back to the
+    local prefixed id the runner needs.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        # Router echoes the bare id it was given.
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", model_prefixes=["databricks-"]
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "hi", {"self": ["databricks-claude-opus-4-8", "databricks-gpt-5-5"]}
+        )
+
+    # Outbound: configured prefix stripped for the router's vocabulary.
+    assert captured["body"]["route_options"] == [
+        {"model": "claude-opus-4-8", "harness": "self"},
+        {"model": "gpt-5-5", "harness": "self"},
+    ]
+    # Inbound: mapped back to the local (prefixed) catalog id.
+    assert result is not None
+    assert result.model == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_strips_first_matching_prefix() -> None:
+    """With multiple prefixes, the first matching one is stripped per id."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "claude-opus-4-8"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v0",
+        model_prefixes=["databricks-", "system.ai."],
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "hi", {"self": ["databricks-claude-opus-4-8", "system.ai.claude-sonnet-5"]}
+        )
+
+    # Each id has its own matching prefix stripped.
+    assert captured["body"]["route_options"] == [
+        {"model": "claude-opus-4-8", "harness": "self"},
+        {"model": "claude-sonnet-5", "harness": "self"},
+    ]
+    assert result is not None
+    assert result.model == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_maps_back_by_harness() -> None:
+    """The same bare id under two harnesses maps back to distinct local ids.
+
+    A Databricks-authed harness carries the ``databricks-`` prefix while a
+    subscription harness (e.g. Codex) uses the bare id; both reduce to the
+    same router id, so the (harness, router-id) key keeps them distinct.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        # Router picks the codex option (bare id, codex harness).
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "gpt-5-5", "harness": "codex"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", model_prefixes=["databricks-"]
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route(
+            "hi",
+            {"pi": ["databricks-gpt-5-5"], "codex": ["gpt-5-5"]},
+        )
+
+    # Both harnesses reduce to router id "gpt-5-5"; the pick maps back to the
+    # codex local id, not pi's prefixed one.
+    assert result is not None
+    assert result.model == "gpt-5-5"
+    assert result.harness == "codex"
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_no_prefix_sends_catalog_ids_verbatim() -> None:
+    """With no model_prefix configured, catalog ids are sent verbatim.
+
+    Provider-agnostic guarantee: core invents/strips nothing — even a
+    ``databricks-`` id passes through untouched when unconfigured.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "databricks-claude-opus-4-8"}}]},
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route("hi", {"self": ["databricks-claude-opus-4-8", "gpt-5-5"]})
+
+    # Sent verbatim — no prefix stripped.
+    assert captured["body"]["route_options"] == [
+        {"model": "databricks-claude-opus-4-8", "harness": "self"},
+        {"model": "gpt-5-5", "harness": "self"},
+    ]
+    assert result is not None
+    assert result.model == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_empty_available_models_skips() -> None:
+    """No candidates -> no HTTP call, returns None."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {}) is None
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_swallows_http_error() -> None:
+    """A router outage returns None so the turn proceeds."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_empty_selection_returns_none() -> None:
+    """An empty route_selection (e.g. router declined) yields None."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"route_selection": [], "rationale": ""})
+
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_rejects_out_of_set_model() -> None:
+    """A model the router was never offered is rejected, not persisted.
+
+    Parity with the built-in judge: the returned model would become the
+    session's ``model_override``, so an out-of-set pick returns None and the
+    turn proceeds on the agent's default model.
+    """
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "route_selection": [
+                    {"route_option": {"model": "hallucinated-model", "harness": "claude"}}
+                ]
+            },
+        )
+
+    client = ExternalRoutingClient(base_url="http://localhost:6767/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"claude": ["claude-opus-4-8"]}) is None
+
+
+@pytest.mark.asyncio
+async def test_external_routing_client_sends_bearer_auth() -> None:
+    """When built with auth, the request carries the bearer header."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("Authorization")
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "m", "harness": "h"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", auth=_bearer_auth("dapi-XYZ")
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        await client.route("hi", {"h": ["m"]})
+    assert captured["authorization"] == "Bearer dapi-XYZ"

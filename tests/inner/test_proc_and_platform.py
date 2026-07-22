@@ -356,3 +356,100 @@ def test_host_runner_env_lets_child_import_asyncio_and_resolve_home() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# resolve_cli_binary — CLIs that may live off the daemon's frozen PATH
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_cli_binary_prefers_path(monkeypatch):
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == "/usr/bin/tool"
+
+
+def test_resolve_cli_binary_env_override_wins(monkeypatch, tmp_path):
+    override = tmp_path / "tool"
+    override.write_text("#!/bin/sh\n")
+    override.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(override))
+    # PATH would resolve elsewhere, but the override takes precedence.
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(override)
+
+
+def test_resolve_cli_binary_falls_back_to_global_dir(monkeypatch, tmp_path):
+    """A binary off PATH is still found in a common global install dir.
+
+    This is the nvm case: the host daemon's frozen PATH omits the bin dir,
+    but the binary is present on disk.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    tool = fallback_dir / "tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(tool)
+
+
+def test_resolve_cli_binary_returns_none_when_absent(monkeypatch, tmp_path):
+    monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path / "empty",))
+    assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") is None
+
+
+def test_resolve_cli_binary_warns_on_bad_override(monkeypatch, tmp_path, caplog):
+    """A set-but-unresolvable override warns (so a misconfig surfaces) and then
+    falls back to PATH rather than launching nothing."""
+    monkeypatch.setenv("OMNIGENT_TESTCLI_PATH", str(tmp_path / "does-not-exist"))
+    monkeypatch.setattr(
+        _platform.shutil, "which", lambda name: "/usr/bin/tool" if name == "tool" else None
+    )
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    with caplog.at_level("WARNING"):
+        resolved = _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH")
+    assert resolved == "/usr/bin/tool"
+    assert "OMNIGENT_TESTCLI_PATH" in caplog.text
+
+
+def test_resolve_cli_binary_no_env_var(monkeypatch):
+    """Without an env_var, resolution is PATH then fallback dirs only."""
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: "/usr/bin/tool")
+    assert _platform.resolve_cli_binary("tool") == "/usr/bin/tool"
+
+
+def test_cli_fallback_dirs_includes_nvm_version_bins(monkeypatch, tmp_path):
+    """nvm keeps global bins under ~/.nvm/versions/node/<ver>/bin; the ladder
+    must include those (newest first) since that's the reported nvm case.
+
+    Ordering is by parsed numeric version, so double-digit majors (v10) beat
+    single-digit ones (v9) — a lexicographic sort would get this backwards.
+    """
+    nvm = tmp_path / ".nvm" / "versions" / "node"
+    for ver in ("v9.11.0", "v10.2.0", "v20.5.0"):
+        (nvm / ver / "bin").mkdir(parents=True)
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    dirs = _platform._cli_fallback_dirs()
+    for ver in ("v9.11.0", "v10.2.0", "v20.5.0"):
+        assert nvm / ver / "bin" in dirs
+    # newest → oldest, numerically: v20 > v10 > v9 (not the lexicographic
+    # order where "v9" would sort after "v10"/"v20").
+    order = [dirs.index(nvm / v / "bin") for v in ("v20.5.0", "v10.2.0", "v9.11.0")]
+    assert order == sorted(order)
+
+
+def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
+    """Absent ~/.nvm, the ladder still returns the static dirs without error."""
+    monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
+    dirs = _platform._cli_fallback_dirs()
+    assert tmp_path / ".local" / "bin" in dirs

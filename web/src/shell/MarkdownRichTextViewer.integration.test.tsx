@@ -89,7 +89,10 @@ vi.mock("@tiptap/extension-table", () => ({
 }));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
-vi.mock("./tiptapMarkdownPatches", () => ({ installMarkdownSerializerPatch: vi.fn() }));
+vi.mock("./tiptapMarkdownPatches", () => ({
+  installMarkdownSerializerPatch: vi.fn(),
+  installMarkdownParserPatch: vi.fn(),
+}));
 vi.mock("./TipTapWorkspaceImage", () => ({
   createWorkspaceImageExtension: vi.fn().mockReturnValue({}),
   ImageAwareLink: { configure: vi.fn().mockReturnValue({}) },

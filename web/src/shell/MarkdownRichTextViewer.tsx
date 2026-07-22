@@ -44,11 +44,20 @@ import {
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
-import { installMarkdownSerializerPatch } from "./tiptapMarkdownPatches";
+import {
+  installMarkdownParserPatch,
+  installMarkdownSerializerPatch,
+} from "./tiptapMarkdownPatches";
 
 // Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
 // installed once at module load, before any editor instance is created.
 installMarkdownSerializerPatch();
+
+// Post-parse normalisation wrapping loose inline runs (a standalone image in
+// document flow, `1. ![x](y)`) in a paragraph so block+ containers never get
+// a bare inline child — the crash residual #2320 documented (see
+// tiptapMarkdownPatches.ts).
+installMarkdownParserPatch();
 
 // @tiptap/markdown parses a list item whose first child is a non-paragraph
 // block — a nested list, a fenced code block, a blockquote, a heading, or a

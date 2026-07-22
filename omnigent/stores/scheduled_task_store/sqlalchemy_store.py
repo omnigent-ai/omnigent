@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import asc, delete, desc, select
 
 from omnigent.db.db_models import (
+    DEFAULT_WORKSPACE_ID,
     SqlScheduledTask,
     SqlScheduledTaskRun,
     current_workspace_id,
@@ -43,10 +44,11 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         id=row.id,
         name=row.name,
         prompt=row.prompt,
-        owner_user_id=row.owner_user_id,
+        user_id=row.user_id,
         agent_id=row.agent_id,
         timezone=row.timezone,
         created_at=row.created_at,
+        workspace_id=row.workspace_id or DEFAULT_WORKSPACE_ID,
         rrule=row.rrule,
         model_override=row.model_override,
         reasoning_effort=row.reasoning_effort,
@@ -111,15 +113,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         name: str,
         prompt: str,
         rrule: str,
-        owner_user_id: str | None,
+        user_id: str | None,
         agent_id: str,
         timezone: str,
         *,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
-        base_branch: str | None = None,
-        execution_target: str = "connected_host",
         host_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
@@ -129,14 +129,14 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             name=name,
             prompt=prompt,
             rrule=rrule,
-            owner_user_id=owner_user_id,
+            user_id=user_id,
             agent_id=agent_id,
             timezone=timezone,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
             workspace=workspace,
-            base_branch=base_branch,
-            execution_target=encode_scheduled_task_execution_target(execution_target),
+            base_branch=None,
+            execution_target=encode_scheduled_task_execution_target("connected_host"),
             host_id=host_id,
             state=encode_scheduled_task_state(state),
             last_run_at=None,
@@ -180,6 +180,21 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
+    def list_active_all_workspaces(self) -> list[ScheduledTask]:
+        """List active scheduled tasks across every workspace for scheduler boot."""
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTask)
+                .where(SqlScheduledTask.state == encode_scheduled_task_state("active"))
+                .order_by(
+                    asc(SqlScheduledTask.workspace_id),
+                    asc(SqlScheduledTask.created_at),
+                    asc(SqlScheduledTask.id),
+                )
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_to_entity(r) for r in rows]
+
     def update(
         self,
         scheduled_task_id: str,
@@ -191,8 +206,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         model_override: str | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
-        base_branch: str | None = None,
-        execution_target: str | None = None,
         host_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
@@ -232,14 +245,6 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if workspace is not None and row.workspace != workspace:
                 row.workspace = workspace
                 changed = True
-            if base_branch is not None and row.base_branch != base_branch:
-                row.base_branch = base_branch
-                changed = True
-            if execution_target is not None:
-                encoded_target = encode_scheduled_task_execution_target(execution_target)
-                if row.execution_target != encoded_target:
-                    row.execution_target = encoded_target
-                    changed = True
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
                 changed = True
@@ -316,6 +321,78 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 select(SqlScheduledTaskRun)
                 .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
                 .where(SqlScheduledTaskRun.scheduled_task_id == scheduled_task_id)
+                .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_run_to_entity(r) for r in rows]
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        finished_at: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> ScheduledTaskRun | None:
+        """Transition a still-``running`` run to a terminal status.
+
+        Conditional on the current status being ``running`` so an
+        already-terminal run is never clobbered and concurrent sweeps cannot
+        double-transition (see the interface docstring).
+        """
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            if row is None or row.status != running_code:
+                return None
+            row.status = encode_scheduled_task_run_status(status)
+            row.finished_at = finished_at
+            row.error = error
+            row.error_code = error_code
+            session.flush()
+            return _run_to_entity(row)
+
+    def get_running_run_by_conversation(self, conversation_id: str) -> ScheduledTaskRun | None:
+        """Return the ``running`` run for a conversation, or ``None``.
+
+        Workspace-scoped reverse lookup for the event-driven completion hook;
+        backed by ``ix_scheduled_task_runs_conversation_id``. A conversation has
+        at most one ``running`` run, so ``.first()`` is exact rather than lossy.
+        """
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.conversation_id == conversation_id)
+                .where(SqlScheduledTaskRun.status == running_code)
+            )
+            row = session.execute(stmt).scalars().first()
+            return _run_to_entity(row) if row is not None else None
+
+    def list_running_runs_for_tasks(self, scheduled_task_ids: list[str]) -> list[ScheduledTaskRun]:
+        """List ``running`` runs for the given tasks in the current workspace.
+
+        Powers the lazy-on-read stale backstop on the scheduled-task LIST
+        endpoint: the route resolves the owner's tasks, then this returns their
+        still-``running`` runs (one indexed, workspace-scoped query over the
+        ``scheduled_task_id`` index) so the route can force-fail the stale ones.
+        An empty ``scheduled_task_ids`` returns an empty list without a query.
+
+        :param scheduled_task_ids: Task ids (already owner-scoped by the caller).
+        :returns: ``running`` runs for those tasks, ordered
+            ``scheduled_at DESC, id DESC``.
+        """
+        if not scheduled_task_ids:
+            return []
+        running_code = encode_scheduled_task_run_status("running")
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
+                .where(SqlScheduledTaskRun.scheduled_task_id.in_(scheduled_task_ids))
+                .where(SqlScheduledTaskRun.status == running_code)
                 .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
             )
             rows = session.execute(stmt).scalars().all()

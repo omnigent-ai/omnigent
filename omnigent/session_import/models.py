@@ -9,7 +9,7 @@ from typing import Literal
 from omnigent.entities import MessageData, NewConversationItem
 from omnigent.entities.conversation import synthesize_conversation_title
 
-ImportSource = Literal["claude", "codex"]
+ImportSource = Literal["claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"]
 
 IMPORT_SOURCE_LABEL_KEY = "omnigent.import.source"
 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY = "omnigent.import.external_session_id"

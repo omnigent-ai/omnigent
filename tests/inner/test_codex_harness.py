@@ -74,6 +74,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
     monkeypatch.setenv("HARNESS_CODEX_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
     monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
     monkeypatch.setenv("HARNESS_CODEX_DISABLE_NATIVE_TOOLS", "true")
 

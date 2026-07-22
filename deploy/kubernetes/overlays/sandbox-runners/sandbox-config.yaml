@@ -19,6 +19,16 @@ data:
       # Service listens on port 80) is simplest; use your ingress URL if runner
       # Pods must reach the server through it.
       server_url: http://omnigent.omnigent.svc.cluster.local
+      # ── optional, provider-agnostic ──
+      # host_config:               # verbatim in-sandbox ~/.omnigent/config.yaml content,
+      #   providers:               # merged in before `omnigent host` starts — e.g. route
+      #     litellm:               # the `pi` harness through a self-hosted gateway.
+      #       kind: gateway        # Keep secrets out: api_key_ref: env: resolves inside
+      #       default: [pi]        # the runner Pod against the secret_name Secret below.
+      #       openai:
+      #         base_url: http://litellm.litellm.svc.cluster.local/v1
+      #         api_key_ref: env:LITELLM_API_KEY
+      #         wire_api: chat
       kubernetes:
         # Runner-Pod namespace (secret_name / service_account resolve here).
         namespace: omnigent-sandboxes
