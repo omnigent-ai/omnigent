@@ -8438,6 +8438,27 @@ def create_runner_app(
 
     app.state.has_active_work = _has_active_work
 
+    def _drain_session_streams() -> None:
+        """Signal end-of-stream to every open ``GET /stream`` subscriber.
+
+        Called once on graceful (idle-reaper) shutdown, before the tunnel is
+        torn down. Enqueues the ``None`` sentinel to each session event queue
+        so its stream generator emits ``[DONE]`` (see ``_event_generator``)
+        instead of being severed mid-flight. The server relay treats ``[DONE]``
+        as a clean return — no ``runner_disconnected`` failure and no durable
+        error label — so an idle-reaped session settles quietly rather than
+        showing a scary error banner. Mirror of the per-session ``put(None)``
+        the session-delete path already does; this is the whole-runner variant.
+
+        Snapshots the queues before iterating. The loop is synchronous (no
+        await, so nothing can interleave today), but the snapshot keeps the
+        drain robust if a queue mutation ever moves off this atomic path.
+        """
+        for queue in list(_session_event_queues.values()):
+            queue.put_nowait(None)
+
+    app.state.drain_session_streams = _drain_session_streams
+
     def _publish_event(session_id: str, event: dict[str, Any]) -> None:
         """Put an event on the session's queue for GET /stream.
 

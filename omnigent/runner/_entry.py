@@ -42,6 +42,13 @@ _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
+# Backstop on how long a graceful (idle-reaper) shutdown waits for the tunnel
+# to drain its session streams and complete its close handshake before we give
+# up and tear it down anyway. Comfortably above serve_tunnel's own drain +
+# close-handshake budgets (~10s combined) so a healthy remote round-trip
+# finishes cleanly; a tunnel wedged past this is cancelled so shutdown can't
+# hang forever.
+_GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S = 15.0
 # Re-mint a delegated runner's owner JWT this many seconds before it
 # expires, so a live session's HTTP callbacks never present an expired
 # token. Well under the server-side token TTL.
@@ -1261,6 +1268,10 @@ async def _run_tunnel_from_env() -> None:
         adopted_event=adopted_event,
         record_reason=_record_exit_reason,
     )
+    # Set (instead of stop_event) on an idle-reaper shutdown so the tunnel
+    # drains its session streams and closes cleanly — the server then sees an
+    # end-of-stream, not an abrupt drop that renders a scary error banner.
+    tunnel_shutdown_event = asyncio.Event()
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -1272,6 +1283,8 @@ async def _run_tunnel_from_env() -> None:
             auth_token_factory=auth_token_factory,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
+            shutdown_event=tunnel_shutdown_event,
+            on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
         ),
         name=f"runner-ws-tunnel:{runner_id}",
     )
@@ -1280,12 +1293,18 @@ async def _run_tunnel_from_env() -> None:
     if idle_timeout_s > 0:
 
         def _request_idle_shutdown() -> None:
-            """Attribute the exit to the idle watchdog, then stop.
+            """Attribute the exit to the idle watchdog, then drain gracefully.
+
+            Signals the tunnel (not stop_event) so it flushes each session
+            stream's ``[DONE]`` and completes its close handshake before the
+            process exits; the tunnel task then returns on its own and the main
+            wait below unwinds. Does NOT set stop_event — that would trip the
+            abrupt-teardown path (cancel the tunnel mid-drain).
 
             :returns: None.
             """
             _record_exit_reason("idle timeout reached")
-            stop_event.set()
+            tunnel_shutdown_event.set()
 
         idle_task = asyncio.create_task(
             _run_inactivity_monitor(
@@ -1334,6 +1353,15 @@ async def _run_tunnel_from_env() -> None:
             # own rather than a signal/idle/parent-death shutdown request.
             _record_exit_reason("websocket tunnel closed")
             await tunnel_task
+        elif idle_task is not None and idle_task in done and tunnel_shutdown_event.is_set():
+            # Idle reaper fired: it signalled the tunnel to drain its session
+            # streams and close cleanly, then the monitor returned (so idle_task
+            # is done). Wait for the tunnel to finish that graceful close —
+            # bounded — instead of falling straight into the finally, which
+            # would cancel it mid-drain and turn the clean end-of-stream back
+            # into an abrupt drop. A tunnel that overruns the budget is
+            # cancelled by the finally as a backstop.
+            await asyncio.wait({tunnel_task}, timeout=_GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S)
     finally:
         # Log why the runner is stopping so the runner log explains the exit.
         # A crash unwinding through here is attributed by sys.excepthook with
