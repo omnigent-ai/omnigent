@@ -1523,7 +1523,9 @@ function HarnessConfigModal({
       setDraftEffort("");
     } else if (value === MODEL_SELECT_DEFAULT) {
       setDraftModel("");
-      if (smartRoutingOn) setDraftRouting("off");
+      // "Default" = no override; defer routing to the spec default (null,
+      // omitted from create) rather than emitting an explicit "off".
+      if (smartRoutingOn) setDraftRouting(null);
     } else {
       setDraftModel(value);
       // Picking an explicit model turns routing off (mutually exclusive).
@@ -1539,7 +1541,6 @@ function HarnessConfigModal({
       setPickedModel(draftModel);
       setPickedEffort(draftEffort);
       setPermissionMode(draftPermission);
-      setCostControlMode(draftRouting);
       if (entryHarness)
         writeHarnessOption(entryHarness, {
           model: draftModel,
@@ -1557,6 +1558,10 @@ function HarnessConfigModal({
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
     }
+    // Smart Routing is offered on Claude (Model dropdown) and other routable
+    // agents (standalone toggle), so commit it for every eligible agent — not
+    // just the Claude branch above.
+    if (smartRoutingEligible) setCostControlMode(draftRouting);
     onOpenChange(false);
   };
 
@@ -1694,6 +1699,23 @@ function HarnessConfigModal({
                   ))}
                 </SelectContent>
               </Select>
+            </ConfigRow>
+          )}
+
+          {/* Smart Routing as a standalone toggle for routable agents that have
+          no Model dropdown to fold it into (Codex, bundle agents, …). Claude
+          offers it as a Model option instead, so it's excluded here. */}
+          {smartRoutingEligible && !hasPermission && (
+            <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
+              <div className="flex h-8 items-center">
+                <Switch
+                  size="sm"
+                  checked={smartRoutingOn}
+                  data-testid="new-chat-landing-config-smart-routing"
+                  aria-label="Smart Routing"
+                  onCheckedChange={(next) => setDraftRouting(next ? "on" : "off")}
+                />
+              </div>
             </ConfigRow>
           )}
         </div>
@@ -2307,16 +2329,17 @@ export function NewChatLandingScreen() {
     cursorExecMode,
     pickedHarness,
   ]);
-  // Defense in depth for the DANGEROUS bypass toggle: never let an armed
-  // bypass carry across an agent change. Switching the picker to another
-  // agent — or away from Codex and back — must require the typed confirmation
-  // again, the same per-context re-opt-in the store enforces for fork /
-  // agent-switch (CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY is instance-scoped).
-  // Keyed on the effective agent id so it also fires when a persisted pick
-  // resolves to a different agent on mount.
+  // Reset per-agent-instance run-config that must not carry across an agent
+  // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
+  // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
+  // is instance-scoped). Smart routing likewise clears: switching to an agent
+  // whose modal has no routing control (or isn't routable) would otherwise
+  // leave it stuck "on" with no UI to turn it off. Keyed on the effective
+  // agent id so it also fires when a persisted pick resolves on mount.
   useEffect(() => {
     setBypassSandbox(false);
-  }, [effectiveAgentId]);
+    setCostControlMode(null);
+  }, [effectiveAgentId, setCostControlMode]);
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.

@@ -2345,6 +2345,71 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(effort.textContent).toContain("Default");
     expect(effort).toBeDisabled();
   });
+
+  it("offers a standalone Smart Routing toggle for routable non-Claude agents (Codex)", () => {
+    // Codex (a2) is routable but has no Model dropdown, so routing appears as a
+    // standalone toggle — not buried in a Claude-only control. It's absent when
+    // the server disables routing.
+    const { unmount } = renderLanding({ smart_routing_enabled: false });
+    openAgentConfig("a2");
+    expect(screen.queryByTestId("new-chat-landing-config-smart-routing")).toBeNull();
+    unmount();
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-smart-routing")).toBeTruthy();
+  });
+
+  it("rides Codex Smart Routing along to create as cost_control_mode_override", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    openAgentConfig("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-smart-routing"));
+    saveConfig();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "build it" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.agent_id).toBe("a2");
+    expect(body.cost_control_mode_override).toBe("on");
+  });
+
+  it("clears an armed Smart Routing when the selected agent changes", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({ smart_routing_enabled: true });
+    // Arm Smart Routing on Claude (a1) via its Model dropdown, Save.
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
+    saveConfig();
+    // Switch to Codex (a2): the armed routing must reset so it can't ride along
+    // stuck "on" for the new agent.
+    selectAgent("a2");
+    openAgentConfig("a2");
+    expect(
+      (
+        screen.getByTestId("new-chat-landing-config-smart-routing") as HTMLButtonElement
+      ).getAttribute("aria-checked"),
+    ).toBe("false");
+    // A create now omits the override (deferred).
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "go" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.agent_id).toBe("a2");
+    expect(body.cost_control_mode_override).toBeUndefined();
+  });
 });
 
 describe("NewChatLandingScreen custom-agent sandbox gating", () => {
