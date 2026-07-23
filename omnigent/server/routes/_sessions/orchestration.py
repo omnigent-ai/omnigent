@@ -3911,8 +3911,6 @@ async def _relay_runner_stream(
         that exercise relay parsing/persistence without asserting on
         startup readiness.
     """
-    from omnigent.runtime import session_stream
-
     text_acc: list[str] = []
     current_response_id: str | None = None
     # Model/agent label from the turn header, stamped on text segments
