@@ -500,7 +500,15 @@ class ExternalRoutingClient:
 # SDK harnesses offered as candidates when the user picks "auto" harness.
 # Native harnesses are excluded: they require CLI binaries that may not be
 # installed, and they bake the model at terminal launch rather than per-turn.
-_AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "pi", "codex")
+#
+# Order matters: it is the insertion order of the candidate set sent to the
+# router AND the tiebreak order when a model is served by multiple harnesses
+# (both the external router's id-only fallback and our own model-ownership
+# fallback pick the FIRST harness owning the model). codex precedes pi so GPT
+# models default to codex — which uses the Responses API and handles gpt-5.5+
+# reasoning models with tools, whereas pi's openai-completions path 400s on
+# them. claude-sdk owns Claude models; pi is the last-resort multi-model home.
+_AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "codex", "pi")
 
 # The live runner catalog (fetch_runner_models) keys rows by WORKER name — the
 # sub-agent names declared in the parent spec (e.g. "claude_code") plus "self"

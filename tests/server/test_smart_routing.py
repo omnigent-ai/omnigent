@@ -1009,5 +1009,7 @@ async def test_route_session_harness_falls_back_by_model_when_harness_absent() -
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
         harness, model, _verdict, _error = await route_session_harness("what time is it?")
-    assert harness in ("codex", "pi")
+    # codex precedes pi in _AUTO_ROUTING_HARNESSES, so a GPT model owned by both
+    # deterministically resolves to codex.
+    assert harness == "codex"
     assert model == "databricks-gpt-5-4-nano"
