@@ -1329,8 +1329,6 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
 
     # Write the previous claude_session_id into the bridge state.json *before*
     # auto-create runs so the pre-wipe read can find it.
-    import json
-
     session_id = "5cdbea97a2fb0c659bc09605401e2bb2"
     prior_claude_sid = "3d10247d-c3c0-4689-8cbd-862d7453bf70"
     pre_bridge_dir = bridge_dir_for_bridge_id(session_id)

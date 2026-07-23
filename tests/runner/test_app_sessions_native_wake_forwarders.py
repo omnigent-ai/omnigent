@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
+import omnigent.runner.app as runner_app_mod
 from omnigent import (
     claude_native_bridge,
     codex_native_bridge,
@@ -305,8 +306,6 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
     still post items (it runs right before the bridge's forward-cursor
     state is wiped).
     """
-    import omnigent.runner.app as runner_app_mod
-
     session_id = "f98115a89870f7e364064c9d06c52ee7"
     run = _ForwarderRun()
 
@@ -362,8 +361,6 @@ async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stal
        Without the identity check, B would lose its strong reference and
        the registry would report no forwarder for a session that has one.
     """
-    import omnigent.runner.app as runner_app_mod
-
     session_id = "f14ef86c47cc555be7e4c5eb00e88a9a"
     run_a = _ForwarderRun()
     run_b = _ForwarderRun()
@@ -417,8 +414,6 @@ async def test_auto_forwarder_registry_isolates_sessions_and_evicts_completed() 
     finishes on its own removes its entry (the dict must not leak entries
     the way the old set relied on ``discard`` for).
     """
-    import omnigent.runner.app as runner_app_mod
-
     run_a = _ForwarderRun()
     run_b = _ForwarderRun()
 
@@ -480,8 +475,6 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    import omnigent.runner.app as runner_app_mod
-
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -595,7 +588,6 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     import omnigent.codex_native_app_server as codex_app_mod
-    import omnigent.runner.app as runner_app_mod
 
     session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"

@@ -879,8 +879,6 @@ async def test_create_session_repl_terminal_dispatch(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.runner.app as runner_app_mod
-
     # Keep the codex-native branch's bridge writes inside tmp_path.
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 
@@ -916,14 +914,16 @@ async def test_create_session_repl_terminal_dispatch(
             name="tui",
         )
 
-    monkeypatch.setattr(runner_app_mod, "_auto_create_repl_terminal", _fake_auto_create_repl)
+    monkeypatch.setattr("omnigent.runner.app._auto_create_repl_terminal", _fake_auto_create_repl)
 
     async def _fake_codex_needs(server_client: Any, session_id: str) -> bool:
         """Neutralize the codex-native terminal branch (out of scope here)."""
         del server_client, session_id
         return False
 
-    monkeypatch.setattr(runner_app_mod, "_codex_session_needs_runner_terminal", _fake_codex_needs)
+    monkeypatch.setattr(
+        "omnigent.runner.app._codex_session_needs_runner_terminal", _fake_codex_needs
+    )
 
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
