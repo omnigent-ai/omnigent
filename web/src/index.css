@@ -12,6 +12,83 @@
 
 @custom-variant dark (&:is(.dark *));
 
+.agi-launch {
+  position: fixed;
+  z-index: 60;
+  top: calc(var(--omnigent-inset-top, 0px) + 0.875rem);
+  left: 50%;
+  pointer-events: none;
+  transform: translateX(-50%);
+  animation: agi-launch-enter 900ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.agi-launch-text {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.25rem;
+  max-width: calc(100vw - 2rem);
+  overflow: hidden;
+  border: 1px solid color-mix(in oklab, var(--foreground) 12%, transparent);
+  border-radius: 999px;
+  background:
+    linear-gradient(120deg, transparent 0%, rgba(255, 255, 255, 0.72) 45%, transparent 58%),
+    color-mix(in oklab, var(--card-solid, var(--card)) 92%, transparent);
+  background-size:
+    220% 100%,
+    100% 100%;
+  box-shadow: 0 14px 42px rgba(17, 23, 28, 0.16);
+  color: var(--foreground);
+  font-size: 0.875rem;
+  font-weight: 650;
+  line-height: 1;
+  padding: 0 1rem;
+  white-space: nowrap;
+  animation:
+    agi-launch-shimmer 2.4s 350ms ease-in-out infinite,
+    agi-launch-float 3.2s 900ms ease-in-out infinite;
+}
+
+@keyframes agi-launch-enter {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -0.75rem) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+
+@keyframes agi-launch-shimmer {
+  from {
+    background-position:
+      180% 0,
+      0 0;
+  }
+  to {
+    background-position:
+      -80% 0,
+      0 0;
+  }
+}
+
+@keyframes agi-launch-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(0.1875rem);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agi-launch,
+  .agi-launch-text {
+    animation: none;
+  }
+}
+
 @theme inline {
   --font-heading: var(--font-sans);
   /* Native system UI font stack — defers to whatever the OS ships
