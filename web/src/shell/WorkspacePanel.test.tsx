@@ -88,6 +88,27 @@ function renderWorkspace(
   return { openFileViewer, onCloseFile, onRightRailTabChange };
 }
 
+describe("WorkspacePanel surface presentation", () => {
+  it("uses an evenly inset desktop surface instead of clearing the header", () => {
+    renderWorkspace();
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    expect(panel).toHaveClass("md:m-2", "md:rounded-lg");
+    expect(panel).not.toHaveClass("md:mt-14", "md:mr-2", "md:mb-2");
+  });
+
+  it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
+    renderWorkspace();
+
+    const filesTab = screen.getByRole("tab", { name: "Files" });
+    const agentsTab = screen.getByRole("tab", { name: "Agents 1" });
+    expect(filesTab).toHaveClass("size-8", "p-0");
+    expect(filesTab).toHaveAttribute("title", "Files");
+    expect(agentsTab).toHaveClass("size-8", "p-0");
+    expect(agentsTab).toHaveAttribute("title", "Agents");
+  });
+});
+
 describe("WorkspacePanel open-file tabs", () => {
   it("renders a tab per open file labeled by basename, next to the fixed Files tab", () => {
     renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"] });
