@@ -168,6 +168,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import {
   ConfigRow,
+  EFFORT_SELECT_NONE,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
 } from "@/components/HarnessConfigControls";
@@ -5484,11 +5485,17 @@ function SessionConfigModal({
         if (draftRoutingOn) {
           if (costRoutingEligible && !liveRoutingOn) await store.setCostControlMode("on");
         } else {
-          // Re-pin the model when routing was on (its setter cleared the applied
-          // override, and `resolvedModelId` reflects the leftover cross-session
-          // sticky — not what's applied — so the ``!==`` guard would false-
-          // negative), or whenever the drafted model actually changed.
-          if (liveRoutingOn || draftModelId !== resolvedModelId) await store.setModel(draftModelId);
+          // Re-pin the model when routing was on and there's a Model dropdown
+          // (its setter cleared the applied override, and `resolvedModelId`
+          // reflects the leftover cross-session sticky — not what's applied — so
+          // the ``!==`` guard would false-negative), or whenever the drafted
+          // model actually changed. For a no-dropdown agent (e.g. Polly) the
+          // user can't have chosen a model, so re-pinning the seeded
+          // `resolvedModelId` would risk pinning a leaked sticky — turning
+          // routing off just clears via setModel(null) below.
+          const modelChanged = draftModelId !== resolvedModelId;
+          const rePinAfterRouting = liveRoutingOn && showModels;
+          if (rePinAfterRouting || modelChanged) await store.setModel(draftModelId);
           if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
         }
         // Skip effort while routing is on: the router picks it per turn, and a
@@ -5571,8 +5578,8 @@ function SessionConfigModal({
           {showEffort && (
             <ConfigRow label="Effort" description="Reasoning depth vs. speed">
               <Select
-                value={draftEffort ?? MODEL_SELECT_DEFAULT}
-                onValueChange={(v) => setDraftEffort(v === MODEL_SELECT_DEFAULT ? null : v)}
+                value={draftEffort ?? EFFORT_SELECT_NONE}
+                onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
                 // Smart Routing picks the model + effort per turn, so an
                 // explicit effort can't apply — freeze it to Default.
                 disabled={draftRoutingOn}
@@ -5585,7 +5592,7 @@ function SessionConfigModal({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+                  <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                   {effortLevels.map((level) => (
                     <SelectItem
                       key={level}

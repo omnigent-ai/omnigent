@@ -1809,6 +1809,40 @@ describe("Composer config gear", () => {
     expect(setCostControlMode).toHaveBeenCalledWith("off");
   });
 
+  it("does not re-pin a leaked sticky model when turning routing off on a no-dropdown agent", async () => {
+    // An SDK/bundle agent (Polly) has no Model dropdown, so the user can't have
+    // chosen a model. Turning routing off must NOT re-pin the seeded
+    // resolvedModelId (which could be a leaked cross-session sticky) — it should
+    // clear via setModel(null). Only the routing PATCH carries the intent.
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const setCostControlMode = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      setModel,
+      setCostControlMode,
+      costControlModeOverride: "on",
+      // A leftover cross-session sticky that must NOT get pinned.
+      selectedModel: "gpt-5.5",
+      sessionModelOverride: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          // No Model dropdown (SDK/bundle) but routing-eligible → standalone switch.
+          showModels: false,
+          modelPickerKind: null,
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    const toggle = await screen.findByTestId("composer-config-smart-routing");
+    fireEvent.click(toggle); // turn routing off
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(setCostControlMode).toHaveBeenCalledWith("off"));
+    // Must clear, never pin the leaked "gpt-5.5" sticky.
+    expect(setModel).not.toHaveBeenCalledWith("gpt-5.5");
+  });
+
   it("discards drafted changes on Cancel", async () => {
     const setModel = vi.fn().mockResolvedValue(undefined);
     const setCostControlMode = vi.fn().mockResolvedValue(undefined);
