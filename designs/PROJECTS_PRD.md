@@ -525,11 +525,15 @@ folder), carrying the first-class `id` when one exists.
   `projectsApi`).
 
 ### TODO
-- ⬜ **Benchmark.** Now that the sidebar is wired, add a `list_project_sessions`
-  journey to `dev/benchmarks/omnigent` (mirrors the existing `list_sessions` hot
-  read path), and consider a `list_projects` journey for the sidebar's project
-  list fetch. CRUD writes (create/rename/delete) are infrequent single-row ops
-  and don't need a benchmark.
+- ✅ **Benchmark (#3094).** Added `list_projects` (sidebar project list,
+  dual-read union) and `list_project_sessions` (`?project=` folder fetch)
+  latency journeys to `dev/benchmarks/omnigent`, mirroring the `list_sessions`
+  hot read path. The corpus seeder now also seeds first-class `projects` rows
+  and files a configurable fraction of sessions into them (`--projects`,
+  `--filed-fraction`) so the journeys measure a realistic sidebar instead of an
+  empty project set, and the PR benchmark regression check runs on
+  `dev/benchmarks/**` changes. CRUD writes remain unbenchmarked (infrequent
+  single-row ops).
 - ⬜ **Phase 2 — project defaults (P4a)** — add a `config` JSON column (small
   add-column migration) and plumb it through the store/entity/API; seed
   host/workspace/harness/model into the new-chat dialog (§8.1).
