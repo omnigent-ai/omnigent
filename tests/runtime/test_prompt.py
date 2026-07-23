@@ -4,6 +4,8 @@ import json
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
+
 from omnigent.entities import ConversationItem, FunctionCallOutputData
 from omnigent.runtime.prompt import (
     append_framework_instructions,
@@ -50,6 +52,33 @@ def test_history_replay_strips_inline_base64_image() -> None:
     assert huge_b64 not in output, "base64 image data must not be replayed as text"
     assert "image/png image omitted from history" in output
     assert "re-run the tool call" in output
+    assert len(output) < 300
+
+
+def test_history_replay_strips_truncated_image_block() -> None:
+    """Base64 clipped at the store byte cap (invalid JSON) is still stripped.
+
+    Real wedged sessions stored the image output truncated at the
+    conversation-store byte cap, leaving the base64 string unterminated — so it
+    no longer parses as JSON. The strip must fall back to an in-place rewrite,
+    or the exact payloads that wedge resume would slip through unchanged.
+    """
+    huge_b64 = "iVBORw0KGgo" + "A" * 100_000
+    # Mimic the store cap: a valid prefix cut mid-base64, no closing quote/braces.
+    truncated = (
+        '[{"type":"image","source":{"type":"base64","data":"'
+        + huge_b64
+        + "…[truncated by conversation-store: item exceeded 245760B cap]"
+    )
+    # Precondition: this is genuinely not parseable JSON.
+    with pytest.raises(ValueError):
+        json.loads(truncated)
+
+    result = history_to_input_items([_output_item(truncated)])
+
+    output = result[0]["output"]
+    assert huge_b64 not in output, "truncated base64 must not survive replay"
+    assert "image omitted from history" in output
     assert len(output) < 300
 
 

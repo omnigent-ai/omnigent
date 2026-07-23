@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -120,6 +121,19 @@ def _strip_output_annotations(
     return result
 
 
+def _image_omitted_placeholder(media_type: str | None) -> str:
+    """Return the placeholder text for a stripped inline image.
+
+    :param media_type: Image MIME type when known, e.g. ``"image/png"``.
+    :returns: Human/agent-readable placeholder naming how to recover it.
+    """
+    label = f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
+    return (
+        f"[{label} omitted from history to save context — "
+        "re-run the tool call above (e.g. Read the same path) to view it again]"
+    )
+
+
 def _strip_output_image_data(value: Any) -> Any:
     """Rewrite inline base64 image blocks to a text placeholder.
 
@@ -137,20 +151,28 @@ def _strip_output_image_data(value: Any) -> Any:
     if isinstance(value, dict):
         source = value.get("source")
         if value.get("type") == "image" and isinstance(source, dict):
-            media_type = source.get("media_type")
-            label = (
-                f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
-            )
             return {
                 "type": "text",
-                "text": (
-                    f"[{label} omitted from history to save context — "
-                    "re-run the tool call above (e.g. Read the same path) "
-                    "to view it again]"
-                ),
+                "text": _image_omitted_placeholder(source.get("media_type")),
             }
         return {key: _strip_output_image_data(val) for key, val in value.items()}
     return value
+
+
+# Matches one Anthropic image ``source`` object inside a tool-result JSON
+# string. The ``source`` only ever holds ``type``/``media_type``/``data``, so
+# each key is a fixed, optional group and the base64 value ranges over an
+# alphabet disjoint from the ``"`` terminator — no nested quantifiers, so the
+# match stays linear even against a multi-hundred-KB payload. The trailing
+# ``"?`` and optional closing braces tolerate a block clipped mid-``data`` when
+# the output was truncated at the conversation-store byte cap.
+_IMAGE_SOURCE_RE = re.compile(
+    r'\{"type":"image","source":\{'
+    r'(?:"type":"base64",?)?'
+    r'(?:"media_type":"(?P<media>[^"]*)",?)?'
+    r'"data":"[A-Za-z0-9+/=]*"?'
+    r"\}?\}?"
+)
 
 
 def _dedupe_tool_output_images(output: str) -> str:
@@ -164,19 +186,30 @@ def _dedupe_tool_output_images(output: str) -> str:
     resume cleanly without a store migration. Plain-text outputs (the common
     case) are returned unchanged.
 
+    Two forms are handled: well-formed JSON (parsed, walked, reserialized) and
+    JSON that was truncated at the conversation-store byte cap — the exact shape
+    that wedges resume — which no longer parses, so a regex fallback rewrites the
+    ``{"type":"image","source":{...base64...}}`` block in place.
+
     :param output: The persisted ``function_call_output.output`` string.
     :returns: The output with any inline base64 image data replaced by a
-        placeholder, or the original string when it holds no image JSON.
+        placeholder, or the original string when it holds no image data.
     """
     # Fast path: only JSON arrays/objects can carry an image block, and every
-    # such payload contains the ``"image"`` type tag. Skip the parse otherwise.
+    # such payload contains the ``"image"`` type tag. Skip otherwise.
     stripped = output.lstrip()
     if stripped[:1] not in ("[", "{") or '"image"' not in output:
         return output
     try:
         decoded = json.loads(output)
     except (ValueError, TypeError):
-        return output
+        # Truncated/invalid JSON (e.g. clipped at the store byte cap): fall back
+        # to an in-place regex rewrite of any image source block.
+        def _replace(match: re.Match[str]) -> str:
+            placeholder = _image_omitted_placeholder(match.group("media"))
+            return json.dumps({"type": "text", "text": placeholder}, separators=(",", ":"))
+
+        return _IMAGE_SOURCE_RE.sub(_replace, output)
     sanitized = _strip_output_image_data(decoded)
     if sanitized == decoded:
         return output
