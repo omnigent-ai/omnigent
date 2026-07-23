@@ -1,7 +1,8 @@
 // Cmd+↑/↓ (Ctrl+↑/↓ on Win/Linux) opens the previous / next sidebar session,
 // wrapping at the ends. Sibling to ChatPage's Cmd+Alt+↑/↓ message nav; they
 // don't collide (that one requires Alt, this one requires Alt up). Suppressed
-// inside editable fields so typing in the composer isn't interrupted. Bind ONCE.
+// inside non-empty editable fields so typing in the composer isn't interrupted.
+// Bind ONCE.
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "@/lib/routing";
@@ -27,14 +28,24 @@ export function useSessionSwitchHotkey(
       if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
       if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
 
-      // Leave the chord alone while editing so the composer keeps its native
-      // caret-to-start/end and the user isn't yanked to another session.
+      // Leave the chord alone when an editable has content so native
+      // caret-to-start/end movement and in-progress text stay uninterrupted.
       const target = e.target;
-      if (
-        target instanceof HTMLElement &&
-        target.closest('textarea, input, [contenteditable="true"]')
-      ) {
-        return;
+      if (target instanceof HTMLElement) {
+        const editable = target.closest('textarea, input, [contenteditable="true"]');
+        if (
+          (editable instanceof HTMLTextAreaElement || editable instanceof HTMLInputElement) &&
+          editable.value.length > 0
+        ) {
+          return;
+        }
+        if (
+          editable instanceof HTMLElement &&
+          editable.matches('[contenteditable="true"]') &&
+          (editable.textContent?.length ?? 0) > 0
+        ) {
+          return;
+        }
       }
 
       const { orderedIds: ids, activeId: active } = latest.current;
