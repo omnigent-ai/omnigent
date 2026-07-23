@@ -3230,7 +3230,9 @@ function ProjectFolderActions({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   return (
-    <div className="flex items-center">
+    // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
+    // pin↔kebab spacing, so the two icon columns line up across row types.
+    <div className="flex items-center gap-0.5">
       {/* Desktop-only quick affordance; on mobile it folds into the kebab's
           "New session" item below. */}
       <Tooltip>
