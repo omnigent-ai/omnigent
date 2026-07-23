@@ -372,11 +372,13 @@ def ui_credential_configurable_harnesses() -> frozenset[str]:
 # than derived from ``HarnessInstallSpec.login_args`` — keep them in sync with
 # that spec by hand if a harness's login command changes.
 # ``command`` steps run on the host and are status-tracked; ``setup`` steps
-# (pi/qwen: API key or gateway) can't be driven from the UI yet, so M1 points at
-# ``omnigent setup`` and does not track their status.
+# ``command`` steps run on the host and are status-tracked; ``auth`` steps
+# (pi) open the UI credential form and are status-tracked; ``setup`` steps
+# (qwen: env-auth, not UI-authable) point at ``omnigent setup`` and don't track.
 #   claude/codex: subscription login via the CLI's own login command.
 #   opencode: its own `opencode auth login`.
-#   pi/qwen: a provider credential (API key or gateway) — configured by setup.
+#   pi: a provider credential (API key / gateway / adopt) written from the UI.
+#   qwen: env-auth — omnigent stores no key, so it stays a setup signpost.
 _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
     ANTHROPIC_FAMILY: SetupStep(
         kind="auth",
@@ -405,14 +407,21 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
     PI_KEY: SetupStep(
         kind="auth",
         title="Add a Pi credential",
-        detail="Pi needs an API key or gateway. Set it up on the host for now.",
-        action="setup",
-        command="omnigent setup",
-        status_key=None,
+        # Pi is UI-authable: the setup dialog renders an inline credential form
+        # (API key / gateway / adopt) for it, keyed on kind == "auth". No
+        # ``command`` — Pi has no subscription CLI login, so no copy-signpost.
+        # ``status_key="authed"`` makes the step trackable so it isn't dropped
+        # as "unknown" (which would make the dialog wrongly read "ready").
+        detail="Add an API key or gateway so Pi can run.",
+        action="auth",
+        command=None,
+        status_key="authed",
     ),
     QWEN_KEY: SetupStep(
         kind="auth",
         title="Add a Qwen credential",
+        # Qwen is env-auth (not UI-authable): omnigent stores no key for it, so
+        # this stays an untrackable signpost pointing at the CLI.
         detail="Qwen needs an API key or gateway. Set it up on the host for now.",
         action="setup",
         command="omnigent setup",

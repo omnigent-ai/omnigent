@@ -993,10 +993,22 @@ def test_ui_setup_steps_native_spelling_matches_bare() -> None:
     ]
 
 
-def test_ui_setup_steps_pi_auth_is_untracked_setup_fallback() -> None:
-    """Pi's credential (API key / gateway) can't be driven from the UI yet, so
-    its auth step points at ``omnigent setup`` and is not status-tracked."""
+def test_ui_setup_steps_pi_auth_is_ui_authable_and_tracked() -> None:
+    """Pi is UI-authable: its auth step opens the credential form (action
+    ``"auth"``), carries no CLI login command (no subscription), and is
+    status-tracked (``"authed"``) so the dialog can't drop it as "unknown"
+    and wrongly read "ready"."""
     steps = hi.ui_setup_steps("pi")
+    assert [s.kind for s in steps] == ["install", "auth"]
+    assert steps[1].action == "auth"
+    assert steps[1].command is None
+    assert steps[1].status_key == "authed"
+
+
+def test_ui_setup_steps_qwen_auth_stays_untracked_setup_fallback() -> None:
+    """Qwen is env-auth (not UI-authable), so its auth step stays an untracked
+    ``omnigent setup`` signpost — the case that must NOT gain the form."""
+    steps = hi.ui_setup_steps("qwen")
     assert [s.kind for s in steps] == ["install", "auth"]
     assert steps[1].action == "setup"
     assert steps[1].command == "omnigent setup"
