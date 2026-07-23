@@ -2393,6 +2393,36 @@ def test_list_conversations_by_runner_id_filters(
     assert result[0].runner_id == "runner_token_a"
 
 
+def test_list_conversations_by_runner_id_hydrates_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Conversations from the reconnect lookup carry their labels.
+
+    ``_on_runner_connect`` sources conversations here and feeds them to
+    the runner session-init envelope, which is built from
+    ``conversation.labels``. If this path returns label-less entities the
+    envelope ships empty labels, so a forked native session's fork
+    directives (carry-history / source transcript id) never reach the
+    runner and it launches without history. Guards that regression.
+    """
+    bound = conversation_store.create_conversation(runner_id="runner_token_a")
+    conversation_store.set_labels(
+        bound.id,
+        {
+            "omnigent.fork.carry_history": "1",
+            "omnigent.fork.source_external_session_id": "src-claude-sid",
+        },
+    )
+
+    result = conversation_store.list_conversations_by_runner_id("runner_token_a")
+
+    assert [c.id for c in result] == [bound.id]
+    assert result[0].labels == {
+        "omnigent.fork.carry_history": "1",
+        "omnigent.fork.source_external_session_id": "src-claude-sid",
+    }
+
+
 # ── Host id ─────────────────────────────────────────
 
 

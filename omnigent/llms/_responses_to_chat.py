@@ -216,9 +216,14 @@ def chat_response_to_response(
     choice = chat_dict["choices"][0]
     message = choice["message"]
 
-    # Text content
-    if content := message.get("content"):
-        output.append(MessageOutput(content=[OutputText(text=content)]))
+    # Text content — content may be a plain string or a list of typed
+    # blocks (Claude via Databricks, Kimi, etc.). Flatten via the shared
+    # helper so list-shaped content is joined into a string rather than
+    # stored raw.
+    if raw_content := message.get("content"):
+        text, _reasoning = _extract_delta_content(raw_content)
+        if text:
+            output.append(MessageOutput(content=[OutputText(text=text)]))
 
     # Tool calls
     for tc in message.get("tool_calls") or []:

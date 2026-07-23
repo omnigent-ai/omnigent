@@ -17,7 +17,6 @@ import {
   BotIcon,
   CheckIcon,
   AlertTriangleIcon,
-  ChevronDownIcon,
   CornerUpLeftIcon,
   CopyIcon,
   FileTextIcon,
@@ -28,13 +27,14 @@ import {
   Loader2Icon,
   MessageSquareIcon,
   PaperclipIcon,
+  SettingsIcon,
   SquareIcon,
   TerminalIcon,
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
 import { useNavigate, useParams } from "@/lib/routing";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
@@ -71,13 +71,6 @@ import {
   setNativeServerSwitcherHidden,
   setNativeViewMode,
 } from "@/lib/nativeBridge";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
 import { agentDisplayLabel } from "@/components/AgentInfo";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
@@ -156,12 +149,29 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { isCostRoutingSession } from "@/components/CostRoutingControl";
 import {
-  IntelligentModelControl,
-  type CostRoutingVerdict,
-  isCostRoutingSession,
-  parseCostRoutingVerdict,
-} from "@/components/CostRoutingControl";
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import {
+  ConfigRow,
+  EFFORT_SELECT_NONE,
+  MODEL_SELECT_DEFAULT,
+  MODEL_SELECT_SMART,
+} from "@/components/HarnessConfigControls";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
@@ -599,7 +609,6 @@ export function ChatPage() {
   } | null>(null);
   const {
     data: agents,
-    isLoading: agentsLoading,
     error: agentsError,
     refetch: refetchAgents,
   } = useAgents({ enabled: !urlConvId });
@@ -848,14 +857,12 @@ export function ChatPage() {
   // tripping React's "rendered fewer hooks than expected".
   const { session: activeSession, isLoading: sessionLoading } = useSession(urlConvId ?? null);
 
-  // Hoisted above the guards; the turn-start/turn-end ["session", id] invalidations refresh it (no new polling).
-  const activeSessionLabels = activeSession?.labels;
-  const costRoutingVerdict = useMemo(
-    () => parseCostRoutingVerdict(activeSessionLabels),
-    [activeSessionLabels],
-  );
   // Orchestrator-only: polly's children inherit its agentName, so the gate
   // needs the session predicate (parent linkage), not a bare name check.
+  // Same predicate the prior IntelligentModelControl used, so eligibility is
+  // unchanged — the gear modal just relocates where an eligible session's
+  // Smart Routing toggle lives (Claude folds it into the Model dropdown; other
+  // routable agents get a standalone Switch row).
   const serverInfo = useServerInfo();
   const costRoutingEligible =
     serverInfo !== "loading" &&
@@ -1116,9 +1123,7 @@ export function ChatPage() {
         else setReconnectDialogOpen(true);
       }}
       agents={visibleAgents}
-      agentsLoading={agentsLoading}
       selectedAgentId={agentId}
-      onSelectAgent={setSelectedAgentId}
       hasMoreHistory={hasMoreHistory}
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
@@ -1130,7 +1135,6 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
-      costRoutingVerdict={costRoutingVerdict}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
     />
@@ -1339,9 +1343,7 @@ interface MainAgentSurfaceProps {
   onStop: () => void;
   onShowReconnectHelp: () => void;
   agents: Agent[] | undefined;
-  agentsLoading: boolean;
   selectedAgentId: string | null;
-  onSelectAgent: (id: string) => void;
   /** Whether older messages exist that haven't been loaded yet. */
   hasMoreHistory: boolean;
   /** Whether a load-more fetch is currently in flight. */
@@ -1362,8 +1364,6 @@ interface MainAgentSurfaceProps {
   showCodexPlanMode: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
-  /** Latest advisor verdict for the cost-routing pill; null when none. */
-  costRoutingVerdict: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
   costRoutingEligible: boolean;
   /**
@@ -1422,9 +1422,7 @@ function MainAgentSurface({
   onStop,
   onShowReconnectHelp,
   agents,
-  agentsLoading,
   selectedAgentId,
-  onSelectAgent,
   hasMoreHistory,
   loadingMoreHistory,
   permissionLevel,
@@ -1436,7 +1434,6 @@ function MainAgentSurface({
   codexModelOptions,
   showCodexPlanMode,
   showGoalControl = false,
-  costRoutingVerdict,
   costRoutingEligible,
   subAgentLabel,
 }: MainAgentSurfaceProps) {
@@ -1831,9 +1828,7 @@ function MainAgentSurface({
         onSendSlashCommand={handleSendSlashCommand}
         onStop={onStop}
         agents={agents}
-        agentsLoading={agentsLoading}
         selectedAgentId={selectedAgentId}
-        onSelectAgent={onSelectAgent}
         permissionLevel={permissionLevel}
         readOnlyReason={readOnlyReason}
         replyQuotes={replyQuotes}
@@ -1854,9 +1849,9 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
+        sessionLive={liveness.kind === "online"}
         hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
         onShowReconnectHelp={onShowReconnectHelp}
-        costRoutingVerdict={costRoutingVerdict}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
       />
@@ -3334,9 +3329,7 @@ interface ComposerProps {
   onSendSlashCommand?: (name: string, args: string) => void;
   onStop: () => void;
   agents: Agent[] | undefined;
-  agentsLoading: boolean;
   selectedAgentId: string | null;
-  onSelectAgent: (id: string) => void;
   permissionLevel: number | null;
   /**
    * When non-null, the composer is forced read-only and the string is
@@ -3410,10 +3403,18 @@ interface ComposerProps {
    * `onReconnect`), replacing the separate banner below the composer.
    */
   hostOffline?: boolean;
+  /**
+   * The session's runner tunnel is live (`liveness.kind === "online"`). Only
+   * a live runner can accept a config change — unlike a message, a model/
+   * effort/routing POST can't wake an asleep, stranded, or not-yet-observed
+   * runner, and those states also never load the model catalog. So the config
+   * gear is inert whenever this is false, which is stricter than `unreachable`
+   * (the composer stays open on asleep/unknown because a message wakes them).
+   * Defaults to `true` so tests that don't wire liveness keep the gear live.
+   */
+  sessionLive?: boolean;
   /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
   onShowReconnectHelp?: () => void;
-  /** Latest parsed advisor verdict for the cost-routing pill; `null`/omitted when none. */
-  costRoutingVerdict?: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
   costRoutingEligible?: boolean;
   /**
@@ -3629,12 +3630,10 @@ export function composerHarnessLabel(
  * agent-info popover (the "i" button), not here.
  */
 function ComposerStatusLine({
-  harnessLabel,
   goal,
   isSubAgentSession,
   onHostReconnect,
 }: {
-  harnessLabel: string | null;
   goal: Goal | null;
   isSubAgentSession: boolean;
   /**
@@ -3654,17 +3653,18 @@ function ComposerStatusLine({
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
 
+  // Host binding drives whether the HostBadge has anything to show — read it
+  // from the same source the badge does so the tray's render guard matches.
+  const { session } = useSession(conversationId);
+  const isHostBound = !!session?.hostId;
+
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
   // Hidden on sub-agent sessions — the header's child-session slot owns the
   // back affordance there, mirroring where this badge used to live. HostBadge
-  // self-hides when the session isn't host-bound, so this is a visibility gate,
-  // not a host-presence claim.
+  // self-hides when the session isn't host-bound, so also gate on isHostBound
+  // (below) before treating the badge as a reason to render the tray.
   const showHost = !!conversationId && !isSubAgentSession;
-  // The harness/agent identity (e.g. "Claude", "Polly (Pi)") lives here now;
-  // the picker trigger above owns the model/effort label since it's the
-  // control that changes them.
-  const showHarness = !!conversationId && harnessLabel !== null;
   const showPlanMode = !!conversationId && codexPlanMode;
   const showGoal = !!conversationId && goal != null;
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
@@ -3672,12 +3672,16 @@ function ComposerStatusLine({
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
   // The offline-host reconnect affordance lives in the host badge, so the tray
   // must render even when every other slot is empty (an unreachable session
-  // often has no branch/ring/harness yet). Gated by `showHost`: only host-bound
+  // often has no branch/ring yet). Gated by `showHost`: only host-bound
   // sessions can be `host_offline`, and sub-agents (which hide the badge) are
   // never host-bound — a stranded child is `local_stranded`, which keeps its
   // banner elsewhere.
   const showReconnect = showHost && !!onHostReconnect;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness && !showReconnect)
+  // A host-bound session shows the badge, so the tray must render for it even
+  // with no branch/ring yet — otherwise the host + context footer vanishes for
+  // sessions with no worktree branch (e.g. codex) until the ring populates.
+  const showHostBadge = showHost && isHostBound;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showReconnect && !showHostBadge)
     return null;
 
   return (
@@ -3724,15 +3728,6 @@ function ComposerStatusLine({
           </span>
         )}
         {showGoal && goal && <GoalStatusPill goal={goal} />}
-        {showHarness && harnessLabel && (
-          <span
-            data-testid="composer-harness"
-            className="max-w-36 truncate text-xs text-muted-foreground sm:max-w-52"
-            title={harnessLabel}
-          >
-            {harnessLabel}
-          </span>
-        )}
         {showRing && <ContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} />}
       </div>
     </div>
@@ -3822,9 +3817,7 @@ export function Composer({
   onSendSlashCommand,
   onStop,
   agents,
-  agentsLoading,
   selectedAgentId,
-  onSelectAgent,
   permissionLevel,
   readOnlyReason,
   replyQuotes,
@@ -3842,9 +3835,9 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
+  sessionLive = true,
   hostOffline = false,
   onShowReconnectHelp,
-  costRoutingVerdict = null,
   costRoutingEligible = false,
   subAgentLabel = null,
 }: ComposerProps) {
@@ -3904,8 +3897,6 @@ export function Composer({
     ),
   );
 
-  // Per-session cost-control switch, hydrated from the snapshot on bind.
-  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
   // Harness/agent identity shown in the status tray below the card. The
   // picker trigger owns model/effort now, so the identity moves here.
@@ -4415,15 +4406,17 @@ export function Composer({
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
-      // Bare "/model" when the picker has a switchable Models section
-      // (claude-native): sent as plaintext it would open Claude's interactive
-      // selector inside the vendor TUI, which the web UI can't render — the
-      // session just blocks. Open the composer's model picker instead and let
-      // the user choose there. "/model <name>" takes the builtin route below to
-      // setModel — the same write the picker makes.
+      // Bare "/model" when the session has a switchable model (claude-native):
+      // sent as plaintext it would open Claude's interactive selector inside the
+      // vendor TUI, which the web UI can't render — the session just blocks. Open
+      // the composer's config gear modal (which owns the Model dropdown) instead
+      // and let the user choose there. "/model <name>" takes the builtin route
+      // below to setModel — the same write the modal makes.
       //
-      // Runner-backed catalogs can arrive after bind. Until rows exist, show
-      // the current-model hint instead of opening a model-less dropdown.
+      // Runner-backed catalogs (now including claude-native) can arrive after
+      // bind. Until rows exist, fall through to the builtin "/model" handler,
+      // which surfaces the current model as a read-only hint instead of opening
+      // a model-less modal. ("/model <name>" still routes to setModel there.)
       const canOpenModelPicker = codexModelOptions.length > 0;
       if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         dirtyRef.current = true;
@@ -4948,21 +4941,11 @@ export function Composer({
               }}
             />
           </div>
-          {/* Cost toggle + agent picker + Send — right side */}
+          {/* Agent picker + config gear + Send — right side. Smart Routing is
+              no longer a standalone toggle here; it folds into the gear modal's
+              Model control (Claude) or a Smart Routing switch (other routable
+              agents), mirroring the new-session composer. */}
           <div className="flex min-w-0 items-center gap-0.5">
-            {costRoutingEligible && (
-              <IntelligentModelControl
-                value={costControlModeOverride}
-                onChange={(mode) =>
-                  void useChatStore
-                    .getState()
-                    .setCostControlMode(mode)
-                    .catch(() => {})
-                }
-                disabled={isReadOnly}
-                verdict={costRoutingVerdict}
-              />
-            )}
             {showCodexPlanMode && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -5003,16 +4986,28 @@ export function Composer({
                 backendLabel="Codex"
               />
             )}
-            <AgentPicker
-              agents={agents}
-              isLoading={agentsLoading}
-              selectedId={selectedAgentId}
-              onSelect={onSelectAgent}
-              effortLevels={effortLevels}
+            <ComposerModelEffortLabel
+              showModels={showModels}
               showEffort={showEffort}
               modelPickerKind={modelPickerKind}
               codexModelOptions={codexModelOptions}
-              disabled={isReadOnly}
+              costRoutingEligible={costRoutingEligible}
+              harnessLabel={harnessLabel}
+            />
+            <ComposerConfigGear
+              harnessLabel={harnessLabel}
+              showModels={showModels}
+              showEffort={showEffort}
+              effortLevels={effortLevels}
+              modelPickerKind={modelPickerKind}
+              codexModelOptions={codexModelOptions}
+              costRoutingEligible={costRoutingEligible}
+              // Only a live runner can accept a config change — a model/effort/
+              // routing POST can't wake an asleep, stranded, or not-yet-observed
+              // runner, and those states never load the model catalog either. So
+              // the gear is inert whenever the session isn't online, alongside
+              // the read-only cases.
+              disabled={isReadOnly || !sessionLive}
               openNonce={pickerOpenNonce}
             />
             <Button
@@ -5047,7 +5042,6 @@ export function Composer({
         </div>
       </div>
       <ComposerStatusLine
-        harnessLabel={harnessLabel}
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
         onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
@@ -5378,64 +5372,435 @@ export function isModelImplicitlySelected(modelId: string, llmModel: string | nu
   return llmModel === modelId || llmModel.endsWith(`/${modelId}`) || llmModel.includes(modelId);
 }
 
-interface AgentPickerProps {
-  agents: Agent[] | undefined;
-  isLoading: boolean;
-  selectedId: string | null;
-  onSelect: (id: string) => void;
-  effortLevels: readonly string[];
-  /** Show the Effort section and selected effort. */
-  showEffort: boolean;
-  /** Native model picker family, when present. */
-  modelPickerKind: NativeModelPickerKind | null;
-  /** Runner-owned model picker rows for native sessions. */
-  codexModelOptions: readonly NativeModelOption[];
-  /**
-   * Disables the picker trigger. The picker is purely a write
-   * surface (selecting an agent / model / effort changes how the
-   * next turn runs), so read-only sessions disable it alongside the
-   * other composer buttons.
-   */
-  disabled?: boolean;
-  /**
-   * External "open the dropdown" signal; nonce-keyed so repeat
-   * requests re-open (same pattern as the composer prefill). Used by
-   * bare ``/model`` submits. ``0`` / omitted means never requested.
-   */
-  openNonce?: number;
-}
-
-/** Title-case an effort level for the trigger pill (``"high"`` → ``"High"``). */
+/** Title-case an effort level for the status label (``"high"`` → ``"High"``). */
 function formatEffortLabel(effort: string): string {
   return effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
-function AgentPicker({
-  agents,
-  isLoading,
-  selectedId,
-  onSelect,
-  effortLevels,
+/**
+ * In-session run-config modal opened from the composer's gear icon. The
+ * live-committing analogue of the new-session ``HarnessConfigModal``: only the
+ * knobs switchable mid-session appear — Model, Effort, and Smart Routing.
+ * Permission/approval/cursor modes are launch-time only (no in-session state to
+ * read or write), so they are intentionally absent.
+ *
+ * Like the new-session modal, changes are drafted locally and only applied on
+ * Save (through the store setters ``setModel`` / ``setEffort`` /
+ * ``setCostControlMode``); Cancel / dismiss discards them. The setters enforce
+ * the model↔routing mutual exclusion server-side.
+ */
+function SessionConfigModal({
+  open,
+  onOpenChange,
+  harnessLabel,
+  showModels,
   showEffort,
+  effortLevels,
   modelPickerKind,
   codexModelOptions,
-  disabled = false,
+  costRoutingEligible,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  harnessLabel: string | null;
+  showModels: boolean;
+  showEffort: boolean;
+  effortLevels: readonly string[];
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+  costRoutingEligible: boolean;
+}) {
+  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
+    useResolvedComposerModel(modelPickerKind, codexModelOptions);
+
+  // Agents with a Model dropdown fold Smart Routing into it as an option; those
+  // without one get a standalone Switch (matches HarnessConfigModal).
+  const liveRoutingOn = costRoutingEligible && costControlModeOverride === "on";
+
+  // Resolve the row the current model maps to, matching the old picker's
+  // active-row rule: the explicit override wins, else the bound `llmModel`
+  // implicitly selects its row (so a launch-resolved model shows without an
+  // explicit pick), else the catalog default. Falls back to the "Default"
+  // sentinel when nothing resolves.
+  const implicitModelId =
+    pickerSelectedModel === null
+      ? ((usesServerModelOptions
+          ? (findNativeModelOption(codexModelOptions, llmModel)?.id ??
+            codexModelOptions.find((option) => option.isDefault)?.id)
+          : modelOptions.find((m) => isModelImplicitlySelected(m.id, llmModel))?.id) ?? null)
+      : null;
+  const resolvedModelId = pickerSelectedModel ?? implicitModelId;
+
+  // Local draft — seeded from the live state each time the modal opens so
+  // Cancel discards and re-opening always reflects the committed config.
+  // `draftModelId` is the resolved model id (null = Default sentinel);
+  // `draftRoutingOn` folds Smart Routing in as a mutually-exclusive choice.
+  const [draftModelId, setDraftModelId] = useState<string | null>(resolvedModelId);
+  const [draftEffort, setDraftEffort] = useState<string | null>(selectedEffort);
+  const [draftRoutingOn, setDraftRoutingOn] = useState(liveRoutingOn);
+  useEffect(() => {
+    if (!open) return;
+    setDraftModelId(resolvedModelId);
+    setDraftEffort(selectedEffort);
+    setDraftRoutingOn(liveRoutingOn);
+    // Seed once per open from the current live values.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  // The Select value: the router sentinel when routing is drafted on, else the
+  // drafted model, else the "Default" sentinel (no override).
+  const modelValue = draftRoutingOn ? MODEL_SELECT_SMART : (draftModelId ?? MODEL_SELECT_DEFAULT);
+
+  const onModelChange = (value: string) => {
+    if (value === MODEL_SELECT_SMART) {
+      setDraftRoutingOn(true);
+      setDraftModelId(null);
+      // The router picks the model (and its effort) per turn, so an explicit
+      // effort can't apply — reset it so it doesn't ride along frozen.
+      setDraftEffort(null);
+    } else if (value === MODEL_SELECT_DEFAULT) {
+      setDraftModelId(null);
+      setDraftRoutingOn(false);
+    } else {
+      // Pinning a model turns routing off (mutually exclusive).
+      setDraftModelId(value);
+      setDraftRoutingOn(false);
+    }
+  };
+
+  const save = () => {
+    // Commit the changed knobs SEQUENTIALLY, awaiting each PATCH before the
+    // next. Claude-native applies model/effort changes by typing separate
+    // ``/model``/``/effort`` slash commands into its terminal, so firing them
+    // concurrently lets the injections interleave into one line (e.g.
+    // ``/model opus/effort medium``, which Claude rejects as a model name).
+    // Awaiting serializes them — each change lands in its own turn. Order
+    // matches HarnessConfigModal.save: model/routing first (their setters
+    // enforce the mutual exclusion server-side), then effort.
+    void (async () => {
+      const store = useChatStore.getState();
+      try {
+        if (draftRoutingOn) {
+          if (costRoutingEligible && !liveRoutingOn) await store.setCostControlMode("on");
+        } else {
+          // Re-pin the model when routing was on and there's a Model dropdown
+          // (its setter cleared the applied override, and `resolvedModelId`
+          // reflects the leftover cross-session sticky — not what's applied — so
+          // the ``!==`` guard would false-negative), or whenever the drafted
+          // model actually changed. For a no-dropdown agent (e.g. Polly) the
+          // user can't have chosen a model, so re-pinning the seeded
+          // `resolvedModelId` would risk pinning a leaked sticky — turning
+          // routing off just clears via setModel(null) below.
+          const modelChanged = draftModelId !== resolvedModelId;
+          const rePinAfterRouting = liveRoutingOn && showModels;
+          if (rePinAfterRouting || modelChanged) await store.setModel(draftModelId);
+          if (costRoutingEligible && liveRoutingOn) await store.setCostControlMode("off");
+        }
+        // Skip effort while routing is on: the router picks it per turn, and a
+        // stray ``/effort`` injection would just be noise.
+        if (showEffort && !draftRoutingOn && draftEffort !== selectedEffort)
+          await store.setEffort(draftEffort);
+      } catch {
+        // Individual setters already roll back their optimistic state; a failed
+        // PATCH shouldn't wedge the modal open.
+      }
+    })();
+    onOpenChange(false);
+  };
+
+  const modelSelectOptions = usesServerModelOptions
+    ? modelOptions.map((m) => ({ id: m.id, label: m.displayName ?? m.id }))
+    : modelOptions.map((m) => ({ id: m.id, label: m.label ?? m.id }));
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md" data-testid="composer-config-modal">
+        <DialogHeader>
+          <DialogTitle>Configure {harnessLabel ?? "session"}</DialogTitle>
+          <DialogDescription className="sr-only">
+            Change how this session runs. Model, effort, and smart routing apply to the next turn.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex flex-col gap-5 py-1">
+          {/* Smart Routing as a standalone toggle only for routable agents with
+          no Model dropdown to fold it into (e.g. Polly). Agents that render a
+          Model dropdown (Claude, Codex, …) offer it as a Model option below. */}
+          {costRoutingEligible && !showModels && (
+            <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
+              <div className="flex h-8 items-center justify-end">
+                <Switch
+                  size="sm"
+                  checked={draftRoutingOn}
+                  data-testid="composer-config-smart-routing"
+                  aria-label="Smart Routing"
+                  onCheckedChange={(next) => {
+                    setDraftRoutingOn(next);
+                    // Routing picks the model + effort per turn, so an explicit
+                    // effort can't apply — reset it while routing is on.
+                    if (next) setDraftEffort(null);
+                  }}
+                />
+              </div>
+            </ConfigRow>
+          )}
+          {showModels && (
+            <ConfigRow label="Model" description="Underlying LLM">
+              <Select value={modelValue} onValueChange={onModelChange}>
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-model"
+                  aria-label="Model"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  {costRoutingEligible && (
+                    <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
+                  )}
+                  <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+                  {modelSelectOptions.map((m) => (
+                    <SelectItem
+                      key={m.id}
+                      value={m.id}
+                      data-model-id={m.id}
+                      data-active={draftModelId === m.id ? "true" : undefined}
+                    >
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+          {showEffort && (
+            <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+              <Select
+                value={draftEffort ?? EFFORT_SELECT_NONE}
+                onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? null : v)}
+                // Smart Routing picks the model + effort per turn, so an
+                // explicit effort can't apply — freeze it to Default.
+                disabled={draftRoutingOn}
+              >
+                <SelectTrigger
+                  className="w-full"
+                  data-testid="composer-config-effort"
+                  aria-label="Effort"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                  {effortLevels.map((level) => (
+                    <SelectItem
+                      key={level}
+                      value={level}
+                      data-effort-level={level}
+                      // Codex efforts render raw (its ids aren't title-cased);
+                      // other harnesses title-case for display.
+                      className={modelPickerKind === "codex" ? undefined : "capitalize"}
+                    >
+                      {formatStatusEffortLabel(level, modelPickerKind === "codex") ?? level}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </ConfigRow>
+          )}
+        </div>
+
+        <DialogFooter className="border-t-0 bg-transparent">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            data-testid="composer-config-cancel"
+          >
+            Cancel
+          </Button>
+          <Button type="button" onClick={save} data-testid="composer-config-save">
+            Save
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * Composer gear affordance: a ghost `SettingsIcon` that shows the session's
+ * live run-config on hover and opens `SessionConfigModal` on click. Rendered
+ * only when the session has at least one switchable knob (model, effort, or
+ * smart routing) — otherwise there's nothing to configure.
+ *
+ * @param openNonce External "open the modal" signal, nonce-keyed so repeat
+ *   requests re-open (bare ``/model`` submits route here now that the composer
+ *   trigger is a read-only label). ``0`` / omitted means never requested.
+ */
+function ComposerConfigGear({
+  harnessLabel,
+  showModels,
+  showEffort,
+  effortLevels,
+  modelPickerKind,
+  codexModelOptions,
+  costRoutingEligible,
+  disabled,
   openNonce = 0,
-}: AgentPickerProps) {
-  // Controlled so bare "/model" in the composer can open the dropdown.
+}: {
+  harnessLabel: string | null;
+  showModels: boolean;
+  showEffort: boolean;
+  effortLevels: readonly string[];
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+  costRoutingEligible: boolean;
+  disabled: boolean;
+  openNonce?: number;
+}) {
   const [open, setOpen] = useState(false);
   const appliedOpenNonce = useRef(0);
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
+    // Consume the nonce even when disabled so a later enable doesn't replay a
+    // stale open request; skip opening while the gear is inert (read-only /
+    // not-live), matching the click guard.
     appliedOpenNonce.current = openNonce;
+    if (disabled) return;
     setOpen(true);
-  }, [openNonce]);
+  }, [openNonce, disabled]);
+  const summary = useSessionConfigSummary({
+    harnessLabel,
+    showModels,
+    showEffort,
+    modelPickerKind,
+    codexModelOptions,
+    costRoutingEligible,
+  });
 
-  const hasAgents = !!agents && agents.length > 0;
+  if (!showModels && !showEffort && !costRoutingEligible) return null;
+
+  return (
+    <>
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              // Soft-disable: keep the button hover-able so its tooltip (the
+              // read-only config summary) still shows, but block the click and
+              // dim it. A native `disabled` button swallows pointer events, so
+              // the tooltip would never fire.
+              className={cn(
+                "size-9 shrink-0 text-muted-foreground hover:text-foreground md:size-8",
+                disabled && "cursor-default opacity-50 hover:text-muted-foreground",
+              )}
+              aria-disabled={disabled}
+              onClick={() => {
+                if (disabled) return;
+                setOpen(true);
+              }}
+              data-testid="composer-config-gear"
+              aria-label="Configure session"
+            >
+              <SettingsIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          {summary.length > 0 && (
+            <TooltipContent
+              side="top"
+              className="flex-col items-start gap-0.5 px-3 py-2"
+              data-testid="composer-config-gear-tooltip"
+            >
+              {summary.map((row) => (
+                <span key={row.label} className="text-muted-foreground">
+                  {row.label}: <span className="text-popover-foreground">{row.value}</span>
+                </span>
+              ))}
+            </TooltipContent>
+          )}
+        </Tooltip>
+      </TooltipProvider>
+      <SessionConfigModal
+        open={open}
+        onOpenChange={setOpen}
+        harnessLabel={harnessLabel}
+        showModels={showModels}
+        showEffort={showEffort}
+        effortLevels={effortLevels}
+        modelPickerKind={modelPickerKind}
+        codexModelOptions={codexModelOptions}
+        costRoutingEligible={costRoutingEligible}
+      />
+    </>
+  );
+}
+
+/**
+ * Label/value rows summarizing the session's live run-config, for the gear
+ * icon's hover tooltip. Mirrors the new-session summary but with in-session
+ * values and no Permissions row (permission mode is launch-time only).
+ */
+function useSessionConfigSummary({
+  harnessLabel,
+  showModels,
+  showEffort,
+  modelPickerKind,
+  codexModelOptions,
+  costRoutingEligible,
+}: {
+  harnessLabel: string | null;
+  showModels: boolean;
+  showEffort: boolean;
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+  costRoutingEligible: boolean;
+}): { label: string; value: string }[] {
   const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const routingOn = costRoutingEligible && costControlModeOverride === "on";
+
+  const rows: { label: string; value: string }[] = [];
+  if (harnessLabel) rows.push({ label: "Harness", value: harnessLabel });
+  if (showModels) {
+    rows.push({ label: "Model", value: routingOn ? "Smart Routing" : (modelLabel ?? "Default") });
+  }
+  // Suppress Effort while Smart Routing is on: the router picks the model and
+  // its effort per turn, so a pinned effort doesn't apply and would mislead.
+  if (showEffort && !routingOn) {
+    const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
+    rows.push({ label: "Effort", value: effortValue ?? "Default" });
+  }
+  // Routable agents with no Model row surface Smart Routing as a standalone row;
+  // those with a Model dropdown fold it into Model above (shown as the value).
+  if (costRoutingEligible && !showModels && routingOn) {
+    rows.push({ label: "Smart Routing", value: "On" });
+  }
+  return rows;
+}
+
+/**
+ * Resolve the session's live model + its picker option list from the store,
+ * per harness family. Shared by the AgentPicker trigger, the gear config
+ * modal, and the gear hover summary so all three agree on what "the current
+ * model" is (the resolution differs by wrapper — see the inline notes).
+ *
+ * @param modelPickerKind Native picker family, or ``null`` for SDK/bundle.
+ * @param codexModelOptions Server-provided model options (codex/cursor/…).
+ */
+function useResolvedComposerModel(
+  modelPickerKind: NativeModelPickerKind | null,
+  codexModelOptions: readonly NativeModelOption[],
+) {
   const selectedModel = useChatStore((s) => s.selectedModel);
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
+  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
 
   // Native model pickers populate from the snapshot's runner-backed
   // ``model_options`` field. Claude's rows are the aliases pinned to the
@@ -5450,22 +5815,11 @@ function AgentPicker({
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
     usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
-  // Only offer the agent list when there's an actual choice. Inside a
-  // session the picker is scoped to the single bound agent (the runner is
-  // tied 1:1 to it and can't be reassigned), so a one-row "Agents" section
-  // is pure noise — drop it and let the dropdown be just the effort/model
-  // controls.
-  const showAgents = !isNativeModelPicker && (agents?.length ?? 0) > 1;
-  const rawAgentName = agents?.find((a) => a.id === selectedId)?.name ?? agents?.[0]?.name;
-  const agentDisplayName = rawAgentName ? agentDisplayLabel(rawAgentName) : rawAgentName;
 
-  // The trigger now names what this control changes: model + effort. The
-  // harness/agent identity moved to the status tray below the card.
   // qwen/goose/cursor/pi/opencode native wrappers pick their model inside
   // the vendor TUI, so the bound `llmModel` is an unused default — don't
   // surface it as if it were live; claude-/codex-native and SDK agents
   // resolve to a real model.
-  const nativeVendorOwnsModel = useChatStore((s) => s.nativeVendorOwnsModel);
   // cursor-native is a vendor-owns-model wrapper, but unlike qwen/goose/pi/
   // opencode it mirrors its live TUI model into the session override
   // (`sessionModelOverride` / `model_override`), kept current both by the
@@ -5515,181 +5869,97 @@ function AgentPicker({
         : null
     : nonNativeModel;
   const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
-  const effortTriggerLabel =
-    showEffort && selectedEffort
-      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
-      : null;
-  const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
-
-  // Before a native harness resolves a live model, prefer its advertised
-  // default; kiro/pi fall back to their first catalog row when none is marked.
-  const launchFallbackOption =
-    codexModelOptions.find((m) => m.isDefault) ??
-    (modelPickerKind === "kiro" || modelPickerKind === "pi" ? codexModelOptions[0] : undefined);
-  const launchFallbackLabel = launchFallbackOption?.displayName ?? launchFallbackOption?.id;
-
-  // Model in foreground (black), effort in muted (grey). Static fallbacks
-  // first; the final `else` returns null so a session with nothing to show
-  // and nothing to switch doesn't render an empty disabled pill — its
-  // identity is carried by the status tray below.
-  let triggerContent: React.ReactNode;
-  if (isLoading) {
-    triggerContent = "Loading…";
-  } else if (!hasAgents) {
-    triggerContent = "No agents";
-  } else if (modelLabel) {
-    triggerContent = (
-      <>
-        <span className="text-foreground">{modelLabel}</span>
-        {effortTriggerLabel && <span className="text-muted-foreground"> {effortTriggerLabel}</span>}
-      </>
-    );
-  } else if (effortTriggerLabel) {
-    // Vendor owns the model but effort is still switchable from the web UI.
-    triggerContent = <span className="text-muted-foreground">{effortTriggerLabel}</span>;
-  } else if (showAgents) {
-    // No model/effort to surface, but the user can still switch agents —
-    // label the trigger with the current agent so the switcher reads clearly.
-    triggerContent = agentDisplayName;
-  } else if (hasPickerActions) {
-    // The live model/effort isn't resolved yet (e.g. a claude-/codex-native
-    // session before the snapshot fills llmModel/selectedEffort: the generated
-    // spec may carry no executor model and no sticky/override is set), but the
-    // dropdown still has model rows to switch. Keep the trigger rendered — and
-    // the model dropdown + bare-`/model` open path reachable — with a stable
-    // identity fallback rather than hiding the picker entirely. For kiro/pi,
-    // prefer the catalog default (e.g. "Auto") over the agent name so the
-    // launch-window label reads as a model.
-    triggerContent = launchFallbackLabel ?? agentDisplayName ?? "Model";
-  } else {
-    return null;
-  }
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          disabled={!hasAgents || disabled || !hasPickerActions}
-          data-testid="agent-picker-trigger"
-          className="h-7 min-w-0 shrink gap-1.5 px-2 text-muted-foreground hover:text-foreground"
-        >
-          <span className="min-w-0 truncate text-xs tabular-nums">{triggerContent}</span>
-          {hasPickerActions && <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />}
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-64 p-1">
-        {showAgents && (
-          <>
-            <PickerSectionHeader>Agents</PickerSectionHeader>
-            {agents?.map((a) => (
-              <DropdownMenuItem
-                key={a.id}
-                data-testid="agent-picker-item"
-                data-agent-id={a.id}
-                data-agent-name={a.name}
-                data-active={a.id === selectedId ? "true" : undefined}
-                onSelect={() => onSelect(a.id)}
-                className={cn(
-                  "items-start gap-2 rounded-sm px-2 py-1.5 text-xs",
-                  "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
-                )}
-              >
-                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <span className="truncate">{agentDisplayLabel(a.name)}</span>
-                  {a.description && (
-                    <span className="truncate text-xs text-muted-foreground">{a.description}</span>
-                  )}
-                </div>
-              </DropdownMenuItem>
-            ))}
-          </>
-        )}
-        {modelOptions.length > 0 && (
-          <>
-            {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
-            <PickerSectionHeader>Models</PickerSectionHeader>
-            {modelOptions.map((m) => {
-              const explicitOption = findNativeModelOption(codexModelOptions, pickerSelectedModel);
-              const isExplicit = explicitOption?.id === m.id;
-              const isImplicit =
-                pickerSelectedModel === null &&
-                (usesServerModelOptions
-                  ? (
-                      findNativeModelOption(codexModelOptions, llmModel) ??
-                      codexModelOptions.find((option) => option.isDefault)
-                    )?.id === m.id
-                  : isModelImplicitlySelected(m.id, llmModel));
-              const isActive = isExplicit || isImplicit;
-              return (
-                <DropdownMenuItem
-                  key={m.id}
-                  data-testid="model-picker-item"
-                  data-model-id={m.id}
-                  data-active={isActive ? "true" : undefined}
-                  onSelect={() =>
-                    void useChatStore
-                      .getState()
-                      .setModel(m.id)
-                      .catch(() => {})
-                  }
-                  className={cn(
-                    "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
-                    "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
-                  )}
-                >
-                  <span className="flex-1 truncate">
-                    {usesServerModelOptions ? (m.displayName ?? m.id) : m.label}
-                  </span>
-                </DropdownMenuItem>
-              );
-            })}
-          </>
-        )}
-        {/* Skip the leading rule when Effort is the only section, so the
-            dropdown doesn't open with a stray divider at the top. */}
-        {showEffort && (
-          <>
-            {(showAgents || modelOptions.length > 0) && <DropdownMenuSeparator className="my-1" />}
-            <PickerSectionHeader>Effort</PickerSectionHeader>
-            {effortLevels.map((level) => (
-              <DropdownMenuItem
-                key={level}
-                data-testid="effort-picker-item"
-                data-effort-level={level}
-                data-active={selectedEffort === level ? "true" : undefined}
-                onSelect={() =>
-                  void useChatStore
-                    .getState()
-                    .setEffort(level)
-                    .catch(() => {})
-                }
-                className={cn(
-                  "items-center gap-2 rounded-sm px-2 py-1.5 text-xs",
-                  modelPickerKind !== "codex" && "capitalize",
-                  "data-[active=true]:bg-accent/60 data-[active=true]:text-foreground",
-                )}
-              >
-                <span className="flex-1 truncate">{level}</span>
-              </DropdownMenuItem>
-            ))}
-          </>
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
+  return {
+    llmModel,
+    usesServerModelOptions,
+    modelOptions,
+    isNativeModelPicker,
+    pickerSelectedModel,
+    effectiveModel,
+    modelLabel,
+  };
 }
 
 /**
- * Category label inside the picker dropdown. Plain ``div``, not
- * ``DropdownMenuLabel``, so Radix doesn't claim focus for it.
+ * Read-only ``<Model> <Effort>`` label in the composer, left of the config
+ * gear. Model switching / effort control now live in the gear modal, so this
+ * is a glanceable status label rather than a dropdown trigger — model in the
+ * foreground, effort muted. Renders nothing when neither is known/switchable
+ * (the harness identity and full config live in the gear tooltip/modal).
+ *
+ * @param showModels Whether the session exposes a model to surface.
+ * @param showEffort Whether the session exposes a reasoning-effort level.
+ * @param modelPickerKind Native picker family, or ``null`` for SDK/bundle.
+ * @param codexModelOptions Server-provided model options (codex/cursor/…).
+ * @param costRoutingEligible Whether Smart Routing is offered for this session.
+ * @param harnessLabel Harness identity (e.g. "Polly (Pi)"), used as the label
+ *   fallback for SDK/bundle agents that surface no model/effort.
  */
-function PickerSectionHeader({ children }: { children: React.ReactNode }) {
+function ComposerModelEffortLabel({
+  showModels,
+  showEffort,
+  modelPickerKind,
+  codexModelOptions,
+  costRoutingEligible,
+  harnessLabel,
+}: {
+  showModels: boolean;
+  showEffort: boolean;
+  modelPickerKind: NativeModelPickerKind | null;
+  codexModelOptions: readonly NativeModelOption[];
+  costRoutingEligible: boolean;
+  harnessLabel: string | null;
+}) {
+  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
+  const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const routingOn = costRoutingEligible && costControlModeOverride === "on";
+  // Smart Routing picks the model + effort per turn, so the label reads
+  // "Smart Routing" with no pinned model/effort — matching the gear tooltip.
+  if (routingOn) {
+    return (
+      <span
+        data-testid="composer-model-effort-label"
+        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+      >
+        <span className="text-foreground">Smart Routing</span>
+      </span>
+    );
+  }
+  const effortLabel =
+    showEffort && selectedEffort
+      ? formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex")
+      : null;
+  // SDK/bundle sessions (no native picker) still surface their resolved model
+  // in the label even though the gear modal has no Model dropdown for them —
+  // showModels gates only the modal control, not this read-out.
+  const model = showModels || modelPickerKind === null ? modelLabel : null;
+  // SDK/bundle agents (e.g. Polly) that resolve no model/effort fall back to
+  // the harness identity ("Polly (Pi)") so the slot isn't empty — mirrors what
+  // the pre-gear picker trigger showed there. Scoped to SDK/bundle
+  // (modelPickerKind === null): native wrappers keep an empty label when their
+  // model is unresolved rather than resurfacing the bare vendor name, which the
+  // gear tooltip owns now.
+  if (!model && !effortLabel) {
+    if (modelPickerKind !== null || !harnessLabel) return null;
+    return (
+      <span
+        data-testid="composer-model-effort-label"
+        className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+      >
+        <span className="text-foreground">{harnessLabel}</span>
+      </span>
+    );
+  }
+
   return (
-    <div className="px-2 pt-2 pb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
-      {children}
-    </div>
+    <span
+      data-testid="composer-model-effort-label"
+      className="min-w-0 shrink truncate px-1 text-xs tabular-nums text-muted-foreground"
+    >
+      {model && <span className="text-foreground">{model}</span>}
+      {model && effortLabel && " "}
+      {effortLabel && <span className="text-muted-foreground">{effortLabel}</span>}
+    </span>
   );
 }
