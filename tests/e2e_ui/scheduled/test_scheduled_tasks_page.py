@@ -1,7 +1,7 @@
 """UI journey: the Scheduled Tasks page (``/tasks``).
 
-Covers the behaviour UI-1 added: a task row renders the human-readable
-schedule SUMMARY derived client-side from the stored RRULE
+Covers the Scheduled Tasks page row behavior: a task row renders the
+human-readable schedule SUMMARY derived client-side from the stored RRULE
 (``describeSchedule``), and it does NOT render a "Next run in Xh"
 countdown — that was deliberately removed because a client-computed
 next-run can't be guaranteed to match the server's anchor for

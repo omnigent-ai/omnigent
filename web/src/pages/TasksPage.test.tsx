@@ -285,7 +285,7 @@ describe("New task button", () => {
   it("opens the manual create dialog directly (no dropdown)", () => {
     setTasks([]);
     renderPage();
-    // "Create with Omnigent" is hidden for now (TODO(UI-2)), leaving one create
+    // "Create with Omnigent" is hidden for now, leaving one create
     // path — so the button opens the manual dialog directly rather than a menu.
     fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();

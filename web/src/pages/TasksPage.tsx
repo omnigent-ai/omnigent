@@ -142,8 +142,8 @@ export function TasksPage() {
         </div>
         {/* Only one create path is live right now ("Set up manually"), so the
             "New task" button opens that dialog directly rather than showing a
-            one-item dropdown. TODO(UI-2): re-enable the "Create with Omnigent"
-            entry point and restore the two-option dropdown (NewTaskMenu). */}
+            one-item dropdown. TODO: restore the two-option dropdown when the
+            "Create with Omnigent" entry point is ready. */}
         <Button data-testid="new-task-button" className="shrink-0" onClick={openManual}>
           New task
         </Button>
@@ -244,9 +244,9 @@ export function TasksPage() {
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
       />
-      {/* TODO(UI-2): stub kept wired but currently unreachable — nothing opens
-          it while the "Create with Omnigent" menu entry is hidden. Restore the
-          NewTaskMenu entry point (which calls setOmnigentOpen(true)) in UI-2. */}
+      {/* TODO: stub kept wired but currently unreachable while the
+          "Create with Omnigent" menu entry is hidden. Restore the NewTaskMenu
+          entry point when the create flow is ready. */}
       <CreateWithOmnigentDialog open={omnigentOpen} onOpenChange={setOmnigentOpen} />
     </PageScroll>
   );
@@ -255,12 +255,12 @@ export function TasksPage() {
 /**
  * The "New task" split button: a caret dropdown with the two create paths.
  *
- * TODO(UI-2): currently NOT rendered — while "Create with Omnigent" is hidden,
+ * TODO: currently NOT rendered while "Create with Omnigent" is hidden,
  * the "New task" button opens the Set-up-manually dialog directly (see the
  * header above). Restore this dropdown (and the `onCreateWithOmnigent` wiring)
- * when the Omnigent create flow lands in UI-2.
+ * when the Omnigent create flow is ready.
  *
- * Exported (rather than deleted) so it's retained for UI-2 and doesn't trip
+ * Exported rather than deleted so it is retained without tripping
  * `noUnusedLocals` while it has no in-module caller.
  */
 export function NewTaskMenu({
