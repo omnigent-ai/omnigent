@@ -558,6 +558,14 @@ known-first-party = ["omnigent"]
 "integrations/slack/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
+# The sessions route is a facade over an implementation package: the public
+# ``sessions.py`` re-exports its impl modules with ``import *``, and each impl
+# module layers on the ones below it the same way (common → helpers →
+# orchestration). Star re-export is the point of the facade, so F403 (star
+# import) and F405 (name may be from star import) are expected here and can't
+# be resolved without enumerating hundreds of re-exports by hand.
+"omnigent/server/routes/sessions.py" = ["F403", "F405"]
+"omnigent/server/routes/_sessions/*.py" = ["F403", "F405"]
 
 [tool.mypy]
 python_version = "3.12"

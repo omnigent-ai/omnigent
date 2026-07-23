@@ -35,6 +35,8 @@ CREATE TABLE messages (
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
+    reasoning_content TEXT,
+    reasoning TEXT,
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0
 );
@@ -48,18 +50,20 @@ def _seed_db(path: Path, *, cwd: str, started_at: float, session_id: str = "2026
         "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
         (session_id, "cli", cwd, started_at),
     )
-    # (session_id, role, content, tool_call_id, tool_calls, tool_name, active)
+    # (session_id, role, content, tool_call_id, tool_calls, tool_name, reasoning_content,
+    #  reasoning, active)
     rows = [
-        (session_id, "user", "hi [Attached: /x.png]", None, None, None, 1),
-        (session_id, "assistant", "hello", None, None, None, 1),
-        (session_id, "tool", "{tool-result}", None, None, None, 1),  # no tool_call_id -> skipped
-        (session_id, "assistant", "", None, None, None, 1),  # no prose, no tool_calls -> skipped
-        (session_id, "user", "soft-deleted", None, None, None, 0),  # inactive -> skipped
+        (session_id, "user", "hi [Attached: /x.png]", None, None, None, None, None, 1),
+        (session_id, "assistant", "hello", None, None, None, None, None, 1),
+        (session_id, "tool", "{tool-result}", None, None, None, None, None, 1),  # no id -> skip
+        (session_id, "assistant", "", None, None, None, None, None, 1),  # no prose/tools -> skip
+        (session_id, "user", "soft-deleted", None, None, None, None, None, 0),  # inactive -> skip
     ]
     con.executemany(
         "INSERT INTO messages"
-        "(session_id, role, content, tool_call_id, tool_calls, tool_name, active)"
-        " VALUES (?,?,?,?,?,?,?)",
+        "(session_id, role, content, tool_call_id, tool_calls, tool_name, reasoning_content,"
+        " reasoning, active)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
         rows,
     )
     con.commit()
@@ -135,6 +139,39 @@ def test_read_new_items_maps_roles_and_strips_attachments(tmp_path: Path) -> Non
     assert posted[1].item_data["role"] == "assistant"
     assert posted[1].item_data["agent"] == "hermes-native-ui"
     assert posted[1].item_data["content"] == [{"type": "output_text", "text": "hello"}]
+
+
+def test_read_new_items_mirrors_reasoning_before_message(tmp_path: Path) -> None:
+    """An assistant row with reasoning posts a one-shot reasoning delta before the message."""
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.executescript(_SCHEMA)
+    con.execute(
+        "INSERT INTO sessions(id, source, cwd, started_at) VALUES (?,?,?,?)",
+        ("s1", "cli", str(tmp_path), 1000.0),
+    )
+    con.execute(
+        "INSERT INTO messages"
+        "(session_id, role, content, reasoning_content, reasoning, active)"
+        " VALUES (?,?,?,?,?,?)",
+        ("s1", "assistant", "done", "thinking hard [Attached: /x]", "fallback", 1),
+    )
+    con.commit()
+    con.close()
+    items = f._read_new_items(db, "s1", 0, "hermes-native-ui")
+    posted = [i for i in items if i.item_type]
+    assert posted[0].item_type == "external_output_reasoning_delta"
+    assert posted[0].item_data == {"delta": "thinking hard", "started": True}  # marker stripped
+    assert posted[1].item_type == "message"
+    assert posted[1].item_data["content"] == [{"type": "output_text", "text": "done"}]
+
+
+def test_read_new_items_no_reasoning_when_columns_empty(tmp_path: Path) -> None:
+    """An assistant row without reasoning posts no reasoning delta (the seeded "hello" row)."""
+    db = tmp_path / "state.db"
+    _seed_db(db, cwd=str(tmp_path), started_at=1000.0)
+    items = f._read_new_items(db, "20260620_1", 0, "hermes-native-ui")
+    assert not any(i.item_type == "external_output_reasoning_delta" for i in items)
 
 
 def test_read_new_items_mirrors_tool_calls(tmp_path: Path) -> None:
@@ -298,6 +335,21 @@ async def test_post_conversation_item_posts_event(tmp_path) -> None:
     assert url == "/v1/sessions/conv_q/events"
     assert body["type"] == "external_conversation_item"
     assert body["data"]["response_id"] == "hermes:5"
+
+
+async def test_post_conversation_item_posts_reasoning_delta(tmp_path) -> None:
+    client = _FakeClient()
+    item = f._MirrorItem(
+        msg_id=6,
+        item_type="external_output_reasoning_delta",
+        item_data={"delta": "let me think", "started": True},
+        response_id="hermes:6",
+    )
+    await f._post_conversation_item(client, session_id="conv_q", item=item)
+    url, body = client.posts[0]
+    assert url == "/v1/sessions/conv_q/events"
+    assert body["type"] == "external_output_reasoning_delta"
+    assert body["data"] == {"delta": "let me think", "started": True}
 
 
 async def test_forward_loop_discovers_and_mirrors_new_messages(tmp_path, monkeypatch) -> None:

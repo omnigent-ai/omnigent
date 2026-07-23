@@ -35,6 +35,8 @@ from rich.cells import cell_len
 from rich.console import Console
 from rich.text import Text
 
+from omnigent._platform import IS_WINDOWS
+
 # Reuse the REPL theme picker's palette verbatim so the selector is
 # visually identical to ``_theme_picker.py`` (``_ACCENT`` / ``_MUTED``).
 ACCENT = "#F43BA6"
@@ -399,6 +401,9 @@ def select(
     mask = _normalize_selectable(options, selectable)
 
     if not sys.stdin.isatty():
+        return _select_fallback(title, options, default=default, selectable=mask)
+
+    if IS_WINDOWS:
         return _select_fallback(title, options, default=default, selectable=mask)
 
     import termios

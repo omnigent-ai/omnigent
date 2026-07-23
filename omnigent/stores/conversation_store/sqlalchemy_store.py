@@ -1490,6 +1490,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        See :meth:`ConversationStore.sum_daily_cost`. Day strings compare
+        lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
+        a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
+        an empty range, coalesced to ``0.0``.
+        """
+        with self._session() as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(SqlUserDailyCost.cost_usd), 0.0))
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+            ).scalar_one()
+            return float(total or 0.0)
+
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
         Return a user's daily cost rollup state for one UTC day.
@@ -2481,6 +2499,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
         harness_override: str | None = None,
+        _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
@@ -2503,8 +2522,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param _unset_cost_control_mode_override: When ``True``, clear
             ``cost_control_mode_override`` to ``None``.
         :param harness_override: Per-session brain-harness override,
-            e.g. ``"pi"``. ``None`` leaves unchanged; set once at
-            session create, no ``_unset`` variant.
+            e.g. ``"pi"``. ``None`` leaves unchanged.
+        :param _unset_harness_override: When ``True``, clear
+            ``harness_override`` to ``None`` (used to replace the
+            ``"auto"`` sentinel after first-message routing resolves).
         :param terminal_launch_args: Per-session native-terminal
             pass-through args, e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -2549,7 +2570,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             elif cost_control_mode_override is not None:
                 overrides["cost_control_mode_override"] = cost_control_mode_override
                 overrides_changed = True
-            if harness_override is not None:
+            if _unset_harness_override:
+                overrides["harness_override"] = None
+                overrides_changed = True
+            elif harness_override is not None:
                 overrides["harness_override"] = harness_override
                 overrides_changed = True
             if overrides_changed:
@@ -2561,6 +2585,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now
+            labels = _fetch_labels(ap_sess, conversation_id)
         if terminal_launch_args is not None:
             with self._session() as meta_sess:
                 meta = meta_sess.get(
@@ -2582,7 +2607,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     meta_sess.add(meta)
                 meta.terminal_launch_args = json.dumps(terminal_launch_args)
-        return self.get_conversation(conversation_id)
+        else:
+            meta = self._get_meta(ap_sess, conversation_id)
+        return _to_conversation(row, meta, labels)
 
     def rename_conversation_if_title_matches(
         self,
@@ -2606,6 +2633,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if result.rowcount != 1:
                 return None
+        # Bulk UPDATE leaves no in-session ORM row to reuse; re-read.
         return self.get_conversation(conversation_id)
 
     def set_runner_id(self, conversation_id: str, runner_id: str) -> bool:
@@ -2759,14 +2787,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.runner_id = runner_id
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def clear_runner_id(self, conversation_id: str) -> Conversation:
         """
@@ -2787,14 +2814,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.runner_id = None
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def clear_host_binding(self, conversation_id: str) -> Conversation:
         """
@@ -2823,14 +2849,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.runner_id = None
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def list_conversations_by_runner_id(
         self,
@@ -2869,7 +2894,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .scalars()
                 .all()
             )
-        return [_to_conversation(r, meta_by_id.get(r.id)) for r in ap_rows]
+            # Hydrate labels (one batched query, no N+1): the runner
+            # session-init envelope is built from ``conversation.labels``, and
+            # the reconnect path (``_on_runner_connect``) sources its
+            # conversations here. Without this the envelope ships empty labels,
+            # so fork directives (carry-history / source transcript) never reach
+            # the runner and a forked native session launches without history.
+            labels_by_conv = _fetch_labels_bulk(ap_sess, conv_ids)
+        return [
+            _to_conversation(r, meta_by_id.get(r.id), labels_by_conv.get(r.id, {}))
+            for r in ap_rows
+        ]
 
     def set_host_id(
         self,
@@ -2924,14 +2959,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.git_branch = git_branch
         with self._conv_session() as ap_sess:
             ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-            if ap_row is not None:
-                ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def set_external_session_id(
         self,
@@ -2972,17 +3006,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             changed = existing != value
             if changed:
                 meta.external_session_id = value
-        if changed:
-            with self._conv_session() as ap_sess:
-                ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
-                if ap_row is not None:
-                    ap_row.updated_at = now_epoch()
-        conv = self.get_conversation(conversation_id)
-        if conv is None:
-            raise ConversationNotFoundError(
-                f"conversation {conversation_id!r} does not exist",
-            )
-        return conv
+        with self._conv_session() as ap_sess:
+            ap_row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if ap_row is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            if changed:
+                ap_row.updated_at = now_epoch()
+            labels = _fetch_labels(ap_sess, conversation_id)
+        return _to_conversation(ap_row, meta, labels)
 
     def create_session_with_agent(
         self,
@@ -3051,10 +3084,43 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``parent_conversation_id`` is set but no such
             conversation exists.
         """
+        return self._create_session_with_agent_with_id(
+            generate_conversation_id(),
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_bundle_location=agent_bundle_location,
+            agent_description=agent_description,
+            title=title,
+            labels=labels,
+            reasoning_effort=reasoning_effort,
+            workspace=workspace,
+            terminal_launch_args=terminal_launch_args,
+            parent_conversation_id=parent_conversation_id,
+            runner_id=runner_id,
+        )
+
+    def _create_session_with_agent_with_id(
+        self,
+        conversation_id: str,
+        *,
+        agent_id: str,
+        agent_name: str,
+        agent_bundle_location: str,
+        agent_description: str | None,
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        terminal_launch_args: list[str] | None = None,
+        parent_conversation_id: str | None = None,
+        runner_id: str | None = None,
+    ) -> CreatedSession:
+        """Body of :meth:`create_session_with_agent` under a caller-supplied
+        ``conversation_id``. The public method generates a fresh id; this seam
+        lets a subclass inject one (MAS's WHS-homed store injects the WHS node id)."""
         from omnigent.stores.conversation_store import ConversationNotFoundError
 
         now = now_epoch()
-        conversation_id = generate_conversation_id()
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.
         # Get parent root_id from AP first.
@@ -3207,8 +3273,45 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ValueError: If *up_to_response_id* is set but no item in
             the source conversation has that ``response_id``.
         """
+        return self._fork_conversation_with_id(
+            generate_conversation_id(),
+            source_conversation_id,
+            title=title,
+            agent_id=agent_id,
+            cloned_agent_name=cloned_agent_name,
+            cloned_agent_bundle_location=cloned_agent_bundle_location,
+            cloned_agent_description=cloned_agent_description,
+            copy_model_settings=copy_model_settings,
+            copy_terminal_launch_args=copy_terminal_launch_args,
+            carry_history_into_native=carry_history_into_native,
+            resume_source_native_session=resume_source_native_session,
+            presentation_labels=presentation_labels,
+            up_to_response_id=up_to_response_id,
+        )
+
+    def _fork_conversation_with_id(
+        self,
+        conversation_id: str,
+        source_conversation_id: str,
+        *,
+        title: str | None = None,
+        agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
+        copy_model_settings: bool = True,
+        copy_terminal_launch_args: bool = True,
+        carry_history_into_native: bool = False,
+        resume_source_native_session: bool = True,
+        presentation_labels: dict[str, str] | None = None,
+        up_to_response_id: str | None = None,
+    ) -> Conversation:
+        """Body of :meth:`fork_conversation` under a caller-supplied
+        ``conversation_id``. The public method generates a fresh id; this seam
+        lets a subclass inject one (MAS's WHS-homed store injects the WHS node id
+        so a forked session keeps a single identity across storage backends)."""
         now = now_epoch()
-        new_conv_id = generate_conversation_id()
+        new_conv_id = conversation_id
 
         # Fetch source metadata (workspace, external_session_id, terminal_launch_args)
         # from the Omnigent DB before opening the AP session.

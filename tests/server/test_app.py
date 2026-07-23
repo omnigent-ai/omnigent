@@ -1113,3 +1113,35 @@ async def test_health_derives_runner_online_from_fresh_row_stamp(
     assert sessions[fresh.id]["runner_online"] is True
     assert sessions[stale.id]["runner_online"] is False
     assert sessions[cleared.id]["runner_online"] is False
+
+
+# ── debug router loading (out-of-tree diagnostic endpoints) ──────────
+
+
+def test_load_debug_routers_none_and_empty() -> None:
+    """No configured modules → no routers, no error."""
+    assert server_app._load_debug_routers(None) == []
+    assert server_app._load_debug_routers([]) == []
+
+
+def test_load_debug_routers_missing_module_is_skipped() -> None:
+    """A module that can't be imported is logged and skipped, never raised.
+
+    This is the production safety net: a stray ``debug_router_modules`` key
+    naming an out-of-tree module absent from the install must not crash boot.
+    """
+    assert server_app._load_debug_routers(["nope.not.a.real.module"]) == []
+
+
+def test_load_debug_routers_module_without_list_is_skipped() -> None:
+    """A module lacking a DEBUG_ROUTERS list is skipped (uses a stdlib module)."""
+    assert server_app._load_debug_routers(["json"]) == []
+
+
+def test_load_debug_routers_collects_entries() -> None:
+    """The benchmark debug router module exposes a mountable DEBUG_ROUTERS entry."""
+    entries = server_app._load_debug_routers(["dev.benchmarks.omnigent.debug_router"])
+    assert len(entries) == 1
+    _router, prefix, tags = entries[0]
+    assert prefix == "/debug"
+    assert tags == ["debug"]

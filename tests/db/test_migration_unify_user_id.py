@@ -75,12 +75,16 @@ def test_scheduled_tasks_user_id_column_at_head(db_engine: Engine) -> None:
 
 
 def test_scheduled_tasks_index_renamed(db_engine: Engine) -> None:
-    """The scheduled_tasks owner index is ``ix_scheduled_tasks_user_id`` at head."""
+    """At head the scheduled_tasks owner index is the consolidated user-scope index.
+
+    This revision renamed ``ix_scheduled_tasks_owner_user_id`` to
+    ``ix_scheduled_tasks_user_id``; migration f4664ca64ea8 then folded it with the
+    created_at listing index into ``ix_scheduled_tasks_user_scope``.
+    """
     idx = {i["name"] for i in sa.inspect(db_engine).get_indexes("scheduled_tasks")}
-    assert "ix_scheduled_tasks_user_id" in idx, f"Expected ix_scheduled_tasks_user_id; found {idx}"
-    assert "ix_scheduled_tasks_owner_user_id" not in idx, (
-        f"ix_scheduled_tasks_owner_user_id should be gone; found {idx}"
-    )
+    assert "ix_scheduled_tasks_user_scope" in idx, idx
+    assert "ix_scheduled_tasks_user_id" not in idx
+    assert "ix_scheduled_tasks_owner_user_id" not in idx
 
 
 def test_downgrade_restores_old_names(tmp_path: Path) -> None:

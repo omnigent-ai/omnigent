@@ -87,10 +87,11 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list(self) -> list[ScheduledTask]:
+    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
         """
         List all scheduled tasks ordered by ``created_at ASC, id ASC``.
 
+        :param owner_user_id: When given, return only tasks owned by this user.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
@@ -199,13 +200,26 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list_runs(self, scheduled_task_id: str) -> list[ScheduledTaskRun]:
+    def list_runs(
+        self,
+        scheduled_task_id: str,
+        *,
+        limit: int = 100,
+        after_id: str | None = None,
+    ) -> tuple[list[ScheduledTaskRun], str | None]:
         """
-        List runs for a task ordered by ``scheduled_at DESC, id DESC``
+        List one page of a task's runs ordered by ``scheduled_at DESC, id DESC``
         (most recent first).
 
+        Cursor-paginated so run history is never silently truncated: returns
+        ``(runs, next_cursor)`` where ``next_cursor`` is the id to pass as
+        ``after_id`` for the next page, or ``None`` when the last page is
+        reached.
+
         :param scheduled_task_id: The task whose runs to return.
-        :returns: List of :class:`ScheduledTaskRun` instances.
+        :param limit: Maximum number of runs per page. Defaults to 100.
+        :param after_id: Return runs ordered after this run id (exclusive).
+        :returns: ``(runs, next_cursor)``.
         """
         ...
 

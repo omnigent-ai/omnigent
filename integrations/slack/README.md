@@ -7,7 +7,9 @@ issues requests to that fixed host. Each user still authenticates as their own
 Omnigent identity against it.
 
 > This README is the operator/user guide (setup, scopes, running, auth). For the
-> architecture and key technical decisions, see **[DESIGN.md](DESIGN.md)**.
+> user-facing behaviour contract (setup, DM, channels, error handling), see
+> **[docs/CUJS.md](docs/CUJS.md)**; for the Databricks-App auth design, see
+> **[docs/DATABRICKS_APP_WEBAUTH_DESIGN.md](docs/DATABRICKS_APP_WEBAUTH_DESIGN.md)**.
 
 ## Setup
 
@@ -42,6 +44,7 @@ required for the bot's core behaviour:
 | `im:history` | Read direct messages. DMs are a first-class entry point and do **not** fire `app_mention`, so without this the bot can't respond in DMs. |
 | `commands` | Register and receive the `/omnigent` slash command. |
 | `team:read` | Read the workspace name (`team.info`) to label the delegated-login request. |
+| `users:read`, `users:read.email` | Read the user's email (`users.info`) — **required only for Databricks web-auth mode**, where it's signed into the enrollment link and matched against the OAuth-authenticated email to bind the token to the right person. Omit for `accounts`/`oidc` mode. |
 
 **Channel history — add per channel type where the bot will run.** These back
 the plain-`message` event; add only the ones matching where you'll use the bot:
@@ -151,11 +154,15 @@ socket server can drive the device flow.
 IdP* in their browser. The server hands back its session JWT — the same token
 a browser session gets. There is **no device grant and no refresh token**: the
 session lasts its normal TTL (default 8h), after which the user logs in again.
-- `header` **/ proxy mode** → **unsupported**. Identity is asserted by a trusted
-upstream proxy header (e.g. `X-Forwarded-Email`), so the server mints no token
-and exposes no per-user login the bot can drive; setup reports that the server
-can't be logged into. Run the server in `accounts` or `oidc` mode to use the
-bot with authentication, or place the bot behind the same identity proxy.
+- `header` **/ proxy mode** → identity is asserted by a trusted upstream proxy
+header (e.g. `X-Forwarded-Email`), so the server mints no token and exposes no
+per-user login the auto-detect flow can drive. Two options:
+  - **Databricks Apps** (the common case): set
+    `OMNIGENT_SLACK_SERVER_AUTH=databricks` and the bot enrolls each user
+    through a web page it serves as its own Databricks App — see
+    [Databricks Apps web-auth](#databricks-apps-web-auth) below.
+  - Otherwise run the server in `accounts`/`oidc` mode, or place the bot behind
+    the same identity proxy.
 
 Either way the flow is the same from Slack's side:
 
@@ -181,6 +188,47 @@ Run `/omnigent` afterwards to set up again.
 
 See `designs/DEVICE_AUTH.md` in the main repo for the full design and
 threat model.
+
+### Databricks Apps web-auth
+
+When the Omnigent server is deployed as a **Databricks App**, it runs in header
+mode: the Databricks Apps proxy authenticates every request and injects the
+user's identity. A Socket-Mode event carries no such proxy-authenticated
+request, so the device/OIDC flows above can't be driven. Instead the bot runs a
+**custom U2M OAuth app** (authorization code + PKCE, `offline_access`) via an
+enrollment page it serves as its own Databricks App:
+
+1. On `/omnigent`, the bot looks up the user's email (`users.info`), generates a
+   PKCE verifier + single-use nonce, and posts a *Sign in with Databricks* link
+   — the workspace `/oidc/v1/authorize` URL whose signed `state` carries that
+   email and nonce.
+2. The user signs in at the Databricks authorize screen and Databricks redirects
+   back to the bot's `GET /auth/callback` with a single-use, PKCE-bound code.
+3. The callback consumes the PKCE verifier for the nonce (single-use — a
+   replayed redirect is refused) and exchanges the code at `/oidc/v1/token` for
+   an **access + refresh** pair, reading the authenticated email from the
+   `id_token` (falling back to SCIM `Me`).
+4. **Identity binding (confused-deputy guard):** the callback requires the
+   OAuth-authenticated email to equal the Slack email in the signed state — so a
+   link bound to user A, signed in by victim V, can't store V's token under A.
+   Mismatch → refused (HTTP 403).
+5. **Confirm before storing:** the GET stores nothing — it shows a consent page
+   naming the exact identities being linked ("your Omnigent `<server>` account
+   `<idp-email>` with Slack user `<slack-email>`") and a **Confirm** button. The
+   pair is persisted only when the user submits the confirming POST, then the
+   setup modal advances automatically. The token is bounded by the OAuth app's
+   requested scopes, so it isn't a broad workspace credential.
+6. The bot calls the server with the access token; the proxy validates it and
+   injects the real `X-Forwarded-Email`, so the server maps the request to the
+   user — **no server-side change needed**. On expiry the bot refreshes silently
+   via the refresh token; the user signs in once, not hourly.
+
+Enabled with `OMNIGENT_SLACK_SERVER_AUTH=databricks` plus the custom OAuth app's
+`OMNIGENT_SLACK_DATABRICKS_CLIENT_ID` / `OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET`
+and a `OMNIGENT_SLACK_DATABRICKS_STATE_SECRET` (see `.env.example`). To deploy
+the bot as its own Databricks App, see
+[`deploy/databricks/README.md`](deploy/databricks/README.md); for the full
+design and threat model, [`docs/DATABRICKS_APP_WEBAUTH_DESIGN.md`](docs/DATABRICKS_APP_WEBAUTH_DESIGN.md).
 
 Run `/omnigent` (or `/omnigent config`) any time to reopen this modal and change
 your agent, host, or workspace. The server is fixed by the operator, so there's
@@ -222,8 +270,10 @@ Send another message while the bot is still replying and it privately tells you
 to wait or continue in the web UI; a message to an idle thread just continues the
 conversation.
 
-For how any of this works under the hood — streaming, turn-end detection,
-elicitation handling, concurrency, ordering — see **[DESIGN.md](DESIGN.md)**.
+For the full set of user-facing behaviours — setup, DM vs channel routing,
+ownership, and error handling — see **[docs/CUJS.md](docs/CUJS.md)**. The
+under-the-hood details (streaming, turn-end detection, elicitation handling,
+concurrency, ordering) live in the module docstrings and inline comments.
 
 ## Development
 

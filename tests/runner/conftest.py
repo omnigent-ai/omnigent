@@ -25,6 +25,31 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig
 from tests.runner.helpers import NullServerClient
 
 
+def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:
+    """
+    Drain and return every dict item currently on a runner session queue.
+
+    Used by the native control-event tests to clear creation-time events
+    (e.g. the ``session.terminal_pending`` pair the claude-native
+    auto-create path enqueues) so a later drain isolates only the events
+    a specific control signal produced.
+
+    :param queue: The per-session event queue from
+        ``_session_event_queues_ref``, or ``None`` when the session has
+        no queue (already deleted / never created).
+    :returns: The dict items drained, in FIFO order. Empty when the
+        queue is ``None`` or held only non-dict sentinels.
+    """
+    drained: list[dict[str, Any]] = []
+    if queue is None:
+        return drained
+    while not queue.empty():
+        item = queue.get_nowait()
+        if isinstance(item, dict):
+            drained.append(item)
+    return drained
+
+
 class _FakeMcpManager:
     """Stand-in for RunnerMcpManager that returns scripted schemas/names."""
 

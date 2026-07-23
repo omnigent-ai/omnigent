@@ -6,102 +6,40 @@ Verifies the `_stream_message_to_harness` shared helper covers both
 ``omnigent_runner_dispatched`` marker on intercepted events, and
 route MCP dispatch to the runner manager.
 """
+
 from __future__ import annotations
+
 import asyncio
-import contextlib
-import json
-import logging
-import shutil
-import sys
-import threading
 import uuid
-from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, cast
-import httpx
+from typing import Any
+
 import pytest
-from fastapi import FastAPI
+
 from omnigent import (
     claude_native_bridge,
     codex_native_bridge,
-    cursor_native_bridge,
     kiro_native_bridge,
-    qwen_native_bridge,
-)
-from omnigent.antigravity_native_bridge import (
-    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-)
-from omnigent.antigravity_native_bridge import (
-    is_placeholder_conversation_id as bridge_mod_is_placeholder,
 )
 from omnigent.claude_native_bridge import (
-    BRIDGE_ID_LABEL_KEY,
-    bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
-    prepare_bridge_dir,
-    read_permission_hook_config,
 )
-from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.entities.session_resources import SessionResourceView
 from omnigent.runner import create_runner_app
-from omnigent.runner import tool_dispatch as _tool_dispatch
-from omnigent.runner.app import (
-    _RUNNER_DISPATCHED_FIELD,
-    _WAKE_POST_MAX_ATTEMPTS,
-    ResolvedSpec,
-    _agent_os_env_from_spec,
-    _auto_create_antigravity_terminal,
-    _auto_create_claude_terminal,
-    _auto_create_codex_terminal,
-    _auto_create_cursor_terminal,
-    _auto_create_kiro_terminal,
-    _auto_create_pi_terminal,
-    _auto_create_repl_terminal,
-    _deliver_subagent_wake_post,
-    _KiroNativeLaunchConfig,
-    _load_claude_launch_metadata,
-    _log_terminal_lookup_miss,
-    _PiNativeLaunchConfig,
-    _publish_native_terminal_start_error,
-    _publish_terminal_pending,
-    _refresh_claude_permission_hook_auth,
-    _resolved_workdir_for_spec,
-    _session_labels_for_runner_spawn,
-    _terminal_lookup_miss_log_state,
-    _wake_post_is_retryable,
-)
-from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.resource_registry import (
-    ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
-    CLAUDE_NATIVE_TERMINAL_ROLE,
-    CODEX_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
-    OMNIGENT_REPL_TERMINAL_ROLE,
-    PI_NATIVE_TERMINAL_ROLE,
-    SessionResourceRegistry,
 )
-from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
-from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo, MCPServerConfig
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
-from tests.runner.helpers import NullServerClient
 from tests.runner.conftest import (
-    _BlockingHarnessClient,
-    _NativeBlockingHarnessClient,
-    _FakeFileServerClient,
-    _FakeMcpManager,
+    _drain_session_event_queue,
     _FakeProcessManager,
-    _McpToolsListServerClient,
-    _ReadTimeoutTransport,
-    _ScriptedHarnessClient,
-    _build_app_with_mcp_tool,
-    _build_interrupt_app,
-    _build_lifecycle_app,
-    _build_native_app,
     _runner_client,
-    _spec_resolver_returning,
-    _sse,
+    _ScriptedHarnessClient,
 )
+from tests.runner.helpers import NullServerClient
+
 
 class _EventRecordingServerClient(NullServerClient):
     """Records Omnigent ``external_*`` event POSTs for assertion.
@@ -613,6 +551,166 @@ async def test_codex_native_model_options_query_model_list(
     ]
     assert fake_client.connected
     assert fake_client.closed
+
+
+@pytest.mark.asyncio
+async def test_claude_native_model_options_use_session_launch_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner exposes friendly aliases from one cached Claude config."""
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    conv_id = "6a416804870ed618cc8908f5cebab937"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-10",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+        },
+        api_key_helper="printf token",
+        model="system.ai.claude-opus-4-10",
+    )
+    resolved_specs: list[AgentSpec | None] = []
+
+    def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
+        resolved_specs.append(spec)
+        return config
+
+    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        resolver = kwargs.get("resolve_launch_config")
+        recorder = kwargs.get("record_launch_config")
+        assert callable(resolver)
+        assert callable(recorder)
+        recorder(session_id, await resolver())
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _fake_auto_create)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        first = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        second = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    expected = {
+        "models": [
+            {
+                "id": "opus",
+                "model": "system.ai.claude-opus-4-10",
+                "displayName": "Opus 4.10",
+                "isDefault": True,
+            },
+            {
+                "id": "haiku",
+                "model": "system.ai.claude-haiku-4-5",
+                "displayName": "Haiku 4.5",
+                "isDefault": False,
+            },
+        ]
+    }
+    assert first.status_code == 200
+    assert first.json() == expected
+    assert second.json() == expected
+    # Auto-create and both UI reads shared one launch-time live query.
+    assert resolved_specs == [claude_spec]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_model_options_config_error_is_not_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative-empty catalog answers 424, not the retryable 503.
+
+    The AP server treats 503 as a "runner still booting" retry window; a
+    configuration failure (workspace exposes no Claude models) can't be
+    retried away, so it must use a distinct status.
+    """
+    import click
+
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    conv_id = "7b527915981fe729dd9a19a6dfcbca48"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
+        del spec
+        raise click.ClickException("Databricks profile 'p' exposes no Claude model services.")
+
+    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _fake_auto_create)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert resp.status_code == 424
+    body = resp.json()
+    assert body["error"] == "claude_native_model_options_config"
+    assert "exposes no Claude model services" in body["detail"]
 
 
 @pytest.mark.asyncio
@@ -2898,5 +2996,3 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
-
-

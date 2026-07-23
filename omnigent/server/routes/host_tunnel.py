@@ -36,6 +36,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -629,6 +630,18 @@ async def _receive_loop(
                         "payload": frame.payload,
                         "error_status": frame.error_status,
                         "error_code": frame.error_code,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostModelOptionsResultFrame):
+            model_future = conn.pending_model_options.pop(frame.request_id, None)
+            if model_future is not None and not model_future.done():
+                model_future.set_result(
+                    {
+                        "status": frame.status,
+                        "models": frame.models,
                         "error": frame.error,
                     }
                 )

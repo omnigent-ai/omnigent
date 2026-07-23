@@ -37,7 +37,11 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  useHostModelOptions: vi.fn(() => ({ data: [] })),
+  useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
@@ -62,6 +66,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
   useBrainHarnessLabels: () => ({}),
+  // Stub so the setup dialog's hook doesn't fire its own /v1/harnesses fetch
+  // (which would skew the create-flow call-count assertions here).
+  useHarnessSetupSteps: () => ({}),
 }));
 
 function host(overrides: Partial<Host> = {}): Host {

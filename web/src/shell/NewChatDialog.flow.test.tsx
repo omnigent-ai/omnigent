@@ -49,7 +49,17 @@ vi.mock("@/store/chatStore", () => ({
 }));
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  useHostModelOptions: vi.fn(() => ({
+    data: [
+      { id: "opus", displayName: "Opus" },
+      { id: "sonnet", displayName: "Sonnet" },
+      { id: "haiku", displayName: "Haiku" },
+    ],
+  })),
+  useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -93,6 +103,9 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     antigravity: "Antigravity",
     copilot: "Copilot",
   }),
+  // Stub so the setup dialog's hook doesn't fire its own /v1/harnesses fetch
+  // (which would skew the create-flow call-count assertions here).
+  useHarnessSetupSteps: () => ({}),
 }));
 
 function host(overrides: Partial<Host> = {}): Host {
@@ -160,25 +173,37 @@ function openWorktree(): void {
   fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
 }
 
-/**
- * Open the agent/harness picker and open <agentId>'s config submenu via
- * keyboard (ArrowRight). A plain click on a knobbed row instead COMMITS the
- * pick and closes the menu, so config flows use the keyboard to drill in.
- */
-function openAgentConfig(agentId: string): void {
-  fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  fireEvent.keyDown(screen.getByTestId(`new-chat-landing-agent-${agentId}`), { key: "ArrowRight" });
-}
-
 /** Open the picker and commit (select + close) an agent by clicking its row. */
 function selectAgent(agentId: string): void {
   fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
 }
 
-/** Dismiss any open menu so a subsequent submit click isn't swallowed. */
-function closeMenu(): void {
-  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+/**
+ * Select <agentId> and open its run-config modal via the composer gear icon.
+ * The knobs (model / effort / permission / approval / cursor mode / brain
+ * harness) live in this modal, not the picker dropdown.
+ */
+function openAgentConfig(agentId: string): void {
+  selectAgent(agentId);
+  fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
+}
+
+/** Open a Radix Select trigger (opens on pointerdown in jsdom). */
+function openSelect(testId: string): void {
+  fireEvent.pointerDown(screen.getByTestId(testId), { button: 0 });
+  fireEvent.click(screen.getByTestId(testId));
+}
+
+/** Open the config-modal Select at <triggerTestId> and click the option labeled <label>. */
+function pickSelectOption(triggerTestId: string, label: string): void {
+  openSelect(triggerTestId);
+  fireEvent.click(screen.getByText(label));
+}
+
+/** Close the config modal by clicking Save (commits the draft). */
+function saveConfig(): void {
+  fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
 }
 
 beforeEach(() => {
@@ -600,14 +625,14 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Claude Code's config submenu (ArrowRight) and pick a non-default
-    // permission mode. The create call proves the choice travels as a
+    // Open Claude Code's config modal and pick a non-default permission mode,
+    // then Save. The create call proves the choice travels as a
     // `--permission-mode <mode>` pair in terminal_launch_args.
     openAgentConfig("ag_native");
-    fireEvent.click(screen.getByTestId("new-chat-landing-permission-bypassPermissions"));
-    // The trigger label stays the bare agent name (the pick lives in the submenu).
+    pickSelectOption("new-chat-landing-config-permission", "Bypass permissions");
+    saveConfig();
+    // The trigger label stays the bare agent name (the pick lives in the modal).
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
-    closeMenu();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -657,14 +682,17 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     openAgentConfig("ag_native");
-    fireEvent.click(screen.getByTestId("new-chat-landing-permission-acceptEdits"));
+    pickSelectOption("new-chat-landing-config-permission", "Accept edits");
+    saveConfig();
 
-    // The pick is snapshotted under the harness key immediately, so the next
-    // visit can seed from it.
+    // The pick is snapshotted under the harness key on Save, so the next
+    // visit can seed from it. (Saving also records the empty model/effort,
+    // which stay unset for this default-model session.)
     await waitFor(() =>
-      expect(JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")).toEqual({
-        "claude-native": { mode: "acceptEdits" },
-      }),
+      expect(
+        JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")["claude-native"]
+          ?.mode,
+      ).toBe("acceptEdits"),
     );
   });
 
@@ -679,16 +707,16 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Claude Code's submenu: its permission mode is at "Default" (the
-    // checked radio), and Codex's "Full access" approval preset doesn't even
-    // exist in this submenu — no cross-harness bleed.
+    // Open Claude Code's config modal: it shows the permission select (not an
+    // approval select), and Codex's stored "full-access" preset doesn't bleed
+    // in — the permission select sits at its Default.
     openAgentConfig("ag_native");
-    await waitFor(() =>
-      expect(
-        screen.getByTestId("new-chat-landing-permission-default").getAttribute("aria-checked"),
-      ).toBe("true"),
+    expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
+    // The permission select's trigger displays its current value — "Default",
+    // not Codex's stored "full-access" (which isn't even a valid value here).
+    expect(screen.getByTestId("new-chat-landing-config-permission").textContent).toContain(
+      "Default",
     );
-    expect(screen.queryByTestId("new-chat-landing-approval-full-access")).toBeNull();
   });
 
   it("posts no launch args for opencode-native, even after a codex full-access pick", async () => {
@@ -708,12 +736,13 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick "Full access" for Codex (single-section submenu → closes on pick).
+    // Pick "Full access" for Codex in its config modal and Save.
     openAgentConfig("ag_codex");
-    fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
+    pickSelectOption("new-chat-landing-config-approval", "Full access");
+    saveConfig();
 
-    // Switch to OpenCode by clicking its row (a plain row — no config submenu,
-    // since it has no mode knobs).
+    // Switch to OpenCode by clicking its row. It has no mode knobs, so no gear
+    // shows for it — its launch posts no terminal_launch_args.
     selectAgent("ag_opencode");
 
     typeMessage("go");
@@ -782,12 +811,12 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Model, effort and permission mode share Claude Code's one config submenu;
-    // it stays open across picks (multi-section) so both can be set in one visit.
+    // Model, effort and permission mode share Claude Code's one config modal;
+    // both can be set in one visit and commit together on Save.
     openAgentConfig("ag_native");
-    fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
-    fireEvent.click(screen.getByTestId("new-chat-landing-effort-high"));
-    closeMenu();
+    pickSelectOption("new-chat-landing-config-model", "Opus");
+    pickSelectOption("new-chat-landing-config-effort", "High");
+    saveConfig();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -836,13 +865,17 @@ describe("NewChatLandingScreen create flow", () => {
     renderLanding();
     await waitForWorkspaceSeed();
     openAgentConfig("ag_native");
-    fireEvent.click(screen.getByTestId("new-chat-landing-model-opus"));
+    pickSelectOption("new-chat-landing-config-model", "Opus");
+    saveConfig();
 
-    await waitFor(() =>
-      expect(JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")).toEqual({
-        "claude-native": { model: "opus", effort: "high" },
-      }),
-    );
+    // Save merges the model pick with the stored effort — both seed next time.
+    await waitFor(() => {
+      const stored = JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")[
+        "claude-native"
+      ];
+      expect(stored?.model).toBe("opus");
+      expect(stored?.effort).toBe("high");
+    });
   });
 
   it("ignores a retired stored model id and omits the override on create", async () => {
@@ -902,10 +935,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Codex's config submenu and pick "Full access" (single section →
-    // selecting it also commits and closes the menu).
+    // Open Codex's config modal, pick "Full access", and Save.
     openAgentConfig("ag_codex");
-    fireEvent.click(screen.getByTestId("new-chat-landing-approval-full-access"));
+    pickSelectOption("new-chat-landing-config-approval", "Full access");
+    saveConfig();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -953,10 +986,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Polly's config submenu and pick the Pi harness (single section →
-    // selecting it commits the agent pick and closes the menu).
+    // Open Polly's config modal and pick the Pi harness, then Save.
     openAgentConfig("ag_polly");
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
+    pickSelectOption("new-chat-landing-config-harness", "Pi");
+    saveConfig();
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1009,12 +1042,14 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick Pi, then change mind back to the spec default (Claude SDK). Each
-    // pick closes the single-section submenu, so reopen between the two.
+    // Pick Pi, Save, then change mind back to the spec default (Claude SDK)
+    // and Save again.
     openAgentConfig("ag_polly");
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-pi"));
+    pickSelectOption("new-chat-landing-config-harness", "Pi");
+    saveConfig();
     openAgentConfig("ag_polly");
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-claude-sdk"));
+    pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
+    saveConfig();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1027,43 +1062,36 @@ describe("NewChatLandingScreen create flow", () => {
   });
 
   // Skipped while the toggle is hidden behind the false-gate in NewChatDialog; un-skip when re-enabling.
-  it.skip("posts cost_control_mode_override when the intelligent-model toggle is flipped on (polly)", async () => {
-    // Cost control is a polly-only feature, so the toggle only renders when
-    // the selected agent is polly. Seed polly as the sole (auto-selected) agent.
-    setAgents([agent({ id: "ag_polly", name: "polly", display_name: "Polly" })]);
-    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-
-    renderLanding();
-    await waitForWorkspaceSeed();
-    // Click the sparkle toggle — unset flips straight to "on"; the choice
-    // must travel in the create body so the switch is persisted before the
-    // session's first turn.
-    fireEvent.click(screen.getByTestId("cost-toggle-trigger"));
-    typeMessage("go");
-    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-
-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
-    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
-    const body = JSON.parse(init.body as string);
-    expect(body.cost_control_mode_override).toBe("on");
-  });
-
-  it("hides the Cost Optimized pill for non-polly agents", async () => {
-    // The default seeded agent is a plain YAML agent (hello_world), not polly,
-    // so the cost pill must not render at all — cost control is polly-only.
+  it("no longer renders a standalone smart-routing composer toggle", async () => {
+    // The sparkle toggle was folded into the gear modal's Model dropdown — it
+    // must not render as a separate composer control anymore.
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     renderLanding();
     await waitForWorkspaceSeed();
     expect(screen.queryByTestId("cost-toggle-trigger")).toBeNull();
   });
 
-  it("omits cost_control_mode_override when the pill is left at spec default (polly)", async () => {
-    setAgents([agent({ id: "ag_polly", name: "polly", display_name: "Polly" })]);
+  it("renders the config modal footer without its own background or top border", async () => {
+    // The Cancel/Save footer should blend into the modal body — no gray tray
+    // band and no divider line above the buttons.
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_native");
+
+    const footer = screen
+      .getByTestId("new-chat-landing-config-save")
+      .closest("[data-slot=dialog-footer]");
+    expect(footer).not.toBeNull();
+    expect(footer).toHaveClass("bg-transparent", "border-t-0");
+    expect(footer?.className).not.toMatch(/bg-muted/);
+  });
+
+  it("omits cost_control_mode_override when Smart Routing is left unpicked", async () => {
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ id: "conv_new" }),
+      json: async () => ({ id: "conv_native" }),
     } as unknown as Response);
 
     renderLanding();
@@ -1075,10 +1103,8 @@ describe("NewChatLandingScreen create flow", () => {
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
     // Anchor on a required field so the absence check can't pass vacuously.
-    expect(body.agent_id).toBe("ag_polly");
-    // Unset = defer to the spec default; the field must be absent (an
-    // explicit null at create would be a pointless write, and "off" here
-    // would wrongly disable a spec-configured mode).
+    expect(body.agent_id).toBe("ag_native");
+    // Unset = defer to the spec default; the field must be absent.
     expect(body.cost_control_mode_override).toBeUndefined();
   });
 
@@ -1288,8 +1314,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick the non-default agent (Radix opens on pointerdown).
+    // Pick the non-default agent (Radix opens on pointerdown). "second_agent"
+    // is a custom agent, so it lives in the "Custom agents" submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_two"));
     // The explicit pick persists immediately — no session has to be created
     // for the preference to stick.

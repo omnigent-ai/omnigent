@@ -6,59 +6,43 @@ Verifies the `_stream_message_to_harness` shared helper covers both
 ``omnigent_runner_dispatched`` marker on intercepted events, and
 route MCP dispatch to the runner manager.
 """
+
 from __future__ import annotations
+
 import asyncio
-import contextlib
 import json
 import logging
-import shutil
-import sys
-import threading
-import uuid
-from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
+
 import httpx
 import pytest
-from fastapi import FastAPI
+
 from omnigent import (
     claude_native_bridge,
-    codex_native_bridge,
     cursor_native_bridge,
     kiro_native_bridge,
-    qwen_native_bridge,
 )
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
 )
-from omnigent.antigravity_native_bridge import (
-    is_placeholder_conversation_id as bridge_mod_is_placeholder,
-)
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
-    bridge_dir_for_conversation_id,
     prepare_bridge_dir,
     read_permission_hook_config,
 )
-from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
+from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
-from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
-    _RUNNER_DISPATCHED_FIELD,
-    _WAKE_POST_MAX_ATTEMPTS,
     ResolvedSpec,
     _agent_os_env_from_spec,
-    _auto_create_antigravity_terminal,
     _auto_create_claude_terminal,
-    _auto_create_codex_terminal,
     _auto_create_cursor_terminal,
     _auto_create_kiro_terminal,
     _auto_create_pi_terminal,
-    _auto_create_repl_terminal,
-    _deliver_subagent_wake_post,
     _KiroNativeLaunchConfig,
     _load_claude_launch_metadata,
     _log_terminal_lookup_miss,
@@ -66,42 +50,24 @@ from omnigent.runner.app import (
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
     _refresh_claude_permission_hook_auth,
-    _resolved_workdir_for_spec,
-    _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
-    _wake_post_is_retryable,
 )
-from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.resource_registry import (
-    ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
-    CODEX_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
-    OMNIGENT_REPL_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
-from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo, MCPServerConfig
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
-from tests.runner.helpers import NullServerClient
 from tests.runner.conftest import (
-    _BlockingHarnessClient,
-    _NativeBlockingHarnessClient,
-    _FakeFileServerClient,
-    _FakeMcpManager,
     _FakeProcessManager,
-    _McpToolsListServerClient,
-    _ReadTimeoutTransport,
-    _ScriptedHarnessClient,
-    _build_app_with_mcp_tool,
-    _build_interrupt_app,
-    _build_lifecycle_app,
-    _build_native_app,
     _runner_client,
-    _spec_resolver_returning,
-    _sse,
+    _ScriptedHarnessClient,
 )
+from tests.runner.helpers import NullServerClient
+
 
 @pytest.mark.asyncio
 async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
@@ -965,12 +931,14 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
             lambda req: httpx.Response(200, json={"labels": {}}),
         ),
     )
+    recorded_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
 
     await _auto_create_claude_terminal(
         "13efa494411f3ae60211e6be5635062a",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
+        record_launch_config=recorded_configs.__setitem__,
     )
 
     spec = captured["spec"]
@@ -989,6 +957,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # The apiKeyHelper threaded into the Claude settings augment so the
     # gateway token command is registered.
     assert "databricks auth token --fake-helper" in " ".join(spec.args)
+    assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
     await fake_client.aclose()
 
@@ -1459,31 +1428,6 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
     # The forwarder must start past the replayed transcript (same as a
     # normal cold resume where the server returned the binding directly).
     assert forwarder_kwargs.get("start_at_end") is True
-
-
-def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[str, Any]]:
-    """
-    Drain and return every dict item currently on a runner session queue.
-
-    Used by the native control-event tests to clear creation-time events
-    (e.g. the ``session.terminal_pending`` pair the claude-native
-    auto-create path enqueues) so a later drain isolates only the events
-    a specific control signal produced.
-
-    :param queue: The per-session event queue from
-        ``_session_event_queues_ref``, or ``None`` when the session has
-        no queue (already deleted / never created).
-    :returns: The dict items drained, in FIFO order. Empty when the
-        queue is ``None`` or held only non-dict sentinels.
-    """
-    drained: list[dict[str, Any]] = []
-    if queue is None:
-        return drained
-    while not queue.empty():
-        item = queue.get_nowait()
-        if isinstance(item, dict):
-            drained.append(item)
-    return drained
 
 
 @dataclass
@@ -2607,5 +2551,3 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
-
-

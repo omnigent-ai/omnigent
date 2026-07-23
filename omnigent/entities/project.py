@@ -9,7 +9,8 @@ conversation's metadata row (``project_id``), not here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -26,6 +27,11 @@ class Project:
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param config: Default session settings as an opaque JSON object (host,
+        workspace, harness, model, reasoning effort, git base-branch, …), or an
+        empty dict when none are stored. The key vocabulary is owned by the
+        client; the store persists and returns it whole. These are hints the
+        new-chat dialog pre-fills, not enforced requirements.
     """
 
     id: str
@@ -33,3 +39,4 @@ class Project:
     owner_user_id: str | None
     created_at: int
     updated_at: int | None = None
+    config: dict[str, Any] = field(default_factory=dict)
