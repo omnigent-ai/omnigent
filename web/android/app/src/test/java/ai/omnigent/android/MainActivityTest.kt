@@ -1,8 +1,11 @@
 package ai.omnigent.android
 
 import android.content.res.Configuration
+import android.webkit.WebView
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -13,6 +16,14 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class MainActivityTest {
+    @Test
+    fun `webview leaves algorithmic darkening disabled`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        assertFalse(activity.webView().settings.isAlgorithmicDarkeningAllowed)
+    }
+
     @Test
     fun `configuration change preserves SPA-applied system bar polarity`() {
         // Skip onCreate to isolate the bare config-change path from WebView dispatch.
@@ -44,4 +55,11 @@ class MainActivityTest {
             .apply { isAccessible = true }
             .invoke(this, isLight)
     }
+
+    private fun MainActivity.webView(): WebView =
+        MainActivity::class
+            .java
+            .getDeclaredField("webView")
+            .apply { isAccessible = true }
+            .get(this) as WebView
 }

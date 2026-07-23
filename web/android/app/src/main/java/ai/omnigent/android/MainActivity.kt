@@ -148,9 +148,6 @@ class MainActivity : ComponentActivity() {
                     downloadFile(downloadUrl, contentDisposition, mimeType)
                 }
             }
-        // No algorithmic darkening: with targetSdk >= 33 the DayNight theme alone
-        // makes prefers-color-scheme track the OS, and darkening would invert the
-        // SPA when the user forces light mode under an OS dark theme.
         // Wrap the WebView in a FrameLayout so the floating server-switcher
         // pill can sit on top of it. The pill uses the app's brand palette
         // (values/values-night colors.xml) so it adapts to light/dark mode.

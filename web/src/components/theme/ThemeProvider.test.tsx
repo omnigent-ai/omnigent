@@ -28,40 +28,36 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ThemeProvider native theme sync", () => {
-  it("reports the resolved scheme with a trailing system report while in system mode", () => {
-    // Android reads the concrete scheme; Electron keeps the last report, so
-    // "system" must come after it for native OS tracking.
+  it("reports the resolved Android scheme and selected Electron system theme", () => {
     render(<ThemeProvider>content</ThemeProvider>);
-    expect(themeState.reportColorScheme.mock.calls).toEqual([["light"], ["system"]]);
+    expect(themeState.reportColorScheme).toHaveBeenCalledWith("light", "system");
   });
 
-  it("re-reports on a resolved change in system mode, still ending on system", () => {
+  it("updates Android while Electron remains on system when the OS scheme changes", () => {
     const { rerender } = render(<ThemeProvider>content</ThemeProvider>);
     themeState.reportColorScheme.mockClear();
 
     themeState.resolvedTheme = "dark";
     rerender(<ThemeProvider>content</ThemeProvider>);
 
-    expect(themeState.reportColorScheme.mock.calls).toEqual([["dark"], ["system"]]);
+    expect(themeState.reportColorScheme).toHaveBeenCalledWith("dark", "system");
   });
 
-  it("reports the forced scheme when system is deselected without a resolved change", () => {
-    // System with a light OS → explicit Light: resolvedTheme stays "light",
-    // but Electron must still be told so themeSource stops tracking the OS.
+  it("reports an explicit Electron theme when system is deselected without a resolved change", () => {
     const { rerender } = render(<ThemeProvider>content</ThemeProvider>);
     themeState.reportColorScheme.mockClear();
 
     themeState.theme = "light";
     rerender(<ThemeProvider>content</ThemeProvider>);
 
-    expect(themeState.reportColorScheme.mock.calls).toEqual([["light"]]);
+    expect(themeState.reportColorScheme).toHaveBeenCalledWith("light", "light");
   });
 
-  it("reports only the concrete scheme for an explicit selection", () => {
+  it("keeps the resolved Android scheme separate from the explicit Electron theme", () => {
     themeState.theme = "dark";
-    themeState.resolvedTheme = "dark";
+    themeState.resolvedTheme = "light";
     render(<ThemeProvider>content</ThemeProvider>);
 
-    expect(themeState.reportColorScheme.mock.calls).toEqual([["dark"]]);
+    expect(themeState.reportColorScheme).toHaveBeenCalledWith("light", "dark");
   });
 });

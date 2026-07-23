@@ -203,24 +203,24 @@ describe("supportsBrowser", () => {
 });
 
 describe("reportColorScheme", () => {
-  it("keeps the Electron color-scheme path intact", () => {
+  it("routes the selected system theme through the Electron bridge", () => {
     setElectron(true);
-    reportColorScheme("system");
+    reportColorScheme("dark", "system");
     expect(electronSetColorScheme).toHaveBeenCalledWith("system");
   });
 
-  it("routes concrete schemes through the Android bridge", () => {
-    setAndroid(true);
-    reportColorScheme("light");
-    reportColorScheme("dark");
-    expect(androidSetColorScheme).toHaveBeenNthCalledWith(1, "light");
-    expect(androidSetColorScheme).toHaveBeenNthCalledWith(2, "dark");
+  it("routes an explicit selected theme through the Electron bridge", () => {
+    setElectron(true);
+    reportColorScheme("light", "light");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("light");
   });
 
-  it("does not route an unresolved system scheme to Android", () => {
+  it("routes only resolved concrete schemes through the Android bridge", () => {
     setAndroid(true);
-    reportColorScheme("system");
-    expect(androidSetColorScheme).not.toHaveBeenCalled();
+    reportColorScheme("light", "system");
+    reportColorScheme("dark", "system");
+    expect(androidSetColorScheme).toHaveBeenNthCalledWith(1, "light");
+    expect(androidSetColorScheme).toHaveBeenNthCalledWith(2, "dark");
   });
 });
 

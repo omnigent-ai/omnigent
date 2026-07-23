@@ -59,7 +59,7 @@ interface NativeShellApi {
    * ignore it.
    */
   setBadgeCount: (count: number, activation?: BadgeActivation) => void;
-  /** ThemeProvider sends resolved light/dark; legacy "system" reaches Electron only, never Android. */
+  /** Electron receives the selected theme; Android receives resolved light/dark, never "system". */
   setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
@@ -463,26 +463,29 @@ export function onNativeSidebarDrag(
  * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
 /**
- * Tell native shell chrome the web app's resolved color scheme. Electron
- * mirrors it via nativeTheme; Android updates system-bar icon contrast.
+ * Tell native shell chrome the web app's color scheme. Electron receives the
+ * selected theme so system mode keeps following the OS; Android receives the
+ * resolved scheme for system-bar icon contrast.
  * No-op outside supported shells. Fire-and-forget.
  */
-export function reportColorScheme(scheme: "light" | "dark" | "system"): void {
+export function reportColorScheme(
+  resolvedScheme: "light" | "dark",
+  selectedScheme: "light" | "dark" | "system",
+): void {
   const electron = electronApi();
   if (electron?.setColorScheme) {
     try {
-      electron.setColorScheme(scheme);
+      electron.setColorScheme(selectedScheme);
     } catch (err) {
       console.warn("[nativeBridge] setColorScheme failed:", err);
     }
     return;
   }
 
-  if (scheme === "system") return;
   const android = nativeApi();
   if (android?.kind !== "android" || !android.setColorScheme) return;
   try {
-    android.setColorScheme(scheme);
+    android.setColorScheme(resolvedScheme);
   } catch (err) {
     console.warn("[nativeBridge] setColorScheme failed:", err);
   }
