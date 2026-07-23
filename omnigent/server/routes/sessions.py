@@ -3046,6 +3046,7 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime import get_agent_cache
         from omnigent.runtime._globals import _agent_store
+        from omnigent.runtime.workflow import _find_spec_by_name
 
         if _agent_store is None:
             return None
@@ -3058,13 +3059,13 @@ def _resolve_harness(conv: Conversation | None) -> str | None:
         executor = loaded.spec.executor
         # For a bundled-agent head sub-agent, report the HEAD's own harness,
         # not the bundle brain's — `harness` is this session's provider family
-        # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
-        # brain harness when the head declares none or can't be matched.
+        # (a gpt head runs codex, not the claude-sdk brain). Resolve the child
+        # through the full sub-agent tree (the same resolver the runner uses),
+        # so a nested grandchild head resolves rather than falling back to the
+        # brain harness. Falls back to the brain when the head declares none or
+        # can't be matched.
         if conv.sub_agent_name:
-            sub = next(
-                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
-                None,
-            )
+            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
         harness = (

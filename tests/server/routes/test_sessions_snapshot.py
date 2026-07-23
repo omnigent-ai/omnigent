@@ -16,6 +16,7 @@ from omnigent.server.routes.sessions import (
     _get_session_snapshot,
     _persist_session_status_error_labels,
     _publish_subtree_cost_to_ancestors,
+    _resolve_harness,
     _truncate_label,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -1961,3 +1962,101 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
         captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
         == "runner_error"
     )
+
+
+def _harness_spec_tree() -> AgentSpec:
+    """Build a 3-level bundle: advisor → mid → executor (grandchild).
+
+    The advisor brain runs ``claude-sdk``; only the grandchild ``executor``
+    declares ``codex``. A ``sub_agent_name="executor"`` session must resolve
+    the grandchild's harness, not the brain's.
+    """
+    executor = AgentSpec(
+        spec_version=1,
+        name="executor",
+        executor=ExecutorSpec(config={"harness": "codex"}),
+    )
+    mid = AgentSpec(
+        spec_version=1,
+        name="mid",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        sub_agents=[executor],
+    )
+    return AgentSpec(
+        spec_version=1,
+        name="advisor",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+        sub_agents=[mid],
+    )
+
+
+def _patch_harness_stores(monkeypatch: pytest.MonkeyPatch, spec: AgentSpec) -> None:
+    """Wire ``_resolve_harness``'s agent store + cache to serve ``spec``."""
+
+    class _StoredAgent:
+        id = "ag_advisor"
+        bundle_location = "bundle"
+        session_id = None
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            assert agent_id == "ag_advisor"
+            return _StoredAgent()
+
+    class _Loaded:
+        def __init__(self, spec: AgentSpec) -> None:
+            self.spec = spec
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool) -> Any:
+            assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            return _Loaded(spec)
+
+    monkeypatch.setattr("omnigent.runtime._globals._agent_store", _AgentStore())
+    monkeypatch.setattr("omnigent.runtime.get_agent_cache", lambda: _AgentCache())
+
+
+def _conv_for_subagent(sub_agent_name: str | None) -> Conversation:
+    return Conversation(
+        id="conv_child",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_parent",
+        parent_conversation_id="conv_parent",
+        agent_id="ag_advisor",
+        kind="sub_agent" if sub_agent_name else "default",
+        sub_agent_name=sub_agent_name,
+    )
+
+
+def test_resolve_harness_resolves_nested_grandchild_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A grandchild head resolves its own harness via the full-tree search.
+
+    The pre-existing direct-children-only lookup missed a nested sub-agent
+    and fell back to the brain harness; the full-tree resolver finds it.
+    """
+    _patch_harness_stores(monkeypatch, _harness_spec_tree())
+
+    assert _resolve_harness(_conv_for_subagent("executor")) == "codex"
+
+
+def test_resolve_harness_falls_back_to_brain_for_unknown_subagent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolvable sub-agent name keeps the brain harness (safe fallback)."""
+    _patch_harness_stores(monkeypatch, _harness_spec_tree())
+
+    assert _resolve_harness(_conv_for_subagent("does-not-exist")) == "claude-sdk"
+
+
+def test_resolve_harness_top_level_session_uses_brain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A top-level session (no sub_agent_name) reports the brain harness."""
+    _patch_harness_stores(monkeypatch, _harness_spec_tree())
+
+    assert _resolve_harness(_conv_for_subagent(None)) == "claude-sdk"
