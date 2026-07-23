@@ -56,6 +56,18 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
   });
 });
 
+describe("artifact surface wiring (src/main.js)", () => {
+  it("registers sync, destroy, and inspect IPC handlers", () => {
+    assert.match(liveCode, /omnigent:artifact-surface-sync/);
+    assert.match(liveCode, /omnigent:artifact-surface-destroy/);
+    assert.match(liveCode, /omnigent:artifact-surface-inspect/);
+    assert.match(
+      liveCode,
+      /win\.on\("close"[\s\S]{0,120}artifactSurfaceManager\.destroyWindow\(win\)/,
+    );
+  });
+});
+
 // Wiring guards for the window-open policy (src/popupPolicy.js decides,
 // main.js enforces; policy behavior is unit-tested in popupPolicy.test.js).
 // Losing any of these silently reopens the chromeless-credential-window

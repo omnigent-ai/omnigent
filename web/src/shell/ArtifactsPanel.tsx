@@ -1,5 +1,5 @@
-import { FileCode2Icon, Loader2Icon, RefreshCwIcon } from "lucide-react";
-import { useMemo } from "react";
+import { FileCode2Icon, Loader2Icon, RefreshCwIcon, ScanSearchIcon } from "lucide-react";
+import { useId, useMemo, useState } from "react";
 import { useArtifactPreview } from "@/hooks/useArtifactPreview";
 import { useManagedArtifacts } from "@/hooks/useManagedArtifacts";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -11,14 +11,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { ArtifactPreviewSurface } from "./ArtifactPreviewSurface";
+import { hasNativeArtifactInspector, inspectNativeArtifactSurface } from "@/lib/nativeBridge";
 
 export interface ArtifactEntry {
   entryPath: string;
   title: string;
   modifiedAt: number | null;
 }
-
-const ARTIFACT_PREVIEW_SANDBOX = "allow-scripts allow-same-origin";
 
 function titleFromSlug(slug: string): string {
   return slug
@@ -59,6 +59,19 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
   const entries = useMemo(() => artifactEntriesFromFiles(query.data ?? []), [query.data]);
   const selected = entries.find((entry) => entry.entryPath === selectedPath) ?? null;
   const preview = useArtifactPreview(conversationId, selected?.entryPath ?? null);
+  const [selectorOpen, setSelectorOpen] = useState(false);
+  const [inspecting, setInspecting] = useState(false);
+  const artifactSurfaceId = `artifact-surface-${useId()}`;
+  const canInspect = hasNativeArtifactInspector();
+
+  const inspectArtifact = async () => {
+    setInspecting(true);
+    try {
+      await inspectNativeArtifactSurface(artifactSurfaceId);
+    } finally {
+      setInspecting(false);
+    }
+  };
 
   if (query.isLoading) {
     return (
@@ -99,7 +112,7 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex shrink-0 items-center border-b border-border px-2 py-1.5">
-        <Select value={selected?.entryPath} onValueChange={onSelect}>
+        <Select value={selected?.entryPath} onValueChange={onSelect} onOpenChange={setSelectorOpen}>
           <SelectTrigger
             aria-label="Select artifact"
             className="h-8 min-w-0 flex-1 justify-start border-0 bg-transparent px-2 shadow-none hover:bg-muted *:data-[slot=select-value]:flex-1 *:data-[slot=select-value]:text-left dark:bg-transparent dark:hover:bg-muted"
@@ -115,6 +128,23 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
             ))}
           </SelectContent>
         </Select>
+        {canInspect && selected !== null && preview.data !== undefined ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Inspect artifact element"
+            title="Inspect artifact element"
+            disabled={inspecting}
+            onClick={() => void inspectArtifact()}
+          >
+            {inspecting ? (
+              <Loader2Icon className="size-4 animate-spin" />
+            ) : (
+              <ScanSearchIcon className="size-4" />
+            )}
+          </Button>
+        ) : null}
       </div>
       {selected === null ? (
         <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">
@@ -139,11 +169,11 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
               </Button>
             </div>
           ) : (
-            <iframe
-              title={`${selected.title} preview`}
-              src={preview.data.url}
-              sandbox={ARTIFACT_PREVIEW_SANDBOX}
-              className="h-full w-full border-0 bg-white"
+            <ArtifactPreviewSurface
+              surfaceId={artifactSurfaceId}
+              title={selected.title}
+              url={preview.data.url}
+              visible={!selectorOpen}
             />
           )}
         </div>
