@@ -968,6 +968,37 @@ async def test_route_session_harness_excludes_incompatible_models_from_pi() -> N
 
 
 @pytest.mark.asyncio
+async def test_route_session_harness_redirects_incompatible_router_pick() -> None:
+    """A router that ignores our candidate set and picks pi+gpt-5.5 is redirected.
+
+    Some external routers return a (harness, model) pair we excluded. The
+    verdict post-processing must redirect gpt-5.5 off pi to codex.
+    """
+    # Router returns pi + gpt-5-5 (an excluded, incompatible pair).
+    expected = RoutingResult(
+        model="databricks-gpt-5-5", rationale="picked despite exclusion", harness="pi"
+    )
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict, error = await route_session_harness("do something")
+    assert harness == "codex", f"gpt-5.5 on pi should redirect to codex, got {harness!r}"
+    assert model == "databricks-gpt-5-5"
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_redirects_claude_on_pi_to_claude_sdk() -> None:
+    """A router pick of a Claude model on pi is redirected to claude-sdk."""
+    expected = RoutingResult(model="databricks-claude-haiku-4-5", rationale="cheap", harness="pi")
+    caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict, error = await route_session_harness("quick q")
+    assert harness == "claude-sdk", f"claude on pi should redirect to claude-sdk, got {harness!r}"
+    assert model == "databricks-claude-haiku-4-5"
+    assert error is None
+
+
+@pytest.mark.asyncio
 async def test_route_session_harness_falls_back_by_model_when_harness_absent() -> None:
     """When the router returns no harness, fall back to finding it by model."""
     expected = RoutingResult(

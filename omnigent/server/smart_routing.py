@@ -549,6 +549,36 @@ def _filter_excluded_models(harness: str, models: list[str]) -> list[str]:
     return [m for m in models if m not in excluded]
 
 
+def _redirect_incompatible_pick(harness: str | None, model: str) -> str | None:
+    """Redirect a router verdict off a harness that can't serve *model*.
+
+    Some external routers ignore the candidate set we send and return a
+    ``(harness, model)`` pair we deliberately excluded (see
+    :data:`_HARNESS_EXCLUDED_MODELS`). Since we can't stop the router from
+    choosing it, redirect the pick to a harness that CAN serve the model:
+
+    - a Claude model on pi → ``claude-sdk``
+    - a gpt-5.5/5.6 reasoning model on pi → ``codex`` (Responses API)
+
+    :param harness: The router's chosen harness id (may be ``None``).
+    :param model: The router's chosen model id.
+    :returns: A replacement harness id, or the original *harness* when the
+        pick is already compatible.
+    """
+    if harness is None:
+        return None
+    excluded = _HARNESS_EXCLUDED_MODELS.get(harness, ())
+    if model not in excluded:
+        return harness
+    lower = model.lower()
+    if "claude" in lower:
+        return "claude-sdk"
+    if "gpt" in lower:
+        return "codex"
+    # Unknown family on an excluding harness — leave as-is rather than guess.
+    return harness
+
+
 async def route_session_harness(
     user_message: str,
     *,
@@ -641,6 +671,20 @@ async def route_session_harness(
             if result.model in models:
                 chosen_harness = h
                 break
+
+    # Redirect an incompatible (harness, model) pick the router may have
+    # returned despite our filtered candidate set (some external routers
+    # ignore it): a Claude model or gpt-5.5+ reasoning model on pi is
+    # redirected to claude-sdk / codex respectively.
+    _redirected = _redirect_incompatible_pick(chosen_harness, result.model)
+    if _redirected != chosen_harness:
+        _logger.info(
+            "smart_routing: redirecting incompatible pick harness=%s model=%s -> harness=%s",
+            chosen_harness,
+            result.model,
+            _redirected,
+        )
+        chosen_harness = _redirected
 
     _logger.info(
         "smart_routing: auto-harness harness=%s model=%s rationale=%s",
