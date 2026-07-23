@@ -551,9 +551,15 @@ def test_kiro_base_model_options_shape_and_default() -> None:
     options = kiro_base_model_options()
     ids = [o["id"] for o in options]
 
-    # Canonical ids confirmed against ``kiro-cli --list-models`` (2.10.0).
+    # Canonical ids confirmed against ``kiro-cli --list-models`` (2.14.0).
     assert ids[0] == "auto"
     assert "claude-haiku-4.5" in ids and "glm-5" in ids
+    # Regression coverage: these shipped after the picker was last refreshed and
+    # were silently missing from the Web UI picker despite being valid
+    # ``kiro-cli --model`` ids (reachable only by typing the id at the terminal).
+    assert "claude-opus-4.8" in ids
+    assert "claude-sonnet-5" in ids
+    assert "gpt-5.6-sol" in ids
     # Exactly one default, and every option carries the picker fields.
     assert [o["id"] for o in options if o["isDefault"]] == ["auto"]
     for option in options:
