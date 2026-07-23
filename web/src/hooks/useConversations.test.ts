@@ -951,7 +951,10 @@ describe("useMoveToProject", () => {
     const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_move");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({ project_id: "p_sprint" });
+    expect(JSON.parse(init.body as string)).toEqual({
+      project_id: "p_sprint",
+      labels: { omni_project: "" },
+    });
   });
 
   it("creates the project on demand when the name has no first-class row", async () => {
@@ -985,7 +988,10 @@ describe("useMoveToProject", () => {
     expect(JSON.parse(createInit.body as string)).toEqual({ name: "Fresh" });
     const [patchUrl, patchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
     expect(patchUrl).toBe("/v1/sessions/conv_move");
-    expect(JSON.parse(patchInit.body as string)).toEqual({ project_id: "p_new" });
+    expect(JSON.parse(patchInit.body as string)).toEqual({
+      project_id: "p_new",
+      labels: { omni_project: "" },
+    });
   });
 
   it("unfiles with project_id='' (no id resolution) and invalidates the lists", async () => {
@@ -1011,7 +1017,10 @@ describe("useMoveToProject", () => {
 
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_move");
-    expect(JSON.parse(init.body as string)).toEqual({ project_id: "" });
+    expect(JSON.parse(init.body as string)).toEqual({
+      project_id: "",
+      labels: { omni_project: "" },
+    });
 
     // Both keys must refresh: conversations so the row re-groups into its new
     // section, projects so the sidebar list updates.

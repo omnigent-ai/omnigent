@@ -842,12 +842,25 @@ export function useArchivedProjectNames() {
  * Resolve a project NAME to its first-class id, creating the `projects` row on
  * demand when only a legacy label-project of that name exists (or nothing does).
  * This is how filing/renaming a label-only folder promotes it to first-class.
+ *
+ * Create-on-demand races: two concurrent moves to the same new name can both
+ * see no existing project and both POST; the second gets a 409. Treat that as
+ * benign — re-list and return the id the winner created.
  */
 async function resolveOrCreateProjectId(name: string): Promise<string> {
   const projects = await apiListProjects();
   const existing = projects.find((p) => p.name === name);
   if (existing) return existing.id;
-  return (await apiCreateProject(name)).id;
+  try {
+    return (await apiCreateProject(name)).id;
+  } catch {
+    // Lost the create race (or a transient failure) — re-list and use the
+    // now-existing row; only rethrow if it still isn't there.
+    const after = await apiListProjects();
+    const created = after.find((p) => p.name === name);
+    if (created) return created.id;
+    throw new Error(`Could not resolve or create project "${name}"`);
+  }
 }
 
 /**
@@ -856,6 +869,12 @@ async function resolveOrCreateProjectId(name: string): Promise<string> {
  * non-empty name is resolved to its project id (creating the row on demand for
  * a label-only folder); `""` clears membership. Exported for the new-session
  * flow, which files a freshly created session under the picked project name.
+ *
+ * The legacy `omni_project` label is cleared in the same PATCH: during the
+ * dual-read transition the sidebar groups a folder by `project_id` OR that
+ * label, so leaving a stale label would keep the session in its old
+ * label-folder (and make it match two folders at once). First-class
+ * `project_id` is the single source of truth after a move.
  */
 export async function moveConversationToProject(
   id: string,
@@ -866,7 +885,8 @@ export async function moveConversationToProject(
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     // "" clears membership (unfile); a non-empty id files into that project.
-    body: JSON.stringify({ project_id: projectId }),
+    // Clear the legacy label either way so the two representations don't diverge.
+    body: JSON.stringify({ project_id: projectId, labels: { [PROJECT_LABEL_KEY]: "" } }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
@@ -1089,12 +1109,16 @@ export function useCreateProject() {
 }
 
 /**
- * Rename a project. First-class projects rename in O(1) via
- * `PATCH /v1/projects/{id}` (members reference the id, not the name). A
- * label-only folder (`id === null`) has no row to rename, so it is promoted to
- * first-class on demand — created under the new name — then its member
- * sessions are re-filed onto the new id and their stale `omni_project` label is
- * cleared. Members are swept via the dual-read `?project=<oldName>`.
+ * Rename a project. A first-class project renames its row via
+ * `PATCH /v1/projects/{id}`; a label-only folder (`id === null`) is promoted on
+ * demand — a row created under the new name.
+ *
+ * Either way, the folder's members are swept via the dual-read
+ * `?project=<oldName>` and re-filed onto the target `project_id` with their
+ * legacy `omni_project` label cleared. That keeps the rename coherent across
+ * both membership representations during the transition: a first-class row's
+ * members that were still matched by the legacy label don't get stranded in an
+ * `oldName` folder, and nothing ends up matching two folders at once.
  */
 export function useRenameProject() {
   const queryClient = useQueryClient();
@@ -1108,12 +1132,20 @@ export function useRenameProject() {
       oldName: string;
       newName: string;
     }) => {
+      // The target project id: rename the existing row (first-class), or
+      // create one on demand (label-only folder being promoted).
+      let projectId: string;
       if (id !== null) {
         await apiRenameProject(id, newName);
-        return;
+        projectId = id;
+      } else {
+        projectId = (await apiCreateProject(newName)).id;
       }
-      // Label-only → promote: create the row, migrate members onto it.
-      const created = await apiCreateProject(newName);
+      // Reconcile the folder's members either way. During the dual-read
+      // transition a member can still sit in the oldName folder via the legacy
+      // omni_project label; re-file each onto project_id and clear that label so
+      // the rename is coherent for both membership representations and nothing
+      // is left behind in an oldName folder.
       const memberIds = await fetchAllProjectSessionIds(oldName);
       await Promise.all(
         memberIds.map(async (sid) => {
@@ -1121,12 +1153,12 @@ export function useRenameProject() {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              project_id: created.id,
+              project_id: projectId,
               labels: { [PROJECT_LABEL_KEY]: "" },
             }),
           });
           // Surface a failed re-file: a resolved-but-4xx/5xx response would
-          // otherwise report success while leaving members unfiled.
+          // otherwise report success while leaving members behind.
           if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         }),
       );

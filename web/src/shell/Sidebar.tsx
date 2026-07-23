@@ -5,7 +5,9 @@ import {
   type MouseEvent,
   type ReactNode,
   type RefObject,
+  createContext,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -169,6 +171,12 @@ const TIME_MARKER_SLOT_CLASS =
 // gentler gray in light mode (a gentler glow in dark mode) and reads as "active
 // area" without the heavy fill. Pair with `transition-colors` so it eases in.
 const DROP_TARGET_HIGHLIGHT = "bg-primary/5";
+
+// Maps a first-class project id → its name, provided once at the list level so
+// each row resolves its ``project_id`` to a folder name without its own
+// ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
+// a query observer per row (which would also re-run on every project mutation).
+const ProjectNamesContext = createContext<Map<string, string>>(new Map());
 
 /**
  * Which session tab the sidebar is showing. ``"mine"`` is the viewer's own
@@ -990,6 +998,16 @@ function ConversationList({
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
 
+  // id → name for the rows' project_id lookup, built once here and shared via
+  // context so a row doesn't subscribe to useProjects() itself.
+  const projectNamesById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of projects) {
+      if (p.id !== null) map.set(p.id, p.name);
+    }
+    return map;
+  }, [projects]);
+
   // Each ProjectFolder registers its actually-rendered conversation IDs here
   // (synchronously during render) so shift-select ranges use the real rendered
   // order, not the global paginated list which can diverge.
@@ -1415,217 +1433,219 @@ function ConversationList({
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
   return (
-    <DndContext
-      sensors={sensors}
-      collisionDetection={pointerWithin}
-      // Always-measure so the transient "remove from project" zone (mounted at
-      // drag start) is registered as a drop target without a stale layout cache.
-      measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
-      onDragStart={handleDragStart}
-      onDragEnd={handleDragEnd}
-      onDragCancel={() => setActiveDrag(null)}
-    >
-      <div className="flex flex-col gap-3">
-        {/* Removing a filed session from its project means dropping it back
+    <ProjectNamesContext.Provider value={projectNamesById}>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={pointerWithin}
+        // Always-measure so the transient "remove from project" zone (mounted at
+        // drag start) is registered as a drop target without a stale layout cache.
+        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+        onDragStart={handleDragStart}
+        onDragEnd={handleDragEnd}
+        onDragCancel={() => setActiveDrag(null)}
+      >
+        <div className="flex flex-col gap-3">
+          {/* Removing a filed session from its project means dropping it back
             onto the flat "Chats" list — so the Chats section itself is the
             ungroup target (wrapped below). This top strip is only a FALLBACK
             for when there are no ungrouped chats yet, so the Chats section
             isn't rendered and there'd otherwise be nowhere to drop. */}
-        {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
-          <UngroupDropZone />
-        )}
-        {totalVisible === 0 ? (
-          <>
-            <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
-            {/* The list is one paginated stream ordered by updated_at across
+          {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
+            <UngroupDropZone />
+          )}
+          {totalVisible === 0 ? (
+            <>
+              <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
+              {/* The list is one paginated stream ordered by updated_at across
               owned + shared sessions, so the current tab can be empty on the
               loaded window while its sessions live on a later page. Keep the
               sentinel mounted so pagination continues instead of stranding the
               user on a false "empty" state. */}
-            {hasMorePages && (
-              <InfiniteScrollSentinel
-                hasMore={hasMorePages}
-                isFetching={isFetchingNextPage}
-                fetchMore={fetchNextPage}
-                scrollRoot={scrollContainerRef}
-              />
-            )}
-          </>
-        ) : (
-          <>
-            {sections.pinned.length > 0 && (
-              // Drop a session here to pin it — pin-precedence then floats it
-              // out of any project into this section. Active only while dragging
-              // an unpinned session; outline-only highlight.
-              <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
-                <ConversationSection
-                  title="Pinned"
-                  conversations={sections.pinned}
-                  pinnedConversationIds={pinnedConversationIds}
-                  collapsed={effectiveCollapsedSections.includes("Pinned")}
-                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
-                  onRowClick={onRowClick}
-                  onTogglePinned={onTogglePinned}
-                  selectionMode={selectionMode}
-                  selectedIds={selectedIds}
-                  onToggleSelected={onToggleSelected}
-                  onProjectAssigned={expandProject}
+              {hasMorePages && (
+                <InfiniteScrollSentinel
+                  hasMore={hasMorePages}
+                  isFetching={isFetchingNextPage}
+                  fetchMore={fetchNextPage}
+                  scrollRoot={scrollContainerRef}
                 />
-              </PinDropZone>
-            )}
-            {/* Projects: a "Projects" group header, with each project rendered as
-              a collapsible folder row nested beneath it. Folders default
-              collapsed; an empty folder shows "No sessions". The folder icon marks
-              a project row; the group/section headers carry no icon or count.
-              Shown on the "mine" tab even with zero projects, so "New project"
-              (create-empty) is discoverable — projects are a My-sessions tool. */}
-            {activeTab !== "shared" && (
-              <SectionGroup
-                title="Projects"
-                collapsed={effectiveCollapsedSections.includes("Projects")}
-                onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
-                headerAction={(() => {
-                  const allNames = sections.projectGroups.map((g) => g.name);
-                  // "New project" is always available (even when collapsed) so
-                  // the create-empty flow is reachable; the expand/revert control
-                  // is only meaningful when there are folders and the group is open.
-                  const showExpandControls =
-                    !effectiveCollapsedSections.includes("Projects") && allNames.length > 0;
-                  // Once every folder is open the only useful move is to undo it,
-                  // so the control flips to "revert" — which restores the set open
-                  // before "Expand all", or collapses everything when there's no
-                  // real last state (folders opened by hand). Otherwise it expands.
-                  const allExpanded =
-                    allNames.length > 0 && allNames.every((n) => expandedProjects.includes(n));
-                  return (
-                    <div className="flex items-center">
-                      {showExpandControls &&
-                        (allExpanded ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-sm"
-                                aria-label="Collapse to previous"
-                                data-testid="revert-projects"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  revertProjects();
-                                }}
-                              >
-                                <Minimize2Icon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Collapse to previous</TooltipContent>
-                          </Tooltip>
-                        ) : (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-sm"
-                                aria-label="Expand all"
-                                data-testid="expand-all-projects"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  expandAllProjects(allNames);
-                                }}
-                              >
-                                <Maximize2Icon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Expand all</TooltipContent>
-                          </Tooltip>
-                        ))}
-                      <NewProjectButton onCreated={expandProject} />
-                    </div>
-                  );
-                })()}
-              >
-                {sections.projectGroups.map((group) => (
-                  <ProjectFolder
-                    key={group.name}
-                    name={group.name}
-                    projectId={group.id}
-                    expanded={expandedProjects.includes(group.name)}
-                    // Best-effort marker from the globally-loaded window: a
-                    // collapsed folder hasn't fetched its own sessions yet.
-                    marker={projectMarkerState(group.conversations)}
-                    onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+              )}
+            </>
+          ) : (
+            <>
+              {sections.pinned.length > 0 && (
+                // Drop a session here to pin it — pin-precedence then floats it
+                // out of any project into this section. Active only while dragging
+                // an unpinned session; outline-only highlight.
+                <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
+                  <ConversationSection
+                    title="Pinned"
+                    conversations={sections.pinned}
                     pinnedConversationIds={pinnedConversationIds}
-                    activeOverride={activeOverride}
-                    scrollRoot={scrollContainerRef}
+                    collapsed={effectiveCollapsedSections.includes("Pinned")}
+                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
                     onRowClick={onRowClick}
                     onTogglePinned={onTogglePinned}
                     selectionMode={selectionMode}
                     selectedIds={selectedIds}
                     onToggleSelected={onToggleSelected}
                     onProjectAssigned={expandProject}
-                    projectRenderedIdsRef={projectRenderedIdsRef}
                   />
-                ))}
-                {sections.projectGroups.length === 0 &&
-                  !effectiveCollapsedSections.includes("Projects") && (
-                    <p className="px-3 py-1.5 text-xs text-muted-foreground">
-                      No projects yet. Create one to group your sessions.
-                    </p>
-                  )}
-              </SectionGroup>
-            )}
-            {sections.sessions.length > 0 && (
-              // Drop a session here to send it to the flat "Chats" list — where
-              // unfiled, unpinned sessions live. Active while dragging a filed
-              // session (removes it from its project) or a pinned one (unpins
-              // it), since both have somewhere to land here.
-              <ChatsDropZone
-                active={activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)}
-              >
-                <ConversationSection
-                  title="Sessions"
-                  conversations={sections.sessions}
-                  pinnedConversationIds={pinnedConversationIds}
-                  collapsed={effectiveCollapsedSections.includes("Chats")}
-                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
-                  onRowClick={onRowClick}
-                  onTogglePinned={onTogglePinned}
-                  selectionMode={selectionMode}
-                  selectedIds={selectedIds}
-                  onToggleSelected={onToggleSelected}
-                  onProjectAssigned={expandProject}
-                />
-              </ChatsDropZone>
-            )}
-            {/* Both tabs render this same Pinned / Projects / Sessions tree;
+                </PinDropZone>
+              )}
+              {/* Projects: a "Projects" group header, with each project rendered as
+              a collapsible folder row nested beneath it. Folders default
+              collapsed; an empty folder shows "No sessions". The folder icon marks
+              a project row; the group/section headers carry no icon or count.
+              Shown on the "mine" tab even with zero projects, so "New project"
+              (create-empty) is discoverable — projects are a My-sessions tool. */}
+              {activeTab !== "shared" && (
+                <SectionGroup
+                  title="Projects"
+                  collapsed={effectiveCollapsedSections.includes("Projects")}
+                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Projects")}
+                  headerAction={(() => {
+                    const allNames = sections.projectGroups.map((g) => g.name);
+                    // "New project" is always available (even when collapsed) so
+                    // the create-empty flow is reachable; the expand/revert control
+                    // is only meaningful when there are folders and the group is open.
+                    const showExpandControls =
+                      !effectiveCollapsedSections.includes("Projects") && allNames.length > 0;
+                    // Once every folder is open the only useful move is to undo it,
+                    // so the control flips to "revert" — which restores the set open
+                    // before "Expand all", or collapses everything when there's no
+                    // real last state (folders opened by hand). Otherwise it expands.
+                    const allExpanded =
+                      allNames.length > 0 && allNames.every((n) => expandedProjects.includes(n));
+                    return (
+                      <div className="flex items-center">
+                        {showExpandControls &&
+                          (allExpanded ? (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  aria-label="Collapse to previous"
+                                  data-testid="revert-projects"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    revertProjects();
+                                  }}
+                                >
+                                  <Minimize2Icon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Collapse to previous</TooltipContent>
+                            </Tooltip>
+                          ) : (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  aria-label="Expand all"
+                                  data-testid="expand-all-projects"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    expandAllProjects(allNames);
+                                  }}
+                                >
+                                  <Maximize2Icon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Expand all</TooltipContent>
+                            </Tooltip>
+                          ))}
+                        <NewProjectButton onCreated={expandProject} />
+                      </div>
+                    );
+                  })()}
+                >
+                  {sections.projectGroups.map((group) => (
+                    <ProjectFolder
+                      key={group.name}
+                      name={group.name}
+                      projectId={group.id}
+                      expanded={expandedProjects.includes(group.name)}
+                      // Best-effort marker from the globally-loaded window: a
+                      // collapsed folder hasn't fetched its own sessions yet.
+                      marker={projectMarkerState(group.conversations)}
+                      onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                      pinnedConversationIds={pinnedConversationIds}
+                      activeOverride={activeOverride}
+                      scrollRoot={scrollContainerRef}
+                      onRowClick={onRowClick}
+                      onTogglePinned={onTogglePinned}
+                      selectionMode={selectionMode}
+                      selectedIds={selectedIds}
+                      onToggleSelected={onToggleSelected}
+                      onProjectAssigned={expandProject}
+                      projectRenderedIdsRef={projectRenderedIdsRef}
+                    />
+                  ))}
+                  {sections.projectGroups.length === 0 &&
+                    !effectiveCollapsedSections.includes("Projects") && (
+                      <p className="px-3 py-1.5 text-xs text-muted-foreground">
+                        No projects yet. Create one to group your sessions.
+                      </p>
+                    )}
+                </SectionGroup>
+              )}
+              {sections.sessions.length > 0 && (
+                // Drop a session here to send it to the flat "Chats" list — where
+                // unfiled, unpinned sessions live. Active while dragging a filed
+                // session (removes it from its project) or a pinned one (unpins
+                // it), since both have somewhere to land here.
+                <ChatsDropZone
+                  active={activeDrag != null && (activeDrag.project != null || activeDrag.isPinned)}
+                >
+                  <ConversationSection
+                    title="Sessions"
+                    conversations={sections.sessions}
+                    pinnedConversationIds={pinnedConversationIds}
+                    collapsed={effectiveCollapsedSections.includes("Chats")}
+                    onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
+                    onRowClick={onRowClick}
+                    onTogglePinned={onTogglePinned}
+                    selectionMode={selectionMode}
+                    selectedIds={selectedIds}
+                    onToggleSelected={onToggleSelected}
+                    onProjectAssigned={expandProject}
+                  />
+                </ChatsDropZone>
+              )}
+              {/* Both tabs render this same Pinned / Projects / Sessions tree;
               `sections` is scoped to the active tab's conversations (owned vs.
               shared), and Projects is empty on the Shared tab. */}
-            {/* Archived sessions are no longer listed here — they live on the
+              {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-            {/* Infinite-scroll sentinel for the global list. Pagination extends
+              {/* Infinite-scroll sentinel for the global list. Pagination extends
               the Chats list, so it hides with a collapsed Chats group — a loader
               under a collapsed group reads orphaned. */}
-            {!effectiveCollapsedSections.includes("Chats") && (
-              <InfiniteScrollSentinel
-                hasMore={hasMorePages}
-                isFetching={isFetchingNextPage}
-                fetchMore={fetchNextPage}
-                scrollRoot={scrollContainerRef}
-              />
-            )}
-          </>
-        )}
-      </div>
-      {/* The dragged row's preview follows the pointer (rendered in a portal),
+              {!effectiveCollapsedSections.includes("Chats") && (
+                <InfiniteScrollSentinel
+                  hasMore={hasMorePages}
+                  isFetching={isFetchingNextPage}
+                  fetchMore={fetchNextPage}
+                  scrollRoot={scrollContainerRef}
+                />
+              )}
+            </>
+          )}
+        </div>
+        {/* The dragged row's preview follows the pointer (rendered in a portal),
           a compact card showing the session's title. */}
-      <DragOverlay dropAnimation={null}>
-        {activeDrag ? (
-          <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-sm shadow-lg">
-            {activeDrag.label}
-          </div>
-        ) : null}
-      </DragOverlay>
-    </DndContext>
+        <DragOverlay dropAnimation={null}>
+          {activeDrag ? (
+            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-sm shadow-lg">
+              {activeDrag.label}
+            </div>
+          ) : null}
+        </DragOverlay>
+      </DndContext>
+    </ProjectNamesContext.Provider>
   );
 }
 
@@ -2436,12 +2456,11 @@ function ConversationRow({
   // The session's current project NAME, or null when unfiled — drives the
   // kebab submenu label ("Add to project" vs "Move session") and the pinned
   // flyout. Dual-read: prefer the first-class membership (project_id → name via
-  // the cached project list), falling back to the legacy omni_project label.
-  const { data: projectList = [] } = useProjects();
+  // the list-level map from context — no per-row query), falling back to the
+  // legacy omni_project label.
+  const projectNamesById = useContext(ProjectNamesContext);
   const firstClassProjectName =
-    conversation.project_id != null
-      ? projectList.find((p) => p.id === conversation.project_id)?.name
-      : undefined;
+    conversation.project_id != null ? projectNamesById.get(conversation.project_id) : undefined;
   const currentProject = firstClassProjectName ?? conversation.labels?.[PROJECT_LABEL_KEY] ?? null;
   // Pinned sessions are lifted OUT of their project folder into the flat
   // "Pinned" section, so the row no longer shows which project it belongs to.
