@@ -2317,6 +2317,8 @@ async def terminate_managed_host(
     host: Host,
     host_store: HostStore,
     config: ManagedSandboxConfig | None,
+    *,
+    delete_host_row: bool = True,
 ) -> None:
     """
     Terminate a managed host's sandbox and delete its host row.
@@ -2335,10 +2337,14 @@ async def terminate_managed_host(
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
+    :param delete_host_row: Whether to delete the host row after provider
+        termination. Set to ``False`` when the caller already claimed and
+        removed the row transactionally.
     """
     launcher = _launcher_for_teardown(host, config)
     await _terminate_sandbox_best_effort(launcher, host)
-    await asyncio.to_thread(host_store.delete_host, host.host_id)
+    if delete_host_row:
+        await asyncio.to_thread(host_store.delete_host, host.host_id)
 
 
 async def _terminate_sandbox_best_effort(

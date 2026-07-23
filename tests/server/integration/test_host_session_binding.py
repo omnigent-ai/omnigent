@@ -492,6 +492,127 @@ async def test_managed_session_create_end_to_end(
     del tunnels
 
 
+async def test_managed_sessions_have_distinct_sandboxes_and_independent_teardown(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two top-level sessions never share lifecycle-owned managed compute."""
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+    agent = await create_test_agent(env.client, name="managed-isolation")
+
+    created_ids: list[str] = []
+    bound: list[Conversation] = []
+    for _ in range(2):
+        response = await env.client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "host_type": "managed"},
+        )
+        assert response.status_code == 201, response.text
+        session_id = response.json()["id"]
+        created_ids.append(session_id)
+        bound.append(await _wait_for_managed_binding(env, session_id))
+
+    tunnels = [await future for future in host_futures]
+    first, second = bound
+    assert first.host_id is not None
+    assert second.host_id is not None
+    assert first.host_id != second.host_id
+    first_host = env.host_store.get_host(first.host_id)
+    second_host = env.host_store.get_host(second.host_id)
+    assert first_host is not None and first_host.sandbox_id == "sb-fake-1"
+    assert second_host is not None and second_host.sandbox_id == "sb-fake-2"
+
+    first_delete = await env.client.delete(f"/v1/sessions/{created_ids[0]}")
+    assert first_delete.status_code == 200, first_delete.text
+    assert fake.terminated == ["sb-fake-1"]
+    assert env.host_store.get_host(first.host_id) is None
+    assert env.host_store.get_host(second.host_id) is not None
+    assert env.conv_store.get_conversation(created_ids[1]) is not None
+
+    second_delete = await env.client.delete(f"/v1/sessions/{created_ids[1]}")
+    assert second_delete.status_code == 200, second_delete.text
+    assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
+    assert env.host_store.get_host(second.host_id) is None
+    del tunnels
+
+
+async def test_deleting_one_session_never_terminates_a_still_referenced_managed_sandbox(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed teardown is reference-safe across legacy/shared host bindings."""
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+    agent = await create_test_agent(env.client, name="managed-reference-guard")
+    created = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert created.status_code == 201, created.text
+    owner_id = created.json()["id"]
+    owner = await _wait_for_managed_binding(env, owner_id)
+    tunnel = await host_futures[0]
+    assert owner.host_id is not None
+
+    # Model a surviving legacy/manual binding. New managed-session creates
+    # never share a host, but teardown must fail safe if historical data or an
+    # operator migration produced this shape.
+    survivor = env.conv_store.create_conversation(
+        agent_id=agent["id"],
+        host_id=owner.host_id,
+        workspace=owner.workspace,
+    )
+
+    first_delete = await env.client.delete(f"/v1/sessions/{owner_id}")
+    assert first_delete.status_code == 200, first_delete.text
+    assert fake.terminated == []
+    assert env.host_store.get_host(owner.host_id) is not None
+    surviving_row = env.conv_store.get_conversation(survivor.id)
+    assert surviving_row is not None and surviving_row.host_id == owner.host_id
+
+    # Once the final reference is deleted, the exact same sandbox is reaped.
+    final_delete = await env.client.delete(f"/v1/sessions/{survivor.id}")
+    assert final_delete.status_code == 200, final_delete.text
+    assert fake.terminated == ["sb-fake-1"]
+    assert env.host_store.get_host(owner.host_id) is None
+    del tunnel
+
+
 async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,

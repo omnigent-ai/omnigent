@@ -186,6 +186,7 @@ class HostStore:
         """
         self._engine: Engine = get_or_create_engine(storage_location)
         self._session = make_managed_session_maker(self._engine)
+        self._session_immediate = make_managed_session_maker(self._engine, immediate=True)
 
     def upsert_on_connect(
         self,
@@ -796,6 +797,49 @@ class HostStore:
                     SqlHost.host_id == host_id,
                 )
             )
+
+    def claim_unbound_managed_host_for_termination(self, host_id: str) -> Host | None:
+        """Remove and return a managed host only when no session references it.
+
+        The reference check and host-row deletion happen in one transaction.
+        Removing the row revokes its launch token before provider termination,
+        while a surviving reference leaves both the host and sandbox untouched.
+        Normal managed-session creation never shares hosts; this guard protects
+        historical, migrated, or manually bound data that does.
+
+        :param host_id: Managed host identifier.
+        :returns: A detached snapshot for provider-side termination when the
+            claim succeeded, or ``None`` when the host is absent, external, or
+            still referenced.
+        """
+        try:
+            with self._session_immediate() as session:
+                row = session.execute(
+                    select(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id == host_id,
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if row is None or row.sandbox_id is None:
+                    return None
+                surviving_reference = session.execute(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+                if surviving_reference is not None:
+                    return None
+                claimed = _row_to_host(row)
+                session.delete(row)
+                return claimed
+        except IntegrityError:
+            # Fail closed if a database invariant prevents the claim.
+            return None
 
     def revoke_launch_token(self, host_id: str) -> None:
         """

@@ -2008,6 +2008,31 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     )
 
 
+async def test_terminate_managed_host_can_skip_an_already_claimed_row(db_uri: str) -> None:
+    """Reference-safe callers can run the provider side effect without a second delete."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="f4020e77f35477cb7030f648722544db",
+        name="managed-term-claimed",
+        user_id=_OWNER,
+        token="tok-term-claimed",
+        provider="modal",
+        sandbox_id="sb-term-claimed",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    await terminate_managed_host(
+        host,
+        host_store,
+        _injected_config(fake),
+        delete_host_row=False,
+    )
+
+    assert fake.terminated == ["sb-term-claimed"]
+    assert host_store.get_host(host.host_id) is not None
+
+
 async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
