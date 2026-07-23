@@ -46,6 +46,7 @@ export function TasksPage() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
   const [manualOpen, setManualOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
   // Prefill for the manual create dialog when opened from a "Suggestions" chip.
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
   // stale prefill never leaks into a subsequent plain "New task" open.
@@ -53,17 +54,22 @@ export function TasksPage() {
 
   function openManual() {
     setPrefill(null);
+    setEditingTask(null);
     setManualOpen(true);
   }
 
   function openFromSuggestion(s: ScheduledTaskSuggestion) {
     setPrefill(s.prefill);
+    setEditingTask(null);
     setManualOpen(true);
   }
 
   function handleManualOpenChange(next: boolean) {
     setManualOpen(next);
-    if (!next) setPrefill(null);
+    if (!next) {
+      setPrefill(null);
+      setEditingTask(null);
+    }
   }
 
   const filtered = useMemo(() => {
@@ -110,6 +116,12 @@ export function TasksPage() {
 
   function handleDelete(task: ScheduledTask) {
     deleteMutation.mutate(task.id);
+  }
+
+  function handleEdit(task: ScheduledTask) {
+    setPrefill(null);
+    setEditingTask(task);
+    setManualOpen(true);
   }
 
   const hasAnyTasks = (tasks ?? []).length > 0;
@@ -198,6 +210,7 @@ export function TasksPage() {
               key={task.id}
               task={task}
               busy={busyId === task.id}
+              onEdit={handleEdit}
               onPauseToggle={handlePauseToggle}
               onDelete={handleDelete}
             />
@@ -218,6 +231,7 @@ export function TasksPage() {
         onOpenChange={handleManualOpenChange}
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
+        editingTask={editingTask}
       />
     </PageScroll>
   );

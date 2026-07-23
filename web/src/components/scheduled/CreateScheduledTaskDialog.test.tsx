@@ -20,7 +20,10 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
-vi.mock("@/hooks/useScheduledTasks", () => ({ useCreateScheduledTask: vi.fn() }));
+vi.mock("@/hooks/useScheduledTasks", () => ({
+  useCreateScheduledTask: vi.fn(),
+  useUpdateScheduledTask: vi.fn(),
+}));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   WorkspacePicker: ({ onNavigate }: { onNavigate?: (p: string) => void }) => (
@@ -134,9 +137,11 @@ const AGENTS: AvailableAgent[] = [
 ];
 
 const mutateAsync = vi.fn();
+const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
+  updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
     data: AGENTS,
   } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -147,12 +152,38 @@ beforeEach(() => {
     mutateAsync,
     isPending: false,
   } as unknown as ReturnType<typeof scheduledHooks.useCreateScheduledTask>);
+  vi.mocked(scheduledHooks.useUpdateScheduledTask).mockReturnValue({
+    mutateAsync: updateMutateAsync,
+    isPending: false,
+  } as unknown as ReturnType<typeof scheduledHooks.useUpdateScheduledTask>);
 });
 
 afterEach(() => cleanup());
 
 function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
   return render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+}
+
+function scheduledTask(overrides: Partial<import("@/lib/scheduledTasksApi").ScheduledTask> = {}) {
+  return {
+    id: "st_1",
+    name: "Morning brief",
+    prompt: "Summarize overnight activity",
+    rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=30",
+    ownerUserId: null,
+    agentId: "ag_1",
+    timezone: "America/Los_Angeles",
+    createdAt: 1,
+    updatedAt: 2,
+    modelOverride: null,
+    reasoningEffort: null,
+    workspace: null,
+    hostId: null,
+    state: "active",
+    lastRunAt: null,
+    lastRunConversationId: null,
+    ...overrides,
+  } satisfies import("@/lib/scheduledTasksApi").ScheduledTask;
 }
 
 describe("agent picker readiness (needs-setup badges)", () => {
@@ -239,6 +270,63 @@ describe("CreateScheduledTaskDialog prefill (seed-on-open + reset)", () => {
     rerender(<CreateScheduledTaskDialog open={false} onOpenChange={vi.fn()} />);
     rerender(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
     expect((screen.getByTestId("task-name-input") as HTMLInputElement).value).toBe("");
+  });
+});
+
+describe("CreateScheduledTaskDialog edit mode", () => {
+  it("seeds fields from the scheduled task and uses edit copy", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "ag_1" })}
+      />,
+    );
+    expect(screen.getByText("Edit scheduled task")).toBeInTheDocument();
+    expect(screen.getByText(/Update this recurring agent session/i)).toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toHaveTextContent("Update task");
+    expect((screen.getByTestId("task-name-input") as HTMLInputElement).value).toBe("Morning brief");
+    expect((screen.getByTestId("task-prompt-input") as HTMLTextAreaElement).value).toBe(
+      "Summarize overnight activity",
+    );
+    expect(screen.getByTestId("task-agent-readonly")).toHaveTextContent("Polly");
+    expect(screen.queryByTestId("agent-picker-stub")).not.toBeInTheDocument();
+    expect(screen.getByTestId("schedule-time")).toHaveTextContent("8:30 AM");
+  });
+
+  it("submits supported edits through the update mutation without changing agent defaults", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+    fireEvent.change(screen.getByTestId("task-name-input"), {
+      target: { value: "Updated brief" },
+    });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: "Updated prompt" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(updateMutateAsync.mock.calls[0][0]).toEqual({
+      id: "st_1",
+      input: {
+        name: "Updated brief",
+        prompt: "Updated prompt",
+        rrule: "FREQ=DAILY;BYHOUR=8;BYMINUTE=30",
+        timezone: "America/Los_Angeles",
+      },
+    });
+  });
+
+  it("blocks update when the existing RRULE cannot be represented by the form", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0" })}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
   });
 });
 

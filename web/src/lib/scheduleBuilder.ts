@@ -80,6 +80,42 @@ export function buildRRule(model: ScheduleModel): string {
   }
 }
 
+export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
+  const parts = parseRuleParts(rrule);
+  if (parts === null) return null;
+  const freq = parts.get("FREQ");
+  const interval = parts.get("INTERVAL");
+  if (interval !== undefined && interval !== "1") return null;
+
+  const hour = parseNumberPart(parts.get("BYHOUR"), 0, 23);
+  const minute = parseNumberPart(parts.get("BYMINUTE"), 0, 59);
+  if (minute === null || !isVisibleMinuteOption(minute)) return null;
+
+  if (freq === "HOURLY") {
+    if (hasUnsupportedParts(parts, ["FREQ", "INTERVAL", "BYMINUTE"])) return null;
+    return { ...DEFAULT_SCHEDULE_MODEL, preset: "hourly", minute };
+  }
+
+  if (hour === null) return null;
+
+  if (freq === "DAILY") {
+    if (hasUnsupportedParts(parts, ["FREQ", "INTERVAL", "BYHOUR", "BYMINUTE"])) return null;
+    return { ...DEFAULT_SCHEDULE_MODEL, preset: "daily", hour, minute };
+  }
+
+  if (freq === "WEEKLY") {
+    if (hasUnsupportedParts(parts, ["FREQ", "INTERVAL", "BYDAY", "BYHOUR", "BYMINUTE"])) {
+      return null;
+    }
+    const weekdays = parseWeekdaysPart(parts.get("BYDAY"));
+    if (weekdays === null || weekdays.length === 0) return null;
+    const preset = weekdays.join(",") === "MO,TU,WE,TH,FR" ? "weekdays" : "weekly";
+    return { ...DEFAULT_SCHEDULE_MODEL, preset, hour, minute, weekdays };
+  }
+
+  return null;
+}
+
 function buildCustomRRule(model: ScheduleModel): string {
   const { hour, minute } = model;
   const interval = clampInterval(model.interval);
@@ -105,6 +141,49 @@ function buildCustomRRule(model: ScheduleModel): string {
     default:
       return `FREQ=DAILY;INTERVAL=${interval};BYHOUR=${hour};BYMINUTE=${minute}`;
   }
+}
+
+function parseRuleParts(rrule: string): Map<string, string> | null {
+  const body = rrule.startsWith("RRULE:") ? rrule.slice("RRULE:".length) : rrule;
+  const parts = new Map<string, string>();
+  for (const segment of body.split(";")) {
+    const [rawKey, rawValue] = segment.split("=");
+    if (!rawKey || rawValue == null || rawValue === "") return null;
+    parts.set(rawKey.toUpperCase(), rawValue.toUpperCase());
+  }
+  return parts;
+}
+
+function hasUnsupportedParts(parts: Map<string, string>, supported: string[]): boolean {
+  const supportedSet = new Set(supported);
+  for (const key of parts.keys()) {
+    if (!supportedSet.has(key)) return true;
+  }
+  return false;
+}
+
+function parseNumberPart(value: string | undefined, min: number, max: number): number | null {
+  if (value == null) return null;
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) return null;
+  return parsed;
+}
+
+function parseWeekdaysPart(value: string | undefined): WeekdayCode[] | null {
+  if (value == null) return null;
+  const rawCodes = value.split(",");
+  if (rawCodes.length === 0) return null;
+  const codes: WeekdayCode[] = [];
+  for (const rawCode of rawCodes) {
+    if (!WEEKDAY_CODES.includes(rawCode as WeekdayCode)) return null;
+    codes.push(rawCode as WeekdayCode);
+  }
+  return normalizeWeekdays(codes);
+}
+
+function isVisibleMinuteOption(minute: number): boolean {
+  return minute === 0 || minute === 15 || minute === 30 || minute === 45;
 }
 
 /**
