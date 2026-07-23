@@ -699,6 +699,13 @@ class SqlProject(OmnigentBase):
     owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Default session settings as a compact JSON object (host/workspace/harness/
+    # model/reasoning_effort/git base-branch, …), or NULL for "no defaults". The
+    # keys are an opaque, client-owned vocabulary: the value is read and written
+    # whole with the row and never filtered in SQL, so new keys need no schema
+    # change. Stored values are hints the new-chat dialog pre-fills and the user
+    # can always override.
+    config: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, owner_user_id) with
