@@ -87,6 +87,26 @@ interface DesignArtifactCardProps {
 const PREVIEW_VIEWPORT_WIDTH = 1024;
 const PREVIEW_WELL_HEIGHT = 168;
 
+function HtmlTileIcon() {
+  return (
+    <svg
+      data-testid="design-artifact-html-icon"
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.7"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="16 18 22 12 16 6" />
+      <polyline points="8 6 2 12 8 18" />
+    </svg>
+  );
+}
+
 interface ArtifactPreviewWellProps {
   title: string;
   url?: string;
@@ -196,7 +216,7 @@ export function DesignArtifactCard({ data }: DesignArtifactCardProps) {
     >
       <div className="flex items-center gap-3 px-4 pb-3 pt-3.5">
         <span className="flex size-[34px] shrink-0 items-center justify-center rounded-lg bg-muted text-foreground">
-          <Code2Icon className="size-[18px]" aria-hidden="true" />
+          <HtmlTileIcon />
         </span>
         <span className="min-w-0 flex-1">
           <span className="block truncate text-sm font-semibold text-foreground">{data.title}</span>

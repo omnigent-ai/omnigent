@@ -84,6 +84,9 @@ describe("DesignArtifactCard", () => {
     expect(screen.getByTestId("design-artifact-preview-well")).toBeDefined();
     expect(screen.getByText("Revenue dashboard")).toBeDefined();
     expect(screen.getByText("HTML")).toBeDefined();
+    const htmlIcon = screen.getByTestId("design-artifact-html-icon");
+    expect(htmlIcon.querySelectorAll("polyline")).toHaveLength(2);
+    expect(htmlIcon.querySelector("path")).toBeNull();
     expect(screen.getByText("4 files")).toBeDefined();
     expect(screen.getByText("Created")).toBeDefined();
     expect(screen.queryByText("artifacts/revenue-dashboard/index.html")).toBeNull();
