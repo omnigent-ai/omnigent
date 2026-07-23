@@ -239,7 +239,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
     not configured, with the structured error_code and a message that
-    names the harness, the host, and the `omnigent setup` fix.
+    names the harness, the host, and the `omni setup` fix.
 
     If this regresses, an unconfigured launch spawns a runner whose
     first turn dies inside the executor — the exact dead-session UX
@@ -272,7 +272,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     # harness, the host, and the remediation command.
     assert "'codex'" in (result.error or "")
     assert "test-laptop" in (result.error or "")
-    assert "omnigent setup" in (result.error or "")
+    assert "omni setup" in (result.error or "")
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
@@ -284,7 +284,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
 ) -> None:
     """
     A native-Cursor refusal must name the ``cursor-agent`` installer and
-    login, not ``omnigent setup`` — which only configures the SDK ``cursor``
+    login, not ``omni setup`` — which only configures the SDK ``cursor``
     harness and never installs the ``cursor-agent`` CLI ``omni cursor`` boots.
 
     Here ``harness_setup_hint`` is the real function (only the readiness check
@@ -313,7 +313,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     assert "test-laptop" in message
     assert "cursor.com/install" in message
     assert "cursor-agent login" in message
-    assert "omnigent setup" not in message
+    assert "omni setup" not in message
     assert host._runners == {}
 
 

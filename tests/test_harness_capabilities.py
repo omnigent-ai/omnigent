@@ -176,7 +176,7 @@ def test_catalog_rows_carry_setup_steps() -> None:
         assert len(row["setup_steps"]) >= 1
         for step in row["setup_steps"]:
             assert step["kind"] in ("install", "auth")
-            assert step["action"] in ("install", "command", "setup")
+            assert step["action"] in ("install", "command", "setup", "auth")
             # JSON-serializable primitives only.
             for value in step.values():
                 assert value is None or isinstance(value, str)
