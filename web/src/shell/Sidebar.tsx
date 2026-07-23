@@ -2871,7 +2871,7 @@ function ConversationRow({
           aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
           data-testid="quick-pin-conversation"
           className={cn(
-            "-translate-y-1/2 absolute top-1/2 right-8 transition-opacity",
+            "-translate-y-1/2 absolute top-1/2 right-[14px] transition-opacity",
             // Desktop-only quick affordance: hidden on mobile (the kebab's
             // Pin item below covers that), hover/focus-revealed from `md` up.
             // Pinned rows no longer keep a persistent pin marker, since the
@@ -2913,7 +2913,7 @@ function ConversationRow({
               // surfaced while the menu is open so the trigger doesn't
               // vanish under the cursor.
               className={cn(
-                "-translate-y-1/2 absolute top-1/2 right-1 transition-opacity",
+                "-translate-y-1/2 absolute top-1/2 -right-3 transition-opacity",
                 "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                 "md:aria-expanded:opacity-100",
               )}
