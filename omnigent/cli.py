@@ -1494,6 +1494,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "debug",
         "doctor",
         "goose",
+        "grok-build",
         "hermes",
         "host",
         "import",
@@ -5466,6 +5467,12 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.hermes_native",
         function="run_hermes_native",
         args_param="hermes_args",
+        model_strategy="explicit_passthrough",
+    ),
+    "grok-build": _NativeTerminalDispatchSpec(
+        module="omnigent.grok_build_native",
+        function="run_grok_build_native",
+        args_param="grok_build_args",
         model_strategy="explicit_passthrough",
     ),
 }
