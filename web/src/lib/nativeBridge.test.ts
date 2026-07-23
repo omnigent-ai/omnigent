@@ -119,6 +119,8 @@ beforeEach(() => {
 afterEach(() => {
   setElectron(false);
   setIOS(false);
+  setAndroid(true);
+  window.dispatchEvent(new Event("omnigent-native-ready"));
   setAndroid(false);
 });
 

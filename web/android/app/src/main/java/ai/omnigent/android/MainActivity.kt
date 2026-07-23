@@ -136,6 +136,8 @@ class MainActivity : ComponentActivity() {
                 webViewClient =
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
+                        // Full page loads briefly use OS-derived bar polarity until the SPA
+                        // reports its resolved scheme; capable SPAs override it immediately.
                         onTopLevelNavigation = ::resetColorSchemeToSystem,
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
