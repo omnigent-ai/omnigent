@@ -752,6 +752,68 @@ async def test_external_routing_client_mints_fresh_token_per_call_from_profile()
     assert captured == ["Bearer tok-1", "Bearer tok-2"]
 
 
+@pytest.mark.asyncio
+async def test_external_routing_client_records_last_error_on_http_failure() -> None:
+    """A 4xx/5xx sets last_error with the gateway's unwrapped message."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error_code": 401,
+                "message": "Credential was not sent or was of an unsupported type for this API.",
+            },
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v0")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        result = await client.route("hi", {"h": ["m"]})
+    assert result is None
+    assert client.last_error is not None
+    assert "401" in client.last_error
+    assert "Credential was not sent" in client.last_error
+
+
+def test_router_error_detail_unwraps_nested_message() -> None:
+    from omnigent.server.smart_routing import _router_error_detail
+
+    # Doubly-encoded: outer message holds another JSON object.
+    body = json.dumps(
+        {
+            "error_code": "BAD_REQUEST",
+            "message": json.dumps({"error": {"message": "task_v0 requires [...] models"}}),
+        }
+    )
+    assert _router_error_detail(body) == "task_v0 requires [...] models"
+    # Plain body passes through (trimmed).
+    assert _router_error_detail("boom") == "boom"
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_surfaces_router_error_detail() -> None:
+    """When the client exposes last_error, route_session_harness surfaces it."""
+
+    class _FailingClient:
+        last_error = "router returned HTTP 401: Credential was not sent"
+
+        async def route(
+            self, _message: str, _available: dict[str, list[str]]
+        ) -> RoutingResult | None:
+            return None
+
+    caps = _FakeCaps(routing_client=_FailingClient())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict, error = await route_session_harness("hi")
+    assert harness is None
+    assert model is None
+    assert error is not None
+    assert "401" in error
+    assert "Credential was not sent" in error
+
+
 # ── route_session_harness ───────────────────────────────────────────────────
 
 

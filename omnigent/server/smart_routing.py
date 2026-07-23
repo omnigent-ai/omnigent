@@ -343,6 +343,38 @@ def _bearer_auth(token: str) -> Any:  # type: ignore[explicit-any]  # returns ht
     return _BearerAuth()
 
 
+def _router_error_detail(body: str) -> str:
+    """Extract a clean, short reason from a router error response body.
+
+    The gateway wraps the reason in nested JSON (e.g.
+    ``{"error_code": 401, "message": "Credential was not sent ..."}`` or a
+    doubly-encoded ``message`` holding another JSON object). Pull out the
+    innermost human message when possible; otherwise return a trimmed body.
+
+    :param body: The raw response text.
+    :returns: A short reason string suitable for a UI card.
+    """
+    text = (body or "").strip()
+    for _ in range(4):  # unwrap up to a few nested message/error layers
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError):
+            break
+        if not isinstance(parsed, dict):
+            break
+        candidate = parsed.get("message")
+        if candidate is None:
+            candidate = parsed.get("error")
+        # A dict ``error`` (e.g. {"error": {"message": ...}}) — descend into it.
+        if isinstance(candidate, dict):
+            candidate = candidate.get("message")
+        if isinstance(candidate, str) and candidate:
+            text = candidate.strip()
+            continue
+        break
+    return text[:300]
+
+
 class ExternalRoutingClient:
     """Routing client backed by an external ``routes:select`` service.
 
@@ -399,6 +431,11 @@ class ExternalRoutingClient:
         self._sdk_config: Any = None
         self._model_prefixes = model_prefixes or []
         self._request_timeout = request_timeout
+        # Human-readable reason the most recent route() returned None, for the
+        # caller to surface in the UI (a bare None hides the actual cause, e.g.
+        # a 401 or the task_v0 required-model-set error). Set on every failure
+        # path, cleared on success.
+        self.last_error: str | None = None
 
     def _resolve_auth(self) -> Any:  # type: ignore[explicit-any]  # httpx.Auth | None
         """Return the auth for a request, refreshing an OAuth token per call.
@@ -478,6 +515,7 @@ class ExternalRoutingClient:
         import asyncio
 
         auth = await asyncio.to_thread(self._resolve_auth)
+        self.last_error = None
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as http:
                 resp = await http.post(
@@ -489,6 +527,7 @@ class ExternalRoutingClient:
         except httpx.HTTPError as exc:
             # Transport-level failure (connect/timeout/DNS): no response body.
             _logger.warning("ExternalRoutingClient: routes:select request failed: %s", exc)
+            self.last_error = f"router request failed: {exc}"
             return None
         if resp.status_code >= 400:
             # Log the response body — the gateway puts the actual reason there
@@ -499,6 +538,9 @@ class ExternalRoutingClient:
                 resp.status_code,
                 resp.text[:2000],
             )
+            self.last_error = (
+                f"router returned HTTP {resp.status_code}: {_router_error_detail(resp.text)}"
+            )
             return None
         try:
             out = json_format.ParseDict(resp.json(), pb.SelectRouteResponse())
@@ -507,11 +549,14 @@ class ExternalRoutingClient:
                 "ExternalRoutingClient: could not parse routes:select response: %s",
                 resp.text[:2000],
             )
+            self.last_error = "router returned an unparseable response"
             return None
         if not out.route_selection:
+            self.last_error = "router returned no route selection"
             return None
         selected = out.route_selection[0].route_option
         if not selected.model:
+            self.last_error = "router returned an empty model"
             return None
         # Map the router's pick back to the local catalog id, rejecting an
         # out-of-set model (falls back to an id-only match when the router
@@ -533,6 +578,7 @@ class ExternalRoutingClient:
                 selected.model,
                 selected.harness,
             )
+            self.last_error = f"router picked model {selected.model!r} outside the candidate set"
             return None
         return RoutingResult(
             model=local_model,
@@ -701,7 +747,15 @@ async def route_session_harness(
         return None, None, None, f"Routing call failed: {exc}"
 
     if result is None:
-        return None, None, None, "The router returned no verdict; using default harness."
+        # Surface the client's specific failure reason (e.g. HTTP 401 with the
+        # gateway's message) when it exposes one; otherwise a generic note.
+        detail = getattr(_caps.routing_client, "last_error", None)
+        reason = (
+            f"Routing unavailable: {detail}"
+            if detail
+            else "The router returned no verdict; using default harness."
+        )
+        return None, None, None, reason
 
     # Use the router's harness pick only when it names one of our candidates
     # AND the chosen model is in that harness's list (avoids mismatches).
