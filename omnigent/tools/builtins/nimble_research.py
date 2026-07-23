@@ -94,6 +94,9 @@ _MAX_CONTENT_CHARS = 50_000
 _MAX_TRUST_SOURCES = 10
 _MAX_TRUST_CLAIMS = 10
 _MAX_CITATIONS_PER_CLAIM = 3
+# Per-string cap for trust fields (reasoning / url / title / type) so a single
+# oversized API-supplied value can't inflate the envelope past its bound.
+_MAX_FIELD_CHARS = 2_000
 
 # Test seams: unit tests monkeypatch these module attributes with a fake clock
 # instead of patching the process-global ``time`` module.
@@ -285,7 +288,7 @@ def _start_run(
                 "Nimble research error: HTTP 422 (the run request was rejected as invalid).",
             )
         return None, f"Nimble research error: HTTP {code}{_http_error_detail(exc.response)}"
-    except httpx.RequestError as exc:
+    except (httpx.RequestError, httpx.InvalidURL) as exc:
         return None, f"Nimble research error: {exc}"
     run = _parse_json_dict(resp)
     if run is None:
@@ -472,6 +475,11 @@ def _truncate(text: str, limit: int) -> str:
     return text
 
 
+def _cap_field(value: str) -> str:
+    """Cap a single API-supplied trust string to keep the envelope bounded."""
+    return value if len(value) <= _MAX_FIELD_CHARS else value[:_MAX_FIELD_CHARS] + "…"
+
+
 def _map_trust(trust: object) -> dict[str, Any]:
     """
     Map the API's trust metadata into a bounded envelope section: overall
@@ -489,7 +497,7 @@ def _map_trust(trust: object) -> dict[str, Any]:
         mapped["confidence"] = confidence
     reasoning = trust.get("reasoning")
     if isinstance(reasoning, str):
-        mapped["reasoning"] = reasoning
+        mapped["reasoning"] = _cap_field(reasoning)
 
     raw_sources = trust.get("sources")
     sources = raw_sources if isinstance(raw_sources, list) else []
@@ -497,11 +505,12 @@ def _map_trust(trust: object) -> dict[str, Any]:
     for source in sources[:_MAX_TRUST_SOURCES]:
         if not isinstance(source, dict):
             continue
-        entry: dict[str, Any] = {"url": source.get("url")}
+        url = source.get("url")
+        entry: dict[str, Any] = {"url": _cap_field(url) if isinstance(url, str) else url}
         if isinstance(source.get("type"), str):
-            entry["type"] = source["type"]
+            entry["type"] = _cap_field(source["type"])
         if isinstance(source.get("title"), str):
-            entry["title"] = source["title"]
+            entry["title"] = _cap_field(source["title"])
         kept_sources.append(entry)
     mapped["sources"] = kept_sources
     if len(sources) > _MAX_TRUST_SOURCES:
@@ -526,9 +535,10 @@ def _map_trust(trust: object) -> dict[str, Any]:
         for citation in citations[:_MAX_CITATIONS_PER_CLAIM]:
             if not isinstance(citation, dict):
                 continue
-            cite: dict[str, Any] = {"url": citation.get("url")}
+            curl = citation.get("url")
+            cite: dict[str, Any] = {"url": _cap_field(curl) if isinstance(curl, str) else curl}
             if isinstance(citation.get("title"), str):
-                cite["title"] = citation["title"]
+                cite["title"] = _cap_field(citation["title"])
             kept_citations.append(cite)
         entry["citations"] = kept_citations
         kept_claims.append(entry)
@@ -553,7 +563,9 @@ def _build_envelope(run_id: str, output: dict[str, Any]) -> str:
     raw_type = output.get("type")
     content = output.get("content")
     output_type = (
-        raw_type if isinstance(raw_type, str) else ("text" if isinstance(content, str) else "json")
+        _cap_field(raw_type)
+        if isinstance(raw_type, str)
+        else ("text" if isinstance(content, str) else "json")
     )
     content_truncated = False
     if isinstance(content, str):

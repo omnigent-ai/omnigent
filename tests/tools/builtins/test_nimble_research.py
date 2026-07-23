@@ -670,6 +670,34 @@ def test_result_malformed_json_keeps_run_id(tool_ctx: ToolContext, fake_clock: _
 
 
 # ---------------------------------------------------------------------------
+# Malformed config / envelope bounds (hardening)
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+def test_control_char_agent_id_returns_error_not_raises(tool_ctx: ToolContext) -> None:
+    """A control char in the configured agent_id yields a clean error, never raises."""
+    out = _invoke(_config(agent_id="wsa_\n0000"), tool_ctx)
+    assert out.startswith("Nimble research error:")
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_oversized_trust_reasoning_is_capped(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """A huge API-supplied trust.reasoning is capped; the envelope stays valid JSON."""
+    trust = _trust()
+    trust["reasoning"] = "z" * 60_000
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result(trust=trust)))
+    envelope = json.loads(_invoke(_config(), tool_ctx))
+    reasoning = envelope["trust"]["reasoning"]
+    assert len(reasoning) <= 2_010
+    assert reasoning.endswith("…")
+
+
+# ---------------------------------------------------------------------------
 # Secret hygiene
 # ---------------------------------------------------------------------------
 
