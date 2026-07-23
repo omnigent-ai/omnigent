@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.runner.app import _inject_mcp_schemas
+from omnigent.runner.app import _inject_mcp_schemas, _merge_session_tool_schemas
 
 
 def _schema(name: str) -> dict[str, Any]:
@@ -111,3 +111,14 @@ def test_inject_skips_mcp_already_present() -> None:
     names = [t["name"] for t in body["tools"]]
     assert names == ["sys_os_read", "confluence_get_service_info", "confluence_search_pages"]
     assert names.count("confluence_get_service_info") == 1
+
+
+def test_merge_session_schemas_preserves_builtin_name_with_double_underscore() -> None:
+    """A refreshed MCP schema list keeps builtin names containing ``__``."""
+    builtin = [_schema("admin__audit_tool_calls")]
+    refreshed_mcp = [_schema("github__search_repositories")]
+
+    schemas = _merge_session_tool_schemas(builtin, refreshed_mcp)
+
+    names = [schema["name"] for schema in schemas]
+    assert names == ["admin__audit_tool_calls", "github__search_repositories"]
