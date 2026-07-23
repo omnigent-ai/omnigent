@@ -1766,7 +1766,7 @@ function HarnessConfigModal({
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="border-t-0 bg-transparent">
           <Button
             type="button"
             variant="outline"

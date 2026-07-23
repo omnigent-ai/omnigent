@@ -1064,6 +1064,22 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.queryByTestId("cost-toggle-trigger")).toBeNull();
   });
 
+  it("renders the config modal footer without its own background or top border", async () => {
+    // The Cancel/Save footer should blend into the modal body — no gray tray
+    // band and no divider line above the buttons.
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_native");
+
+    const footer = screen
+      .getByTestId("new-chat-landing-config-save")
+      .closest("[data-slot=dialog-footer]");
+    expect(footer).not.toBeNull();
+    expect(footer).toHaveClass("bg-transparent", "border-t-0");
+    expect(footer?.className).not.toMatch(/bg-muted/);
+  });
+
   it("omits cost_control_mode_override when Smart Routing is left unpicked", async () => {
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
