@@ -10341,8 +10341,7 @@ def create_runner_app(
             async with _grok_build_ensure_lock:
                 _tr = resource_registry.terminal_registry
                 _has_grok_build_terminal = (
-                    _tr is not None
-                    and _tr.get(session_id, "grok-build", "main") is not None
+                    _tr is not None and _tr.get(session_id, "grok-build", "main") is not None
                 )
                 if not _has_grok_build_terminal:
                     _publish_terminal_pending(_publish_event, session_id, True)
@@ -17168,9 +17167,7 @@ def create_runner_app(
             and session_key == "main"
         ):
             grok_build_terminal_id = terminal_resource_id("grok-build", "main")
-            ensure_lock = _grok_build_terminal_ensure_locks.setdefault(
-                session_id, asyncio.Lock()
-            )
+            ensure_lock = _grok_build_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
             async with ensure_lock:
                 existing = await resource_registry.get_terminal_resource(
                     session_id, grok_build_terminal_id
