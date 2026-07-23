@@ -830,7 +830,11 @@ class SlackOmnigentService:
 
         delta = extract_delta(event)
         if delta:
-            await reply.add_delta(delta)
+            # ``message_id`` (native terminal harnesses tag each assistant message
+            # item; None for in-process streaming) lets the reply insert a
+            # paragraph break between back-to-back messages.
+            mid = event.get("message_id")
+            await reply.add_delta(delta, mid if isinstance(mid, str) else None)
             return
 
         elicitation = extract_elicitation_request(event, session_id)

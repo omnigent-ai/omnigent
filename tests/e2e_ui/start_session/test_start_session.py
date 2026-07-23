@@ -2337,10 +2337,12 @@ async def _drive_project_prefill(base_url: str, session_id: str) -> None:
 
             async def handle_projects(route: Route) -> None:
                 # One project so exactly one folder (and pencil) renders.
+                # GET /v1/sessions/projects returns the dual-read union as
+                # {id, name} objects (id=None for a label-only project).
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
-                    body=json.dumps([project]),
+                    body=json.dumps([{"id": None, "name": project}]),
                 )
 
             async def handle_worktrees(route: Route) -> None:

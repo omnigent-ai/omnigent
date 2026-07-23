@@ -6693,6 +6693,46 @@ def test_claude_transcript_image_result_sent_as_blocks_not_text() -> None:
     assert block["content"][0]["source"]["data"] == big_b64
 
 
+def test_claude_transcript_truncated_image_result_stripped_not_leaked() -> None:
+    """
+    A base64 image clipped at the store byte cap must not leak on resume.
+
+    Real wedged sessions stored image tool results truncated at the
+    conversation-store byte cap, leaving the base64 unterminated (invalid
+    JSON). Rehydration fails on that, so the old path fell back to sending the
+    raw ~250K-char base64 as ``tool_result`` text AND stashed it in
+    ``toolUseResult`` — re-overflowing the resumed context. The synthesizer
+    must collapse such a payload to a placeholder in both places.
+    """
+    big_b64 = "iVBORw0KGgo" + "A" * 100_000
+    truncated = (
+        '[{"type":"image","source":{"type":"base64","data":"'
+        + big_b64
+        + "…[truncated by conversation-store: item exceeded 245760B cap]"
+    )
+    items: list[dict[str, Any]] = [
+        {
+            "id": "fco_1",
+            "response_id": "resp_1",
+            "type": "function_call_output",
+            "call_id": "toolu_1",
+            "output": truncated,
+        }
+    ]
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+    )
+    assert len(records) == 1
+    # No base64 anywhere in the record — not in tool_result content, not in
+    # toolUseResult metadata.
+    blob = json.dumps(records[0])
+    assert big_b64 not in blob, "truncated base64 must not survive into the transcript"
+    assert "omitted from history" in blob
+
+
 def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
     """
     Pin the resume crash to the old ``toolUseResult = output`` flatten.

@@ -195,6 +195,7 @@ afterEach(() => {
   // don't leak persisted state or the --ui-font-scale variable into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--ui-font-scale");
+  document.documentElement.style.removeProperty("--sidebar-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -361,6 +362,24 @@ describe("SettingsPage", () => {
     fireEvent.keyDown(system, { key: "ArrowRight" });
 
     expect(mocks.setTheme).toHaveBeenCalledWith("light");
+  });
+
+  it("groups a Sidebar-only font size control under Appearance", () => {
+    renderPage("/settings/appearance");
+
+    const sidebarGroup = screen.getByRole("group", { name: "Sidebar settings" });
+    expect(within(sidebarGroup).getByText("Sidebar")).toBeInTheDocument();
+    const input = within(sidebarGroup).getByLabelText(
+      "Sidebar font size in pixels",
+    ) as HTMLInputElement;
+    expect(input.value).toBe("13");
+
+    fireEvent.click(within(sidebarGroup).getByLabelText("Increase sidebar font size"));
+
+    expect(input.value).toBe("14");
+    expect(localStorage.getItem("omnigent:sidebar-font-size")).toBe("14");
+    expect(document.documentElement.style.getPropertyValue("--sidebar-font-size")).toBe("14px");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("");
   });
 
   it("shows the default UI font size and steps it up, persisting the choice", () => {

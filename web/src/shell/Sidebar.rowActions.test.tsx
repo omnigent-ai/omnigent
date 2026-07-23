@@ -52,7 +52,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects }),
+  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
   // (this suite keeps its test row unfiled; the picker only needs the name).
@@ -67,6 +67,8 @@ vi.mock("@/hooks/useConversations", () => ({
   }),
   useMoveToProject: () => mocks.moveToProject,
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -189,6 +191,61 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("quick pin/unpin hover button", () => {
+  it("keeps the row full-width and the trailing controls inset from the right edge", () => {
+    // The row link is `w-full` (not `w-[calc(100%+1rem)]`) so its highlight
+    // stays inset from the right edge, aligning with the project/folder rows.
+    renderSidebar();
+
+    // The pin + kebab share ONE absolutely-positioned flex container anchored
+    // at right-1 with gap-0.5, mirroring the project-folder header actions —
+    // so the spacing is defined once and can't drift (no per-button fixed-px
+    // offsets like the old right-[30px] / -right-3).
+    const pin = screen.getByTestId("quick-pin-conversation");
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(pin).toHaveClass("size-6");
+    expect(kebab).toHaveClass("size-6");
+    // Both buttons live in the same wrapper, which owns the position + gap.
+    const controls = pin.parentElement!;
+    expect(controls).toBe(kebab.parentElement);
+    expect(controls).toHaveClass("absolute", "right-1", "flex", "items-center", "gap-0.5");
+    // The old per-button offsets are gone.
+    expect(pin).not.toHaveClass("right-[30px]", "right-[1.875rem]", "right-[14px]", "absolute");
+    expect(kebab).not.toHaveClass("-right-3", "absolute");
+
+    const rowLink = screen.getByRole("link", { name: "My Session" });
+    expect(rowLink).toHaveClass("w-full");
+    expect(rowLink).not.toHaveClass("w-[calc(100%+1rem)]");
+  });
+
+  it("sizes the project-folder header controls to match the session-row kebab", () => {
+    // The folder-header pencil + kebab share the right-edge column with the
+    // session-row kebab, so they must be the same compact `icon-xs` (size-6)
+    // button — not the larger `icon-sm` (size-7) — or their glyphs sit in
+    // different columns and read as misaligned.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    expect(screen.getByTestId("project-actions")).toHaveClass("size-6");
+    expect(screen.getByTestId("project-actions")).not.toHaveClass("size-7");
+    expect(screen.getByTestId("project-new-session")).toHaveClass("size-6");
+    expect(screen.getByTestId("project-new-session")).not.toHaveClass("size-7");
+    // Same compact size as the session-row kebab it aligns with.
+    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
+  });
+
+  it("sizes the Projects group-header controls to the same compact icon", () => {
+    // The "New project" / "Expand all" controls share the right-edge column
+    // with the folder + session kebabs, so they use the same compact `icon-xs`
+    // (size-6), not the larger `icon-sm` (size-7).
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    expect(screen.getByTestId("new-project")).toHaveClass("size-6");
+    expect(screen.getByTestId("new-project")).not.toHaveClass("size-7");
+    expect(screen.getByTestId("expand-all-projects")).toHaveClass("size-6");
+    expect(screen.getByTestId("expand-all-projects")).not.toHaveClass("size-7");
+  });
+
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
     renderSidebar();
 
@@ -374,7 +431,13 @@ describe("pinned row project flyout", () => {
     fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
     const flyout = await screen.findByTestId("pinned-project-flyout");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
-    expect(within(flyout).getByText("My Session")).toBeInTheDocument();
+    const flyoutTitle = within(flyout).getByText("My Session");
+    expect(flyoutTitle).toBeInTheDocument();
+    // The flyout title is sized to match the sidebar row name (fixed
+    // --sidebar-font-size via `sidebar-compact-text`), not the rem-based
+    // `text-sm` that scaled with the UI font-size setting.
+    expect(flyoutTitle).toHaveClass("sidebar-compact-text");
+    expect(flyoutTitle).not.toHaveClass("text-sm");
   });
 
   it("renders no project flyout for a pinned row with no project", () => {
