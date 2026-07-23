@@ -9596,6 +9596,7 @@ async def _forward_event_to_runner(
         conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
     ) or _parent_routing_on
     _routed_model: str | None = None
+    _routed_harness: str | None = None
     _verdict: dict[str, Any] | None = None
     # For child sessions, route even when the orchestrator specified a model via
     # sys_session_send (effective_runner_override is already set). Smart routing
@@ -9606,41 +9607,77 @@ async def _forward_event_to_runner(
         and (effective_runner_override is None or conv.parent_conversation_id is not None)
     )
     if _should_route:
-        from omnigent.server.smart_routing import route_turn
-
-        _harness = _resolve_harness(conv)
         _user_text = _extract_user_text_for_routing(body)
         if _user_text:
-            _routed_model, _verdict = await route_turn(
-                _harness,
-                _user_text,
-                session_id=session_id,
-                runner_client=runner_client,
-            )
-            if _routed_model is not None:
-                effective_runner_override = _routed_model
-                # Persist as the session's model_override so all
-                # subsequent turns use this model automatically.
+            if _parent_routing_on:
+                # Child sessions: use route_session_harness to pick both harness
+                # and model, overriding whatever the orchestrator specified in
+                # sys_session_send.
+                from omnigent.server.smart_routing import route_session_harness
+
+                _routed_harness, _routed_model, _verdict, _route_err = await route_session_harness(
+                    _user_text,
+                    session_id=session_id,
+                    runner_client=runner_client,
+                )
+                if _routed_model is not None:
+                    effective_runner_override = _routed_model
                 try:
-                    await asyncio.to_thread(
-                        conversation_store.update_conversation,
-                        session_id,
-                        model_override=_routed_model,
-                    )
+                    _child_updates: dict[str, Any] = {}
+                    if _routed_model is not None:
+                        _child_updates["model_override"] = _routed_model
+                    if _routed_harness is not None:
+                        _child_updates["harness_override"] = _routed_harness
+                    elif _routed_model is None and _route_err is None:
+                        pass  # router returned nothing but no error — leave as-is
+                    if _child_updates:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            **_child_updates,
+                        )
                 except (OSError, ValueError):
                     _logger.warning(
-                        "smart_routing: failed to persist model_override "
-                        "for session=%s; turn still uses routed model",
+                        "smart_routing: failed to persist harness/model for child session=%s",
                         session_id,
                         exc_info=True,
                     )
+            else:
+                # Top-level sessions: model-only routing (harness already fixed by spec).
+                from omnigent.server.smart_routing import route_turn
+
+                _harness = _resolve_harness(conv)
+                _routed_model, _verdict = await route_turn(
+                    _harness,
+                    _user_text,
+                    session_id=session_id,
+                    runner_client=runner_client,
+                )
+                if _routed_model is not None:
+                    effective_runner_override = _routed_model
+                    try:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            model_override=_routed_model,
+                        )
+                    except (OSError, ValueError):
+                        _logger.warning(
+                            "smart_routing: failed to persist model_override "
+                            "for session=%s; turn still uses routed model",
+                            session_id,
+                            exc_info=True,
+                        )
     # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None and conv.harness_override != "auto":
-        runner_body["harness_override"] = conv.harness_override
+    # _routed_harness is non-None when the child routing path resolved one
+    # this turn (conv is not refreshed, so we use the in-flight value).
+    _effective_harness = _routed_harness or conv.harness_override
+    if _effective_harness is not None and _effective_harness != "auto":
+        runner_body["harness_override"] = _effective_harness
 
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
