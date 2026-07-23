@@ -25,14 +25,14 @@ import pytest
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
-
-# Reuse the proven runner-turn stubs from the sessions-native suite.
-from tests.runner.helpers import NullServerClient
-from tests.runner.test_app_sessions_native import (
+from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
 )
+
+# Reuse the proven runner-turn stubs from the sessions-native suite.
+from tests.runner.helpers import NullServerClient
 
 PARENT_SESSION_ID = "conv_parent_orchestrator"
 CHILD_SESSION_ID = "conv_child_reviewer"

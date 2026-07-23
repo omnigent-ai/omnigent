@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -1439,8 +1440,7 @@ async def test_session_stream_receives_events() -> None:
 @pytest.mark.asyncio
 async def test_session_stream_emits_heartbeat_on_idle() -> None:
     """The session stream emits an immediate and idle ``session.heartbeat``."""
-    import omnigent.runner.app as runner_app_module
-
+    runner_app_module = sys.modules[_session_labels_for_runner_spawn.__module__]
     original = runner_app_module._SESSION_STREAM_HEARTBEAT_S
     runner_app_module._SESSION_STREAM_HEARTBEAT_S = 0.05
     try:
