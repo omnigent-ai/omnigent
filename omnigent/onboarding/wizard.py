@@ -413,7 +413,8 @@ _CLI_HARNESSES: dict[str, dict[str, str]] = {
     "claude-sdk": {
         "cli": "claude",
         "display": "Claude Code",
-        "install": "npm install -g @anthropic-ai/claude-code",
+        # Mirrors the Claude HarnessInstallSpec in onboarding.harness_install.
+        "install": "curl -fsSL https://claude.ai/install.sh | bash",
     },
     "codex": {
         "cli": "codex",
