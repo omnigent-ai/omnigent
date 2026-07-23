@@ -1440,7 +1440,7 @@ async def test_session_stream_receives_events() -> None:
 @pytest.mark.asyncio
 async def test_session_stream_emits_heartbeat_on_idle() -> None:
     """The session stream emits an immediate and idle ``session.heartbeat``."""
-    runner_app_module = sys.modules[_session_labels_for_runner_spawn.__module__]
+    runner_app_module = sys.modules[create_runner_app.__module__]
     original = runner_app_module._SESSION_STREAM_HEARTBEAT_S
     runner_app_module._SESSION_STREAM_HEARTBEAT_S = 0.05
     try:
