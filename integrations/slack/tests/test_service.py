@@ -3,15 +3,24 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import omnigent_slack.service as service_module
+import pytest
 from omnigent_slack.approvals import Verdict, parse_action_value
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import (
     AuthRequiredError,
+    HarnessNotConfiguredError,
     HostUnavailableError,
     OmnigentError,
     ServerUnreachableError,
+    StreamInterruptedError,
 )
-from omnigent_slack.service import _ACK_TEXT, SlackOmnigentService
+from omnigent_slack.service import (
+    _ACK_TEXT,
+    _SERVER_UNREACHABLE_TEXT,
+    _STREAM_INTERRUPTED_TEXT,
+    SlackOmnigentService,
+)
 from omnigent_slack.store import SQLiteStore
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web.async_slack_response import AsyncSlackResponse
@@ -36,12 +45,18 @@ class FakeStream:
         start_kwargs: dict[str, Any],
         close_after: int | None = None,
         buffer_size: int = 256,
+        close_error: str = "message_not_in_streaming_state",
     ) -> None:
         self._client = client
         self.start_kwargs = start_kwargs
         self.appended: list[str] = []
         self.stopped = False
         self.stop_text: str | None = None
+        # Which Slack error code a closed stream raises. Slack uses
+        # ``message_not_in_streaming_state`` for a finalized message and
+        # ``message_not_found`` for one old enough to be gone — both must trigger
+        # the reopen path.
+        self._close_error = close_error
         # Monotonic rank of when this stream's message opened, relative to other
         # posts/streams on the same client. Slack orders by the timestamp fixed
         # at open time, so this models a segment's position in the thread.
@@ -78,7 +93,7 @@ class FakeStream:
                 http_verb="POST",
                 api_url="https://slack.com/api/chat.appendStream",
                 req_args={},
-                data={"ok": False, "error": "message_not_in_streaming_state"},
+                data={"ok": False, "error": self._close_error},
                 headers={},
                 status_code=200,
             ),
@@ -137,12 +152,16 @@ class FakeSlackClient:
         self.updates: list[dict[str, Any]] = []
         # Ephemeral ("Only visible to you") notices — private, not durable posts.
         self.ephemerals: list[dict[str, Any]] = []
+        # DM channels opened via conversations_open (users= payloads).
+        self.dm_opens: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
         self._next_ts = 0
         self._order = 0
         # When set, every stream this client opens auto-closes after this many
         # appended deltas — simulating Slack finalizing the message mid-turn.
         self.stream_close_after: int | None = None
+        # The Slack error code a closed stream raises (see FakeStream).
+        self.stream_close_error: str = "message_not_in_streaming_state"
 
     def _tick(self) -> int:
         # Monotonic rank stamped on each post/stream-open so tests can assert
@@ -163,6 +182,13 @@ class FakeSlackClient:
         self.ephemerals.append({**kwargs})
         return {"ok": True, "message_ts": "ephemeral"}
 
+    async def conversations_open(self, **kwargs: Any) -> dict[str, Any]:
+        # Record who we DM'd and hand back a stable DM channel id. A DM message is
+        # then a normal chat_postMessage to that channel.
+        self.dm_opens.append({**kwargs})
+        user = kwargs.get("users")
+        return {"ok": True, "channel": {"id": f"D-{user}"}}
+
     async def chat_delete(self, **kwargs: Any) -> dict[str, Any]:
         ts = kwargs.get("ts")
         self.deleted_ts.append(str(ts))
@@ -177,11 +203,18 @@ class FakeSlackClient:
                 post.update(kwargs)
         return {"ok": True, "ts": ts}
 
+    async def chat_getPermalink(self, **kwargs: Any) -> dict[str, Any]:
+        channel = kwargs.get("channel")
+        ts = kwargs.get("message_ts")
+        return {"ok": True, "permalink": f"https://slack.test/archives/{channel}/p{ts}"}
+
     async def chat_stream(self, **kwargs: Any) -> FakeStream:
         # Only the first stream auto-closes (Slack finalizes the idle message);
         # the continuation the bot opens streams fresh, mirroring reality.
         close_after = self.stream_close_after if not self.streams else None
-        stream = FakeStream(self, kwargs, close_after=close_after)
+        stream = FakeStream(
+            self, kwargs, close_after=close_after, close_error=self.stream_close_error
+        )
         self.streams.append(stream)
         return stream
 
@@ -206,19 +239,16 @@ class FakeOmnigentClient:
         self.resolved_content: list[dict[str, Any] | None] = []
         self.next_session_id = "conv_1"
         self.final_text = final_text
-        # Rolled-up status the grace window polls at a soft idle; default idle so
-        # a turn ends promptly unless a test sets it to "running".
-        self.status = "idle"
         # Newest assistant message the server would return, for the no-delta
         # fallback. ``latest_message_id`` pins the id (else each call gets a
         # fresh id, so the fallback treats it as new relative to the baseline).
         self.latest_message: str | None = None
         self.latest_message_id: str | None = None
         self._latest_calls = 0
-        # Whether an outstanding elicitation is still pending server-side. Default
-        # True so the Slack-click path is exercised; a test sets it False to
-        # simulate the user answering elsewhere (web UI).
-        self.elicitation_pending = True
+        # Fires when the bot POSTs a verdict via resolve_elicitation — lets a
+        # fixture generator wait for the answer before emitting the server's
+        # elicitation_resolved + continuation (the pure-push model).
+        self.resolve_signal = asyncio.Event()
         # Server activity reported at ROUTE time (before a turn) — the gate that
         # decides whether a new message runs or is deflected. Defaults to free
         # (idle, no pending) so a follow-up runs; a test sets these to simulate a
@@ -226,9 +256,9 @@ class FakeOmnigentClient:
         # in-turn grace window polls) so the two don't collide.
         self.route_status: str | None = "idle"
         self.route_pending_elicitation = False
-
-    async def get_session_status(self, session_id: str) -> str | None:
-        return self.status
+        # Server-authoritative harness/agent for the first-message config summary.
+        self.info_harness: str | None = "claude-native"
+        self.info_agent_name: str | None = "debby"
 
     async def get_session_activity(self, session_id: str) -> Any:
         from omnigent_slack.omnigent import SessionActivity
@@ -237,8 +267,10 @@ class FakeOmnigentClient:
             status=self.route_status, pending_elicitation=self.route_pending_elicitation
         )
 
-    async def is_elicitation_pending(self, session_id: str, elicitation_id: str) -> bool:
-        return self.elicitation_pending
+    async def get_session_info(self, session_id: str) -> Any:
+        from omnigent_slack.omnigent import SessionInfo
+
+        return SessionInfo(harness=self.info_harness, agent_name=self.info_agent_name)
 
     async def create_session(self, agent_id: str, title: str) -> str:
         self.created.append((agent_id, title))
@@ -293,6 +325,7 @@ class FakeOmnigentClient:
     ) -> None:
         self.resolved.append((session_id, elicitation_id, accepted))
         self.resolved_content.append(content)
+        self.resolve_signal.set()
 
 
 class FakePool:
@@ -312,6 +345,7 @@ class FakeSetup:
 
     def __init__(self) -> None:
         self.prompted: list[dict[str, Any]] = []
+        self.relogin_prompted: list[dict[str, Any]] = []
 
     async def prompt_unconfigured(
         self,
@@ -330,6 +364,25 @@ class FakeSetup:
                 "in_channel": in_channel,
             }
         )
+
+    async def prompt_relogin(
+        self,
+        client: Any,
+        user_id: str,
+        *,
+        channel: str,
+        thread_ts: str | None,
+        in_channel: bool,
+    ) -> bool:
+        self.relogin_prompted.append(
+            {
+                "user_id": user_id,
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "in_channel": in_channel,
+            }
+        )
+        return True
 
 
 async def _store(tmp_path: Path) -> SQLiteStore:
@@ -405,6 +458,9 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     record = await store.get_session(key)
     assert record is not None and record.session_id == "conv_1"
     assert omnigent.created[0][0] == "ag_1"
+    # Session title is "Slack: <thread permalink>" (a clickable URL the web UI
+    # linkifies), not the old opaque "Slack C…/ts" descriptor.
+    assert omnigent.created[0][1] == "Slack: https://slack.test/archives/C1/p100.1"
     assert omnigent.bound == ["conv_1"]
     assert omnigent.turns == [("conv_1", "hello")]
     # The stream replies in-thread and delivers the streamed answer.
@@ -416,7 +472,16 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     # started streaming — leaving no leftover placeholder.
     assert len(slack.acks) == 1
     assert slack.acks[0]["ts"] in slack.deleted_ts
-    assert slack.posts == []
+    # A new session posts one durable config-summary message (agent / harness /
+    # workspace + web-UI link) as the first thread message.
+    assert len(slack.posts) == 1
+    info_text = slack.posts[0]["text"]
+    assert "debby" in info_text  # agent name
+    assert "claude-native" in info_text  # harness
+    assert "/c/conv_1|Open in Omnigent>" in info_text  # web-UI link
+    # The config summary comes FIRST, then the "Working on it…" ack: the thread
+    # reads metadata → ack → answer.
+    assert slack.posts[0]["order"] < slack.acks[0]["order"]
     # The placeholder stayed up until the streamed message was actually on
     # screen. This short answer buffers in the SDK and only becomes visible at
     # stop(); the ack was still live then and is deleted only afterwards, so the
@@ -424,9 +489,107 @@ async def test_app_mention_creates_session_and_posts_response(tmp_path: Path) ->
     assert stream.ack_live_when_visible is True
 
 
-async def test_ack_is_posted_and_cleared_on_host_unavailable(tmp_path: Path) -> None:
-    # Even when the session can't start, the immediate ack is posted and then
-    # deleted before the guidance reply, so no placeholder lingers.
+async def test_failed_handle_unclaims_event_so_it_can_retry(tmp_path: Path) -> None:
+    # Regression: the event is claimed (dedup) and Bolt auto-acks before the turn
+    # runs, so Slack won't redeliver. If handling then fails, the claim must be
+    # released — otherwise the user's message is permanently swallowed and even a
+    # re-send with the same id is deduped away.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    boom = RuntimeError("DB hiccup mid-route")
+    original_get_session = store.get_session
+    fail_next = {"on": True}
+
+    async def _flaky_get_session(key: ThreadKey):  # type: ignore[no-untyped-def]
+        if fail_next["on"]:
+            raise boom
+        return await original_get_session(key)
+
+    store.get_session = _flaky_get_session  # type: ignore[method-assign]
+
+    args: dict[str, Any] = {
+        "body": {"team_id": "T1", "event_id": "Ev1"},
+        "event": {"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        "client": slack,
+        "context": {"bot_user_id": "B1"},
+    }
+    # The handler propagates the failure (Bolt's error handler logs it)...
+    with pytest.raises(RuntimeError):
+        await service.handle_app_mention(**args)  # type: ignore[arg-type]
+
+    # ...and the event was unclaimed, so the SAME id is processable again.
+    fail_next["on"] = False
+    store.get_session = original_get_session  # type: ignore[method-assign]
+    await service.handle_app_mention(**args)  # type: ignore[arg-type]
+    stream = await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The retry actually ran the turn (it wasn't deduped away).
+    assert omnigent.turns == [("conv_1", "hello")]
+    assert stream.text == "hello final"
+
+
+async def test_session_title_falls_back_when_permalink_unavailable(tmp_path: Path) -> None:
+    # The title lookup is cosmetic and must never block session start: if
+    # chat.getPermalink fails (e.g. a missing scope), fall back to a plain
+    # channel/ts descriptor and still create the session.
+    store = await _store(tmp_path)
+
+    class NoPermalinkSlack(FakeSlackClient):
+        async def chat_getPermalink(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("missing scope")
+
+    slack = NoPermalinkSlack()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    assert len(omnigent.created) == 1
+    assert omnigent.created[0][1] == "Slack thread C1/100.1"
+
+
+async def test_session_info_omits_missing_fields(tmp_path: Path) -> None:
+    # The config summary degrades gracefully when the snapshot omits harness /
+    # agent (unreadable or older session) — no "None", no crash.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    omnigent.info_harness = None
+    omnigent.info_agent_name = None
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    info_text = slack.posts[0]["text"]
+    assert "None" not in info_text
+    assert "/c/conv_1|Open in Omnigent>" in info_text  # link still present
+
+
+async def test_no_ack_when_session_cannot_start_host_unavailable(tmp_path: Path) -> None:
+    # The "Working on it…" placeholder is posted only after the session is
+    # established, so a failed start shows just the guidance — no placeholder
+    # flicker to clear.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = HostUnavailableClient()
@@ -442,9 +605,8 @@ async def test_ack_is_posted_and_cleared_on_host_unavailable(tmp_path: Path) -> 
     await _wait_for_posts(slack, 1)
     await service.shutdown()
 
-    assert len(slack.acks) == 1
-    assert slack.acks[0]["ts"] in slack.deleted_ts
-    # The only durable post is the guidance, not the ack.
+    assert slack.acks == []
+    # The only durable post is the guidance.
     assert len(slack.posts) == 1
     assert "omni host --server http://omnigent.test" in slack.posts[-1]["text"]
 
@@ -507,8 +669,8 @@ class StreamingClient(FakeOmnigentClient):
 class NoDeltaIdleClient(FakeOmnigentClient):
     """Mirrors a real claude-native short answer: NO text deltas — the answer
     arrives only as a committed ``output_item.done`` — and the turn ends on
-    ``session.status: idle`` (not ``response.completed``), exercising the grace
-    window. The ack must stay live until the buffered answer is on screen.
+    ``session.status: idle`` (not ``response.completed``). The ack must stay live
+    until the buffered answer is on screen.
     """
 
     async def run_turn(
@@ -541,8 +703,6 @@ async def test_no_delta_idle_answer_keeps_ack_until_visible(tmp_path: Path) -> N
     slack = FakeSlackClient()
     omnigent = NoDeltaIdleClient(final_text="Here is the answer.")
     service, _pool, _setup = _service(store, omnigent)
-    # Snapshot idle so the grace window ends promptly.
-    omnigent.status = "idle"  # type: ignore[attr-defined]
     await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
@@ -560,6 +720,63 @@ async def test_no_delta_idle_answer_keeps_ack_until_visible(tmp_path: Path) -> N
     assert stream.ack_live_when_visible is True
     assert len(slack.acks) == 1
     assert slack.acks[0]["ts"] in slack.deleted_ts
+
+
+class MultiMessageClient(FakeOmnigentClient):
+    """Streams two assistant messages back to back, each tagged with its own
+    ``message_id`` — the claude-native shape when the agent narrates between tool
+    calls. The deltas arrive with no boundary between the two messages.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running", "response_id": "resp_1"}
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "Let me poll once more.",
+            "message_id": "msg_a",
+        }
+        # A tool call runs between the two messages; the next delta belongs to a
+        # NEW assistant message (distinct message_id).
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "The credentials agent is taking longer.",
+            "message_id": "msg_b",
+        }
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
+
+
+async def test_back_to_back_messages_get_paragraph_break(tmp_path: Path) -> None:
+    # Regression: consecutive assistant messages (distinct message_id) must not
+    # run together ("…once more.The credentials…"). A paragraph break is inserted
+    # at the id boundary so each message reads as its own block, mirroring the web
+    # UI's separate bubbles.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = MultiMessageClient(final_text="")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> status?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The two messages are separated by a blank line, not concatenated.
+    assert (
+        slack.streamed_text == "Let me poll once more.\n\nThe credentials agent is taking longer."
+    )
 
 
 async def test_long_answer_streams_in_full(tmp_path: Path) -> None:
@@ -582,9 +799,10 @@ async def test_long_answer_streams_in_full(tmp_path: Path) -> None:
     await service.shutdown()
 
     # The full answer is delivered (deltas + stop tail) with one stream, no
-    # overflow chat.postMessage replies.
+    # overflow chat.postMessage replies — the only durable post is the session
+    # config summary, which never carries answer text.
     assert stream.text == long_answer
-    assert slack.posts == []
+    assert all(long_answer not in str(p.get("text", "")) for p in slack.posts)
 
 
 async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) -> None:
@@ -638,15 +856,20 @@ async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) 
 
     # The stream delivered the real answer, not the error.
     assert stream.text == "the real answer"
-    # The failure is a separate reply in the same thread.
-    failure_posts = [p for p in slack.posts if "failed" in str(p.get("text", ""))]
+    # The failure is a separate reply in the same thread — a GENERIC message; the
+    # raw in-band detail ("boom", which could be a stack trace) is NEVER echoed.
+    failure_posts = [p for p in slack.posts if "went wrong" in str(p.get("text", ""))]
     assert len(failure_posts) == 1
-    assert "boom" in failure_posts[0]["text"]
+    assert "boom" not in failure_posts[0]["text"]
     assert failure_posts[0]["thread_ts"] == "100.1"
 
 
-async def test_turn_error_without_answer_finalizes_with_error(tmp_path: Path) -> None:
-    """When nothing streamed, the error surfaces as the stream's final text."""
+async def test_turn_error_without_answer_finalizes_with_generic_message(tmp_path: Path) -> None:
+    """When nothing streamed, a GENERIC failure surfaces as the stream's final text.
+
+    The raw in-band error ("boom" — which could be a stack trace / internal path)
+    is logged server-side but NEVER echoed to the channel (DESIGN.md).
+    """
     store = await _store(tmp_path)
     slack = FakeSlackClient()
 
@@ -662,7 +885,7 @@ async def test_turn_error_without_answer_finalizes_with_error(tmp_path: Path) ->
             self.turns.append((session_id, text))
             yield {
                 "type": "response.failed",
-                "response": {"error": {"message": "boom"}},
+                "response": {"error": {"message": "boom /secret/internal/path"}},
             }
 
     omnigent = ErroringNoAnswerClient()
@@ -678,9 +901,52 @@ async def test_turn_error_without_answer_finalizes_with_error(tmp_path: Path) ->
     stream = await _wait_for_stream_stop(slack)
     await service.shutdown()
 
-    assert "boom" in (stream.stop_text or "")
-    # No extra failure reply when there was no answer to preserve.
-    assert slack.posts == []
+    # The generic failure is shown; the raw detail is NOT leaked to the channel.
+    assert "went wrong" in (stream.stop_text or "")
+    assert "boom" not in (stream.stop_text or "")
+    assert "/secret/internal/path" not in (stream.stop_text or "")
+
+
+async def test_exhausted_reconnect_shows_non_alarming_text(tmp_path: Path) -> None:
+    # A mid-stream drop whose reconnects are exhausted surfaces as
+    # StreamInterruptedError. The server stayed reachable, so the user must NOT be
+    # told to reconfigure — they get the "lost the live connection" notice, and
+    # the turn's result may still land in the thread.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class StreamInterruptedClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            raise StreamInterruptedError("stream dropped mid-turn")
+            yield  # pragma: no cover -- makes this an async generator
+
+    omnigent = StreamInterruptedClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
+    # The notice is a public post (not ephemeral): the non-alarming stream-drop
+    # text, never the "server unreachable / reconfigure" guidance.
+    text = slack.posts[-1]["text"]
+    assert text == _STREAM_INTERRUPTED_TEXT
+    assert text != _SERVER_UNREACHABLE_TEXT
+    assert "reconfigure" not in text
 
 
 async def test_stream_closed_mid_turn_continues_in_new_stream(tmp_path: Path) -> None:
@@ -708,9 +974,40 @@ async def test_stream_closed_mid_turn_continues_in_new_stream(tmp_path: Path) ->
     # first, and together they reconstruct the full answer with no lost text.
     assert len(slack.streams) >= 2
     assert slack.streamed_text == "chunk-a" + "y" * 600
-    # The continuation streamed in the same thread; no static catch-up reply.
+    # The continuation streamed in the same thread; no static catch-up reply
+    # (the answer text never appears in a durable post — only the config summary).
     assert slack.streams[-1].start_kwargs["thread_ts"] == "100.1"
-    assert slack.posts == []
+    assert all("chunk-a" not in str(p.get("text", "")) for p in slack.posts)
+
+
+async def test_stream_message_not_found_also_reopens(tmp_path: Path) -> None:
+    # Regression: a turn that outlives repeated proxy stream-drop reconnects can be
+    # so old that Slack reports the streaming message as ``message_not_found`` (not
+    # just ``message_not_in_streaming_state``). Both mean "the stream is dead —
+    # reopen"; a mishandled ``message_not_found`` previously surfaced as a generic
+    # turn failure instead of continuing in a fresh reply.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    slack.stream_close_after = 1
+    slack.stream_close_error = "message_not_found"
+    omnigent = StreamingClient(final_text="chunk-a" + "y" * 600)
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hello"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # Reopened into a fresh stream and delivered the full answer — no generic
+    # failure post.
+    assert len(slack.streams) >= 2
+    assert slack.streamed_text == "chunk-a" + "y" * 600
+    assert all("went wrong" not in str(p.get("text", "")) for p in slack.posts)
 
 
 async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Path) -> None:
@@ -749,10 +1046,11 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
 
     # Both deltas streamed live (across the reopened stream); nothing was lost.
     assert slack.streamed_text == "part one part two"
-    # The failure is its own clean reply, not the raw stream-closed error.
-    failure_posts = [p for p in slack.posts if "failed" in str(p.get("text", ""))]
+    # The failure is its own clean, GENERIC reply — the raw in-band detail is not
+    # echoed to the channel.
+    failure_posts = [p for p in slack.posts if "went wrong" in str(p.get("text", ""))]
     assert len(failure_posts) == 1
-    assert "boom" in failure_posts[0]["text"]
+    assert "boom" not in failure_posts[0]["text"]
 
 
 async def test_empty_app_mention_prompts_without_creating_session(tmp_path: Path) -> None:
@@ -813,6 +1111,22 @@ async def test_direct_message_creates_session(tmp_path: Path) -> None:
     service, _pool, _setup = _service(store, omnigent)
     await _configure_user(store, "T1", "U1")
 
+    stream = await _run_dm_and_stop(service, slack)
+    await service.shutdown()
+
+    assert len(omnigent.created) == 1
+    assert omnigent.created[0][0] == "ag_1"
+    assert omnigent.bound == ["conv_1"]
+    assert omnigent.turns == [("conv_1", "hello there")]
+    # A DM keys its session PER THREAD (like a channel): this top-level message
+    # keys on its own ts, starting a new thread/session.
+    record = await store.get_session(ThreadKey("T1", "D1", "100.1"))
+    assert record is not None and record.session_id == "conv_1"
+    # The reply threads under the triggering message.
+    assert stream.start_kwargs["thread_ts"] == "100.1"
+
+
+async def _run_dm_and_stop(service: Any, slack: "FakeSlackClient") -> "FakeStream":
     await service.handle_message(
         body={"team_id": "T1", "event_id": "Ev1"},
         event={
@@ -825,18 +1139,12 @@ async def test_direct_message_creates_session(tmp_path: Path) -> None:
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_stream_stop(slack)
-    await service.shutdown()
-
-    assert len(omnigent.created) == 1
-    assert omnigent.created[0][0] == "ag_1"
-    assert omnigent.bound == ["conv_1"]
-    assert omnigent.turns == [("conv_1", "hello there")]
-    record = await store.get_session(ThreadKey("T1", "D1", "100.1"))
-    assert record is not None and record.session_id == "conv_1"
+    return await _wait_for_stream_stop(slack)
 
 
-async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> None:
+async def test_direct_message_threaded_reply_reuses_existing_session(tmp_path: Path) -> None:
+    # A DM maps one session PER THREAD (like a channel): a reply carrying the
+    # thread's root ts reuses that thread's session rather than creating a new one.
     store = await _store(tmp_path)
     key = ThreadKey(team_id="T1", channel_id="D1", thread_ts="100.1")
     await store.upsert_session(
@@ -854,7 +1162,7 @@ async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> N
         event={
             "channel": "D1",
             "channel_type": "im",
-            "thread_ts": "100.1",
+            "thread_ts": "100.1",  # a reply under the existing thread root
             "ts": "101.1",
             "user": "U1",
             "text": "follow up",
@@ -868,6 +1176,40 @@ async def test_direct_message_reply_reuses_existing_session(tmp_path: Path) -> N
     assert omnigent.created == []
     assert omnigent.bound == []
     assert omnigent.turns == [("conv_existing", "follow up")]
+
+
+async def test_direct_message_top_level_starts_new_session_per_thread(tmp_path: Path) -> None:
+    # A DM is NOT one standing session per channel: a bare top-level DM (its own
+    # ts, no thread_ts) starts a NEW thread/session, keyed on its ts.
+    store = await _store(tmp_path)
+    # An unrelated prior DM thread exists on the same channel.
+    await store.upsert_session(
+        ThreadKey("T1", "D1", "099.9"), "conv_old", "title", owner_user_id="U1"
+    )
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "101.1",  # top-level, no thread_ts
+            "user": "U1",
+            "text": "brand new topic",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # A new session was created for the new thread, keyed on the message ts.
+    assert omnigent.turns == [("conv_1", "brand new topic")]
+    record = await store.get_session(ThreadKey("T1", "D1", "101.1"))
+    assert record is not None and record.session_id == "conv_1"
 
 
 async def test_message_while_server_busy_is_deflected(tmp_path: Path) -> None:
@@ -999,6 +1341,53 @@ async def test_message_while_awaiting_action_points_to_pending_request(tmp_path:
     notices = [e for e in slack.ephemerals if "waiting on your response" in e["text"].lower()]
     assert len(notices) == 1
     assert notices[0]["user"] == "U1"
+
+
+async def test_message_while_parked_in_process_points_to_pending_request(tmp_path: Path) -> None:
+    # Regression: a turn parked on a pending elicitation is STILL streaming, so it
+    # holds the in-process reservation — a new message hits the _active_threads
+    # branch, not the server-activity one. That branch must still surface the
+    # "respond to the pending request above" notice (needs_action=True), NOT the
+    # generic "still working" one, by consulting the server's activity.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    # While parked, the server reports the session needs user action.
+    omnigent.route_pending_elicitation = True
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    # First mention parks on the approval card (the turn keeps streaming).
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_card(slack)
+
+    # A second mention in the same thread WHILE the card is pending in-process.
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "101.1",
+            "user": "U1",
+            "text": "<@B1> another",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+
+    # It got the pending-request notice, not the generic "still working" one.
+    notices = [e for e in slack.ephemerals if "waiting on your response" in e["text"].lower()]
+    assert len(notices) == 1
+    assert notices[0]["user"] == "U1"
+    assert not any("still working" in e["text"].lower() for e in slack.ephemerals)
+
+    # Tear down with the card still parked (shutdown cancels the resolver).
+    await service.shutdown()
 
 
 async def test_idle_follow_up_message_runs_in_thread(tmp_path: Path) -> None:
@@ -1204,6 +1593,74 @@ async def test_channel_followup_from_other_user_is_ignored(tmp_path: Path) -> No
     assert "start a new thread" in notice["text"].lower()
 
 
+async def test_non_owner_reply_rejected_without_session_record(tmp_path: Path) -> None:
+    # Security regression guard: even with NO stored session (e.g. the ephemeral
+    # store was wiped by a restart), a reply into another user's thread must be
+    # refused. Slack's ``parent_user_id`` (the thread root author) is authoritative
+    # and survives restarts, so the non-owner is turned away rather than silently
+    # granted a fresh session in someone else's thread.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, setup = _service(store, omnigent)
+    # U2 is configured, so the only thing stopping them is the ownership gate.
+    await _configure_user(store, "T1", "U2")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "101.1",
+            "user": "U2",
+            "parent_user_id": "U1",  # thread was started by U1
+            "text": "<@B1> jumping into U1's thread",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await service.shutdown()
+
+    # No session was created for U2, no setup prompt — just the private notice.
+    assert omnigent.turns == []
+    assert omnigent.created == []
+    assert setup.prompted == []
+    assert slack.posts == []
+    assert len(slack.ephemerals) == 1
+    assert slack.ephemerals[0]["user"] == "U2"
+    assert "start a new thread" in slack.ephemerals[0]["text"].lower()
+
+
+async def test_owner_reply_in_own_thread_is_allowed(tmp_path: Path) -> None:
+    # The owner replying in their OWN thread (parent_user_id == requester) passes
+    # the ownership gate and runs, even after a store wipe (no session record).
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = FakeOmnigentClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "C1",
+            "thread_ts": "100.1",
+            "ts": "101.1",
+            "user": "U1",
+            "parent_user_id": "U1",  # U1 owns this thread
+            "text": "<@B1> continuing my own thread",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The owner's turn ran (a fresh session, since the store had no record).
+    assert len(omnigent.created) == 1
+    assert slack.ephemerals == []
+
+
 async def test_turn_runs_against_the_fixed_operator_server(tmp_path: Path) -> None:
     # The bot always routes to the operator-configured server; the user's saved
     # config only carries the agent/host/workspace choice.
@@ -1285,14 +1742,16 @@ async def test_unreachable_server_prompts_config_command(tmp_path: Path) -> None
     assert "couldn't reach" in text.lower()
 
 
-async def test_auth_required_clears_ack_and_prompts_relogin(tmp_path: Path) -> None:
-    # A user with saved config but no valid token (e.g. bot restarted, in-memory
-    # tokens lost) must NOT be left with a lingering "Working on it…" — the ack
-    # is cleared and a re-login prompt is posted instead.
+async def test_auth_required_prompts_relogin(tmp_path: Path) -> None:
+    # A user with saved config but an expired/lost token is told to log in
+    # again — via the setup flow's DM re-login prompt (a reliably-delivered,
+    # actionable button), NOT a plain thread notice a user may never see. The ack
+    # posts only after the session starts, so a failed start leaves no
+    # "Working on it…" behind.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = AuthRequiredClient()
-    service, _pool, _setup = _service(store, omnigent)
+    service, _pool, setup = _service(store, omnigent)
     await _configure_user(store, "T1", "U1")
 
     await service.handle_app_mention(
@@ -1301,23 +1760,108 @@ async def test_auth_required_clears_ack_and_prompts_relogin(tmp_path: Path) -> N
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_posts(slack, 1)
+    for _ in range(50):
+        if setup.relogin_prompted:
+            break
+        await asyncio.sleep(0.02)
     await service.shutdown()
 
-    # The placeholder was posted and then deleted — nothing lingers.
-    assert len(slack.acks) == 1
-    assert slack.acks[0]["ts"] in slack.deleted_ts
-    # No session persisted; the user is told to log in again.
+    # No placeholder was posted (session never started).
+    assert slack.acks == []
+    # No session persisted.
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
-    text = slack.posts[-1]["text"]
-    assert "/omnigent" in text
-    assert "log in" in text.lower() or "login" in text.lower()
+    # The re-login DM prompt was triggered for the owner (not a plain thread post).
+    assert slack.posts == []
+    assert len(setup.relogin_prompted) == 1
+    prompt = setup.relogin_prompted[-1]
+    assert prompt["user_id"] == "U1"
+    assert prompt["channel"] == "C1"
+    assert prompt["in_channel"] is True
 
 
-async def test_server_error_creating_session_clears_ack_and_reports(tmp_path: Path) -> None:
+async def test_auth_required_mid_stream_prompts_relogin(tmp_path: Path) -> None:
+    # The token expires DURING the turn (the stream raises AuthRequiredError), not
+    # at startup. This must also route to the DM re-login prompt — not a raw error
+    # or a stranded "Working on it…".
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class AuthMidStreamClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            raise AuthRequiredError("401 mid-stream")
+            yield  # pragma: no cover -- makes this an async generator
+
+    omnigent = AuthMidStreamClient()
+    service, _pool, setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    for _ in range(50):
+        if setup.relogin_prompted:
+            break
+        await asyncio.sleep(0.02)
+    await service.shutdown()
+
+    # The mid-stream auth failure routed to the re-login DM prompt.
+    assert len(setup.relogin_prompted) == 1
+    assert setup.relogin_prompted[-1]["user_id"] == "U1"
+    # No raw error text leaked to the thread.
+    assert all("401" not in str(p.get("text", "")) for p in slack.posts)
+
+
+async def test_auth_required_in_dm_skips_in_channel_pointer(tmp_path: Path) -> None:
+    # In a DM the re-login post lands in the same conversation, so the redundant
+    # "check your DM" ephemeral pointer must NOT be posted (in_channel=False).
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = AuthRequiredClient()
+    service, _pool, setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_message(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={
+            "channel": "D1",
+            "channel_type": "im",
+            "ts": "100.1",
+            "user": "U1",
+            "text": "hi",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    for _ in range(50):
+        if setup.relogin_prompted:
+            break
+        await asyncio.sleep(0.02)
+    await service.shutdown()
+
+    assert len(setup.relogin_prompted) == 1
+    prompt = setup.relogin_prompted[-1]
+    assert prompt["user_id"] == "U1"
+    assert prompt["channel"] == "D1"
+    # A DM already receives the re-login post directly — no channel pointer.
+    assert prompt["in_channel"] is False
+
+
+async def test_server_error_creating_session_reports(tmp_path: Path) -> None:
     # A 500 from create_session raises a bare OmnigentError (not one of the
-    # specifically-handled subclasses). It must still clear the "Working on
-    # it…" placeholder and post a failure — never strand the thread.
+    # specifically-handled subclasses). It must still post a failure and never
+    # strand the thread. The ack posts only after the session starts, so a
+    # failed start leaves no placeholder to clear.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = ServerErrorClient()
@@ -1333,13 +1877,19 @@ async def test_server_error_creating_session_clears_ack_and_reports(tmp_path: Pa
     await _wait_for_posts(slack, 1)
     await service.shutdown()
 
-    # Placeholder posted then deleted — nothing lingers on "Working on it…".
-    assert len(slack.acks) == 1
-    assert slack.acks[0]["ts"] in slack.deleted_ts
+    # No placeholder was posted (session never started).
+    assert slack.acks == []
     # A failure reply was posted, and no session was persisted.
     assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
     text = slack.posts[-1]["text"]
-    assert "failed" in text.lower()
+    # A GENERIC startup-failure message — the raw OmnigentError detail (which can
+    # carry a server status / internal string) is NOT echoed to the channel.
+    assert "went wrong" in text.lower()
+    assert "internal_error" not in text
+    assert "500" not in text
+    # A non-auth error is PUBLIC (affects everyone on the thread), unlike the
+    # expired-login notice which is DM'd to the owner — no ephemeral here.
+    assert slack.ephemerals == []
 
 
 async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:
@@ -1362,6 +1912,41 @@ async def test_no_online_host_prompts_omni_host_command(tmp_path: Path) -> None:
     text = slack.posts[-1]["text"]
     assert "omni host --server http://omnigent.test" in text
     assert "/omnigent" in text
+
+
+class HarnessNotConfiguredClient(FakeOmnigentClient):
+    async def launch_runner(
+        self, session_id: str, *, workspace: str, host_id: str | None = None
+    ) -> str:
+        raise HarnessNotConfiguredError(
+            "host failed to launch runner: claude CLI not found; run omnigent setup"
+        )
+
+
+async def test_harness_not_configured_412_surfaces_server_message(tmp_path: Path) -> None:
+    # A 412 on runner launch (harness not set up on the host) is actionable — the
+    # server's message must reach the user so they know to run `omnigent setup`,
+    # not a generic "request failed".
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = HarnessNotConfiguredClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> hi"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_posts(slack, 1)
+    await service.shutdown()
+
+    # Session was not persisted (startup failed) and the actionable message shows.
+    assert await store.get_session(ThreadKey("T1", "C1", "100.1")) is None
+    text = slack.posts[-1]["text"]
+    assert "omnigent setup" in text
+    assert "status 412" not in text  # not the generic fallback
 
 
 # ── Tool-approval (elicitation) flow ─────────────────────────────────
@@ -1407,12 +1992,26 @@ def _form_elicitation_event(elicitation_id: str = "elicit_form") -> dict[str, An
     }
 
 
+async def _wait_any(*events: asyncio.Event) -> None:
+    """Wait until any of ``events`` is set (with a safety timeout)."""
+    waiters = [asyncio.ensure_future(e.wait()) for e in events]
+    try:
+        await asyncio.wait(waiters, timeout=5.0, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for w in waiters:
+            if not w.done():
+                w.cancel()
+
+
 class ApprovalClient(FakeOmnigentClient):
     """A turn that streams, parks on an elicitation, then streams a tail.
 
-    The generator yields the elicitation event and then blocks until the worker
-    resolves it (the worker awaits the verdict before pulling the next event).
-    This mirrors the server keeping the stream open across the park.
+    Pure-push model: the generator yields the elicitation event, then WAITS for
+    the verdict to be resolved — either the bot POSTs it (``resolve_signal``, a
+    Slack click) or the test resolves it externally (``resolve_externally``).
+    It then emits the server's ``response.elicitation_resolved`` push, streams
+    the continuation, and ends on an id-bearing idle. This mirrors the real
+    server holding the continuation until the elicitation is answered.
     """
 
     def __init__(
@@ -1421,6 +2020,9 @@ class ApprovalClient(FakeOmnigentClient):
         super().__init__(final_text="done")
         self._elicitation_id = elicitation_id
         self._event = event or _elicitation_event(elicitation_id)
+        # When set, the fixture emits elicitation_resolved WITHOUT waiting for the
+        # bot to POST a verdict — models an answer in the web UI / another client.
+        self.resolve_externally = asyncio.Event()
 
     async def run_turn(
         self,
@@ -1433,10 +2035,15 @@ class ApprovalClient(FakeOmnigentClient):
         self.turns.append((session_id, text))
         yield {"type": "response.output_text.delta", "delta": "work"}
         yield self._event
-        # The worker resolves the elicitation before requesting more events;
-        # by the time control returns here the verdict has been delivered.
+        # Keep the stream "open": wait until the elicitation is answered — either
+        # the bot POSTs a verdict (Slack click) or the test resolves it elsewhere.
+        await _wait_any(self.resolve_signal, self.resolve_externally)
+        yield {
+            "type": "response.elicitation_resolved",
+            "elicitation_id": self._elicitation_id,
+        }
         yield {"type": "response.output_text.delta", "delta": "ing"}
-        yield {"type": "session.status", "status": "idle"}
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
 
 class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
@@ -1470,6 +2077,9 @@ class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
             },
         }
         yield self._event
+        # Wait for the answer, then the server pushes elicitation_resolved.
+        await _wait_any(self.resolve_signal)
+        yield {"type": "response.elicitation_resolved", "elicitation_id": "elicit_form"}
         # Post-answer message arrives ONLY as a committed item (no deltas) — the
         # tail must be recovered and delivered, not dropped.
         yield {
@@ -1480,7 +2090,7 @@ class PreambleThenCommittedAnswerClient(FakeOmnigentClient):
                 "content": [{"type": "output_text", "text": "You picked A. Full summary here."}],
             },
         }
-        yield {"type": "session.status", "status": "idle"}
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
 
 async def _wait_for_card(client: FakeSlackClient) -> dict[str, Any]:
@@ -1494,13 +2104,21 @@ async def _wait_for_card(client: FakeSlackClient) -> dict[str, Any]:
     raise AssertionError("Timed out waiting for an approval card")
 
 
-def _card_elicitation_id(card: dict[str, Any]) -> str:
+def _card_target(card: dict[str, Any]) -> Any:
     for block in card.get("blocks", []):
         if block.get("type") == "actions":
             target = parse_action_value(block["elements"][0]["value"])
             assert target is not None
-            return target.elicitation_id
+            return target
     raise AssertionError("Card has no actions block")
+
+
+def _card_elicitation_id(card: dict[str, Any]) -> str:
+    return str(_card_target(card).elicitation_id)
+
+
+def _card_session_id(card: dict[str, Any]) -> str:
+    return str(_card_target(card).session_id)
 
 
 async def _wait_for_resolved(omnigent: "FakeOmnigentClient", count: int = 1) -> None:
@@ -1532,8 +2150,9 @@ async def test_tool_approval_approve_resumes_turn(tmp_path: Path) -> None:
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
+    sid = _card_session_id(card)
     delivered = await service.handle_elicitation_action(
-        elicitation_id=eid, verdict=Verdict(accepted=True)
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
     )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
@@ -1574,7 +2193,10 @@ async def test_short_pre_card_text_is_flushed_before_the_card(tmp_path: Path) ->
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
-    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=True))
+    sid = _card_session_id(card)
+    await service.handle_elicitation_action(
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
+    )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
 
@@ -1585,6 +2207,64 @@ async def test_short_pre_card_text_is_flushed_before_the_card(tmp_path: Path) ->
     assert pre_card.forced_flush_order is not None, "pre-card text was not force-flushed"
     # The forced flush happened strictly before the card message was posted.
     assert pre_card.forced_flush_order < card["order"]
+
+
+async def test_idle_stream_flushes_buffered_text_before_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A short delta (well under the SDK buffer) followed by an idle gap must be
+    # revealed while the stream is quiet — not held invisible until the turn
+    # ends. The read loop detects the idle window and force-flushes it.
+    monkeypatch.setattr(service_module, "_IDLE_FLUSH_SECONDS", 0.05)
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    release = asyncio.Event()
+
+    class IdleThenEndClient(FakeOmnigentClient):
+        async def run_turn(
+            self,
+            session_id: str,
+            text: str,
+            *,
+            workspace: str | None = None,
+            host_id: str | None = None,
+        ) -> AsyncIterator[dict[str, Any]]:
+            self.turns.append((session_id, text))
+            # A short burst that won't fill the SDK buffer, then go quiet.
+            yield {"type": "response.output_text.delta", "delta": "partial answer"}
+            # Stay open (no further events) until the test has verified the
+            # buffered text was flushed during the idle window.
+            await _wait_any(release)
+            yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
+
+    omnigent = IdleThenEndClient(final_text="partial answer")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> go"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    # Before the turn ends, the idle window should have force-flushed the buffered
+    # "partial answer" onto the screen.
+    for _ in range(100):
+        if slack.streams and slack.streams[0].forced_flush_order is not None:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        release.set()
+        await service.shutdown()
+        raise AssertionError("buffered text was not flushed during the idle window")
+
+    # It was revealed WHILE the turn was still open (before we let it end).
+    assert slack.streams[0].text == "partial answer"
+
+    release.set()
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
 
 
 async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
@@ -1602,7 +2282,10 @@ async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
-    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=False))
+    sid = _card_session_id(card)
+    await service.handle_elicitation_action(
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=False)
+    )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
 
@@ -1610,39 +2293,228 @@ async def test_tool_approval_deny_forwards_decline(tmp_path: Path) -> None:
     assert "Denied" in slack.updates[-1]["blocks"][0]["text"]["text"]
 
 
-async def test_elicitation_resolved_externally_unblocks_without_verdict(tmp_path: Path) -> None:
-    # The user answers the request in the web UI instead of clicking the Slack
-    # card. The worker must stop waiting (once the server shows it no longer
-    # pending) and NOT post its own verdict — otherwise it blocks to the
-    # coordinator timeout, holding the thread's turn open and deflecting its
-    # follow-ups the whole time.
+async def test_elicitation_resolved_externally_finalizes_without_posting(tmp_path: Path) -> None:
+    # Pure-push: the user answers in the web UI (not the Slack card). The loop
+    # keeps reading and sees response.elicitation_resolved; it must finalize the
+    # card ("Answered elsewhere") WITHOUT posting its own verdict, and the
+    # continuation must still stream.
     store = await _store(tmp_path)
     slack = FakeSlackClient()
     omnigent = ApprovalClient()
     service, _pool, _setup = _service(store, omnigent)
-    service._external_resolve_poll_seconds = 0.02  # type: ignore[attr-defined]
     await _configure_user(store, "T1", "U1")
 
-    # User will answer elsewhere; the card click never comes.
-    omnigent.elicitation_pending = False
     await service.handle_app_mention(
         body={"team_id": "T1", "event_id": "Ev1"},
         event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    # Wait for the card to be updated with the outcome (the external-resolve path).
-    for _ in range(100):
-        if slack.updates:
-            break
-        await asyncio.sleep(0.02)
+    await _wait_for_card(slack)
+    # No Slack click — resolve elsewhere; the fixture then emits the push.
+    omnigent.resolve_externally.set()
+    await _wait_for_turn_end(slack)
     await service.shutdown()
 
-    # The bot did not post its own verdict (the server already has it), and the
-    # card was updated to reflect the external resolution.
+    # We posted NO verdict (answered elsewhere), the card shows the neutral
+    # outcome, and the continuation ("ing") streamed after the card.
     assert omnigent.resolved == []
-    assert slack.updates
     assert "Answered elsewhere" in slack.updates[-1]["blocks"][0]["text"]["text"]
+    assert any("ing" in s.text for s in slack.streams)
+
+
+async def test_abandoned_elicitation_at_turn_end_is_declined(tmp_path: Path) -> None:
+    # A card left open when the turn is torn down (here: shutdown mid-park) was
+    # never answered and the server is still parked on it. finish_pending must
+    # DECLINE it (so the server park releases) and label it "Not answered", NOT
+    # mislabel it "Answered elsewhere" (nothing answered it).
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    # Neither a Slack click nor an external resolve — the card just sits open.
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_card(slack)
+    # Tear the turn down with the card still parked (mirrors a process shutdown).
+    await service.shutdown()
+
+    # The abandoned request was declined server-side (accepted=False), and the
+    # card shows the abandonment label with a retry hint — not "Answered elsewhere".
+    assert omnigent.resolved == [("conv_1", "elicit_1", False)]
+    assert slack.updates
+    card_text = slack.updates[-1]["blocks"][0]["text"]["text"]
+    assert "Not answered" in card_text
+    assert "Answered elsewhere" not in card_text
+
+
+async def test_elicitation_card_post_failure_declines_and_unregisters(tmp_path: Path) -> None:
+    # If posting the approval card fails, the coordinator waiter must not be
+    # orphaned and the server must not stay parked: the request is declined
+    # server-side and no pending entry is left behind.
+    store = await _store(tmp_path)
+
+    class CardPostFailsClient(FakeSlackClient):
+        async def chat_postMessage(self, **kwargs: Any) -> dict[str, Any]:
+            # The elicitation card carries an actions block — fail only that post,
+            # so acks/summaries still work and we isolate the card-post failure.
+            if any(b.get("type") == "actions" for b in (kwargs.get("blocks") or [])):
+                raise SlackApiError(
+                    "card post failed", {"ok": False, "error": "channel_not_found"}
+                )
+            return await super().chat_postMessage(**kwargs)
+
+    slack = CardPostFailsClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    # The turn's ApprovalClient waits for a resolve; the card-post failure declines
+    # it, which unblocks the stream and ends the turn without the 600s backstop.
+    await _wait_for_resolved(omnigent)
+    await service.shutdown()
+
+    # The request was declined server-side so the park releases (no orphaned wait).
+    assert omnigent.resolved == [("conv_1", "elicit_1", False)]
+    # No live coordinator waiter left behind.
+    assert service.elicitations._pending == {}  # type: ignore[attr-defined]
+
+
+async def test_verdict_post_failure_shows_delivery_failed_not_approved(tmp_path: Path) -> None:
+    # A Slack click whose resolve_elicitation POST raises must NOT label the card
+    # "Approved" — the server never received the verdict and is still parked. The
+    # card shows the delivery-failure notice instead, and no verdict is recorded.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class FailingResolveClient(ApprovalClient):
+        async def resolve_elicitation(
+            self,
+            session_id: str,
+            elicitation_id: str,
+            *,
+            accepted: bool,
+            content: dict[str, Any] | None = None,
+        ) -> None:
+            # The click reached us, but delivering it to the server fails.
+            raise ServerUnreachableError("verdict POST failed")
+
+    omnigent = FailingResolveClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    sid = _card_session_id(card)
+    await service.handle_elicitation_action(
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
+    )
+    # The turn never gets the push (the server never received the verdict); the
+    # card is finalized at turn teardown with the delivery-failure outcome.
+    await service.shutdown()
+
+    assert slack.updates
+    card_text = slack.updates[-1]["blocks"][0]["text"]["text"]
+    assert "Couldn't be delivered" in card_text
+    assert "Approved" not in card_text
+
+
+async def test_delivery_failed_releases_server_park_at_turn_end(tmp_path: Path) -> None:
+    # Regression: a failed verdict POST leaves the server parked on the
+    # elicitation. finish_pending must still DECLINE it (release the park) so the
+    # session isn't wedged, even though the card is labelled "delivery failed".
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+
+    class RecordingResolveClient(ApprovalClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resolve_calls: list[tuple[str, bool]] = []
+
+        async def resolve_elicitation(
+            self,
+            session_id: str,
+            elicitation_id: str,
+            *,
+            accepted: bool,
+            content: dict[str, Any] | None = None,
+        ) -> None:
+            self.resolve_calls.append((elicitation_id, accepted))
+            # The verdict delivery (accepted=True) fails; the later park-release
+            # decline (accepted=False) is allowed to succeed.
+            if accepted:
+                raise ServerUnreachableError("verdict POST failed")
+
+    omnigent = RecordingResolveClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    card = await _wait_for_card(slack)
+    eid = _card_elicitation_id(card)
+    sid = _card_session_id(card)
+    await service.handle_elicitation_action(
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
+    )
+    await service.shutdown()
+
+    # Two calls: the failed verdict delivery (accepted=True), then the park-release
+    # decline (accepted=False) at turn end so the server isn't left wedged.
+    assert (eid, True) in omnigent.resolve_calls
+    assert (eid, False) in omnigent.resolve_calls
+    # Card still shows the delivery-failure label, not "Approved".
+    card_text = slack.updates[-1]["blocks"][0]["text"]["text"]
+    assert "Couldn't be delivered" in card_text
+
+
+async def test_resolver_tasks_are_cancelled_on_shutdown(tmp_path: Path) -> None:
+    # A resolver awaiting a click that never comes must be cancelled on shutdown,
+    # not orphaned ("Task was destroyed but it is pending").
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = ApprovalClient()
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> edit"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_card(slack)
+    # A resolver is live and parked on the (never-arriving) click.
+    assert len(service._elicitation._resolvers) == 1  # type: ignore[attr-defined]
+    resolver = next(iter(service._elicitation._resolvers))  # type: ignore[attr-defined]
+
+    await service.shutdown()
+
+    # The resolver was cancelled/finished and dropped from the tracking set.
+    assert resolver.done()
+    assert service._elicitation._resolvers == set()  # type: ignore[attr-defined]
 
 
 async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -> None:
@@ -1663,9 +2535,12 @@ async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -
             host_id: str | None = None,
         ) -> AsyncIterator[dict[str, Any]]:
             self.turns.append((session_id, text))
-            # Only a gated tool call, no answer text; ends on idle.
+            # Only a gated tool call, no answer text. Park until the deny is
+            # posted, then the server resolves and ends the turn — no answer.
             yield _elicitation_event("elicit_rm")
-            yield {"type": "session.status", "status": "idle"}
+            await _wait_any(self.resolve_signal)
+            yield {"type": "response.elicitation_resolved", "elicitation_id": "elicit_rm"}
+            yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
     omnigent = DeniedNoAnswerClient()
     # A stale prior-turn answer exists on the server, pinned to a fixed id so it
@@ -1683,7 +2558,10 @@ async def test_denied_approval_does_not_resurrect_prior_answer(tmp_path: Path) -
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
-    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=False))
+    sid = _card_session_id(card)
+    await service.handle_elicitation_action(
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=False)
+    )
     for _ in range(100):
         if slack.streams and all(s.stopped for s in slack.streams):
             break
@@ -1729,7 +2607,7 @@ async def test_stale_approval_click_is_reported_as_not_delivered(tmp_path: Path)
 
     # No turn is parked on this id, so the click finds no waiter.
     delivered = await service.handle_elicitation_action(
-        elicitation_id="elicit_gone", verdict=Verdict(accepted=True)
+        session_id="sess_gone", elicitation_id="elicit_gone", verdict=Verdict(accepted=True)
     )
     await service.shutdown()
     assert delivered is False
@@ -1753,10 +2631,11 @@ async def test_form_elicitation_forwards_selections_as_content(tmp_path: Path) -
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
+    sid = _card_session_id(card)
     # Answers arrive as option indices ("Redis" is index 0); the service maps
     # them back to the full labels before forwarding to the server.
     await service.handle_elicitation_action(
-        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "0"})
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "0"})
     )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
@@ -1847,7 +2726,10 @@ async def test_url_mode_binary_renders_approval_card(tmp_path: Path) -> None:
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
-    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=True))
+    sid = _card_session_id(card)
+    await service.handle_elicitation_action(
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
+    )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
 
@@ -1876,8 +2758,9 @@ async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path)
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
+    sid = _card_session_id(card)
     await service.handle_elicitation_action(
-        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
     )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
@@ -1887,11 +2770,10 @@ async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path)
 
 
 class PreambleThenSilentAfterElicitationClient(FakeOmnigentClient):
-    """Models the stale-connection incident: a preamble streams, the elicitation
-    is handled, then the SSE connection goes SILENT — the post-answer message
-    never arrives on the stream (only the terminal idle does). The final answer
-    lives solely in the server's latest_assistant_message, recovered by the
-    no-delta fallback. Regression for a turn that hung + dropped the answer.
+    """The turn produces NO answer text on the stream at all — a preamble seals
+    at the elicitation, and after resolution the answer never streams (it lives
+    only in the server's committed message). Exercises the no-delta fallback
+    safety net: the final answer is recovered from latest_assistant_message.
     """
 
     def __init__(self, event: dict[str, Any]) -> None:
@@ -1909,10 +2791,12 @@ class PreambleThenSilentAfterElicitationClient(FakeOmnigentClient):
         self.turns.append((session_id, text))
         yield {"type": "response.output_text.delta", "delta": "Before deleting, let me look."}
         yield self._event
-        # After the verdict resolves, the connection is stale — no post-answer
-        # event arrives, only the eventual terminal idle. The answer is recovered
-        # from the server snapshot (latest_message), not the stream.
-        yield {"type": "session.status", "status": "idle"}
+        # Park until the verdict is posted; the answer then never streams (no
+        # delta, no committed item) — only the id-bearing terminal. The final
+        # answer is recovered from the server snapshot (latest_message).
+        await _wait_any(self.resolve_signal)
+        yield {"type": "response.elicitation_resolved", "elicitation_id": "elicit_form"}
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
 
 
 async def test_post_elicitation_answer_recovered_when_stream_silent(tmp_path: Path) -> None:
@@ -1938,8 +2822,9 @@ async def test_post_elicitation_answer_recovered_when_stream_silent(tmp_path: Pa
     )
     card = await _wait_for_card(slack)
     eid = _card_elicitation_id(card)
+    sid = _card_session_id(card)
     await service.handle_elicitation_action(
-        elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
     )
     await _wait_for_turn_end(slack)
     await service.shutdown()
@@ -1972,7 +2857,10 @@ async def test_elicitation_clears_working_placeholder(tmp_path: Path) -> None:
     assert slack.acks, "expected an ack to have been posted"
     assert all(a["ts"] in slack.deleted_ts for a in slack.acks)
     eid = _card_elicitation_id(card)
-    await service.handle_elicitation_action(elicitation_id=eid, verdict=Verdict(accepted=True))
+    sid = _card_session_id(card)
+    await service.handle_elicitation_action(
+        session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
+    )
     await _wait_for_resolved(omnigent)
     await service.shutdown()
 
@@ -2091,6 +2979,10 @@ async def test_answer_then_trailing_notice_is_not_duplicated(tmp_path: Path) -> 
     # into a fresh post-notice segment by the fallback.
     answer_segments = [s for s in slack.streams if "The full answer." in s.text]
     assert len(answer_segments) == 1
+    # And the sealed-off answer must NOT trip the empty-segment fallback: no
+    # "completed without returning response text" segment after the notice.
+    all_stream_text = " ".join(s.text for s in slack.streams)
+    assert "without returning" not in all_stream_text
 
 
 async def test_todos_posted_once_then_updated_in_place(tmp_path: Path) -> None:

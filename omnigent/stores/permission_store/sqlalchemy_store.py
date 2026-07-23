@@ -173,46 +173,75 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 .scalars()
                 .all()
             )
-            for row in rows:
-                conversation_id = row.conversation_id
-                if (
-                    session.get(
-                        SqlSessionPermission,
-                        (current_workspace_id(), to_user_id, conversation_id),
+            if not rows:
+                return 0
+            conversation_ids = [r.conversation_id for r in rows]
+            # Single query: which conversation_ids does to_user already hold?
+            existing_to = set(
+                session.execute(
+                    select(SqlSessionPermission.conversation_id).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == to_user_id,
+                        SqlSessionPermission.conversation_id.in_(conversation_ids),
                     )
-                    is not None
-                ):
-                    # Destination already has access — drop the duplicate.
-                    session.delete(row)
-                    continue
-                # user_id is part of the PK, so repoint with a targeted Core
-                # UPDATE rather than mutating the ORM object's primary key.
+                ).scalars()
+            )
+            # Partition into duplicates (to_user already has access) vs. reassigns.
+            duplicate_ids = [cid for cid in conversation_ids if cid in existing_to]
+            reassign_ids = [cid for cid in conversation_ids if cid not in existing_to]
+            # Bulk delete duplicates (to_user already has the grant).
+            if duplicate_ids:
+                session.execute(
+                    delete(SqlSessionPermission).where(
+                        SqlSessionPermission.workspace_id == current_workspace_id(),
+                        SqlSessionPermission.user_id == from_user_id,
+                        SqlSessionPermission.conversation_id.in_(duplicate_ids),
+                    )
+                )
+            # Bulk UPDATE reassigns in one statement.
+            if reassign_ids:
+                # user_id is part of the PK, so use a Core UPDATE.
                 session.execute(
                     update(SqlSessionPermission)
                     .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == from_user_id,
-                        SqlSessionPermission.conversation_id == conversation_id,
+                        SqlSessionPermission.conversation_id.in_(reassign_ids),
                     )
                     .values(user_id=to_user_id)
                 )
-                moved += 1
+                moved = len(reassign_ids)
             return moved
 
-    def list_for_session(self, conversation_id: str) -> list[SessionPermission]:
-        """Return all grants on a session. See base class for contract."""
+    def list_for_session(
+        self,
+        conversation_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[SessionPermission], str | None]:
+        """Return grants on a session with cursor pagination. See base class for contract."""
         with self._session() as session:
-            rows = (
-                session.execute(
-                    select(SqlSessionPermission).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.conversation_id == conversation_id,
-                    )
+            stmt = (
+                select(SqlSessionPermission)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == conversation_id,
                 )
-                .scalars()
-                .all()
+                .order_by(SqlSessionPermission.user_id.asc())
+                .limit(limit + 1)
             )
-            return [_to_entity(r) for r in rows]
+            if after_user_id is not None:
+                stmt = stmt.where(SqlSessionPermission.user_id > after_user_id)
+            rows = session.execute(stmt).scalars().all()
+        if len(rows) > limit:
+            rows = rows[:limit]
+            # Cursor is the last returned user_id; the next page uses an
+            # exclusive ``user_id > after_user_id`` filter.
+            next_cursor: str | None = rows[-1].user_id
+        else:
+            next_cursor = None
+        return [_to_entity(r) for r in rows], next_cursor
 
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""
@@ -237,15 +266,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
             result[entity.conversation_id].append(entity)
         return result
 
-    def list_for_user(self, user_id: str) -> list[SessionPermission]:
+    def list_for_user(self, user_id: str, *, limit: int = 1000) -> list[SessionPermission]:
         """Return all grants for a user. See base class for contract."""
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlSessionPermission).where(
+                    select(SqlSessionPermission)
+                    .where(
                         SqlSessionPermission.workspace_id == current_workspace_id(),
                         SqlSessionPermission.user_id == user_id,
                     )
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
@@ -278,12 +309,14 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
 
-    def list_users(self) -> list[Account]:
+    def list_users(self, *, limit: int = 1000) -> list[Account]:
         """List every real user row. See base class for contract."""
         with self._session() as session:
             rows = (
                 session.execute(
-                    select(SqlUser).where(SqlUser.workspace_id == current_workspace_id())
+                    select(SqlUser)
+                    .where(SqlUser.workspace_id == current_workspace_id())
+                    .limit(limit)
                 )
                 .scalars()
                 .all()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
+from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_plugins import model_env_keys
 
 # Generous-but-safe upper bound; real ids ("databricks-claude-opus-4-8",
@@ -74,15 +75,14 @@ def validate_model_override(value: str) -> str:
 _CLAUDE_FAMILY_HARNESSES: frozenset[str] = frozenset(
     {"claude-native", "native-claude", "claude-sdk", "claude_sdk"}
 )
-# codex stays single-vendor (GPT-only): the Databricks gateway only serves
+# CODEX_CANONICAL_HARNESSES stays single-vendor (GPT-only): the gateway serves
 # codex over the Anthropic-incompatible Responses wire, and codex >= 0.137
 # dropped the chat/completions wire that was the only path to Claude — so a
 # codex x Claude dispatch is genuinely broken and must fail loud here.
 # openai-agents (and its "openai-agents-sdk" / "agents_sdk" spellings) is
-# intentionally NOT in this set: a live SDK probe completed a Claude
+# intentionally not included: a live SDK probe completed a Claude
 # tool-calling turn on the gateway over the chat wire, so the harness is
 # multi-model like pi and accepts any validated id (no family rejection).
-_CODEX_FAMILY_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native", "native-codex"})
 # antigravity is Gemini-native: it authenticates a direct Gemini API key /
 # Vertex AI and has no Databricks/gateway path (see _build_antigravity_spawn_env
 # in omnigent/runtime/workflow.py). So unlike the single-vendor harnesses above,
@@ -139,7 +139,7 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
             f"'claude'); got {model!r}. Use the codex worker for GPT models "
             "or the pi / openai-agents worker for any other gateway model."
         )
-    if canon in _CODEX_FAMILY_HARNESSES and not is_gpt:
+    if canon in CODEX_CANONICAL_HARNESSES and not is_gpt:
         return (
             f"harness {canon!r} only runs GPT models (id containing 'gpt' "
             f"or 'codex'); got {model!r}. Use the claude_code worker for "

@@ -114,3 +114,48 @@ describe("LoginPage sanitizeReturnTo open-redirect defense", () => {
     expect(hrefWrites[0]).not.toContain("evil.com");
   });
 });
+
+describe("LoginPage forced re-auth (?reauth=1)", () => {
+  it("does NOT auto-bounce an already-signed-in user — shows the form", async () => {
+    // getMe resolves to an account (beforeEach default), which normally
+    // auto-returns to return_to. Under reauth=1 (device-grant consent), that
+    // shortcut must be suppressed so the user re-enters their password.
+    render(
+      <MemoryRouter
+        initialEntries={["/login?reauth=1&return_to=%2Foauth%2Fdevice%3Fuser_code%3DABCD"]}
+      >
+        <LoginPage />
+      </MemoryRouter>,
+    );
+    // The password form is shown…
+    await waitFor(() => expect(screen.getByLabelText(/password/i)).toBeInTheDocument());
+    // …and no auto-navigation happened despite an existing session.
+    expect(hrefWrites).toHaveLength(0);
+    expect(accountsApi.getMe).not.toHaveBeenCalled();
+  });
+
+  it("navigates to return_to only after a fresh submit under reauth=1", async () => {
+    vi.mocked(accountsApi.login).mockResolvedValue({
+      ok: true,
+      user: { id: "alice", is_admin: false },
+      token: "t",
+      expires_in: 3600,
+    });
+    render(
+      <MemoryRouter
+        initialEntries={["/login?reauth=1&return_to=%2Foauth%2Fdevice%3Fuser_code%3DABCD"]}
+      >
+        <LoginPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByLabelText(/password/i)).toBeInTheDocument());
+    expect(hrefWrites).toHaveLength(0); // still no auto-bounce
+
+    fireEvent.change(screen.getByLabelText(/username/i), { target: { value: "alice" } });
+    fireEvent.change(screen.getByLabelText(/password/i), { target: { value: "pw" } });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/oauth/device?user_code=ABCD");
+  });
+});

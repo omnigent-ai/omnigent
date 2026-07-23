@@ -1,0 +1,123 @@
+# Databricks Asset Bundle config for the Omnigent Slack bot.
+#
+# Deploys the Slack Socket-Mode bot + its Databricks web-auth enrollment
+# page as a Databricks App. Unlike the Omnigent server app, this needs no
+# Lakebase or UC volume — it's a stateless (tokens re-enroll) pure-PyPI
+# package. deploy.py copies the package source into src/ and wraps
+# `databricks bundle deploy` + `bundle run`. See README.md.
+
+bundle:
+  name: omnigent-slack
+
+variables:
+  app_name:
+    description: "Databricks App name (e.g. omnigent-slack)."
+  secret_scope:
+    description: >
+      Databricks secret scope holding the bot's credentials. Create it and
+      the keys below with the databricks CLI (see README.md):
+      slack_bot_token, slack_app_token, token_encryption_key,
+      databricks_oauth_client_secret, databricks_state_secret.
+  oauth_client_id:
+    description: >
+      Custom U2M OAuth app client id. Public (not a secret) — passed inline.
+  server_url:
+    description: "Base URL of the Omnigent server app (the bot talks to this)."
+  webauth_base_url:
+    description: >
+      This bot app's own public URL, used to build the enrollment link posted
+      into Slack. The platform does NOT inject an app-URL env var, so it must be
+      passed explicitly. After the first deploy, read it with:
+      databricks apps get <this-app> -o json | jq -r .url
+
+resources:
+  apps:
+    # Resource key must match _BUNDLE_RESOURCE_KEY in deploy.py.
+    #
+    # SINGLE INSTANCE ONLY — do NOT enable "Horizontal scaling" (Beta) on this
+    # app. The bot is a Slack Socket-Mode consumer (a 2nd replica double-processes
+    # every event → duplicate turns), and the enrollment PKCE verifiers /
+    # unconfirmed tokens live in process memory (a callback routed to another
+    # replica fails closed with "link expired"). Apps are single-instance by
+    # default; keep it that way. There is no DAB field to pin this yet (instance
+    # count is UI-only in the Beta), so this is enforced by NOT turning it on.
+    omnigent-slack:
+      name: ${var.app_name}
+      description: "Omnigent Slack bot with Databricks web-auth enrollment."
+      source_code_path: ./src
+
+      # Secrets live in a Databricks secret scope, never in this file. Each
+      # is bound as an app resource and surfaced to the process via
+      # `valueFrom` in the env block below.
+      resources:
+        - name: slack-bot-token
+          secret:
+            scope: ${var.secret_scope}
+            key: slack_bot_token
+            permission: READ
+        - name: slack-app-token
+          secret:
+            scope: ${var.secret_scope}
+            key: slack_app_token
+            permission: READ
+        - name: token-encryption-key
+          secret:
+            scope: ${var.secret_scope}
+            key: token_encryption_key
+            permission: READ
+        - name: databricks-oauth-client-secret
+          secret:
+            scope: ${var.secret_scope}
+            key: databricks_oauth_client_secret
+            permission: READ
+        - name: databricks-state-secret
+          secret:
+            scope: ${var.secret_scope}
+            key: databricks_state_secret
+            permission: READ
+
+      config:
+        command: ["python", "app.py"]
+        env:
+          # Slack credentials + at-rest encryption + enrollment state secret.
+          - name: OMNIGENT_SLACK_BOT_TOKEN
+            value_from: slack-bot-token
+          - name: OMNIGENT_SLACK_APP_TOKEN
+            value_from: slack-app-token
+          - name: OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY
+            value_from: token-encryption-key
+          # Custom U2M OAuth app credentials (authorization code + PKCE). The
+          # client id is public (inline); only the secret is a secret.
+          - name: OMNIGENT_SLACK_DATABRICKS_CLIENT_ID
+            value: ${var.oauth_client_id}
+          - name: OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET
+            value_from: databricks-oauth-client-secret
+          # HMAC key signing the enrollment state — its own secret, kept separate
+          # from the OAuth client secret so rotating one doesn't affect the other.
+          - name: OMNIGENT_SLACK_DATABRICKS_STATE_SECRET
+            value_from: databricks-state-secret
+          # Databricks web-auth mode + non-secret config. The workspace host
+          # defaults to the platform-injected DATABRICKS_HOST, and the bot's own
+          # public URL to DATABRICKS_APP_URL, so they need no value here.
+          - name: OMNIGENT_SLACK_SERVER_AUTH
+            value: databricks
+          - name: OMNIGENT_SERVER_URL
+            value: ${var.server_url}
+          # This app's own public URL (the enrollment link base). The platform
+          # injects no app-URL env var, so it's passed explicitly.
+          - name: OMNIGENT_SLACK_WEBAUTH_BASE_URL
+            value: ${var.webauth_base_url}
+          # SQLite store on ephemeral disk — tokens are encrypted and
+          # re-enrolled after a restart, so no durable volume is needed.
+          - name: OMNIGENT_DATA_DIR
+            value: /tmp/omnigent-slack
+
+targets:
+  # One target per workspace. workspace.host must be literal (DAB reads it
+  # before resolving vars). deploy.py selects via --target.
+  prod:
+    mode: production
+    workspace:
+      host: https://example.databricks.com   # ← your workspace URL
+      # Isolate remote state per app so one bundle can deploy multiple apps.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${var.app_name}

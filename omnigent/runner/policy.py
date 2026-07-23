@@ -106,6 +106,35 @@ class PolicyVerdict:
 _ALLOW: PolicyVerdict = PolicyVerdict(action="allow")
 
 
+def _resolve_failure_diagnostic(ps: FunctionPolicySpec, exc: BaseException) -> str:
+    """
+    Build an actionable load-failure reason without embedding exception text.
+
+    Factory kwargs (API keys, tokens) can appear in ``str(exc)``; keep only
+    the exception type and the configured function path so operators can fix
+    the spec without secrets landing in tool output.
+    """
+    path = ps.function.path if ps.function is not None else "<missing function>"
+    return (
+        f"policy failed to resolve ({type(exc).__name__}); "
+        f"function path {path!r} could not be loaded; "
+        f"tool calls are denied until this policy is fixed"
+    )
+
+
+def _unresolved_policy_sentinel(
+    ps: FunctionPolicySpec,
+    exc: BaseException,
+) -> FunctionPolicy:
+    """Fail-closed stand-in for a configured policy that failed to resolve."""
+    reason = _resolve_failure_diagnostic(ps, exc)
+
+    def _always_deny(_event: Any) -> dict[str, str]:
+        return {"result": "DENY", "reason": reason}
+
+    return FunctionPolicy(ps, _always_deny)
+
+
 class RunnerToolPolicyGate:
     """Per-spec runner-side enforcement of function-type policies.
 
@@ -120,7 +149,12 @@ class RunnerToolPolicyGate:
 
     @classmethod
     def from_spec(cls, spec: AgentSpec) -> RunnerToolPolicyGate:
-        """Pick out function-type tool_call/tool_result policies and resolve them."""
+        """Pick out function-type tool_call/tool_result policies and resolve them.
+
+        A configured tool-phase policy that fails to resolve is replaced with
+        a fail-closed sentinel that always DENYs. Skipping would leave an
+        empty gate that ALLOWs every tool call (fail-open).
+        """
         guard = getattr(spec, "guardrails", None)
         if guard is None or not guard.policies:
             return cls([])
@@ -137,12 +171,11 @@ class RunnerToolPolicyGate:
                 continue
             try:
                 policy = resolve_function_policy(ps)
-            except Exception:
-                _logger.exception(
-                    "runner failed to resolve function policy %r; skipping",
-                    ps.name,
-                )
-                continue
+            except Exception as exc:  # noqa: BLE001 - all resolution failures deny
+                diagnostic = _resolve_failure_diagnostic(ps, exc)
+                _logger.error("runner %s", diagnostic)
+                policy = _unresolved_policy_sentinel(ps, exc)
+                phases = frozenset([Phase.TOOL_CALL, Phase.TOOL_RESULT])
             out.append(_GatedPolicy(name=ps.name, policy=policy, phases=phases))
         return cls(out)
 

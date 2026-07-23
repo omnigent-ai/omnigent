@@ -23,6 +23,7 @@ const {
   dialog,
   ipcMain,
   nativeImage,
+  nativeTheme,
   screen,
   session,
   shell,
@@ -30,6 +31,7 @@ const {
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
+const { createUpdateOverlay } = require("./update_overlay");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -54,6 +56,10 @@ const SETUP_PAGE_URL = pathToFileURL(SETUP_PAGE);
 
 /** Absolute path to the bundled find-in-page bar page. */
 const FIND_PAGE = path.join(__dirname, "..", "find", "index.html");
+// Built by web's `build:overlay` into electron/overlay/ (shipped by
+// electron-builder). Shell-owned so the update UI is independent of the
+// connected server's web-bundle version.
+const UPDATE_OVERLAY_PAGE = path.join(__dirname, "..", "overlay", "update-overlay.html");
 
 /** The find bar's file:// URL, for verifying IPC sender frames. */
 const FIND_PAGE_URL = pathToFileURL(FIND_PAGE);
@@ -623,7 +629,24 @@ const updater = createDesktopUpdater({
   isPinnedOriginSender,
   pinnedOrigin,
   iconPath: ICON_PNG,
-  forceDevUpdateConfig: process.env.OMNIGENT_FORCE_DEV_UPDATE_CONFIG === "1",
+  // Dev builds always use the local dev feed (dev-app-update.yml ->
+  // 127.0.0.1:8765); packaged builds always use the baked app-update.yml.
+  // Tying this to !app.isPackaged — not an env var — closes a redirect attack:
+  // an OMNIGENT_FORCE_DEV_UPDATE_CONFIG-style env var could otherwise point a
+  // packaged (production) app at an untrusted HTTP local feed and push a
+  // malicious update. A packaged build can never be redirected to the dev feed.
+  forceDevUpdateConfig: !app.isPackaged,
+});
+
+// Shell-owned update toast: renders the reused web UpdateBanner in a transparent
+// corner window so it shows even against servers running old omnigent web.
+const updateOverlay = createUpdateOverlay({
+  BrowserWindow,
+  ipcMain,
+  nativeTheme,
+  updater,
+  overlayPage: UPDATE_OVERLAY_PAGE,
+  preloadPath: path.join(__dirname, "update_overlay_preload.js"),
 });
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1042,7 @@ function createWindow(targetUrl, opts = {}) {
   // treated as "no server configured" rather than crashing window creation.
   const destinationOrigin = serverUrl ? originOf(serverUrl) : null;
   const destination = destinationOrigin ? loadUrl : null;
+  updateOverlay.ensureOverlay(win);
   windows.set(win, {
     // Pin to the destination's origin up front; setup-page windows stay
     // unpinned (null) until the user connects them.
@@ -1696,8 +1720,8 @@ function buildMenu() {
     {
       id: "new_window",
       label: "New Window",
-      // Standard new-window accelerator; the role-based File menu below
-      // doesn't include one, so we own it here.
+      // Own the standard new-window accelerator here — there is no
+      // role-based File menu in this app.
       accelerator: "CmdOrCtrl+N",
       click: () => newWindow(),
     },
@@ -1714,6 +1738,68 @@ function buildMenu() {
       label: "Change Server…",
       click: () => changeServer(),
     },
+    { type: "separator" },
+    // Manual update check, surfaced as a production item here so shipped
+    // .app users can trigger it from the menubar. Download/install still
+    // flows through the in-app Settings UI / UpdateBanner (and the native
+    // consent dialog when driven from a server page).
+    {
+      id: "check_for_updates",
+      label: "Check for Updates…",
+      click: async () => {
+        // Surface the two silent outcomes of a manual menubar check with a
+        // native dialog: "no update" (otherwise only the renderer banner
+        // hears it, which the user may not be looking at) and "check failed"
+        // (the promise rejects and was previously swallowed). An available
+        // update is left to the in-app UpdateBanner to avoid a double notify.
+        try {
+          await updater.checkForUpdates({ manual: true });
+          const status = updater.getStatus();
+          if (status.state === "none") {
+            await dialog.showMessageBox(activeWindow(), {
+              type: "info",
+              title: "Omnigent",
+              message: "You're up to date!",
+              detail: `Omnigent ${app.getVersion()} is the latest version.`,
+              buttons: ["OK"],
+            });
+          }
+        } catch (err) {
+          await dialog.showMessageBox(activeWindow(), {
+            type: "warning",
+            title: "Omnigent",
+            message: "Couldn't check for updates",
+            detail: String(err?.message ?? err),
+            buttons: ["OK"],
+          });
+        }
+      },
+    },
+    {
+      id: "restart_to_update",
+      label: "Restart to Update",
+      click: async () => {
+        // Production install path: the UpdateBanner toast is dismissible (and
+        // a user may have closed it), so the menubar must still offer a way to
+        // install a downloaded update. installUpdateNow() quits the app to
+        // hand off to the installer; it returns false when nothing is ready
+        // (e.g. the toast was for an update since skipped or not downloaded),
+        // which we surface with a native dialog instead of silently no-op'ing.
+        if (!updater.installUpdateNow()) {
+          await dialog.showMessageBox(activeWindow(), {
+            type: "info",
+            title: "Omnigent",
+            message: "No update is ready to install",
+            detail: "Check for updates first, then download the new version.",
+            buttons: ["OK"],
+          });
+        }
+      },
+    },
+    { type: "separator" },
+    // `role: "close"` carries the standard CmdOrCtrl+W shortcut and closes
+    // the focused window. There is no File menu, so Close lives under Server.
+    { role: "close", label: "Close Window" },
   ];
 
   // Our custom Server menu, inserted right after the leftmost menu — index 1
@@ -1723,68 +1809,6 @@ function buildMenu() {
     submenu: serverSubmenu,
   });
 
-  template.push({
-    label: "Updates",
-    submenu: [
-      {
-        id: "check_for_updates",
-        label: "Check for Updates…",
-        click: () => {
-          updater.checkForUpdates({ manual: true }).catch(() => {});
-        },
-      },
-      {
-        id: "restart_to_update",
-        label: "Restart to Update",
-        click: () => {
-          if (updater.getStatus().state === "downloaded") updater.installUpdateNow();
-        },
-      },
-    ],
-  });
-
-  // Notifications menu (macOS only — sound playback uses `afplay`): an on/off
-  // switch for the notification sound plus a picker of macOS system sounds.
-  // Selections persist in settings.json and are read live by the notify
-  // handler, so a change applies to the next notification without a relaunch.
-  if (isMac) {
-    /** @type {Electron.MenuItemConstructorOptions[]} */
-    const soundChoices = systemSoundNames().map((name) => ({
-      id: `notification_sound_${name}`,
-      label: name,
-      type: "radio",
-      checked: currentNotificationSoundName() === name,
-      click: () => {
-        const settings = loadSettings();
-        settings.notification_sound_name = name;
-        saveSettings(settings);
-        // Pick-to-preview: play the choice immediately so the user hears it,
-        // even when the sound is currently toggled off.
-        playSystemSound(name);
-      },
-    }));
-    template.push({
-      label: "Notifications",
-      submenu: [
-        {
-          id: "notification_sound_enabled",
-          label: "Play Notification Sound",
-          type: "checkbox",
-          checked: notificationSoundEnabled(),
-          click: (item) => {
-            const settings = loadSettings();
-            settings.notification_sound_enabled = item.checked;
-            saveSettings(settings);
-          },
-        },
-        { type: "separator" },
-        { label: "Sound", submenu: soundChoices },
-      ],
-    });
-  }
-
-  // Standard roles — these carry the predefined keyboard shortcuts.
-  template.push({ role: "fileMenu" });
   // The Edit roles (Undo/Redo/Cut/Copy/Paste/Select All) carry the platform
   // text-editing shortcuts; hand-rolled here instead of `role: "editMenu"`
   // only so Find… can live where users expect it.
@@ -1812,14 +1836,13 @@ function buildMenu() {
       },
     ],
   });
-  // Same items as `role: "viewMenu"`, hand-rolled so Toggle Developer
-  // Tools (and its accelerator) can be dropped from release builds.
+  // Standard View roles (Reload/zoom/fullscreen). Developer Tools lives in
+  // the Debug menu (dev only), so this menu is identical in dev and release.
   template.push({
     label: "View",
     submenu: [
       { role: "reload" },
       { role: "forceReload" },
-      ...(app.isPackaged ? [] : [{ role: "toggleDevTools" }]),
       { type: "separator" },
       { role: "resetZoom" },
       { role: "zoomIn" },
@@ -1829,6 +1852,59 @@ function buildMenu() {
     ],
   });
   template.push({ role: "windowMenu" });
+
+  // Debug menu (dev only, !app.isPackaged): consolidates every debug-only /
+  // non-production affordance behind a single top-level menu — the macOS
+  // notification-sound settings (sound playback uses `afplay`, so macOS-only)
+  // and the developer tools. Restart-to-update now lives in the production
+  // Server menu (it's a needed install path, not a debug affordance, once the
+  // UpdateBanner toast is dismissible). Hidden in the shipped .app. Placed
+  // last so it never displaces the standard menus users expect.
+  if (!app.isPackaged) {
+    /** @type {Electron.MenuItemConstructorOptions[]} */
+    const debugSubmenu = [];
+
+    // macOS notification-sound settings: an on/off switch plus a picker of
+    // system sounds. Selections persist in settings.json and are read live by
+    // the notify handler, so a change applies to the next notification without
+    // a relaunch. macOS-only because playback uses `afplay`.
+    if (isMac) {
+      /** @type {Electron.MenuItemConstructorOptions[]} */
+      const soundChoices = systemSoundNames().map((name) => ({
+        id: `notification_sound_${name}`,
+        label: name,
+        type: "radio",
+        checked: currentNotificationSoundName() === name,
+        click: () => {
+          const settings = loadSettings();
+          settings.notification_sound_name = name;
+          saveSettings(settings);
+          // Pick-to-preview: play the choice immediately so the user hears it,
+          // even when the sound is currently toggled off.
+          playSystemSound(name);
+        },
+      }));
+      debugSubmenu.push(
+        { type: "separator" },
+        {
+          id: "notification_sound_enabled",
+          label: "Play Notification Sound",
+          type: "checkbox",
+          checked: notificationSoundEnabled(),
+          click: (item) => {
+            const settings = loadSettings();
+            settings.notification_sound_enabled = item.checked;
+            saveSettings(settings);
+          },
+        },
+        { label: "Sound", submenu: soundChoices },
+      );
+    }
+
+    debugSubmenu.push({ type: "separator" }, { role: "toggleDevTools" });
+
+    template.push({ label: "Debug", submenu: debugSubmenu });
+  }
 
   const menu = Menu.buildFromTemplate(template);
   Menu.setApplicationMenu(menu);
@@ -2309,6 +2385,19 @@ function registerIpc() {
   // Updater IPC surface (get/set config, get status, check/download/install).
   // The module owns the handlers and their trusted-sender + consent gates.
   updater.registerIpc();
+  updateOverlay.registerIpc();
+
+  // Mirror the web app's in-app theme onto the native side so the update
+  // overlay, native dialogs, and menus track the theme switcher (not just the
+  // OS). Value-validated; the worst a page can do is toggle appearance. Still
+  // gated to a pinned server page like every other privileged channel, so a
+  // foreign page can't drive the shell's native appearance.
+  ipcMain.on("omnigent:set-color-scheme", (event, scheme) => {
+    if (!isPinnedOriginSender(event)) return;
+    if (scheme === "light" || scheme === "dark" || scheme === "system") {
+      nativeTheme.themeSource = scheme;
+    }
+  });
 
   // SPA → start / stop / restart this machine's host daemon for the window's
   // own server (the host selection menu's "connect this machine" action).
