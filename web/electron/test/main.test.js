@@ -57,10 +57,13 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("artifact surface wiring (src/main.js)", () => {
-  it("registers sync, destroy, and inspect IPC handlers", () => {
+  it("registers artifact surface lifecycle, selection, and review IPC handlers", () => {
     assert.match(liveCode, /omnigent:artifact-surface-sync/);
     assert.match(liveCode, /omnigent:artifact-surface-destroy/);
     assert.match(liveCode, /omnigent:artifact-surface-inspect/);
+    assert.match(liveCode, /omnigent:artifact-surface-select/);
+    assert.match(liveCode, /omnigent:artifact-surface-reload/);
+    assert.match(liveCode, /omnigent:artifact-surface-review/);
     assert.match(
       liveCode,
       /win\.on\("close"[\s\S]{0,120}artifactSurfaceManager\.destroyWindow\(win\)/,

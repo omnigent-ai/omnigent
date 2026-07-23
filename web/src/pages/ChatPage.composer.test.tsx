@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -106,6 +106,54 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+describe("Composer external context insertion", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      pendingComposerInserts: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("drains visual review text and screenshot files into the active composer", async () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const screenshot = new File(["image"], "artifact-selection-1.png", { type: "image/png" });
+
+    act(() => {
+      useChatStore.getState().queueComposerInsert({
+        conversationId: "conv_test",
+        text: "Review the selected artifact element.",
+        files: [screenshot],
+      });
+    });
+
+    await waitFor(() => expect(textarea().value).toBe("Review the selected artifact element."));
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).toHaveBeenCalledWith("Review the selected artifact element.", [screenshot]);
+    expect(useChatStore.getState().pendingComposerInserts).toEqual([]);
+  });
+
+  it("does not drain visual context pinned to another conversation", () => {
+    render(<Composer {...composerProps()} />);
+
+    act(() => {
+      useChatStore.getState().queueComposerInsert({
+        conversationId: "conv_other",
+        text: "Do not leak this draft.",
+        files: [],
+      });
+    });
+
+    expect(textarea().value).toBe("");
+  });
+});
 
 describe("Composer slash-command menu", () => {
   beforeEach(() => {

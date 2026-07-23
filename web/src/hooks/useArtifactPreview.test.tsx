@@ -51,4 +51,37 @@ describe("useArtifactPreview", () => {
     );
     expect(result.current.data?.url).toContain("preview.localhost");
   });
+
+  it("brokers a fresh grant when the artifact revision changes", async () => {
+    authenticatedFetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            url: "http://preview.localhost:6767/p/grant-1/artifacts/revenue/index.html",
+            expires_at: 1234,
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            url: "http://preview.localhost:6767/p/grant-2/artifacts/revenue/index.html",
+            expires_at: 2345,
+          }),
+          { status: 201, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+
+    const { result, rerender } = renderHook(
+      ({ revision }) =>
+        useArtifactPreview("conv_preview", "artifacts/revenue/index.html", revision),
+      { wrapper, initialProps: { revision: 1 } },
+    );
+    await waitFor(() => expect(result.current.data?.url).toContain("grant-1"));
+
+    rerender({ revision: 2 });
+    await waitFor(() => expect(result.current.data?.url).toContain("grant-2"));
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(2);
+  });
 });

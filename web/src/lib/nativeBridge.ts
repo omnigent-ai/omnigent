@@ -191,18 +191,66 @@ interface ElectronDesktopApi extends NativeShellApi {
   destroyArtifactSurface?: (id: string) => Promise<void>;
   /** Run the artifact element picker and inspect the selected node. */
   inspectArtifactSurface?: (id: string) => Promise<boolean>;
+  /** Select an artifact element and return structured context for the agent. */
+  selectArtifactElement?: (id: string) => Promise<ArtifactElementContext | null>;
+  /** Reload the active artifact browser surface. */
+  reloadArtifactSurface?: (id: string) => Promise<boolean>;
+  /** Run lightweight accessibility and runtime diagnostics. */
+  reviewArtifactSurface?: (id: string) => Promise<ArtifactSurfaceDiagnostics | null>;
 }
 
 export interface ArtifactSurfaceSync {
   id: string;
   url: string;
   visible: boolean;
+  viewportWidth?: number;
   bounds: {
     x: number;
     y: number;
     width: number;
     height: number;
   };
+}
+
+export interface ArtifactElementContext {
+  selector: string;
+  tagName: string;
+  role: string | null;
+  accessibleName: string | null;
+  text: string;
+  html: string;
+  rect: { x: number; y: number; width: number; height: number };
+  viewport: { width: number; height: number; devicePixelRatio: number };
+  styles: Record<string, string>;
+  screenshotDataUrl: string;
+}
+
+export interface ArtifactReviewIssue {
+  severity: "error" | "warning" | "info";
+  code: string;
+  message: string;
+  selector: string | null;
+}
+
+export interface ArtifactConsoleMessage {
+  level: string;
+  message: string;
+  line: number;
+  source: string;
+}
+
+export interface ArtifactLoadError {
+  code: number;
+  description: string;
+  url: string;
+  mainFrame: boolean;
+}
+
+export interface ArtifactSurfaceDiagnostics {
+  viewport: { width: number; height: number };
+  issues: ArtifactReviewIssue[];
+  consoleMessages: ArtifactConsoleMessage[];
+  loadErrors: ArtifactLoadError[];
 }
 
 /** A lifecycle action for the host daemon. */
@@ -365,6 +413,48 @@ export async function inspectNativeArtifactSurface(id: string): Promise<boolean>
     return await inspect(id);
   } catch {
     return false;
+  }
+}
+
+/** Select an artifact element and capture structured review context. */
+export async function selectNativeArtifactElement(
+  id: string,
+): Promise<ArtifactElementContext | null> {
+  const select = electronApi()?.selectArtifactElement;
+  if (!select) return null;
+  try {
+    return await select(id);
+  } catch {
+    return null;
+  }
+}
+
+/** Reload the native artifact surface. */
+export async function reloadNativeArtifactSurface(id: string): Promise<boolean> {
+  const reload = electronApi()?.reloadArtifactSurface;
+  if (!reload) return false;
+  try {
+    return await reload(id);
+  } catch {
+    return false;
+  }
+}
+
+/** True when the desktop shell exposes artifact diagnostics. */
+export function hasNativeArtifactReview(): boolean {
+  return typeof electronApi()?.reviewArtifactSurface === "function";
+}
+
+/** Collect native artifact diagnostics. */
+export async function reviewNativeArtifactSurface(
+  id: string,
+): Promise<ArtifactSurfaceDiagnostics | null> {
+  const review = electronApi()?.reviewArtifactSurface;
+  if (!review) return null;
+  try {
+    return await review(id);
+  } catch {
+    return null;
   }
 }
 

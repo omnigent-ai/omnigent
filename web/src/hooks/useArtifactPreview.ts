@@ -6,9 +6,13 @@ export interface ArtifactPreviewGrant {
   expires_at: number;
 }
 
-export function useArtifactPreview(conversationId: string, entryPath: string | null) {
+export function useArtifactPreview(
+  conversationId: string,
+  entryPath: string | null,
+  revision: number | null = null,
+) {
   return useQuery({
-    queryKey: ["artifact-preview", conversationId, entryPath],
+    queryKey: ["artifact-preview", conversationId, entryPath, revision],
     enabled: entryPath !== null,
     retry: false,
     refetchOnWindowFocus: false,

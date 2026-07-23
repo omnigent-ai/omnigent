@@ -38,9 +38,21 @@ function fakeViewFactory(created) {
       },
       on: (event, handler) => listeners.set(event, handler),
       loadURL: async (url) => webContents.loaded.push(url),
-      executeJavaScript: async () => ({ x: 42, y: 84 }),
+      executeJavaScript: async () => webContents.executeResult ?? { x: 42, y: 84 },
+      capturePage: async () => ({
+        toDataURL: () => "data:image/png;base64,c2VsZWN0aW9u",
+      }),
       inspectElement: (x, y) => {
         webContents.inspected = { x, y };
+      },
+      reload: () => {
+        webContents.reloads = (webContents.reloads ?? 0) + 1;
+      },
+      enableDeviceEmulation: (parameters) => {
+        webContents.deviceEmulation = parameters;
+      },
+      disableDeviceEmulation: () => {
+        webContents.deviceEmulation = null;
       },
       close: () => {
         webContents.closed = true;
@@ -172,6 +184,36 @@ describe("ArtifactSurfaceManager", () => {
     assert.equal(win.children.length, 0);
   });
 
+  it("fits a fixed viewport inside the native artifact pane", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 480, height: 600 },
+      viewportWidth: 768,
+    });
+
+    assert.deepEqual(created[0].webContents.deviceEmulation, {
+      screenPosition: "desktop",
+      screenSize: { width: 768, height: 960 },
+      viewPosition: { x: 0, y: 0 },
+      deviceScaleFactor: 1,
+      viewSize: { width: 768, height: 960 },
+      scale: 0.625,
+    });
+
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 480, height: 600 },
+    });
+    assert.equal(created[0].webContents.deviceEmulation, null);
+  });
+
   it("destroys the surface during window cleanup", async () => {
     const win = fakeWindow();
     const created = [];
@@ -201,6 +243,100 @@ describe("ArtifactSurfaceManager", () => {
     assert.equal(await manager.inspect(win, "stale"), false);
     assert.equal(await manager.inspect(win, "current"), true);
     assert.deepEqual(created[0].webContents.inspected, { x: 42, y: 84 });
+  });
+
+  it("captures structured element context and a screenshot crop", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 500, height: 400 },
+    });
+    created[0].webContents.executeResult = {
+      selector: "main > button.primary",
+      tagName: "button",
+      role: "button",
+      accessibleName: "Save changes",
+      text: "Save",
+      html: '<button class="primary">Save</button>',
+      rect: { x: 12, y: 24, width: 120, height: 40 },
+      viewport: { width: 500, height: 400, devicePixelRatio: 1 },
+      styles: { color: "rgb(0, 0, 0)", display: "inline-flex" },
+    };
+
+    assert.equal(await manager.select(win, "stale"), null);
+    assert.deepEqual(await manager.select(win, "current"), {
+      selector: "main > button.primary",
+      tagName: "button",
+      role: "button",
+      accessibleName: "Save changes",
+      text: "Save",
+      html: '<button class="primary">Save</button>',
+      rect: { x: 12, y: 24, width: 120, height: 40 },
+      viewport: { width: 500, height: 400, devicePixelRatio: 1 },
+      styles: { color: "rgb(0, 0, 0)", display: "inline-flex" },
+      screenshotDataUrl: "data:image/png;base64,c2VsZWN0aW9u",
+    });
+  });
+
+  it("reloads the surface and reports console, load, and accessibility diagnostics", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 500, height: 400 },
+    });
+    const view = created[0];
+    view.emit("console-message", {}, 3, "Broken interaction", 18, "app.js");
+    view.emit("did-fail-load", {}, -6, "ERR_FILE_NOT_FOUND", "missing.css", true);
+    view.webContents.executeResult = {
+      viewport: { width: 500, height: 400 },
+      issues: [
+        {
+          severity: "error",
+          code: "missing-label",
+          message: "Button has no accessible name",
+          selector: "main > button:nth-of-type(2)",
+        },
+      ],
+    };
+
+    assert.equal(manager.reload(win, "stale"), false);
+    assert.equal(manager.reload(win, "current"), true);
+    assert.equal(view.webContents.reloads, 1);
+    assert.deepEqual(await manager.review(win, "current"), {
+      viewport: { width: 500, height: 400 },
+      issues: [
+        {
+          severity: "error",
+          code: "missing-label",
+          message: "Button has no accessible name",
+          selector: "main > button:nth-of-type(2)",
+        },
+      ],
+      consoleMessages: [
+        {
+          level: "error",
+          message: "Broken interaction",
+          line: 18,
+          source: "app.js",
+        },
+      ],
+      loadErrors: [
+        {
+          code: -6,
+          description: "ERR_FILE_NOT_FOUND",
+          url: "missing.css",
+          mainFrame: true,
+        },
+      ],
+    });
   });
 });
 

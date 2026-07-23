@@ -220,6 +220,13 @@ export interface ComposerAttachment {
   lineRange?: { start: number; end: number };
 }
 
+/** Text and uploaded files queued into one specific conversation's composer. */
+export interface ComposerInsert {
+  conversationId: string;
+  text: string;
+  files: File[];
+}
+
 /**
  * Identity key for a composer attachment, used to dedup the queue and the
  * drained chips. Keyed on path + dir-ness + line range (not path alone) so a
@@ -413,6 +420,8 @@ export interface ChatState {
    * The composer drains this on change and clears it.
    */
   pendingComposerAttachments: ComposerAttachment[];
+  /** Visual-review context waiting to be inserted into a pinned conversation's composer. */
+  pendingComposerInserts: ComposerInsert[];
   /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
@@ -659,6 +668,10 @@ export interface ChatState {
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
+  /** Queue text/files into a specific conversation's composer without auto-sending. */
+  queueComposerInsert: (insert: ComposerInsert) => void;
+  /** Drain inserts for one conversation after its composer accepts them. */
+  clearPendingComposerInserts: (conversationId: string) => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -919,6 +932,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
+  pendingComposerInserts: [],
   llmModel: null,
   sessionHarness: null,
   subAgentName: null,
@@ -1634,6 +1648,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // session's composer (which drains the store on mount). Same reset
         // discipline as ``viewers`` above.
         pendingComposerAttachments: [],
+        pendingComposerInserts: [],
         sandboxStatus: null,
         mcpStartup: null,
         abortController: null,
@@ -1713,6 +1728,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   clearPendingComposerAttachments: () => set({ pendingComposerAttachments: [] }),
+
+  queueComposerInsert: (insert) => {
+    set((state) => ({ pendingComposerInserts: [...state.pendingComposerInserts, insert] }));
+  },
+
+  clearPendingComposerInserts: (conversationId) => {
+    set((state) => ({
+      pendingComposerInserts: state.pendingComposerInserts.filter(
+        (insert) => insert.conversationId !== conversationId,
+      ),
+    }));
+  },
 
   compact: async () => {
     const { conversationId } = get();

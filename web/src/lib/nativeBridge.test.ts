@@ -7,6 +7,10 @@ import {
   isNativeShell,
   hasNativeArtifactSurface,
   hasNativeArtifactInspector,
+  hasNativeArtifactReview,
+  reloadNativeArtifactSurface,
+  reviewNativeArtifactSurface,
+  selectNativeArtifactElement,
   inspectNativeArtifactSurface,
   syncNativeArtifactSurface,
   destroyNativeArtifactSurface,
@@ -237,6 +241,44 @@ describe("artifact surface bridge", () => {
     expect(inspect).toHaveBeenCalledWith("surface");
   });
 
+  it("delegates native selection, reload, and diagnostics", async () => {
+    const selection = {
+      selector: "main > button",
+      tagName: "button",
+      role: "button",
+      accessibleName: "Save",
+      text: "Save",
+      html: "<button>Save</button>",
+      rect: { x: 1, y: 2, width: 3, height: 4 },
+      viewport: { width: 800, height: 600, devicePixelRatio: 1 },
+      styles: { display: "inline-flex" },
+      screenshotDataUrl: "data:image/png;base64,abc",
+    };
+    const diagnostics = {
+      viewport: { width: 800, height: 600 },
+      issues: [],
+      consoleMessages: [],
+      loadErrors: [],
+    };
+    const select = vi.fn().mockResolvedValue(selection);
+    const reload = vi.fn().mockResolvedValue(true);
+    const review = vi.fn().mockResolvedValue(diagnostics);
+    setElectron(true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentDesktop as object, {
+      selectArtifactElement: select,
+      reloadArtifactSurface: reload,
+      reviewArtifactSurface: review,
+    });
+
+    expect(hasNativeArtifactReview()).toBe(true);
+    await expect(selectNativeArtifactElement("surface")).resolves.toEqual(selection);
+    await expect(reloadNativeArtifactSurface("surface")).resolves.toBe(true);
+    await expect(reviewNativeArtifactSurface("surface")).resolves.toEqual(diagnostics);
+    expect(select).toHaveBeenCalledWith("surface");
+    expect(reload).toHaveBeenCalledWith("surface");
+    expect(review).toHaveBeenCalledWith("surface");
+  });
+
   it("falls back safely when the shell is old", async () => {
     setElectron(true);
     expect(hasNativeArtifactSurface()).toBe(false);
@@ -248,6 +290,9 @@ describe("artifact surface bridge", () => {
         bounds: { x: 0, y: 0, width: 1, height: 1 },
       }),
     ).resolves.toBe(false);
+    await expect(selectNativeArtifactElement("surface")).resolves.toBeNull();
+    await expect(reloadNativeArtifactSurface("surface")).resolves.toBe(false);
+    await expect(reviewNativeArtifactSurface("surface")).resolves.toBeNull();
   });
 });
 

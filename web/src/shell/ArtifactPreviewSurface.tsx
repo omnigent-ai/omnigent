@@ -12,6 +12,8 @@ interface ArtifactPreviewSurfaceProps {
   title: string;
   url: string;
   visible: boolean;
+  refreshKey?: number;
+  viewportWidth?: number;
 }
 
 export function ArtifactPreviewSurface({
@@ -19,12 +21,14 @@ export function ArtifactPreviewSurface({
   title,
   url,
   visible,
+  refreshKey = 0,
+  viewportWidth,
 }: ArtifactPreviewSurfaceProps) {
   const elementRef = useRef<HTMLDivElement>(null);
-  const previewStateRef = useRef({ url, visible });
+  const previewStateRef = useRef({ url, visible, viewportWidth });
   const syncRef = useRef<() => void>(() => undefined);
   const nativeSurface = hasNativeArtifactSurface();
-  previewStateRef.current = { url, visible };
+  previewStateRef.current = { url, visible, viewportWidth };
 
   useEffect(() => {
     if (!nativeSurface) return;
@@ -43,6 +47,7 @@ export function ArtifactPreviewSurface({
         id: surfaceId,
         url: previewState.url,
         visible: previewState.visible && intersectsViewport && rect.width > 0 && rect.height > 0,
+        viewportWidth: previewState.viewportWidth,
         bounds: {
           x: Math.round(rect.left),
           y: Math.round(rect.top),
@@ -67,7 +72,7 @@ export function ArtifactPreviewSurface({
 
   useEffect(() => {
     if (nativeSurface) syncRef.current();
-  }, [nativeSurface, url, visible]);
+  }, [nativeSurface, url, visible, viewportWidth]);
 
   useEffect(
     () => () => {
@@ -79,6 +84,7 @@ export function ArtifactPreviewSurface({
   if (!nativeSurface) {
     return (
       <iframe
+        key={refreshKey}
         title={`${title} preview`}
         src={url}
         sandbox={ARTIFACT_PREVIEW_SANDBOX}

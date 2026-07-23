@@ -2053,6 +2053,24 @@ function registerIpc() {
     return artifactSurfaceManager.inspect(win, id);
   });
 
+  ipcMain.handle("omnigent:artifact-surface-select", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.select(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-reload", (event, id) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.reload(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-review", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.review(win, id);
+  });
+
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
