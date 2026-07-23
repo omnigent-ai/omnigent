@@ -246,5 +246,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        "grok-build",
+        "grok-build-native",
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses
