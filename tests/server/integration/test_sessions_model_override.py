@@ -713,9 +713,7 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
             None,
         )
 
-    with patch(
-        "omnigent.server.smart_routing.route_session_harness", _fake_route_session_harness
-    ):
+    with patch("omnigent.server.smart_routing.route_session_harness", _fake_route_session_harness):
         agent = await create_test_agent(client)
 
         # Parent session with routing toggle on.
