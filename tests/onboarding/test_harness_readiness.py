@@ -249,7 +249,6 @@ def test_configured_harness_map_covers_all_spellings(
         # Grok Build — native TUI harness (``grok-build-native`` /
         # ``native-grok-build``, via ``omni grok-build``); gates on the
         # ``grok`` CLI.
-        "grok-build",
         "grok-build-native",
         "native-grok-build",
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
