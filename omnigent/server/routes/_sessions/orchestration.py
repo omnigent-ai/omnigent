@@ -288,9 +288,13 @@ async def _publish_and_wait_for_harness_elicitation(
                     # for the gate's timeout. ``asyncio.wait`` absorbs
                     # the CancelledError outcome; an unreaped task is
                     # logged and abandoned to die with the request.
+                    # Resolve through the facade so a test's
+                    # monkeypatch of this constant is honored here.
+                    from omnigent.server.routes import sessions as _facade
+
                     _reaped, still_pending = await asyncio.wait(
                         {race_task},
-                        timeout=_RACE_TASK_REAP_TIMEOUT_S,
+                        timeout=_facade._RACE_TASK_REAP_TIMEOUT_S,
                     )
                     if still_pending:
                         _logger.warning(
@@ -364,7 +368,11 @@ def _schedule_deferred_elicitation_clear(
 
         :returns: None.
         """
-        await asyncio.sleep(_HARNESS_ELICITATION_REPARK_GRACE_S)
+        # Resolve through the facade so a test's monkeypatch of this
+        # constant is honored here.
+        from omnigent.server.routes import sessions as _facade
+
+        await asyncio.sleep(_facade._HARNESS_ELICITATION_REPARK_GRACE_S)
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear.
             return
@@ -2514,6 +2522,35 @@ def _kick_managed_relaunch(
 
 
 def _kick_managed_wake(
+    *,
+    session_id: str,
+    conv: Conversation,
+    sandbox_config: ManagedSandboxConfig,
+    tracker: ManagedLaunchTracker,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    app_state: Any,
+) -> None:
+    """
+    Spawn the background wake for a dormant resumable host.
+
+    Call-time proxy to the facade so a test's ``monkeypatch.setattr`` of this
+    name on ``sessions`` is honored by sibling impl callers.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    return _facade._kick_managed_wake(
+        session_id=session_id,
+        conv=conv,
+        sandbox_config=sandbox_config,
+        tracker=tracker,
+        conversation_store=conversation_store,
+        host_store=host_store,
+        app_state=app_state,
+    )
+
+
+def _kick_managed_wake_impl(
     *,
     session_id: str,
     conv: Conversation,

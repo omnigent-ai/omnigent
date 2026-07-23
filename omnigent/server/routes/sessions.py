@@ -189,6 +189,9 @@ from omnigent.server.routes._sessions.helpers import (
     _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,  # noqa: F401
 )
 from omnigent.server.routes._sessions.helpers import (
+    _compact_lock_impl as _compact_lock,  # noqa: F401
+)
+from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -233,6 +236,9 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate_impl as _hold_native_ask_gate,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _kick_managed_wake_impl as _kick_managed_wake,  # noqa: F401
 )
 from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,

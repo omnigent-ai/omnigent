@@ -888,16 +888,21 @@ def _prune_pre_resolved_harness_elicitations(now: float | None = None) -> None:
     """
     if not _harness_pre_resolved_elicitations:
         return
+    # Resolve limits through the facade so a test's monkeypatch of these
+    # constants is honored here.
+    from omnigent.server.routes import sessions as _facade
+
     now = time.time() if now is None else now
     expired = [
         elicitation_id
         for elicitation_id, tombstone in _harness_pre_resolved_elicitations.items()
-        if now - tombstone.created_at > _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S
+        if now - tombstone.created_at > _facade._HARNESS_PRE_RESOLVED_ELICITATION_TTL_S
     ]
     for elicitation_id in expired:
         _harness_pre_resolved_elicitations.pop(elicitation_id, None)
     overflow = (
-        len(_harness_pre_resolved_elicitations) - _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES
+        len(_harness_pre_resolved_elicitations)
+        - _facade._HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES
     )
     if overflow <= 0:
         return
@@ -5877,6 +5882,18 @@ async def _flush_relay_text(
 
 
 def _compact_lock(session_id: str) -> asyncio.Lock:
+    """
+    Return the lock serializing explicit compaction for one session.
+
+    Call-time proxy to the facade so a test's ``monkeypatch.setattr`` of
+    this name on ``sessions`` is honored by sibling impl callers.
+    """
+    from omnigent.server.routes import sessions as _facade
+
+    return _facade._compact_lock(session_id)
+
+
+def _compact_lock_impl(session_id: str) -> asyncio.Lock:
     """
     Return the lock serializing explicit compaction for one session.
 
