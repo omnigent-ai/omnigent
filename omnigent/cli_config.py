@@ -1351,13 +1351,13 @@ def _prompt_install_harness(family: str) -> bool:
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.harness_install import (
         harness_cli_version,
-        harness_install_command,
+        harness_install_display,
         install_harness_cli,
     )
     from omnigent.onboarding.interactive import console, select
 
     label = family_label(family)
-    cmd = " ".join(harness_install_command(family))
+    cmd = harness_install_display(family)
     detected_version, range_str = harness_cli_version(family)
     if detected_version is None:
         prompt = f"{label}'s CLI is missing. Install it now?"
@@ -1375,7 +1375,7 @@ def _prompt_install_harness(family: str) -> bool:
             "I'll run it myself (show the command)",
         ],
         descriptions=[
-            f"Runs `{cmd}` (needs npm), then continues to credential setup.",
+            f"Runs `{cmd}`, then continues to credential setup.",
             "Return to the harness picker without installing.",
             "Print the command so you can install it yourself, then return.",
         ],
@@ -3407,6 +3407,7 @@ def _run_configure_harnesses_interactive() -> None:
         harness_cli_installed,
         harness_cli_logged_in,
         harness_install_command,
+        harness_install_display,
         harness_install_spec,
     )
     from omnigent.onboarding.interactive import select
@@ -3536,7 +3537,7 @@ def _run_configure_harnesses_interactive() -> None:
                 name,
                 _cli_absence_label(fam),
                 "missing",
-                _install_hint(" ".join(harness_install_command(fam))),
+                _install_hint(harness_install_display(fam)),
             )
         default = surface_default_provider(config, fam)
         if default is None:
