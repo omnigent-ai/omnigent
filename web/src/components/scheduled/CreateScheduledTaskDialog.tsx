@@ -171,8 +171,8 @@ export function CreateScheduledTaskDialog({
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
   // Host whose `configured_harnesses` drives the picker's "needs setup" badges.
-  // Host is OPTIONAL on scheduled tasks (post-FU-3: unset = resolve the connected
-  // host at fire time), so we must NOT require the user to pin one before the
+  // Host is optional on scheduled tasks; unset means resolve the connected host
+  // at fire time, so we must not require the user to pin one before the
   // readiness affordance appears. Fall back to the first ONLINE host for badge
   // computation only — this does NOT change the form's `hostId` value (which
   // stays "" = resolve-at-fire); it just gives the picker a readiness map so
