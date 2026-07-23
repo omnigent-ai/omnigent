@@ -611,10 +611,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 New session
               </Link>
             </Button>
-            {/* "Scheduled" — recurring agent runs (/tasks). Second row in the
-            top nav group, directly under "New session" and above search. Same
-            full-width nav-row treatment as "New session"; a Link so
-            cmd/middle-click opens a new tab. */}
+            {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
             <Button
               asChild
               className={cn(
