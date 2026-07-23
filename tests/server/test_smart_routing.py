@@ -836,6 +836,33 @@ async def test_route_session_harness_returns_none_for_empty_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_route_session_harness_excludes_claude_haiku_from_pi() -> None:
+    """pi's candidate list must not include databricks-claude-haiku-4-5.
+
+    pi routes Claude models through the Anthropic gateway, which rejects the
+    eager_input_streaming field with a 400 when tools are present. The model
+    must be filtered out of pi's candidates (static path here).
+    """
+    pi_models: list[str] = []
+
+    class _CapturingClient:
+        async def route(
+            self, _message: str, available_models: dict[str, list[str]]
+        ) -> RoutingResult | None:
+            pi_models.extend(available_models.get("pi", []))
+            return RoutingResult(model="databricks-gpt-5-4-nano", rationale="x", harness="codex")
+
+    caps = _FakeCaps(routing_client=_CapturingClient())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        await route_session_harness("hello")
+    assert "databricks-claude-haiku-4-5" not in pi_models, (
+        "haiku must be filtered from pi candidates"
+    )
+    # pi still offers its GPT models.
+    assert any("gpt" in m for m in pi_models)
+
+
+@pytest.mark.asyncio
 async def test_route_session_harness_falls_back_by_model_when_harness_absent() -> None:
     """When the router returns no harness, fall back to finding it by model."""
     expected = RoutingResult(

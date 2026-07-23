@@ -502,6 +502,23 @@ class ExternalRoutingClient:
 # installed, and they bake the model at terminal launch rather than per-turn.
 _AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "pi", "codex")
 
+# Per-harness model exclusions for auto routing. The pi harness routes Claude
+# models through the Anthropic Messages gateway, whose request path adds an
+# ``eager_input_streaming`` field the Databricks serving endpoint rejects with
+# a 400 when tools are present. Until pi's Databricks-anthropic path is fixed,
+# keep Claude models off pi — claude-sdk serves them instead.
+_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
+    "pi": ("databricks-claude-haiku-4-5",),
+}
+
+
+def _filter_excluded_models(harness: str, models: list[str]) -> list[str]:
+    """Drop models known to be incompatible with *harness* (see _HARNESS_EXCLUDED_MODELS)."""
+    excluded = _HARNESS_EXCLUDED_MODELS.get(harness)
+    if not excluded:
+        return models
+    return [m for m in models if m not in excluded]
+
 
 async def route_session_harness(
     user_message: str,
@@ -542,9 +559,12 @@ async def route_session_harness(
     for h in _AUTO_ROUTING_HARNESSES:
         if live_catalog is not None:
             if h in live_catalog:
-                harness_models[h] = live_catalog[h]
+                models = _filter_excluded_models(h, live_catalog[h])
+                if models:
+                    harness_models[h] = models
         else:
-            models = infer_models(h)
+            models = infer_models(h) or []
+            models = _filter_excluded_models(h, models)
             if models:
                 harness_models[h] = models
 
