@@ -557,6 +557,14 @@ async def test_enrollment_poll_clears_map_slot_on_completion(tmp_path: Path) -> 
         on_failure=on_failure,
         poll_interval_seconds=0.01,
     )
+    # Let the poll baseline the (absent) token BEFORE writing the fresh one —
+    # otherwise, if `store.put` races ahead of the poll's first read (likely
+    # under a loaded `-n` runner), the poll baselines "fresh" and never sees a
+    # change, so on_success never fires and this test times out. The sibling
+    # ``test_enrollment_fires_on_first_token_when_none_existed`` uses the same
+    # ordering barrier.
+    await asyncio.sleep(0.05)
+    assert not succeeded.is_set()
     await store.put("T1", "U1", _BASE, access_token="fresh", refresh_token="")
     await asyncio.wait_for(succeeded.wait(), timeout=1.0)
     # Let the done-callback run.
