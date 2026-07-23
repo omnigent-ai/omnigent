@@ -491,10 +491,19 @@ async def _refresh_claude_permission_hook_auth(
     while True:
         await asyncio.sleep(refresh_interval_s)
         try:
-            token = await asyncio.to_thread(auth_token_factory)
-            if token:
-                headers = databricks_request_headers(server_url, bearer_token=token)
-                update_permission_hook_auth_headers(bridge_dir, headers)
+
+            def _refresh_snapshot() -> None:
+                token = auth_token_factory()
+                if token:
+                    headers = databricks_request_headers(server_url, bearer_token=token)
+                    update_permission_hook_auth_headers(bridge_dir, headers)
+
+            # Run the whole snapshot refresh off-loop: the token fetch can
+            # shell out to the Databricks CLI, and both the header build and
+            # the bridge-file write are synchronous. Keeping them on the loop
+            # (every 60s per session) needlessly competes with the tunnel's
+            # keepalive coroutine — see _RunnerDatabricksAuth.async_auth_flow.
+            await asyncio.to_thread(_refresh_snapshot)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — retain the last still-valid snapshot

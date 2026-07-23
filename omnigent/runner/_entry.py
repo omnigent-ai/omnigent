@@ -262,6 +262,56 @@ class _RunnerDatabricksAuth(httpx.Auth):
                 request.headers["Authorization"] = f"Bearer {token}"
                 yield request
 
+    async def async_auth_flow(
+        self,
+        request: httpx.Request,
+    ) -> AsyncIterator[httpx.Request]:
+        """Async twin of :meth:`auth_flow` that never blocks the event loop.
+
+        This auth is attached to the runner's ``httpx.AsyncClient`` (see
+        :func:`serve_tunnel`'s ``server_client``), which shares the event
+        loop with the WebSocket tunnel's keepalive coroutine. httpx drives a
+        sync-only ``auth_flow`` generator *inline on the loop*, so the token
+        factory — whose first post-rejection call lazily resolves runner-local
+        auth: a Databricks CLI shell-out (~0.5s) and, on the managed path, a
+        blocking ``httpx.Client`` mint POST (up to 10s, see
+        :func:`_mint_managed_owner_token`) — would stall the loop long enough
+        to miss the server's keepalive ping and drop the tunnel with a
+        ``1011 keepalive ping timeout``. Defining ``async_auth_flow`` makes
+        httpx use *this* instead, and every potentially-blocking call is
+        offloaded with ``asyncio.to_thread`` so a slow credential resolution
+        can never starve keepalive. The auth semantics are otherwise identical
+        to :meth:`auth_flow`.
+
+        :param request: The outgoing httpx request.
+        :yields: The request with the auth header set, or unmodified when no
+            factory is configured.
+        :raises httpx.RequestError: When the factory is configured but
+            returns no token.
+        """
+        if self._server_url:
+            from omnigent.cli_auth import databricks_request_headers
+
+            headers = await asyncio.to_thread(databricks_request_headers, self._server_url)
+            request.headers.update(headers)
+        if self._factory is not None:
+            token = await asyncio.to_thread(self._factory)
+            if not token:
+                if getattr(self._factory, "declined", False):
+                    yield request
+                    return
+                raise httpx.RequestError("Databricks token refresh returned no token")
+            request.headers["Authorization"] = f"Bearer {token}"
+        response = yield request
+        if self._factory is None:
+            return
+        if _is_login_redirect_or_unauthorized(response):
+            await asyncio.to_thread(_invalidate_auth_token_factory, self._factory)
+            token = await asyncio.to_thread(self._factory)
+            if token:
+                request.headers["Authorization"] = f"Bearer {token}"
+                yield request
+
 
 def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     """Return ``True`` when ``response`` is a re-auth signal.

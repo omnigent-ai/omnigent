@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import io
 import logging
@@ -924,6 +925,118 @@ async def test_runner_databricks_auth_end_to_end_through_mock_transport() -> Non
     # cached value instead of asking the factory for a new one.
     assert seen_authz == ["Bearer tok-1", "Bearer tok-2"]
     assert minted_tokens == ["tok-1", "tok-2"]
+
+
+@pytest.mark.asyncio
+async def test_async_auth_flow_remints_on_login_redirect_through_async_client() -> None:
+    """``async_auth_flow`` re-mints on a 302→/oidc/ exactly like the sync flow.
+
+    ``httpx.AsyncClient`` prefers ``async_auth_flow`` over the sync
+    ``auth_flow`` when both are defined, so this pins that the async twin
+    added to keep the event loop unblocked preserves the login-redirect
+    re-mint semantics (the ``ness-tool-spin`` regression guard, async path).
+
+    :returns: None.
+    """
+    minted_tokens: list[str] = []
+    seen_authz: list[str] = []
+
+    def _factory() -> str:
+        token = f"tok-{len(minted_tokens) + 1}"
+        minted_tokens.append(token)
+        return token
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_authz.append(request.headers.get("authorization", ""))
+        if len(seen_authz) == 1:
+            return httpx.Response(
+                302,
+                headers={"Location": "https://ws.example.com/oidc/oauth2/v2.0/authorize"},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(
+        base_url="http://ap.example.com",
+        auth=_RunnerDatabricksAuth(_factory),
+        transport=transport,
+    ) as client:
+        resp = await client.post("/v1/sessions/conv_abc/mcp", json={})
+
+    assert resp.status_code == 200
+    assert seen_authz == ["Bearer tok-1", "Bearer tok-2"]
+    assert minted_tokens == ["tok-1", "tok-2"]
+
+
+@pytest.mark.asyncio
+async def test_async_auth_flow_blocking_factory_does_not_starve_event_loop() -> None:
+    """A slow (blocking) token factory must not stall the asyncio loop.
+
+    This is the regression guard for the ``1011 keepalive ping timeout``
+    tunnel drops: ``_RunnerDatabricksAuth`` is attached to the runner's
+    ``httpx.AsyncClient``, which shares the event loop with the WebSocket
+    tunnel's keepalive coroutine. If the (synchronous, sometimes multi-second
+    — CLI shell-out / mint POST) token factory runs inline on the loop, the
+    keepalive coroutine cannot answer the server's ping and the tunnel drops.
+    ``async_auth_flow`` offloads the factory via ``asyncio.to_thread``; this
+    test proves a concurrent loop task keeps ticking *while* the blocking
+    factory runs.
+
+    :returns: None.
+    """
+    factory_entered = asyncio.Event()
+
+    def _blocking_factory() -> str:
+        # Simulate the worst case: a synchronous multi-second credential
+        # resolution (Databricks CLI shell-out / 10s mint POST). If this runs
+        # on the event loop, the concurrent heartbeat below cannot advance.
+        factory_entered.set()
+        time.sleep(0.5)
+        return "tok"
+
+    heartbeats = 0
+
+    async def _heartbeat() -> None:
+        # Stand-in for the websockets keepalive coroutine: must keep ticking
+        # on the loop even while the factory is blocking in its worker thread.
+        nonlocal heartbeats
+        while True:
+            heartbeats += 1
+            await asyncio.sleep(0.02)
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True})
+
+    hb = asyncio.create_task(_heartbeat())
+    try:
+        transport = httpx.MockTransport(_handler)
+        async with httpx.AsyncClient(
+            base_url="http://ap.example.com",
+            auth=_RunnerDatabricksAuth(_blocking_factory),
+            transport=transport,
+        ) as client:
+            # The post must run concurrently with the wait: the factory only
+            # runs (and sets factory_entered) *during* the request, so we
+            # can't await the event before launching the post.
+            post = asyncio.create_task(client.post("/v1/sessions/conv_abc/mcp", json={}))
+            await factory_entered.wait()
+            beats_before = heartbeats
+            resp = await post
+    finally:
+        hb.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await hb
+
+    assert resp.status_code == 200
+    # The 0.5s blocking factory spans ~25 heartbeat ticks (20ms each). If the
+    # factory had run on the loop, the heartbeat would have been frozen for
+    # its whole duration and gained ~0 ticks. Requiring several ticks proves
+    # the loop stayed live — i.e. keepalive pings would still be answered.
+    assert heartbeats - beats_before >= 5, (
+        f"event loop starved during token resolution: only "
+        f"{heartbeats - beats_before} heartbeat tick(s) while the factory "
+        f"blocked — async_auth_flow is running the factory on the loop"
+    )
 
 
 def test_runner_tunnel_binding_token_from_env_returns_none_without_token(
