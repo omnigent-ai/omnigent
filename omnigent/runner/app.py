@@ -150,10 +150,19 @@ def __getattr__(name: str) -> Any:
 
 def _native_builder(name: str) -> Any:
     async def _call(*args: Any, **kwargs: Any) -> Any:
+        overrides: list[tuple[str, Any]] = []
         for dependency in _native.__all__:
             if not dependency.startswith("_auto_create_") and dependency in globals():
-                setattr(_native_runtime, dependency, globals()[dependency])
-        return await getattr(_native_runtime, name)(*args, **kwargs)
+                app_value = globals()[dependency]
+                runtime_value = getattr(_native_runtime, dependency)
+                if app_value is not runtime_value:
+                    overrides.append((dependency, runtime_value))
+                    setattr(_native_runtime, dependency, app_value)
+        try:
+            return await getattr(_native_runtime, name)(*args, **kwargs)
+        finally:
+            for dependency, runtime_value in reversed(overrides):
+                setattr(_native_runtime, dependency, runtime_value)
 
     return _call
 
@@ -256,16 +265,8 @@ async def _generate_claude_native_background_title(
     return stdout.decode(errors="replace").strip()
 
 
-# ── session.status "waiting" backwards-compat (new runner ↔ old server) ──
-# The runner emits ``session.status: "waiting"`` when a turn ends with sub-agents
-# still running (for the headless ``-p`` fast-exit). Servers older than
-# 0.3.0 don't model "waiting" — their ``SessionResponse.status`` is
-# ``Literal["idle","running","failed"]`` — and 500 on ``GET /v1/sessions`` when
-# they try to serialize the cached value. So we resolve the server version once
-# (``_get_server_version``) and, when publishing status, downgrade
-# "waiting"→"running" unless that version supports it
-# (``_version_supports_waiting_status``). An unknown version — unprobed or a
-# probe failure — downgrades too, so an old server is never 500'd.
+# Servers before 0.3.0 cannot serialize the runner's "waiting" status.
+# Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
@@ -362,11 +363,6 @@ _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX = "missing_parent_inbox"
 # fail-open/retry path. Guarded by tests/test_ask_timeout_infinite.py.
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
-# Terminal resource hosting the framework's own TUI (the Omnigent REPL,
-# ``omnigent attach``) for runner-hosted SDK sessions — the SDK mirror of
-# the claude-/codex-native embedded terminals. Resource id derives as
-# ``terminal_tui_main`` (see ``terminal_resource_id``).
-
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
 # delivery signal for the last child of a fan-out, and Omnigent routinely
 # returns a transient 503 RUNNER_UNAVAILABLE while the parent's runner tunnel
