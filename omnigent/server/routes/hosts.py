@@ -1378,11 +1378,18 @@ def create_hosts_router(
             wire_api=body.wire_api,
             env_var=body.env_var,
         )
-        result = await _proxy_store_secret(
-            host_registry=host_registry,
-            host_conn=conn,
-            frame=frame,
-        )
+        # Serialize credential writes to this host: the daemon's write is a
+        # non-atomic load→merge→save of config.yaml (twice — entry, then
+        # default), so two overlapping writes (a double-click, or key + gateway
+        # in quick succession) could interleave and clobber a sibling providers:
+        # entry. The lock lives on the connection, so it's discarded when the
+        # host disconnects.
+        async with conn.credential_write_lock:
+            result = await _proxy_store_secret(
+                host_registry=host_registry,
+                host_conn=conn,
+                frame=frame,
+            )
 
         if result.get("status") == "failed":
             # The host's reason is non-secret (validation / write failure).
