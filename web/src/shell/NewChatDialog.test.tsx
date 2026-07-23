@@ -1114,28 +1114,6 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
-  it("rides Smart Routing along to create as cost_control_mode_override", async () => {
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-    renderLanding({ smart_routing_enabled: true });
-    // a1 (Claude Code) auto-selects; pick Smart Routing in its gear modal, Save.
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "build it" },
-    });
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-    const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    expect(body.cost_control_mode_override).toBe("on");
-    // Smart Routing and an explicit model are mutually exclusive.
-    expect(body.model_override).toBeUndefined();
-  });
-
   it("shows a conflict banner in the file browser for an occupied directory", async () => {
     // A live session in the seeded workspace ("/Users/corey/repo") on the
     // auto-selected host occupies the directory the picker opens at.
@@ -2537,23 +2515,6 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(tooltip.textContent).not.toContain("Bypass: On");
   });
 
-  it("reflects Smart Routing in the gear tooltip (Model=Smart Routing, Effort=Default)", async () => {
-    renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
-    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
-        0,
-      ),
-    );
-    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
-    expect(tooltip.textContent).toContain("Model: Smart Routing");
-    // Effort is frozen to Default under Smart Routing — the tooltip mirrors it.
-    expect(tooltip.textContent).toContain("Effort: Default");
-  });
-
   it("shows the permission mode description in the dropdown footer, tracking hover", () => {
     renderLanding();
     openAgentConfig("a1");
@@ -2582,65 +2543,6 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     );
   });
 
-  it("offers Smart Routing in the Model dropdown only when the server enables it", () => {
-    // Server flag off → no Smart Routing option.
-    const { unmount } = renderLanding({ smart_routing_enabled: false });
-    openAgentConfig("a1");
-    openSelect("new-chat-landing-config-model");
-    expect(screen.queryByRole("option", { name: "Smart Routing" })).toBeNull();
-    unmount();
-    // Server flag on (claude-native is routable) → the option appears.
-    renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    openSelect("new-chat-landing-config-model");
-    expect(screen.getByRole("option", { name: "Smart Routing" })).toBeTruthy();
-  });
-
-  it("freezes Effort to Default (disabled) while Smart Routing is selected", () => {
-    renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a1");
-    // Effort is editable before picking Smart Routing.
-    expect(screen.getByTestId("new-chat-landing-config-effort")).not.toBeDisabled();
-    // Picking Smart Routing freezes Effort at Default and disables it.
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    const effort = screen.getByTestId("new-chat-landing-config-effort");
-    expect(effort.textContent).toContain("Default");
-    expect(effort).toBeDisabled();
-  });
-
-  it("offers a standalone Smart Routing toggle for routable non-Claude agents (Codex)", () => {
-    // Codex (a2) is routable but has no Model dropdown, so routing appears as a
-    // standalone toggle — not buried in a Claude-only control. It's absent when
-    // the server disables routing.
-    const { unmount } = renderLanding({ smart_routing_enabled: false });
-    openAgentConfig("a2");
-    expect(screen.queryByTestId("new-chat-landing-config-smart-routing")).toBeNull();
-    unmount();
-    renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a2");
-    expect(screen.getByTestId("new-chat-landing-config-smart-routing")).toBeTruthy();
-  });
-
-  it("shows the gear for a bundle agent with only Smart Routing armed (harness + toggle)", () => {
-    // A bundle agent's harness (claude-sdk) is both a brain-harness knob AND
-    // routable, so its modal shows the Agent Harness select plus a standalone
-    // Smart Routing toggle. This is the reachable "routing + one knob" case.
-    mockAgents([
-      {
-        id: "a_polly",
-        name: "polly",
-        display_name: "Polly",
-        description: null,
-        harness: "claude-sdk",
-        skills: [],
-      },
-    ]);
-    renderLanding({ smart_routing_enabled: true });
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-harness")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-config-smart-routing")).toBeTruthy();
-  });
-
   it("keeps the gear visible for routing-eligible agents even with no other knob (guard)", () => {
     // Defensive: if a routable harness ever has no permission/approval/cursor
     // knob and isn't a brain agent, Smart Routing (modal-only) still needs the
@@ -2660,95 +2562,6 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     renderLanding({ smart_routing_enabled: true });
     // opencode-native has no knobs and isn't routable → no gear.
     expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
-  });
-
-  it("rides Codex Smart Routing along to create as cost_control_mode_override", async () => {
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-    renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("a2");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-smart-routing"));
-    saveConfig();
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "build it" },
-    });
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-    const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    expect(body.agent_id).toBe("a2");
-    expect(body.cost_control_mode_override).toBe("on");
-  });
-
-  it("clears an armed Smart Routing when the selected agent changes", async () => {
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-    renderLanding({ smart_routing_enabled: true });
-    // Arm Smart Routing on Claude (a1) via its Model dropdown, Save.
-    openAgentConfig("a1");
-    pickSelectOption("new-chat-landing-config-model", "Smart Routing");
-    saveConfig();
-    // Switch to Codex (a2): the armed routing must reset so it can't ride along
-    // stuck "on" for the new agent.
-    selectAgent("a2");
-    openAgentConfig("a2");
-    expect(
-      (
-        screen.getByTestId("new-chat-landing-config-smart-routing") as HTMLButtonElement
-      ).getAttribute("aria-checked"),
-    ).toBe("false");
-    // A create now omits the override (deferred).
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "go" },
-    });
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-    const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    expect(body.agent_id).toBe("a2");
-    expect(body.cost_control_mode_override).toBeUndefined();
-  });
-
-  it("drops Smart Routing when a bundle agent is overridden to a non-routable harness", async () => {
-    // A bundle agent on a routable brain harness (claude-sdk) offers both the
-    // Smart Routing toggle and the Agent Harness override. Arming routing and
-    // then overriding to a NON-routable harness (Cursor) must drop eligibility,
-    // so the create omits cost_control_mode_override — routing can't ride along
-    // invisibly for a harness that can't route.
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-    mockAgents([
-      {
-        id: "a_polly",
-        name: "polly",
-        display_name: "Polly",
-        description: null,
-        harness: "claude-sdk",
-        skills: [],
-      },
-    ]);
-    renderLanding({ smart_routing_enabled: true });
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    // Arm routing, then override the brain harness to non-routable Cursor.
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-smart-routing"));
-    pickSelectOption("new-chat-landing-config-harness", "Cursor");
-    saveConfig();
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "go" },
-    });
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-    const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
-    expect(body.harness_override).toBe("cursor");
-    expect(body.cost_control_mode_override).toBeUndefined();
   });
 });
 
