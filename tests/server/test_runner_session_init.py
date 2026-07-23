@@ -150,25 +150,12 @@ async def test_session_init_readiness_is_explicit_and_backward_compatible(
 
 
 def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) -> None:
-    """A forked native session's fork directives survive to the runner envelope.
+"""Regression guard: fork directives survive runner reconnect init.
 
-    End-to-end regression guard for the exact seam that dropped a forked
-    claude-native session's history: the runner reconnect path
-    (``_on_runner_connect``) sources its conversations from
-    ``list_conversations_by_runner_id`` and hands each straight to
-    ``build_runner_session_init_payload``, which projects
-    ``conversation.labels`` into the init envelope the runner reads to decide
-    whether to clone/rebuild the vendor transcript. When that store lookup
-    returned label-less conversations, the envelope shipped no ``omnigent.fork.*``
-    directives, so the runner skipped its clone/rebuild branch and launched the
-    TUI fresh — history lost — even though the fork copied the history into the
-    store.
-
-    This drives the real store (fork included), not a hand-built envelope, so it
-    fails if any layer between the by-runner-id lookup and the envelope stops
-    carrying labels. The label→launch-metadata projection is covered separately
-    by ``test_claude_launch_metadata_envelope_never_calls_server``.
-    """
+Exercises store-backed fork → list_conversations_by_runner_id → build_runner_session_init_payload →
+parse_runner_session_init_envelope, and asserts the fork labels are present and parsed into
+Claude launch metadata.
+"""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conversation_store = SqlAlchemyConversationStore(db_uri)
 
