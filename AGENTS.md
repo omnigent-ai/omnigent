@@ -3,6 +3,16 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Parallel development
+
+For one or more independently running Omnigent revisions, use one source
+checkout or worktree and one isolated `omnidev` pod per revision. Sessions and
+target project directories using the same revision may share its pod. Do not
+share databases, ports, or pod directories between checkouts. Follow [Develop
+and test one or more
+changes](CONTRIBUTING.md#develop-and-test-one-or-more-changes) and see the
+[`omnidev` reference](dev/omnidev/README.md) for pod behavior and options.
+
 ## Committing
 
 Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
