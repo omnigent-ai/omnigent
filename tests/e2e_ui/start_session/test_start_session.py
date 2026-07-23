@@ -967,6 +967,28 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
 
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
+            # This isolated host fixture has no live harness bridge, so provide
+            # the catalog the new-session picker now resolves through the host.
+            async def handle_model_options(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "models": [
+                                {"id": "opus", "displayName": "Opus 4.8"},
+                                {"id": "sonnet", "displayName": "Sonnet 4.6"},
+                                {"id": "haiku", "displayName": "Haiku 4.5"},
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route(
+                f"**/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
+                handle_model_options,
+            )
+
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
@@ -990,9 +1012,10 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await expect(effort).to_contain_text("Default")
 
             # Pick model + effort in the same modal visit (each select commits to
-            # a local draft; Save commits both at once).
-            await _pick_config_select(page, "new-chat-landing-config-model", "Opus")
-            await expect(model).to_contain_text("Opus")
+            # a local draft; Save commits both at once). The model rows carry the
+            # host catalog's live display names, not the static alias labels.
+            await _pick_config_select(page, "new-chat-landing-config-model", "Opus 4.8")
+            await expect(model).to_contain_text("Opus 4.8")
             await _pick_config_select(page, "new-chat-landing-config-effort", "High")
             await expect(effort).to_contain_text("High")
             await _save_config(page)

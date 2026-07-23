@@ -120,15 +120,24 @@ def test_expected_indexes(db_engine: Engine) -> None:
     """Both tables expose the indexes that back the read paths."""
     insp = sa.inspect(db_engine)
     scheduled_tasks_idx = {i["name"] for i in insp.get_indexes("scheduled_tasks")}
-    assert {
-        "ix_scheduled_tasks_created_at",
-        "ix_scheduled_tasks_user_id",
-    } <= scheduled_tasks_idx
+    assert "ix_scheduled_tasks_user_scope" in scheduled_tasks_idx
+    scheduled_tasks_idx_cols = {
+        i["name"]: list(i["column_names"]) for i in insp.get_indexes("scheduled_tasks")
+    }
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_user_scope"] == [
+        "workspace_id",
+        "user_id",
+        "created_at",
+        "id",
+    ]
     assert "ix_scheduled_tasks_agent_id" not in scheduled_tasks_idx
-    # ix_scheduled_tasks_state was dropped: list_active's per-workspace shape
-    # has no production caller, and the boot-time list_active_all_workspaces
-    # scan is served by ix_scheduled_tasks_created_at with state as a residual
-    # filter (see migration e5c8b1f4a2d7).
+    # The separate created_at + user_id listing indexes were folded into the
+    # single user-scope index above: with the user_id filter pushed into SQL the
+    # per-user list is a covered seek, and the boot scan reads whole rows
+    # regardless (see migration f4664ca64ea8).
+    assert "ix_scheduled_tasks_created_at" not in scheduled_tasks_idx
+    assert "ix_scheduled_tasks_user_id" not in scheduled_tasks_idx
+    # ix_scheduled_tasks_state was dropped earlier (see migration e5c8b1f4a2d7).
     assert "ix_scheduled_tasks_state" not in scheduled_tasks_idx
     runs_idx = {i["name"] for i in insp.get_indexes("scheduled_task_runs")}
     assert "ix_scheduled_task_runs_scheduled_task_id" in runs_idx

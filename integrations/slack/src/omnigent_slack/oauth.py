@@ -239,17 +239,24 @@ async def _start_device_login(
     except httpx.HTTPError as exc:
         await client.aclose()
         raise OAuthError(f"Could not start device authorization: {exc}") from exc
-    data = resp.json()
-    device_code = str(data["device_code"])
-    interval = max(int(data.get("interval", 5)), 1)
-    expires_in = int(data.get("expires_in", 600))
+    try:
+        data = resp.json()
+        device_code = str(data["device_code"])
+        interval = max(int(data.get("interval", 5)), 1)
+        expires_in = int(data.get("expires_in", 600))
+        verification_url = str(data["verification_uri_complete"])
+        user_code = str(data.get("user_code", ""))
+    except (ValueError, KeyError, TypeError) as exc:
+        # A 200 with a malformed body would otherwise leak the open client.
+        await client.aclose()
+        raise OAuthError(f"Malformed device authorization response: {exc}") from exc
 
     async def _poll() -> TokenResult:
         return await _poll_device(client, device_code, interval, expires_in)
 
     return PendingLogin(
-        verification_url=str(data["verification_uri_complete"]),
-        user_code=str(data.get("user_code", "")),
+        verification_url=verification_url,
+        user_code=user_code,
         _poll=_poll,
         _close=client.aclose,
     )
@@ -263,10 +270,13 @@ async def _poll_device(
         if asyncio.get_event_loop().time() >= deadline:
             raise AuthorizationExpiredError("The login link expired.")
         await asyncio.sleep(interval)
-        resp = await client.post(
-            "/oauth/token",
-            data={"grant_type": _DEVICE_GRANT_TYPE, "device_code": device_code},
-        )
+        try:
+            resp = await client.post(
+                "/oauth/token",
+                data={"grant_type": _DEVICE_GRANT_TYPE, "device_code": device_code},
+            )
+        except httpx.HTTPError:
+            continue  # transient — keep polling until the deadline (mirrors the ticket flow)
         if resp.status_code == 200:
             return _token_from_response(
                 resp, access_key="access_token", has_refresh=True, default_expires=3600
@@ -296,10 +306,15 @@ async def _start_cli_ticket_login(server_url: str) -> PendingLogin:
     except httpx.HTTPError as exc:
         await client.aclose()
         raise OAuthError(f"Could not start login: {exc}") from exc
-    data = resp.json()
-    ticket = str(data["ticket"])
-    # login_url is a server-relative path (e.g. "/auth/login?ticket=…").
-    login_url = str(data["login_url"])
+    try:
+        data = resp.json()
+        ticket = str(data["ticket"])
+        # login_url is a server-relative path (e.g. "/auth/login?ticket=…").
+        login_url = str(data["login_url"])
+    except (ValueError, KeyError, TypeError) as exc:
+        # A 200 with a malformed body would otherwise leak the open client.
+        await client.aclose()
+        raise OAuthError(f"Malformed cli-login response: {exc}") from exc
     verification_url = login_url if login_url.startswith("http") else f"{base}{login_url}"
 
     async def _poll() -> TokenResult:

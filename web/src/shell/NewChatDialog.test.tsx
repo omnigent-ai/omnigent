@@ -22,7 +22,7 @@ import {
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
-import { useHosts, useInstallHarness, type Host } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts, useInstallHarness, type Host } from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -42,6 +42,7 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostModelOptions: vi.fn(),
   // The setup dialog mounts these; default to an inert mutation + not-installing
   // so tests that don't exercise install don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
@@ -128,6 +129,7 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 
 const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const useHostsMock = vi.mocked(useHosts);
+const useHostModelOptionsMock = vi.mocked(useHostModelOptions);
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useHostWorktreesMock = vi.mocked(useHostWorktrees);
@@ -597,6 +599,7 @@ function mockAgents(agents: AvailableAgent[]) {
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
   useHostsMock.mockReset();
+  useHostModelOptionsMock.mockReset();
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
   useHostWorktreesMock.mockReset();
@@ -622,6 +625,19 @@ function setupLandingMocks() {
     data: undefined,
   } as unknown as ReturnType<typeof useHostWorktrees>);
   mockHosts([host("online")]);
+  useHostModelOptionsMock.mockReturnValue({
+    data: [
+      { id: "opus", model: "system.ai.claude-opus-4-8[1m]", displayName: "Opus 4.8" },
+      {
+        id: "sonnet",
+        model: "system.ai.claude-sonnet-4-6[1m]",
+        displayName: "Sonnet 4.6",
+      },
+      { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
+    ],
+    isLoading: false,
+    isError: false,
+  } as unknown as ReturnType<typeof useHostModelOptions>);
   mockAgents([
     {
       id: "a1",
@@ -1012,9 +1028,13 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-config-effort")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-config-permission")).toBeTruthy();
-    // The model select offers the Claude model options.
+    // The model select offers the selected host's live catalog (mocked to
+    // Opus 4.8 / Sonnet 4.6 / Haiku 4.5) — never the removed/static rows.
     openSelect("new-chat-landing-config-model");
-    expect(screen.getByText("Opus")).toBeTruthy();
+    expect(screen.getByText("Opus 4.8")).toBeTruthy();
+    expect(screen.getByText("Sonnet 4.6")).toBeTruthy();
+    expect(screen.queryByText("Fable")).toBeNull();
+    expect(screen.queryByText("Sonnet 5")).toBeNull();
     closeMenu();
     // The permission select offers every permission mode.
     openSelect("new-chat-landing-config-permission");

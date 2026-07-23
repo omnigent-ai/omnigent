@@ -46,6 +46,31 @@ async def _drain_model_options(session_id: str) -> None:
         await asyncio.sleep(0)
 
 
+def test_model_options_wire_keeps_rows_without_display_name() -> None:
+    """Provider rows may omit ``displayName`` — the UI falls back to ``id``.
+
+    Codex ``model/list`` and OpenCode ``/api/model`` rows are
+    provider-supplied; requiring ``displayName`` would blank the whole
+    picker when one row lacks it.
+    """
+    options = _sessions_mod._model_options_from_wire([{"id": "opencode-go/glm-5.2"}])
+    assert [option["id"] for option in options] == ["opencode-go/glm-5.2"]
+    assert "displayName" not in options[0]
+
+
+def test_model_options_wire_skips_malformed_rows_not_the_catalog() -> None:
+    """One invalid row (or non-dict) is dropped; its siblings survive."""
+    options = _sessions_mod._model_options_from_wire(
+        [
+            {"id": "opus", "displayName": "Opus 4.10"},
+            {"displayName": "no id"},
+            "not-a-dict",
+            {"id": 42},
+        ]
+    )
+    assert [option["id"] for option in options] == ["opus"]
+
+
 class _ConversationStore:
     """Minimal store that records ``list_items`` calls.
 
@@ -745,13 +770,98 @@ async def test_session_snapshot_includes_model_options_from_runner(
     )
 
     assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
-    assert snapshot.model_options[0]["displayName"] == "GPT-5.5"
-    assert snapshot.model_options[0]["supportedReasoningEfforts"] == [
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0].displayName == "GPT-5.5"
+    assert [
+        effort.model_dump(exclude_none=True)
+        for effort in snapshot.model_options[0].supportedReasoningEfforts
+    ] == [
         {"reasoningEffort": "low", "description": "Low"},
         {"reasoningEffort": "medium", "description": "Medium"},
         {"reasoningEffort": "high", "description": "High"},
         {"reasoningEffort": "xhigh", "description": "Extra high"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_claude_session_snapshot_loads_launch_time_model_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude snapshots populate from the runner's launch-time catalog."""
+    from omnigent.server.routes import sessions as _mod
+
+    _mod._session_status_cache.clear()
+    _mod._runner_skills_cache.clear()
+    _mod._runner_skills_inflight.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+
+    class _FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            self.get_calls.append(url)
+            if url.endswith("/skills"):
+                return _FakeResponse({"skills": []})
+            if url.endswith("/claude-model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "opus",
+                                "model": "system.ai.claude-opus-4-10",
+                                "displayName": "Opus 4.10",
+                                "isDefault": True,
+                            },
+                            {
+                                "id": "haiku",
+                                "model": "system.ai.claude-haiku-4-5",
+                                "displayName": "Haiku 4.5",
+                                "isDefault": False,
+                            },
+                        ]
+                    }
+                )
+            return _FakeResponse({"status": "idle"})
+
+    session_id = "conv_claude_options"
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert f"/v1/sessions/{session_id}/claude-model-options" in fake_client.get_calls
+    assert [(m.id, m.displayName) for m in snapshot.model_options] == [
+        ("opus", "Opus 4.10"),
+        ("haiku", "Haiku 4.5"),
     ]
 
 
@@ -846,11 +956,11 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
     # Served straight from the pushed cache — no runner model-options fetch.
     assert not any("model-options" in url for url in fake_client.get_calls)
-    assert [m["id"] for m in snapshot.model_options] == [
+    assert [m.id for m in snapshot.model_options] == [
         "databricks-claude-sonnet-4-6",
         "anthropic-claude-opus-4-1",
     ]
-    assert snapshot.model_options[0]["displayName"] == "Sonnet 4.6"
+    assert snapshot.model_options[0].displayName == "Sonnet 4.6"
 
 
 @pytest.mark.asyncio
@@ -919,7 +1029,7 @@ async def test_session_snapshot_serves_static_cursor_model_options(
 
     # No runner round-trip for cursor model options (served statically).
     assert not any("model-options" in url for url in fake_client.get_calls)
-    ids = [m["id"] for m in snapshot.model_options]
+    ids = [m.id for m in snapshot.model_options]
     assert "claude-opus-4-6" in ids and "gpt-5.2" in ids and "composer-2.5" in ids
     # base-id namespace only — no flattened effort variants leak through.
     assert not any("-high" in i or "-xhigh" in i for i in ids)
@@ -1019,7 +1129,7 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
     )
     # Refresh must not echo the stale cached row. If this is "stale-model",
     # browser reloads would not recover after the server-side cache shape is fixed.
-    assert [m["id"] for m in refreshed.model_options] == []
+    assert [m.id for m in refreshed.model_options] == []
     await _drain_model_options("3626053dfa9668a8604cc06e0b590ae0")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
@@ -1030,8 +1140,8 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
         "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/codex-model-options"
         in fake_client.get_calls
     )
-    assert [m["id"] for m in snapshot.model_options] == ["fresh-model"]
-    assert snapshot.model_options[0]["displayName"] == "Fresh Model"
+    assert [m.id for m in snapshot.model_options] == ["fresh-model"]
+    assert snapshot.model_options[0].displayName == "Fresh Model"
 
 
 @pytest.mark.asyncio
@@ -1053,7 +1163,7 @@ async def test_session_snapshot_retries_empty_model_options(
     _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
-    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
 
     class _FakeResponse:
         def __init__(self, payload: dict[str, object]) -> None:
@@ -1131,8 +1241,8 @@ async def test_session_snapshot_retries_empty_model_options(
         )
         == 2
     )
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.5"]
-    assert snapshot.model_options[0]["defaultReasoningEffort"] == "xhigh"
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
+    assert snapshot.model_options[0].defaultReasoningEffort == "xhigh"
 
 
 @pytest.mark.asyncio
@@ -1154,7 +1264,7 @@ async def test_session_snapshot_retries_503_model_options(
     _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
-    monkeypatch.setattr(_mod, "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
 
     class _FakeResponse:
         def __init__(
@@ -1245,8 +1355,8 @@ async def test_session_snapshot_retries_503_model_options(
         )
         == 2
     )
-    assert [m["id"] for m in snapshot.model_options] == ["gpt-5.4"]
-    assert snapshot.model_options[0]["defaultReasoningEffort"] == "medium"
+    assert [m.id for m in snapshot.model_options] == ["gpt-5.4"]
+    assert snapshot.model_options[0].defaultReasoningEffort == "medium"
 
 
 @pytest.mark.asyncio

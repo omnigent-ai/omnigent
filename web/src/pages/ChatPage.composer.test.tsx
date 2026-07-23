@@ -85,6 +85,14 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
   };
 }
 
+const CLAUDE_MODEL_OPTIONS = [
+  { id: "fable", displayName: "Fable" },
+  { id: "opus", displayName: "Opus" },
+  { id: "sonnet", displayName: "Sonnet 4.6" },
+  { id: "sonnet_5", displayName: "Sonnet 5" },
+  { id: "haiku", displayName: "Haiku" },
+];
+
 /** The composer textarea, located by its aria-label. */
 function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
@@ -422,6 +430,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -433,6 +442,29 @@ describe("Composer slash-command submit routing", () => {
     expect(ta.value).toBe("");
     // The AgentPicker dropdown is open with the Models rows to choose from.
     expect(screen.getAllByTestId("model-picker-item").length).toBeGreaterThan(0);
+  });
+
+  it("does not open an empty Claude model picker while the live catalog loads", () => {
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByText(/Usage: \/model <name>/)).toBeVisible();
   });
 
   it("opens the server-backed model picker for bare /model on opencode-native", () => {
@@ -508,6 +540,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -577,6 +610,7 @@ describe("AgentPicker trigger label", () => {
           selectedAgentId: "a1",
           modelPickerKind: "claude",
           showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -606,6 +640,7 @@ describe("AgentPicker trigger label", () => {
           modelPickerKind: "claude",
           showModels: true,
           showEffort: false,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -631,6 +666,84 @@ describe("AgentPicker trigger label", () => {
     expect(opusRow).not.toHaveAttribute("data-active", "true");
   });
 
+  it("maps a Claude concrete model to its friendly active alias", () => {
+    useChatStore.setState({
+      selectedModel: null,
+      sessionModelOverride: null,
+      llmModel: "system.ai.claude-sonnet-5",
+    });
+    const liveOptions = [
+      {
+        id: "opus",
+        model: "system.ai.claude-opus-4-10",
+        displayName: "Opus 4.10",
+        isDefault: false,
+      },
+      {
+        id: "sonnet",
+        model: "system.ai.claude-sonnet-5",
+        displayName: "Sonnet 5",
+        isDefault: true,
+      },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: liveOptions,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-picker-trigger")).toHaveTextContent("Sonnet 5");
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(
+      document.querySelector('[data-testid="model-picker-item"][data-model-id="sonnet"]'),
+    ).toHaveAttribute("data-active", "true");
+  });
+
+  it("uses the catalog default when a Claude session has no concrete model", () => {
+    useChatStore.setState({ selectedModel: null, sessionModelOverride: null, llmModel: null });
+    const liveOptions = [
+      {
+        id: "opus",
+        model: "system.ai.claude-opus-4-10",
+        displayName: "Opus 4.10",
+        isDefault: false,
+      },
+      {
+        id: "sonnet",
+        model: "system.ai.claude-sonnet-5",
+        displayName: "Sonnet 5",
+        isDefault: true,
+      },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: liveOptions,
+        })}
+      />,
+    );
+
+    expect(screen.getByTestId("agent-picker-trigger")).toHaveTextContent("Sonnet 5");
+    fireEvent.change(textarea(), { target: { value: "/model " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(
+      document.querySelector('[data-testid="model-picker-item"][data-model-id="sonnet"]'),
+    ).toHaveAttribute("data-active", "true");
+  });
+
   it("still renders an enabled trigger when the model/effort label is unresolved", () => {
     // Regression guard: a claude-native session before the snapshot fills
     // llmModel/selectedEffort has no model label, no effort label, and no
@@ -647,6 +760,7 @@ describe("AgentPicker trigger label", () => {
           modelPickerKind: "claude",
           showModels: true,
           showEffort: false,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -809,6 +923,7 @@ describe("Composer effort slash-command visibility", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
