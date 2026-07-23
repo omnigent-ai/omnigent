@@ -402,9 +402,11 @@ async def _setup_project_name(env: BenchEnvironment) -> str:
     """Return a project name to fetch: an existing corpus project, else seed one.
 
     Mirrors ``_setup_target_session``: real runs read a representative project
-    from the seeded corpus, but when none exists (empty-DB smoke path) we file a
-    session under a first-class project so the ``?project=`` folder fetch
-    exercises the real dual-read filter instead of an empty match.
+    from the seeded corpus (``seed.py`` files a configurable fraction of sessions
+    into first-class projects), so the folder fetch resolves a realistically
+    populated project. When none exists (empty-DB smoke path) we file one session
+    under a fresh project so the ``?project=`` filter still exercises the real
+    dual-read path instead of an empty match.
     """
     assert env.client is not None
     listing = await env.client.get("/v1/sessions/projects")

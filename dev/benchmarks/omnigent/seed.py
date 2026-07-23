@@ -20,10 +20,16 @@ loopback server resolves every request to user ``"local"`` and
 2. ``permission_store.grant("local", sid, LEVEL_OWNER)`` — makes it listable.
 3. one batched ``append(sid, items)`` — user-role message items.
 
+Also seeds first-class projects (``projects`` rows owned by ``"local"``) and
+files a fraction of sessions into them, so the project read journeys
+(``list_projects`` / ``list_project_sessions``) measure a realistic sidebar —
+a folder count and per-folder depth — instead of an empty project set.
+
 Run standalone::
 
     uv run --no-sync dev/benchmarks/omnigent/seed.py \
-        --database-uri sqlite:///tmp/bench.db --sessions 5000 --items-per-session 50
+        --database-uri sqlite:///tmp/bench.db --sessions 5000 --items-per-session 50 \
+        --projects 20 --filed-fraction 0.5
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from omnigent.db.db_models import (
     SqlConversationItem,
     SqlConversationLabel,
     SqlConversationMetadata,
+    SqlProject,
     SqlSessionPermission,
     SqlUser,
     current_workspace_id,
@@ -73,6 +80,7 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
 # Label key stamped on the first seeded session recording the corpus config, so
 # a later run can detect an existing (and matching) seed and skip re-seeding.
@@ -84,6 +92,21 @@ _AGENT_BUNDLE = "bench/seed"  # never validated on the read path
 _DEFAULT_SESSIONS = 5000
 _DEFAULT_ITEMS = 50
 _DEFAULT_RNG_SEED = 1234
+
+# First-class projects seeded into the corpus, and the fraction of sessions
+# filed into one (round-robin). Without these the project read journeys
+# (list_projects / list_project_sessions) would measure an empty project set —
+# a 0-folder union and a 0-member folder — which tests nothing. The defaults
+# give a realistic sidebar: 20 folders, each holding ~1/20th of the filed half
+# of the corpus (e.g. 5000 sessions × 0.5 / 20 = 125 sessions/project).
+_DEFAULT_PROJECTS = 20
+_DEFAULT_FILED_FRACTION = 0.5
+
+# Owner of every seeded project. The loopback bench server is single-user, so
+# it resolves each request to the reserved ``"local"`` user; the project list
+# and the ``?project=`` filter are owner-scoped, so a project owned by anyone
+# else would be invisible to the benchmark's reads.
+_PROJECT_OWNER = RESERVED_USER_LOCAL
 
 # A pool of realistic-ish message fragments; the RNG assembles item text from
 # these so search_text has lexical variety without external data.
@@ -114,14 +137,56 @@ _FTS_INSERT_SQL = text(
 _CORE_ITEM_CHUNK = 100_000
 
 
-def _meta_value(sessions: int, items_per_session: int, rng_seed: int, head: str) -> str:
+def _meta_value(
+    sessions: int,
+    items_per_session: int,
+    rng_seed: int,
+    projects: int,
+    filed_fraction: float,
+    head: str,
+) -> str:
     """Serialize the corpus config into the seed-marker label value.
 
     Includes the Alembic *head* read at seed time, so a corpus seeded under an
     older schema auto-mismatches the current head and is reseeded — no
-    hand-maintained revision constant.
+    hand-maintained revision constant. The project knobs are part of the key so
+    a pre-existing corpus seeded without projects is reseeded once they're added.
     """
-    return f"sessions={sessions};items={items_per_session};rng={rng_seed};rev={head}"
+    return (
+        f"sessions={sessions};items={items_per_session};rng={rng_seed};"
+        f"projects={projects};filed={filed_fraction:g};rev={head}"
+    )
+
+
+def _project_id(index: int) -> str:
+    """Deterministic 32-char-hex project id for the ``index``-th seeded project.
+
+    Derived from the index (not random) so both write paths produce identical
+    project rows and a re-seed at the same config is byte-stable.
+    """
+    return hashlib.sha256(f"bench-project-{index}".encode()).hexdigest()[:32]
+
+
+def _project_plan(
+    sessions: int,
+    projects: int,
+    filed_fraction: float,
+) -> tuple[list[tuple[str, str]], dict[int, str]]:
+    """Plan the corpus's first-class projects and their session membership.
+
+    :returns: ``(project_specs, project_of_session)`` where ``project_specs`` is
+        ``[(id, name), …]`` for the ``projects`` rows to create, and
+        ``project_of_session`` maps a session index to the project id it is
+        filed under. The first ``round(sessions × filed_fraction)`` sessions are
+        filed, assigned round-robin across the projects so each folder holds a
+        realistic, even share; the rest stay unfiled.
+    """
+    if projects <= 0 or filed_fraction <= 0 or sessions <= 0:
+        return [], {}
+    specs = [(_project_id(p), f"bench project {p}") for p in range(projects)]
+    filed_count = min(sessions, round(sessions * filed_fraction))
+    project_of_session = {s: specs[s % projects][0] for s in range(filed_count)}
+    return specs, project_of_session
 
 
 def _existing_seed_meta(conv: SqlAlchemyConversationStore) -> str | None:
@@ -168,6 +233,8 @@ def seed(
     sessions: int = _DEFAULT_SESSIONS,
     items_per_session: int = _DEFAULT_ITEMS,
     rng_seed: int = _DEFAULT_RNG_SEED,
+    projects: int = _DEFAULT_PROJECTS,
+    filed_fraction: float = _DEFAULT_FILED_FRACTION,
     reseed: bool = False,
     _fast: bool | None = None,
 ) -> int:
@@ -183,6 +250,11 @@ def seed(
     :param sessions: Number of listable sessions to create.
     :param items_per_session: Conversation items appended to each session.
     :param rng_seed: Seed for the deterministic text RNG.
+    :param projects: Number of first-class ``projects`` rows to create (owned by
+        ``"local"``). ``0`` seeds no projects.
+    :param filed_fraction: Fraction of sessions filed into a project (round-robin
+        across the ``projects`` folders); the rest stay unfiled. Ignored when
+        ``projects`` is 0.
     :param reseed: Seed even when a matching corpus is already present.
     :param _fast: Override the write strategy. ``None`` (default) uses the
         bulk-insert Core fast path for SQLite and the store-API loop for every
@@ -203,7 +275,7 @@ def seed(
     # Read the current schema head at runtime (no DB contacted) and fold it into
     # the reuse marker, so a corpus from an older schema is auto-reseeded.
     head = _get_head_db_revision("sqlite:///:memory:")
-    want = _meta_value(sessions, items_per_session, rng_seed, head)
+    want = _meta_value(sessions, items_per_session, rng_seed, projects, filed_fraction, head)
     if not reseed:
         existing = _existing_seed_meta(conv)
         if existing == want:
@@ -213,6 +285,8 @@ def seed(
             print(f"seed: existing corpus differs ({existing!r} != {want!r}); pass --reseed")
             return 0
 
+    project_specs, project_of_session = _project_plan(sessions, projects, filed_fraction)
+
     if use_fast:
         n = _seed_via_core(
             db_uri,
@@ -220,6 +294,8 @@ def seed(
             items_per_session=items_per_session,
             rng_seed=rng_seed,
             want=want,
+            project_specs=project_specs,
+            project_of_session=project_of_session,
         )
     else:
         perms = SqlAlchemyPermissionStore(db_uri)
@@ -230,9 +306,14 @@ def seed(
             items_per_session=items_per_session,
             rng_seed=rng_seed,
             want=want,
+            project_specs=project_specs,
+            project_of_session=project_of_session,
         )
 
-    print(f"seed: created {n} sessions × {items_per_session} items ({want})")
+    print(
+        f"seed: created {n} sessions × {items_per_session} items, "
+        f"{len(project_specs)} projects, {len(project_of_session)} filed ({want})"
+    )
     return n
 
 
@@ -244,15 +325,23 @@ def _seed_via_store(
     items_per_session: int,
     rng_seed: int,
     want: str,
+    project_specs: list[tuple[str, str]],
+    project_of_session: dict[int, str],
 ) -> int:
     """Seed through the production store ORM API (one row/commit at a time).
 
     This is the original path and the only one used on non-SQLite dialects
     (e.g. the nightly Postgres benchmark). It is kept verbatim so behavior
-    there stays identical.
+    there stays identical, save for the added first-class projects.
     """
     perms.ensure_user(RESERVED_USER_LOCAL)
     rng = random.Random(rng_seed)
+
+    # First-class projects, owned by "local" so the owner-scoped project reads
+    # see them. Created before the sessions so membership can be set inline.
+    projects_store = SqlAlchemyProjectStore(conv.storage_location)
+    for project_id, name in project_specs:
+        projects_store.create(project_id, name, owner_user_id=_PROJECT_OWNER)
 
     last_sid = ""
     for s in range(sessions):
@@ -268,6 +357,9 @@ def _seed_via_store(
         perms.grant(RESERVED_USER_LOCAL, sid, LEVEL_OWNER)
         if items_per_session:
             conv.append(sid, _make_items(rng, items_per_session))
+        project_id = project_of_session.get(s)
+        if project_id is not None:
+            conv.set_conversation_project(sid, project_id)
         _progress(s, sessions)
 
     # Stamp the corpus config on the LAST (newest) session — that's the one
@@ -286,6 +378,8 @@ def _seed_via_core(
     items_per_session: int,
     rng_seed: int,
     want: str,
+    project_specs: list[tuple[str, str]],
+    project_of_session: dict[int, str],
 ) -> int:
     """Seed the entire corpus in one transaction via SQLAlchemy Core.
 
@@ -387,6 +481,7 @@ def _seed_via_core(
                     "runner_last_seen": None,
                     "live_status": None,
                     "pending_elicitation_count": None,
+                    "project_id": project_of_session.get(s),
                 }
             )
             perm_rows.append(
@@ -461,6 +556,27 @@ def _seed_via_core(
         conn.execute(SqlConversationMetadata.__table__.insert(), meta_rows)
         conn.execute(SqlSessionPermission.__table__.insert(), perm_rows)
 
+        # First-class projects, owned by "local" (the reserved single-user id
+        # the owner-scoped project reads resolve to). Membership already lives
+        # on each metadata row's ``project_id`` above. ``updated_at`` is NULL,
+        # matching a freshly created project (the store sets it only on rename).
+        if project_specs:
+            project_now = now_epoch()
+            conn.execute(
+                SqlProject.__table__.insert(),
+                [
+                    {
+                        "workspace_id": ws,
+                        "id": project_id,
+                        "name": name,
+                        "owner_user_id": _PROJECT_OWNER,
+                        "created_at": project_now,
+                        "updated_at": None,
+                    }
+                    for project_id, name in project_specs
+                ],
+            )
+
         # Stamp the corpus config on the LAST (newest) session, matching the
         # store path's ``set_labels`` upsert (clamped to LABEL_VALUE_MAX_LEN).
         if last_sid:
@@ -499,6 +615,22 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--items-per-session", type=int, default=_DEFAULT_ITEMS, metavar="N")
     parser.add_argument("--rng-seed", type=int, default=_DEFAULT_RNG_SEED, metavar="N")
     parser.add_argument(
+        "--projects",
+        type=int,
+        default=_DEFAULT_PROJECTS,
+        metavar="N",
+        help="First-class projects to seed (0 = none). Filed sessions are "
+        "spread round-robin across them.",
+    )
+    parser.add_argument(
+        "--filed-fraction",
+        type=float,
+        default=_DEFAULT_FILED_FRACTION,
+        metavar="F",
+        help="Fraction of sessions filed into a project (0..1); the rest stay "
+        "unfiled. Ignored when --projects is 0.",
+    )
+    parser.add_argument(
         "--reseed",
         action="store_true",
         help="Seed even if a matching corpus is already present.",
@@ -524,6 +656,8 @@ def main(argv: list[str] | None = None) -> int:
         sessions=args.sessions,
         items_per_session=args.items_per_session,
         rng_seed=args.rng_seed,
+        projects=args.projects,
+        filed_fraction=args.filed_fraction,
         reseed=args.reseed,
     )
     return 0
