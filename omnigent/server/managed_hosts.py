@@ -160,10 +160,14 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "e2b",
         "openshell",
         "kubernetes",
+        "cloudflare",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
-    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes"}
+    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes", "cloudflare"}
+)
+PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
+    {"modal", "daytona", "boxlite", "cwsandbox", "islo", "e2b", "openshell", "kubernetes", "cloudflare_sandbox"}
 )
 
 # How long a managed launch waits for the sandboxed host to register
@@ -217,6 +221,14 @@ OPENSHELL_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # reconnects while still expiring tokens of Pods nobody deleted. A relaunch
 # mints a fresh token (and the per-Pod token Secret is replaced).
 KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
+
+# Launch-token lifetime for the YAML cloudflare_sandbox path. Cloudflare
+# Sandboxes have no hard platform lifetime cap (they run until explicitly
+# destroyed), so the bound is policy, not platform: 7 days mirrors the
+# Daytona/Islo/OpenShell/Kubernetes policy — long enough for a live sandbox
+# to re-authenticate its tunnel across reconnects while still expiring tokens
+# of sandboxes nobody deleted. A relaunch mints a fresh token.
+CLOUDFLARE_SANDBOX_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The cwsandbox launch-token TTL is NOT a constant: CW Sandbox's lifetime is
 # operator-overridable (OMNIGENT_CWSANDBOX_MAX_LIFETIME_S), so the TTL is
@@ -633,6 +645,45 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxLauncher
     return _reject
 
 
+def _cloudflare_launcher_factory(
+    bridge_url: str | None,
+    api_key: str | None,
+    image: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: cloudflare`` path.
+
+    :param bridge_url: Cloudflare Sandbox Bridge Worker URL, e.g.
+        ``"https://sandbox-bridge.your-subdomain.workers.dev"``.
+        If ``None``, falls back to ``OMNIGENT_CLOUDFLARE_SANDBOX_BRIDGE_URL`` env var.
+    :param api_key: SANDBOX_API_KEY for the bridge. If ``None``, falls back to
+        ``OMNIGENT_CLOUDFLARE_SANDBOX_API_KEY`` env var.
+    :param image: Registry image reference with omnigent pre-installed,
+        e.g. ``"docker.io/me/omnigent-host:latest"``, or ``None`` to
+        use the official prebaked host image.
+    :param env: Names of server-process environment variables (harness
+        LLM credentials, gateway URLs, ``GIT_TOKEN``) injected into
+        every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
+        ``None`` to resolve from the launcher's env-var fallback /
+        inject nothing.
+    :returns: A factory producing parameterized Cloudflare sandbox launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Cloudflare sandbox launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.cloudflare_sandbox import CloudflareSandboxLauncher
+
+        return CloudflareSandboxLauncher(
+            bridge_url=bridge_url,
+            api_key=api_key,
+            image=image,
+            env=env,
+        )
+
+    return _build
+
+
 def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the top-level ``sandbox.host_config`` block.
@@ -833,6 +884,14 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             resources=_parse_kubernetes_resources(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
+    elif provider == "cloudflare":
+        launcher_factory = _cloudflare_launcher_factory(
+            bridge_url=_parse_provider_string(raw, "cloudflare", "bridge_url"),
+            api_key=_parse_provider_string(raw, "cloudflare", "api_key"),
+            image=_parse_provider_image(raw, "cloudflare"),
+            env=_parse_provider_env(raw, "cloudflare"),
+        )
+        token_ttl_s = CLOUDFLARE_SANDBOX_MANAGED_TOKEN_TTL_S
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -920,6 +979,124 @@ def _parse_modal_secrets(raw: dict[str, object]) -> list[str] | None:
     return [name.strip() for name in secrets]
 
 
+def _parse_cloudflare_bridge_url(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the cloudflare bridge URL from the ``sandbox`` dict.
+
+    ``sandbox.cloudflare.bridge_url`` is the Cloudflare Sandbox Bridge Worker URL.
+    OPTIONAL — absent means the launcher's env-var fallback applies.
+
+    :param raw: The raw ``sandbox`` mapping (provider already known to
+        be ``"cloudflare"``).
+    :returns: The validated bridge URL, or ``None`` when not configured.
+    :raises ValueError: When ``sandbox.cloudflare`` is present but not a
+        mapping, or ``sandbox.cloudflare.bridge_url`` is present but not a
+        non-empty string.
+    """
+    cf_raw = raw.get("cloudflare")
+    if cf_raw is None:
+        return None
+    if not isinstance(cf_raw, dict):
+        raise ValueError("server config 'sandbox.cloudflare' must be a mapping")
+    bridge_url = cf_raw.get("bridge_url")
+    if bridge_url is None:
+        return None
+    if not isinstance(bridge_url, str) or not bridge_url.strip():
+        raise ValueError(
+            "server config 'sandbox.cloudflare.bridge_url' must be a URL "
+            "like 'https://sandbox-bridge.your-subdomain.workers.dev'"
+        )
+    return bridge_url.strip()
+
+
+def _parse_cloudflare_api_key(raw: dict[str, object]) -> str | None:
+    """
+    Extract and validate the cloudflare API key from the ``sandbox`` dict.
+
+    ``sandbox.cloudflare.api_key`` is the SANDBOX_API_KEY for the bridge.
+    OPTIONAL — absent means the launcher's env-var fallback applies.
+
+    :param raw: The raw ``sandbox`` mapping (provider already known to
+        be ``"cloudflare"``).
+    :returns: The validated API key, or ``None`` when not configured.
+    :raises ValueError: When ``sandbox.cloudflare`` is present but not a
+        mapping, or ``sandbox.cloudflare.api_key`` is present but not a
+        non-empty string.
+    """
+    cf_raw = raw.get("cloudflare")
+    if cf_raw is None:
+        return None
+    if not isinstance(cf_raw, dict):
+        raise ValueError("server config 'sandbox.cloudflare' must be a mapping")
+    api_key = cf_raw.get("api_key")
+    if api_key is None:
+        return None
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ValueError(
+            "server config 'sandbox.cloudflare.api_key' must be a non-empty string "
+            "(the SANDBOX_API_KEY for the bridge)"
+        )
+    return api_key.strip()
+
+
+def _parse_cloudflare_image(raw: dict[str, object]) -> str | None:
+    """
+    Extract the optional ``sandbox.cloudflare.image`` (default: official
+    host image).
+
+    :param raw: The raw ``sandbox`` mapping (provider already known to
+        be ``"cloudflare"``).
+    :returns: The validated image reference, or ``None`` to use the default.
+    :raises ValueError: When present but not a non-empty string.
+    """
+    cf_raw = raw.get("cloudflare")
+    if cf_raw is None:
+        return None
+    if not isinstance(cf_raw, dict):
+        raise ValueError("server config 'sandbox.cloudflare' must be a mapping")
+    image = cf_raw.get("image")
+    if image is None:
+        return None
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            "server config 'sandbox.cloudflare.image' must be a registry image "
+            "reference with omnigent pre-installed, e.g. "
+            "'docker.io/me/omnigent-host:latest' (omit it to use the official image)"
+        )
+    return image.strip()
+
+
+def _parse_cloudflare_env(raw: dict[str, object]) -> list[str] | None:
+    """
+    Extract the optional ``sandbox.cloudflare.env`` — SERVER-process
+    environment variable NAMES whose values are injected into every sandbox.
+
+    :param raw: The raw ``sandbox`` mapping (provider already known to
+        be ``"cloudflare"``).
+    :returns: The validated env var names, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``,
+        or ``None`` when not configured.
+    :raises ValueError: When ``sandbox.cloudflare`` is present but not a
+        mapping, or ``sandbox.cloudflare.env`` is present but not a
+        list of non-empty strings.
+    """
+    cf_raw = raw.get("cloudflare")
+    if cf_raw is None:
+        return None
+    if not isinstance(cf_raw, dict):
+        raise ValueError("server config 'sandbox.cloudflare' must be a mapping")
+    env = cf_raw.get("env")
+    if env is None:
+        return None
+    if not isinstance(env, list) or not all(
+        isinstance(name, str) and name.strip() for name in env
+    ):
+        raise ValueError(
+            "server config 'sandbox.cloudflare.env' must be a list of server "
+            "environment variable NAMES to inject, e.g. ['OPENAI_API_KEY', 'GIT_TOKEN']"
+        )
+    return [name.strip() for name in env]
+
+
 def _daytona_launcher_factory(
     image: str | None,
     env: list[str] | None,
@@ -944,6 +1121,45 @@ def _daytona_launcher_factory(
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
         return DaytonaSandboxLauncher(image=image, env=env)
+
+    return _build
+
+
+def _cloudflare_launcher_factory(
+    bridge_url: str | None,
+    api_key: str | None,
+    image: str | None,
+    env: list[str] | None,
+) -> Callable[[], SandboxLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: cloudflare`` path.
+
+    :param bridge_url: Cloudflare Sandbox Bridge Worker URL, e.g.
+        ``"https://sandbox-bridge.your-subdomain.workers.dev"``.
+        If ``None``, falls back to ``OMNIGENT_CLOUDFLARE_SANDBOX_BRIDGE_URL`` env var.
+    :param api_key: SANDBOX_API_KEY for the bridge. If ``None``, falls back to
+        ``OMNIGENT_CLOUDFLARE_SANDBOX_API_KEY`` env var.
+    :param image: Registry image reference with omnigent pre-installed,
+        e.g. ``"docker.io/me/omnigent-host:latest"``, or ``None`` to
+        use the official prebaked host image.
+    :param env: Names of server-process environment variables (harness
+        LLM credentials, gateway URLs, ``GIT_TOKEN``) injected into
+        every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
+        ``None`` to resolve from the launcher's env-var fallback /
+        inject nothing.
+    :returns: A factory producing parameterized Cloudflare sandbox launchers.
+    """
+
+    def _build() -> SandboxLauncher:
+        """Construct the Cloudflare sandbox launcher (lazy SDK import inside)."""
+        from omnigent.onboarding.sandboxes.cloudflare_sandbox import CloudflareSandboxLauncher
+
+        return CloudflareSandboxLauncher(
+            bridge_url=bridge_url,
+            api_key=api_key,
+            image=image,
+            env=env,
+        )
 
     return _build
 

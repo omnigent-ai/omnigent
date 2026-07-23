@@ -52,7 +52,7 @@ __all__ = [
 ]
 
 # Provider name → "module:ClassName" of its SandboxLauncher. Modules are
-# imported lazily (some pull in optional SDKs) and may be absent from a
+# imported lazily (some pull in optional SDKs) and may be absent from a given
 # distribution entirely (e.g. lakebox).
 _LAUNCHERS: dict[str, str] = {
     "lakebox": "omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
@@ -70,6 +70,8 @@ _LAUNCHERS: dict[str, str] = {
     # On-demand Kubernetes runner Pod via the official kubernetes client (the
     # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
     "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
+    # Cloudflare Sandbox via the Sandbox Bridge HTTP API.
+    "cloudflare": "omnigent.onboarding.sandboxes.cloudflare_sandbox:CloudflareSandboxLauncher",
 }
 
 
