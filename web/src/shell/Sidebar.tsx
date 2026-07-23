@@ -2824,7 +2824,7 @@ function ConversationRow({
           aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
           data-testid="quick-pin-conversation"
           className={cn(
-            "-translate-y-1/2 absolute top-1/2 right-9 transition-opacity",
+            "-translate-y-1/2 absolute top-1/2 right-8 transition-opacity",
             // Desktop-only quick affordance: hidden on mobile (the kebab's
             // Pin item below covers that), hover/focus-revealed from `md` up.
             // Pinned rows no longer keep a persistent pin marker, since the
@@ -3153,27 +3153,35 @@ function ProjectFolderActions({
 }) {
   return (
     <div className="flex items-center">
-      <ProjectFolderMenu projectName={projectName} projectId={projectId} />
-      <Button
-        asChild
-        type="button"
-        variant="ghost"
-        size="icon-sm"
-        aria-label={`New session in ${projectName}`}
-        data-testid="project-new-session"
-      >
-        <Link
-          to={`/?project=${encodeURIComponent(projectName)}`}
-          onClick={(e) => {
-            // Keep the click off the folder's collapse toggle, then run the
-            // shared nav handler (closes the sidebar overlay on mobile).
-            e.stopPropagation();
-            onNavigate(e);
-          }}
-        >
-          <SquarePenIcon className="size-3.5" />
-        </Link>
-      </Button>
+      {/* Desktop-only quick affordance; on mobile it folds into the kebab's
+          "New session" item below. */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            asChild
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`New session in ${projectName}`}
+            data-testid="project-new-session"
+            className="max-md:hidden"
+          >
+            <Link
+              to={`/?project=${encodeURIComponent(projectName)}`}
+              onClick={(e) => {
+                // Keep the click off the folder's collapse toggle, then run the
+                // shared nav handler (closes the sidebar overlay on mobile).
+                e.stopPropagation();
+                onNavigate(e);
+              }}
+            >
+              <SquarePenIcon className="size-3.5" />
+            </Link>
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">New session in project</TooltipContent>
+      </Tooltip>
+      <ProjectFolderMenu projectName={projectName} projectId={projectId} onNavigate={onNavigate} />
     </div>
   );
 }
@@ -3189,9 +3197,13 @@ function ProjectFolderActions({
 function ProjectFolderMenu({
   projectName,
   projectId,
+  onNavigate,
 }: {
   projectName: string;
   projectId: string | null;
+  /** Nav handler for the mobile-only "New session" item (desktop uses the
+      hover-revealed pencil). Closes the sidebar overlay on mobile. */
+  onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -3217,6 +3229,20 @@ function ProjectFolderMenu({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+          {/* New session — mobile-only (md:hidden); desktop uses the
+              hover-revealed pencil on the folder header. */}
+          <DropdownMenuItem asChild className="md:hidden" data-testid="project-new-session-menu">
+            <Link
+              to={`/?project=${encodeURIComponent(projectName)}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onNavigate(e);
+              }}
+            >
+              <SquarePenIcon className="size-3.5" />
+              New session
+            </Link>
+          </DropdownMenuItem>
           <DropdownMenuItem
             data-testid="rename-project"
             onSelect={() => {

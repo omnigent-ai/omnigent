@@ -937,6 +937,30 @@ describe("Sidebar project sections", () => {
       expect.anything(),
     );
   });
+
+  it("folds the new-session pencil into the kebab on mobile", async () => {
+    // The pencil is desktop-only (max-md:hidden); on mobile the same action is
+    // offered as a md:hidden "New session" kebab item pre-filed under the
+    // project (same ?project= link as the pencil).
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    // Pencil stays in the tree but is hidden below the md breakpoint.
+    expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
+
+    // Open the kebab → a mobile-only "New session" item linking to the same
+    // pre-filed composer.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    const menuItem = await screen.findByTestId("project-new-session-menu");
+    expect(menuItem).toHaveClass("md:hidden");
+    expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+  });
 });
 
 // A collapsed project bubbles up its hidden rows' marker, using the same
