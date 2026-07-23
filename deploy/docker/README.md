@@ -33,6 +33,58 @@ to launch a local runner against it. From your laptop:
 omnigent run path/to/agent.yaml --server http://localhost:8000
 ```
 
+### Reusable deployment pipeline
+
+The checked-in `Taskfile.yml` is the deployment entry point for both local
+operators and CI. It validates the Compose model, deploys with health-check
+waiting, and verifies the health and OAuth device-grant endpoints.
+
+For local deployment using the GPG-backed `pass` password manager, store:
+
+```text
+omnigent/rtx-3090/postgres-password
+omnigent/rtx-3090/accounts-cookie-secret
+omnigent/rtx-3090/accounts-admin-password
+omnigent/rtx-3090/device-client-secret
+```
+
+Then run the local secret-provider adapter:
+
+```bash
+task deploy:pass
+```
+
+Set `OMNIGENT_PASS_PREFIX` to use another password-store namespace and
+`OMNIGENT_DEPLOY_IMAGE` to select an immutable prebuilt image. The task reads
+only the first line of each entry and passes it to Compose's host-environment
+secret source. Compose mounts the values under `/run/secrets`; they are not
+included in the containers' environment or image. Neither the password store
+nor its GPG key is mounted into a container.
+
+CI uses the same provider-neutral task:
+
+```bash
+task deploy
+```
+
+The runner supplies these secret inputs:
+
+```text
+OMNIGENT_DEPLOY_POSTGRES_PASSWORD
+OMNIGENT_DEPLOY_ACCOUNTS_COOKIE_SECRET
+OMNIGENT_DEPLOY_ACCOUNTS_ADMIN_PASSWORD
+OMNIGENT_DEPLOY_DEVICE_CLIENT_SECRET
+```
+
+`.github/workflows/deploy-compose.yml` maps GitHub Environment secrets to
+those inputs on a self-hosted deployment runner. Other CI providers only need
+the equivalent secret mapping before invoking `task deploy`.
+
+Postgres consumes its native `POSTGRES_PASSWORD_FILE`. The OmniGent entrypoint
+accepts allowlisted `*_FILE` variables for its database password, accounts
+cookie secret, initial admin password, and device-client secret. The pass
+overlay also enables accounts authentication and OAuth device grants.
+
 Reset everything (drops the DB and the artifact store):
 
 ```bash

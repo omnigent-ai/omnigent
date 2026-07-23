@@ -40,6 +40,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -59,6 +60,13 @@ _DEFAULT_HOST = "0.0.0.0"
 # decoupled from the CLI's local-server default (6767 in host/local_server.py).
 _DEFAULT_PORT = "8000"
 _DEFAULT_ARTIFACT_DIR = "/data/artifacts"
+_SECRET_FILE_ENV = {
+    "OMNIGENT_ACCOUNTS_COOKIE_SECRET": "OMNIGENT_ACCOUNTS_COOKIE_SECRET_FILE",
+    "OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD": ("OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD_FILE"),
+    "OMNIGENT_DEVICE_CLIENT_SECRET": "OMNIGENT_DEVICE_CLIENT_SECRET_FILE",
+    "OMNIGENT_OIDC_CLIENT_SECRET": "OMNIGENT_OIDC_CLIENT_SECRET_FILE",
+    "OMNIGENT_OIDC_COOKIE_SECRET": "OMNIGENT_OIDC_COOKIE_SECRET_FILE",
+}
 
 
 @dataclass(frozen=True)
@@ -111,6 +119,45 @@ def run_migrations(database_url: str) -> None:
         migration_engine.dispose()
 
 
+def _read_secret_file(variable: str, file_variable: str) -> str | None:
+    """Load one allowlisted secret without putting it in container metadata."""
+
+    path_value = os.environ.get(file_variable, "").strip()
+    direct_value = os.environ.get(variable, "")
+    if not path_value:
+        return direct_value or None
+    if direct_value:
+        raise RuntimeError(f"set {variable} or {file_variable}, not both")
+    try:
+        value = Path(path_value).read_text(encoding="utf-8").rstrip("\r\n")
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {file_variable}: {exc}") from exc
+    if not value:
+        raise RuntimeError(f"{file_variable} points to an empty secret")
+    return value
+
+
+def _load_secret_files() -> None:
+    for variable, file_variable in _SECRET_FILE_ENV.items():
+        value = _read_secret_file(variable, file_variable)
+        if value is not None:
+            os.environ[variable] = value
+
+
+def _database_url_from_secret_file() -> str | None:
+    password = _read_secret_file("DATABASE_PASSWORD", "DATABASE_PASSWORD_FILE")
+    if password is None:
+        return None
+    user = os.environ.get("DATABASE_USER", "omnigent")
+    host = os.environ.get("DATABASE_HOST", "postgres")
+    port = os.environ.get("DATABASE_PORT", "5432")
+    name = os.environ.get("DATABASE_NAME", "omnigent")
+    return (
+        f"postgresql+psycopg://{quote(user, safe='')}:{quote(password, safe='')}"
+        f"@{host}:{port}/{quote(name, safe='')}"
+    )
+
+
 def _resolve_config() -> _ResolvedConfig:
     """Load config and resolve startup settings before migrations run."""
 
@@ -119,6 +166,7 @@ def _resolve_config() -> _ResolvedConfig:
     from omnigent.server.server_config import load_server_config
 
     # ── Configuration ────────────────────────────────────────
+    _load_secret_files()
     # Non-secret settings come from a YAML config file (default
     # <data_dir>/config.yaml, e.g. /data/config.yaml on the volume, or
     # OMNIGENT_CONFIG) — the same experience a laptop gets from
@@ -128,7 +176,11 @@ def _resolve_config() -> _ResolvedConfig:
 
     # DATABASE_URL is env-first (compose/PaaS inject it; it's a secret),
     # with `database_uri:` in the config as a fallback for self-managed DBs.
-    database_url = os.environ.get("DATABASE_URL") or cfg.get("database_uri")
+    database_url = (
+        os.environ.get("DATABASE_URL")
+        or _database_url_from_secret_file()
+        or cfg.get("database_uri")
+    )
     if not database_url:
         raise RuntimeError(
             "DATABASE_URL is required (env), or set `database_uri:` in the server config. "

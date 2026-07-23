@@ -64,6 +64,9 @@ services:
       # the file survives container restarts. Empty/unset would
       # write to /root/.omnigent/ inside the ephemeral container.
       OMNIGENT_ADMIN_CREDENTIALS_PATH: /data/admin-credentials
+      # Origin allowlist for WebSocket + multipart routes behind
+      # a Tailscale (or any other) reverse proxy. Set in .env.
+      OMNIGENT_WS_ALLOWED_ORIGINS: "${OMNIGENT_WS_ALLOWED_ORIGINS:-}"
 
       # ── Auth ─────────────────────────────────────────
       # OMNIGENT_AUTH_ENABLED is the single auth switch. "1" (the

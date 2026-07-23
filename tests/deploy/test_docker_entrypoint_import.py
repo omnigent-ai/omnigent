@@ -12,6 +12,7 @@ blow up if called during import).
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -129,6 +130,69 @@ def test_resolve_config_rejects_non_s3_artifact_uri(
 
     monkeypatch.setenv("OMNIGENT_ARTIFACT_URI", "gs://my-bucket")
     with pytest.raises(RuntimeError, match="s3://"):
+        _resolve_config()
+
+
+def test_resolve_config_reads_database_password_from_secret_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("{}\n")
+    password_file = tmp_path / "database-password"
+    password_file.write_text("p@ss/word\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config_file))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("DATABASE_HOST", "postgres")
+    monkeypatch.setenv("DATABASE_PORT", "5432")
+    monkeypatch.setenv("DATABASE_NAME", "omnigent")
+    monkeypatch.setenv("DATABASE_USER", "omnigent")
+    monkeypatch.setenv("DATABASE_PASSWORD_FILE", str(password_file))
+    monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+
+    resolved = _resolve_config()
+
+    assert (
+        resolved.database_url
+        == "postgresql+psycopg://omnigent:p%40ss%2Fword@postgres:5432/omnigent"
+    )
+    assert "DATABASE_PASSWORD" not in os.environ
+
+
+def test_resolve_config_loads_allowlisted_secret_file(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    secret_file = tmp_path / "cookie-secret"
+    secret_file.write_text("cookie-value\n")
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", raising=False)
+    monkeypatch.setenv(
+        "OMNIGENT_ACCOUNTS_COOKIE_SECRET_FILE",
+        str(secret_file),
+    )
+
+    _resolve_config()
+
+    assert os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"] == "cookie-value"
+
+
+def test_resolve_config_rejects_ambiguous_secret_sources(
+    _entrypoint_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from deploy.docker.entrypoint import _resolve_config
+
+    secret_file = tmp_path / "cookie-secret"
+    secret_file.write_text("file-value\n")
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", "environment-value")
+    monkeypatch.setenv(
+        "OMNIGENT_ACCOUNTS_COOKIE_SECRET_FILE",
+        str(secret_file),
+    )
+
+    with pytest.raises(RuntimeError, match="both"):
         _resolve_config()
 
 

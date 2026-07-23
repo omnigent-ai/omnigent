@@ -1,0 +1,71 @@
+version: "3"
+
+vars:
+  COMPOSE: docker compose -f docker-compose.yaml -f docker-compose.pass.yaml
+  PASS_PREFIX: '{{default "omnigent/rtx-3090" .OMNIGENT_PASS_PREFIX}}'
+  HEALTH_TIMEOUT: '{{default "60" .OMNIGENT_HEALTH_TIMEOUT}}'
+
+tasks:
+  default:
+    desc: List the available deployment tasks
+    cmds:
+      - task --list
+
+  validate:
+    desc: Validate the resolved Compose deployment
+    preconditions:
+      - sh: test -n "$OMNIGENT_DEPLOY_POSTGRES_PASSWORD"
+        msg: OMNIGENT_DEPLOY_POSTGRES_PASSWORD is required
+      - sh: test -n "$OMNIGENT_DEPLOY_ACCOUNTS_COOKIE_SECRET"
+        msg: OMNIGENT_DEPLOY_ACCOUNTS_COOKIE_SECRET is required
+      - sh: test -n "$OMNIGENT_DEPLOY_ACCOUNTS_ADMIN_PASSWORD"
+        msg: OMNIGENT_DEPLOY_ACCOUNTS_ADMIN_PASSWORD is required
+      - sh: test -n "$OMNIGENT_DEPLOY_DEVICE_CLIENT_SECRET"
+        msg: OMNIGENT_DEPLOY_DEVICE_CLIENT_SECRET is required
+    cmds:
+      - "{{.COMPOSE}} config --quiet"
+
+  deploy:
+    desc: Run the provider-neutral Compose deployment pipeline
+    deps: [validate]
+    cmds:
+      - "{{.COMPOSE}} up -d --wait --wait-timeout {{.HEALTH_TIMEOUT}}"
+      - task: verify
+
+  verify:
+    desc: Verify container health and the OAuth contract
+    cmds:
+      - |
+        set -euo pipefail
+        endpoint="$({{.COMPOSE}} port omnigent 8000 | tail -n 1)"
+        host_port="${endpoint##*:}"
+        base_url="http://127.0.0.1:${host_port}"
+        curl --fail --silent --show-error "${base_url}/health"
+        curl --fail --silent --show-error "${base_url}/openapi.json" |
+          jq -e '
+            .paths["/oauth/device/authorize"] != null and
+            .paths["/oauth/token"] != null and
+            .paths["/oauth/revoke"] != null
+          ' >/dev/null
+        echo
+        echo "Deployment verified at ${base_url}"
+
+  status:
+    desc: Show deployment status
+    cmds:
+      - "{{.COMPOSE}} ps"
+
+  deploy:pass:
+    desc: Deploy locally using secrets from pass
+    silent: true
+    preconditions:
+      - sh: command -v pass >/dev/null
+        msg: pass is required for local secret resolution
+    cmds:
+      - |
+        set -euo pipefail
+        export OMNIGENT_DEPLOY_POSTGRES_PASSWORD="$(pass show '{{.PASS_PREFIX}}/postgres-password' | sed -n '1p')"
+        export OMNIGENT_DEPLOY_ACCOUNTS_COOKIE_SECRET="$(pass show '{{.PASS_PREFIX}}/accounts-cookie-secret' | sed -n '1p')"
+        export OMNIGENT_DEPLOY_ACCOUNTS_ADMIN_PASSWORD="$(pass show '{{.PASS_PREFIX}}/accounts-admin-password' | sed -n '1p')"
+        export OMNIGENT_DEPLOY_DEVICE_CLIENT_SECRET="$(pass show '{{.PASS_PREFIX}}/device-client-secret' | sed -n '1p')"
+        task deploy

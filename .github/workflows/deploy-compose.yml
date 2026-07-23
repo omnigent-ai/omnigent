@@ -1,0 +1,63 @@
+name: Deploy Compose
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Immutable image reference to deploy
+        required: true
+        type: string
+      environment:
+        description: GitHub deployment environment
+        required: true
+        default: production
+        type: environment
+  workflow_call:
+    inputs:
+      image:
+        description: Immutable image reference to deploy
+        required: true
+        type: string
+      environment:
+        description: GitHub deployment environment
+        required: true
+        type: string
+    secrets:
+      postgres_password:
+        required: true
+      accounts_cookie_secret:
+        required: true
+      accounts_admin_password:
+        required: true
+      device_client_secret:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compose-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    environment: ${{ inputs.environment }}
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 15
+    env:
+      OMNIGENT_DEPLOY_IMAGE: ${{ inputs.image }}
+      OMNIGENT_DEPLOY_POSTGRES_PASSWORD: ${{ secrets.postgres_password }}
+      OMNIGENT_DEPLOY_ACCOUNTS_COOKIE_SECRET: ${{ secrets.accounts_cookie_secret }}
+      OMNIGENT_DEPLOY_ACCOUNTS_ADMIN_PASSWORD: ${{ secrets.accounts_admin_password }}
+      OMNIGENT_DEPLOY_DEVICE_CLIENT_SECRET: ${{ secrets.device_client_secret }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Task
+        uses: go-task/setup-task@70f2430ad412f838533de8c0515c749ffb2b8bd3 # v1
+
+      - name: Deploy and verify
+        working-directory: deploy/docker
+        run: task deploy

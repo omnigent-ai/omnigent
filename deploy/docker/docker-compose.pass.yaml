@@ -1,0 +1,51 @@
+# Secret-backed deployment overlay.
+#
+# The deployment task supplies these values from pass locally or from the CI
+# provider's secret store. Compose mounts them as files in the containers.
+
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: !reset null
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-password
+    secrets:
+      - postgres-password
+
+  omnigent:
+    image: ${OMNIGENT_DEPLOY_IMAGE:-omnigent-server:pass-secrets}
+    build: !reset null
+    environment:
+      DATABASE_URL: !reset null
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: "${POSTGRES_DB:-omnigent}"
+      DATABASE_USER: "${POSTGRES_USER:-omnigent}"
+      DATABASE_PASSWORD_FILE: /run/secrets/postgres-password
+
+      OMNIGENT_AUTH_ENABLED: "1"
+      OMNIGENT_AUTH_PROVIDER: accounts
+      OMNIGENT_DEVICE_GRANT_ENABLED: "1"
+
+      OMNIGENT_ACCOUNTS_COOKIE_SECRET: !reset null
+      OMNIGENT_ACCOUNTS_COOKIE_SECRET_FILE: /run/secrets/accounts-cookie-secret
+      OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD: !reset null
+      OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD_FILE: /run/secrets/accounts-admin-password
+      OMNIGENT_DEVICE_CLIENT_SECRET_FILE: /run/secrets/device-client-secret
+
+      OMNIGENT_OIDC_CLIENT_SECRET: !reset null
+      OMNIGENT_OIDC_COOKIE_SECRET: !reset null
+    secrets:
+      - postgres-password
+      - accounts-cookie-secret
+      - accounts-admin-password
+      - device-client-secret
+
+secrets:
+  postgres-password:
+    environment: OMNIGENT_DEPLOY_POSTGRES_PASSWORD
+  accounts-cookie-secret:
+    environment: OMNIGENT_DEPLOY_ACCOUNTS_COOKIE_SECRET
+  accounts-admin-password:
+    environment: OMNIGENT_DEPLOY_ACCOUNTS_ADMIN_PASSWORD
+  device-client-secret:
+    environment: OMNIGENT_DEPLOY_DEVICE_CLIENT_SECRET
