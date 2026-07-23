@@ -128,7 +128,7 @@ const ROUTING_VERBS = ["weighing", "matching", "tuning", "sizing up"] as const;
  *
  * Three states: while judging (`input-available`) the rows show their
  * worker with a shimmering per-task verb placeholder; on success each row gets
- * its recommended {@link ModelTierPill} plus the judge's rationale; on
+ * its recommended model pill plus the judge's rationale; on
  * failure (error string / unparseable output / no output recorded) the
  * dispatcher's message renders as a muted line — the orchestrator
  * dispatches with its own model choices in that case, so the card must
