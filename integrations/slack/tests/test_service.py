@@ -722,6 +722,63 @@ async def test_no_delta_idle_answer_keeps_ack_until_visible(tmp_path: Path) -> N
     assert slack.acks[0]["ts"] in slack.deleted_ts
 
 
+class MultiMessageClient(FakeOmnigentClient):
+    """Streams two assistant messages back to back, each tagged with its own
+    ``message_id`` — the claude-native shape when the agent narrates between tool
+    calls. The deltas arrive with no boundary between the two messages.
+    """
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        yield {"type": "session.status", "status": "running", "response_id": "resp_1"}
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "Let me poll once more.",
+            "message_id": "msg_a",
+        }
+        # A tool call runs between the two messages; the next delta belongs to a
+        # NEW assistant message (distinct message_id).
+        yield {
+            "type": "response.output_text.delta",
+            "delta": "The credentials agent is taking longer.",
+            "message_id": "msg_b",
+        }
+        yield {"type": "session.status", "status": "idle", "response_id": "resp_1"}
+
+
+async def test_back_to_back_messages_get_paragraph_break(tmp_path: Path) -> None:
+    # Regression: consecutive assistant messages (distinct message_id) must not
+    # run together ("…once more.The credentials…"). A paragraph break is inserted
+    # at the id boundary so each message reads as its own block, mirroring the web
+    # UI's separate bubbles.
+    store = await _store(tmp_path)
+    slack = FakeSlackClient()
+    omnigent = MultiMessageClient(final_text="")
+    service, _pool, _setup = _service(store, omnigent)
+    await _configure_user(store, "T1", "U1")
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev1"},
+        event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> status?"},
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    await _wait_for_stream_stop(slack)
+    await service.shutdown()
+
+    # The two messages are separated by a blank line, not concatenated.
+    assert (
+        slack.streamed_text == "Let me poll once more.\n\nThe credentials agent is taking longer."
+    )
+
+
 async def test_long_answer_streams_in_full(tmp_path: Path) -> None:
     # A long answer is streamed and finalized without any splitting/msg_too_long
     # handling — Slack owns chunking for streams.
