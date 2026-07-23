@@ -208,6 +208,22 @@ describe("quick pin/unpin hover button", () => {
     expect(rowLink).not.toHaveClass("w-[calc(100%+1rem)]");
   });
 
+  it("sizes the project-folder header controls to match the session-row kebab", () => {
+    // The folder-header pencil + kebab share the right-edge column with the
+    // session-row kebab, so they must be the same compact `icon-xs` (size-6)
+    // button — not the larger `icon-sm` (size-7) — or their glyphs sit in
+    // different columns and read as misaligned.
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    expect(screen.getByTestId("project-actions")).toHaveClass("size-6");
+    expect(screen.getByTestId("project-actions")).not.toHaveClass("size-7");
+    expect(screen.getByTestId("project-new-session")).toHaveClass("size-6");
+    expect(screen.getByTestId("project-new-session")).not.toHaveClass("size-7");
+    // Same compact size as the session-row kebab it aligns with.
+    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
+  });
+
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
     renderSidebar();
 

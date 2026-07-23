@@ -3239,7 +3239,7 @@ function ProjectFolderActions({
             asChild
             type="button"
             variant="ghost"
-            size="icon-sm"
+            size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
             className="max-md:hidden"
@@ -3297,7 +3297,7 @@ function ProjectFolderMenu({
           <Button
             type="button"
             variant="ghost"
-            size="icon-sm"
+            size="icon-xs"
             aria-label={`Project actions for ${projectName}`}
             data-testid="project-actions"
             // Sits on the folder header; keep its click off the collapse toggle.
