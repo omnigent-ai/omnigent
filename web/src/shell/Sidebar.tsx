@@ -693,10 +693,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           )}
 
-          <nav
-            ref={scrollContainerRef}
-            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-gutter:stable]"
-          >
+          <nav ref={scrollContainerRef} className="relative flex-1 overflow-y-auto px-2 pb-3">
             <ConversationList
               conversationsQuery={conversationsQuery}
               scrollContainerRef={scrollContainerRef}
