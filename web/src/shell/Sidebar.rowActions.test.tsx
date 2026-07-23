@@ -224,6 +224,19 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6");
   });
 
+  it("sizes the Projects group-header controls to the same compact icon", () => {
+    // The "New project" / "Expand all" controls share the right-edge column
+    // with the folder + session kebabs, so they use the same compact `icon-xs`
+    // (size-6), not the larger `icon-sm` (size-7).
+    mocks.projects = ["Sprint 42"];
+    renderSidebar();
+
+    expect(screen.getByTestId("new-project")).toHaveClass("size-6");
+    expect(screen.getByTestId("new-project")).not.toHaveClass("size-7");
+    expect(screen.getByTestId("expand-all-projects")).toHaveClass("size-6");
+    expect(screen.getByTestId("expand-all-projects")).not.toHaveClass("size-7");
+  });
+
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
     renderSidebar();
 

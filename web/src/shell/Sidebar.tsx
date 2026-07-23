@@ -1531,7 +1531,7 @@ function ConversationList({
                                 <Button
                                   type="button"
                                   variant="ghost"
-                                  size="icon-sm"
+                                  size="icon-xs"
                                   aria-label="Collapse to previous"
                                   data-testid="revert-projects"
                                   onClick={(e) => {
@@ -1550,7 +1550,7 @@ function ConversationList({
                                 <Button
                                   type="button"
                                   variant="ghost"
-                                  size="icon-sm"
+                                  size="icon-xs"
                                   aria-label="Expand all"
                                   data-testid="expand-all-projects"
                                   onClick={(e) => {
