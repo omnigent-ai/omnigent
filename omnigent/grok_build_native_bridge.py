@@ -136,9 +136,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         if info is not None:
             return info
         time.sleep(_POLL_INTERVAL_S)
-    raise RuntimeError(
-        f"grok-build-native tmux target was not advertised within {timeout_s:.0f}s"
-    )
+    raise RuntimeError(f"grok-build-native tmux target was not advertised within {timeout_s:.0f}s")
 
 
 def _run_tmux(socket_path: str, *args: str) -> None:
@@ -152,9 +150,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s"
-        ) from exc
+        raise RuntimeError(f"tmux command timed out after {_TMUX_SEND_TIMEOUT_S}s") from exc
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
@@ -305,9 +301,7 @@ def inject_user_message(
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
 
 
-def inject_interrupt(
-    bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S
-) -> None:
+def inject_interrupt(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
     """Cancel the in-flight Grok Build turn by sending ``Escape`` to the pane.
 
     :raises RuntimeError: If the tmux target is not advertised or send-keys fails.
@@ -316,9 +310,7 @@ def inject_interrupt(
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
 
-def kill_session(
-    bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S
-) -> None:
+def kill_session(bridge_dir: Path, *, timeout_s: float = _TMUX_READY_TIMEOUT_S) -> None:
     """Hard-stop the Grok Build session by killing its tmux session.
 
     :raises RuntimeError: If the tmux target is not advertised or kill-session fails.

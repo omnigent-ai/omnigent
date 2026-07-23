@@ -192,8 +192,7 @@ def _materialize_grok_build_agent_spec(tmpdir: Path) -> Path:
     raw: dict[str, Any] = {
         "name": _AGENT_NAME,
         "prompt": (
-            "Grok Build is running in the session terminal. The user drives the "
-            "grok TUI directly."
+            "Grok Build is running in the session terminal. The user drives the grok TUI directly."
         ),
         "executor": {"harness": "grok-build-native"},
         "spawn": True,
@@ -366,9 +365,7 @@ async def _prepare_grok_build_terminal_via_daemon(
             workspace=workspace,
         )
         _update_startup_progress(startup_progress, "Waiting for runner...")
-        await wait_for_runner_online(
-            client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S
-        )
+        await wait_for_runner_online(client, runner_id, timeout_s=_DAEMON_RUNNER_ONLINE_TIMEOUT_S)
         await _bind_session_runner(client, session_id, runner_id)
         _update_startup_progress(startup_progress, "Starting Grok Build terminal...")
         await _ensure_grok_build_terminal_on_runner(client, session_id)
@@ -417,17 +414,14 @@ async def _create_grok_build_session(
     return new_session_id
 
 
-async def _fetch_grok_build_session(
-    client: httpx.AsyncClient, session_id: str
-) -> dict[str, Any]:
+async def _fetch_grok_build_session(client: httpx.AsyncClient, session_id: str) -> dict[str, Any]:
     """Fetch an existing Omnigent session."""
     resp = await client.get(f"/v1/sessions/{url_component(session_id)}")
     if resp.status_code == 404:
         raise click.ClickException(f"Conversation {session_id!r} not found on the server.")
     if resp.status_code >= 400:
         raise click.ClickException(
-            f"Failed to fetch conversation {session_id!r} ({resp.status_code}): "
-            f"{error_text(resp)}"
+            f"Failed to fetch conversation {session_id!r} ({resp.status_code}): {error_text(resp)}"
         )
     payload = resp.json()
     if not isinstance(payload, dict):

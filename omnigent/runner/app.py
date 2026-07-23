@@ -2883,7 +2883,7 @@ async def _auto_create_grok_build_terminal(
     publish_event: Callable[[str, dict[str, Any]], None],
     *,
     server_client: httpx.AsyncClient | None,
-    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    _ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the Grok Build TUI terminal for a grok-build-native session.
@@ -2915,7 +2915,6 @@ async def _auto_create_grok_build_terminal(
     grok_build_env: dict[str, str] = {
         "NO_COLOR": "1",
     }
-    launch_epoch_s = time.time()
     grok_build_launch_args = launch_config.terminal_launch_args or []
     terminal_spec = TerminalEnvSpec(
         command=grok_build_command,

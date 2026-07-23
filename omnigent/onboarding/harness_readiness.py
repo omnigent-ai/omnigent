@@ -131,7 +131,9 @@ _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-h
 # Native Grok Build TUI harnesses (``omnigent grok-build``). Boot the ``grok``
 # TUI and can't launch without the ``grok`` binary on ``PATH`` — gate on it.
 # Grok Build owns its own auth (browser OAuth on first launch).
-_GROK_BUILD_NATIVE_HARNESSES: frozenset[str] = frozenset({"grok-build-native", "native-grok-build"})
+_GROK_BUILD_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"grok-build-native", "native-grok-build"}
+)
 
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
