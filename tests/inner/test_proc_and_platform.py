@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -453,3 +455,119 @@ def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
     monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
     dirs = _platform._cli_fallback_dirs()
     assert tmp_path / ".local" / "bin" in dirs
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX process groups")
+def test_group_kernel_present_tracks_real_group_lifecycle() -> None:
+    """killpg-0 reports present for a live group and ESRCH-absent once empty.
+
+    This is the relay-proof delete gate the fallback tiers rely on: the
+    kernel checks the whole group atomically, so no fork racing a
+    userspace scan can hide from it.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    pgid = os.getpgid(proc.pid)
+    try:
+        assert _proc.group_kernel_present(pgid) is True
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    deadline = time.monotonic() + 5.0
+    while _proc.group_kernel_present(pgid) is not False and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _proc.group_kernel_present(pgid) is False
+
+
+@pytest.mark.skipif(_platform.IS_WINDOWS, reason="POSIX process groups")
+def test_group_kernel_present_survives_a_live_fork_relay() -> None:
+    """A group that continuously hands off generations stays kernel-present.
+
+    The exact adversarial shape a fixed-count userspace scan cannot
+    handle: each generation forks its successor into the group and then
+    exits, so at every instant exactly one short-lived member exists and
+    any single pid listing can miss it. ``killpg(pgid, 0)`` — a kernel
+    check — never reports the group absent while the relay runs.
+    """
+    # Generation 0 leads the group; each generation spawns the next INTO
+    # the same group (no new session) and exits, so membership churns
+    # continuously rather than sitting on two static sleepers. Generation
+    # 0 waits on a startup barrier (a byte on stdin) before starting the
+    # chain, so the parent captures a stable pgid while it is still alive.
+    relay_src = (
+        "import os, sys, time\n"
+        "gen = int(sys.argv[1])\n"
+        "if gen == 0:\n"
+        "    sys.stdin.read(1)\n"  # barrier: wait until the parent has our pgid
+        "if gen < 400:\n"
+        "    nxt = [sys.executable, __file__, str(gen + 1)]\n"
+        "    os.posix_spawn(sys.executable, nxt, os.environ)\n"
+        "    time.sleep(0.01)\n"  # hand off, then exit — one live member at a time
+        "else:\n"
+        "    time.sleep(5)\n"
+    )
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(relay_src)
+        script = fh.name
+    relay = subprocess.Popen(
+        [sys.executable, script, "0"], start_new_session=True, stdin=subprocess.PIPE
+    )
+    pgid = os.getpgid(relay.pid)  # gen 0 is blocked on the barrier — stable
+    try:
+        assert relay.stdin is not None
+        relay.stdin.write(b"go")  # release the barrier; the chain begins
+        relay.stdin.flush()
+        # Sample across many handoffs; the kernel check never false-empties.
+        for _ in range(30):
+            assert _proc.group_kernel_present(pgid) is not False
+            time.sleep(0.01)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            relay.wait(timeout=10)
+        # Reap the whole group's adopted descendants: under a
+        # PR_SET_CHILD_SUBREAPER pytest each generation reparents to us as
+        # it orphans, so waitpid(-pgid) collects them; ECHILD ends it.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                reaped, _ = os.waitpid(-pgid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if reaped == 0:
+                time.sleep(0.02)
+        with contextlib.suppress(OSError):
+            os.unlink(script)
+
+
+def test_group_kernel_present_none_for_bad_pgid() -> None:
+    """A non-positive pgid is indeterminate, never a false absence."""
+    assert _proc.group_kernel_present(0) is None
+    assert _proc.group_kernel_present(-1) is None
+
+
+def test_settled_helper_treats_unverifiable_as_not_dead(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The test settled predicate never reports an unreadable process dead.
+
+    "unverifiable" (exists but its identity cannot be read — a foreign or
+    racing process) must keep waiters waiting, not falsely pass a
+    death-wait.
+    """
+    from tests._helpers import procs as test_procs
+
+    monkeypatch.setattr(test_procs._proc, "process_identity_state", lambda _p, _i: "unverifiable")
+    monkeypatch.setattr(test_procs._proc, "process_is_zombie", lambda _p: False)
+    assert test_procs.settled(123, "id") is False
+    assert test_procs.alive(123, "id") is True
+    assert test_procs.wait_gone(123, "id", deadline_s=0.05) is False
+
+    monkeypatch.setattr(test_procs._proc, "process_identity_state", lambda _p, _i: "gone")
+    assert test_procs.settled(123, "id") is True
+
+    monkeypatch.setattr(test_procs._proc, "process_identity_state", lambda _p, _i: "match")
+    monkeypatch.setattr(test_procs._proc, "process_is_zombie", lambda _p: True)
+    assert test_procs.settled(123, "id") is True

@@ -6767,10 +6767,12 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
     # gates the Ctrl-C stop-server prompt so we never offer to stop a server
     # we didn't bring up.
     spawned_local_server = False
+    local_server_pid = None
     if not server:
         startup = ensure_local_omnigent_server()
         server = startup.url
         spawned_local_server = startup.spawned
+        local_server_pid = startup.pid
     record = _foreground_daemon_record(
         target=target,
         server_url=server,
@@ -6790,7 +6792,7 @@ def host(ctx: click.Context, server: str | None, non_interactive: bool) -> None:
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
-        run_host_process(server_url=server)
+        run_host_process(server_url=server, local_server_pid=local_server_pid)
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it

@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -194,6 +196,9 @@ _TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # (``reap_orphaned_terminals``).
 _TERMINAL_DIR_PREFIX = "omnigent-terminal-"
 _OWNER_PID_FILENAME = "owner.pid"
+# Sibling of the owner-pid marker carrying the owner's kernel start
+# identity, so the dead-owner gate survives pid recycling.
+_OWNER_IDENTITY_FILENAME = "owner.ident"
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
@@ -763,6 +768,37 @@ def _terminals_tmp_root() -> Path:
     return Path(tempfile.gettempdir())
 
 
+def terminal_owner_is_dead(instance_dir: Path) -> bool | None:
+    """
+    Whether the instance dir's recorded owner is provably dead.
+
+    Identity-anchored when the marker carries a start identity (a
+    recycled owner pid reads as dead, an unverifiable one as unknown);
+    legacy markers without one fall back to raw pid liveness, which can
+    only err toward "alive" (retention).
+
+    :param instance_dir: A ``omnigent-terminal-*`` instance dir.
+    :returns: ``True`` dead, ``False`` alive, ``None`` unknown/unmarked.
+    """
+    try:
+        pid = int((instance_dir / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    identity: str | None
+    try:
+        identity = (instance_dir / _OWNER_IDENTITY_FILENAME).read_text(encoding="utf-8").strip()
+    except OSError:
+        identity = None
+    if identity:
+        state = _proc.process_identity_state(pid, identity)
+        if state == "match":
+            return False
+        if state == "gone":
+            return True
+        return None
+    return not _process_alive(pid)
+
+
 def reap_orphaned_terminals() -> int:
     """
     Kill terminal tmux servers whose owning process is gone.
@@ -782,16 +818,21 @@ def reap_orphaned_terminals() -> int:
     """
     if not _tmux_available():
         return 0
+    try:
+        entries = list(_terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"))
+    except OSError:
+        return 0
     reaped = 0
-    for entry in _terminals_tmp_root().glob(f"{_TERMINAL_DIR_PREFIX}*"):
-        try:
-            pid = int((entry / _OWNER_PID_FILENAME).read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            continue
-        if _process_alive(pid):
+    for entry in entries:
+        if terminal_owner_is_dead(entry) is not True:
             continue
         socket_path = entry / "tmux.sock"
-        if socket_path.exists():
+        try:
+            has_socket = socket_path.exists()
+        except OSError:
+            # Foreign-owned dir on a shared host — not ours to reap.
+            continue
+        if has_socket:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
@@ -801,9 +842,52 @@ def reap_orphaned_terminals() -> int:
                     capture_output=True,
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
+            if _tmux_server_alive(socket_path):
+                # Kill unverified (wedged tmux, permission failure): keep
+                # the dir — the only pointer to the socket — so a later
+                # sweep retries instead of leaking a live server on an
+                # unlinked socket.
+                continue
         shutil.rmtree(entry, ignore_errors=True)
         reaped += 1
     return reaped
+
+
+def _tmux_server_alive(socket_path: Path) -> bool:
+    """
+    Positively probe whether a tmux server still listens on *socket_path*.
+
+    ``kill-server``'s exit status cannot distinguish "server already dead"
+    (the common orphan case) from a failed kill, so absence is verified by
+    connecting: a live server accepts, a dead one leaves a connect-refused
+    (or unlinked, or never-a-socket) path. Ambiguous errors — permission
+    denied, timeouts — read as alive so the caller keeps the dir.
+
+    :param socket_path: The instance's ``tmux.sock`` path.
+    :returns: ``True`` when a server (or an unprobeable socket) is there.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(2.0)
+        probe.connect(str(socket_path))
+    except TimeoutError:
+        # A wedged-but-bound server can time out the connect; that is
+        # still a server, not confirmed absence.
+        return True
+    except OSError as exc:
+        if exc.errno is None:
+            # Python refuses over-long AF_UNIX paths before the syscall;
+            # no server could ever have bound such a path either.
+            return False
+        return exc.errno not in (
+            errno.ENOENT,
+            errno.ECONNREFUSED,
+            errno.ENOTSOCK,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            probe.close()
+    return True
 
 
 def build_terminal_os_env_spec(
@@ -1955,6 +2039,13 @@ def create_terminal_instance(
     # server if we die without graceful shutdown (SIGKILL, harness
     # teardown) — see ``reap_orphaned_terminals``.
     (private_dir / _OWNER_PID_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
+    owner_identity = _proc.process_start_identity(os.getpid())
+    if owner_identity is not None:
+        # Atomic replace: a torn identity read would look like a recycled
+        # (dead) owner and could reap a live session's terminal.
+        ident_tmp = private_dir / (_OWNER_IDENTITY_FILENAME + ".tmp")
+        ident_tmp.write_text(owner_identity, encoding="utf-8")
+        os.replace(ident_tmp, private_dir / _OWNER_IDENTITY_FILENAME)
 
     # Resolve os_env spec.  If none specified, inherit from parent.
     effective_os_env_spec = build_terminal_os_env_spec(

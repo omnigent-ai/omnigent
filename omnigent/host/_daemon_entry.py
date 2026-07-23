@@ -51,17 +51,20 @@ def main() -> None:
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
 
+    local_server_pid = None
     if args.local:
         # The daemon owns the local server: start/reuse it, then connect.
         from omnigent.host.local_server import ensure_local_omnigent_server
 
-        server_url = ensure_local_omnigent_server().url
+        startup = ensure_local_omnigent_server()
+        server_url = startup.url
+        local_server_pid = startup.pid
     else:
         server_url = args.server
 
     from omnigent.host.connect import run_host_process
 
-    run_host_process(server_url=server_url)
+    run_host_process(server_url=server_url, local_server_pid=local_server_pid)
 
 
 if __name__ == "__main__":

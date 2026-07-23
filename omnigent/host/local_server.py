@@ -426,6 +426,9 @@ class LocalServerStartup:
         the connect Ctrl-C stop-server prompt — gate on this so they only
         offer to stop a server they actually brought up, never one the user
         started independently.
+    :param pid: The server process's pid — the freshly spawned child's, or
+        the health-verified pidfile record's on reuse — so the host daemon
+        can bind its adopted-orphan exclusion to that exact incarnation.
     :param log_path: Absolute path of the background server's captured log
         file, e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``
         — surfaced so callers (``server --background``) can point the user at the
@@ -438,6 +441,7 @@ class LocalServerStartup:
     url: str
     spawned: bool
     log_path: Path | None = None
+    pid: int | None = None
 
 
 def ensure_local_omnigent_server() -> LocalServerStartup:
@@ -467,8 +471,12 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
     reused = local_server_url_if_healthy()
     if reused is not None:
         if _read_local_server_sig() == desired_sig:
+            recorded = _read_local_server_pid_file()
             return LocalServerStartup(
-                url=reused, spawned=False, log_path=_read_local_server_log_path()
+                url=reused,
+                spawned=False,
+                log_path=_read_local_server_log_path(),
+                pid=recorded[0] if recorded else None,
             )
         # Config drift: the running server was spawned under a different
         # auth source and cannot be reconfigured in place (auth
@@ -503,7 +511,10 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
                 spawned.proc.pid, port, desired_sig, log_path=spawned.log_path
             )
             return LocalServerStartup(
-                url=spawned.base_url, spawned=True, log_path=spawned.log_path
+                url=spawned.base_url,
+                spawned=True,
+                log_path=spawned.log_path,
+                pid=spawned.proc.pid,
             )
         # A DIFFERENT process owns the port. The stable-port preference
         # means two concurrent spawners (another HOME on this box, a

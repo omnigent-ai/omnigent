@@ -1171,6 +1171,21 @@ def _dead_pid() -> int:
     return child.pid
 
 
+def test_terminal_owner_gate_is_identity_anchored(tmp_path: Path) -> None:
+    """A recycled owner pid reads as dead once the identity sibling exists."""
+    d = tmp_path / "omnigent-terminal-x"
+    d.mkdir()
+    (d / "owner.pid").write_text(str(__import__("os").getpid()), encoding="utf-8")
+    assert terminal_mod.terminal_owner_is_dead(d) is False
+    (d / "owner.ident").write_text("not-our-identity", encoding="utf-8")
+    assert terminal_mod.terminal_owner_is_dead(d) is True
+    identity = terminal_mod._proc.process_start_identity(__import__("os").getpid())
+    assert identity is not None
+    (d / "owner.ident").write_text(identity, encoding="utf-8")
+    assert terminal_mod.terminal_owner_is_dead(d) is False
+    assert terminal_mod.terminal_owner_is_dead(tmp_path / "omnigent-terminal-none") is None
+
+
 def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1257,6 +1272,100 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     # kill-server targeted exactly this instance's socket; a missing
     # call means the tmux server (the real leak) survives dir removal.
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
+
+
+def test_reap_orphaned_terminals_keeps_dir_while_server_still_listens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A dir whose server survives the kill attempt is kept for a retry.
+
+    The kill is verified by connecting to the socket, not by kill-server's
+    ambiguous exit status. A still-listening server (wedged tmux, failed
+    kill) means the dir — the only pointer to the socket — must survive;
+    removing it would leak a live server on an unlinked socket forever.
+
+    :param tmp_path: Unused pytest fixture slot (socket paths need a short
+        root; macOS caps ``AF_UNIX`` paths at ~104 chars).
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    import socket as socket_mod
+    import tempfile
+
+    def _failing_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        """Model a kill-server that reports failure and kills nothing."""
+        return SimpleNamespace(returncode=1)
+
+    short_root = Path(tempfile.mkdtemp(prefix="omnigent-t-", dir="/tmp"))
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: short_root)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(
+        terminal_mod,
+        "subprocess",
+        SimpleNamespace(run=_failing_run, TimeoutExpired=TimeoutError),
+    )
+    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+    try:
+        dead_dir = _write_instance_dir(short_root, "omnigent-terminal-dead3", _dead_pid())
+        server.bind(str(dead_dir / "tmux.sock"))
+        server.listen(1)
+
+        reaped = terminal_mod.reap_orphaned_terminals()
+
+        assert reaped == 0
+        assert dead_dir.exists(), "dir must be kept while the server still listens"
+
+        # Once the server is really gone (connect refused), the same dir
+        # is reapable on the next pass.
+        server.close()
+        reaped = terminal_mod.reap_orphaned_terminals()
+        assert reaped == 1
+        assert not dead_dir.exists()
+    finally:
+        server.close()
+        shutil.rmtree(short_root, ignore_errors=True)
+
+
+def test_tmux_server_alive_treats_connect_timeout_as_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A timed-out connect reads as alive, never as confirmed absence.
+
+    ``socket.timeout`` carries ``errno=None`` just like the pre-syscall
+    path-too-long error; conflating them would delete the retry dir of a
+    wedged-but-live server.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+
+    class _TimingOutSocket:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def connect(self, _path: str) -> None:
+            raise TimeoutError("timed out")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        terminal_mod,
+        "socket",
+        SimpleNamespace(
+            socket=_TimingOutSocket,
+            AF_UNIX=object(),
+            SOCK_STREAM=object(),
+        ),
+    )
+
+    assert terminal_mod._tmux_server_alive(Path("/tmp/any.sock")) is True
 
 
 @pytest.mark.skipif(
