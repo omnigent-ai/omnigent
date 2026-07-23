@@ -311,7 +311,7 @@ _AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
 
 
 def _family_provider_configured(harness: str) -> bool:
-    """Whether a usable omnigent-managed credential serves *harness*'s family.
+    """Whether a non-subscription default provider ENTRY serves *harness*'s family.
 
     Reads the local ``providers:`` config the same way the ``omnigent setup``
     overview does (:func:`surface_default_provider` / :func:`default_provider_for_harness`,
@@ -321,14 +321,22 @@ def _family_provider_configured(harness: str) -> bool:
     so counting it would double-count the CLI-login path and mask a genuine
     "installed but no key" state.
 
+    This checks that a default provider *entry* exists — not that its secret
+    actually resolves. An entry whose ``api_key_ref`` points at an unset
+    ``env:``/``$VAR`` or a missing keychain secret still reads configured here
+    (matching the secret-blind ``omnigent setup`` overview), so a harness can
+    report ready while a launch would still fail auth; that surfaces as the
+    executor's first-turn error. The launch gate stays binary-only regardless,
+    and the signal only moves toward green (no configured harness regresses).
+
     Local, synchronous, side-effect free (config file reads only) and never
     raises: any resolver/config error fails to ``False`` so a broken config
     reports "needs-auth" rather than crashing the readiness refresh.
 
     :param harness: A canonical harness spelling, e.g. ``"claude-native"`` or
         ``"pi"``.
-    :returns: ``True`` when a non-subscription provider is configured for the
-        harness's family, else ``False``.
+    :returns: ``True`` when a non-subscription default provider entry is present
+        for the harness's family, else ``False``.
     """
     try:
         from omnigent.onboarding.provider_config import (
