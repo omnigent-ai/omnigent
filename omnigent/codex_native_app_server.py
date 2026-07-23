@@ -34,6 +34,7 @@ from omnigent.codex_native_process_registry import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _apply_codex_config_overrides,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -532,7 +533,8 @@ class CodexNativeAppServer:
     :param socket_path: Codex app-server Unix socket path.
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
-    :param config_overrides: Codex ``-c`` config override values.
+    :param config_overrides: Generated Codex settings written to the private
+        session ``config.toml`` before startup.
     :param developer_instructions: Optional framework-owned instructions
         appended to the private session config before app-server startup.
     :param cwd: Working directory for the app-server process.
@@ -604,9 +606,9 @@ class CodexNativeAppServer:
             self.codex_home,
             _codex_home_config_source_from_env(),
         )
+        _apply_codex_config_overrides(self.codex_home, self.config_overrides)
         # Write the MCP server config into config.toml so the app-server
-        # discovers it at config load. The -c overrides may not be honored
-        # by `codex app-server`, so we write directly to the file.
+        # discovers it at config load.
         _inject_mcp_server_config(self.codex_home, self.bridge_dir, self.python_executable)
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
@@ -659,8 +661,6 @@ class CodexNativeAppServer:
             "--listen",
             resolved_listen,
         ]
-        for override in self.config_overrides:
-            argv.extend(["-c", override])
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
@@ -1172,9 +1172,8 @@ def build_codex_native_server(
         runs. ``None`` uses :data:`sys.executable`.
     :param codex_path: Optional executable override. ``None`` searches
         ``PATH``.
-    :param extra_config_overrides: Additional ``-c`` config overrides
-        appended after Databricks routing overrides, e.g. MCP server
-        registration for the Omnigent tool relay.
+    :param extra_config_overrides: Additional generated Codex settings
+        applied after Databricks routing settings.
     :param developer_instructions: Optional framework-owned instructions
         appended to Codex's private per-session config.
     :param bypass_sandbox: When ``True``, append config overrides that put
@@ -1255,7 +1254,7 @@ class NativeCodexLaunch:
     Resolved by :func:`resolve_native_codex_launch` so a native Codex
     session honors ``configure harnesses`` like the in-process codex harness.
 
-    :param config_overrides: Codex ``-c`` overrides that route through a
+    :param config_overrides: Codex settings that route through a
         generic provider (``model_provider`` + base_url + auth + wire);
         empty for the Databricks-profile and CLI-login paths.
     :param model: Model id to pin, or ``None`` to keep Codex's default.
@@ -1280,7 +1279,7 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
     silently dropping the carried history. The correct value is whatever
     provider the launch itself routes through:
 
-    - a ``model_provider`` ``-c`` override (cli-config / key / gateway /
+    - a generated ``model_provider`` setting (cli-config / key / gateway /
       local providers) pins it explicitly — the override value is a TOML
       basic string, which is also valid JSON;
     - a Databricks profile launch carries no override here; the provider
@@ -1311,12 +1310,12 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     - a ``databricks`` entry routes via its ucode profile (the Databricks
       branch of :func:`build_native_codex_app` turns the profile into config
       overrides), so the launch carries ``profile`` and empty overrides;
-    - a ``cli-config`` entry routes via a single ``model_provider`` ``-c``
-      override pinning the custom provider its ``~/.codex/config.toml``
+    - a ``cli-config`` entry routes via a generated ``model_provider`` setting
+      pinning the custom provider its ``~/.codex/config.toml``
       defines (the provider table + credential live in that file, which the
       native server bridges into the session ``CODEX_HOME``);
-    - a ``key`` / ``gateway`` / ``local`` entry routes via a generated
-      ``model_provider`` ``-c`` override (base_url + bearer-token auth command
+    - a ``key`` / ``gateway`` / ``local`` entry routes via generated
+      provider settings (base_url + bearer-token auth command
       + wire protocol).
 
     Returns ``None`` when *entry* cannot route Codex on its own — a
@@ -1349,7 +1348,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     if entry.kind == CLI_CONFIG_KIND:
         # Pin the config.toml-defined provider by name; its table (and
         # credential) ride along via the bridged config.toml. json.dumps
-        # yields a valid TOML basic string for the -c override value.
+        # yields a valid TOML basic string for the generated setting.
         return NativeCodexLaunch(
             config_overrides=[f"model_provider={json.dumps(entry.model_provider)}"],
             model=model,
@@ -1498,7 +1497,7 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
     Codex session route through ``omnigent setup``:
 
     1. an explicit per-family default provider →
-       - ``key`` / ``gateway`` / ``local`` → provider ``-c`` overrides
+       - ``key`` / ``gateway`` / ``local`` → generated provider settings
          (base_url + token + wire), ``profile=None``;
        - ``databricks`` → the ucode profile path (its profile);
        - ``subscription`` → the Codex CLI's own stored login (no overrides)
@@ -1739,7 +1738,6 @@ def build_codex_remote_args(
     codex_args: tuple[str, ...],
     thread_id: str | None,
     remote_url: str,
-    config_overrides: tuple[str, ...] = (),
     bypass_sandbox: bool = False,
 ) -> list[str]:
     """
@@ -1753,20 +1751,10 @@ def build_codex_remote_args(
     (``"ws://IP:PORT"``, the host-spawned runner path — see
     :class:`CodexNativeAppServer` ``listen_url``).
 
-    The ``config_overrides`` are the same ``-c key=value`` provider/model
-    overrides the app-server is launched with. The ``--remote`` TUI is a
-    *separate* process that loads its own config from ``CODEX_HOME`` and
-    does NOT inherit the app-server's ``-c`` flags; without them it falls
-    back to the built-in OpenAI provider, whose ``requires_openai_auth``
-    is ``true``, so the TUI renders the first-run "Sign in with ChatGPT"
-    onboarding screen and never creates a thread. On a host-spawned
-    (web-UI-driven) session there is nobody at the terminal to dismiss
-    that screen, so ``wait_for_thread_started`` times out and the session
-    hangs in ``running`` with no response. Passing the provider overrides
-    through makes the TUI resolve the Omnigent provider
-    (``requires_openai_auth = false``), skip onboarding, and start the
-    thread immediately. Codex global ``-c`` flags must precede the
-    ``resume`` subcommand, so they are emitted first.
+    The TUI is a separate process, but it shares the app-server's private
+    ``CODEX_HOME``. Generated provider settings are materialized in that
+    home's ``config.toml`` before either process starts, so no provider
+    configuration or credential is passed in this command line.
 
     :param codex_args: Raw Codex CLI args that precede the attach flags,
         e.g. ``("--model", "gpt-5.4-mini")``. Empty when the thread's own
@@ -1777,11 +1765,6 @@ def build_codex_remote_args(
     :param remote_url: App-server endpoint the TUI attaches to, e.g.
         ``"unix:///home/user/.omnigent/codex-native/x/app-server.sock"``
         or ``"ws://127.0.0.1:9876"``.
-    :param config_overrides: Codex ``-c`` config override values to apply
-        to the TUI, e.g.
-        ``('model="databricks-gpt-5-5"', 'model_provider="omnigent_databricks"')``.
-        Each is emitted as a ``-c <value>`` global flag. Empty for a
-        plain Codex-login launch that needs no provider routing.
     :param bypass_sandbox: When ``True``, emit a single
         ``--dangerously-bypass-approvals-and-sandbox`` flag and strip any
         conflicting ``--sandbox`` / ``--ask-for-approval`` pairs from
@@ -1792,9 +1775,6 @@ def build_codex_remote_args(
         the granular flags untouched. See issue #657.
     :returns: Codex argv tail after the executable.
     """
-    override_args: list[str] = []
-    for override in config_overrides:
-        override_args.extend(["-c", override])
     if bypass_sandbox:
         # Strip the conflicting granular flags, then prepend one canonical
         # bypass flag (a global flag, so it precedes any ``resume``).
@@ -1802,8 +1782,8 @@ def build_codex_remote_args(
     else:
         passthrough = list(codex_args)
     if thread_id is None:
-        return [*override_args, *passthrough, "--remote", remote_url]
-    return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+        return [*passthrough, "--remote", remote_url]
+    return [*passthrough, "resume", "--remote", remote_url, thread_id]
 
 
 def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:

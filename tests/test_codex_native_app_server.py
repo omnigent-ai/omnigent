@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,7 +24,10 @@ from omnigent.codex_native_app_server import (
     trust_native_policy_hooks,
 )
 from omnigent.codex_native_hook import _EVALUATE_POLICY_TIMEOUT_S
-from omnigent.inner.codex_executor import _populate_codex_home_config
+from omnigent.inner.codex_executor import (
+    _populate_codex_home_config,
+    _provider_codex_config_overrides,
+)
 
 
 def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
@@ -515,6 +519,53 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "sys_session_rename": {"approval_mode": "approve"},
         },
     }
+
+
+async def test_start_keeps_provider_secret_out_of_native_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native app-server reads provider auth from its private config."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    secret = "sk-native-argv-sentinel"
+    subprocess_calls: list[tuple[object, ...]] = []
+    real_create_subprocess_exec = asyncio.create_subprocess_exec
+
+    async def _capture_create_subprocess_exec(*args: object, **kwargs: object):
+        subprocess_calls.append(args)
+        return await real_create_subprocess_exec(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _capture_create_subprocess_exec)
+    server = CodexNativeAppServer(
+        codex_path=sys.executable,
+        socket_path=tmp_path / "codex.sock",
+        codex_home=codex_home,
+        env={},
+        config_overrides=_provider_codex_config_overrides(
+            model="test-model",
+            base_url="https://provider.invalid/v1",
+            auth_command=f"printf %s {secret}",
+            wire_api="responses",
+        ),
+        cwd=workspace,
+        bridge_dir=tmp_path / "bridge",
+    )
+
+    await server.start()
+    try:
+        app_server_argv = next(call for call in subprocess_calls if "app-server" in call)
+        assert secret not in "\0".join(str(arg) for arg in app_server_argv)
+        assert "-c" not in app_server_argv
+        config_path = codex_home / "config.toml"
+        assert secret in config_path.read_text(encoding="utf-8")
+        assert config_path.stat().st_mode & 0o777 == 0o600
+    finally:
+        await server.close()
 
 
 async def test_untrusted_hook_is_trusted_via_batchwrite() -> None:
