@@ -8034,7 +8034,7 @@ def create_runner_app(
             if current is instance:
                 try:
                     await terminal_registry.close(conv_id, terminal_name, "main")
-                except Exception:
+                except Exception:  # noqa: BLE001 — cleanup is best-effort
                     _logger.warning(
                         "failed to close stale native pane for conv=%s; proceeding to re-create",
                         conv_id,
