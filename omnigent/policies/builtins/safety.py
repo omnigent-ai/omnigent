@@ -136,10 +136,11 @@ def _args_hash(tool_name: str, arguments: Any) -> str:  # type: ignore[explicit-
 def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
     """Factory: detect repeated identical tool calls.
 
-    Tracks recent ``(tool_name, args_hash)`` tuples in
-    ``session_state``.  When the same call repeats *threshold*
-    times within the last *window* calls, returns ASK so the
-    user can break the loop.
+    Tracks recent tool-call hashes in ``session_state`` as a
+    bounded list of SHA-256 hex digests keyed by
+    ``_policy_loop_recent_hashes``.  When the same hash
+    appears *threshold* times within the last *window* calls,
+    returns ASK so the user can break the loop.
 
     This catches the #1 token-waste pattern — an agent retrying
     the exact same failing tool call — which
@@ -147,12 +148,15 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
     counts total calls.
 
     :param window: Number of recent calls to consider.
-        Defaults to ``10``.
+        Defaults to ``10``. Clamped to a minimum of ``1``.
     :param threshold: How many times a call must repeat within
-        *window* to trigger. Defaults to ``3``.
+        *window* to trigger. Defaults to ``3``. Clamped to a
+        minimum of ``1``.
     :returns: A policy callable that ASKs when a loop is
         detected.
     """
+    window = max(1, window)
+    threshold = max(1, threshold)
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the current tool call is a repeated loop.
@@ -672,11 +676,13 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
             "properties": {
                 "window": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Number of recent tool calls to consider",
                     "default": 10,
                 },
                 "threshold": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Number of identical repeats within the window to trigger",
                     "default": 3,
                 },

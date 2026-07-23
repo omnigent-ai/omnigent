@@ -36,13 +36,17 @@ guardrails:
 """
 
 
+@pytest.fixture()
+def conversation_store(db_uri: str) -> SqlAlchemyConversationStore:
+    """Conversation store backed by a per-test SQLite DB."""
+    return SqlAlchemyConversationStore(db_uri)
+
+
 def _build(tmp_path: Path, store: SqlAlchemyConversationStore) -> PolicyEngine:
     (tmp_path / "config.yaml").write_text(_YAML)
     spec = parse(tmp_path)
     conv = store.create_conversation()
-    return build_policy_engine(
-        spec=spec, conversation_id=conv.id, conversation_store=store
-    )
+    return build_policy_engine(spec=spec, conversation_id=conv.id, conversation_store=store)
 
 
 def _tool_ctx(name: str, args: dict | None = None) -> EvaluationContext:
@@ -124,8 +128,6 @@ async def test_detect_loop_non_tool_call_phases_pass_through(
 
     for _ in range(5):
         r = await engine.evaluate(
-            EvaluationContext(
-                phase=Phase.REQUEST, content="same message", tool_name=None
-            )
+            EvaluationContext(phase=Phase.REQUEST, content="same message", tool_name=None)
         )
         assert r.action == PolicyAction.ALLOW
