@@ -8056,29 +8056,6 @@ def _slack_argv() -> list[str]:
     return [sys.executable, "-m", _SLACK_PACKAGE]
 
 
-def _slack_cwd() -> Path | None:
-    """Directory to run the Slack bot from, so its ``.env`` resolves.
-
-    The bot's ``Settings`` loads a CWD-relative ``.env``; a background daemon
-    otherwise inherits whatever directory ``omni`` was launched from and
-    silently misses config. For a source/editable install the package lives at
-    ``<integration>/src/omnigent_slack``, so the integration dir (holding the
-    ``.env``) is three parents up. Returns that dir only when it actually holds
-    a ``.env``; otherwise ``None`` (a wheel install has no such dir — config
-    then comes from real environment variables).
-    """
-    import importlib.util
-
-    spec = importlib.util.find_spec(_SLACK_PACKAGE)
-    if spec is None or not spec.origin:
-        return None
-    origin = Path(spec.origin)
-    if len(origin.parents) < 3:
-        return None
-    integration_dir = origin.parents[2]
-    return integration_dir if (integration_dir / ".env").is_file() else None
-
-
 def _integration_state_dir() -> Path:
     """Runtime dir for integration daemon records (honors OMNIGENT_DATA_DIR)."""
     from omnigent.host.local_server import _local_data_dir
@@ -8120,8 +8097,11 @@ def slack(ctx: click.Context) -> None:
       omni integration slack stop     # terminate the daemon
       omni integration slack logs     # where the daemon logs (-f to tail)
 
-    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from the environment
-    and the integration's .env file — see integrations/slack/.env.example.
+    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from environment
+    variables — the bot does not read a .env file itself (matching
+    ``omni server``). Export them, or launch under a tool that injects a .env
+    (e.g. ``uv run --env-file .env``). See integrations/slack/.env.example for
+    the full set; a missing required var prints a friendly error and exits.
     """
     if ctx.invoked_subcommand is not None:
         return
@@ -8136,9 +8116,11 @@ def slack(ctx: click.Context) -> None:
             "Stop it first with `omni integration slack stop`, or view it with "
             "`omni integration slack status`."
         )
-    # Foreground: inherit stdio, block until the bot exits (Ctrl-C).
+    # Foreground: inherit stdio, block until the bot exits (Ctrl-C). Config
+    # comes from the inherited environment only (no .env loading — matches
+    # `omni server`), so the child inherits our cwd; nothing to special-case.
     click.echo("Starting the Omnigent Slack bot (foreground). Press Ctrl-C to stop.")
-    result = subprocess.run(_slack_argv(), env=os.environ.copy(), cwd=_slack_cwd(), check=False)
+    result = subprocess.run(_slack_argv(), env=os.environ.copy(), check=False)
     raise SystemExit(result.returncode)
 
 
@@ -8153,7 +8135,7 @@ def slack_start() -> None:
         click.echo(f"Slack bot already running (pid {existing.pid}).")
         click.echo(f"Logs: {_display_path(Path(existing.log_path))}")
         return
-    record = daemon.start(_slack_argv(), os.environ.copy(), cwd=_slack_cwd())
+    record = daemon.start(_slack_argv(), os.environ.copy())
     # A detached daemon that dies on startup (missing tokens, bad server URL)
     # leaves nothing on the terminal — confirm it survives a short grace and
     # surface the log tail if it didn't, instead of falsely reporting success.

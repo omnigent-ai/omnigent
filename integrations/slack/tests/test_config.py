@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from omnigent_slack.config import Settings
+from omnigent_slack.config import ConfigError, Settings, load_settings
 from pydantic import ValidationError
 
 
@@ -81,6 +81,68 @@ def test_server_url_required(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_device_client_secret_optional_defaults_none(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_env(monkeypatch)
     assert _load().device_client_secret is None
+
+
+# ── load_settings(): operator-friendly config errors ─────────────────
+
+
+def test_load_settings_missing_vars_raises_friendly_configerror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing required vars → a ConfigError naming each env var + how to set
+    them, NOT a raw pydantic ValidationError traceback."""
+    _set_env(monkeypatch)  # baseline
+    for key in _REQUIRED:  # then unset all three required vars
+        monkeypatch.delenv(key, raising=False)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    msg = str(excinfo.value)
+    # Every required env var is named by its real (env) name…
+    for name in _REQUIRED:
+        assert name in msg
+    # …and the message tells the operator how config is loaded.
+    assert "does NOT load a .env" in msg
+    assert "Missing required configuration" in msg
+    # It must not be a bare pydantic dump.
+    assert "validation error" not in msg.lower()
+
+
+def test_load_settings_reports_only_the_missing_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When only one required var is missing, only that one is listed."""
+    _set_env(monkeypatch)
+    monkeypatch.delenv("OMNIGENT_SERVER_URL", raising=False)
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    msg = str(excinfo.value)
+    assert "OMNIGENT_SERVER_URL" in msg
+    assert "OMNIGENT_SLACK_BOT_TOKEN" not in msg  # the ones that ARE set aren't flagged
+
+
+def test_load_settings_invalid_value_raises_friendly_configerror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A value that fails a validator (bad URL scheme) → a ConfigError under an
+    'Invalid configuration' heading, not a missing-var message."""
+    _set_env(monkeypatch, OMNIGENT_SERVER_URL="ftp://nope")
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_settings()
+
+    msg = str(excinfo.value)
+    assert "Invalid configuration" in msg
+    assert "OMNIGENT_SERVER_URL" in msg
+    assert "http://" in msg  # surfaces the validator's guidance
+
+
+def test_load_settings_succeeds_with_full_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The happy path returns a Settings instance (no error)."""
+    _set_env(monkeypatch)
+    settings = load_settings()
+    assert settings.server_url == _REQUIRED["OMNIGENT_SERVER_URL"]
 
 
 def test_device_client_secret_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

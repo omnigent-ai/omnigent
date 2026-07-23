@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 
-from dotenv import load_dotenv
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
@@ -16,7 +16,7 @@ from omnigent_slack.approvals import (
     route_elicitation_click,
 )
 from omnigent_slack.auth_manager import AuthManager, pack_user_key
-from omnigent_slack.config import load_settings
+from omnigent_slack.config import ConfigError, load_settings
 from omnigent_slack.databricks_oauth import DatabricksOAuthClient
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
@@ -27,8 +27,20 @@ from omnigent_slack.webauth import WebAuthServer
 
 
 async def run() -> None:
-    load_dotenv()
-    settings = load_settings()
+    # Config comes from real environment variables only — mirroring `omni
+    # server` (the core CLI loads no .env). Whatever populates the environment
+    # (your shell, `uv run`, the Docker/Databricks deploy) is the single source
+    # of truth; there is no in-app .env loading. See integrations/slack/README.
+    #
+    # A missing/invalid config raises ConfigError with an operator-friendly,
+    # pre-formatted message. Print it plainly and exit non-zero — no traceback,
+    # no logging setup (which hasn't run yet). SystemExit(2) is the conventional
+    # "usage/config" exit code and is what the foreground CLI surfaces.
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print(f"omnigent-slack: {exc}", file=sys.stderr)
+        raise SystemExit(2) from None
     level = getattr(logging, settings.log_level.upper(), logging.INFO)
     # force=True so this wins even when an entry point (e.g. the Databricks App
     # wrapper) already called basicConfig at import — otherwise a second
