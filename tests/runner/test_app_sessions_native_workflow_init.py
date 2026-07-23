@@ -1,11 +1,4 @@
-"""Tests for runner app integration with the sessions-native event path.
-
-Verifies the `_stream_message_to_harness` shared helper covers both
-``POST /v1/responses`` (legacy) and ``POST /v1/sessions/{conv}/events``
-(sessions-native). Both paths must inject MCP schemas, stamp the
-``omnigent_runner_dispatched`` marker on intercepted events, and
-route MCP dispatch to the runner manager.
-"""
+"""Tests for native session initialization, dispatch, status, and streams."""
 
 from __future__ import annotations
 

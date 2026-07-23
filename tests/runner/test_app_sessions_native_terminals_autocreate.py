@@ -1,11 +1,4 @@
-"""Tests for runner app integration with the sessions-native event path.
-
-Verifies the `_stream_message_to_harness` shared helper covers both
-``POST /v1/responses`` (legacy) and ``POST /v1/sessions/{conv}/events``
-(sessions-native). Both paths must inject MCP schemas, stamp the
-``omnigent_runner_dispatched`` marker on intercepted events, and
-route MCP dispatch to the runner manager.
-"""
+"""Tests for native terminal auto-creation across supported harnesses."""
 
 from __future__ import annotations
 
@@ -26,6 +19,13 @@ from omnigent import (
 )
 from omnigent.antigravity_native_bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+    AntigravityNativeBridgeState,
+)
+from omnigent.antigravity_native_bridge import (
+    prepare_bridge_dir as prepare_antigravity_bridge_dir,
+)
+from omnigent.antigravity_native_bridge import (
+    write_bridge_state as write_antigravity_bridge_state,
 )
 from omnigent.claude_native_bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -2318,17 +2318,18 @@ async def test_create_session_antigravity_auto_create_guard_skips_rotation_targe
     ``clear_rotation_target_skips`` case red (auto-create fires for a rotation
     target again).
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
-
-    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    monkeypatch.setattr(
+        "omnigent.antigravity_native_bridge._BRIDGE_ROOT",
+        tmp_path / "antigravity-native",
+    )
 
     # Seed the shared bridge state so the guard reads the original
     # (terminal-owning) session as the bridge's active session.
     if scenario.bridge_state_session is not None:
-        seed_dir = bridge_mod.prepare_bridge_dir(scenario.bridge_id_label)
-        bridge_mod.write_bridge_state(
+        seed_dir = prepare_antigravity_bridge_dir(scenario.bridge_id_label)
+        write_antigravity_bridge_state(
             seed_dir,
-            bridge_mod.AntigravityNativeBridgeState(
+            AntigravityNativeBridgeState(
                 session_id=scenario.bridge_state_session,
                 conversation_id="cascade_old",
             ),

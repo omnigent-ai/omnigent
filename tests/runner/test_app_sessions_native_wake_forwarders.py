@@ -1,11 +1,4 @@
-"""Tests for runner app integration with the sessions-native event path.
-
-Verifies the `_stream_message_to_harness` shared helper covers both
-``POST /v1/responses`` (legacy) and ``POST /v1/sessions/{conv}/events``
-(sessions-native). Both paths must inject MCP schemas, stamp the
-``omnigent_runner_dispatched`` marker on intercepted events, and
-route MCP dispatch to the runner manager.
-"""
+"""Tests for wake-post retries and native transcript forwarder lifecycle."""
 
 from __future__ import annotations
 
@@ -23,13 +16,6 @@ from omnigent import (
     codex_native_bridge,
 )
 from omnigent.entities.session_resources import SessionResourceView
-from omnigent.runner.app import (
-    _WAKE_POST_MAX_ATTEMPTS,
-    _auto_create_claude_terminal,
-    _auto_create_codex_terminal,
-    _deliver_subagent_wake_post,
-    _wake_post_is_retryable,
-)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 
@@ -128,7 +114,7 @@ async def test_wake_post_retries_transient_503_then_succeeds(
         [_wake_response(503, parent_id), _wake_response(200, parent_id)]
     )
 
-    delivered = await _deliver_subagent_wake_post(
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -166,10 +152,10 @@ async def test_wake_post_persistent_503_returns_failure(
     """
     parent_id = "a25887ef53cb74bba721c20edf204d10"
     client = _QueuedResponseServerClient(
-        [_wake_response(503, parent_id) for _ in range(_WAKE_POST_MAX_ATTEMPTS)]
+        [_wake_response(503, parent_id) for _ in range(runner_app_mod._WAKE_POST_MAX_ATTEMPTS)]
     )
 
-    delivered = await _deliver_subagent_wake_post(
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -180,13 +166,14 @@ async def test_wake_post_persistent_503_returns_failure(
     assert delivered is False
     # Attempted exactly the bounded budget — not once (no retry) and not
     # unbounded. The stub would have asserted on a call past the queue.
-    assert len(client.calls) == _WAKE_POST_MAX_ATTEMPTS, (
-        f"Expected {_WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, got {len(client.calls)}."
+    assert len(client.calls) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS, (
+        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts on persistent 503, "
+        f"got {len(client.calls)}."
     )
     # One backoff fewer than attempts: we don't sleep after the final attempt.
-    assert len(_no_wake_backoff) == _WAKE_POST_MAX_ATTEMPTS - 1, (
-        f"Expected {_WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
-        f"{_WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
+    assert len(_no_wake_backoff) == runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1, (
+        f"Expected {runner_app_mod._WAKE_POST_MAX_ATTEMPTS - 1} backoffs between "
+        f"{runner_app_mod._WAKE_POST_MAX_ATTEMPTS} attempts, got {_no_wake_backoff}."
     )
 
 
@@ -202,7 +189,7 @@ async def test_wake_post_permanent_4xx_not_retried(
     parent_id = "43cc3eccd350fed1b91854b2adf5ec3e"
     client = _QueuedResponseServerClient([_wake_response(400, parent_id)])
 
-    delivered = await _deliver_subagent_wake_post(
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
         client,  # type: ignore[arg-type]
         parent_id,
         "[System: worker completed]",
@@ -247,7 +234,7 @@ def test_wake_post_is_retryable_status_classification(
     )
     # Pins which statuses cost a retry vs. fail fast; a wrong verdict here
     # would either waste the budget on permanent errors or give up on a 503.
-    assert _wake_post_is_retryable(exc) is expected_retryable
+    assert runner_app_mod._wake_post_is_retryable(exc) is expected_retryable
 
 
 def test_wake_post_transport_error_is_retryable() -> None:
@@ -260,7 +247,7 @@ def test_wake_post_transport_error_is_retryable() -> None:
     request = httpx.Request("POST", "http://test/v1/sessions/p/events")
     exc = httpx.ConnectError("connection refused", request=request)
     # True because a transport failure is not a definitive server rejection.
-    assert _wake_post_is_retryable(exc) is True
+    assert runner_app_mod._wake_post_is_retryable(exc) is True
 
 
 @dataclass
@@ -524,7 +511,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             )
 
     try:
-        await _auto_create_claude_terminal(
+        await runner_app_mod._auto_create_claude_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
@@ -535,7 +522,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         await asyncio.sleep(0)
 
         # The recovery path: terminal resource gone, ensure re-creates.
-        await _auto_create_claude_terminal(
+        await runner_app_mod._auto_create_claude_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
@@ -747,7 +734,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
     )
 
     try:
-        await _auto_create_codex_terminal(
+        await runner_app_mod._auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
@@ -756,7 +743,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         )
         await asyncio.sleep(0)
 
-        await _auto_create_codex_terminal(
+        await runner_app_mod._auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
             lambda _sid, _evt: None,
