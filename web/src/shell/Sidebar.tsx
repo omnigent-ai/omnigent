@@ -2359,7 +2359,8 @@ function SessionTooltipContent({ conversation }: { conversation: Conversation })
     <TooltipContent
       side="right"
       sideOffset={12}
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch gap-3 rounded-xl px-4 py-3 whitespace-normal shadow-lg"
+      data-testid="session-tooltip-content"
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch gap-3 rounded-xl bg-card-solid px-4 py-3 whitespace-normal shadow-lg"
     >
       <div className="text-sm font-medium leading-snug">
         {conversation.title ?? conversation.id}

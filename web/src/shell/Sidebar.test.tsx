@@ -401,10 +401,12 @@ describe("Sidebar session list", () => {
 
     fireEvent.pointerMove(row, { pointerType: "mouse" });
     await waitFor(() => {
-      const tooltip = screen.getByRole("tooltip");
+      const tooltip = screen.getByTestId("session-tooltip-content");
       expect(tooltip).toHaveTextContent(title);
+      expect(tooltip.className).toContain("bg-card-solid");
+      expect(tooltip.className).not.toContain("bg-popover");
       expect(tooltip).toHaveTextContent("2d");
-      expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
+      expect(within(tooltip).getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(
         "Local machine",
       );
     });
