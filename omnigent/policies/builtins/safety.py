@@ -127,10 +127,10 @@ def _args_hash(tool_name: str, arguments: Any) -> str:  # type: ignore[explicit-
 
     :param tool_name: Tool being called.
     :param arguments: Arguments dict (or any JSON-serializable value).
-    :returns: Hex digest uniquely identifying this (tool, args) pair.
+    :returns: SHA-256 hex digest identifying this (tool, args) pair.
     """
     blob = _json.dumps({"t": tool_name, "a": arguments}, sort_keys=True, default=str)
-    return _hashlib.sha256(blob.encode()).hexdigest()[:16]
+    return _hashlib.sha256(blob.encode()).hexdigest()
 
 
 def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
