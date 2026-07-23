@@ -9,7 +9,7 @@ A coding harness is "ready" along two independent axes:
   that axis, mirroring how ``ucode`` checks (``shutil.which(binary)``) and the
   npm packages it installs.
 
-``omnigent setup --no-internal-beta`` uses this to mark an uninstalled harness and
+``omni setup --no-internal-beta`` uses this to mark an uninstalled harness and
 offer to ``npm install`` it; the first-run ``omnigent run`` flow uses the
 same map so the two surfaces never disagree about what the machine can launch.
 
@@ -66,7 +66,7 @@ CURSOR_KEY = "cursor"
 KIMI_KEY = "kimi"
 
 # Kiro authenticates against its own backend and ships as a standalone native
-# installer, not an npm package managed by ``omnigent setup``.
+# installer, not an npm package managed by ``omni setup``.
 KIRO_KEY = "kiro"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
@@ -374,7 +374,7 @@ def ui_credential_configurable_harnesses() -> frozenset[str]:
 # ``command`` steps run on the host and are status-tracked; ``setup`` steps
 # ``command`` steps run on the host and are status-tracked; ``auth`` steps
 # (pi) open the UI credential form and are status-tracked; ``setup`` steps
-# (qwen: env-auth, not UI-authable) point at ``omnigent setup`` and don't track.
+# (qwen: env-auth, not UI-authable) point at ``omni setup`` and don't track.
 #   claude/codex: subscription login via the CLI's own login command.
 #   opencode: its own `opencode auth login`.
 #   pi: a provider credential (API key / gateway / adopt) written from the UI.
@@ -424,7 +424,7 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
         # this stays an untrackable signpost pointing at the CLI.
         detail="Qwen needs an API key or gateway. Set it up on the host for now.",
         action="setup",
-        command="omnigent setup",
+        command="omni setup",
         status_key=None,
     ),
 }
@@ -433,13 +433,13 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
 def ui_setup_steps(harness: str) -> list[SetupStep]:
     """Return the ordered setup checklist for a UI harness identifier.
 
-    Mirrors what ``omnigent setup`` walks a user through for the harness: an
+    Mirrors what ``omni setup`` walks a user through for the harness: an
     install step, then (for the five first-class families) an auth step. The
     install step's label uses the harness's :class:`HarnessInstallSpec` display
     name; the auth step's command is a display-only literal from
     :data:`_UI_AUTH_STEP_BY_KEY` (shown for the user to run, not executed).
     Harnesses outside the UI-installable set get a single generic
-    "run ``omnigent setup``" step (M1 scope).
+    "run ``omni setup``" step (M1 scope).
 
     :param harness: A harness identifier the UI holds, e.g. ``"codex"`` or the
         native spelling ``"codex-native"`` (both resolve to the same steps).
@@ -452,9 +452,9 @@ def ui_setup_steps(harness: str) -> list[SetupStep]:
             SetupStep(
                 kind="install",
                 title="Set up on the host",
-                detail="Run omnigent setup on the host to configure this agent.",
+                detail="Run omni setup on the host to configure this agent.",
                 action="setup",
-                command="omnigent setup",
+                command="omni setup",
                 status_key=None,
             )
         ]
@@ -536,21 +536,21 @@ def harness_setup_hint(harness: str | None) -> str:
     """Return actionable remediation when *harness* can't launch on a machine.
 
     Most CLI harnesses (``claude``/``codex``/``pi``) install via npm and a
-    model credential, both of which ``omnigent setup`` handles — so they route
+    model credential, both of which ``omni setup`` handles — so they route
     there. But a harness whose CLI ships out-of-band (``cursor-agent``, via
     Cursor's own curl installer rather than npm — it carries an ``install_hint``
-    and no ``package``) is **not** installed by ``omnigent setup``: pointing a
+    and no ``package``) is **not** installed by ``omni setup``: pointing a
     native-Cursor user there is a dead end, since setup only configures the
     SDK-based ``cursor`` harness (``cursor-sdk`` + ``CURSOR_API_KEY``). For
     those, name the vendor installer and the CLI's own login instead.
 
     :param harness: An executor harness identifier, e.g. ``"cursor-native"``,
         ``"claude-native"``, or ``"codex"``; ``None`` falls back to the
-        ``omnigent setup`` hint.
+        ``omni setup`` hint.
     :returns: A remediation clause for the "harness not configured" message,
         e.g. ``"install the cursor-agent CLI on that machine with `curl
         https://cursor.com/install -fsS | bash`, then run `cursor-agent
-        login`"`` for native Cursor, or the ``omnigent setup`` hint otherwise.
+        login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
     spec = required_cli_for_harness(harness or "")
     if spec is not None and spec.package is None and spec.install_hint:
@@ -560,7 +560,7 @@ def harness_setup_hint(harness: str | None) -> str:
         elif spec.auth_hint:
             login = f", then {spec.auth_hint}"
         return f"install the {spec.binary} CLI on that machine with `{spec.install_hint}`{login}"
-    return "run `omnigent setup` on that machine to install the CLI and set a default credential"
+    return "run `omni setup` on that machine to install the CLI and set a default credential"
 
 
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
