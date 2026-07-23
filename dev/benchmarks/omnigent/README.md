@@ -60,6 +60,8 @@ see *Network* below).
 | `search_sessions` | `GET /v1/sessions?search_query=` — unindexed `LIKE` | total item count |
 | `fork_session` | `POST /v1/sessions/{id}/fork` — fork (deep-copy items); forks deleted in teardown, untimed | items/session |
 | `add_comment` | `POST /v1/sessions/{id}/comments` — create a review comment | write path |
+| `list_projects` | `GET /v1/sessions/projects` — sidebar project list (dual-read union) | project count |
+| `list_project_sessions` | `GET /v1/sessions?project=` — a project folder's sessions (dual-read filter) | sessions/project |
 
 Read journeys target a **pre-seeded** session when the DB has a corpus; against
 an empty DB they self-seed a small fallback session over HTTP (the

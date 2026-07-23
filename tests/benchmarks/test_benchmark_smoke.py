@@ -29,6 +29,8 @@ _SMOKE_JOURNEYS = [
     "get_session",
     "load_conversation_history",
     "search_sessions",
+    "list_projects",
+    "list_project_sessions",
     "fork_session",
     "add_comment",
 ]
