@@ -518,16 +518,84 @@ def test_fetch_model_pricing_already_prefixed_still_works(
     assert pricing.output_per_token == pytest.approx(3.0e-6)
 
 
+import json as _json_test
+import urllib.request
+
+
+class _ListResp:
+    """Fake urllib response for the OpenRouter list-endpoint."""
+
+    def __init__(self, payload: object) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return _json_test.dumps(self._payload).encode()
+
+    def __enter__(self) -> "_ListResp":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
+
+def _or_list_response(*entries: dict) -> dict:
+    """Build a mock OpenRouter /api/v1/models response."""
+    return {"data": list(entries)}
+
+
+# --- A working fake catalog that returns entries for known providers ---
+def _make_catalog(or_catalog: dict[str, Any] | None = None, other: dict[str, Any] | None = None):
+    """Return a mock _fetch_mlflow_provider_catalog callable.
+
+    ``or_catalog`` is the ``openrouter`` provider catalog;
+    ``other`` is any other provider (e.g. "anthropic").
+    """
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        if provider == "openrouter":
+            return or_catalog
+        if provider == "anthropic":
+            return other
+        return None
+    return _catalog
+
+
+def test_fetch_model_pricing_unknown_bare_id_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A bare single-segment id with no catalog match returns ``None``.
+
+    Exercises the genuine fall-through path (own-provider: None, OR catalog:
+    None, live API: model not in list) without short-circuiting via
+    ``OMNIGENT_DISABLE_CATALOG_LOOKUP``.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+    monkeypatch.setattr(
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda url, timeout=3: _ListResp(_or_list_response(
+            {"id": "other/model", "pricing": {"prompt": "1", "completion": "2"}}
+        )),
+    )
+
+    assert fetch_model_pricing("nonexistent-model") is None
+
+
 def test_fetch_model_pricing_single_segment_unknown_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A single-segment id with no catalog entry returns ``None`` cleanly."""
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
     monkeypatch.setattr(
         context_window, "_fetch_mlflow_provider_catalog", lambda _: None
     )
-    # Clear live cache so this doesn't hit the network
-    context_window._live_pricing_cache.clear()
     monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
 
     assert fetch_model_pricing("unknown-model") is None
@@ -538,79 +606,90 @@ def test_fetch_model_pricing_live_fallback_prices_glm52(
 ) -> None:
     """
     Models absent from MLflow (e.g. ``z-ai/glm-5.2``) are priced via the
-    live OpenRouter API fallback.
+    live OpenRouter list-endpoint fallback.
+
+    The list endpoint returns ``data`` as a LIST, not a dict.
     """
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     context_window._live_pricing_cache.clear()
+    monkeypatch.setattr(
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
+    )
 
-    def _catalog(provider: str) -> dict[str, Any] | None:
-        # Neither "z-ai" nor "openrouter" catalog has glm-5.2
-        return None
-
-    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
-
-    mock_response = {
-        "data": {
+    list_payload = _or_list_response(
+        {"id": "some/other-model", "pricing": {"prompt": "1", "completion": "2"}},
+        {
             "id": "z-ai/glm-5.2",
             "pricing": {
                 "prompt": "0.0000007938",
                 "completion": "0.0000024948",
                 "input_cache_read": "0.00000014742",
             },
-        }
-    }
+        },
+    )
 
-    import json
-    import urllib.request
-
-    class _FakeResp:
-        def __init__(self, data: dict) -> None:
-            self._data = data
-
-        def read(self) -> bytes:
-            return json.dumps(self._data).encode()
-
-        def __enter__(self) -> "_FakeResp":
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-    def _fake_urlopen(url: str, timeout: int = 3) -> _FakeResp:
-        assert "z-ai/glm-5.2" in url
-        return _FakeResp(mock_response)
+    def _fake_urlopen(url: str, timeout: int = 3) -> _ListResp:
+        assert "openrouter.ai/api/v1/models" in url
+        return _ListResp(list_payload)
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
 
     pricing = fetch_model_pricing("z-ai/glm-5.2")
-    assert pricing is not None, "z-ai/glm-5.2 was not priced via live fallback"
+    assert pricing is not None, "z-ai/glm-5.2 was not priced via live list fallback"
     assert pricing.input_per_token == pytest.approx(7.938e-7)
     assert pricing.output_per_token == pytest.approx(2.4948e-6)
     assert pricing.cache_read_per_token == pytest.approx(1.4742e-7)
 
 
+def test_fetch_model_pricing_live_fallback_strips_openrouter_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An ``openrouter/``-prefixed id is stripped before matching the live list.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+    monkeypatch.setattr(
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
+    )
+
+    list_payload = _or_list_response(
+        {"id": "vendor/model-x", "pricing": {"prompt": "2e-6", "completion": "8e-6"}},
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda url, timeout=3: _ListResp(list_payload),
+    )
+
+    pricing = fetch_model_pricing("openrouter/vendor/model-x")
+    assert pricing is not None
+    assert pricing.input_per_token == pytest.approx(2e-6)
+    assert pricing.output_per_token == pytest.approx(8e-6)
+
+
 def test_fetch_model_pricing_live_fallback_404_returns_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Live fallback returns ``None`` on 404 without raising."""
+    """Live fallback returns ``None`` on HTTP 404 without raising."""
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     context_window._live_pricing_cache.clear()
-
     monkeypatch.setattr(
-        context_window, "_fetch_mlflow_provider_catalog", lambda _: None
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
     )
 
-    import urllib.request
-
     def _fake_urlopen_404(url: str, timeout: int = 3) -> None:
-        raise urllib.error.HTTPError(
-            url, 404, "Not Found", {}, None
-        )
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_404)
 
-    pricing = fetch_model_pricing("z-ai/glm-99")
-    assert pricing is None
+    assert fetch_model_pricing("z-ai/glm-99") is None
 
 
 def test_fetch_model_pricing_live_fallback_timeout_returns_none(
@@ -619,20 +698,55 @@ def test_fetch_model_pricing_live_fallback_timeout_returns_none(
     """Live fallback returns ``None`` on timeout without raising."""
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     context_window._live_pricing_cache.clear()
-
     monkeypatch.setattr(
-        context_window, "_fetch_mlflow_provider_catalog", lambda _: None
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
     )
-
-    import urllib.request
 
     def _fake_urlopen_timeout(url: str, timeout: int = 3) -> None:
         raise TimeoutError("timed out")
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_timeout)
 
-    pricing = fetch_model_pricing("unknown/vendor-model")
-    assert pricing is None
+    assert fetch_model_pricing("unknown/vendor-model") is None
+
+
+def test_fetch_model_pricing_live_fallback_malformed_list_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 200 response where ``data`` is a non-list shape returns None
+    without raising.  Covers: dict (old single-model shape), null, bare
+    string, and nested-garbage.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+    monkeypatch.setattr(
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
+    )
+
+    for malformed_payload in [
+        {"data": {"id": "k", "pricing": {}}},  # dict, not list
+        {"data": None},
+        {"data": "garbage-string"},
+        {"not_data_key": [1, 2, 3]},
+        "bare-string-at-top-level",
+    ]:
+        # Clear the cache between iterations so each shape is freshly checked.
+        context_window._live_pricing_cache.clear()
+        monkeypatch.setattr(
+            urllib.request,
+            "urlopen",
+            lambda url, timeout=3, _p=malformed_payload: _ListResp(_p),
+        )
+        result = fetch_model_pricing("test/model-v1")
+        assert result is None, (
+            f"Malformed payload returned non-None: {result!r}"
+            f"  payload={malformed_payload!r}"
+        )
 
 
 def test_fetch_model_pricing_live_fallback_is_cached(
@@ -641,40 +755,24 @@ def test_fetch_model_pricing_live_fallback_is_cached(
     """Live fallback results are cached; second call doesn't hit the network."""
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     context_window._live_pricing_cache.clear()
-
     monkeypatch.setattr(
-        context_window, "_fetch_mlflow_provider_catalog", lambda _: None
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
     )
-
-    import json
-    import urllib.request
 
     call_count = 0
 
-    class _FakeResp:
-        def __init__(self) -> None:
-            pass
+    list_payload = _or_list_response(
+        {"id": "test/cached-model", "pricing": {"prompt": "1e-6", "completion": "5e-6"}},
+    )
 
-        def read(self) -> bytes:
-            return json.dumps({
-                "data": {
-                    "id": "test/cached-model",
-                    "pricing": {"prompt": "1e-6", "completion": "5e-6"},
-                }
-            }).encode()
-
-        def __enter__(self) -> "_FakeResp":
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            pass
-
-    def _fake_urlopen(url: str, timeout: int = 3) -> _FakeResp:
+    def _counting_urlopen(url: str, timeout: int = 3) -> _ListResp:
         nonlocal call_count
         call_count += 1
-        return _FakeResp()
+        return _ListResp(list_payload)
 
-    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", _counting_urlopen)
 
     p1 = fetch_model_pricing("test/cached-model")
     p2 = fetch_model_pricing("test/cached-model")
@@ -682,3 +780,81 @@ def test_fetch_model_pricing_live_fallback_is_cached(
     assert p2 is not None
     assert p1.input_per_token == p2.input_per_token
     assert call_count == 1, f"Network called {call_count} times; expected 1 (cached)"
+
+
+def test_fetch_model_pricing_live_fallback_price_string_zero_is_authoritative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pricing string of ``"0"`` is an authoritative zero, not "absent".
+    Only absent/None fields are treated as unknown.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+    monkeypatch.setattr(
+        context_window,
+        "_fetch_mlflow_provider_catalog",
+        _make_catalog(or_catalog=None),
+    )
+
+    list_payload = _or_list_response(
+        {"id": "free/model", "pricing": {"prompt": "0", "completion": "0"}},
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda url, timeout=3: _ListResp(list_payload),
+    )
+
+    pricing = fetch_model_pricing("free/model")
+    assert pricing is not None, "Price string '0' should be parsed as 0.0"
+    assert pricing.input_per_token == 0.0
+    assert pricing.output_per_token == 0.0
+
+
+def test_fetch_model_pricing_own_catalog_precedence_over_openrouter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A vendor/model id priced by its OWN provider catalog returns the
+    own-catalog price, even when the openrouter catalog holds the same
+    key at a DIFFERENT price.  This locks in precedence.
+
+    Example: "anthropic/claude-sonnet-4-6" -- if "anthropic" catalog has
+    it at $3/M input and openrouter catalog has it at $99/M input, the
+    own-catalog price wins.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+
+    OWN_PRICE = 3.0  # $/M tokens -- own catalog
+    OR_PRICE = 99.0  # $/M tokens -- openrouter catalog (different!)
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        if provider == "anthropic":
+            return {
+                "claude-sonnet-4-6": {
+                    "pricing": {
+                        "input_per_million_tokens": OWN_PRICE,
+                        "output_per_million_tokens": 15.0,
+                    }
+                }
+            }
+        if provider == "openrouter":
+            return {
+                "anthropic/claude-sonnet-4-6": {
+                    "pricing": {
+                        "input_per_million_tokens": OR_PRICE,
+                        "output_per_million_tokens": 450.0,
+                    }
+                }
+            }
+        return None
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+
+    pricing = fetch_model_pricing("anthropic/claude-sonnet-4-6")
+    assert pricing is not None
+    assert pricing.input_per_token == pytest.approx(OWN_PRICE / 1_000_000), (
+        "Own-provider catalog price must take precedence over openrouter"
+    )
