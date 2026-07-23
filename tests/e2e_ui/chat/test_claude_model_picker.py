@@ -118,32 +118,34 @@ def test_claude_native_picker_lists_only_live_databricks_models(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=15_000)
-    trigger.click()
+    # The Model dropdown lives in the config gear modal now.
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-config-model").click()
 
-    rows = page.locator('[data-testid="model-picker-item"]')
+    # The model options carry the same data-model-id rows as before (plus the
+    # "Default" sentinel row the modal always offers).
+    rows = page.locator('[role="option"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_ROWS))
     for index, (model_id, label) in enumerate(_EXPECTED_ROWS):
         row = rows.nth(index)
         expect(row).to_have_attribute("data-model-id", model_id)
         expect(row).to_contain_text(label)
 
-    sonnet_row = page.locator('[data-testid="model-picker-item"][data-model-id="sonnet"]')
+    # The bound system.ai.claude-sonnet-5 model implicitly selects the "sonnet"
+    # (Sonnet 5) row; fable / sonnet_5 aren't in the live catalog at all.
+    sonnet_row = page.locator('[role="option"][data-model-id="sonnet"]')
     expect(sonnet_row).to_have_attribute("data-active", "true")
-    expect(page.locator('[data-testid="model-picker-item"][data-model-id="fable"]')).to_have_count(
-        0
-    )
-    expect(
-        page.locator('[data-testid="model-picker-item"][data-model-id="sonnet_5"]')
-    ).to_have_count(0)
+    expect(page.locator('[role="option"][data-model-id="fable"]')).to_have_count(0)
+    expect(page.locator('[role="option"][data-model-id="sonnet_5"]')).to_have_count(0)
 
 
 def test_claude_native_picker_updates_after_delayed_catalog(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A live catalog event fills the UI and applies a compatible sticky alias."""
+    """A live catalog event fills the modal and applies a compatible sticky alias."""
     base_url, session_id = seeded_session
     catalog_state = {"ready": False}
     patch_bodies = _patch_session_as_claude_native(
@@ -180,8 +182,8 @@ def test_claude_native_picker_updates_after_delayed_catalog(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_contain_text("system.ai.claude-sonnet-5", timeout=15_000)
+    label = page.get_by_test_id("composer-model-effort-label")
+    expect(label).to_contain_text("system.ai.claude-sonnet-5", timeout=15_000)
     page.wait_for_function("window.__claudeModelStreamController !== undefined")
 
     catalog_state["ready"] = True
@@ -197,17 +199,18 @@ def test_claude_native_picker_updates_after_delayed_catalog(
         {"sessionId": session_id},
     )
 
-    expect(trigger).to_contain_text("Opus 4.10", timeout=10_000)
+    expect(label).to_contain_text("Opus 4.10", timeout=10_000)
     assert {"model_override": "opus", "silent": True} in patch_bodies
-    trigger.click()
-    expect(page.locator('[data-testid="model-picker-item"]')).to_have_count(len(_EXPECTED_ROWS))
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-config-model").click()
+    expect(page.locator('[role="option"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
 
 
 def test_claude_native_alias_selection_persists(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Picking Opus PATCHes its alias and the trigger shows the live label.
+    """Picking Opus PATCHes its alias and the label shows the live name.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -219,10 +222,13 @@ def test_claude_native_alias_selection_persists(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=15_000)
-    trigger.click()
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-config-model").click()
 
+    # Selecting only drafts the pick; the PATCH fires on Save.
+    page.locator('[role="option"][data-model-id="opus"]').click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -230,10 +236,11 @@ def test_claude_native_alias_selection_persists(
             and response.status == 200
         )
     ):
-        page.locator('[data-testid="model-picker-item"][data-model-id="opus"]').click()
+        page.get_by_test_id("composer-config-save").click()
 
     assert patch_bodies[-1] == {"model_override": "opus"}
-    expect(trigger).to_contain_text("Opus 4.10")
+    # The read-only composer label reflects the new pick.
+    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Opus 4.10")
 
 
 def test_claude_native_picker_prefers_session_override_over_sticky_model(
@@ -247,13 +254,14 @@ def test_claude_native_picker_prefers_session_override_over_sticky_model(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_be_visible(timeout=15_000)
-    trigger.click()
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_visible(timeout=15_000)
+    gear.click()
+    page.get_by_test_id("composer-config-model").click()
 
-    expect(
-        page.locator('[data-testid="model-picker-item"][data-model-id="opus"]')
-    ).to_have_attribute("data-active", "true")
-    expect(
-        page.locator('[data-testid="model-picker-item"][data-model-id="haiku"]')
-    ).not_to_have_attribute("data-active", "true")
+    expect(page.locator('[role="option"][data-model-id="opus"]')).to_have_attribute(
+        "data-active", "true"
+    )
+    expect(page.locator('[role="option"][data-model-id="haiku"]')).not_to_have_attribute(
+        "data-active", "true"
+    )
