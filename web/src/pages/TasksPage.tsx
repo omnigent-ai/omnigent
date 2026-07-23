@@ -143,9 +143,6 @@ export function TasksPage() {
           />
         </div>
         {hasAnyTasks && (
-          // Codex-style tabs: the ACTIVE tab keeps a subtle resting background
-          // pill + full-strength foreground — NO bold weight anywhere. Inactive
-          // tabs are plain muted text with a subtle hover highlight.
           <div role="tablist" aria-label="Filter tasks" className="flex items-center gap-1">
             {FILTER_TABS.map((tab) => (
               <button
