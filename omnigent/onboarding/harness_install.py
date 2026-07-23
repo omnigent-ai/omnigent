@@ -337,6 +337,35 @@ def ui_installable_harnesses() -> frozenset[str]:
     return frozenset(resolvable)
 
 
+# The families whose credential the UI can WRITE (Claude/Codex/Pi). A strict
+# subset of the installable families: opencode/qwen are installable but env-auth
+# (omnigent stores no key for them), so they are NOT credential-configurable.
+# ``pi`` consumes anthropic/openai and is handled by the host store-secret
+# handler, so it's included via its own key.
+_UI_CREDENTIAL_FAMILIES: frozenset[str] = frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_KEY})
+
+
+def ui_credential_configurable_harnesses() -> frozenset[str]:
+    """Return every harness identifier the web UI may write a credential for.
+
+    A strict subset of :func:`ui_installable_harnesses`: only harnesses whose
+    provider credential omnigent owns (Claude / Codex / Pi families). The
+    env-auth harnesses (opencode, qwen) are installable but excluded — the host
+    store-secret handler can't configure them — so the credential route can
+    reject them with a clean 400 rather than forwarding a frame the host fails.
+
+    :returns: The set of harness identifiers accepted by the credential route,
+        e.g. ``{"claude", "claude-native", "codex", "codex-native", "pi", ...}``.
+    """
+    resolvable = {
+        h for h, key in _UI_INSTALLABLE_HARNESS_TO_KEY.items() if key in _UI_CREDENTIAL_FAMILIES
+    }
+    for name, mapped in _all_harness_name_to_key().items():
+        if mapped in _UI_CREDENTIAL_FAMILIES:
+            resolvable.add(name)
+    return frozenset(resolvable)
+
+
 # The auth step per UI-installable family, for the setup checklist. These are
 # display-only checklist rows (the command is shown for the user to run on the
 # host, never executed server-side), so the commands are literal here rather

@@ -22,6 +22,7 @@ out of scope here — they are either CLI-login-bound or configured elsewhere.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Literal, NamedTuple
 
 from omnigent.onboarding.configure_models import (
@@ -70,8 +71,6 @@ def _config_writer():  # type: ignore[no-untyped-def]
     ``providers:`` block (adds/updates one entry without dropping siblings),
     matching ``omnigent setup``'s writer.
     """
-    import os
-
     import yaml
 
     from omnigent.onboarding.provider_config import _config_path
@@ -258,13 +257,21 @@ def adopt_env_credential(*, family: str, env_var: str) -> StoreCredentialResult:
 
     :param family: ``"anthropic"`` or ``"openai"``.
     :param env_var: The environment variable to reference, e.g.
-        ``"ANTHROPIC_API_KEY"``.
+        ``"ANTHROPIC_API_KEY"``. Must be present in the host's environment —
+        adopting a var that isn't set would persist a provider entry that
+        resolves to nothing at run time, so it's refused here.
     :returns: A :class:`StoreCredentialResult` (``provider_name`` is the entry).
     """
     if family not in _SUPPORTED_FAMILIES:
         return StoreCredentialResult(False, None, f"unsupported family {family!r}")
-    if not env_var or not env_var.strip():
+    env_var = env_var.strip() if env_var else ""
+    if not env_var:
         return StoreCredentialResult(False, None, "no environment variable named")
+    # Only adopt a var that's actually set on this host — otherwise the entry
+    # would reference an empty credential and fail at the first turn. (This runs
+    # on the runner, so os.environ is the host's environment.)
+    if not os.environ.get(env_var):
+        return StoreCredentialResult(False, None, f"{env_var} is not set on this host")
 
     name = family
     entry = build_key_provider_entry(

@@ -262,7 +262,10 @@ async def test_route_hidden_when_flag_off(
     assert resp.status_code == 404
 
 
-@pytest.mark.parametrize("harness", ["cursor", "goose", "kimi", "hermes"])
+# cursor/goose/kimi/hermes are never installable; opencode/qwen ARE installable
+# but env-auth (not credential-configurable) — all must get a clean 400 (not a
+# 502 from the host bouncing a forwarded frame).
+@pytest.mark.parametrize("harness", ["cursor", "goose", "kimi", "hermes", "opencode", "qwen"])
 async def test_rejects_non_ui_configurable_harness(
     cred_setup: tuple[
         FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]

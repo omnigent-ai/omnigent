@@ -39,7 +39,11 @@ from omnigent.host.frames import (
     HostStoreSecretFrame,
     encode_host_frame,
 )
-from omnigent.onboarding.harness_install import ui_install_key, ui_installable_harnesses
+from omnigent.onboarding.harness_install import (
+    ui_credential_configurable_harnesses,
+    ui_install_key,
+    ui_installable_harnesses,
+)
 from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
@@ -1267,8 +1271,11 @@ def create_hosts_router(
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist before ownership (403) so error codes can't enumerate
-        # ownership. Only UI-installable harnesses are UI-configurable.
-        if harness not in ui_installable_harnesses():
+        # ownership. Gate on the credential-CONFIGURABLE set (Claude/Codex/Pi),
+        # not merely installable — opencode/qwen are installable but env-auth,
+        # so the host can't write a credential for them. Rejecting here gives a
+        # clean 400 instead of forwarding a frame the host bounces as a 502.
+        if harness not in ui_credential_configurable_harnesses():
             raise HTTPException(
                 status_code=400,
                 detail=f"harness {harness!r} is not configurable from the UI",

@@ -132,11 +132,22 @@ def test_adopt_env_credential_writes_env_reference(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Adopt writes an ``env:<VAR>`` reference — never reads the value."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-present")  # var must be set to adopt
     result = ha.adopt_env_credential(family="anthropic", env_var="ANTHROPIC_API_KEY")
     assert result.stored is True
     cfg = load_config()
     entry = cfg["providers"]["anthropic"]  # type: ignore[index]
     assert entry["anthropic"]["api_key_ref"] == "env:ANTHROPIC_API_KEY"
+    # The reference is stored, not the value.
+    assert "sk-ant-present" not in _config_text(tmp_path)
+
+
+def test_adopt_rejects_unset_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Adopting a var that isn't set on the host is refused (no dangling ref)."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    result = ha.adopt_env_credential(family="openai", env_var="OPENAI_API_KEY")
+    assert result.stored is False
+    assert result.reason is not None and "not set" in result.reason
 
 
 def test_adopt_rejects_unsupported_family() -> None:
