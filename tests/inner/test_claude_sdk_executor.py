@@ -170,9 +170,14 @@ class TestConstructor(unittest.TestCase):
         self.assertEqual(executor._clients, {})
         self.assertEqual(executor._crashed_sessions, {})
         self.assertFalse(executor._gateway)
-        # _extra_env carries the default RetryPolicy's CLI env vars
-        # (ANTHROPIC_MAX_RETRIES + ANTHROPIC_REQUEST_TIMEOUT_SECONDS).
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # _extra_env carries Tool Search plus the default RetryPolicy's CLI env.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_os_env_spec_with_no_sandbox_keeps_native_tools_enabled(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -429,6 +434,7 @@ class TestConstructor(unittest.TestCase):
             executor._extra_env["OMNIGENT_CLAUDE_API_KEY_HELPER"],
             "printf token",
         )
+        self.assertEqual(executor._extra_env["ENABLE_TOOL_SEARCH"], "true")
 
     def test_databricks_flag_with_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -461,9 +467,15 @@ class TestConstructor(unittest.TestCase):
         from omnigent.spec.types import RetryPolicy
 
         executor = ClaudeSDKExecutor(gateway=False)
-        # gateway=False → no Databricks env, but RetryPolicy CLI env
-        # is always merged in. Verify the only entries are the retry env.
-        self.assertEqual(executor._extra_env, RetryPolicy().claude_cli.env())
+        # gateway=False → no Databricks env, but Tool Search and RetryPolicy
+        # CLI env are always merged in.
+        self.assertEqual(
+            executor._extra_env,
+            {
+                "ENABLE_TOOL_SEARCH": "true",
+                **RetryPolicy().claude_cli.env(),
+            },
+        )
 
     def test_databricks_profile_default_model_used_when_unset(self):
         """gateway=True (profile-derived) + no model → Databricks default.
@@ -1132,14 +1144,6 @@ class TestSystemMessages(unittest.TestCase):
         shim_upstream: dict[str, str] = {}
 
         async def _t():
-            executor = ClaudeSDKExecutor()
-            executor._gateway = True
-            executor._databricks_profile = "oss"
-            executor._base_url_override = "https://host/ai-gateway/anthropic"
-            executor._extra_env = _resolve_gateway_env(
-                profile="oss",
-                base_url_override="https://host/ai-gateway/anthropic",
-            )
             with (
                 patch(
                     "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
@@ -1147,6 +1151,12 @@ class TestSystemMessages(unittest.TestCase):
                 ),
                 patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
             ):
+                executor = ClaudeSDKExecutor(
+                    gateway=True,
+                    gateway_host="https://host",
+                    base_url_override="https://host/ai-gateway/anthropic",
+                    gateway_auth_command="printf token",
+                )
                 events = [
                     e
                     async for e in executor.run_turn(
@@ -1182,6 +1192,7 @@ class TestSystemMessages(unittest.TestCase):
         self.assertTrue(shim_upstream["base_url"].startswith("http://127.0.0.1:"))
         self.assertEqual(shim_upstream["upstream"], "https://host/ai-gateway/anthropic")
         self.assertEqual(captured_options[0].env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "900000")
+        self.assertEqual(captured_options[0].env["ENABLE_TOOL_SEARCH"], "true")
         self.assertNotIn("OMNIGENT_CLAUDE_API_KEY_HELPER", captured_options[0].env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured_options[0].env)
 
@@ -1473,6 +1484,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                             "extra_args": getattr(self.options, "extra_args", {}),
                             "tools": getattr(self.options, "tools", None),
                             "allowed_tools": getattr(self.options, "allowed_tools", None),
+                            "env": getattr(self.options, "env", None),
                         }
                     )
                     result_session_id = (
@@ -1511,6 +1523,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             # Skill remains available for configured skills; ToolSearch
             # keeps large MCP definitions deferred until they are needed.
             self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch"])
+            self.assertEqual(query_calls[0]["env"]["ENABLE_TOOL_SEARCH"], "true")
             self.assertEqual(query_calls[0]["allowed_tools"], [])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
             self.assertEqual(query_calls[2]["session_id"], "session-a")
@@ -1621,7 +1634,7 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
-    def test_mcp_only_session_disables_native_tool_base_set(self):
+    def test_mcp_only_session_keeps_discovery_tools_without_native_os_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         captured_options = {}
