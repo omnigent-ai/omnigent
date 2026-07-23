@@ -1,7 +1,7 @@
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
- * tasks, a search + Active/Paused filter, a "New task" dropdown (Create with
- * Omnigent / Set up manually), and a static Suggestions section below.
+ * tasks, a search + Active/Paused filter, a "New task" manual-create action,
+ * and a static Suggestions section below.
  *
  * Data comes from `useScheduledTasks` (GET /v1/scheduled-tasks). Pause/resume
  * and delete go through the update/delete mutations, which invalidate the list.
@@ -11,27 +11,11 @@
  */
 
 import { useMemo, useState } from "react";
-import {
-  CalendarClockIcon,
-  ChevronDownIcon,
-  ClockIcon,
-  Loader2Icon,
-  PlusIcon,
-  SearchIcon,
-  SparklesIcon,
-  TriangleAlertIcon,
-} from "lucide-react";
+import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
-import { CreateWithOmnigentDialog } from "@/components/scheduled/CreateWithOmnigentDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
   SCHEDULED_TASK_SUGGESTIONS,
@@ -62,7 +46,6 @@ export function TasksPage() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
   const [manualOpen, setManualOpen] = useState(false);
-  const [omnigentOpen, setOmnigentOpen] = useState(false);
   // Prefill for the manual create dialog when opened from a "Suggestions" chip.
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
   // stale prefill never leaks into a subsequent plain "New task" open.
@@ -140,10 +123,6 @@ export function TasksPage() {
             Run agent sessions on a recurring schedule. Tasks fire on a connected host.
           </p>
         </div>
-        {/* Only one create path is live right now ("Set up manually"), so the
-            "New task" button opens that dialog directly rather than showing a
-            one-item dropdown. TODO: restore the two-option dropdown when the
-            "Create with Omnigent" entry point is ready. */}
         <Button data-testid="new-task-button" className="shrink-0" onClick={openManual}>
           New task
         </Button>
@@ -244,66 +223,7 @@ export function TasksPage() {
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
       />
-      {/* TODO: stub kept wired but currently unreachable while the
-          "Create with Omnigent" menu entry is hidden. Restore the NewTaskMenu
-          entry point when the create flow is ready. */}
-      <CreateWithOmnigentDialog open={omnigentOpen} onOpenChange={setOmnigentOpen} />
     </PageScroll>
-  );
-}
-
-/**
- * The "New task" split button: a caret dropdown with the two create paths.
- *
- * TODO: currently NOT rendered while "Create with Omnigent" is hidden,
- * the "New task" button opens the Set-up-manually dialog directly (see the
- * header above). Restore this dropdown (and the `onCreateWithOmnigent` wiring)
- * when the Omnigent create flow is ready.
- *
- * Exported rather than deleted so it is retained without tripping
- * `noUnusedLocals` while it has no in-module caller.
- */
-export function NewTaskMenu({
-  onCreateWithOmnigent,
-  onSetUpManually,
-}: {
-  onCreateWithOmnigent: () => void;
-  onSetUpManually: () => void;
-}) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button data-testid="new-task-button" className="shrink-0 gap-1.5">
-          <PlusIcon className="size-4" />
-          New task
-          <ChevronDownIcon className="size-3.5 opacity-70" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-56">
-        <DropdownMenuItem
-          onSelect={onCreateWithOmnigent}
-          data-testid="new-task-omnigent"
-          className="gap-2 py-2"
-        >
-          <SparklesIcon className="size-4 text-primary" />
-          <div className="flex flex-col">
-            <span className="text-sm">Create with Omnigent</span>
-            <span className="text-[11px] text-muted-foreground">Describe it in plain language</span>
-          </div>
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={onSetUpManually}
-          data-testid="new-task-manual"
-          className="gap-2 py-2"
-        >
-          <CalendarClockIcon className="size-4 text-muted-foreground" />
-          <div className="flex flex-col">
-            <span className="text-sm">Set up manually</span>
-            <span className="text-[11px] text-muted-foreground">Fill in the schedule yourself</span>
-          </div>
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
   );
 }
 

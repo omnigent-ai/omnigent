@@ -1,11 +1,11 @@
 // Tests for the Scheduled tasks page (`/tasks`): list rendering, the
 // Active/Paused filter + search, the Paused badge/dimming, the New task
-// dropdown's two options, and the pause/delete row actions dispatching the
+// manual create action, and the pause/delete row actions dispatching the
 // mutation hooks.
 //
-// The scheduled-tasks hooks are mocked at their seam; the create dialogs are
-// stubbed to a marker so we assert the menu opens the right one without
-// exercising their internals (covered by their own tests).
+// The scheduled-tasks hooks are mocked at their seam; the create dialog is
+// stubbed to a marker so we assert the page opens it without exercising its
+// internals (covered by its own tests).
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -40,10 +40,6 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-prompt={initialPrompt ?? ""}
       />
     ) : null,
-}));
-vi.mock("@/components/scheduled/CreateWithOmnigentDialog", () => ({
-  CreateWithOmnigentDialog: ({ open }: { open: boolean }) =>
-    open ? <div data-testid="omnigent-dialog-open" /> : null,
 }));
 
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -285,8 +281,6 @@ describe("New task button", () => {
   it("opens the manual create dialog directly (no dropdown)", () => {
     setTasks([]);
     renderPage();
-    // "Create with Omnigent" is hidden for now, leaving one create
-    // path — so the button opens the manual dialog directly rather than a menu.
     fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
   });
@@ -294,11 +288,11 @@ describe("New task button", () => {
   it("does not offer a 'Create with Omnigent' entry point", () => {
     setTasks([]);
     renderPage();
-    // No dropdown, no Omnigent item — the stub dialog is unreachable from the UI.
+    // No dropdown and no deferred create option: the manual dialog is the only
+    // create path on this page.
     fireEvent.pointerDown(screen.getByTestId("new-task-button"), { button: 0 });
     expect(screen.queryByTestId("new-task-omnigent")).toBeNull();
     expect(screen.queryByTestId("new-task-manual")).toBeNull();
-    expect(screen.queryByTestId("omnigent-dialog-open")).toBeNull();
   });
 });
 
