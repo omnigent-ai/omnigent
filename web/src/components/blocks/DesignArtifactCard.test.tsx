@@ -61,10 +61,20 @@ describe("parseDesignArtifactResult", () => {
         entry_path: "artifacts/other.html",
       }),
     ],
+    [
+      "unsupported nested non-index path",
+      JSON.stringify({
+        ...JSON.parse(VALID_OUTPUT),
+        entry_path: "artifacts/team/dashboard.html",
+        artifact_root: "artifacts/team/dashboard.html",
+      }),
+    ],
   ])("rejects %s", (_label, output) => {
-    expect(
-      parseDesignArtifactResult({ entry_path: "artifacts/revenue-dashboard/index.html" }, output),
-    ).toBeNull();
+    const inputPath =
+      _label === "unsupported nested non-index path"
+        ? "artifacts/team/dashboard.html"
+        : "artifacts/revenue-dashboard/index.html";
+    expect(parseDesignArtifactResult({ entry_path: inputPath }, output)).toBeNull();
   });
 });
 

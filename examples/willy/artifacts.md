@@ -47,7 +47,11 @@ store.
 
 ## Choosing the output path
 
-- If the user gives a path under `artifacts/`, use it.
+- If the user gives a path under `artifacts/`, preserve their requested name
+  but normalize the entry to one of the supported shapes below. Nested
+  non-index entry files such as `artifacts/team/dashboard.html` are not
+  publishable; use `artifacts/team-dashboard.html` or
+  `artifacts/team-dashboard/index.html` instead.
 - If the user names an existing artifact, edit that artifact in place.
 - Otherwise choose a short, stable, kebab-cased slug from the design's purpose.
 - Prefer `artifacts/<slug>/index.html` for a multi-file design and

@@ -1180,6 +1180,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    artifact_preview_origin: str | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1343,13 +1344,16 @@ def create_app(
         except (LookupError, OmnigentError):
             return None
 
-    artifact_preview_origin = (
-        os.environ.get("OMNIGENT_ARTIFACT_PREVIEW_ORIGIN", "").strip()
-        or "http://preview.localhost:6767"
+    configured_preview_origin = (
+        artifact_preview_origin or os.environ.get("OMNIGENT_ARTIFACT_PREVIEW_ORIGIN", "").strip()
     )
-    artifact_preview_service = ArtifactPreviewService(
-        preview_origin=artifact_preview_origin,
-        runner_client_for_session=_artifact_preview_runner_client,
+    artifact_preview_service = (
+        ArtifactPreviewService(
+            preview_origin=configured_preview_origin,
+            runner_client_for_session=_artifact_preview_runner_client,
+        )
+        if configured_preview_origin
+        else None
     )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
@@ -1676,10 +1680,11 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
-    app.add_middleware(
-        ArtifactPreviewHostMiddleware,
-        preview_hostname=artifact_preview_service.preview_hostname,
-    )
+    if artifact_preview_service is not None:
+        app.add_middleware(
+            ArtifactPreviewHostMiddleware,
+            preview_hostname=artifact_preview_service.preview_hostname,
+        )
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -2354,7 +2359,8 @@ def create_app(
         prefix="/v1",
         tags=["imports"],
     )
-    app.include_router(create_artifact_preview_public_router(artifact_preview_service))
+    if artifact_preview_service is not None:
+        app.include_router(create_artifact_preview_public_router(artifact_preview_service))
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.

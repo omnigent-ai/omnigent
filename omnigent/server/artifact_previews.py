@@ -14,6 +14,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from omnigent.artifact_paths import canonical_artifact_entry_path
+
 _DEFAULT_TTL_SECONDS = 600
 _DEFAULT_REQUEST_BUDGET = 256
 _DEFAULT_TRANSFER_BUDGET = 64 * 1024 * 1024
@@ -70,21 +72,6 @@ class _GrantState:
     bytes_remaining: int
 
 
-def _canonical_entry_path(entry_path: str) -> tuple[str, str]:
-    if not entry_path or "\\" in entry_path or entry_path.startswith("/"):
-        raise ValueError("entry_path must be a relative POSIX path")
-    parts = entry_path.split("/")
-    if any(not part or part in {".", ".."} for part in parts):
-        raise ValueError("entry_path must be normalized")
-    if parts[0] != "artifacts" or not parts[-1].lower().endswith(".html"):
-        raise ValueError("entry_path must point to HTML under artifacts/")
-    if len(parts) == 2:
-        return entry_path, entry_path
-    if len(parts) == 3 and parts[-1].lower() == "index.html":
-        return entry_path, "/".join(parts[:-1])
-    raise ValueError("entry_path must be artifacts/<slug>.html or artifacts/<slug>/index.html")
-
-
 def _canonical_resource_path(path: str) -> str:
     if not path or "\\" in path or path.startswith("/"):
         raise ArtifactPreviewNotFound
@@ -120,7 +107,7 @@ class ArtifactPreviewService:
         self._lock = asyncio.Lock()
 
     async def create_grant(self, session_id: str, entry_path: str) -> ArtifactPreviewGrant:
-        entry_path, artifact_root = _canonical_entry_path(entry_path)
+        entry_path, artifact_root = canonical_artifact_entry_path(entry_path)
         if await self._runner_client_for_session(session_id) is None:
             raise ArtifactPreviewUnavailable
         token = secrets.token_urlsafe(32)

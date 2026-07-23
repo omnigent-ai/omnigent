@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from omnigent.artifact_paths import canonical_artifact_entry_path
 from omnigent.entities.environment_filesystem import (
     FileContent,
     FilesystemPathNotFound,
@@ -383,11 +384,10 @@ def _publish_managed_artifact_sync(
     title = arguments.get("title")
     operation = arguments.get("operation", "created")
     summary = arguments.get("summary")
-    if not isinstance(entry_path, str):
-        raise InvalidPath("entry_path must be a string")
-    _virtual_parts(entry_path)
-    if not entry_path.lower().endswith(".html"):
-        raise InvalidPath("entry_path must point to an HTML file")
+    try:
+        entry_path, virtual_root = canonical_artifact_entry_path(entry_path)
+    except ValueError as exc:
+        raise InvalidPath(str(exc)) from exc
     if not isinstance(title, str) or not title.strip():
         raise InvalidPath("title must not be empty")
     if operation not in {"created", "updated"}:
@@ -398,9 +398,6 @@ def _publish_managed_artifact_sync(
     _read_managed_bytes_sync(session_id, entry_path, max_bytes=_MAX_READ_BYTES)
     parts = _artifact_relative_parts(entry_path)
     physical_entry = managed_artifact_dir(session_id).joinpath(*parts)
-    virtual_root = (
-        entry_path.rsplit("/", 1)[0] if physical_entry.name == "index.html" else entry_path
-    )
     physical_root = (
         physical_entry.parent if physical_entry.name == "index.html" else physical_entry
     )

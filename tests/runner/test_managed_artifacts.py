@@ -134,6 +134,35 @@ async def test_runner_mcp_manager_publishes_with_session_context(
 
 
 @pytest.mark.asyncio
+async def test_publish_rejects_nested_non_index_html_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.managed_artifacts import publish_managed_artifact
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    session_id = "conv_nested_publish"
+    await write_managed_artifact_text(
+        session_id,
+        "artifacts/team/dashboard.html",
+        "<h1>Nested</h1>",
+    )
+
+    with pytest.raises(
+        InvalidPath,
+        match=r"artifacts/<slug>.html or artifacts/<slug>/index.html",
+    ):
+        await publish_managed_artifact(
+            session_id,
+            {
+                "entry_path": "artifacts/team/dashboard.html",
+                "title": "Nested dashboard",
+                "operation": "created",
+            },
+        )
+
+
+@pytest.mark.asyncio
 async def test_execute_tool_publishes_managed_artifact_before_local_python_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

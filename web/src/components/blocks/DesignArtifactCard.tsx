@@ -18,11 +18,12 @@ export interface DesignArtifactData {
 function normalizedArtifactEntryPath(value: unknown): string | null {
   if (typeof value !== "string" || value.length === 0 || value.includes("\\")) return null;
   const parts = value.split("/");
+  const isStandalone = parts.length === 2 && parts[1]?.toLowerCase().endsWith(".html");
+  const isDirectoryIndex = parts.length === 3 && parts[2] === "index.html";
   if (
-    parts.length < 2 ||
     parts[0] !== "artifacts" ||
     parts.some((part) => part.length === 0 || part === "." || part === "..") ||
-    !parts.at(-1)?.toLowerCase().endsWith(".html")
+    (!isStandalone && !isDirectoryIndex)
   ) {
     return null;
   }
