@@ -1183,7 +1183,7 @@ describe("Composer placeholder", () => {
     // Host online but runner offline — sending relaunches the runner, so the
     // composer stays writable and the placeholder is the affordance.
     render(<Composer {...composerProps({ reconnectHint: true })} />);
-    expect(textarea().placeholder).toBe("Send a message to reconnect this session");
+    expect(textarea().placeholder).toBe("Send a message to continue");
     expect(textarea().disabled).toBe(false);
   });
 

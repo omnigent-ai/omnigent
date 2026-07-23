@@ -1,7 +1,7 @@
 // Inline status indicators for non-tool, non-text, non-reasoning blocks.
 // Each is small enough to live in one file.
 //
-// - ErrorBanner: destructive Alert with `[source]` + code + message.
+// - ErrorBanner: recoverable session notice or destructive error Alert.
 // - RetryIndicator: muted one-liner about an in-flight retry.
 // - CompactionMarker: permanent marker shown after compaction completes.
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
@@ -14,6 +14,7 @@ import {
   RotateCcwIcon,
   ShieldXIcon,
   ShrinkIcon,
+  WifiOffIcon,
 } from "lucide-react";
 import { useMemo } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
@@ -30,11 +31,30 @@ interface ErrorBannerProps {
 }
 
 /**
- * Loud destructive banner for `error` blocks. Falls back to `code` when
- * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * Renders recoverable runner disconnects as a quiet prompt to continue.
+ * Other `error` blocks use a destructive banner and fall back to `code`
+ * when `message` is empty so the panel is never blank.
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
+  if (code === "runner_disconnected") {
+    return (
+      <div
+        role="status"
+        data-testid="runner-disconnected-notice"
+        className={cn(
+          "flex items-center gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground text-xs",
+          TOOL_SURFACE_WIDTH_CLASS,
+        )}
+      >
+        <WifiOffIcon className="size-3.5 shrink-0" />
+        <span className="min-w-0">
+          <span className="font-medium text-foreground">Connection interrupted.</span> Send a
+          message to reconnect and continue.
+        </span>
+      </div>
+    );
+  }
+
   const display = message || code || "Unknown error";
   return (
     <Alert

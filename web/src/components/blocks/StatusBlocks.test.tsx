@@ -1,8 +1,37 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { RoutingDecisionCard, RoutingDecisionChip } from "./StatusBlocks";
+import { ErrorBanner, RoutingDecisionCard, RoutingDecisionChip } from "./StatusBlocks";
 
 afterEach(cleanup);
+
+describe("ErrorBanner", () => {
+  it("renders runner disconnects as a quiet, recoverable session notice", () => {
+    render(
+      <ErrorBanner
+        message="Runner disconnected unexpectedly."
+        source=""
+        code="runner_disconnected"
+      />,
+    );
+
+    const notice = screen.getByTestId("runner-disconnected-notice");
+    expect(notice).toHaveAttribute("role", "status");
+    expect(notice).toHaveClass("w-[48rem]", "max-w-full", "items-center", "border");
+    expect(notice).toHaveTextContent("Connection interrupted.");
+    expect(notice).toHaveTextContent("Send a message to reconnect and continue.");
+    expect(notice).not.toHaveTextContent("runner_disconnected");
+    expect(notice).not.toHaveTextContent("unexpectedly");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps genuine task failures as destructive alerts", () => {
+    render(<ErrorBanner message="Turn setup failed" source="runtime" code="turn_error" />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Error · runtime · turn_error");
+    expect(alert).toHaveTextContent("Turn setup failed");
+  });
+});
 
 describe("RoutingDecisionChip — intelligent model router", () => {
   it("applied verdict: names the active model with its tier, plus the rationale line", () => {
