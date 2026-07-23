@@ -2712,8 +2712,9 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "sidebar-compact-text relative flex min-h-7 w-full flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
+        "sidebar-compact-text relative flex min-h-7 flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
         SIDEBAR_HOVER_HIGHLIGHT,
+        selectionMode ? "w-full" : "w-[calc(100%+1rem)]",
         !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-14"),
         selectionMode && "pr-10",
         isActive && SIDEBAR_ACTIVE_HIGHLIGHT,

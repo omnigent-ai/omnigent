@@ -198,6 +198,10 @@ describe("quick pin/unpin hover button", () => {
     expect(screen.getByTestId("quick-pin-conversation")).not.toHaveClass("right-[30px]");
     expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6", "-right-3");
     expect(screen.getByTestId("conversation-actions")).not.toHaveClass("right-1");
+
+    const rowLink = screen.getByRole("link", { name: "My Session" });
+    expect(rowLink).toHaveClass("w-[calc(100%+1rem)]");
+    expect(rowLink).not.toHaveClass("w-full");
   });
 
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
