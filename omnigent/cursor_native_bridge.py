@@ -297,14 +297,29 @@ def write_mcp_config(
     *,
     python_executable: str | None = None,
 ) -> Path:
-    """Write the workspace-scoped Cursor MCP config for Omnigent tools."""
+    """Write the workspace-scoped Cursor MCP config for Omnigent tools.
+
+    Merges the Omnigent bridge server into an existing ``mcp.json`` so that
+    user-configured MCP servers are preserved.
+    """
     write_mcp_bridge_config(bridge_dir)
     cursor_dir = workspace / ".cursor"
     cursor_dir.mkdir(parents=True, exist_ok=True)
     path = cursor_dir / _MCP_CONFIG_FILE
-    payload = build_mcp_config(bridge_dir, python_executable=python_executable)
+
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    omnigent_entry = build_mcp_config(bridge_dir, python_executable=python_executable)
+    existing.setdefault("mcpServers", {})
+    existing["mcpServers"][_MCP_SERVER_NAME] = omnigent_entry["mcpServers"][_MCP_SERVER_NAME]
+
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
     enable_mcp_for_workspace(workspace)
     allow_mcp_tools_in_cli_config()
