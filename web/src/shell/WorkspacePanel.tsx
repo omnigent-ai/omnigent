@@ -7,9 +7,10 @@ import {
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useRef } from "react";
+import { type ReactElement, useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
@@ -18,6 +19,17 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+
+function WorkspaceTabTooltip({ label, children }: { label: string; children: ReactElement }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex shrink-0">{children}</span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // FileTabsStrip — open file tabs rendered in the top rail tab strip, as peers
@@ -318,77 +330,82 @@ export function WorkspacePanel({
         >
           <TabsList variant="pill" className="gap-1">
             {showFilesPanel && (
-              <TabsTrigger
-                value="files"
-                aria-label={changedCount > 0 ? `Files ${changedCount} changed` : "Files"}
-                title="Files"
-                className="size-8 shrink-0 rounded-md p-0"
-              >
-                <FilePenLineIcon className="size-4" />
-                <span className="sr-only">Files</span>
-                {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
-              </TabsTrigger>
+              <WorkspaceTabTooltip label="Files">
+                <TabsTrigger
+                  value="files"
+                  aria-label={changedCount > 0 ? `Files ${changedCount} changed` : "Files"}
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <FilePenLineIcon className="size-4" />
+                  <span className="sr-only">Files</span>
+                  {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
             )}
-            <TabsTrigger
-              value="subagents"
-              aria-label={
-                subagentsWorking > 0
-                  ? `Agents ${subagentsWorking}/${agentCount}`
-                  : `Agents ${agentCount}`
-              }
-              title="Agents"
-              className="size-8 shrink-0 rounded-md p-0"
-            >
-              <BotIcon className="size-4" />
-              <span className="sr-only">Agents</span>
-              <span
-                className={cn(
-                  TAB_BADGE_BASE,
-                  "sr-only",
-                  subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
-                )}
-              >
-                {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
-              </span>
-            </TabsTrigger>
-            {showShellsTab && (
+            <WorkspaceTabTooltip label="Agents">
               <TabsTrigger
-                value="terminals"
-                aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
-                title="Shells"
+                value="subagents"
+                aria-label={
+                  subagentsWorking > 0
+                    ? `Agents ${subagentsWorking}/${agentCount}`
+                    : `Agents ${agentCount}`
+                }
                 className="size-8 shrink-0 rounded-md p-0"
               >
-                <SquareTerminalIcon className="size-4" />
-                <span className="sr-only">Shells</span>
-                {terminalsLength > 0 && (
-                  <span className="sr-only text-muted-foreground">{terminalsLength}</span>
-                )}
-              </TabsTrigger>
-            )}
-            {todosSupported && todosTotal > 0 && (
-              <TabsTrigger
-                value="todos"
-                aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
-                title="Tasks"
-                className="size-8 shrink-0 rounded-md p-0"
-              >
-                <ListTodoIcon className="size-4" />
-                <span className="sr-only">Tasks</span>
-                <span className="sr-only">
-                  {todosCompleted}/{todosTotal}
+                <BotIcon className="size-4" />
+                <span className="sr-only">Agents</span>
+                <span
+                  className={cn(
+                    TAB_BADGE_BASE,
+                    "sr-only",
+                    subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
+                  )}
+                >
+                  {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
                 </span>
               </TabsTrigger>
+            </WorkspaceTabTooltip>
+            {showShellsTab && (
+              <WorkspaceTabTooltip label="Shells">
+                <TabsTrigger
+                  value="terminals"
+                  aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <SquareTerminalIcon className="size-4" />
+                  <span className="sr-only">Shells</span>
+                  {terminalsLength > 0 && (
+                    <span className="sr-only text-muted-foreground">{terminalsLength}</span>
+                  )}
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {todosSupported && todosTotal > 0 && (
+              <WorkspaceTabTooltip label="Tasks">
+                <TabsTrigger
+                  value="todos"
+                  aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <ListTodoIcon className="size-4" />
+                  <span className="sr-only">Tasks</span>
+                  <span className="sr-only">
+                    {todosCompleted}/{todosTotal}
+                  </span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
             )}
             {showBrowserTab && (
-              <TabsTrigger
-                value="browser"
-                aria-label="Browser"
-                title="Browser"
-                className="size-8 shrink-0 rounded-md p-0"
-              >
-                <GlobeIcon className="size-4" />
-                <span className="sr-only">Browser</span>
-              </TabsTrigger>
+              <WorkspaceTabTooltip label="Browser">
+                <TabsTrigger
+                  value="browser"
+                  aria-label="Browser"
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <GlobeIcon className="size-4" />
+                  <span className="sr-only">Browser</span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
             )}
           </TabsList>
         </Tabs>
