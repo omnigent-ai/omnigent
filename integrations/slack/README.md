@@ -80,17 +80,17 @@ Under **Event Subscriptions → Subscribe to bot events**, add:
 With the `omni` CLI installed, the Slack bot is managed as a background daemon:
 
 ```bash
-omni integration slack           # run in the foreground (Ctrl-C to stop)
-omni integration slack start     # run in the background (detached)
-omni integration slack status    # is the background bot running?
-omni integration slack stop      # stop the background bot
-omni integration slack logs      # print the background bot's log path
-omni integration slack logs -f   # follow the log (like tail -f)
+omni integration slack              # run in the foreground (Ctrl-C to stop)
+omni integration slack --background # run in the background (detached)
+omni integration slack status       # is the background bot running?
+omni integration slack stop         # stop the background bot
+omni integration slack logs         # print the background bot's log path
+omni integration slack logs -f      # follow the log (like tail -f)
 ```
 
-`omni integration slack start` spawns a detached daemon and returns
-immediately; `status`/`stop`/`logs` manage it. Running `start` again while it's
-already up is a no-op that reports the existing process.
+`omni integration slack --background` spawns a detached daemon and returns
+immediately; `status`/`stop`/`logs` manage it. Running `--background` again
+while it's already up is a no-op that reports the existing process.
 
 All configuration (the two Slack tokens, `OMNIGENT_SERVER_URL`, and the
 optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`)

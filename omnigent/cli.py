@@ -7726,33 +7726,56 @@ def integration(ctx: click.Context) -> None:
       slack   The @omnigent Slack socket-mode bot.
 
     Run ``omni integration slack`` to start the Slack bot in the foreground,
-    or ``omni integration slack start`` to run it in the background.
+    or ``omni integration slack --background`` to run it in the background.
     """
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
 
 @integration.group("slack", invoke_without_command=True)
+@click.option(
+    "--background",
+    "background",
+    is_flag=True,
+    default=False,
+    help=(
+        "Spawn the Slack bot as a detached background daemon (returning "
+        "immediately) instead of running it in the foreground. Reuses a "
+        "healthy background daemon if one is already up."
+    ),
+)
 @click.pass_context
-def slack(ctx: click.Context) -> None:
-    """Run the @omnigent Slack socket-mode bot (foreground).
+def slack(ctx: click.Context, background: bool) -> None:
+    """Run the @omnigent Slack socket-mode bot.
 
     \b
     Bare invocation runs in the FOREGROUND (Ctrl-C to stop):
       omni integration slack
-    Manage a BACKGROUND daemon with the subcommands:
-      omni integration slack start    # spawn detached, return immediately
+    Pass --background to spawn it as a detached daemon instead:
+      omni integration slack --background   # spawn detached, return immediately
+    Manage that background daemon with the subcommands:
       omni integration slack status   # is it running?
       omni integration slack stop     # terminate the daemon
       omni integration slack logs     # where the daemon logs (-f to tail)
 
     Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from the environment
     and the integration's .env file — see integrations/slack/.env.example.
+
+    :param background: When True, spawn the detached background daemon (the
+        former ``slack start`` behavior) instead of running in the foreground.
     """
     if ctx.invoked_subcommand is not None:
+        # A subcommand (stop/status/logs) handles this invocation.
         return
     if not _slack_installed():
         raise click.ClickException(_SLACK_INSTALL_HINT)
+
+    if background:
+        # `omni integration slack --background` replaces the removed `start`
+        # subcommand: spawn (or reuse) the detached daemon and return.
+        _start_slack_background()
+        return
+
     # A background daemon already holds the Slack socket; a second foreground
     # bot would contend on the same connection. Refuse rather than double-run.
     existing = _slack_daemon().running_record()
@@ -7768,11 +7791,13 @@ def slack(ctx: click.Context) -> None:
     raise SystemExit(result.returncode)
 
 
-@slack.command("start")
-def slack_start() -> None:
-    """Start the Slack bot as a background daemon."""
-    if not _slack_installed():
-        raise click.ClickException(_SLACK_INSTALL_HINT)
+def _start_slack_background() -> None:
+    """Spawn (or reuse) the detached background Slack daemon and report it.
+
+    The background counterpart to the foreground bare ``omni integration
+    slack``, invoked by the ``--background`` flag (the former ``start``
+    subcommand).
+    """
     daemon = _slack_daemon()
     existing = daemon.running_record()
     if existing is not None:
