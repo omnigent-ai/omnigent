@@ -185,6 +185,21 @@ async def test_sessions_native_resolves_file_id_before_harness() -> None:
     assert "file_id" not in image_block
 
 
+class _MalformedMetaFileServerClient(_FakeFileServerClient):
+    """File metadata GETs answer 200 with a non-JSON body (a proxy error page)."""
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        response = await super().get(url, **kwargs)
+        if "/resources/files/" in url and not url.endswith("/content"):
+
+            def _raise_not_json() -> dict[str, Any]:
+                raise ValueError("body is not JSON")
+
+            response.content = b"<html>gateway error</html>"
+            response.json = _raise_not_json
+        return response
+
+
 @pytest.mark.asyncio
 async def test_sessions_native_malformed_file_metadata_is_nonfatal() -> None:
     """A 200-but-unparseable metadata body must not break attachment resolution.
@@ -197,7 +212,7 @@ async def test_sessions_native_malformed_file_metadata_is_nonfatal() -> None:
         [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
     )
     pm = _FakeProcessManager(harness_client)
-    server_client = _FakeFileServerClient(malformed_meta=True)
+    server_client = _MalformedMetaFileServerClient()
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         server_client=server_client,  # type: ignore[arg-type]
@@ -242,35 +257,43 @@ class _HistoryFileServerClient(_FakeFileServerClient):
     """Server client whose stored history carries an unresolved ``file_id``."""
 
     def __init__(self, *, fail_file_fetch: bool = False) -> None:
+        super().__init__()
+        self._fail_file_fetch = fail_file_fetch
         # Prior turn persisted in pre-resolution form: the image block
         # still references the server-side file store by file_id.
-        super().__init__(
-            items_payload={
-                "data": [
-                    {
-                        "id": "item_prior_user",
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_image",
-                                "file_id": "file_img",
-                                "filename": "photo.png",
-                            },
-                            {"type": "input_text", "text": "look at this image"},
-                        ],
-                    },
-                    {
-                        "id": "item_prior_assistant",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "A photo."}],
-                    },
-                ],
-                "has_more": False,
-            },
-            fail_file_fetch=fail_file_fetch,
-        )
+        self._items_payload: dict[str, Any] = {
+            "data": [
+                {
+                    "id": "item_prior_user",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "file_id": "file_img",
+                            "filename": "photo.png",
+                        },
+                        {"type": "input_text", "text": "look at this image"},
+                    ],
+                },
+                {
+                    "id": "item_prior_assistant",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "A photo."}],
+                },
+            ],
+            "has_more": False,
+        }
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if self._fail_file_fetch and not url.endswith("/items"):
+            self.get_calls.append(url)
+            raise httpx.ConnectError("file resource endpoint unreachable")
+        response = await super().get(url, **kwargs)
+        if url.endswith("/items"):
+            response.json = lambda: self._items_payload
+        return response
 
 
 @pytest.mark.asyncio

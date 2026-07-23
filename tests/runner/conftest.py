@@ -406,28 +406,10 @@ async def _runner_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 
 
 class _FakeFileServerClient:
-    """Minimal server client for runner-side file_id resolution tests.
+    """Minimal server client for runner-side file_id resolution tests."""
 
-    :param items_payload: Optional ``/items`` response body (stored
-        session history); by default ``/items`` serves the metadata
-        payload like any other non-content URL.
-    :param fail_file_fetch: When ``True``, file resource GETs raise,
-        simulating an unreachable file endpoint.
-    :param malformed_meta: When ``True``, the file metadata GET returns
-        a 200 whose body is not JSON (a proxy serving an HTML error page).
-    """
-
-    def __init__(
-        self,
-        *,
-        items_payload: dict[str, Any] | None = None,
-        fail_file_fetch: bool = False,
-        malformed_meta: bool = False,
-    ) -> None:
+    def __init__(self) -> None:
         self.get_calls: list[str] = []
-        self._items_payload = items_payload
-        self._fail_file_fetch = fail_file_fetch
-        self._malformed_meta = malformed_meta
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         del kwargs
@@ -448,22 +430,8 @@ class _FakeFileServerClient:
             def raise_for_status(self) -> None:
                 return None
 
-        if url.endswith("/items") and self._items_payload is not None:
-            return _Response(payload=self._items_payload)
-        if self._fail_file_fetch:
-            raise httpx.ConnectError("file resource endpoint unreachable")
         if url.endswith("/content"):
             return _Response(body=b"png-bytes")
-        if self._malformed_meta and "/resources/files/" in url:
-
-            class _MalformedMetaResponse(_Response):
-                def __init__(self) -> None:
-                    super().__init__(body=b"<html>gateway error</html>")
-
-                def json(self) -> dict[str, Any]:
-                    raise ValueError("body is not JSON")
-
-            return _MalformedMetaResponse()
         return _Response(
             payload={
                 "id": "07b38328508bae2010c8b9933a310846",
