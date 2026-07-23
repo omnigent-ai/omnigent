@@ -9528,6 +9528,11 @@ async def _forward_event_to_runner(
     # routing block below doesn't re-route the same message (which would
     # double the judge call, emit two cards, and risk a mismatched pick).
     _auto_resolved_this_turn = False
+    # Auto-harness verdict captured for card emission AFTER the runner forward
+    # and input.consumed (so the live SSE stream delivers the user bubble
+    # before the routing card, matching the per-turn routing path).
+    _auto_card_model: str | None = None
+    _auto_card_verdict: dict[str, Any] | None = None
     if conv.harness_override == "auto" and body.type == "message":
         from omnigent.server.smart_routing import route_session_harness
 
@@ -9564,41 +9569,14 @@ async def _forward_event_to_runner(
                     session_id,
                     exc_info=True,
                 )
+            # Defer card emission until after input.consumed (see below).
             if _auto_model is not None and _auto_verdict is not None:
-                await _emit_server_routing_decision(
-                    session_id,
-                    conversation_store,
-                    _auto_model,
-                    _auto_verdict,
-                )
-                # Mirror into the parent's transcript so the orchestrator's
-                # session shows which model was chosen for this sub-agent —
-                # the decision is otherwise only visible on the child screen.
-                if conv.parent_conversation_id is not None:
-                    await _emit_server_routing_decision(
-                        conv.parent_conversation_id,
-                        conversation_store,
-                        _auto_model,
-                        _auto_verdict,
-                        agent=agent_name or "",
-                    )
+                _auto_card_model = _auto_model
+                _auto_card_verdict = _auto_verdict
             elif _auto_error is not None:
-                # Routing failed — emit a routing card (applied=False) so the
-                # user sees why auto-harness fell back to defaults.
-                await _emit_server_routing_decision(
-                    session_id,
-                    conversation_store,
-                    "unavailable",
-                    {"rationale": _auto_error, "applied": False},
-                )
-                if conv.parent_conversation_id is not None:
-                    await _emit_server_routing_decision(
-                        conv.parent_conversation_id,
-                        conversation_store,
-                        "unavailable",
-                        {"rationale": _auto_error, "applied": False},
-                        agent=agent_name or "",
-                    )
+                # Routing failed — surface why auto-harness fell back to defaults.
+                _auto_card_model = "unavailable"
+                _auto_card_verdict = {"rationale": _auto_error, "applied": False}
 
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
@@ -9721,6 +9699,23 @@ async def _forward_event_to_runner(
         # Emit the routing_decision chip AFTER input.consumed so the
         # live SSE stream delivers the user bubble before the chip —
         # matching the store order (user message was persisted first).
+        # Auto-harness card (success or failure) emitted here for the same
+        # ordering reason; it was resolved earlier in the turn.
+        if _auto_card_model is not None and _auto_card_verdict is not None:
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                _auto_card_model,
+                _auto_card_verdict,
+            )
+            if conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _auto_card_model,
+                    _auto_card_verdict,
+                    agent=agent_name or "",
+                )
         if _routed_model is not None and _verdict is not None:
             await _emit_server_routing_decision(
                 session_id,
