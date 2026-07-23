@@ -13166,14 +13166,39 @@ async def _create_session_from_existing_agent(
         body.cost_control_mode_override
     )
 
+    # When the parent session has smart routing on, a sub-agent created via
+    # sys_session_send is routed regardless of the harness/model the
+    # orchestrator chose: force the "auto" sentinel so the first-message
+    # routing path picks both harness and model, ignoring the tool's
+    # ``agent``/``model`` args. Only applied to omnigent-executor agents
+    # (auto requires a swappable brain harness).
+    _force_auto_for_child = False
+    if body.parent_session_id is not None:
+        _parent_for_routing = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
+        if (
+            _parent_for_routing is not None
+            and _parent_for_routing.cost_control_mode_override == "on"
+        ):
+            try:
+                await asyncio.to_thread(_validated_harness_override_executor_type, agent)
+                _force_auto_for_child = True
+            except OmnigentError:
+                # Non-omnigent agent (e.g. a native wrapper) — can't route
+                # harness; leave the orchestrator's choice untouched.
+                _force_auto_for_child = False
+
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's
     # --harness fail-loud rules.
     # "auto" defers harness + model selection to the first-message routing
     # path; validate executor type now but store the sentinel unchanged.
-    if body.harness_override == "auto":
+    if _force_auto_for_child or body.harness_override == "auto":
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
+        # Ignore any orchestrator-supplied model; routing picks it.
+        model_override = None
     else:
         harness_override = await asyncio.to_thread(
             _validated_harness_override, body.harness_override, agent
@@ -13375,11 +13400,15 @@ async def _create_session_from_existing_agent(
     elif (
         body.sub_agent_name
         and sub_spec is not None
+        and not _force_auto_for_child
         and (_sa_labels := _native_subagent_wrapper_labels_from_spec(sub_spec))
     ):
         # A native-harness sub-agent (claude-native / codex-native) must
         # render terminal-first with the Chat/Terminal pill, same as a
         # top-level wrapper session. Merge over any caller-supplied labels.
+        # Skipped when forcing auto: the harness is not decided until the
+        # first-message router runs, so native terminal labels would be
+        # premature (routing may pick a non-native SDK harness).
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_sa_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
