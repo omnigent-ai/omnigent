@@ -2876,7 +2876,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .scalars()
                 .all()
             )
-        return [_to_conversation(r, meta_by_id.get(r.id)) for r in ap_rows]
+            # Hydrate labels (one batched query, no N+1): the runner
+            # session-init envelope is built from ``conversation.labels``, and
+            # the reconnect path (``_on_runner_connect``) sources its
+            # conversations here. Without this the envelope ships empty labels,
+            # so fork directives (carry-history / source transcript) never reach
+            # the runner and a forked native session launches without history.
+            labels_by_conv = _fetch_labels_bulk(ap_sess, conv_ids)
+        return [
+            _to_conversation(r, meta_by_id.get(r.id), labels_by_conv.get(r.id, {}))
+            for r in ap_rows
+        ]
 
     def set_host_id(
         self,
