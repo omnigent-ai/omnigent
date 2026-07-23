@@ -520,7 +520,7 @@ to a **remote** server never needs the CLI — only "Start locally" and hosting 
 
 ### Start locally
 
-**"Start a server on this machine"** runs `omnigent server start` (idempotent —
+**"Start a server on this machine"** runs `omnigent server --background` (idempotent —
 reuses a healthy one) and then connects this window to its
 `http://127.0.0.1:<port>` URL through the normal connect flow. It does not
 connect this machine as a runner — that stays an explicit step in the app.

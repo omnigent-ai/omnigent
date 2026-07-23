@@ -2273,6 +2273,94 @@ def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path)
     assert (source / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
+def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path) -> None:
+    """A ChatGPT-app ``model_reasoning_effort = "ultra"`` becomes ``xhigh``.
+
+    The ChatGPT desktop app writes ``ultra`` into ``~/.codex/config.toml``;
+    the codex CLI maps it to the retired ``max`` wire value, which the
+    OpenAI Responses API rejects (``invalid_value: 'max'``) — failing every
+    codex turn on such machines. The session copy must be normalized while
+    (a) the user's real config stays untouched and (b) keys inside tables
+    are never rewritten.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = (
+        'model = "gpt-5.5"\n'
+        'model_reasoning_effort = "ultra"\n'
+        "[profiles.other]\n"
+        'model_reasoning_effort = "ultra"\n'
+    )
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    # Top-level deprecated value is normalized in the session copy.
+    assert 'model_reasoning_effort = "xhigh"' in copied.splitlines()[1]
+    # Keys inside tables are left alone — they may target other ladders.
+    assert copied.splitlines()[3] == 'model_reasoning_effort = "ultra"'
+    # The user's real config is never mutated.
+    assert (source / "config.toml").read_text() == original
+
+
+def test_populate_codex_home_config_keeps_valid_effort(tmp_path: Path) -> None:
+    """A supported top-level effort value is copied verbatim."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = 'model = "gpt-5.5"\nmodel_reasoning_effort = "high"\n'
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "config.toml").read_text() == original
+
+
+def test_populate_codex_home_config_normalizes_effort_after_multiline_array(
+    tmp_path: Path,
+) -> None:
+    """A top-level effort key AFTER a multiline array is still normalized.
+
+    A top-level array's continuation lines can start with ``[`` (nested
+    arrays), which must not be mistaken for a table header -- otherwise the
+    still-top-level ``model_reasoning_effort`` past the array is skipped.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = (
+        "value = [\n"
+        '  ["nested"],\n'
+        '  ["deep"],\n'
+        "]\n"
+        'model_reasoning_effort = "ultra"\n'
+        "[profiles.other]\n"
+        'model_reasoning_effort = "ultra"\n'
+    )
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text().splitlines()
+    assert copied[0] == "value = ["
+    assert copied[1] == '  ["nested"],'
+    assert copied[4] == 'model_reasoning_effort = "xhigh"'
+    assert copied[5] == "[profiles.other]"
+    assert copied[6] == 'model_reasoning_effort = "ultra"'
+    assert (source / "config.toml").read_text() == original
+
+
 def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     """When the source ``CODEX_HOME`` dir doesn't exist (fresh install),
     nothing is created in the target.

@@ -598,15 +598,20 @@ def _fetch_search_snippets(
     return out
 
 
-def _to_item(row: SqlConversationItem) -> ConversationItem:
+def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
     """
     Convert a :class:`SqlConversationItem` ORM row to a
     :class:`ConversationItem` entity.
 
-    Deserializes the JSON ``data`` column and parses it into
-    the appropriate typed data model.
+    Parses *data_json* into the appropriate typed data model.
 
     :param row: The SQLAlchemy ORM row to convert.
+    :param data_json: The row's already-decoded ``data`` JSON. Callers decode a
+        page of rows up front via
+        :meth:`SqlAlchemyConversationStore._decode_item_data_batch` (identity by
+        default), so this builds the entity from plaintext and never reads
+        ``row.data`` directly — letting a subclass decode a whole page in one
+        pass (e.g. a single batched decrypt) rather than once per row.
     :returns: A :class:`ConversationItem` Pydantic model.
     """
     item_type = decode_item_type(row.type)
@@ -616,7 +621,7 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
         status=decode_item_status(row.status),
         response_id=row.response_id,
         created_at=row.created_at,
-        data=parse_item_data(item_type, json.loads(row.data)),
+        data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
     )
 
@@ -1490,6 +1495,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        See :meth:`ConversationStore.sum_daily_cost`. Day strings compare
+        lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
+        a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
+        an empty range, coalesced to ``0.0``.
+        """
+        with self._session() as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(SqlUserDailyCost.cost_usd), 0.0))
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+            ).scalar_one()
+            return float(total or 0.0)
+
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
         Return a user's daily cost rollup state for one UTC day.
@@ -1708,7 +1731,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             # Preserve FTS rank order
             order = {iid: i for i, iid in enumerate(item_ids)}
-            return [_to_item(r) for r in sorted(rows, key=lambda r: order[r.id])]
+            ordered = sorted(rows, key=lambda r: order[r.id])
+            decoded = self._decode_item_data_batch([r.data for r in ordered])
+            return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
     def list_items(
         self,
@@ -1782,7 +1807,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
-            items = [_to_item(r) for r in rows]
+            decoded = self._decode_item_data_batch([r.data for r in rows])
+            items = [_to_item(r, d) for r, d in zip(rows, decoded, strict=True)]
             return PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
@@ -1823,9 +1849,48 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(ranked.c.row_num <= per_conversation_limit)
                 .order_by(ranked.c.conversation_id, ranked.c.position.desc())
             ).all()
-            for row in rows:
-                result[row.conversation_id].append(_to_item(row))  # type: ignore[arg-type]
+            decoded = self._decode_item_data_batch([row.data for row in rows])
+            for row, data_json in zip(rows, decoded, strict=True):
+                result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
         return result
+
+    def _encode_item_data(self, data_json: str) -> str:
+        """
+        Transform an item's serialized ``data`` JSON on its way into the
+        ``conversation_items.data`` column. Inverse of
+        :meth:`_decode_item_data_batch`.
+
+        The default is identity — the column stays plaintext ``Text`` and the
+        JSON is returned unchanged. A subclass may override to compress or
+        encrypt the payload, provided it applies the matching inverse in
+        :meth:`_decode_item_data_batch` (and maps the column to a binary type if
+        the transform yields non-text bytes).
+        """
+        return data_json
+
+    def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+        """
+        Inverse of :meth:`_encode_item_data` for a whole page of rows, applied
+        when reading. Returns one decoded ``data`` JSON per input, in order.
+
+        The default returns the values unchanged (the column is plaintext). A
+        subclass that encoded the column on write reverses it here; overriding
+        the *batch* — rather than a per-row hook — lets it decode the page in a
+        single pass (e.g. one bulk decrypt call) instead of once per row.
+        """
+        return stored
+
+    def _item_search_text(self, item: NewConversationItem) -> str | None:
+        """
+        Plain-text extraction of *item* persisted in ``search_text`` and indexed
+        for full-text search by :meth:`append`.
+
+        The default extracts the searchable text as before. A subclass whose
+        schema omits ``search_text`` (e.g. because ``data`` is stored opaquely
+        and cannot be searched in SQL) returns ``None`` to skip persisting the
+        column and its FTS row entirely.
+        """
+        return strip_nul_bytes(extract_search_text(item))
 
     def append(
         self,
@@ -1895,8 +1960,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # column, which rejects them outright. Tool output can
                 # embed NUL (e.g. reading a binary file); without this
                 # the whole INSERT aborts and the item never persists.
-                data = strip_nul_bytes(json.dumps(data_dict))
-                search = strip_nul_bytes(extract_search_text(item))
+                data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
+                search = self._item_search_text(item)
                 item_id = generate_item_id(item.type)
                 row = SqlConversationItem(
                     id=item_id,
@@ -1907,11 +1972,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     position=position,
                     type=encode_item_type(item.type),
                     data=data,
-                    search_text=search,
                     created_by=item.created_by,
                 )
+                # A backend may omit search_text (see _item_search_text); leaving
+                # the attribute unset drops it from the INSERT so a schema without
+                # the column still works, and skips its FTS row.
+                if search is not None:
+                    row.search_text = search
+                    fts_rows.append((item_id, conversation_id, search))
                 session.add(row)
-                fts_rows.append((item_id, conversation_id, search))
                 persisted.append(
                     ConversationItem(
                         id=row.id,
@@ -2876,7 +2945,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .scalars()
                 .all()
             )
-        return [_to_conversation(r, meta_by_id.get(r.id)) for r in ap_rows]
+            # Hydrate labels (one batched query, no N+1): the runner
+            # session-init envelope is built from ``conversation.labels``, and
+            # the reconnect path (``_on_runner_connect``) sources its
+            # conversations here. Without this the envelope ships empty labels,
+            # so fork directives (carry-history / source transcript) never reach
+            # the runner and a forked native session launches without history.
+            labels_by_conv = _fetch_labels_bulk(ap_sess, conv_ids)
+        return [
+            _to_conversation(r, meta_by_id.get(r.id), labels_by_conv.get(r.id, {}))
+            for r in ap_rows
+        ]
 
     def set_host_id(
         self,
@@ -3056,10 +3135,43 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``parent_conversation_id`` is set but no such
             conversation exists.
         """
+        return self._create_session_with_agent_with_id(
+            generate_conversation_id(),
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_bundle_location=agent_bundle_location,
+            agent_description=agent_description,
+            title=title,
+            labels=labels,
+            reasoning_effort=reasoning_effort,
+            workspace=workspace,
+            terminal_launch_args=terminal_launch_args,
+            parent_conversation_id=parent_conversation_id,
+            runner_id=runner_id,
+        )
+
+    def _create_session_with_agent_with_id(
+        self,
+        conversation_id: str,
+        *,
+        agent_id: str,
+        agent_name: str,
+        agent_bundle_location: str,
+        agent_description: str | None,
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        terminal_launch_args: list[str] | None = None,
+        parent_conversation_id: str | None = None,
+        runner_id: str | None = None,
+    ) -> CreatedSession:
+        """Body of :meth:`create_session_with_agent` under a caller-supplied
+        ``conversation_id``. The public method generates a fresh id; this seam
+        lets a subclass inject one (MAS's WHS-homed store injects the WHS node id)."""
         from omnigent.stores.conversation_store import ConversationNotFoundError
 
         now = now_epoch()
-        conversation_id = generate_conversation_id()
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.
         # Get parent root_id from AP first.
@@ -3212,8 +3324,45 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ValueError: If *up_to_response_id* is set but no item in
             the source conversation has that ``response_id``.
         """
+        return self._fork_conversation_with_id(
+            generate_conversation_id(),
+            source_conversation_id,
+            title=title,
+            agent_id=agent_id,
+            cloned_agent_name=cloned_agent_name,
+            cloned_agent_bundle_location=cloned_agent_bundle_location,
+            cloned_agent_description=cloned_agent_description,
+            copy_model_settings=copy_model_settings,
+            copy_terminal_launch_args=copy_terminal_launch_args,
+            carry_history_into_native=carry_history_into_native,
+            resume_source_native_session=resume_source_native_session,
+            presentation_labels=presentation_labels,
+            up_to_response_id=up_to_response_id,
+        )
+
+    def _fork_conversation_with_id(
+        self,
+        conversation_id: str,
+        source_conversation_id: str,
+        *,
+        title: str | None = None,
+        agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
+        copy_model_settings: bool = True,
+        copy_terminal_launch_args: bool = True,
+        carry_history_into_native: bool = False,
+        resume_source_native_session: bool = True,
+        presentation_labels: dict[str, str] | None = None,
+        up_to_response_id: str | None = None,
+    ) -> Conversation:
+        """Body of :meth:`fork_conversation` under a caller-supplied
+        ``conversation_id``. The public method generates a fresh id; this seam
+        lets a subclass inject one (MAS's WHS-homed store injects the WHS node id
+        so a forked session keeps a single identity across storage backends)."""
         now = now_epoch()
-        new_conv_id = generate_conversation_id()
+        new_conv_id = conversation_id
 
         # Fetch source metadata (workspace, external_session_id, terminal_launch_args)
         # from the Omnigent DB before opening the AP session.

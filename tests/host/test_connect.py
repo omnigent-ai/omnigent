@@ -33,6 +33,8 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -54,6 +56,43 @@ from omnigent.runner.identity import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_handle_model_options_uses_host_claude_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch picker is resolved on the host that will start Claude."""
+    from omnigent import claude_native
+
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", lambda *, spec: None)
+    monkeypatch.setattr(
+        claude_native,
+        "claude_native_model_options",
+        lambda config: [
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_models",
+        status="ok",
+        models=[
+            {
+                "id": "sonnet",
+                "model": "system.ai.claude-sonnet-4-6[1m]",
+                "displayName": "Sonnet 4.6",
+            }
+        ],
+    )
 
 
 def _make_host_process() -> HostProcess:

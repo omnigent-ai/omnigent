@@ -44,13 +44,19 @@ import {
   Select,
   SelectContent,
   SelectItem,
-  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import {
+  ConfigRow,
+  DescribedSelect,
+  EFFORT_SELECT_NONE,
+  MODEL_SELECT_DEFAULT,
+  MODEL_SELECT_SMART,
+} from "@/components/HarnessConfigControls";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -115,7 +121,7 @@ import {
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -138,7 +144,11 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import { useNewestProjectSession, useProjects, PROJECT_LABEL_KEY } from "@/hooks/useConversations";
+import {
+  useNewestProjectSession,
+  useProjects,
+  moveConversationToProject,
+} from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -180,16 +190,6 @@ const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
 // session's terminal_launch_args. Keep in sync with `claude --help`.
-// Harnesses for which server-side smart routing is available.
-const _ROUTABLE_HARNESSES = new Set([
-  "claude-sdk",
-  "claude_sdk",
-  "claude-native",
-  "codex",
-  "codex-native",
-  "pi",
-]);
-
 const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
   { value: "default", label: "Default", description: "Prompts before edits and commands" },
@@ -814,7 +814,7 @@ function LandingProjectPicker({
   }, [creatingNew]);
 
   const filtered = search
-    ? projects.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
 
   function pick(project: string) {
@@ -874,10 +874,10 @@ function LandingProjectPicker({
             <span className="flex-1 truncate">No project</span>
             {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
           </button>
-          {filtered.map((name) => (
-            <button key={name} type="button" className={itemClass} onClick={() => pick(name)}>
-              <span className="flex-1 truncate">{name}</span>
-              {value === name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
+          {filtered.map((p) => (
+            <button key={p.name} type="button" className={itemClass} onClick={() => pick(p.name)}>
+              <span className="flex-1 truncate">{p.name}</span>
+              {value === p.name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
             </button>
           ))}
           {filtered.length === 0 && !creatingNew && (
@@ -960,7 +960,7 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
  * BEFORE selecting, so the harness-switch reseed effect in the screen reads it
  * back as the same value and doesn't clobber the choice.
  */
-function AgentHarnessPicker({
+export function AgentHarnessPicker({
   agentEntries,
   harnessEntries,
   effectiveAgentId,
@@ -973,6 +973,12 @@ function AgentHarnessPicker({
   onSelectPending,
   onCreateCustomAgent,
   sandboxSelected,
+  onOpenChange,
+  dropdownModal = true,
+  contentClassName,
+  contentAlign = "end",
+  triggerClassName,
+  triggerLabelClassName,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -986,6 +992,27 @@ function AgentHarnessPicker({
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
   sandboxSelected: boolean;
+  // ── Optional reuse hooks (all default-undefined) ─────────────────────────
+  // These let a host OTHER than the composer footer embed the picker without
+  // changing its default behavior. The interactive New Chat call site passes
+  // none of them, so it renders exactly as before. The scheduled-task create
+  // dialog passes them to: forward the dropdown open/close into its own
+  // outside-click dismiss guard (`onOpenChange`), bound + left-align the menu
+  // in a tall modal (`contentClassName` / `contentAlign`), and style the
+  // trigger to match sibling <Select> fields (`triggerClassName` /
+  // `triggerLabelClassName`).
+  /** Notified when the picker dropdown opens/closes. */
+  onOpenChange?: (open: boolean) => void;
+  /** Whether the Radix dropdown should modal-block outside content. Defaults true. */
+  dropdownModal?: boolean;
+  /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
+  contentClassName?: string;
+  /** Dropdown alignment. Defaults to "end" (composer footer). */
+  contentAlign?: "start" | "center" | "end";
+  /** Extra classes merged onto the trigger Button. */
+  triggerClassName?: string;
+  /** Extra classes merged onto the trigger's label span. */
+  triggerLabelClassName?: string;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -1144,9 +1171,11 @@ function AgentHarnessPicker({
 
   return (
     <DropdownMenu
+      modal={dropdownModal}
       open={open}
       onOpenChange={(next) => {
         setOpen(next);
+        onOpenChange?.(next);
         if (next) {
           // Prefetch harness/description/skills for all session-discovered
           // agents so the list is stable before the user reads it.
@@ -1165,23 +1194,36 @@ function AgentHarnessPicker({
           disabled={!hasAgents}
           data-testid="new-chat-landing-agent-select"
           // Drop the Button's focus-visible ring/border that otherwise shows
-          // when focus returns to the trigger after a pick.
-          className="h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
+          // when focus returns to the trigger after a pick. `triggerClassName`
+          // (default undefined) lets an embedder override sizing/border to match
+          // its own form fields; tailwind-merge lets the passed classes win.
+          className={cn(
+            "h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0",
+            triggerClassName,
+          )}
         >
-          <span className="max-w-[12rem] truncate text-xs text-foreground">
+          <span
+            className={cn("max-w-[12rem] truncate text-xs text-foreground", triggerLabelClassName)}
+          >
             {hasAgents ? agentLabel : "No agents"}
           </span>
           <ChevronDownIcon className="size-3.5 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
-        align="end"
+        align={contentAlign}
         // Keep the menu inside the viewport on short mobile screens: pad the
         // collision box so the available-height cap leaves room below the
         // status bar, and let it flip/scroll rather than run off the top.
         collisionPadding={12}
         avoidCollisions
-        className="max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1"
+        // `contentClassName` (default undefined) lets an embedder tighten the
+        // height cap / pin a width; tailwind-merge lets the passed max-h/width
+        // override the defaults.
+        className={cn(
+          "max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-64 max-w-[calc(100vw-2rem)] overflow-y-auto p-1",
+          contentClassName,
+        )}
       >
         {showMore ? (
           // Mobile drill-in page for the "needs setup" harnesses.
@@ -1303,115 +1345,6 @@ function AgentHarnessPicker({
   );
 }
 
-// Sentinel Select values for the Model row. Radix requires a non-empty value,
-// so the two "no explicit model" choices ride on reserved tokens rather than
-// "": DEFAULT = Claude Code's own configured model (no override), SMART = the
-// intelligent router picks per turn.
-const MODEL_SELECT_DEFAULT = "__default__";
-const MODEL_SELECT_SMART = "__smart__";
-// Sentinel for the "no explicit effort" (—) choice, same reasoning.
-const EFFORT_SELECT_NONE = "__none__";
-
-/**
- * A labeled configuration row: bold label + muted sub-description on the left,
- * the control on the right. Mirrors the "Configure …" modal layout.
- */
-function ConfigRow({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: ReactNode;
-}) {
-  return (
-    // Stacked on mobile (label above a full-width control) so the label never
-    // gets squeezed into a narrow column and wraps hard; side-by-side from sm+
-    // with the control pinned to a fixed width.
-    <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
-      <div className="min-w-0 sm:pt-1">
-        <div className="text-sm font-medium">{label}</div>
-        {description && <div className="text-xs text-muted-foreground">{description}</div>}
-      </div>
-      <div className="w-full sm:w-52 sm:shrink-0">{children}</div>
-    </div>
-  );
-}
-
-/**
- * A config-modal Select whose options carry descriptions. The description of
- * the hovered / focused option (falling back to the selected one) shows in a
- * footer line pinned at the bottom of the OPEN dropdown. The popup is pinned to
- * the trigger width and the footer wraps, so the dropdown never changes width
- * as you hover across options.
- *
- * @param value Selected option value.
- * @param onValueChange Selection callback.
- * @param options Value/label/description triples.
- * @param testId Trigger test id.
- * @param ariaLabel Accessible name for the trigger (the visible ConfigRow
- *   label is visual-only, so pass it here to name the control for AT).
- */
-function DescribedSelect({
-  value,
-  onValueChange,
-  options,
-  testId,
-  ariaLabel,
-}: {
-  value: string;
-  onValueChange: (value: string) => void;
-  options: readonly { value: string; label: string; description: string }[];
-  testId: string;
-  ariaLabel: string;
-}) {
-  const [previewed, setPreviewed] = useState<string | null>(null);
-  const detail = options.find((o) => o.value === (previewed ?? value))?.description;
-  return (
-    <Select
-      value={value}
-      onValueChange={onValueChange}
-      // Reset the preview when the list closes so the next open starts on the
-      // selected option's blurb.
-      onOpenChange={(next) => {
-        if (!next) setPreviewed(null);
-      }}
-    >
-      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
-        <SelectValue />
-      </SelectTrigger>
-      {/* Pin the popup to the trigger width so a long blurb wraps in the footer
-      instead of widening the list as you hover across options. */}
-      <SelectContent
-        position="popper"
-        align="start"
-        className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
-      >
-        {options.map((o) => (
-          <SelectItem
-            key={o.value}
-            value={o.value}
-            onPointerEnter={() => setPreviewed(o.value)}
-            onFocus={() => setPreviewed(o.value)}
-          >
-            {o.label}
-          </SelectItem>
-        ))}
-        {/* Footer blurb pinned inside the dropdown, tracking the hovered row.
-        min-h reserves a line so the popup height doesn't jump as it changes. */}
-        <SelectSeparator />
-        <p
-          data-testid={`${testId}-detail`}
-          className="min-h-8 px-2.5 pt-0.5 pb-1 text-xs leading-snug text-muted-foreground"
-        >
-          {detail}
-        </p>
-      </SelectContent>
-    </Select>
-  );
-}
-
 /**
  * Harness-configuration modal opened from the composer's gear icon. Shows the
  * selected agent's run-config knobs — Claude: model / effort / permissions;
@@ -1436,6 +1369,8 @@ function HarnessConfigModal({
   cursorExecMode,
   bypassSandbox,
   pickedModel,
+  claudeModelOptions,
+  claudeModelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1460,6 +1395,8 @@ function HarnessConfigModal({
   cursorExecMode: string;
   bypassSandbox: boolean;
   pickedModel: string;
+  claudeModelOptions: readonly { id: string; displayName: string }[];
+  claudeModelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1620,11 +1557,21 @@ function HarnessConfigModal({
                       <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
                     )}
                     <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
-                    {CLAUDE_NATIVE_MODELS.map((m) => (
+                    {claudeModelOptions.map((m) => (
                       <SelectItem key={m.id} value={m.id}>
-                        {m.label}
+                        {m.displayName}
                       </SelectItem>
                     ))}
+                    {claudeModelsLoading && (
+                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                        Loading models…
+                      </div>
+                    )}
+                    {!claudeModelsLoading && claudeModelOptions.length === 0 && (
+                      <div className="px-2.5 py-1 text-xs text-muted-foreground">
+                        Models unavailable
+                      </div>
+                    )}
                   </SelectContent>
                 </Select>
               </ConfigRow>
@@ -1766,7 +1713,7 @@ function HarnessConfigModal({
           )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="border-t-0 bg-transparent">
           <Button
             type="button"
             variant="outline"
@@ -1861,6 +1808,8 @@ export function NewChatLandingScreen() {
 
   const [message, setMessage] = useState<string>(() => landingDraft?.message ?? "");
   const dictation = useDictationInsert(setMessage);
+  // Composer text captured when voice dictation starts, so Esc can revert to it.
+  const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isComposingRef = useRef(false);
   // maxRows 9 = 180px of 20px lines, matching the composer's 200px
@@ -1955,6 +1904,24 @@ export function NewChatLandingScreen() {
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
     () => landingDraft?.sandboxSelected ?? false,
+  );
+  const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    "claude-native",
+    !sandboxSelected,
+  );
+  const claudeModelOptions = useMemo(
+    () =>
+      sandboxSelected
+        ? CLAUDE_NATIVE_MODELS.map((model) => ({
+            id: model.id,
+            displayName: model.label,
+          }))
+        : (hostClaudeModelOptions ?? []).map((option) => ({
+            id: option.id,
+            displayName: option.displayName ?? option.id,
+          })),
+    [hostClaudeModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -2319,13 +2286,9 @@ export function NewChatLandingScreen() {
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Smart routing is offered in the config modal — as a Model choice for Claude,
-  // a standalone toggle otherwise — when the server enables it and the selected
-  // harness is routable. Use the EFFECTIVE harness (a bundle agent's brain-
-  // harness override wins over its spec harness), so overriding Polly/Debby to a
-  // non-routable harness (e.g. Cursor) correctly drops routing eligibility.
-  const effectiveHarness = pickedHarness ?? selectedAgent?.harness ?? "";
-  const smartRoutingEligible = smartRoutingEnabled && _ROUTABLE_HARNESSES.has(effectiveHarness);
+  // Smart Routing (per-session model selection) is superseded by the Auto
+  // harness which handles both harness + model. Hide it entirely for now.
+  const smartRoutingEligible = false;
   // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
@@ -2348,7 +2311,7 @@ export function NewChatLandingScreen() {
     if (supportsPermissionMode) {
       const modelValue = routingOn
         ? "Smart Routing"
-        : (CLAUDE_NATIVE_MODELS.find((m) => m.id === pickedModel)?.label ?? "Default");
+        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? "Default");
       // Smart Routing freezes effort to the default (the router picks per turn),
       // so mirror the modal: show "Default" whenever routing is on or effort is
       // unset, else the picked level.
@@ -2404,6 +2367,7 @@ export function NewChatLandingScreen() {
     brainHarnessLabels,
     routingOn,
     pickedModel,
+    claudeModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -2459,7 +2423,7 @@ export function NewChatLandingScreen() {
       // nothing stored (or a retired id) it resolves to "" — unselected, so the
       // create omits the override and Claude Code uses its own configured model.
       setPickedModel(
-        stored.model != null && CLAUDE_NATIVE_MODELS.some((m) => m.id === stored.model)
+        stored.model != null && claudeModelOptions.some((m) => m.id === stored.model)
           ? stored.model
           : "",
       );
@@ -2473,10 +2437,10 @@ export function NewChatLandingScreen() {
     } else if (supportsCursorMode) {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     }
-    // Reseed only on harness change; capability flags are derived from the
-    // same harness so they don't need to be deps.
+    // Reseed on harness changes and when the selected host's catalog resolves;
+    // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness]);
+  }, [selectedNativeHarness, claudeModelOptions]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -3051,13 +3015,17 @@ export function NewChatLandingScreen() {
             model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
-            // Smart routing toggle — server-side. Only send it when routing is
-            // actually eligible for the effective harness, so a stale "on" (from
-            // a since-overridden harness, or the server flag flipping off) can't
-            // ride along invisibly with no control to clear it.
-            cost_control_mode_override: smartRoutingEligible
-              ? (costControlMode ?? undefined)
-              : undefined,
+            // Smart routing toggle — server-side. The "Auto" harness always
+            // routes (harness + model), so send "on" to keep the persisted
+            // state consistent with the lit routing icon. Otherwise only send
+            // it when routing is eligible for the effective harness, so a stale
+            // "on" can't ride along invisibly with no control to clear it.
+            cost_control_mode_override:
+              pickedHarness === AUTO_HARNESS_ID
+                ? "on"
+                : smartRoutingEligible
+                  ? (costControlMode ?? undefined)
+                  : undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });
@@ -3067,17 +3035,15 @@ export function NewChatLandingScreen() {
         }
         data = (await res.json()) as { id: string };
       }
-      // File the new session under the chosen project (an implicit collection
-      // stored as a conversation_labels row). Awaited so the conversations
-      // refetch below already sees the label; non-fatal if it fails — the
-      // session is created either way, just unfiled.
+      // File the new session under the chosen project (first-class membership).
+      // Awaited so the conversations refetch below already reflects it;
+      // non-fatal if it fails — the session is created either way, just unfiled.
       if (selectedProject) {
         try {
-          await authenticatedFetch(`/v1/sessions/${data.id}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: selectedProject } }),
-          });
+          // File via first-class project_id; the helper resolves the picked
+          // name to a project id, creating an empty project on demand when the
+          // name is new or label-only.
+          await moveConversationToProject(data.id, selectedProject);
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -3434,7 +3400,12 @@ export function NewChatLandingScreen() {
                   <span className="sr-only">Attach files</span>
                 </Button>
                 <ComposerMicButton
+                  enableHotkey
                   disabled={creating}
+                  onVoiceStart={() => {
+                    voiceSnapshotRef.current = message;
+                  }}
+                  onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
                   onTranscript={dictation.appendFinal}
                   onInterim={dictation.replaceInterim}
                 />
@@ -3509,6 +3480,10 @@ export function NewChatLandingScreen() {
                     cursorExecMode={cursorExecMode}
                     bypassSandbox={bypassSandbox}
                     pickedModel={pickedModel}
+                    claudeModelOptions={claudeModelOptions}
+                    claudeModelsLoading={
+                      !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
+                    }
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
                     costControlMode={costControlMode}

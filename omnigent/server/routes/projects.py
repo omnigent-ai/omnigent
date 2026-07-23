@@ -43,6 +43,7 @@ def _to_response(project: Project) -> dict[str, Any]:
         "name": project.name,
         "created_at": project.created_at,
         "updated_at": project.updated_at,
+        "config": project.config,
     }
 
 
@@ -78,6 +79,7 @@ def create_projects_router(
             uuid.uuid4().hex,
             body.name,
             user_id,
+            body.config,
         )
         return _to_response(project)
 
@@ -131,6 +133,7 @@ def create_projects_router(
             project_id,
             owner_user_id=user_id,
             name=body.name,
+            config=body.config,
         )
         if project is None:
             raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)

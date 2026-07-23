@@ -39,6 +39,7 @@ vi.mock("@/store/chatStore", () => ({
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostModelOptions: vi.fn(() => ({ data: [] })),
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
