@@ -72,11 +72,7 @@ _logger = logging.getLogger(__name__)
 # (backward compatible). The BROWSER endpoints (consent GET / approve /
 # deny) are NOT gated by this: they run in the user's browser, which never
 # holds the secret; their trust comes from the session cookie + Origin.
-# Public alias so callers (e.g. app.py's startup warning) reference the env
-# var name without reaching into a private symbol; the module uses the private
-# name internally to avoid churn.
-CLIENT_SECRET_ENV = "OMNIGENT_DEVICE_CLIENT_SECRET"
-_CLIENT_SECRET_ENV = CLIENT_SECRET_ENV
+_CLIENT_SECRET_ENV = "OMNIGENT_DEVICE_CLIENT_SECRET"
 _CLIENT_SECRET_HEADER = "X-Omnigent-Client-Secret"
 
 # Scope granted to delegated (device-grant) access tokens. Restricts them

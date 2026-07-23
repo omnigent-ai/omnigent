@@ -2797,16 +2797,13 @@ def create_app(
             # into OMNIGENT_DEVICE_CLIENT_SECRET (which closes initiation to
             # unauthorized callers) rather than leaving it off unknowingly. See
             # designs/DEVICE_AUTH.md § "Device-code phishing".
-            from omnigent.server.routes.device_auth import CLIENT_SECRET_ENV
-
-            if not os.environ.get(CLIENT_SECRET_ENV, "").strip():
+            if not os.environ.get("OMNIGENT_DEVICE_CLIENT_SECRET", "").strip():
                 _logger.warning(
-                    "device-grant: %s is not set — the /oauth/device/authorize "
-                    "endpoint is PUBLIC (any caller may initiate a login flow). "
-                    "Set %s on the server and its trusted client(s) to restrict "
-                    "initiation to authorized clients. See designs/DEVICE_AUTH.md.",
-                    CLIENT_SECRET_ENV,
-                    CLIENT_SECRET_ENV,
+                    "device-grant: OMNIGENT_DEVICE_CLIENT_SECRET is not set — the "
+                    "/oauth/device/authorize endpoint is PUBLIC (any caller may "
+                    "initiate a login flow). Set OMNIGENT_DEVICE_CLIENT_SECRET on "
+                    "the server and its trusted client(s) to restrict initiation "
+                    "to authorized clients. See designs/DEVICE_AUTH.md.",
                 )
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
