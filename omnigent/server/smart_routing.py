@@ -502,6 +502,19 @@ class ExternalRoutingClient:
 # installed, and they bake the model at terminal launch rather than per-turn.
 _AUTO_ROUTING_HARNESSES: tuple[str, ...] = ("claude-sdk", "pi", "codex")
 
+# The live runner catalog (fetch_runner_models) keys rows by WORKER name — the
+# sub-agent names declared in the parent spec (e.g. "claude_code") plus "self"
+# for the session's own harness — NOT by harness id. Map the common worker
+# names back to their harness id so a child session's catalog still yields
+# routable candidates. Unknown worker names are ignored (the static
+# infer_models fallback covers them).
+_WORKER_NAME_TO_HARNESS: dict[str, str] = {
+    "claude_code": "claude-sdk",
+    "claude-sdk": "claude-sdk",
+    "codex": "codex",
+    "pi": "pi",
+}
+
 # Per-harness model exclusions for auto routing. The pi harness routes Claude
 # models through the Anthropic Messages gateway, whose request path adds an
 # ``eager_input_streaming`` field the Databricks serving endpoint rejects with
@@ -550,21 +563,30 @@ async def route_session_harness(
     if _caps is None or _caps.routing_client is None:
         return None, None, None, "Intelligent routing is not configured on this server."
 
-    # Fetch live catalog and restrict to our known SDK harnesses.
+    # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
+    # names + "self"), so normalize those to harness ids before matching
+    # against _AUTO_ROUTING_HARNESSES.
     live_catalog: dict[str, list[str]] | None = None
     if session_id and runner_client is not None:
         live_catalog = await fetch_runner_models(session_id, runner_client)
 
     harness_models: dict[str, list[str]] = {}
-    for h in _AUTO_ROUTING_HARNESSES:
-        if live_catalog is not None:
-            if h in live_catalog:
-                models = _filter_excluded_models(h, live_catalog[h])
-                if models:
-                    harness_models[h] = models
-        else:
-            models = infer_models(h) or []
-            models = _filter_excluded_models(h, models)
+    if live_catalog:
+        for worker_name, worker_models in live_catalog.items():
+            harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
+            if harness is None or harness not in _AUTO_ROUTING_HARNESSES:
+                continue
+            models = _filter_excluded_models(harness, worker_models)
+            if models:
+                # First worker wins for a given harness id (dedupe).
+                harness_models.setdefault(harness, models)
+
+    # Fall back to the static table when the live catalog produced no
+    # routable candidates (e.g. a child session whose catalog only lists
+    # "self" under an unrecognized worker name, or the runner was unreachable).
+    if not harness_models:
+        for h in _AUTO_ROUTING_HARNESSES:
+            models = _filter_excluded_models(h, infer_models(h) or [])
             if models:
                 harness_models[h] = models
 

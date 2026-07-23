@@ -814,6 +814,106 @@ async def test_route_session_harness_uses_live_catalog_skips_absent_harness() ->
 
 
 @pytest.mark.asyncio
+async def test_route_session_harness_maps_worker_names_to_harnesses() -> None:
+    """Live catalog keyed by worker names (claude_code, codex) maps to harness ids."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    # Catalog uses SUB-AGENT worker names, as the real runner returns.
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "claude_code": {
+                "source": "catalog",
+                "verified": True,
+                "models": [{"id": "databricks-claude-opus-4-8"}],
+                "note": "",
+            },
+            "codex": {
+                "source": "catalog",
+                "verified": True,
+                "models": [{"id": "databricks-gpt-5-4-nano"}],
+                "note": "",
+            },
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    received: list[str] = []
+
+    class _CapturingClient:
+        async def route(
+            self, _message: str, available_models: dict[str, list[str]]
+        ) -> RoutingResult | None:
+            received.extend(available_models.keys())
+            return RoutingResult(
+                model="databricks-claude-opus-4-8", rationale="complex", harness="claude-sdk"
+            )
+
+    caps = _FakeCaps(routing_client=_CapturingClient())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict, error = await route_session_harness(
+            "refactor everything",
+            session_id="conv_child",
+            runner_client=mock_client,
+        )
+    # Worker name claude_code → harness id claude-sdk in the candidate set.
+    assert "claude-sdk" in received
+    assert "codex" in received
+    assert harness == "claude-sdk"
+    assert model == "databricks-claude-opus-4-8"
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_route_session_harness_falls_back_when_catalog_has_only_self() -> None:
+    """A catalog with only an unrecognized 'self' worker falls back to the static table."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            # "self" is not in _WORKER_NAME_TO_HARNESS, so live matching yields
+            # nothing and the static infer_models fallback kicks in.
+            "self": {
+                "source": "catalog",
+                "verified": True,
+                "models": [{"id": "databricks-claude-opus-4-8"}],
+                "note": "",
+            },
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    received: list[str] = []
+
+    class _CapturingClient:
+        async def route(
+            self, _message: str, available_models: dict[str, list[str]]
+        ) -> RoutingResult | None:
+            received.extend(available_models.keys())
+            return RoutingResult(
+                model="databricks-claude-opus-4-8", rationale="x", harness="claude-sdk"
+            )
+
+    caps = _FakeCaps(routing_client=_CapturingClient())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, _model, _verdict, error = await route_session_harness(
+            "hello",
+            session_id="conv_child",
+            runner_client=mock_client,
+        )
+    # Static fallback offers all _AUTO_ROUTING_HARNESSES.
+    for h in _AUTO_ROUTING_HARNESSES:
+        assert h in received, f"static fallback should offer {h!r}"
+    assert harness == "claude-sdk"
+    assert error is None
+
+
+@pytest.mark.asyncio
 async def test_route_session_harness_returns_none_when_no_client() -> None:
     """route_session_harness returns (None, None, None, error) when no routing client."""
     caps = _FakeCaps(routing_client=None)
