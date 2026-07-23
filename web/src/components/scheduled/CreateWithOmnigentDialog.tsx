@@ -2,10 +2,9 @@
 // the user describes the task in natural language and the agent proposes the
 // name / prompt / schedule.
 //
-// TODO(UI-2): This is intentionally a STUB. The full conversational create flow
-// is built in the UI-2 task; this dialog only exists so the "New task" menu's
-// first option is wired and discoverable now. Do not add real behavior here —
-// UI-2 owns it.
+// TODO: keep this inert until the conversational create flow has backend support.
+// This dialog only exists so the "New task" menu's first option is wired and
+// discoverable now.
 
 import { SparklesIcon } from "lucide-react";
 import {

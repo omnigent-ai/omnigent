@@ -271,7 +271,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(arg.timezone.length).toBeGreaterThan(0);
   });
 
-  // v1 is AGENT-SELECTION ONLY — model/effort are not offered, so the create
+  // Model/effort controls are not offered, so the create
   // body carries agent_id and NEVER model_override / reasoning_effort, whether
   // the pick is a bare harness (claude-native) or a plain agent (polly).
   it("maps a bare-harness pick to its agent_id, never sends model/effort", async () => {
@@ -343,20 +343,20 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(options).toEqual([":00", ":15", ":30", ":45"]);
   });
 
-  it("offers exactly the four v1 frequency presets — no Custom entry point", async () => {
+  it("offers exactly the four frequency presets with no Custom entry point", async () => {
     renderDialog();
     // Open the frequency Select (keyboard is the reliable jsdom path).
     fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
     const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
     expect(options).toEqual(["Hourly", "Daily", "Weekdays", "Weekly"]);
     expect(options).not.toContain("Custom");
-    // The Custom-only sub-controls must never be in the DOM in v1.
+    // The Custom-only sub-controls are not reachable from this form.
     expect(screen.queryByTestId("custom-freq-trigger")).toBeNull();
     expect(screen.queryByTestId("custom-interval")).toBeNull();
     expect(screen.queryByTestId("schedule-month-trigger")).toBeNull();
   });
 
-  it("does not render the 'Reads as' schedule preview (removed in v1)", () => {
+  it("does not render the 'Reads as' schedule preview", () => {
     renderDialog();
     expect(screen.queryByTestId("schedule-preview")).toBeNull();
     expect(screen.queryByText(/Reads as:/i)).toBeNull();

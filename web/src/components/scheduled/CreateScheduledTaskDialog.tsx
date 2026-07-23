@@ -79,8 +79,8 @@ export function CreateScheduledTaskDialog({
   // single `pickedAgentId` covers both cases — for a bare-harness pick it's the
   // `*-native-ui` agent's id, exactly what the interactive dialog sends.
   //
-  // v1 is AGENT-SELECTION ONLY: model/effort and the permission/approval/cursor
-  // mode knobs are NOT offered here. Upstream moved those into a separate
+  // Scheduled tasks currently create sessions from the selected agent. Model,
+  // effort, and permission controls are not offered here; upstream moved those into a separate
   // gear-icon HarnessConfigModal (NewChatDialog); reusing it is disproportionate
   // for a scheduled task (26 props, bound to smart-routing / cost-control /
   // dynamic model loading). A scheduled task only requires `agent_id`; model_override
@@ -222,13 +222,11 @@ export function CreateScheduledTaskDialog({
         // here (harness rows are the `*-native-ui` agents), matching what the
         // interactive dialog sends as `agent_id`.
         agentId: effectiveAgentId,
-        // v1 is agent-only: model_override / reasoning_effort are omitted, so the
-        // fire path uses the agent's configured model/effort. (Model/effort UI
-        // moved to a separate gear modal upstream; offering it here is a follow-up.)
+        // Model/effort overrides are omitted so the fire path uses the selected
+        // agent's configured defaults.
         // Timezone is inferred from the browser (Intl) and not user-editable in
-        // v1 — a picker can be added later if cross-timezone scheduling is
-        // needed. Still sent so the server evaluates the RRULE in the user's
-        // local zone rather than defaulting to UTC.
+        // this dialog. Still sent so the server evaluates the RRULE in the
+        // user's local zone rather than defaulting to UTC.
         timezone: localTimezone(),
         // Send the host/workspace pair only when a host was pinned. A pinned
         // host with no workspace is allowed (server defaults to the host home).
@@ -368,8 +366,8 @@ export function CreateScheduledTaskDialog({
           />
 
           {/* Timezone is inferred from the browser (localTimezone via Intl) and
-              intentionally has no visible control in v1 — it's still sent in the
-              create payload so the schedule evaluates in the user's local zone. */}
+              intentionally has no visible control. It is still sent in the create
+              payload so the schedule evaluates in the user's local zone. */}
 
           {/* Optional host + workspace pin. Left unset, the server resolves the
               owner's connected host and its home directory at fire time. */}

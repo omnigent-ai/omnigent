@@ -1,16 +1,16 @@
 // The schedule-builder sub-form used by the manual create dialog.
 //
-// v1 top-level frequency: Hourly, Daily, Weekdays, Weekly. Each is a simple
-// preset — Hourly takes no inputs, Daily/Weekdays take a time, Weekly adds a
+// Top-level frequency options are Hourly, Daily, Weekdays, and Weekly. Each is a simple
+// preset: Hourly takes no inputs, Daily/Weekdays take a time, Weekly adds a
 // weekday multi-select. Emits its state up as a ScheduleModel; the parent turns
 // it into an RRULE via buildRRule and gates submit on validateSchedule.
 //
-// TODO(UI-2): the "Custom" entry point (interval + Monthly/Yearly, with the
-// day-of-month / month controls) is deferred. Its model fields, buildRRule
+// TODO: restore the "Custom" entry point when product supports interval-based
+// Monthly/Yearly schedules. Its model fields, buildRRule
 // cases, and scheduleText/nextRun handling for INTERVAL / BYMONTH /
 // multi-BYMONTHDAY / yearly are intentionally KEPT in the lib files
-// (scheduleBuilder.ts, scheduleText.ts) so they stay robust and UI-2 can wire a
-// Custom sub-form back in — they're just not reachable from this v1 UI.
+// (scheduleBuilder.ts, scheduleText.ts) so they stay robust; they are not
+// reachable from this form today.
 
 import { Label } from "@/components/scheduled/Label";
 import {
@@ -30,7 +30,7 @@ import {
 } from "@/lib/scheduleBuilder";
 import { formatClockTime } from "@/lib/scheduleText";
 
-// v1 presets only — "custom" is deferred to UI-2 (see file header) and is
+// Presets only: "custom" is deferred (see file header) and is
 // deliberately absent from this list, so it's unreachable from the dropdown.
 const PRESET_OPTIONS: { value: SchedulePreset; label: string }[] = [
   { value: "hourly", label: "Hourly" },
@@ -215,10 +215,8 @@ export function ScheduleFields({
         )}
       </div>
 
-      {/* TODO(UI-2): the human-readable "Reads as: <scheduleText>" preview was
-          removed from v1 per product. describeSchedule/buildRRule stay in the
-          lib for the list rows + a future preview; only the inline validation
-          error renders here now. */}
+      {/* describeSchedule/buildRRule stay in the lib for list rows and possible
+          future previews; only the inline validation error renders here now. */}
       {error && (
         <p className="text-xs text-destructive" data-testid="schedule-error">
           {error}
