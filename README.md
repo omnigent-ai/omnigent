@@ -294,7 +294,7 @@ see step 3.)
 **Prefer the browser?** Start a server and register your machine as a host:
 
 ```bash
-omnigent server start   # start the local server and web UI in the background
+omnigent server --background   # start the local server and web UI in the background
 omnigent host           # (separate terminal) register this machine as a host
 ```
 
@@ -374,7 +374,7 @@ Omnigent supports **multi-user accounts**, controlled by one environment
 variable:
 
 ```bash
-OMNIGENT_AUTH_ENABLED=1 omnigent server start
+OMNIGENT_AUTH_ENABLED=1 omnigent server --background
 ```
 
 The **Docker deploy in [step 4](#4-deploy-a-server-and-use-it-from-your-phone)
@@ -505,6 +505,17 @@ omnigent run path/to/my_agent.yaml
 The same file can declare sub-agents and reviewers. For a fuller example, see
 Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/examples/polly/), and the
 [Agent YAML spec](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md) for the full schema.
+
+---
+
+## Telemetry
+
+Omnigent collects anonymized usage data (telemetry) by default. This data
+contains no sensitive or personally identifiable information. If you're using
+Omnigent through a managed service or distribution, please consult your managed
+service agreement to determine any data collection that may impact your use of
+the service. To opt out, follow our instructions in
+[Usage Telemetry](https://omnigent.ai/docs/deploy/telemetry).
 
 ---
 

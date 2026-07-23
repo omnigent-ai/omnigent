@@ -125,6 +125,56 @@ def test_cli_harness_configured_only_when_binary_installed(
     assert harness_is_configured(harness) is False
 
 
+def test_auth_aware_native_harness_reports_binary_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """claude-native / opencode-native report ``binary-missing`` when absent.
+
+    These now carry a two-step signal in the picker map (install, then auth),
+    mirroring Codex — so a missing binary is ``"binary-missing"``, not a bare
+    ``False``.
+    """
+    _no_clis_installed(monkeypatch)
+    result = configured_harness_map()
+    assert result["claude-native"] == "binary-missing"
+    assert result["opencode-native"] == "binary-missing"
+
+
+def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Installed but not signed in → ``needs-auth`` (the second step)."""
+    _all_clis_installed(monkeypatch)
+    # claude: `claude auth status` reports not-logged-in.
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key: False)
+    # opencode: no stored/env provider.
+    import omnigent.onboarding.opencode_auth as oc
+
+    monkeypatch.setattr(
+        oc,
+        "opencode_auth_summary",
+        lambda: oc.OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
+    )
+    result = configured_harness_map()
+    assert result["claude-native"] == "needs-auth"
+    assert result["opencode-native"] == "needs-auth"
+
+
+def test_auth_aware_native_harness_launch_gate_stays_binary_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The LAUNCH gate must not gain the auth check — only the picker map does.
+
+    ``harness_is_configured`` drives whether a runner may spawn; gating it on
+    login state would wrongly block a launch whose auth resolves at run time.
+    So with the binary present it stays ``True`` even when not signed in.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key: False)
+    assert harness_is_configured("claude-native") is True
+    assert harness_is_configured("opencode-native") is True
+
+
 def test_configured_harness_map_covers_all_spellings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -234,8 +284,6 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # antigravity-native is also gated (it wraps the ``agy`` CLI); with no
     # binary it reads False before its credential check is even reached.
     for cli in (
-        "claude-native",
-        "native-claude",
         "pi",
         "kimi",
         "cursor-native",
@@ -250,8 +298,18 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "hermes",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
-    for codex in ("codex", "codex-native", "native-codex"):
-        assert result[codex] == "binary-missing", f"{codex} should name the missing Codex binary"
+    # Auth-aware native harnesses (codex, claude, opencode) carry a two-step
+    # signal in the picker map, so a missing binary is the structured
+    # ``"binary-missing"`` (step 1 to-do), not a bare ``False``.
+    for missing in (
+        "codex",
+        "codex-native",
+        "native-codex",
+        "claude-native",
+        "native-claude",
+        "opencode-native",
+    ):
+        assert result[missing] == "binary-missing", f"{missing} should name the missing CLI binary"
 
 
 def test_configured_harness_map_all_true_with_clis(
@@ -282,6 +340,30 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
     result = configured_harness_map()
     assert all(result.values())
+
+
+def test_configured_harness_map_probes_codex_readiness_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex aliases share one potentially expensive readiness probe."""
+    calls = 0
+
+    def _codex_reason() -> str:
+        nonlocal calls
+        calls += 1
+        return "needs-auth"
+
+    monkeypatch.setattr(
+        "omnigent.codex_native._codex_auth_unavailable_reason",
+        _codex_reason,
+    )
+
+    result = configured_harness_map()
+
+    assert calls == 1
+    assert result["codex"] == "needs-auth"
+    assert result["codex-native"] == "needs-auth"
+    assert result["native-codex"] == "needs-auth"
 
 
 def test_kimi_readiness_keys_off_binary(

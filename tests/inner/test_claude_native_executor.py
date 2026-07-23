@@ -266,7 +266,6 @@ async def test_enqueue_session_message_injects_steering_into_terminal(
         *,
         content: str,
         timeout_s: float = 30.0,
-        verify_delivery: bool = True,
     ) -> None:
         """
         Capture a steering injection.
@@ -274,17 +273,10 @@ async def test_enqueue_session_message_injects_steering_into_terminal(
         :param bridge_dir_arg: Bridge directory passed by the executor.
         :param content: Text typed into the Claude tmux pane.
         :param timeout_s: tmux-target readiness timeout (ignored).
-        :param verify_delivery: Delivery-ack toggle passed by the executor.
         :returns: None.
         """
         del timeout_s
-        sent_messages.append(
-            {
-                "bridge_dir": bridge_dir_arg,
-                "content": content,
-                "verify_delivery": verify_delivery,
-            }
-        )
+        sent_messages.append({"bridge_dir": bridge_dir_arg, "content": content})
 
     monkeypatch.setattr(
         claude_native_executor,
@@ -300,13 +292,10 @@ async def test_enqueue_session_message_injects_steering_into_terminal(
     # session_key is intentionally NOT included since there is one
     # tmux pane per conversation; mixing in routing metadata would
     # cause Claude to see arbitrary key-value pairs as user input.
-    # verify_delivery is False: a queued steering prompt may not fire
-    # UserPromptSubmit promptly, so it keeps the legacy pane-only check.
     assert sent_messages == [
         {
             "bridge_dir": tmp_path,
             "content": "steer me",
-            "verify_delivery": False,
         }
     ]
 
@@ -344,17 +333,15 @@ async def test_concurrent_injections_do_not_overlap_in_terminal(
         *,
         content: str,
         timeout_s: float = 30.0,
-        verify_delivery: bool = True,
     ) -> None:
         """Record peak concurrency, then hold the call open until released.
 
         :param bridge_dir_arg: Bridge directory (ignored).
         :param content: Text that would be typed into tmux (ignored).
         :param timeout_s: tmux-target readiness timeout (ignored).
-        :param verify_delivery: Delivery-ack toggle (ignored).
         :returns: None.
         """
-        del bridge_dir_arg, content, timeout_s, verify_delivery
+        del bridge_dir_arg, content, timeout_s
         with state_lock:
             state["now"] += 1
             state["max"] = max(state["max"], state["now"])
@@ -433,9 +420,8 @@ def _stub_inject(
         *,
         content: str,
         timeout_s: float = 30.0,
-        verify_delivery: bool = True,
     ) -> None:
-        del timeout_s, verify_delivery
+        del timeout_s
         sent.append({"bridge_dir": bridge_dir_arg, "content": content})
 
     return _fake

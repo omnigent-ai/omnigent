@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import importlib
 import io
+import logging
 import os
+import signal
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -17,6 +20,8 @@ import pytest
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _agent_cache_dest,
+    _InitialAuthTokenFactory,
+    _install_crash_logging,
     _load_runner_idle_timeout_s_from_config,
     _make_auth_token_factory,
     _make_managed_mint_factory,
@@ -33,7 +38,10 @@ from omnigent.runner._entry import (
     _server_url_from_env,
     main,
 )
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+from omnigent.runner.identity import (
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+)
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
 
 # Force-load the MCP streamable-http client before any test monkeypatches
@@ -220,6 +228,134 @@ def test_make_auth_token_factory_uses_managed_mint_when_only_binding_token(
 
     assert factory is not None
     assert factory() == "managed-jwt"
+
+
+def test_make_auth_token_factory_prefers_host_delegation_over_user_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host-launched runners mint a scoped bearer without resolving user auth."""
+    resolve_calls: list[int] = []
+
+    def _unexpected_sdk_auth(*args: Any, **kwargs: Any) -> tuple[Any, str]:
+        del args, kwargs
+        resolve_calls.append(1)
+        raise AssertionError("delegated runners must not resolve host Databricks auth")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        _unexpected_sdk_auth,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token",
+        lambda mint_url, server_url, binding_token: ("delegated-jwt", time.time() + 1800),
+    )
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "delegated-jwt"
+    assert resolve_calls == []
+
+
+def test_initial_host_token_defers_local_auth_until_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host bearer covers startup and resolves runner auth only on rejection."""
+    resolve_calls: list[int] = []
+    mint_calls: list[int] = []
+
+    class _SdkAuth:
+        """Refreshable runner-local auth stand-in."""
+
+        def current_token(self) -> str:
+            return "runner-refreshed-token"
+
+    def _resolve(*args: Any, **kwargs: Any) -> tuple[_SdkAuth, str]:
+        del args, kwargs
+        resolve_calls.append(1)
+        return _SdkAuth(), "https://workspace.cloud.databricks.com"
+
+    def _unexpected_mint(*args: Any, **kwargs: Any) -> tuple[str, float]:
+        del args, kwargs
+        mint_calls.append(1)
+        raise AssertionError("bootstrap fallback must use runner-local refresh auth")
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _unexpected_mint)
+
+    factory = _make_auth_token_factory()
+
+    assert isinstance(factory, _InitialAuthTokenFactory)
+    assert RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR not in os.environ
+    assert factory() == "host-bootstrap-token"
+    assert factory() == "host-bootstrap-token"
+    assert resolve_calls == []
+    assert mint_calls == []
+
+    request = httpx.Request("GET", "https://app.databricksapps.com/api/version")
+    redirect = httpx.Response(302, headers={"Location": "/oidc/oauth2/v2.0/authorize"})
+    captured = _drive_auth_flow(_RunnerDatabricksAuth(factory), request, redirect)
+
+    assert captured == [
+        "Bearer host-bootstrap-token",
+        "Bearer runner-refreshed-token",
+    ]
+    assert resolve_calls == [1]
+    assert mint_calls == []
+
+
+def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Apps OAuth redirect makes delegation fall back to refreshable auth."""
+    mint_calls: list[int] = []
+
+    class _SdkAuth:
+        """Refreshable Databricks auth stand-in."""
+
+        def current_token(self) -> str:
+            return "workspace-token"
+
+    def _apps_redirect(mint_url: str, server_url: str, binding_token: str) -> tuple[str, float]:
+        """Model the Apps edge intercepting the mint request before Omnigent."""
+        del server_url, binding_token
+        mint_calls.append(1)
+        request = httpx.Request("POST", mint_url)
+        response = httpx.Response(
+            302,
+            headers={
+                "Location": (
+                    "https://workspace.cloud.databricks.com/oidc/oauth2/v2.0/authorize"
+                    "?redirect_uri=https%3A%2F%2Fapp.databricksapps.com%2F.auth%2Fcallback"
+                )
+            },
+            request=request,
+        )
+        raise httpx.HTTPStatusError("redirected to login", request=request, response=response)
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "https://app.databricksapps.com")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
+    monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth",
+        lambda *args, **kwargs: (_SdkAuth(), "https://workspace.cloud.databricks.com"),
+    )
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _apps_redirect)
+
+    factory = _make_auth_token_factory()
+
+    assert factory is not None
+    assert factory() == "workspace-token"
+    assert mint_calls == [1]
 
 
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
@@ -1123,6 +1259,124 @@ def test_run_parent_death_killer_stands_down_when_adopted() -> None:
         f"an adopted runner must not tear down, but observed {events}; the "
         "web UI would lose a still-live agent on a clean detach"
     )
+
+
+def test_run_parent_death_killer_logs_reason_before_hard_exit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The hard-exit backstop records why it is killing the runner.
+
+    ``os._exit`` skips the exit-reason logging in the tunnel loop's
+    ``finally`` block, so the killer must log the reason itself before
+    hard-exiting — otherwise the parent-death path leaves no explanation
+    in the runner log. Uses an already-orphaned pid, tiny grace, and an
+    injected exit function so the real ``os._exit`` never fires.
+
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    exit_calls: list[int] = []
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"):
+        _run_parent_death_killer(
+            os.getppid() + 100000,  # already "orphaned"
+            lambda: None,
+            poll_interval_s=0.01,
+            grace_s=0.01,
+            exit_fn=exit_calls.append,
+        )
+
+    assert exit_calls == [0]
+    assert any(
+        "runner exiting" in record.message and "parent process died" in record.message
+        for record in caplog.records
+    ), f"expected a parent-death exit log line, got {[r.message for r in caplog.records]}"
+
+
+def test_install_crash_logging_records_uncaught_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An uncaught exception is logged with its type before the process dies.
+
+    This is the "runner randomly died" case: without the hook the only
+    trace is a bare traceback on stderr. The installed ``sys.excepthook``
+    must record the exception (with traceback) to the runner log and then
+    defer to the previously-installed hook so default behavior is intact.
+
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    original_hook = sys.excepthook
+    forwarded: list[str] = []
+    try:
+        sys.excepthook = lambda *args: forwarded.append(args[0].__name__)
+        _install_crash_logging()
+        installed = sys.excepthook
+
+        with caplog.at_level(logging.CRITICAL, logger="omnigent.runner._entry"):
+            try:
+                raise ValueError("boom")
+            except ValueError:
+                installed(*sys.exc_info())
+    finally:
+        sys.excepthook = original_hook
+
+    assert forwarded == ["ValueError"], "the prior excepthook must still run"
+    crash_records = [r for r in caplog.records if "uncaught" in r.message]
+    assert crash_records, "expected the crash hook to log the uncaught exception"
+    record = crash_records[0]
+    assert "ValueError" in record.message
+    assert record.exc_info is not None, "traceback must be attached for diagnosis"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGTERM") or sys.platform == "win32",
+    reason="POSIX signal delivery required",
+)
+async def test_install_signal_handlers_records_signal_reason() -> None:
+    """A shutdown signal both sets the stop event and records its name.
+
+    The recorded reason is what the exit-log line reports, so it must
+    carry the specific signal (e.g. ``SIGTERM``) that stopped the runner
+    rather than a generic "shutdown requested". Delivers a real SIGTERM to
+    this process and waits for the loop handler to fire.
+
+    :returns: None.
+    """
+    from omnigent.runner._entry import _install_signal_handlers
+
+    stop_event = asyncio.Event()
+    reasons: list[str] = []
+    _install_signal_handlers(stop_event, record_reason=reasons.append)
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.remove_signal_handler(sig)
+
+    assert reasons == ["received SIGTERM"]
+
+
+def test_install_crash_logging_is_idempotent() -> None:
+    """Installing the crash hook twice does not stack wrappers.
+
+    ``main`` runs once per process, but tests call it repeatedly; a
+    non-idempotent install would chain a new wrapper each time and log the
+    same crash N times. The second install must be a no-op.
+
+    :returns: None.
+    """
+    original_hook = sys.excepthook
+    try:
+        _install_crash_logging()
+        first = sys.excepthook
+        _install_crash_logging()
+        assert sys.excepthook is first, "second install must not re-wrap"
+    finally:
+        sys.excepthook = original_hook
 
 
 @pytest.mark.asyncio

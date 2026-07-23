@@ -17,8 +17,8 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import type {
-  CodexModelOption,
   ModelUsage,
+  NativeModelOption,
   NestedSessionItem,
   SandboxStatus,
   Session,
@@ -209,7 +209,8 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
-  model_options?: CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  model_options?: NativeModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older

@@ -64,10 +64,12 @@ from omnigent.runner.app import (
     _auto_create_repl_terminal,
     _deliver_subagent_wake_post,
     _KiroNativeLaunchConfig,
+    _load_claude_launch_metadata,
     _log_terminal_lookup_miss,
     _PiNativeLaunchConfig,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
+    _refresh_claude_permission_hook_auth,
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
     _terminal_lookup_miss_log_state,
@@ -83,6 +85,7 @@ from omnigent.runner.resource_registry import (
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo, MCPServerConfig
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import NullServerClient
@@ -1212,6 +1215,73 @@ async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sessions_native_clears_in_flight_on_context_overflow_live_stream() -> None:
+    """clear_in_flight fires for a live (``stream=true``) turn that overflows context.
+
+    Regression for a leak where a context-window overflow on the live-stream
+    path left the reaper's in-flight marker set forever: proxy_stream raised
+    _ContextWindowOverflow uncaught on this path, so _on_proxy_stream_end never
+    ran and the idle reaper (which skips anything in-flight) never reclaimed
+    the harness. The background-turn path already handled this; live turns did
+    not.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_overflow"}}),
+        _sse(
+            {
+                "type": "response.failed",
+                "error": {
+                    "message": (
+                        "context_length_exceeded: 5000 tokens > 4096 maximum context length"
+                    ),
+                    "code": "context_length_exceeded",
+                },
+            }
+        ),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = "b4f6a4f0f2f74d76a2e4c0c9a8e0f9aa"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "965906f5d9fb596610dda599a80faaee",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "openai-agents",
+            },
+        )
+        # Drain the live SSE stream like a real browser client would. Pre-fix
+        # this can surface the uncaught overflow as a transport error; either
+        # way the assertions below are what pin the regression.
+        with contextlib.suppress(Exception):
+            async for _chunk in resp.aiter_text():
+                pass
+
+    # Marked live on response.created, then cleared despite the overflow.
+    assert pm.marked_in_flight == [(conv_id, "resp_overflow")], pm.marked_in_flight
+    assert pm.cleared_in_flight == [conv_id], (
+        f"in-flight marker never cleared on live-stream context overflow "
+        f"(got {pm.cleared_in_flight}) -- the reaper would skip this "
+        f"conversation's harness forever"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stop_session_clears_in_flight_marker() -> None:
     """A mid-stream cancel clears the reaper's in-flight marker.
 
@@ -2270,7 +2340,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert app_server.codex_home == expected_codex_home
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
-    assert build_calls[0]["developer_instructions"] is None
+    assert "developer_instructions" not in build_calls[0]
     assert len(launched_specs) == 1
     launched = launched_specs[0]
     assert launched.command == "/opt/codex/bin/codex"
@@ -3066,9 +3136,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "mean the session snapshot workspace was ignored."
     )
     assert build_calls[0]["cwd"] != bundle_dir.resolve()  # never the spec-bundle dir
-    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
-
-    assert build_calls[0]["developer_instructions"] == SESSION_RENAME_INSTRUCTION
+    assert "developer_instructions" not in build_calls[0]
 
     # Sandbox-override regression: the launched Codex terminal must inherit
     # the agent's sandbox: none rather than falling back to the platform
@@ -4491,6 +4559,82 @@ async def test_create_session() -> None:
     assert "created_at" in body
     assert body["items"] == []
     assert pm.has_session("8e32600337d08f59ad381caf96a90659")
+
+
+@pytest.mark.asyncio
+async def test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks() -> None:
+    """Concurrent v2 initialization resolves once and uses supplied metadata."""
+
+    class _ServerClient:
+        def __init__(self) -> None:
+            self.get_paths: list[str] = []
+
+        async def get(self, path: str, **_kwargs: Any) -> Any:
+            self.get_paths.append(path)
+            if path.endswith("/items"):
+                return type(
+                    "Response",
+                    (),
+                    {"status_code": 200, "json": lambda self: {"data": []}},
+                )()
+            raise AssertionError(f"unexpected metadata callback: {path}")
+
+    server_client = _ServerClient()
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    resolver_entered = asyncio.Event()
+    release_resolver = asyncio.Event()
+    resolver_calls = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolver_calls
+        del agent_id, session_id
+        resolver_calls += 1
+        resolver_entered.set()
+        await release_resolver.wait()
+        return AgentSpec(spec_version=1, name="single-flight")
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    session_id = "initv2_8e32600337d08f59ad381caf96a90659"
+    agent_id = "agentv2_880b5afda28ad55ff74cbeb9b5fc67fb"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "workspace": None,
+                "labels": {},
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        first = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await resolver_entered.wait()
+        second = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await asyncio.sleep(0)
+        release_resolver.set()
+        first_response, second_response = await asyncio.gather(first, second)
+
+    assert first_response.status_code == second_response.status_code == 201
+    assert first_response.json()["created_at"] == 1234
+    assert first_response.json()["session_init_protocol_version"] == 2
+    assert resolver_calls == 1
+    assert len(pm.get_client_calls) == 1
+    assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
 
 
 @pytest.mark.asyncio
@@ -9951,6 +10095,166 @@ async def test_codex_native_model_options_query_model_list(
 
 
 @pytest.mark.asyncio
+async def test_claude_native_model_options_use_session_launch_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runner exposes friendly aliases from one cached Claude config."""
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    conv_id = "6a416804870ed618cc8908f5cebab937"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    config = ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-10",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+        },
+        api_key_helper="printf token",
+        model="system.ai.claude-opus-4-10",
+    )
+    resolved_specs: list[AgentSpec | None] = []
+
+    def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
+        resolved_specs.append(spec)
+        return config
+
+    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event
+        resolver = kwargs.get("resolve_launch_config")
+        recorder = kwargs.get("record_launch_config")
+        assert callable(resolver)
+        assert callable(recorder)
+        recorder(session_id, await resolver())
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _fake_auto_create)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        first = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+        second = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    expected = {
+        "models": [
+            {
+                "id": "opus",
+                "model": "system.ai.claude-opus-4-10",
+                "displayName": "Opus 4.10",
+                "isDefault": True,
+            },
+            {
+                "id": "haiku",
+                "model": "system.ai.claude-haiku-4-5",
+                "displayName": "Haiku 4.5",
+                "isDefault": False,
+            },
+        ]
+    }
+    assert first.status_code == 200
+    assert first.json() == expected
+    assert second.json() == expected
+    # Auto-create and both UI reads shared one launch-time live query.
+    assert resolved_specs == [claude_spec]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_model_options_config_error_is_not_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative-empty catalog answers 424, not the retryable 503.
+
+    The AP server treats 503 as a "runner still booting" retry window; a
+    configuration failure (workspace exposes no Claude models) can't be
+    retried away, so it must use a distinct status.
+    """
+    import click
+
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
+
+    conv_id = "7b527915981fe729dd9a19a6dfcbca48"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    def _resolve(*, spec: AgentSpec | None) -> ClaudeNativeUcodeConfig:
+        del spec
+        raise click.ClickException("Databricks profile 'p' exposes no Claude model services.")
+
+    monkeypatch.setattr("omnigent.claude_native.resolve_native_claude_config", _resolve)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._auto_create_claude_terminal", _fake_auto_create)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert resp.status_code == 424
+    body = resp.json()
+    assert body["error"] == "claude_native_model_options_config"
+    assert "exposes no Claude model services" in body["detail"]
+
+
+@pytest.mark.asyncio
 async def test_events_codex_native_plan_mode_requires_loaded_bridge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -14395,6 +14699,21 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
+    token_calls: list[int] = []
+
+    def _shared_auth_factory() -> str:
+        token_calls.append(1)
+        return "shared-runner-token"
+
+    def _unexpected_auth_resolution(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("terminal launch must reuse the runner auth factory")
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        _unexpected_auth_resolution,
+    )
+
     # The real forwarder opens an HTTP stream to the server; stub it so
     # the auto-create flow runs without network. The created task is
     # scheduled and completes immediately. Capture the kwargs so the
@@ -14444,6 +14763,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        auth_token_factory=_shared_auth_factory,
     )
 
     spec = captured["spec"]
@@ -14454,10 +14774,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     # early no longer cascades into "no server running" (#540).
     assert spec.keep_alive_after_exit is True
     args = spec.args
-    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
-
-    prompt_index = args.index("--append-system-prompt")
-    assert args[prompt_index + 1] == SESSION_RENAME_INSTRUCTION
+    assert "--append-system-prompt" not in args
     settings = json.loads(args[args.index("--settings") + 1])
     assert "PermissionRequest" in settings["hooks"]
     permission_hook = settings["hooks"]["PermissionRequest"][0]["hooks"][0]
@@ -14470,6 +14787,8 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
         bridge_dir_for_bridge_id("4e92b5a0c0ee6db3f874f9c4a3f855a5")
     )
     assert config["ap_server_url"] == "http://127.0.0.1:8000"
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer shared-runner-token"
+    assert token_calls == [1]
 
     # The forwarder must get a refresh-capable httpx.Auth (not just a
     # one-shot Authorization header) so a long-running host-spawned
@@ -14480,6 +14799,49 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
 
     await asyncio.sleep(0)
     assert isinstance(forwarder_kwargs.get("auth"), _RunnerDatabricksAuth)
+
+
+@pytest.mark.asyncio
+async def test_claude_permission_hook_snapshot_refreshes_without_binding_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent runner refreshes delegated hook auth in the bridge file."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("refresh-hook-auth", workspace=tmp_path)
+    claude_native_bridge.build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigent.example.com",
+        ap_auth_headers={"Authorization": "Bearer old-token"},
+    )
+
+    task = asyncio.create_task(
+        _refresh_claude_permission_hook_auth(
+            bridge_dir=bridge_dir,
+            server_url="https://omnigent.example.com",
+            auth_token_factory=lambda: "fresh-delegated-token",
+            refresh_interval_s=0.01,
+        )
+    )
+    try:
+
+        async def _wait_for_refresh() -> None:
+            while True:
+                config = read_permission_hook_config(bridge_dir)
+                if config.get("ap_auth_headers", {}).get("Authorization") == (
+                    "Bearer fresh-delegated-token"
+                ):
+                    return
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_wait_for_refresh(), timeout=1.0)
+    finally:
+        task.cancel()
+        _ = await asyncio.gather(task, return_exceptions=True)
+
+    config = read_permission_hook_config(bridge_dir)
+    assert config["ap_auth_headers"]["Authorization"] == "Bearer fresh-delegated-token"
 
 
 @pytest.mark.asyncio
@@ -14914,7 +15276,9 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_claude_terminal_passes_session_effort(
+    use_envelope: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -14970,21 +15334,46 @@ async def test_auto_create_claude_terminal_passes_session_effort(
             )
 
     # Fake Omnigent server client that returns a session with reasoning_effort.
+    def _handle_request(_request: httpx.Request) -> httpx.Response:
+        if use_envelope:
+            raise AssertionError("envelope terminal startup made a legacy HTTP callback")
+        return httpx.Response(
+            200,
+            json={"reasoning_effort": "high", "labels": {}},
+        )
+
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
-        transport=httpx.MockTransport(
-            lambda req: httpx.Response(
-                200,
-                json={"reasoning_effort": "high", "labels": {}},
-            )
-        ),
+        transport=httpx.MockTransport(_handle_request),
+    )
+
+    session_id = "f89fd41f6eefee45b2117ac0fcbc73fa"
+    session_init = (
+        RunnerSessionInitEnvelope.model_validate(
+            {
+                "protocol_version": 2,
+                "server_version": "0.6.0.dev0",
+                "session_id": session_id,
+                "agent_id": "agent",
+                "snapshot": {
+                    "created_at": 10,
+                    "updated_at": 11,
+                    "workspace": str(tmp_path),
+                    "reasoning_effort": "high",
+                    "labels": {},
+                },
+            }
+        )
+        if use_envelope
+        else None
     )
 
     await _auto_create_claude_terminal(
-        "f89fd41f6eefee45b2117ac0fcbc73fa",
+        session_id,
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
+        session_init=session_init,
     )
 
     args = captured["spec"].args
@@ -14993,6 +15382,46 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     assert args[effort_idx + 1] == "high"
 
     await fake_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_claude_launch_metadata_envelope_never_calls_server() -> None:
+    """Resume configuration comes entirely from a v2 envelope."""
+
+    class _NoCallbackClient:
+        async def get(self, path: str, **_kwargs: Any) -> Any:
+            raise AssertionError(f"envelope path made legacy callback: {path}")
+
+    envelope = RunnerSessionInitEnvelope.model_validate(
+        {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": "conv_resume",
+            "agent_id": "agent_resume",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": "/tmp/worktree",
+                "reasoning_effort": "high",
+                "model_override": "claude-opus-4-7",
+                "terminal_launch_args": ["--verbose"],
+                "external_session_id": "claude-session-id",
+                "labels": {"omnigent.fork.carry_history": "1"},
+            },
+        }
+    )
+
+    metadata = await _load_claude_launch_metadata(
+        server_client=_NoCallbackClient(),  # type: ignore[arg-type]
+        session_id="conv_resume",
+        session_init=envelope,
+    )
+
+    assert metadata.reasoning_effort == "high"
+    assert metadata.model_override == "claude-opus-4-7"
+    assert metadata.terminal_launch_args == ["--verbose"]
+    assert metadata.external_session_id == "claude-session-id"
+    assert metadata.fork_carry_history is True
 
 
 def test_agent_os_env_from_spec_unwraps_resolved_and_handles_none() -> None:
@@ -15234,12 +15663,14 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
             lambda req: httpx.Response(200, json={"labels": {}}),
         ),
     )
+    recorded_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
 
     await _auto_create_claude_terminal(
         "13efa494411f3ae60211e6be5635062a",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=fake_client,
+        record_launch_config=recorded_configs.__setitem__,
     )
 
     spec = captured["spec"]
@@ -15258,6 +15689,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # The apiKeyHelper threaded into the Claude settings augment so the
     # gateway token command is registered.
     assert "databricks auth token --fake-helper" in " ".join(spec.args)
+    assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
     await fake_client.aclose()
 
@@ -15599,10 +16031,12 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     # snapshot carried an external session id.
     if snapshot_external_id is None:
         assert synth_calls == []
-        assert "--append-system-prompt" in launched_args
     else:
         assert synth_calls == [snapshot_external_id]
-        assert "--append-system-prompt" not in launched_args
+
+    # Session titles are generated by an isolated background job, so neither
+    # fresh nor resumed Claude terminals receive framework rename instructions.
+    assert "--append-system-prompt" not in launched_args
 
 
 @pytest.mark.asyncio
@@ -16347,8 +16781,10 @@ _AUTO_CREATE_SCENARIOS = [
 @pytest.mark.parametrize(
     "scenario", _AUTO_CREATE_SCENARIOS, ids=[s.case_id for s in _AUTO_CREATE_SCENARIOS]
 )
+@pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_create_session_auto_create_guard_skips_rotation_targets(
     scenario: _AutoCreateScenario,
+    use_envelope: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -16450,13 +16886,28 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         terminal_registry=terminal_registry,
     )
 
+    payload: dict[str, Any] = {
+        "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
+        "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+    }
+    if use_envelope:
+        payload["session_init"] = {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": payload["session_id"],
+            "agent_id": payload["agent_id"],
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(tmp_path),
+                "labels": {BRIDGE_ID_LABEL_KEY: scenario.bridge_id_label},
+            },
+        }
+
     async with _runner_client(app) as client:
         resp = await client.post(
             "/v1/sessions",
-            json={
-                "session_id": "2d1b1a96e3e08f2cd43c0cc4b695ac5d",
-                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
-            },
+            json=payload,
         )
     assert resp.status_code == 201, resp.text
 

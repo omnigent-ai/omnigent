@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 
 import httpx
 import jwt
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from starlette.responses import RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -556,7 +556,10 @@ def create_auth_router(
     # ── Admin: read-only user list ────────────────────────────────
 
     @router.get("/users")
-    async def list_users(request: Request) -> Response:
+    async def list_users(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> Response:
         """List all users (admin only).
 
         The OIDC analog of the accounts provider's ``GET /auth/users``
@@ -587,7 +590,7 @@ def create_auth_router(
         if not is_admin:
             return JSONResponse(status_code=403, content={"error": "admin only"})
 
-        users = permission_store.list_users() if permission_store is not None else []
+        users = permission_store.list_users(limit=limit) if permission_store is not None else []
         return JSONResponse(
             status_code=200,
             content={

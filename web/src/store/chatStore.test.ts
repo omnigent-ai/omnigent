@@ -2484,8 +2484,9 @@ describe("chatStore — send while streaming (queueing)", () => {
     // The denied queued message was never persisted, so its optimistic
     // bubble must disappear even though the previous response is still live.
     expect(state.pendingUserMessages).toEqual([]);
-    // Denying the queued input must not mark the already-streaming prior
-    // response idle; that response still needs its own response_end.
+    // The denied branch of `send` only settles status when NOT already
+    // streaming, so the POST-return path leaves the prior turn's
+    // running/streaming state intact here.
     expect(state.status).toBe("streaming");
     expect(state.sessionStatus).toBe("running");
     expect(state.activeResponse).toEqual({
@@ -2494,17 +2495,28 @@ describe("chatStore — send while streaming (queueing)", () => {
       error: null,
     });
 
+    // Accepted trade-off: the server's deny short-circuit still publishes a
+    // session-level running→idle pair for the denied out-of-band input, and
+    // the client now trusts `session.status` 1:1 (the guard that used to
+    // suppress this stray idle was removed to fix the fresh-session
+    // "Working…" persists bug). So this idle DOES flip `sessionStatus` to
+    // idle mid-stream. The bubble lifecycle is unaffected — `status` /
+    // `activeResponse` still defer to the streaming turn's own response_end —
+    // and the next real status edge re-asserts running, so the effect is a
+    // brief indicator blip confined to the rare deny-while-streaming case.
     handleSessionEvent({
       type: "session_status",
       conversationId: "conv_abc",
       status: "idle",
     });
     const afterIdle = useChatStore.getState();
-    // The server's deny short-circuit publishes running→idle for the
-    // queued input. That idle must not clear the prior response's
-    // running/working signal while its active response is still streaming.
+    expect(afterIdle.sessionStatus).toBe("idle");
     expect(afterIdle.status).toBe("streaming");
-    expect(afterIdle.sessionStatus).toBe("running");
+    expect(afterIdle.activeResponse).toEqual({
+      responseId: "resp_in_flight",
+      state: "streaming",
+      error: null,
+    });
   });
 });
 
@@ -2580,6 +2592,57 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     const state = useChatStore.getState();
     expect(state.sessionStatus).toBe("idle");
     expect(state.backgroundTaskCount).toBe(0);
+  });
+
+  it("frees the local send lifecycle on a Stop-derived waiting edge (with responseId)", () => {
+    // Regression: the claude/cursor-native Stop hook posts the turn-end
+    // `waiting` edge WITH the ended turn's `response_id`. It must finalize the
+    // local `status` to idle (the turn is done) so the composer sends the next
+    // message instead of queuing it — while `sessionStatus` stays `waiting` and
+    // the shell count sticks, keeping the "Working…" spinner lit.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      backgroundTaskCount: 0,
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      responseId: "resp_1",
+      backgroundTaskCount: 1,
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse?.state).toBe("completed");
+    expect(state.sessionStatus).toBe("waiting");
+    expect(state.backgroundTaskCount).toBe(1);
+  });
+
+  it("frees the local send lifecycle on a waiting edge whose id doesn't match", () => {
+    // A `waiting` edge that carries no id (or a stale one) with no tracked
+    // response must still free the send lifecycle so a message isn't stranded.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      backgroundTaskCount: 0,
+      activeResponse: { responseId: "resp_1", state: "streaming", error: null },
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "waiting",
+      backgroundTaskCount: 1,
+    });
+    const state = useChatStore.getState();
+    expect(state.status).toBe("idle");
+    expect(state.sessionStatus).toBe("waiting");
+    // The stale streaming bubble is finalized so it doesn't linger spinning —
+    // no future edge names this id to close it.
+    expect(state.activeResponse?.state).toBe("completed");
   });
 
   it("clears the shell count when a new turn starts (running edge)", () => {
@@ -3209,7 +3272,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
-    it("idle preserves a still-streaming active response until response_end arrives", () => {
+    it("idle settles sessionStatus but preserves a still-streaming bubble until response_end", () => {
       useChatStore.setState({
         status: "streaming",
         sessionStatus: "running",
@@ -3223,16 +3286,20 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
 
       const state = useChatStore.getState();
-      // A real response bubble is closed by response_end, not by the
-      // coarser session.status signal. Clearing status here would make
-      // the bubble lifecycle disagree with the streaming reducer.
+      // sessionStatus tracks the server's session-level status 1:1 — a server
+      // idle means idle, and the "Working…" indicator (which reads only
+      // sessionStatus) must turn off. The bubble lifecycle is separate: a real
+      // response bubble is still closed by response_end, not by the coarser
+      // session.status signal, so the local `status`/`activeResponse` stay
+      // streaming until response_end lands (dropping the guard that used to
+      // strand sessionStatus at "running" — the "Working…" persists bug).
+      expect(state.sessionStatus).toBe("idle");
       expect(state.status).toBe("streaming");
       expect(state.activeResponse).toEqual({
         responseId: "resp_live",
         state: "streaming",
         error: null,
       });
-      expect(state.sessionStatus).toBe("running");
     });
 
     it("idle refetches the parent's child list when the conversation is a child", () => {
@@ -5270,6 +5337,21 @@ describe("chatStore — elicitation_resolved", () => {
 // PATCH fires as a side effect so the next turn uses the override
 // server-side.
 describe("chatStore — bindStream sticky-pref handoff", () => {
+  const CLAUDE_MODEL_OPTIONS = [
+    {
+      id: "opus",
+      model: "system.ai.claude-opus-4-10",
+      displayName: "Opus 4.10",
+      isDefault: true,
+    },
+    {
+      id: "sonnet",
+      model: "system.ai.claude-sonnet-5",
+      displayName: "Sonnet 5",
+      isDefault: false,
+    },
+  ];
+
   interface SnapshotOverrides {
     labels?: Record<string, string>;
     reasoning_effort?: string | null;
@@ -5319,11 +5401,14 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
   it("PATCHes sticky model and effort onto a claude-native session with no overrides", async () => {
     seedSession("conv_cn", []);
-    withSnapshot("conv_cn", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+    withSnapshot("conv_cn", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_options: CLAUDE_MODEL_OPTIONS,
+    });
 
     useChatStore.setState({
       selectedEffort: "high",
-      selectedModel: "claude-opus-4-7",
+      selectedModel: "opus",
     });
     await useChatStore.getState().switchTo("conv_cn");
 
@@ -5331,14 +5416,254 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     // Model is silent; effort must notify the running native session.
     expect(patches).toEqual(
       expect.arrayContaining([
-        { model_override: "claude-opus-4-7", silent: true },
+        { model_override: "opus", silent: true },
         { reasoning_effort: "high" },
       ]),
     );
 
     const state = useChatStore.getState();
-    expect(state.selectedModel).toBe("claude-opus-4-7");
+    expect(state.selectedModel).toBe("opus");
     expect(state.selectedEffort).toBe("high");
+  });
+
+  it("applies a persisted Claude model after delayed model options arrive", async () => {
+    seedSession("conv_cn_delayed", []);
+    window.localStorage.setItem("omnigent.picker.model", "opus");
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_delayed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        return mockResponse({
+          id: "conv_cn_delayed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    await useChatStore.getState().switchTo("conv_cn_delayed");
+
+    expect(patchCallsFor("conv_cn_delayed").some((p) => "model_override" in p)).toBe(false);
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_delayed",
+    });
+    await tick();
+
+    expect(patchCallsFor("conv_cn_delayed")).toEqual(
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: "opus",
+      sessionModelOverride: "opus",
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("refetches a resolved Claude catalog when its event races the bind snapshot", async () => {
+    seedSession("conv_cn_race", []);
+    window.localStorage.setItem("omnigent.picker.model", "opus");
+    let resolveInitialSnapshot: ((response: Response) => void) | null = null;
+    let resolveItems: ((response: Response) => void) | null = null;
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cn_race/items")) {
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          resolveItems = resolve;
+        }).then(() => response);
+      }
+      if (url.split("?")[0] === "/v1/sessions/conv_cn_race" && (init?.method ?? "GET") === "GET") {
+        snapshotCount += 1;
+        const response = mockResponse({
+          id: "conv_cn_race",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+        if (snapshotCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveInitialSnapshot = resolve;
+          });
+        }
+        return response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "opus" });
+    const switchPromise = useChatStore.getState().switchTo("conv_cn_race");
+    await tick();
+    expect(resolveInitialSnapshot).not.toBeNull();
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_race",
+    });
+    resolveInitialSnapshot!(
+      mockResponse({
+        id: "conv_cn_race",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        model_override: null,
+        model_options: [],
+      }),
+    );
+    await tick();
+    expect(snapshotCount).toBe(2);
+    resolveItems!(mockResponse({}));
+    await switchPromise;
+    await tick();
+
+    expect(patchCallsFor("conv_cn_race")).toEqual(
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: "opus",
+      sessionModelOverride: "opus",
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("drops a removed sticky alias when the resolved catalog wins the bind race", async () => {
+    // Same race as above, but the sticky pick ("fable") is absent from the
+    // raced catalog: the bind's raced branch must not leave it visually
+    // selected with no server override behind it.
+    seedSession("conv_cn_race_removed", []);
+    window.localStorage.setItem("omnigent.picker.model", "fable");
+    let resolveInitialSnapshot: ((response: Response) => void) | null = null;
+    let resolveItems: ((response: Response) => void) | null = null;
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_cn_race_removed/items")) {
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          resolveItems = resolve;
+        }).then(() => response);
+      }
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_race_removed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        const response = mockResponse({
+          id: "conv_cn_race_removed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+        if (snapshotCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveInitialSnapshot = resolve;
+          });
+        }
+        return response;
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    const switchPromise = useChatStore.getState().switchTo("conv_cn_race_removed");
+    await tick();
+    expect(resolveInitialSnapshot).not.toBeNull();
+
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_race_removed",
+    });
+    resolveInitialSnapshot!(
+      mockResponse({
+        id: "conv_cn_race_removed",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        items: [],
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        model_override: null,
+        model_options: [],
+      }),
+    );
+    await tick();
+    resolveItems!(mockResponse({}));
+    await switchPromise;
+    await tick();
+
+    expect(patchCallsFor("conv_cn_race_removed").some((patch) => "model_override" in patch)).toBe(
+      false,
+    );
+    expect(useChatStore.getState()).toMatchObject({
+      selectedModel: null,
+      sessionModelOverride: null,
+      codexModelOptions: CLAUDE_MODEL_OPTIONS,
+    });
+    window.localStorage.removeItem("omnigent.picker.model");
+  });
+
+  it("does not apply a persisted Claude alias removed from the delayed catalog", async () => {
+    seedSession("conv_cn_delayed_removed", []);
+    window.localStorage.setItem("omnigent.picker.model", "fable");
+    let snapshotCount = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_cn_delayed_removed" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        snapshotCount += 1;
+        return mockResponse({
+          id: "conv_cn_delayed_removed",
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          model_override: null,
+          model_options: snapshotCount === 1 ? [] : CLAUDE_MODEL_OPTIONS,
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    await useChatStore.getState().switchTo("conv_cn_delayed_removed");
+    handleSessionEvent({
+      type: "session_model_options",
+      conversationId: "conv_cn_delayed_removed",
+    });
+    await tick();
+
+    expect(
+      patchCallsFor("conv_cn_delayed_removed").some((patch) => "model_override" in patch),
+    ).toBe(false);
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
+    window.localStorage.removeItem("omnigent.picker.model");
   });
 
   it("does NOT apply a sticky model to a routing-enabled session", async () => {
@@ -5409,11 +5734,12 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     withSnapshot("conv_child", {
       labels: { "omnigent.wrapper": "claude-code-native-ui" },
       parent_session_id: "conv_parent",
+      model_options: CLAUDE_MODEL_OPTIONS,
     });
 
     useChatStore.setState({
       selectedEffort: "xhigh",
-      selectedModel: "claude-opus-4-7",
+      selectedModel: "opus",
     });
     await useChatStore.getState().switchTo("conv_child");
 
@@ -5424,7 +5750,7 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     // Sticky prefs are preserved for later top-level sessions.
     const state = useChatStore.getState();
     expect(state.selectedEffort).toBe("xhigh");
-    expect(state.selectedModel).toBe("claude-opus-4-7");
+    expect(state.selectedModel).toBe("opus");
   });
 
   it("does NOT PATCH a non-Claude sticky model onto a claude-native session", async () => {
@@ -5442,6 +5768,20 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
 
     const patches = patchCallsFor("conv_cn_gpt");
     expect(patches.some((p) => "model_override" in p)).toBe(false);
+  });
+
+  it("does NOT PATCH a removed Claude alias onto a new session", async () => {
+    seedSession("conv_cn_removed", []);
+    withSnapshot("conv_cn_removed", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_options: CLAUDE_MODEL_OPTIONS,
+    });
+
+    useChatStore.setState({ selectedEffort: null, selectedModel: "fable" });
+    await useChatStore.getState().switchTo("conv_cn_removed");
+
+    expect(patchCallsFor("conv_cn_removed").some((p) => "model_override" in p)).toBe(false);
+    expect(useChatStore.getState().sessionModelOverride).toBeNull();
   });
 
   it("does NOT PATCH a non-Codex sticky model onto a codex-native session", async () => {
@@ -5655,15 +5995,18 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     // The claude-native handoff persists the sticky model, so it IS the
     // session's active override — `/model` should show it.
     seedSession("conv_sticky_cn", []);
-    withSnapshot("conv_sticky_cn", { labels: { "omnigent.wrapper": "claude-code-native-ui" } });
+    withSnapshot("conv_sticky_cn", {
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      model_options: CLAUDE_MODEL_OPTIONS,
+    });
 
-    useChatStore.setState({ selectedModel: "claude-opus-4-7", sessionModelOverride: null });
+    useChatStore.setState({ selectedModel: "opus", sessionModelOverride: null });
     await useChatStore.getState().switchTo("conv_sticky_cn");
 
     expect(patchCallsFor("conv_sticky_cn")).toEqual(
-      expect.arrayContaining([{ model_override: "claude-opus-4-7", silent: true }]),
+      expect.arrayContaining([{ model_override: "opus", silent: true }]),
     );
-    expect(useChatStore.getState().sessionModelOverride).toBe("claude-opus-4-7");
+    expect(useChatStore.getState().sessionModelOverride).toBe("opus");
   });
 
   it("does NOT surface a non-Claude sticky model as the session override (claude-native)", async () => {
@@ -8335,6 +8678,29 @@ describe("chatStore — client-side message queue", () => {
     expect(sendSpy.mock.calls[1]!.slice(0, 2)).toEqual(["second", "agent_xyz"]);
   });
 
+  // Regression: a background shell / still-running sub-agent keeps the session
+  // in `waiting` after the turn ends, but the server's turn gate is already
+  // free. The flush must NOT treat `waiting` as busy — otherwise a queued
+  // message stays stuck until full idle even though a new turn could start now.
+  it("flushes the head on `waiting` (background work outlives the turn)", async () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "waiting",
+      backgroundTaskCount: 1,
+      send: sendSpy,
+      queuedMessages: [{ queueId: "q_1", text: "first", conversationId: "conv_abc" }],
+    });
+
+    useChatStore.getState().maybeFlushQueuedHead();
+    await tick();
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["first", "agent_xyz"]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it("does not flush a queue owned by a different conversation", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
@@ -8420,7 +8786,7 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["b1"]);
   });
 
-  it("does not flush while busy (streaming or running/waiting)", () => {
+  it("does not flush while busy (streaming or running)", () => {
     const sendSpy = vi.fn().mockResolvedValue(undefined);
     const base = {
       conversationId: "conv_abc",
@@ -8434,9 +8800,6 @@ describe("chatStore — client-side message queue", () => {
     useChatStore.getState().maybeFlushQueuedHead();
     // Server-side turn still running.
     useChatStore.setState({ ...base, status: "idle", sessionStatus: "running" });
-    useChatStore.getState().maybeFlushQueuedHead();
-    // Draining background work.
-    useChatStore.setState({ ...base, status: "idle", sessionStatus: "waiting" });
     useChatStore.getState().maybeFlushQueuedHead();
 
     expect(sendSpy).not.toHaveBeenCalled();

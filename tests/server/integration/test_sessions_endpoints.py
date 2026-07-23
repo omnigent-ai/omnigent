@@ -23,6 +23,7 @@ import pytest
 
 from omnigent.llms.context_window import ModelPricing
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.spec.types import SkillSpec
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -137,6 +138,239 @@ async def test_create_session_without_title_returns_none(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     assert session["title"] is None
+
+
+async def test_first_message_schedules_background_semantic_title(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first user turn returns normally while title generation runs separately."""
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    generated = asyncio.Event()
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        assert request.session_id == session["id"]
+        assert request.prompt == "please investigate the authentication timeout"
+        generated.set()
+        return "Debug authentication timeout"
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    # The events endpoint seeds the title synchronously before returning, so the
+    # coordinator observes the expected seed and renames it. Writing our own seed
+    # here would race that rename and clobber it, so rely on the endpoint's seed.
+    await asyncio.wait_for(generated.wait(), timeout=5)
+    await coordinator.wait_for_idle()
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "Debug authentication timeout"
+
+
+async def test_background_title_failure_does_not_break_subsequent_user_turn(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed title job leaves the session able to accept later user turns."""
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    generator_started = asyncio.Event()
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        generator_started.set()
+        raise RuntimeError("fake title generator failed")
+
+    coordinator = app.state.background_title_coordinator
+    coordinator._generator = generator
+    forwarded_requests: list[httpx.Request] = []
+
+    def forward_to_runner(request: httpx.Request) -> httpx.Response:
+        forwarded_requests.append(request)
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(forward_to_runner),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    first_message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "investigate the timeout"}],
+        },
+    }
+    second_message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue investigating"}],
+        },
+    }
+
+    try:
+        first_response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=first_message,
+        )
+        assert first_response.status_code == 202, first_response.text
+
+        store = SqlAlchemyConversationStore(db_uri)
+        store.update_conversation(session["id"], title="investigate the timeout")
+        await asyncio.wait_for(generator_started.wait(), timeout=5)
+        await coordinator.wait_for_idle()
+
+        snapshot = await client.get(f"/v1/sessions/{session['id']}")
+        assert snapshot.json()["title"] == "investigate the timeout"
+
+        second_response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json=second_message,
+        )
+        assert second_response.status_code == 202, second_response.text
+    finally:
+        await fake_runner.aclose()
+
+    assert len(forwarded_requests) == 2
+
+
+async def test_initial_item_schedules_background_semantic_title(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
+    generated = asyncio.Event()
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        assert request.prompt == "please investigate the authentication timeout"
+        generated.set()
+        return "Debug authentication timeout"
+
+    app.state.background_title_coordinator._generator = generator
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+    agent = await create_test_agent(client)
+    try:
+        session = await _create_session(
+            client,
+            agent["id"],
+            initial_message="please investigate the authentication timeout",
+        )
+    finally:
+        await fake_runner.aclose()
+
+    await asyncio.wait_for(generated.wait(), timeout=5)
+    await app.state.background_title_coordinator.wait_for_idle()
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "Debug authentication timeout"
+
+
+async def test_native_user_item_schedules_background_semantic_title(
+    client: httpx.AsyncClient,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    generated = asyncio.Event()
+
+    async def generator(request: BackgroundTitleRequest) -> str:
+        assert request.prompt == "please investigate the authentication timeout"
+        generated.set()
+        return "Debug authentication timeout"
+
+    app.state.background_title_coordinator._generator = generator
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "please investigate the authentication timeout",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 202, response.text
+    await asyncio.wait_for(generated.wait(), timeout=5)
+    await app.state.background_title_coordinator.wait_for_idle()
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot.json()["title"] == "Debug authentication timeout"
 
 
 # ── GET /v1/sessions (list) ──────────────────────────────
@@ -1258,6 +1492,9 @@ async def test_external_meta_user_message_persists_without_live_input_event(
     meta = next(item for item in items if item["type"] == "message")
     assert meta["is_meta"] is True
     assert meta["content"][0]["text"] == "<skill>hidden</skill>"
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.status_code == 200
+    assert snap.json()["title"] is None
     assert published == []
 
 

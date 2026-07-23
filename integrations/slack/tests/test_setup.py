@@ -6,6 +6,7 @@ import respx
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.setup import (
+    ACTION_SETUP_START,
     AGENT_BLOCK,
     CALLBACK_SETUP_INFO,
     HOST_BLOCK,
@@ -62,6 +63,9 @@ class FakeSetupClient:
 
     async def team_info(self, **kwargs: Any) -> dict[str, Any]:
         return {"ok": True, "team": {"id": kwargs.get("team", "T1"), "name": "Acme Corp"}}
+
+    async def users_info(self, **kwargs: Any) -> dict[str, Any]:
+        return {"ok": True, "user": {"profile": {"email": "user@example.com"}}}
 
 
 class SlackResponseLike:
@@ -420,6 +424,193 @@ async def test_logout_revokes_all_and_clears_settings(tmp_path: Path) -> None:
     assert any("Logged out" in str(p.get("text", "")) for p in client.posts)
 
 
+class _EnrollAuth:
+    """Minimal auth manager stub for the Databricks enrollment path."""
+
+    enabled = True
+
+    def __init__(self) -> None:
+        self.awaited: list[dict[str, Any]] = []
+
+    def await_enrollment_in_background(self, **kwargs: Any) -> None:
+        self.awaited.append(kwargs)
+
+
+def _enroll_flow(
+    store: SQLiteStore, pool: OmnigentClientPool, auth: Any, enrollment_url: Any
+) -> SetupFlow:
+    return SetupFlow(
+        store=store,
+        pool=pool,
+        server_url=_SERVER,
+        auth_manager=auth,
+        enrollment_url=enrollment_url,
+    )
+
+
+async def test_databricks_enrollment_shows_link_bound_to_slack_email(tmp_path: Path) -> None:
+    # The enrollment link must be built from the user's Slack email (looked up
+    # via users.info), so the callback can bind it to X-Forwarded-Email.
+    seen: list[tuple[str, str, str, str]] = []
+
+    def _url(team_id: str, user_id: str, email: str, team_name: str = "") -> str:
+        seen.append((team_id, user_id, email, team_name))
+        return f"https://bot.example.com/auth/callback?state=signed-{email}"
+
+    auth = _EnrollAuth()
+    pool = OmnigentClientPool()
+    flow = _enroll_flow(await _store(tmp_path), pool, auth, _url)
+    client = FakeSetupClient()
+    try:
+        await flow._begin_databricks_enrollment(
+            client, team_id="T1", user_id="U1", server_url=_SERVER, view_id="V1"
+        )
+    finally:
+        await pool.aclose_all()
+
+    # Email + workspace name were resolved from Slack and passed to the minter.
+    assert seen == [("T1", "U1", "user@example.com", "Acme Corp")]
+    # The waiting modal shows the signed link and the poll was started.
+    body = _last_update(client)["blocks"][0]["text"]["text"]
+    assert "auth/callback?state=signed-user@example.com" in body
+    assert len(auth.awaited) == 1
+
+
+@respx.mock
+async def test_post_enrollment_advance_uses_freshly_stored_token(tmp_path: Path) -> None:
+    # Regression: setup pools a TOKENLESS client during the pre-login probe. The
+    # pool resolves auth only at client creation, so after enrollment stores a
+    # token the cached client still has none — its re-validate re-hits the auth
+    # wall and the modal stalls on "requires authentication". _on_success must
+    # invalidate that cached client so the re-fetch picks up the new token.
+    from omnigent_slack.omnigent import ClientAuth
+
+    # A mutable token that only appears after "enrollment".
+    token_box: dict[str, str | None] = {"token": None}
+
+    async def _resolver(server_url: str, user_id: str) -> ClientAuth | None:
+        tok = token_box["token"]
+        return ClientAuth(tok, lambda: _noop()) if tok else None
+
+    async def _noop() -> str | None:
+        return None
+
+    # /health and the listing endpoints require the bearer: 401 without it, 200
+    # with it — mirroring an auth-gated server.
+    def _needs_auth(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("authorization") == "Bearer real-token":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(401)
+
+    respx.get(_SERVER + "/health").mock(side_effect=_needs_auth)
+    respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        return_value=httpx.Response(
+            200,
+            json={"data": [{"name": ".bashrc", "path": "/home/bob/.bashrc", "type": "file"}]},
+        )
+    )
+
+    def _url(team_id: str, user_id: str, email: str, team_name: str = "") -> str:
+        return "https://bot/callback"
+
+    auth = _EnrollAuth()
+    pool = OmnigentClientPool()
+    pool.set_auth_resolver(_resolver)
+    flow = _enroll_flow(await _store(tmp_path), pool, auth, _url)
+    client = FakeSetupClient()
+
+    try:
+        # Full flow: _begin_setup probes the server (pooling a TOKENLESS client
+        # when validate 401s), which routes into the Databricks enrollment path.
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+        # Enrollment stores the token, then fires the success hook.
+        token_box["token"] = "real-token"
+        on_success = auth.awaited[-1]["on_success"]
+        await on_success()
+    finally:
+        await pool.aclose_all()
+
+    # The modal advanced to the agent/host select rather than stalling.
+    view = _last_update(client)
+    assert view["callback_id"] == "omnigent_setup_select"
+
+
+async def test_databricks_enrollment_fails_closed_without_email(tmp_path: Path) -> None:
+    # If Slack won't give us the email (missing users:read.email scope), we must
+    # NOT issue an unverifiable link — show an error and don't start the poll.
+    class NoEmailClient(FakeSetupClient):
+        async def users_info(self, **kwargs: Any) -> dict[str, Any]:
+            return {"ok": True, "user": {"profile": {}}}
+
+    def _url(*args: Any, **kwargs: Any) -> str:  # pragma: no cover - must not be called
+        raise AssertionError("enrollment_url must not be called without an email")
+
+    auth = _EnrollAuth()
+    pool = OmnigentClientPool()
+    flow = _enroll_flow(await _store(tmp_path), pool, auth, _url)
+    client = NoEmailClient()
+    try:
+        await flow._begin_databricks_enrollment(
+            client, team_id="T1", user_id="U1", server_url=_SERVER, view_id="V1"
+        )
+    finally:
+        await pool.aclose_all()
+
+    body = _last_update(client)["blocks"][0]["text"]["text"]
+    assert "email" in body.lower()
+    assert auth.awaited == []
+
+
+@respx.mock
+async def test_post_enrollment_validate_failure_shows_error_not_hang(tmp_path: Path) -> None:
+    # Regression: the callback stored a token (browser shows "You're connected"),
+    # but validating it against the server fails — e.g. the granted scope isn't
+    # accepted. The modal must show a failure screen, not hang on "waiting".
+    from omnigent_slack.omnigent import ClientAuth
+
+    async def _resolver(server_url: str, user_id: str) -> ClientAuth | None:
+        return ClientAuth("stored-but-rejected", lambda: _noop())
+
+    async def _noop() -> str | None:
+        return None
+
+    # The server keeps rejecting the token even after it's stored.
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(401))
+
+    def _url(team_id: str, user_id: str, email: str, team_name: str = "") -> str:
+        return "https://bot/callback"
+
+    auth = _EnrollAuth()
+    pool = OmnigentClientPool()
+    pool.set_auth_resolver(_resolver)
+    flow = _enroll_flow(await _store(tmp_path), pool, auth, _url)
+    client = FakeSetupClient()
+
+    try:
+        await flow._begin_databricks_enrollment(
+            client, team_id="T1", user_id="U1", server_url=_SERVER, view_id="V1"
+        )
+        # Fire the success hook as the poll would once the token lands.
+        on_success = auth.awaited[-1]["on_success"]
+        await on_success()
+    finally:
+        await pool.aclose_all()
+
+    view = _last_update(client)
+    # Not stuck on the waiting screen, and not advanced to select — a clear error.
+    assert view["callback_id"] != "omnigent_setup_select"
+    body = view["blocks"][0]["text"]["text"]
+    assert "didn't complete" in body.lower() or "rejected" in body.lower()
+
+
 @respx.mock
 async def test_setup_reports_unreachable(tmp_path: Path) -> None:
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(500))
@@ -593,3 +784,151 @@ async def test_config_command_opens_connecting_modal(tmp_path: Path) -> None:
     assert ack.calls == [{}]
     assert client.opened_views and client.opened_views[0]["trigger_id"] == "tid-1"
     assert client.opened_views[0]["view"]["callback_id"] == CALLBACK_SETUP_INFO
+
+
+@respx.mock
+async def test_setup_settles_modal_before_first_update(tmp_path: Path, monkeypatch: Any) -> None:
+    # The just-opened modal must settle on the client before the first
+    # views_update, or Slack accepts the update (ok:true) while the not-yet-
+    # rendered client drops it and the modal hangs on "Connecting…". Assert the
+    # settle sleep runs, and runs BEFORE any views_update fires.
+    respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
+    respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
+    respx.get(_SERVER + "/v1/hosts").mock(
+        return_value=httpx.Response(
+            200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
+        )
+    )
+    respx.get(_SERVER + "/v1/hosts/h1/filesystem").mock(
+        return_value=httpx.Response(200, json={"data": []})
+    )
+
+    events: list[str] = []
+
+    import omnigent_slack.setup as setup_mod
+
+    real_sleep = setup_mod.asyncio.sleep
+
+    async def _tracking_sleep(delay: float) -> None:
+        # Only the settle sleep (>0) is interesting; don't record 0-delay yields.
+        if delay > 0:
+            events.append(f"sleep:{delay}")
+        await real_sleep(0)
+
+    monkeypatch.setattr(setup_mod.asyncio, "sleep", _tracking_sleep)
+
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+
+    class _RecordingClient(FakeSetupClient):
+        async def views_update(self, **kwargs: Any) -> dict[str, Any]:
+            events.append("views_update")
+            return await super().views_update(**kwargs)
+
+    client = _RecordingClient()
+
+    try:
+        await flow._handle_config_command(
+            FakeAck(),
+            {"trigger_id": "tid-1", "team_id": "T1", "user_id": "U1"},
+            client,
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert f"sleep:{setup_mod._MODAL_SETTLE_SECONDS}" in events
+    # The settle sleep precedes the first views_update.
+    assert events.index(f"sleep:{setup_mod._MODAL_SETTLE_SECONDS}") < events.index("views_update")
+
+
+async def test_config_command_fails_closed_on_missing_team(tmp_path: Path) -> None:
+    # An empty team_id would collapse token/config keys across workspaces, so the
+    # slash-command path must fail closed (ack, then nothing) rather than proceed.
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    try:
+        await flow._handle_config_command(
+            ack,
+            {"trigger_id": "tid-1", "team_id": "", "user_id": "U1"},
+            client,
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls == [{}]
+    assert client.opened_views == []
+
+
+async def test_setup_start_button_fails_closed_on_missing_team(tmp_path: Path) -> None:
+    # The button-driven setup path must apply the same empty-team/user fail-closed
+    # guard as the slash-command path (keys collapse across workspaces otherwise).
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+    ack = FakeAck()
+    client = FakeSetupClient()
+
+    try:
+        await flow._handle_setup_start(
+            ack,
+            {"trigger_id": "tid-1", "team": {"id": ""}, "user": {"id": "U1"}},
+            client,
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert ack.calls == [{}]
+    assert client.opened_views == []
+
+
+async def test_prompt_relogin_dms_setup_button(tmp_path: Path) -> None:
+    # An expired-token user gets a DM carrying the re-login setup button — reliably
+    # delivered and actionable — plus an in-channel ephemeral pointer to the DM.
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+    client = FakeSetupClient()
+
+    try:
+        delivered = await flow.prompt_relogin(
+            client, "U1", channel="C1", thread_ts="100.1", in_channel=True
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert delivered is True
+    # The DM landed on the opened DM channel and carries the setup-start button.
+    assert client.posts and client.posts[-1]["channel"] == "D123"
+    dm = client.posts[-1]
+    assert "expired" in dm["text"].lower()
+    action_ids = [
+        el.get("action_id") for block in dm.get("blocks", []) for el in block.get("elements", [])
+    ]
+    assert ACTION_SETUP_START in action_ids
+    # The channel trigger also nudges the user to their DM.
+    assert client.ephemeral and client.ephemeral[-1]["user"] == "U1"
+
+
+async def test_prompt_relogin_reports_when_dm_cannot_open(tmp_path: Path) -> None:
+    # If the DM channel can't be opened, prompt_relogin reports failure (no post)
+    # so the caller can log it rather than assume delivery.
+    class NoDmClient(FakeSetupClient):
+        async def conversations_open(self, **kwargs: Any) -> dict[str, Any]:
+            return {"channel": {}}  # no id
+
+    pool = OmnigentClientPool()
+    flow = _flow(await _store(tmp_path), pool)
+    client = NoDmClient()
+
+    try:
+        delivered = await flow.prompt_relogin(
+            client, "U1", channel="C1", thread_ts="100.1", in_channel=False
+        )
+    finally:
+        await pool.aclose_all()
+
+    assert delivered is False
+    assert client.posts == []

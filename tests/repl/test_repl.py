@@ -2158,6 +2158,20 @@ def test_completer_plain_text_yields_nothing() -> None:
     assert _completions_for("hello world") == []
 
 
+def _noop_handler(*_args: object, **_kwargs: object) -> None:
+    """Stand-in handler for synthetic COMMANDS entries in completer tests."""
+    return
+
+
+_FAKE_COMMANDS = {
+    "/superpowers:using-superpowers": (
+        "Establishes how to find and use skills",
+        _noop_handler,
+    ),
+    "/context": ("Show context window usage", _noop_handler),
+}
+
+
 def test_completer_lone_slash_lists_all_canonical_commands() -> None:
     """
     Claim: hitting ``/`` shows every canonical command in
@@ -2185,49 +2199,115 @@ def test_completer_lone_slash_lists_all_canonical_commands() -> None:
     assert actual == expected
 
 
-def test_completer_filters_by_prefix() -> None:
+def test_completer_substring_filters_real_registry() -> None:
     """
-    Claim: typing ``/h`` narrows the popup to commands whose
-    canonical name starts with ``/h``. With the current command
-    set that is ``/help`` and ``/history``.
+    Claim: the substring filter narrows the REAL ``COMMANDS`` registry
+    (not just a monkeypatched fake) and matches mid-name, not only as a
+    prefix. ``heme`` sits inside ``/theme`` but is a prefix of no
+    command, so a hit proves substring matching runs against the live
+    registry the REPL actually ships.
 
-    Failure modes:
-      - Empty result → the prefix-startswith filter is broken
-        (e.g. the completer is comparing against the description).
-      - Returning every command → the filter is being bypassed.
-      - Including ``/quit`` or ``/cancel`` → the prefix match
-        is doing substring matching instead of startswith.
+    The monkeypatched tests below replace ``COMMANDS`` wholesale, so this
+    is the only filtering test that touches the real set. It uses
+    membership assertions rather than an exact list so it stays green as
+    commands are added or removed — the claim is "filtering happens and
+    narrows," not "these exact commands exist."
     """
-    actual = _completions_for("/h")
+    all_names = [name for name, _, _ in _completions_for("/")]
+    names = [name for name, _, _ in _completions_for("/heme")]
+    # Mid-name match against the live registry (substring, not prefix).
+    assert "/theme" in names
+    # A command with no "heme" is excluded — the filter really narrows.
+    assert "/quit" not in names
+    # Narrowing genuinely happened: a non-empty strict subset of the full
+    # list. Catches both "filter bypassed" (== all) and "filter too
+    # greedy" (empty) regressions against the real registry.
+    assert 0 < len(names) < len(all_names)
+
+
+def test_completer_ranks_prefix_before_substring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: prefix matches surface before mid-string matches (mirrors the
+    web menu's ``rankedSlashCommandNames``). Typing ``/e`` offers
+    ``/effort`` (a prefix) before ``/context`` (which merely contains
+    "e"), so the first completion is the one the user most likely meant —
+    not an unrelated command that happens to contain the letter.
+    """
+    fake = {
+        "/compact": ("Compact", _noop_handler),
+        "/context": ("Context", _noop_handler),
+        "/effort": ("Effort", _noop_handler),
+        "/model": ("Model", _noop_handler),
+    }
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", fake)
+    names = [name for name, _, _ in _completions_for("/e")]
+    # /effort is the only prefix match; /context and /model merely contain
+    # "e" (/compact has none), so they rank after it.
+    assert names[0] == "/effort"
+    assert set(names) == {"/effort", "/context", "/model"}
+
+
+def test_completer_ranks_prefix_first_real_registry() -> None:
+    """
+    Claim: against the live registry, ``/m`` surfaces a prefix match
+    (e.g. ``/model``) first, ahead of commands that merely contain "m"
+    (e.g. ``/theme``, ``/compact``). Pins prefix-priority on the real
+    command set without coupling to the exact command list.
+    """
+    names = [name for name, _, _ in _completions_for("/m")]
+    assert "/model" in names
+    # The top completion is a genuine prefix match, not a mid-string one.
+    assert names[0][1:].lower().startswith("m")
+
+
+def test_completer_matches_name_leaf_after_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: typing a namespaced skill's leaf name surfaces the full
+    command — the core fix. `/using-superpowers` must find
+    `/superpowers:using-superpowers` even though the name starts with
+    `superpowers:`. Failure means the completer is still prefix-only.
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    actual = _completions_for("/using-superpowers")
     names = [name for name, _, _ in actual]
-    assert names == ["/help", "/history"], (
-        f"expected ['/help', '/history'] for prefix '/h', got {names}. "
-        f"If empty, the prefix filter no longer matches; if longer, "
-        f"the filter is broader than startswith."
-    )
-    # Every match replaces the full typed prefix (``/h`` == 2 chars).
-    # If start_position drifts, the completion will splice into the
-    # buffer wrong (e.g. produce ``//help``).
+    assert names == ["/superpowers:using-superpowers"]
+    # The completion replaces the full typed prefix so the splice
+    # yields the canonical name, not a doubled slash.
     for _, _, start in actual:
-        assert start == -2
+        assert start == -len("/using-superpowers")
 
 
-def test_completer_exact_match_still_yields_itself() -> None:
+def test_completer_does_not_match_description(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Claim: when the user has typed an entire command (``/help``),
-    that command itself is still offered — picking it from the
-    popup is a no-op replacement that lets the user press Enter
-    to submit without retyping.
-
-    Failure here would mean the popup vanishes the moment the
-    typed text equals a command, which is jarring during
-    keyboard-driven completion.
+    Claim: matching is name-only — a query that appears only in a command's
+    description does NOT surface it. Kept identical to the web menu, which
+    never shows descriptions inline, so a description-driven hit would look
+    unexplained. `window` appears in `/context`'s blurb but not its name, so
+    it must yield nothing.
     """
-    actual = _completions_for("/help")
-    names = [name for name, _, _ in actual]
-    # ``/help`` is a strict prefix of itself; no other current
-    # command starts with the full string ``/help``.
-    assert names == ["/help"]
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    assert _completions_for("/window") == []
+
+
+def test_completer_no_match_yields_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: a query present in no command name yields no rows (the popup
+    closes) — proves matching is a real containment test, not "always show
+    everything".
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    assert _completions_for("/zzz") == []
+
+
+def test_completer_full_name_still_yields_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Claim: a fully-typed command name still offers itself, so the user
+    can press Enter to submit without the popup vanishing. `/context`
+    is a substring of its own name.
+    """
+    monkeypatch.setattr("omnigent.repl._repl.COMMANDS", _FAKE_COMMANDS)
+    names = [name for name, _, _ in _completions_for("/context")]
+    assert names == ["/context"]
 
 
 def test_completer_display_meta_matches_command_help() -> None:

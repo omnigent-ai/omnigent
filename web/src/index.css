@@ -108,6 +108,7 @@
    * browser default; the root `html` rules multiply it into their font-size so
    * the whole rem-based UI scales. Overridden at runtime on documentElement. */
   --ui-font-scale: 1;
+  --sidebar-font-size: 13px;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -234,6 +235,11 @@
   --chart-4: #d4972a;
   --chart-5: #8e99a4;
   --radius: 0.5rem;
+  --radius-otto-button: 6px;
+  --radius-otto-sm: 8px;
+  --radius-otto-md: 12px;
+  --ease-otto: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --duration-otto-fast: 180ms;
   /* Sidebar + workspace cards are white (--card); they float on the
      * near-white .app-shell gradient canvas. --sidebar matches that
      * gradient's lightest tone so bg-sidebar surfaces (the app-shell's
@@ -248,6 +254,9 @@
   --sidebar-accent-foreground: #04355d;
   --sidebar-border: #e8ecf0;
   --sidebar-ring: #2272b4;
+  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 5%, transparent);
+  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
+  --sidebar-active-foreground: var(--sidebar-foreground);
 }
 
 .dark {
@@ -325,6 +334,11 @@
   --sidebar-border: oklch(0.28 0.005 240);
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
   --tooltip-bg: #2a2440;
+}
+
+.sidebar-compact-text {
+  font-size: var(--sidebar-font-size);
+  line-height: calc(var(--sidebar-font-size) + 7px);
 }
 
 /* App-shell canvas gradient. Copied verbatim from the brand mock

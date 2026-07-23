@@ -1,13 +1,14 @@
 """Pure pub-sub in-process live stream for real-time SSE delivery.
 
 This module is a fan-out broadcaster keyed by ``conversation_id``.
-Every active call to :func:`subscribe` owns its own ephemeral
-``asyncio.Queue``; :func:`publish` fans the event out to all
-queues currently subscribed to that conversation_id. Events emitted
-before any subscriber is connected are LOST — there is no buffer
-and no replay. Clients that need to recover state across a
-disconnect fetch ``GET /v1/sessions/{id}`` for the persisted
-history and dedupe by item id.
+Every active call to :func:`subscribe` owns its own bounded ephemeral
+``asyncio.Queue``; :func:`publish` fans the event out to all queues
+currently subscribed to that conversation_id. A subscriber that falls
+behind past the bound is disconnected so it can recover through the
+snapshot + live-tail reconnect contract. Events emitted before any
+subscriber is connected are LOST — there is no buffer and no replay.
+Clients that need to recover state across a disconnect fetch
+``GET /v1/sessions/{id}`` for the persisted history and dedupe by item id.
 
 This module owns no per-conversation lifecycle. There is no
 ``register`` / ``unregister`` step: the first ``subscribe`` call
@@ -35,8 +36,17 @@ from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
 
-# Sentinel object that signals end-of-stream to every subscriber.
+# A generous burst allowance that still bounds one stalled subscriber's memory.
+_SUBSCRIBER_QUEUE_MAX_EVENTS = 1024
+
+# Sentinel objects that signal terminal subscriber states.
 _DONE = object()
+_OVERFLOW = object()
+
+
+class SubscriberOverflowError(RuntimeError):
+    """Raised when a subscriber falls behind the bounded live-event queue."""
+
 
 # Subscriber registry: conversation_id -> set of
 # (queue, event_loop) pairs. The event_loop reference is needed
@@ -47,6 +57,25 @@ _subscribers: dict[
     set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
 ] = {}
 _lock = threading.Lock()
+
+
+def _enqueue_or_overflow(
+    queue: asyncio.Queue[dict[str, Any] | object],
+    item: dict[str, Any] | object,
+) -> None:
+    """Enqueue *item*, replacing a full backlog with an overflow signal."""
+    try:
+        queue.put_nowait(item)
+        return
+    except asyncio.QueueFull:
+        pass
+
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    queue.put_nowait(_OVERFLOW)
 
 
 def publish(conversation_id: str, event: dict[str, Any]) -> None:
@@ -105,7 +134,7 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
-        loop.call_soon_threadsafe(queue.put_nowait, event)
+        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, event)
 
 
 def close(conversation_id: str) -> None:
@@ -122,7 +151,7 @@ def close(conversation_id: str) -> None:
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
-        loop.call_soon_threadsafe(queue.put_nowait, _DONE)
+        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, _DONE)
 
 
 def shutdown_all() -> None:
@@ -139,7 +168,7 @@ def shutdown_all() -> None:
     with _lock:
         all_subs = [entry for subs in _subscribers.values() for entry in subs]
     for queue, _ in all_subs:
-        queue.put_nowait(_DONE)
+        _enqueue_or_overflow(queue, _DONE)
 
 
 async def subscribe(
@@ -153,13 +182,20 @@ async def subscribe(
     """
     Subscribe to live events for a conversation.
 
-    Creates a fresh ephemeral queue for this subscriber, registers
+    Creates a fresh bounded ephemeral queue for this subscriber, registers
     it under ``conversation_id``, and yields events as they arrive
     from :func:`publish`. Ends when :func:`close` broadcasts the
     end-of-stream sentinel or when the caller stops iterating
     (e.g. client disconnect cancels the generator). The
     ``finally`` block always unregisters this subscriber slot so
     a stale queue cannot keep accumulating events.
+
+    If the subscriber falls more than
+    :data:`_SUBSCRIBER_QUEUE_MAX_EVENTS` events behind, its queued backlog
+    is replaced with an overflow signal and this iterator raises
+    :class:`SubscriberOverflowError`. HTTP/SSE callers treat that as a
+    dropped transport and reconnect through the persisted snapshot rather
+    than retaining an unbounded in-memory backlog.
 
     Live-tail only: events emitted before this call are NOT
     replayed. Multiple concurrent subscribers to the same
@@ -208,8 +244,12 @@ async def subscribe(
         yielded verbatim as it was passed to :func:`publish`,
         plus synthetic heartbeat dicts when *heartbeat_interval_s*
         is set.
+    :raises SubscriberOverflowError: If this subscriber falls behind the
+        bounded event queue.
     """
-    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue(
+        maxsize=_SUBSCRIBER_QUEUE_MAX_EVENTS
+    )
     loop = asyncio.get_running_loop()
     entry = (queue, loop)
     with _lock:
@@ -271,6 +311,11 @@ async def subscribe(
                     continue
             if item is _DONE:
                 return
+            if item is _OVERFLOW:
+                raise SubscriberOverflowError(
+                    f"session stream subscriber for {conversation_id!r} "
+                    f"exceeded {_SUBSCRIBER_QUEUE_MAX_EVENTS} queued events"
+                )
             assert isinstance(item, dict)
             yield item
     finally:

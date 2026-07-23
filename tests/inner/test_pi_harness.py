@@ -83,6 +83,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", "printf token")
     monkeypatch.setenv("HARNESS_PI_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_PI_PATH", "/usr/local/bin/pi")
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
 
     captured: dict[str, Any] = {}
 

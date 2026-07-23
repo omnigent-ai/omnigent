@@ -20,8 +20,9 @@ Env vars read at startup:
 - ``HARNESS_QWEN_CWD``: working directory the executor launches
   the Qwen CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE`` if set,
   then to the subprocess's inherited cwd.
-- ``HARNESS_QWEN_PATH``: absolute path to a ``qwen`` CLI binary.
-  ``None`` searches ``PATH``.
+- ``OMNIGENT_QWEN_PATH``: absolute path to a ``qwen`` CLI binary.
+  ``None`` searches ``PATH``. (Legacy ``HARNESS_QWEN_PATH`` still honored,
+  deprecated.)
 - ``HARNESS_QWEN_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
   (from :func:`dataclasses.asdict`). When unset, the wrap
   falls back to a default
@@ -47,6 +48,7 @@ from fastapi import FastAPI
 if TYPE_CHECKING:
     pass
 
+from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
 from omnigent.inner.qwen_executor import QwenExecutor
@@ -59,7 +61,10 @@ _logger = logging.getLogger(__name__)
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_QWEN_MODEL"
 _ENV_CWD = "HARNESS_QWEN_CWD"
-_ENV_QWEN_PATH = "HARNESS_QWEN_PATH"
+_ENV_QWEN_PATH = "OMNIGENT_QWEN_PATH"
+# Deprecated alias — read via resolve_harness_path() which warns on use.
+# Remove this constant and the HARNESS_QWEN_PATH read in v0.8.0.
+_LEGACY_ENV_QWEN_PATH = "HARNESS_QWEN_PATH"
 _ENV_OS_ENV = "HARNESS_QWEN_OS_ENV"
 # Generic-provider / gateway routing: an OpenAI-compatible base URL plus a
 # shell command that prints a bearer token. Emitted by the spawn-env builder
@@ -127,15 +132,14 @@ def _build_qwen_executor() -> Executor:
 
     :returns: A configured :class:`QwenExecutor` instance.
     :raises ImportError: If the ``qwen`` CLI isn't on PATH and
-        ``HARNESS_QWEN_PATH`` isn't set — the inner executor's
+        ``OMNIGENT_QWEN_PATH`` (legacy ``HARNESS_QWEN_PATH``) isn't set — the inner executor's
         constructor surfaces this as a clear ImportError.
     """
     cwd_raw = os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
     cwd = cwd_raw or None
     model_raw = os.environ.get(_ENV_MODEL, "").strip()
     model = model_raw or None
-    qwen_path_raw = os.environ.get(_ENV_QWEN_PATH, "").strip()
-    qwen_path = qwen_path_raw or None
+    qwen_path = resolve_harness_path("qwen")
     gateway_base_url = os.environ.get(_ENV_GATEWAY_BASE_URL, "").strip() or None
     gateway_auth_command = os.environ.get(_ENV_GATEWAY_AUTH_COMMAND, "").strip() or None
 
