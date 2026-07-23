@@ -83,7 +83,7 @@ import { agentDisplayLabel } from "@/components/AgentInfo";
 import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
-import type { CodexModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
+import type { NativeModelOption, SandboxStatus, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
@@ -104,7 +104,7 @@ import {
 } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
-import { codexEffortLevelsForModel, findCodexModelOption } from "@/lib/codexNativeModels";
+import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
@@ -146,6 +146,7 @@ import { HostBadge } from "@/components/HostBadge";
 import {
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
+  rankedSlashCommandNames,
   SlashCommandMenu,
 } from "@/components/SlashCommandMenu";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
@@ -1355,8 +1356,8 @@ interface MainAgentSurfaceProps {
   showModels: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
-  /** Codex app-server model options for codex-native sessions. */
-  codexModelOptions: readonly CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   /** Show the session Goal control. */
@@ -1853,6 +1854,8 @@ function MainAgentSurface({
           !sandboxLaunching &&
           (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
         }
+        hostOffline={!sandboxLaunching && liveness.kind === "host_offline"}
+        onShowReconnectHelp={onShowReconnectHelp}
         costRoutingVerdict={costRoutingVerdict}
         costRoutingEligible={costRoutingEligible}
         subAgentLabel={subAgentLabel}
@@ -2585,6 +2588,18 @@ export function ConnectionIndicator({
     return null;
   }
   if (unreachable) {
+    // A `host_offline` session moves the reconnect affordance up into the
+    // composer's host badge (ComposerStatusLine), where the host is already
+    // named — so render nothing here whenever that composer is on screen
+    // (sub-agent sessions included; their badge carries it just like a normal
+    // session's). The composer is hidden only in the terminal-first *terminal*
+    // view (the PTY owns the surface); there the banner still carries the
+    // affordance. `local_stranded` keeps the banner everywhere (no host, hence
+    // no badge).
+    const composerOnScreen = !(terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal");
+    if (liveness.kind === "host_offline" && composerOnScreen) {
+      return null;
+    }
     return (
       <button
         type="button"
@@ -3347,8 +3362,8 @@ interface ComposerProps {
   showModels: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
-  /** Codex app-server model options for codex-native sessions. */
-  codexModelOptions: readonly CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  codexModelOptions: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   /** Show the session Goal control. */
@@ -3388,6 +3403,15 @@ interface ComposerProps {
    * banner below is the only affordance.
    */
   unreachable?: boolean;
+  /**
+   * The session is host-bound to an offline, non-resumable host
+   * (`host_offline`): the composer's host badge turns into a clickable
+   * "Host is offline — click to reconnect" affordance (see HostBadge's
+   * `onReconnect`), replacing the separate banner below the composer.
+   */
+  hostOffline?: boolean;
+  /** Open the reconnect help dialog — wired to the host badge when `hostOffline`. */
+  onShowReconnectHelp?: () => void;
   /** Latest parsed advisor verdict for the cost-routing pill; `null`/omitted when none. */
   costRoutingVerdict?: CostRoutingVerdict | null;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child); see that predicate. */
@@ -3516,19 +3540,19 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
  * Model label for the composer status tray.
  *
  * @param model - Model override or bound agent model id.
- * @param codexModelOptions - Codex-returned model metadata, when available.
- * @returns Codex's display label for known Codex models, a local Claude alias
+ * @param codexModelOptions - Native model metadata, when available.
+ * @returns The advertised display label for known native models, a local Claude alias
  *   label for Claude native tiers, the raw model id otherwise, or ``null``
  *   when no model is known.
  */
 export function formatStatusModelLabel(
   model: string | null,
-  codexModelOptions: readonly CodexModelOption[] = [],
+  codexModelOptions: readonly NativeModelOption[] = [],
 ): string | null {
   const raw = model?.trim();
   if (!raw) return null;
   const lower = raw.toLowerCase();
-  const codexOption = findCodexModelOption(codexModelOptions, raw);
+  const codexOption = findNativeModelOption(codexModelOptions, raw);
   if (codexOption) return codexOption.displayName ?? codexOption.id;
   const known = CLAUDE_NATIVE_MODELS.find((m) => m.id === lower);
   if (known) return known.label;
@@ -3551,9 +3575,9 @@ function formatStatusEffortLabel(effort: string | null, raw = false): string | n
 export function formatModelEffortStatusLabel(
   model: string | null,
   effort: string | null,
-  codexModelOptions: readonly CodexModelOption[] = [],
+  codexModelOptions: readonly NativeModelOption[] = [],
 ): string | null {
-  const codexOption = model ? findCodexModelOption(codexModelOptions, model.trim()) : null;
+  const codexOption = model ? findNativeModelOption(codexModelOptions, model.trim()) : null;
   const modelLabel = formatStatusModelLabel(model, codexModelOptions);
   const effortLabel = formatStatusEffortLabel(effort, codexOption !== null);
   const parts = [modelLabel, effortLabel].filter((p): p is string => p != null && p.length > 0);
@@ -3608,10 +3632,18 @@ function ComposerStatusLine({
   harnessLabel,
   goal,
   isSubAgentSession,
+  onHostReconnect,
 }: {
   harnessLabel: string | null;
   goal: Goal | null;
   isSubAgentSession: boolean;
+  /**
+   * When set (`host_offline` liveness), the host badge becomes a clickable
+   * "Host is offline — click to reconnect" affordance. Also forces the tray
+   * to render even when it would otherwise be empty, so the prompt is always
+   * visible for an unreachable host.
+   */
+  onHostReconnect?: () => void;
 }) {
   const conversationId = useChatStore((s) => s.conversationId);
   const contextWindow = useChatStore((s) => s.contextWindow);
@@ -3638,7 +3670,15 @@ function ComposerStatusLine({
   // contextWindow > 0: the SSE path validates it but the snapshot path doesn't, and 0/0 → "NaN%".
   const showRing =
     !!conversationId && contextWindow != null && contextWindow > 0 && tokensUsed != null;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness) return null;
+  // The offline-host reconnect affordance lives in the host badge, so the tray
+  // must render even when every other slot is empty (an unreachable session
+  // often has no branch/ring/harness yet). Gated by `showHost`: only host-bound
+  // sessions can be `host_offline`, and sub-agents (which hide the badge) are
+  // never host-bound — a stranded child is `local_stranded`, which keeps its
+  // banner elsewhere.
+  const showReconnect = showHost && !!onHostReconnect;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showHarness && !showReconnect)
+    return null;
 
   return (
     <div
@@ -3660,7 +3700,9 @@ function ComposerStatusLine({
           so the right cluster stays pinned right even when both are absent;
           each item truncates to an ellipsis so the tray never wraps. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
-        {showHost && conversationId && <HostBadge sessionId={conversationId} />}
+        {showHost && conversationId && (
+          <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
+        )}
         {showBranch && (
           <span className="flex min-w-0 items-center gap-1.5">
             <GitBranchIcon className="size-3.5 shrink-0" />
@@ -3800,6 +3842,8 @@ export function Composer({
   reconnectHint = false,
   sandboxAsleepHint = false,
   unreachable = false,
+  hostOffline = false,
+  onShowReconnectHelp,
   costRoutingVerdict = null,
   costRoutingEligible = false,
   subAgentLabel = null,
@@ -3939,6 +3983,8 @@ export function Composer({
   // the input, which would delete the draft. Only save when the user
   // has actually changed the value since the last restore.
   const dirtyRef = useRef(false);
+  // Composer text captured when voice dictation starts, so Esc can revert to it.
+  const voiceSnapshotRef = useRef("");
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
@@ -4040,9 +4086,7 @@ export function Composer({
   };
   // Filtered matches — kept in sync with what SlashCommandMenu renders so
   // keyboard nav indexes into the same list.
-  const menuMatches = menuOpen
-    ? Object.keys(slashCommands).filter((name) => name.slice(1).startsWith(menuQuery.toLowerCase()))
-    : [];
+  const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
 
   // Pre-select the first match whenever the filtered list changes — both
   // when the menu first opens (matches go [] → non-empty) and as the query
@@ -4378,14 +4422,9 @@ export function Composer({
       // the user choose there. "/model <name>" takes the builtin route below to
       // setModel — the same write the picker makes.
       //
-      // opencode-native now surfaces server-backed model options too, so bare
-      // "/model" opens the picker when options are loaded. When the options are
-      // still empty (e.g. the runner catalog hasn't arrived yet), fall through
-      // to the builtin "/model" handler, which surfaces the current model as a
-      // read-only hint instead of popping an empty dropdown. ("/model <name>"
-      // still routes to setModel there — opencode reads model_override on the
-      // next web-injected turn.)
-      const canOpenModelPicker = modelPickerKind !== "opencode" || codexModelOptions.length > 0;
+      // Runner-backed catalogs can arrive after bind. Until rows exist, show
+      // the current-model hint instead of opening a model-less dropdown.
+      const canOpenModelPicker = codexModelOptions.length > 0;
       if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
         dirtyRef.current = true;
         setValue("");
@@ -4886,7 +4925,14 @@ export function Composer({
               <span className="sr-only">Attach files</span>
             </Button>
             <ComposerMicButton
+              enableHotkey
               disabled={disabled || isReadOnly || hasPendingElicitation}
+              onVoiceStart={() => {
+                voiceSnapshotRef.current = value;
+              }}
+              onVoiceDiscard={() => {
+                setValue(voiceSnapshotRef.current);
+              }}
               onTranscript={(text) => {
                 dictation.appendFinal(text);
                 dirtyRef.current = true;
@@ -5004,6 +5050,7 @@ export function Composer({
         harnessLabel={harnessLabel}
         goal={goal}
         isSubAgentSession={subAgentLabel != null}
+        onHostReconnect={hostOffline ? onShowReconnectHelp : undefined}
       />
     </form>
   );
@@ -5222,7 +5269,7 @@ export function readOnlyReasonForSessionLabels(
 
 export function effortLevelsForConv(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
-  codexModelOptions: readonly CodexModelOption[] = [],
+  codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
   switch (conv?.labels?.["omnigent.wrapper"]) {
@@ -5341,8 +5388,8 @@ interface AgentPickerProps {
   showEffort: boolean;
   /** Native model picker family, when present. */
   modelPickerKind: NativeModelPickerKind | null;
-  /** Codex app-server model options for codex-native sessions. */
-  codexModelOptions: readonly CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  codexModelOptions: readonly NativeModelOption[];
   /**
    * Disables the picker trigger. The picker is purely a write
    * surface (selecting an agent / model / effort changes how the
@@ -5390,21 +5437,18 @@ function AgentPicker({
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const llmModel = useChatStore((s) => s.llmModel);
 
-  // Codex, cursor, kiro, pi, and opencode all populate the picker from the
-  // server-provided ``codexModelOptions`` channel (the snapshot's
-  // ``model_options`` field); claude uses the static local catalog.
+  // Native model pickers populate from the snapshot's runner-backed
+  // ``model_options`` field. Claude's rows are the aliases pinned to the
+  // launch-time Databricks catalog; Codex carries richer effort metadata.
   const usesServerModelOptions =
+    modelPickerKind === "claude" ||
     modelPickerKind === "codex" ||
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode";
   const modelOptions: ReadonlyArray<{ id: string; label?: string; displayName?: string }> =
-    modelPickerKind === "claude"
-      ? CLAUDE_NATIVE_MODELS
-      : usesServerModelOptions
-        ? codexModelOptions
-        : [];
+    usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
   // Only offer the agent list when there's an actual choice. Inside a
   // session the picker is scoped to the single bound agent (the runner is
@@ -5477,15 +5521,11 @@ function AgentPicker({
       : null;
   const hasPickerActions = showAgents || modelOptions.length > 0 || showEffort;
 
-  // Before kiro/pi resolve a live model, there is no model to show: kiro until
-  // its first session ``.json`` write, pi until its snapshot fills llmModel (or
-  // the workspace model-list fetch failed, leaving only the launch model). Fall
-  // back to the catalog default (e.g. "Auto") / first option so the trigger
-  // reads as a model rather than the harness name ("Kiro" / "Pi").
+  // Before a native harness resolves a live model, prefer its advertised
+  // default; kiro/pi fall back to their first catalog row when none is marked.
   const launchFallbackOption =
-    modelPickerKind === "kiro" || modelPickerKind === "pi"
-      ? (codexModelOptions.find((m) => m.isDefault) ?? codexModelOptions[0])
-      : undefined;
+    codexModelOptions.find((m) => m.isDefault) ??
+    (modelPickerKind === "kiro" || modelPickerKind === "pi" ? codexModelOptions[0] : undefined);
   const launchFallbackLabel = launchFallbackOption?.displayName ?? launchFallbackOption?.id;
 
   // Model in foreground (black), effort in muted (grey). Static fallbacks
@@ -5572,11 +5612,15 @@ function AgentPicker({
             {!isNativeModelPicker && <DropdownMenuSeparator className="my-1" />}
             <PickerSectionHeader>Models</PickerSectionHeader>
             {modelOptions.map((m) => {
-              const isExplicit = pickerSelectedModel === m.id;
+              const explicitOption = findNativeModelOption(codexModelOptions, pickerSelectedModel);
+              const isExplicit = explicitOption?.id === m.id;
               const isImplicit =
                 pickerSelectedModel === null &&
                 (usesServerModelOptions
-                  ? findCodexModelOption(codexModelOptions, llmModel)?.id === m.id
+                  ? (
+                      findNativeModelOption(codexModelOptions, llmModel) ??
+                      codexModelOptions.find((option) => option.isDefault)
+                    )?.id === m.id
                   : isModelImplicitlySelected(m.id, llmModel));
               const isActive = isExplicit || isImplicit;
               return (

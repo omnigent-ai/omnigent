@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -434,6 +436,80 @@ def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> Non
     assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
 
 
+def test_try_install_harness_cli_success_when_binary_off_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A binary installed into a global dir but off bare ``PATH`` reads success.
+
+    Regression: the install verdict and the readiness badge must use the SAME
+    resolver. On a host whose frozen ``PATH`` omits the npm/nvm/homebrew bin dir,
+    npm lands the binary there — off ``PATH`` but on ``resolve_cli_binary``'s
+    fallback ladder. Judging install success with bare ``shutil.which`` reported
+    a spurious "not found" failure (red toast) while readiness resolved it via
+    the ladder (green tick) — the two verdicts disagreeing on one install.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    codex = fallback_dir / "codex"
+    codex.write_text("#!/bin/sh\n")
+    codex.chmod(0o755)
+
+    # npm is on PATH; the installed codex binary never is — only the ladder finds it.
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
+    )
+
+    # Install verdict agrees with readiness: both see it installed.
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
+
+
+def test_try_install_prepends_resolved_dir_so_login_can_find_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After install, the resolving dir is on ``PATH`` for the later login step.
+
+    The install verdict resolves via the full ladder, but the setup wizard's
+    subsequent ``harness_login`` / ``harness_cli_logged_in`` shell out with the
+    bare binary name and only bare ``shutil.which`` (i.e. ``PATH``). If install
+    succeeds via a fallback dir (nvm/homebrew/…) without putting that dir on
+    ``PATH``, login would fail to find the binary just installed. Assert the
+    install prepends the resolving dir so a bare ``PATH`` lookup then succeeds —
+    converging install, readiness, and login on the same binary.
+    """
+    fallback_dir = tmp_path / "nvm" / "bin"
+    fallback_dir.mkdir(parents=True)
+    codex = fallback_dir / "codex"
+    codex.write_text("#!/bin/sh\n")
+    codex.chmod(0o755)
+
+    # A PATH that has npm but NOT the fallback dir; use the REAL shutil.which so
+    # the prepend is observable via a genuine PATH lookup (what login does).
+    npm_dir = tmp_path / "npmhome"
+    npm_dir.mkdir()
+    (npm_dir / "npm").write_text("#!/bin/sh\n")
+    (npm_dir / "npm").chmod(0o755)
+    monkeypatch.setenv("PATH", str(npm_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
+    )
+
+    # Before: a bare PATH lookup (what harness_login uses) can't find codex.
+    assert shutil.which("codex") is None
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    # After: the resolving dir was prepended, so the login step's bare lookup
+    # now resolves the binary that was just installed.
+    assert shutil.which("codex") == str(codex)
+    assert str(fallback_dir) in os.environ["PATH"].split(os.pathsep)
+
+
 def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Installs via ``npm install -g <package>`` and reports the post-install
     PATH state (True once the binary appears)."""
@@ -492,23 +568,26 @@ def test_install_harness_cli_runs_hermes_installer_then_rechecks(
 def test_install_harness_cli_refreshes_user_local_bin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A vendor install into ~/.local/bin is usable without restarting setup."""
+    """A vendor install into ~/.local/bin is usable without restarting setup.
+
+    The install resolves the binary via ``resolve_cli_binary`` (whose ladder
+    includes ~/.local/bin) and prepends the resolving dir to ``PATH``, so the
+    wizard's later bare-``PATH`` login steps find the just-installed CLI.
+    """
     user_bin = tmp_path / ".local" / "bin"
     user_bin.mkdir(parents=True)
     hermes = user_bin / "hermes"
     hermes.write_text("#!/bin/sh\n")
     hermes.chmod(0o755)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-
-    def _which(name: str) -> str | None:
-        if name == "bash":
-            return "/bin/bash"
-        if name == "hermes" and str(user_bin) in hi.os.environ["PATH"].split(hi.os.pathsep):
-            return str(hermes)
-        return None
-
-    monkeypatch.setattr(hi.shutil, "which", _which)
+    # bash (the hermes installer) is on PATH; hermes is only in the fallback
+    # dir, off bare PATH — the real resolver must find it via the ladder.
+    bin_dir = tmp_path / "sysbin"
+    bin_dir.mkdir()
+    (bin_dir / "bash").write_text("#!/bin/sh\n")
+    (bin_dir / "bash").chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (user_bin,))
     monkeypatch.setattr(
         hi.subprocess,
         "run",
@@ -516,7 +595,10 @@ def test_install_harness_cli_refreshes_user_local_bin(
     )
 
     assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    # The resolving dir (~/.local/bin) is now first on PATH, so a bare
+    # shutil.which — what harness_login uses — finds hermes.
     assert hi.os.environ["PATH"].split(hi.os.pathsep)[0] == str(user_bin)
+    assert shutil.which("hermes") == str(hermes)
 
 
 def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPatch) -> None:

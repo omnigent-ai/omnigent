@@ -157,7 +157,10 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
     harness = _RUNNER_HARNESS if with_runner else _HTTP_HARNESS
 
     async with BenchEnvironment(
-        with_runner=with_runner, with_host=with_host, database_uri=args.database_uri
+        with_runner=with_runner,
+        with_host=with_host,
+        database_uri=args.database_uri,
+        network_delay_ms=args.network_delay_ms,
     ) as env:
         for journey in journeys:
             console.print(f"\n[bold]Benchmarking[/bold] {journey.name} [dim]({backend})[/dim]")
@@ -206,6 +209,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
         "warmup": args.warmup,
         "with_runner": with_runner,
         "backend": backend,
+        "network_delay_ms": args.network_delay_ms,
     }
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     report = build_report(
@@ -275,6 +279,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=10,
         metavar="N",
         help="Warmup operations discarded before each run (default: 10).",
+    )
+    parser.add_argument(
+        "--network-delay-ms",
+        type=float,
+        default=0.0,
+        metavar="MS",
+        help="Simulated client→server network latency, in ms, injected before "
+        "each request the benchmark sends (default: 0 = loopback speed). Models "
+        "a real network hop for testing network optimizations; per-op request "
+        "counts times this delay approximate the round-trip wall cost.",
     )
     parser.add_argument(
         "--output",

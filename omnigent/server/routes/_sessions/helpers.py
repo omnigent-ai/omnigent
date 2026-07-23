@@ -134,6 +134,7 @@ from omnigent.server.schemas import (
     ErrorEvent,
     McpServerStartup,
     ModelUsage,
+    NativeModelOption,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
     PolicyDeniedEvent,
@@ -1648,6 +1649,39 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
             code=ErrorCode.INVALID_INPUT,
         )
     return canonical
+
+
+def _validated_harness_override_executor_type(agent: Agent) -> None:
+    """Validate that *agent* is an ``executor.type: omnigent`` spec.
+
+    Used by the ``"auto"`` harness path to enforce the same executor-type
+    gate as :func:`_validated_harness_override` without requiring a concrete
+    harness name (the real harness is resolved at first-message time).
+
+    :raises OmnigentError: ``invalid_input`` when the agent is not an
+        omnigent executor type or the bundle cannot be loaded.
+    """
+    from omnigent.runtime import get_agent_cache
+    from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
+
+    try:
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+    except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+        raise OmnigentError(
+            f"harness_override 'auto' requires a loadable agent spec; "
+            f"agent {agent.name!r} failed to load: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    executor_type = loaded.spec.executor.type
+    if executor_type != OMNIGENT_EXECUTOR_TYPE:
+        raise OmnigentError(
+            f"harness_override 'auto' only applies to executor.type "
+            f"{OMNIGENT_EXECUTOR_TYPE!r} agents; agent {agent.name!r} "
+            f"declares executor.type {executor_type!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _utc_day(epoch_seconds: int) -> str:
@@ -3495,9 +3529,9 @@ def _publish_model_options(session_id: str) -> None:
     """
     Publish a typed :class:`SessionModelOptionsEvent` to the live stream.
 
-    Fired when the background Codex ``model/list`` fetch populates the
-    per-session model-options cache. Connected clients re-read the session
-    snapshot and apply its cache-backed ``model_options`` field.
+    Fired when a background runner catalog fetch populates the per-session
+    model-options cache. Connected clients re-read the session snapshot and
+    apply its cache-backed ``model_options`` field.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -5175,8 +5209,10 @@ async def _dispatch_skill_slash_command_to_runner(
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
-    # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None:
+    # per-event value exists; the persisted column is the source. The
+    # "auto" sentinel is resolved to a concrete harness at first-message
+    # time and never forwarded verbatim.
+    if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
 
     try:
@@ -5237,6 +5273,8 @@ def _title_content_from_item(
     if not isinstance(item.data, MessageData):
         return []
     if item.data.role != "user":
+        return []
+    if item.data.is_meta:
         return []
     return item.data.content
 
@@ -8168,21 +8206,28 @@ async def _load_runner_skills(
 
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:
     """
-    Validate runner-returned raw Codex ``model/list`` data.
+    Validate runner-returned raw native ``model/list`` data.
 
     :param raw_models: JSON value from the runner's
-        ``{"models": [...]}`` response, e.g. a list of Codex model dicts.
-    :returns: Raw model options for the session snapshot.
-    :raises ValueError: If the payload is not the expected list/dict
-        shape.
+        ``{"models": [...]}`` response, e.g. a list of model dicts.
+    :returns: Raw model options for the session snapshot; malformed rows
+        are skipped so one bad provider row cannot blank the picker.
+    :raises ValueError: If the payload is not a list.
     """
     if not isinstance(raw_models, list):
-        raise ValueError("Codex model options payload must be a list")
+        raise ValueError("Native model options payload must be a list")
     options: list[dict[str, Any]] = []
     for raw_model in raw_models:
+        # Skip malformed rows instead of discarding the whole catalog: one
+        # provider-supplied oddity must not blank the picker for the session.
         if not isinstance(raw_model, dict):
-            raise ValueError("Codex model option must be an object")
-        options.append(raw_model)
+            continue
+        try:
+            option = NativeModelOption.model_validate(raw_model)
+        except ValidationError:
+            _logger.debug("Skipping malformed native model option: %r", raw_model)
+            continue
+        options.append(option.model_dump(exclude_defaults=True, exclude_none=True))
     return options
 
 
@@ -8200,10 +8245,10 @@ async def _load_model_options(
         ``"/v1/sessions/conv_abc/cursor-model-options"``.
     """
     # Read the retry schedule off the facade so tests patching
-    # ``sessions._CODEX_MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
+    # ``sessions._MODEL_OPTIONS_RETRY_DELAYS_S`` reach this impl.
     import omnigent.server.routes.sessions as _facade
 
-    delays = _facade._CODEX_MODEL_OPTIONS_RETRY_DELAYS_S
+    delays = _facade._MODEL_OPTIONS_RETRY_DELAYS_S
     for attempt in range(len(delays) + 1):
         try:
             resp = await runner_client.get(path, timeout=5.0)

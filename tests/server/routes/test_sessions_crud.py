@@ -275,7 +275,11 @@ async def test_list_projects_returns_names_sorted(
 
     resp = await client.get("/v1/sessions/projects")
     assert resp.status_code == 200
-    assert resp.json() == ["Customer X", "Sprint 42"]
+    # Label-only projects (no first-class row) list with id=None, sorted by name.
+    assert resp.json() == [
+        {"id": None, "name": "Customer X"},
+        {"id": None, "name": "Sprint 42"},
+    ]
 
 
 # ── GET /v1/sessions?project= (filter) ───────────────────────────────

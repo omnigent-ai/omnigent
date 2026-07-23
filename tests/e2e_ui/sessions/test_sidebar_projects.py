@@ -1,13 +1,14 @@
 """Browser e2e for the sidebar's session projects.
 
 Projects group conversations under named, collapsible folders inside a
-"Projects" sidebar group. Membership is stored server-side as a
-``conversation_labels`` row with the reserved key ``"omni_project"`` (no new
-table — see ``sqlalchemy_store.list_projects`` / the ``project`` filter on
-``list_conversations``). The web UI moves a session via the row kebab's
-**"Change project"** submenu (``data-testid="move-to-project"``), which calls
-``PATCH /v1/sessions/{id}`` with ``{labels:{omni_project}}`` (an empty value
-removes the label).
+"Projects" sidebar group. Membership is the first-class
+``omnigent_conversation_metadata.project_id`` (see ``projects`` table / the
+``project`` filter on ``list_conversations``, which dual-reads it alongside the
+legacy ``omni_project`` label). The web UI moves a session via the row kebab's
+submenu (``data-testid="move-to-project"``), which calls
+``PATCH /v1/sessions/{id}`` with ``{project_id}`` — resolving the picked name to
+a project id (creating the first-class row on demand for a label-only folder),
+or ``""`` to unfile.
 
 The web UI move submenu is labelled "Add to project" (unfiled) or
 "Move session" (already filed); both share ``data-testid="move-to-project"``.
@@ -105,6 +106,8 @@ def test_remove_session_from_project(
 
     Moves the row into a fresh project first, then uses the kebab's
     "Remove from <project>" item and asserts the row returns to "Sessions".
+    The folder itself stays (now a first-class project, it exists independently
+    of its members and can be empty) — only the membership is cleared.
     """
     base_url, session_id = seeded_session
     title = f"e2e-proj-rm-{uuid.uuid4().hex[:8]}"
@@ -133,10 +136,12 @@ def test_remove_session_from_project(
     project_row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
     # The kebab item names the project it removes from ("Remove from <name>").
+    # It unfiles immediately — no confirmation, since a first-class project
+    # persists when emptied (nothing is deleted).
     page.get_by_role("menuitem", name=re.compile(rf"Remove from {re.escape(project)}")).click()
-    # Removal is confirmed (it may delete the implicit project) — accept it.
-    page.get_by_role("button", name="Remove from project", exact=True).click()
 
-    # Back under "Sessions", and the now-empty project folder is gone.
+    # Back under "Sessions". The first-class project folder persists (empty),
+    # since a first-class project exists independently of its members.
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
-    expect(page.get_by_role("button", name=project, exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name=project, exact=True)).to_have_count(1)
+    expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)

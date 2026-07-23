@@ -678,8 +678,8 @@ def _build_session_response(
         ``None`` falls back to this conversation's own ``session_usage``
         (correct for childless sessions). Passed by the snapshot path;
         other callers omit it.
-    :param model_options: Raw Codex app-server ``model/list``
-        options for this session, e.g. ``[{"id": "gpt-5.5"}]``.
+    :param model_options: Runner-owned native model picker options,
+        e.g. ``[{"id": "gpt-5.5", "displayName": "GPT-5.5"}]``.
         ``None`` is treated as ``[]``.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
@@ -3438,6 +3438,53 @@ async def _forward_event_to_runner(
     effective_runner_override = (
         body.model_override if body.model_override is not None else conv.model_override
     )
+    # ── Auto-harness resolution ───────────────────────────────────────
+    # When the session was created with harness_override="auto", the real
+    # harness + model are determined here on the first message where user
+    # text is available.  After resolution the sentinel is replaced with
+    # the concrete harness so subsequent turns behave normally.
+    if conv.harness_override == "auto" and body.type == "message":
+        from omnigent.server.smart_routing import route_session_harness
+
+        _auto_text = _extract_user_text_for_routing(body)
+        if _auto_text:
+            _auto_harness, _auto_model, _auto_verdict = await route_session_harness(
+                _auto_text,
+                session_id=session_id,
+                runner_client=runner_client,
+            )
+            try:
+                # Always clear the "auto" sentinel even when routing
+                # returned no harness (unavailable/failed) so the branch
+                # doesn't re-run on every subsequent turn.
+                _conv_updates: dict[str, Any] = (
+                    {"harness_override": _auto_harness}
+                    if _auto_harness is not None
+                    else {"_unset_harness_override": True}
+                )
+                if _auto_model is not None and effective_runner_override is None:
+                    _conv_updates["model_override"] = _auto_model
+                    effective_runner_override = _auto_model
+                _updated = await asyncio.to_thread(
+                    conversation_store.update_conversation,
+                    session_id,
+                    **_conv_updates,
+                )
+                if _updated is not None:
+                    conv = _updated
+            except (OSError, ValueError):
+                _logger.warning(
+                    "auto-harness: failed to persist resolved harness for session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            if _auto_model is not None and _auto_verdict is not None:
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    _auto_model,
+                    _auto_verdict,
+                )
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
     # call the judge LLM on the FIRST message to pick the model for
@@ -3501,7 +3548,7 @@ async def _forward_event_to_runner(
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None:
+    if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
 
     # The runner's sessions-native POST returns 202 immediately
@@ -5002,9 +5049,15 @@ async def _create_session_from_existing_agent(
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's
     # --harness fail-loud rules.
-    harness_override = await asyncio.to_thread(
-        _validated_harness_override, body.harness_override, agent
-    )
+    # "auto" defers harness + model selection to the first-message routing
+    # path; validate executor type now but store the sentinel unchanged.
+    if body.harness_override == "auto":
+        await asyncio.to_thread(_validated_harness_override_executor_type, agent)
+        harness_override = "auto"
+    else:
+        harness_override = await asyncio.to_thread(
+            _validated_harness_override, body.harness_override, agent
+        )
 
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
@@ -5240,13 +5293,26 @@ async def _create_session_from_existing_agent(
             _host_install_id: str | None = None
             if _hr is not None and conv.host_id is not None:
                 _host_install_id = _hr.get_host_installation_id(conv.host_id)
+            # Resolve harness directly from the in-scope agent + cache so
+            # the result is independent of _globals._agent_store (which is
+            # only set when the server is started via the CLI).
+            _tel_harness: str | None
+            if native_agent is not None:
+                _tel_harness = native_agent.harness
+            elif conv.harness_override:
+                _tel_harness = conv.harness_override
+            else:
+                _tel_loaded = agent_cache.load(
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+                _tel_harness = _spec_harness(_tel_loaded.spec)
             _tel_emit(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
                     agent_id=agent.id,
-                    harness=native_agent.harness
-                    if native_agent is not None
-                    else _resolve_harness(conv),
+                    harness=_tel_harness,
                     surface=_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
@@ -5911,7 +5977,7 @@ async def _fetch_model_options(
     """
     Resolve the Web UI model-picker options for a native session.
 
-    Two shapes:
+    Three shapes:
 
     * **cursor-native** — a curated *static* base catalog
       (:func:`omnigent.cursor_native.cursor_base_model_options`), returned
@@ -5923,6 +5989,8 @@ async def _fetch_model_options(
       can read (its app-server ``model/list``). Like skills, this stays off the
       snapshot hot path: the first snapshot kicks a background fetch and returns
       ``[]``; subsequent snapshots serve the cache.
+    * **claude-native** — the provider-neutral aliases from the exact launch
+      config, refreshed from Databricks before each new terminal starts.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
@@ -5930,7 +5998,7 @@ async def _fetch_model_options(
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
     :returns: Model options, or ``[]`` when the session has no model picker or
-        the (codex) options are not yet available.
+        the runner-owned options are not yet available.
     """
     wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
     if wrapper == _CURSOR_NATIVE_WRAPPER_LABEL_VALUE:

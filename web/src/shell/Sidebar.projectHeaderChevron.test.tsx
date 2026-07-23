@@ -36,7 +36,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopSession: () => ({ mutate: vi.fn() }),
   // One project so a folder header renders. Empty projects are not filtered
   // out, so no conversations are needed to exercise the header layout.
-  useProjects: () => ({ data: ["My Project"] }),
+  useProjects: () => ({ data: [{ id: "p_my", name: "My Project" }] }),
   useProjectSessions: () => ({
     data: undefined,
     isLoading: false,
@@ -46,6 +46,8 @@ vi.mock("@/hooks/useConversations", () => ({
   }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));

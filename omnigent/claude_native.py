@@ -119,6 +119,7 @@ _TERMINAL_NAME = "claude"
 _TERMINAL_SESSION_KEY = "main"
 _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
+_ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
 _ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
 _AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
@@ -161,12 +162,24 @@ _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION"
 _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME"
 _UCODE_CLAUDE_CUSTOM_TIER = "sonnet_5"
 _UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
+_CLAUDE_NATIVE_STATIC_MODEL_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("fable", "Fable"),
+    ("opus", "Opus"),
+    ("sonnet", "Sonnet 4.6"),
+    (_UCODE_CLAUDE_CUSTOM_TIER, _UCODE_CLAUDE_CUSTOM_TIER_LABEL),
+    ("haiku", "Haiku"),
+)
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
 _CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+_CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
+    Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    Path("/etc/claude-code/managed-settings.json"),
+    Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
+)
 _CLAUDE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _RESUME_ACTION_SWITCH = "switch"
 _RESUME_ACTION_MOVE = "move"
@@ -296,6 +309,135 @@ class ClaudeNativeUcodeConfig:
     env: dict[str, str]
     api_key_helper: str | None = None
     model: str | None = None
+
+
+def resolve_claude_native_model_selection(
+    model: str | None,
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> str | None:
+    """Resolve an Omnigent picker id to a model identifier Claude accepts.
+
+    Claude Code understands its built-in family aliases directly, but the
+    extra Sonnet 5 row uses Omnigent's ``sonnet_5`` id because it occupies
+    Claude Code's provider-configured custom model slot. Resolve that id to
+    the exact custom option, preserving provider suffixes such as ``[1m]``.
+    Direct Claude logins have no provider config, so they use the canonical
+    Anthropic model id.
+
+    :param model: Persisted picker id, built-in alias, or concrete model id.
+    :param claude_config: Resolved provider config for the terminal.
+    :returns: A model identifier suitable for ``--model`` or ``/model``.
+    """
+    if model != _UCODE_CLAUDE_CUSTOM_TIER:
+        return model
+    if claude_config is not None:
+        custom_model = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
+        if custom_model:
+            return custom_model
+        provider_fallback = claude_config.env.get(_UCODE_CLAUDE_TIER_TO_ENV["sonnet"])
+        if provider_fallback:
+            return provider_fallback
+        if claude_config.model:
+            return claude_config.model
+    return "claude-sonnet-5"
+
+
+def _claude_model_display_name(tier: str, model_id: str) -> str:
+    """Build a friendly family/version label from a routable model id."""
+    normalized = model_id.lower().removesuffix("[1m]")
+    marker = f"claude-{tier}-"
+    marker_index = normalized.find(marker)
+    if marker_index < 0:
+        return tier.replace("_", " ").title()
+    version_parts: list[str] = []
+    for part in normalized[marker_index + len(marker) :].split("-"):
+        if not part.isdigit() or len(version_parts) == 2:
+            break
+        version_parts.append(part)
+    family = tier.replace("_", " ").title()
+    return f"{family} {'.'.join(version_parts)}" if version_parts else family
+
+
+def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
+    """Read the model overrides Claude Code applies from managed settings."""
+    allowed_env = {
+        *_UCODE_CLAUDE_TIER_TO_ENV.values(),
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
+        _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
+    }
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw_env = payload.get("env") if isinstance(payload, dict) else None
+        if not isinstance(raw_env, dict):
+            continue
+        model_env = {
+            key: value.strip()
+            for key, value in raw_env.items()
+            if key in allowed_env and isinstance(value, str) and value.strip()
+        }
+        if model_env:
+            raw_default = raw_env.get(_ANTHROPIC_MODEL_ENV)
+            default_model = raw_default.strip() if isinstance(raw_default, str) else None
+            return ClaudeNativeUcodeConfig(env=model_env, model=default_model or None)
+    return None
+
+
+def claude_native_model_options(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, object]]:
+    """Return the model picker rows supported by a Claude launch config.
+
+    Databricks/ucode configs expose only aliases that were pinned to a live or
+    cached gateway model. When Claude owns its configuration, mirror managed
+    model overrides before falling back to the curated subscription catalog.
+
+    :param claude_config: Launch config resolved for the session.
+    :returns: Wire-ready model option objects.
+    """
+    options: list[dict[str, object]] = []
+    effective_config = claude_config or _managed_claude_model_config()
+    if effective_config is not None:
+        default_model = (effective_config.model or "").removesuffix("[1m]")
+        for tier, env_var in _UCODE_CLAUDE_TIER_TO_ENV.items():
+            model_id = effective_config.env.get(env_var)
+            if model_id:
+                options.append(
+                    {
+                        "id": tier,
+                        "model": model_id,
+                        "displayName": _claude_model_display_name(tier, model_id),
+                        "isDefault": model_id.removesuffix("[1m]") == default_model,
+                    }
+                )
+            if tier == "sonnet":
+                custom_model = effective_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
+                if custom_model:
+                    custom_name = effective_config.env.get(
+                        _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
+                        _UCODE_CLAUDE_CUSTOM_TIER_LABEL,
+                    )
+                    options.append(
+                        {
+                            "id": _UCODE_CLAUDE_CUSTOM_TIER,
+                            "model": custom_model,
+                            "displayName": custom_name,
+                            "isDefault": custom_model.removesuffix("[1m]") == default_model,
+                        }
+                    )
+    if options:
+        return options
+    return [
+        {
+            "id": model_id,
+            "model": model_id,
+            "displayName": label,
+            "isDefault": False,
+        }
+        for model_id, label in _CLAUDE_NATIVE_STATIC_MODEL_OPTIONS
+    ]
 
 
 def build_native_claude_terminal_env(
@@ -1401,7 +1543,11 @@ def _strip_resume_from_claude_args(args: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | None:
+def _ucode_config_for_profile(
+    profile: str | None,
+    *,
+    refresh_models: bool = True,
+) -> ClaudeNativeUcodeConfig | None:
     """
     Resolve native Claude Code launch config from ucode state.
 
@@ -1412,6 +1558,9 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
 
     :param profile: Databricks CLI profile name, e.g.
         ``"<your-profile>"``.
+    :param refresh_models: Query Databricks for the workspace's current Claude
+        model services before building the launch config. Tests and non-launch
+        lookups may disable it to use the cached ucode mapping directly.
     :returns: Ucode-derived launch config, or ``None`` when no matching
         ucode state exists.
     :raises click.ClickException: If the selected workspace has a
@@ -1457,6 +1606,37 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
     refresh_interval_ms = (
         agent_state.auth_refresh_interval_ms or _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS
     )
+    claude_models = dict(workspace_state.claude_models)
+    if refresh_models:
+        live_models: dict[str, str] | None = None
+        try:
+            from omnigent.databricks_model_discovery import (
+                discover_databricks_claude_models,
+            )
+            from omnigent.runtime.credentials.databricks import (
+                resolve_databricks_workspace,
+            )
+
+            creds = resolve_databricks_workspace(profile)
+            live_models = discover_databricks_claude_models(creds.host, creds.token)
+        except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+            _logger.warning(
+                "native-claude: live Databricks model discovery failed for profile %r; "
+                "using cached ucode models",
+                profile,
+                exc_info=True,
+            )
+        if live_models is not None:
+            if not workspace_state.fable_enabled:
+                live_models.pop("fable", None)
+            if not live_models:
+                raise click.ClickException(
+                    f"Databricks profile {profile!r} exposes no Claude model services. "
+                    "Ask a workspace admin to grant access, or run `ucode configure` "
+                    "after Claude models are enabled."
+                )
+            claude_models = live_models
+
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
@@ -1468,19 +1648,50 @@ def _ucode_config_for_profile(profile: str | None) -> ClaudeNativeUcodeConfig | 
     # canonical Anthropic name (e.g. "claude-opus-4-7[1m]") that the
     # Databricks gateway rejects.
     for tier, env_var in _UCODE_CLAUDE_TIER_TO_ENV.items():
-        model_id = workspace_state.claude_models.get(tier)
+        model_id = claude_models.get(tier)
         if model_id:
             env[env_var] = model_id
-    custom_model_id = workspace_state.claude_models.get(_UCODE_CLAUDE_CUSTOM_TIER)
+    custom_model_id = claude_models.get(_UCODE_CLAUDE_CUSTOM_TIER)
     if custom_model_id:
         env[_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV] = custom_model_id
         env[_ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV] = _UCODE_CLAUDE_CUSTOM_TIER_LABEL
-    # When ucode caches no model, default it so Claude Code doesn't fall back
-    # to its host-config model (an Anthropic-direct id the gateway rejects).
+    # Preserve the cached default's family while refreshing its version. If it
+    # is unavailable, use ucode's normal family precedence (Opus, Sonnet,
+    # Haiku, then opt-in Fable) before the legacy hardcoded fallback.
+    configured_default = agent_state.model
+    default_model: str | None = None
+    if configured_default:
+        normalized_default = configured_default.removesuffix("[1m]")
+        default_model = next(
+            (
+                model_id
+                for model_id in claude_models.values()
+                if model_id.removesuffix("[1m]") == normalized_default
+            ),
+            None,
+        )
+        default_parts = re.split(r"[^a-z0-9]+", configured_default.lower())
+        if default_model is None:
+            for tier in _UCODE_CLAUDE_TIER_TO_ENV:
+                if tier in default_parts and tier in claude_models:
+                    default_model = claude_models[tier]
+                    break
+    if default_model is None:
+        default_model = next(
+            (
+                claude_models[tier]
+                for tier in ("opus", "sonnet", "haiku", "fable")
+                if tier in claude_models
+            ),
+            None,
+        )
+    # When ucode caches no model and live discovery was unavailable, default it
+    # so Claude Code doesn't fall back to a host-config Anthropic id the gateway
+    # rejects.
     return ClaudeNativeUcodeConfig(
         env=env,
         api_key_helper=agent_state.auth_command,
-        model=agent_state.model or DATABRICKS_CLAUDE_DEFAULT_MODEL,
+        model=default_model or configured_default or DATABRICKS_CLAUDE_DEFAULT_MODEL,
     )
 
 

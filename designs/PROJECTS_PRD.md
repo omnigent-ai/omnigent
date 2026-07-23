@@ -425,10 +425,11 @@ user's memberships would be their own private metadata.
   (P1), move/create-in-project (P2), rename (P3), delete semantics. Reorder is
   **optional** and, if added, client-only (§7.2). No label backfill here — the
   server dual-reads (§13), so first-class projects work alongside existing
-  label-projects without migrating them. Shipped as two PRs: **1a** the project
-  container (table + store + CRUD) and **1b** session membership (the
-  `project_id` column, conversation-store dual-read, and the session-move HTTP
-  surfaces) — see §12.
+  label-projects without migrating them. Shipped as three PRs: **1a** the project
+  container (table + store + CRUD), **1b** session membership (the `project_id`
+  column, conversation-store dual-read, and the session-move HTTP surfaces), and
+  the **web UI** (sidebar create/rename/delete/move against the first-class
+  entity, dual-reading label-projects) — see §12.
 - **Phase 2 — Project defaults (P4a):** default host/workspace/harness/model
   seeded into the new-chat dialog when starting a session from within a project;
   graceful degradation when host offline / not owned.
@@ -488,16 +489,47 @@ Links sessions to projects and exposes it, completing Phase 1.
   cross-DB split-DB path); route move / unfile / list, single- and multi-user
   ownership boundaries.
 
+### Done (Web UI — first-class projects in the sidebar)
+Wires the web app to the first-class entity, keeping the label path working via
+dual-read so no migration is forced. Folders are keyed by **name** (the union
+key that merges a first-class project and a like-named label-project into one
+folder), carrying the first-class `id` when one exists.
+- ✅ **List dual-read** — `GET /v1/sessions/projects` now returns the UNION of
+  first-class projects (`project_store.list`, incl. empty, with `id`) and legacy
+  label-projects (`id=None`), merged by name and sorted. Response shape changed
+  from `list[str]` to `list[{id, name}]`; owner-scoped as before.
+- ✅ **First-class CRUD client** — `web/src/lib/projectsApi.ts`
+  (`list/create/rename/delete` against `/v1/projects`); hooks `useCreateProject`,
+  `useRenameProject`, and a reworked `useDeleteProject`. `useProjects` now
+  returns `{id, name}[]`.
+- ✅ **Create empty project** — a "New project" control (`NewProjectButton`) in
+  the always-visible Projects section (My-sessions tab), even with zero
+  projects (§5.3). `POST /v1/projects`.
+- ✅ **Membership by `project_id`** — filing/moving a session (composer picker,
+  row kebab, drag-drop) PATCHes `project_id`, resolving the picked name to an id
+  and **creating the first-class row on demand** for a label-only folder. `""`
+  unfiles. Sidebar groups a folder's members by first-class id OR the legacy
+  label, and a row's "current project" dual-reads both (so pinned first-class
+  members keep their project flyout).
+- ✅ **Rename** — `PATCH /v1/projects/{id}` (O(1)); a label-only folder is
+  promoted on demand (create + re-file members). **Delete** — archives and
+  unfiles every member (clears `project_id` + `omni_project` label), then
+  deletes the container; sessions are never deleted (§5.3, §7).
+- ✅ Tests: `projectsApi` unit tests; reworked hook tests (resolve→file,
+  create-on-demand, archive+unfile+delete); sidebar/composer suites updated;
+  server union test. Empty folders read "No sessions".
+- ⬜ **Deferred (kept on the name/label path via dual-read):** the new-session
+  prefill state machine and the Settings archived-only project picker still read
+  the `omni_project` label; retiring label reads from the UI is gated on the
+  Phase 4 backfill. TS client types are not codegen-regenerated (hand-written
+  `projectsApi`).
+
 ### TODO
-- ⬜ **Web UI** — always-visible Projects sidebar section; create empty project;
-  "New session here"; session-row kebab move; rename (§5–§7). No TS client
-  types regenerated yet.
-- ⬜ **Benchmark (when the UI ships).** Once the project sidebar is wired, add a
-  `list_project_sessions` journey to `dev/benchmarks/omnigent` (mirrors the
-  existing `list_sessions` hot read path), and consider a `list_projects`
-  journey. CRUD writes (create/rename/delete) are infrequent single-row ops and
-  don't need a benchmark. Nothing to add now — the routes aren't client-facing
-  yet, so there's no user journey to protect.
+- ⬜ **Benchmark.** Now that the sidebar is wired, add a `list_project_sessions`
+  journey to `dev/benchmarks/omnigent` (mirrors the existing `list_sessions` hot
+  read path), and consider a `list_projects` journey for the sidebar's project
+  list fetch. CRUD writes (create/rename/delete) are infrequent single-row ops
+  and don't need a benchmark.
 - ⬜ **Phase 2 — project defaults (P4a)** — add a `config` JSON column (small
   add-column migration) and plumb it through the store/entity/API; seed
   host/workspace/harness/model into the new-chat dialog (§8.1).

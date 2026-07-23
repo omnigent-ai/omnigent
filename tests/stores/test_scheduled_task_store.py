@@ -314,6 +314,34 @@ def test_list_active_all_workspaces_includes_tenant_tasks(
     assert [(t.workspace_id, t.id) for t in tasks] == [(42, task_42.id)]
 
 
+def test_list_active_all_workspaces_pages_beyond_batch_size(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The scheduler-boot scan returns EVERY active task by keyset-paging
+    internally — no silent cap that would leave tasks beyond one batch un-armed."""
+    store._active_boot_batch_size = 5  # force multiple pages
+    total = 17
+    created_ids: list[str] = []
+    for i in range(total):
+        task = store.create(
+            scheduled_task_id=_uid(f"st_boot_{i:03d}"),
+            name=f"n{i}",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        created_ids.append(task.id)
+
+    tasks = store.list_active_all_workspaces()
+    returned_ids = [t.id for t in tasks]
+
+    assert len(returned_ids) == total
+    assert set(returned_ids) == set(created_ids)  # no gaps
+    assert len(returned_ids) == len(set(returned_ids))  # no dupes
+
+
 # ── update ────────────────────────────────────────────────────────────────────
 
 
@@ -421,7 +449,8 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
         error="boom",
         error_code="rate_limited",
     )
-    runs = store.list_runs(_uid("st_runs"))
+    runs, next_cursor = store.list_runs(_uid("st_runs"))
+    assert next_cursor is None
     assert [r.id for r in runs] == [_uid("sr_2"), _uid("sr_1")]  # scheduled_at DESC
     assert runs[0].status == "failed"
     assert runs[0].error == "boom"
@@ -430,6 +459,80 @@ def test_create_run_and_list_runs(store: SqlAlchemyScheduledTaskStore) -> None:
     assert runs[1].conversation_id == _uid("conv_1")
     assert runs[1].fired_at == 101
     assert runs[1].finished_at == 102
+
+
+def test_list_runs_cursor_pagination(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Paging by (limit, after_id) returns every run exactly once, newest-first,
+    with a null cursor on the last page — no gaps, no dupes."""
+    store.create(
+        scheduled_task_id=_uid("st_page"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    total = 25
+    expected_newest_first: list[str] = []
+    for i in range(total):
+        rid = _uid(f"sr_page_{i:03d}")
+        store.create_run(
+            run_id=rid,
+            scheduled_task_id=_uid("st_page"),
+            status="succeeded",
+            scheduled_at=1000 + i,
+        )
+        expected_newest_first.insert(0, rid)
+
+    collected: list[str] = []
+    after: str | None = None
+    pages = 0
+    while True:
+        runs, after = store.list_runs(_uid("st_page"), limit=10, after_id=after)
+        collected.extend(r.id for r in runs)
+        pages += 1
+        if after is None:
+            break
+        assert pages < 10, "pagination did not terminate"
+
+    assert collected == expected_newest_first
+    # 25 rows / page 10 -> 3 pages (10, 10, 5), last page has null cursor.
+    assert pages == 3
+
+
+def test_list_runs_cursor_pagination_ties_on_scheduled_at(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """When many runs share a scheduled_at, the (scheduled_at, id) keyset still
+    walks every row once (id tiebreak), proving an id-only cursor would be wrong."""
+    store.create(
+        scheduled_task_id=_uid("st_ties"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    ids = [_uid(f"sr_tie_{i:03d}") for i in range(15)]
+    for rid in ids:
+        store.create_run(
+            run_id=rid,
+            scheduled_task_id=_uid("st_ties"),
+            status="succeeded",
+            scheduled_at=500,
+        )
+    expected = sorted(ids, reverse=True)  # id DESC when scheduled_at is equal
+
+    collected: list[str] = []
+    after: str | None = None
+    while True:
+        runs, after = store.list_runs(_uid("st_ties"), limit=4, after_id=after)
+        collected.extend(r.id for r in runs)
+        if after is None:
+            break
+    assert collected == expected
 
 
 def test_list_runs_scoped_to_task(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -450,12 +553,12 @@ def test_list_runs_scoped_to_task(store: SqlAlchemyScheduledTaskStore) -> None:
     store.create_run(
         run_id=_uid("sr_y"), scheduled_task_id=_uid("st_y"), status="scheduled", scheduled_at=1
     )
-    assert [r.id for r in store.list_runs(_uid("st_x"))] == [_uid("sr_x")]
+    assert [r.id for r in store.list_runs(_uid("st_x"))[0]] == [_uid("sr_x")]
 
 
 def test_list_runs_empty_for_unknown_task(store: SqlAlchemyScheduledTaskStore) -> None:
-    """A task with no runs (or an unknown id) yields an empty list."""
-    assert store.list_runs(_uid("st_none")) == []
+    """A task with no runs (or an unknown id) yields an empty list and no cursor."""
+    assert store.list_runs(_uid("st_none")) == ([], None)
 
 
 def test_run_status_round_trips_as_string(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -618,9 +721,9 @@ def test_delete_also_removes_associated_runs(store: SqlAlchemyScheduledTaskStore
         status="failed",
         scheduled_at=2,
     )
-    assert len(store.list_runs(_uid("st_del_runs"))) == 2
+    assert len(store.list_runs(_uid("st_del_runs"))[0]) == 2
     store.delete(_uid("st_del_runs"))
-    assert store.list_runs(_uid("st_del_runs")) == []
+    assert store.list_runs(_uid("st_del_runs")) == ([], None)
 
 
 def test_delete_does_not_remove_other_tasks_runs(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -642,8 +745,8 @@ def test_delete_does_not_remove_other_tasks_runs(store: SqlAlchemyScheduledTaskS
             scheduled_at=1,
         )
     store.delete(_uid("st_a_scope"))
-    assert store.list_runs(_uid("st_a_scope")) == []
-    remaining = store.list_runs(_uid("st_b_scope"))
+    assert store.list_runs(_uid("st_a_scope")) == ([], None)
+    remaining, _ = store.list_runs(_uid("st_b_scope"))
     assert len(remaining) == 1
     assert remaining[0].id == _uid("sr_st_b_scope")
 
@@ -717,7 +820,7 @@ def test_update_run_is_idempotent_on_already_terminal(
     second = store.update_run(run_id, status="failed", finished_at=999, error_code="incomplete")
     assert second is None
     # State is unchanged from the first transition.
-    run = store.list_runs(_uid("task_once"))[0]
+    run = store.list_runs(_uid("task_once"))[0][0]
     assert run.status == "succeeded"
     assert run.finished_at == 202
     assert run.error_code is None

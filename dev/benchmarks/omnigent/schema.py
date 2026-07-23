@@ -16,7 +16,16 @@ import subprocess
 # v4: per-journey ``summary`` gained ``runs_total`` / ``runs_ok`` (and omits the
 # metric keys when every run failed); a journey that errored out of measurement
 # entirely carries ``skipped: true`` + ``error`` with empty ``runs``/``summary``.
-SCHEMA_VERSION = 4
+# v5: each run row gained ``http_requests`` / ``http_requests_per_op`` (server
+# HTTP requests handled during the timed region, counted via the CI-only debug
+# endpoint; ``null`` when uncounted); ``summary`` gains
+# ``avg_http_requests_per_op`` when any run was counted; ``config`` gains
+# ``network_delay_ms``.
+# v6: each run row gained ``route_requests`` (per-route breakdown of
+# ``http_requests``, ``"METHOD /route" -> count``); ``summary`` gains a
+# ``network_routes`` appendix (``[{route, requests, per_op}]`` sorted by
+# ``per_op`` desc) when any run recorded a breakdown.
+SCHEMA_VERSION = 6
 
 
 def _git(*args: str) -> str:

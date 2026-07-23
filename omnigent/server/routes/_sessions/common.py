@@ -449,7 +449,7 @@ _model_options_cache: dict[str, list[dict[str, Any]]] = {}
 _model_options_inflight: dict[str, asyncio.Task[None]] = {}
 
 
-_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
+_MODEL_OPTIONS_RETRY_DELAYS_S = (0.25, 0.5, 1.0, 2.0, 2.0)
 
 
 _pushed_model_options_cache: dict[str, list[dict[str, Any]]] = {}
@@ -619,7 +619,10 @@ _UI_ADDED_AGENT_TITLE_PREFIX = "ui"
 _UPLOAD_READ_CHUNK_BYTES: int = 1024 * 1024
 
 
+# Live runner-owned model catalogs, keyed by wrapper label to route segment.
+# Static catalogs bypass this cache so ``refresh_state`` cannot blank them.
 _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER: dict[str, str] = {
+    _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE: "claude-model-options",
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE: "codex-model-options",
     # pi-native is deliberately NOT here: its catalog is PUSHED by the resident
@@ -679,7 +682,6 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
-    "_CODEX_MODEL_OPTIONS_RETRY_DELAYS_S",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",
     "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
@@ -747,6 +749,7 @@ __all__ = [
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
     "_MCP_ELICITATION_TYPE",
     "_MODEL_OPTIONS_ENDPOINT_BY_WRAPPER",
+    "_MODEL_OPTIONS_RETRY_DELAYS_S",
     "_MODEL_TOKEN_KEYS",
     "_NATIVE_PERMISSION_HOOK_TIMEOUT_S",
     "_NATIVE_POLICY_NOT_ENFORCED_CODE",

@@ -320,9 +320,29 @@ describe("Composer status line (branch + context ring)", () => {
     );
   });
 
+  it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
+    // host_offline surfaces the reconnect affordance in the host badge (in
+    // place of the old banner below the composer): the tray shows even with
+    // no branch/ring, and clicking the badge opens the reconnect help.
+    bindHost("mac-laptop");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onShowReconnectHelp = vi.fn();
+    renderComposer({ hostOffline: true, onShowReconnectHelp });
+
+    expect(statusLine()).not.toBeNull();
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).toBe("BUTTON");
+    expect(badge).toHaveTextContent(/Host is offline/);
+    badge.click();
+    expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
   it("hides the host badge on a sub-agent session", () => {
     // A child session repurposes the header's left slot for the back
-    // affordance, so the host badge stays hidden there as it did before.
+    // affordance, so the host badge stays hidden there as it did before. Sub-
+    // agents are never host-bound (host_id is null), so they can't be
+    // host_offline anyway — a stranded child is local_stranded, handled by the
+    // banner elsewhere.
     bindHost("mac-laptop");
     useChatStore.setState({ gitBranch: "geist" });
     renderComposer({ subAgentLabel: "check-eligibility" });

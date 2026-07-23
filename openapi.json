@@ -2181,6 +2181,98 @@
         "title": "ModelUsage",
         "type": "object"
       },
+      "NativeModelOption": {
+        "additionalProperties": true,
+        "description": "One runner-owned native model-picker row.",
+        "properties": {
+          "defaultReasoningEffort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Defaultreasoningeffort"
+          },
+          "displayName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Displayname"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "isDefault": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isdefault"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "supportedReasoningEfforts": {
+            "items": {
+              "$ref": "#/components/schemas/NativeReasoningEffortOption"
+            },
+            "title": "Supportedreasoningefforts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "NativeModelOption",
+        "type": "object"
+      },
+      "NativeReasoningEffortOption": {
+        "additionalProperties": true,
+        "description": "Reasoning-effort metadata advertised by a native model catalog.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "reasoningEffort": {
+            "title": "Reasoningeffort",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reasoningEffort"
+        ],
+        "title": "NativeReasoningEffortOption",
+        "type": "object"
+      },
       "NativeToolData": {
         "description": "A provider-native tool output item (e.g. `web_search_call`).\n\nThese are executed server-side by the LLM provider and returned\nas opaque dicts. Agent-plane persists and replays them so the\nLLM sees its own tool results on subsequent iterations.",
         "properties": {
@@ -4333,10 +4425,10 @@
         "type": "object"
       },
       "SessionModelOptionsEvent": {
-        "description": "Signal that a codex-native session's model catalog has resolved.\n\nModel options are fetched from the bound runner's live\nCodex app-server via `model/list` and cached on the session\nsnapshot. The initial snapshot can return an empty list while\nthis background fetch is in flight; this event tells connected\nclients to re-read the snapshot and apply its now-populated\n`model_options`.\n\nCarries no payload beyond the conversation id. The snapshot's\n`model_options` field remains the source of truth.",
+        "description": "Signal that a native session's model catalog has resolved.\n\nModel options are fetched from the bound runner and cached on the session\nsnapshot. The initial snapshot can return an empty list while this\nbackground fetch is in flight; this event tells connected clients to\nre-read the snapshot and apply its now-populated `model_options`.\n\nCarries no payload beyond the conversation id. The snapshot's\n`model_options` field remains the source of truth.",
         "properties": {
           "conversation_id": {
-            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed Codex model / effort controls from the session snapshot.",
+            "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed Native model / effort controls from the session snapshot.",
             "title": "Conversation Id",
             "type": "string"
           },
@@ -4407,6 +4499,33 @@
           "viewers"
         ],
         "title": "SessionPresenceEvent",
+        "type": "object"
+      },
+      "SessionProjectSummary": {
+        "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
+            "title": "Id"
+          },
+          "name": {
+            "description": "Project name (the folder's display name and union key).",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SessionProjectSummary",
         "type": "object"
       },
       "SessionReasoningEffortEvent": {
@@ -4868,10 +4987,9 @@
             "title": "Mcp Startup"
           },
           "model_options": {
-            "description": "Codex app-server `model/list` options for codex-native sessions, including each model's supported reasoning efforts. Empty for non-codex-native sessions or while the bound runner / Codex app-server cannot answer yet.",
+            "description": "Runner-owned model-picker options for native sessions. Claude supplies launch-time gateway aliases; Codex includes each model's supported reasoning efforts. Empty while unavailable.",
             "items": {
-              "additionalProperties": true,
-              "type": "object"
+              "$ref": "#/components/schemas/NativeModelOption"
             },
             "title": "Model Options",
             "type": "array"
@@ -7104,6 +7222,66 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/{harness}/model-options": {
+      "get": {
+        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.",
+        "operationId": "get_host_model_options_v1_hosts__host_id__harnesses__harness__model_options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response Get Host Model Options V1 Hosts  Host Id  Harnesses  Harness  Model Options Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Model Options",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/runners": {
       "post": {
         "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
@@ -8119,13 +8297,19 @@
     },
     "/v1/sessions/projects": {
       "get": {
-        "description": "Return all project names for the authenticated user, ordered\nalphabetically.\n\nProjects are implicit: they exist while at least one session\nhas a `conversation_labels` row with `key=\"omni_project\"`.\n\n**Returns:** List of project names.",
+        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** List of `SessionProjectSummary` ordered by name.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SessionProjectSummary"
+                  },
+                  "title": "Response List Session Projects V1 Sessions Projects Get",
+                  "type": "array"
+                }
               }
             },
             "description": "Successful Response"
@@ -9528,7 +9712,7 @@
     },
     "/v1/sessions/{session_id}/permissions": {
       "get": {
-        "description": "List all permission grants on a session.\n\nRequires manage-level access.\n\n**Returns:** List of `PermissionObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
+        "description": "List permission grants on a session with cursor pagination.\n\nRequires manage-level access.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session or no access.",
         "operationId": "list_permissions_v1_sessions__session_id__permissions_get",
         "parameters": [
           {
@@ -9540,19 +9724,44 @@
               "title": "Session Id",
               "type": "string"
             }
+          },
+          {
+            "description": "Max grants to return (1\u20131000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
           }
         ],
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/PermissionObject"
-                  },
-                  "title": "Response 200 List Permissions V1 Sessions  Session Id  Permissions Get",
-                  "type": "array"
-                }
+                "schema": {}
               }
             },
             "description": "Successful Response"

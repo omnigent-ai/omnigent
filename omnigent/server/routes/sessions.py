@@ -266,6 +266,7 @@ from omnigent.server.schemas import (
     SessionLabelsResponse,
     SessionList,
     SessionListItem,
+    SessionProjectSummary,
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
@@ -791,31 +792,43 @@ def create_sessions_router(
     # would otherwise be captured by the ``{session_id}`` path param and 404
     # as a missing conversation.
 
-    @router.get(
-        "/sessions/projects",
-        response_model=None,
-    )
+    @router.get("/sessions/projects")
     async def list_session_projects(
         request: Request,
-    ) -> list[str]:
+    ) -> list[SessionProjectSummary]:
         """
-        Return all project names for the authenticated user, ordered
-        alphabetically.
+        Return the caller's projects as ``{"id", "name"}`` pairs, ordered
+        alphabetically by name.
 
-        Projects are implicit: they exist while at least one session
-        has a ``conversation_labels`` row with ``key="omni_project"``.
+        Dual-reads both project representations and unions them by name:
+        - **First-class projects** (``project_store``) — carry an ``id`` and
+          appear even when empty (the whole point of the first-class entity).
+        - **Legacy label-projects** (implicit ``omni_project`` label) — exist
+          while at least one owned session carries the label; ``id`` is
+          ``None`` until such a project is promoted to first-class.
 
-        :returns: List of project names.
+        A name present in both sources collapses to one entry that keeps the
+        first-class ``id``. Filing is owner-only, so both halves are scoped to
+        the caller (label-projects to their owned sessions, first-class to
+        their owned rows) — a project shared to them but owned by another user
+        does not surface as one of their own folders.
+
+        :returns: List of :class:`SessionProjectSummary` ordered by name.
         """
         user_id = _require_user(request, auth_provider)
-        # Filing into a project is owner-only, so the sidebar renders project
-        # folders only on "My sessions". Scope to owned sessions so a project
-        # owned by someone else (with a session shared to this user) doesn't
-        # surface as one of their own folders.
-        return await asyncio.to_thread(
-            conversation_store.list_projects,
-            owned_by=user_id,
-        )
+
+        def _list_union() -> list[SessionProjectSummary]:
+            # First-class first so its id wins when a name exists in both.
+            by_name: dict[str, SessionProjectSummary] = {}
+            if project_store is not None:
+                for proj in project_store.list(owner_user_id=user_id):
+                    by_name[proj.name] = SessionProjectSummary(id=proj.id, name=proj.name)
+            # Legacy path: label-derived projects (id=None unless already first-class).
+            for name in conversation_store.list_projects(owned_by=user_id):
+                by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
+            return [by_name[name] for name in sorted(by_name)]
+
+        return await asyncio.to_thread(_list_union)
 
     # ── PUT /sessions/{session_id}/read-state ─────────────────────
     #
@@ -7273,20 +7286,23 @@ def create_sessions_router(
     @router.get(
         "/sessions/{session_id}/permissions",
         response_model=None,
-        responses={200: {"model": list[PermissionObject]}},
     )
     async def list_permissions(
         request: Request,
         session_id: str,
-    ) -> list[PermissionObject]:
-        """List all permission grants on a session.
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None, description="Cursor: user_id to start after"),
+    ) -> dict:
+        """List permission grants on a session with cursor pagination.
 
         Requires manage-level access.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to list grants for,
             e.g. ``"conv_abc123"``.
-        :returns: List of :class:`PermissionObject`.
+        :param limit: Max grants to return (1–1000, default 100).
+        :param after: Cursor — user_id to start after (exclusive).
+        :returns: ``{"permissions": [...], "next_cursor": str|null}``.
         :raises OmnigentError: 404 if no session or no access.
         """
         user_id = _require_user(request, auth_provider)
@@ -7298,15 +7314,20 @@ def create_sessions_router(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        grants = await asyncio.to_thread(permission_store.list_for_session, session_id)
-        return [
-            PermissionObject(
-                user_id=g.user_id,
-                conversation_id=g.conversation_id,
-                level=g.level,
-            )
-            for g in grants
-        ]
+        grants, next_cursor = await asyncio.to_thread(
+            permission_store.list_for_session, session_id, limit=limit, after_user_id=after
+        )
+        return {
+            "permissions": [
+                PermissionObject(
+                    user_id=g.user_id,
+                    conversation_id=g.conversation_id,
+                    level=g.level,
+                )
+                for g in grants
+            ],
+            "next_cursor": next_cursor,
+        }
 
     # ── Agent sub-resource ────────────────────────────────────────
     # These endpoints expose the session's bound agent metadata

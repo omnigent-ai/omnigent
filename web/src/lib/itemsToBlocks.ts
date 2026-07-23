@@ -83,7 +83,7 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
     // after /compact. It starts with a distinctive prefix and is
     // part of the model's context (needed for resume) but should
     // not be shown as a chat bubble in the web UI.
-    if (isCompactionSummaryMessage(item)) {
+    if (isCompactionSummaryMessage(item) || isClaudeTaskNotificationMessage(item)) {
       return null;
     }
     return userMessageToBlock(item);
@@ -129,6 +129,23 @@ function isCompactionSummaryMessage(item: MessageItem): boolean {
   for (const block of item.content) {
     if (block.type === "input_text" && typeof block.text === "string") {
       if (block.text.startsWith(prefix)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Hide legacy Claude Task notifications persisted before the bridge marked them meta.
+function isClaudeTaskNotificationMessage(item: MessageItem): boolean {
+  const requiredMarkers = ["<task-notification>", "<task-id>", "</task-notification>"];
+  for (const block of item.content) {
+    if (block.type === "input_text" && typeof block.text === "string") {
+      const text = block.text.trimStart();
+      if (
+        text.startsWith("<task-notification>") &&
+        requiredMarkers.every((marker) => text.includes(marker))
+      ) {
         return true;
       }
     }
