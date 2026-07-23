@@ -978,6 +978,7 @@ export function AgentHarnessPicker({
   onCreateCustomAgent,
   sandboxSelected,
   onOpenChange,
+  dropdownModal = true,
   contentClassName,
   contentAlign = "end",
   triggerClassName,
@@ -1006,6 +1007,8 @@ export function AgentHarnessPicker({
   // `triggerLabelClassName`).
   /** Notified when the picker dropdown opens/closes. */
   onOpenChange?: (open: boolean) => void;
+  /** Whether the Radix dropdown should modal-block outside content. Defaults true. */
+  dropdownModal?: boolean;
   /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
   contentClassName?: string;
   /** Dropdown alignment. Defaults to "end" (composer footer). */
@@ -1172,6 +1175,7 @@ export function AgentHarnessPicker({
 
   return (
     <DropdownMenu
+      modal={dropdownModal}
       open={open}
       onOpenChange={(next) => {
         setOpen(next);

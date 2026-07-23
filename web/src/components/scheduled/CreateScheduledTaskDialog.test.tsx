@@ -42,12 +42,14 @@ vi.mock("@/shell/NewChatDialog", () => ({
     effectiveAgentId,
     agentLabel,
     host,
+    dropdownModal,
   }: {
     onSelectAgent: (a: AvailableAgent) => void;
     onOpenChange?: (open: boolean) => void;
     effectiveAgentId: string | null;
     agentLabel: string;
     host?: { host_id: string } | null;
+    dropdownModal?: boolean;
   }) => (
     <div
       data-testid="agent-picker-stub"
@@ -55,6 +57,7 @@ vi.mock("@/shell/NewChatDialog", () => ({
       // Surface the host the dialog feeds the picker for badge computation, so
       // a test can assert it's populated even when no host is pinned.
       data-badge-host={host?.host_id ?? ""}
+      data-dropdown-modal={dropdownModal === false ? "false" : "true"}
     >
       <span>{agentLabel}</span>
       <button
@@ -153,6 +156,13 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
 }
 
 describe("agent picker readiness (needs-setup badges)", () => {
+  it("explains that scheduled tasks use the selected agent's runtime defaults", () => {
+    renderDialog();
+    expect(
+      screen.getByText("Uses this agent's default model, effort, and permission settings"),
+    ).toBeInTheDocument();
+  });
+
   it("feeds the picker a fallback online host so 'needs setup' badges show with no host pinned", () => {
     renderDialog();
     // Fresh state: no host pinned, but the dialog still passes the first online
@@ -160,6 +170,11 @@ describe("agent picker readiness (needs-setup badges)", () => {
     // "needs setup" affordance isn't invisible until the user picks a host.
     const picker = screen.getByTestId("agent-picker-stub");
     expect(picker.getAttribute("data-badge-host")).toBe("host_1");
+  });
+
+  it("embeds the agent dropdown in non-modal mode so inside-dialog clicks only close the menu", () => {
+    renderDialog();
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-dropdown-modal", "false");
   });
 });
 
@@ -348,7 +363,7 @@ describe("CreateScheduledTaskDialog submit", () => {
   });
 });
 
-describe("nested-Select does not dismiss the Dialog (isInsidePopper guard)", () => {
+describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", () => {
   // The guard's decision is pure DOM: is the interaction target inside a Radix
   // popper / Select portal? Unit-test that directly — jsdom can't faithfully
   // reproduce Radix's pointer-capture portal outside-click, so the full
@@ -376,6 +391,15 @@ describe("nested-Select does not dismiss the Dialog (isInsidePopper guard)", () 
     expect(isInsidePopper(listbox)).toBe(true);
   });
 
+  it("treats a click inside the agent DropdownMenu portal as inside-popper", () => {
+    const content = document.createElement("div");
+    content.setAttribute("data-slot", "dropdown-menu-content");
+    const item = document.createElement("div");
+    content.appendChild(item);
+    document.body.appendChild(content);
+    expect(isInsidePopper(item)).toBe(true);
+  });
+
   it("treats the real backdrop (outside any popper) as NOT inside-popper", () => {
     const backdrop = document.createElement("div");
     document.body.appendChild(backdrop);
@@ -385,7 +409,7 @@ describe("nested-Select does not dismiss the Dialog (isInsidePopper guard)", () 
   });
 });
 
-describe("shouldGuardDialogDismiss (backdrop click closes; select-dismiss guarded)", () => {
+describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guarded)", () => {
   function overlayTarget(): Element {
     const overlay = document.createElement("div");
     overlay.setAttribute("data-slot", "dialog-overlay");
@@ -399,6 +423,12 @@ describe("shouldGuardDialogDismiss (backdrop click closes; select-dismiss guarde
     content.appendChild(inner);
     document.body.appendChild(content);
     return inner;
+  }
+  function dialogContentTarget(): Element {
+    const content = document.createElement("div");
+    content.setAttribute("data-slot", "dialog-content");
+    document.body.appendChild(content);
+    return content;
   }
 
   it("does NOT guard a genuine backdrop-overlay click → dialog dismisses", () => {
@@ -416,6 +446,15 @@ describe("shouldGuardDialogDismiss (backdrop click closes; select-dismiss guarde
   it("guards a click INSIDE a popper (option pick) → dialog stays open", () => {
     expect(
       shouldGuardDialogDismiss(popperTarget(), { selectOpen: false, msSinceSelectClose: 9999 }),
+    ).toBe(true);
+  });
+
+  it("guards while a dropdown is open, including clicks inside dialog content", () => {
+    expect(
+      shouldGuardDialogDismiss(dialogContentTarget(), {
+        selectOpen: true,
+        msSinceSelectClose: 9999,
+      }),
     ).toBe(true);
   });
 

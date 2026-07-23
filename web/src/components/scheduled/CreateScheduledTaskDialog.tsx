@@ -61,7 +61,7 @@ export function CreateScheduledTaskDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /** Seed values applied to Name/Prompt when the dialog opens (e.g. from a
-   *  "More ideas" suggestion chip). Omitted → the fields start empty. */
+   *  "Suggestions" suggestion chip). Omitted → the fields start empty. */
   initialName?: string;
   initialPrompt?: string;
 }) {
@@ -108,15 +108,15 @@ export function CreateScheduledTaskDialog({
     setPickedAgentId(agent.id);
   }
 
-  // ── Nested-Select dismiss guard ───────────────────────────────────────────
-  // The agent/host/schedule Selects portal their dropdown OUTSIDE DialogContent.
+  // ── Nested dropdown dismiss guard ─────────────────────────────────────────
+  // The agent picker and host/schedule Selects portal dropdowns OUTSIDE DialogContent.
   // Two dismiss paths leak through to the Dialog and close the whole modal:
   //   (a) picking an option — the closing pointerdown lands in the popper;
-  //   (b) clicking empty modal body (or the trigger) while a Select is open —
+  //   (b) clicking empty modal body (or the trigger) while a dropdown is open —
   //       the target is the dialog body, and the portal ALSO emits a
   //       focus-outside as it unmounts.
   // Target-sniffing (isInsidePopper) only covers (a). To cover (b) too, track
-  // whether ANY Select is open, and keep the guard armed for a short grace
+  // whether ANY dropdown is open, and keep the guard armed for a short grace
   // window after it closes so the trailing pointerup/focus transition that
   // Radix reports as "interact outside" is absorbed. See `guardDialogDismiss`.
   const selectOpenCountRef = useRef(0);
@@ -130,9 +130,10 @@ export function CreateScheduledTaskDialog({
     }
   }
   /** preventDefault the Dialog's outside-dismiss ONLY for the narrow nested-Select
-   * cases — a click inside a popper (path a) or while a Select is open (path b),
-   * plus a short grace window for the trailing focus-outside a Select emits as it
-   * unmounts. A genuine click on the backdrop OVERLAY always dismisses: its target
+   * cases — a click inside portalled dropdown content (path a) or while a dropdown
+   * is open (path b),
+   * plus a short grace window for the trailing focus-outside a dropdown emits as
+   * it unmounts. A genuine click on the backdrop OVERLAY always dismisses: its target
    * is the overlay itself (never a popper), so we let it through even inside the
    * grace window — this is the fix for backdrop-click-to-close being swallowed.
    * Escape + Cancel are unaffected (they don't route through this guard). */
@@ -335,6 +336,10 @@ export function CreateScheduledTaskDialog({
                 // Forward the dropdown open/close into the dialog's outside-click
                 // dismiss guard so opening the picker doesn't close the modal.
                 onOpenChange={handleSelectOpenChange}
+                // This picker is nested inside a Dialog. Radix DropdownMenu's
+                // default modal mode can turn an inside-dialog click into a
+                // parent Dialog outside interaction while the menu dismisses.
+                dropdownModal={false}
                 // Bound the dropdown height so it scrolls in the modal instead
                 // of running off the bottom of the screen (the trigger sits near
                 // the top of a tall dialog, unlike the composer footer). Width
@@ -351,6 +356,9 @@ export function CreateScheduledTaskDialog({
                 triggerLabelClassName="max-w-none text-sm"
               />
             </div>
+            <p className="text-[11px] text-muted-foreground">
+              Uses this agent&apos;s default model, effort, and permission settings
+            </p>
           </div>
 
           <ScheduleFields
@@ -469,7 +477,13 @@ export function isInsidePopper(target: EventTarget | null): boolean {
   return (
     target instanceof Element &&
     target.closest(
-      '[data-radix-popper-content-wrapper], [data-slot="select-content"], [role="listbox"]',
+      [
+        "[data-radix-popper-content-wrapper]",
+        '[data-slot="dropdown-menu-content"]',
+        '[data-slot="popover-content"]',
+        '[data-slot="select-content"]',
+        '[role="listbox"]',
+      ].join(", "),
     ) !== null
   );
 }
@@ -486,10 +500,10 @@ export function isBackdropOverlay(target: EventTarget | null): boolean {
  *
  * A genuine backdrop-overlay click ALWAYS dismisses (returns false), even during
  * the grace window — this is the fix for backdrop-click-to-close being swallowed.
- * Otherwise we swallow only the narrow nested-Select cases: a Select currently
- * open, the trailing focus-outside within `graceMs` of a Select closing, or a
- * click that landed inside a popper. Exported pure so it's unit-testable without
- * Radix's portal machinery.
+ * Otherwise we swallow only the narrow nested-dropdown cases: a dropdown
+ * currently open, the trailing focus-outside within `graceMs` of a dropdown
+ * closing, or a click that landed inside portalled dropdown content. Exported
+ * pure so it's unit-testable without Radix's portal machinery.
  */
 export function shouldGuardDialogDismiss(
   target: EventTarget | null,
