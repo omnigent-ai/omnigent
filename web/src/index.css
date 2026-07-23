@@ -108,6 +108,7 @@
    * browser default; the root `html` rules multiply it into their font-size so
    * the whole rem-based UI scales. Overridden at runtime on documentElement. */
   --ui-font-scale: 1;
+  --sidebar-font-size: 13px;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -336,8 +337,8 @@
 }
 
 .sidebar-compact-text {
-  font-size: 13px;
-  line-height: 20px;
+  font-size: var(--sidebar-font-size);
+  line-height: calc(var(--sidebar-font-size) + 7px);
 }
 
 /* App-shell canvas gradient. Copied verbatim from the brand mock
