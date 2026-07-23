@@ -8,17 +8,61 @@ file runs on both Linux CI and a Windows box.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
+import ctypes
+import io
 import os
 import subprocess
+import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import psutil
 import pytest
 
 from omnigent import _platform
 from omnigent.inner import _proc
+
+
+class _TTYTextIOWrapper(io.TextIOWrapper):
+    """Text stream stand-in that reports an attached terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+class _FakeKernel32:
+    """Minimal Windows console API stand-in for code-page lifecycle tests."""
+
+    def __init__(self, output_cp: int, *, set_succeeds: bool = True) -> None:
+        self.output_cp = output_cp
+        self.set_succeeds = set_succeeds
+        self.set_calls: list[int] = []
+
+    def GetConsoleOutputCP(self) -> int:
+        return self.output_cp
+
+    def SetConsoleOutputCP(self, code_page: int) -> int:
+        self.set_calls.append(code_page)
+        if not self.set_succeeds:
+            return 0
+        self.output_cp = code_page
+        return 1
+
+
+def _install_fake_kernel32(
+    monkeypatch: pytest.MonkeyPatch,
+    kernel32: _FakeKernel32,
+) -> None:
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(kernel32=kernel32),
+        raising=False,
+    )
 
 
 def _spin_cmd() -> list[str]:
@@ -38,6 +82,158 @@ def test_platform_flags_are_mutually_consistent() -> None:
     assert (os.name == "posix") == _platform.IS_POSIX
     # Exactly one OS family is true.
     assert _platform.IS_WINDOWS != _platform.IS_POSIX
+
+
+def test_configure_unicode_safe_stdio_noop_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POSIX (and forced-off Windows) must not touch streams."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", False)
+    assert _platform.configure_unicode_safe_stdio() is False
+
+
+def test_windows_console_output_cp_is_restored_at_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy console code page is restored after Omnigent exits."""
+    kernel32 = _FakeKernel32(936)
+    _install_fake_kernel32(monkeypatch, kernel32)
+    registrations: list[tuple[Callable[..., object], tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        atexit,
+        "register",
+        lambda callback, *args: registrations.append((callback, args)),
+    )
+
+    _platform._set_windows_console_output_utf8()
+
+    assert kernel32.set_calls == [_platform._WINDOWS_UTF8_CP]
+    assert len(registrations) == 1
+    callback, args = registrations[0]
+    callback(*args)
+    assert kernel32.set_calls == [_platform._WINDOWS_UTF8_CP, 936]
+
+
+@pytest.mark.parametrize("initial_cp", [0, _platform._WINDOWS_UTF8_CP])
+def test_windows_console_output_cp_skips_unneeded_switch(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_cp: int,
+) -> None:
+    """Unavailable and already-UTF-8 consoles need no mutation or cleanup."""
+    kernel32 = _FakeKernel32(initial_cp)
+    _install_fake_kernel32(monkeypatch, kernel32)
+    registrations: list[object] = []
+    monkeypatch.setattr(atexit, "register", lambda *args: registrations.append(args))
+
+    _platform._set_windows_console_output_utf8()
+
+    assert kernel32.set_calls == []
+    assert registrations == []
+
+
+def test_windows_console_output_cp_failed_switch_registers_no_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed UTF-8 switch must not schedule a misleading restore."""
+    kernel32 = _FakeKernel32(932, set_succeeds=False)
+    _install_fake_kernel32(monkeypatch, kernel32)
+    registrations: list[object] = []
+    monkeypatch.setattr(atexit, "register", lambda *args: registrations.append(args))
+
+    _platform._set_windows_console_output_utf8()
+
+    assert kernel32.set_calls == [_platform._WINDOWS_UTF8_CP]
+    assert registrations == []
+
+
+def test_windows_console_output_cp_restore_preserves_later_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit cleanup must not overwrite a code page changed by another owner."""
+    kernel32 = _FakeKernel32(936)
+    _install_fake_kernel32(monkeypatch, kernel32)
+    registrations: list[tuple[Callable[..., object], tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        atexit,
+        "register",
+        lambda callback, *args: registrations.append((callback, args)),
+    )
+
+    _platform._set_windows_console_output_utf8()
+    kernel32.output_cp = 437
+    callback, args = registrations[0]
+    callback(*args)
+
+    assert kernel32.set_calls == [_platform._WINDOWS_UTF8_CP]
+
+
+def test_configure_unicode_safe_stdio_reconfigures_gbk_console_streams(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy GBK TextIOWrappers become UTF-8 so emoji / ✓ are printable."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    output_cp_calls: list[None] = []
+    monkeypatch.setattr(
+        _platform,
+        "_set_windows_console_output_utf8",
+        lambda: output_cp_calls.append(None),
+    )
+    out = _TTYTextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict", write_through=True)
+    err = _TTYTextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    # Probe: the pre-fix stream rejects the host banner glyph.
+    with pytest.raises(UnicodeEncodeError):
+        out.write("✓")
+    out.seek(0)
+    out.truncate()
+
+    assert _platform.configure_unicode_safe_stdio() is True
+    assert out.encoding == "utf-8"
+    assert err.encoding == "utf-8"
+    assert output_cp_calls == [None]
+    # Must not raise — this is the Phase 0 CP936 failure mode.
+    print("✓ Connected 🖥️", file=out, flush=True)
+    out.seek(0)
+    assert "✓" in out.read()
+
+
+def test_configure_unicode_safe_stdio_preserves_redirected_stream_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipes stay locale-decodable while replacing unsupported glyphs."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    output_cp_calls: list[None] = []
+    monkeypatch.setattr(
+        _platform,
+        "_set_windows_console_output_utf8",
+        lambda: output_cp_calls.append(None),
+    )
+    buf = io.BytesIO()
+    out = io.TextIOWrapper(buf, encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", out)
+
+    assert _platform.configure_unicode_safe_stdio() is True
+    assert out.encoding == "gbk"
+    assert out.errors == "replace"
+    assert output_cp_calls == []
+
+    print("✓ Connected", file=out, flush=True)
+    assert buf.getvalue().decode("gbk").splitlines() == ["? Connected"]
+
+
+def test_safe_console_print_survives_gbk_strict_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A glyph the stream cannot encode must not raise (host-tunnel safety)."""
+    buf = io.BytesIO()
+    gbk = io.TextIOWrapper(buf, encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", gbk)
+    _platform.safe_console_print("✓ Connected as 'host'")
+    gbk.flush()
+    # Replacement bytes were written; no exception escaped.
+    assert buf.getvalue()
 
 
 def test_default_shell_argv_runs_an_echo() -> None:

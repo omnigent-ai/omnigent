@@ -22,7 +22,7 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import WINDOWS_ENV_PASSTHROUGH, safe_console_print
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -1018,11 +1018,10 @@ class HostProcess:
                 # terminal — print once per redirect streak so a foreground
                 # `omnigent host` shows the auth problem and its fix instead
                 # of sitting silent while it retries.
-                print(
+                safe_console_print(
                     f"⚠ {cause} Retrying — this also happens briefly while "
                     f"the server restarts. {self._credentials_fix_hint()}",
                     file=sys.stderr,
-                    flush=True,
                 )
             return None
         return self._classify_http_status(exc.response.status_code)
@@ -1194,11 +1193,10 @@ class HostProcess:
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
-        print(
+        safe_console_print(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
             f"    log: {_display_log_path(log_path)}"
             f"{session_line}",
-            flush=True,
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
@@ -1232,9 +1230,8 @@ class HostProcess:
                 handle.proc.kill()
                 handle.proc.wait()
         _logger.info("Stopped runner %s", frame.runner_id)
-        print(
+        safe_console_print(
             f"  ↓ Runner stopped: {frame.runner_id}",
-            flush=True,
         )
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
@@ -2187,15 +2184,14 @@ class HostProcess:
         for runner_id, error in list(self._unreported_exits.items()):
             del self._unreported_exits[runner_id]
             await self._report_runner_exit(runner_id, error)
-        # ``print`` (not ``_logger.warning``) so the user always sees the
-        # success line after the noisy ``databricks.sdk`` warnings —
-        # otherwise the terminal goes silent after auth and there's no
-        # signal the WS handshake actually completed.
-        print(
+        # User-facing banner (not ``_logger``) so the line is visible after
+        # noisy ``databricks.sdk`` warnings. ``safe_console_print`` so a
+        # legacy Windows code page cannot UnicodeEncodeError-out of the
+        # tunnel loop and trigger reconnect flaps.
+        safe_console_print(
             f"✓ Connected as {self._identity.name!r} "
             f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
             "Listening for sessions — Ctrl-C to disconnect.",
-            flush=True,
         )
 
         loop = asyncio.get_running_loop()
@@ -2356,20 +2352,20 @@ def run_host_process(
     path = config_path or CONFIG_PATH
     identity = load_or_create_host_identity(path)
     if not path.exists():
-        print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
-    print(f"Connecting to {server_url} as {identity.name!r} ({identity.host_id})")
+        safe_console_print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
+    safe_console_print(f"Connecting to {server_url} as {identity.name!r} ({identity.host_id})")
     # Tell the user where logs land up front — `omnigent host` used to run
     # silently, so a stuck/quiet host gave no hint where to look. Session
     # work goes to per-runner files under the runner dir (the exact
     # file is printed when each runner launches). The host process's
     # own diagnostics go to the host destination.
-    print(f"Session logs: {_display_log_path(_runner_log_dir())}/")
-    print(f"This host's log: {_display_log_path(host_log_path)}")
+    safe_console_print(f"Session logs: {_display_log_path(_runner_log_dir())}/")
+    safe_console_print(f"This host's log: {_display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
-        print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
+        safe_console_print(f"CLI diagnostics: {_display_log_path(_cli_log)}")
 
     host = HostProcess(identity, server_url)
     try:
@@ -2378,5 +2374,8 @@ def run_host_process(
         # Fail loud: a permanent connection failure must not look like the
         # process is still working. Print the cause + fix, then exit non-zero
         # instead of the old behavior of reconnecting silently forever.
-        print(f"\n✗ Could not connect to {server_url}.\n{exc}", file=sys.stderr, flush=True)
+        safe_console_print(
+            f"\n✗ Could not connect to {server_url}.\n{exc}",
+            file=sys.stderr,
+        )
         raise SystemExit(1) from exc

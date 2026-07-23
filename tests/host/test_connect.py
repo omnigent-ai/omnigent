@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -478,6 +480,54 @@ async def test_handle_launch_prints_exact_runner_log_path(
     assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
     assert "session: conv_log" in out
 
+    _cleanup_host(host)
+
+
+async def test_handle_launch_returns_result_when_banner_is_not_gbk_encodable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Unicode log path cannot interrupt launch after the runner is tracked."""
+
+    class _LiveProcess:
+        pid = 4242
+        returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode or 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    unicode_home = tmp_path / "home-😀"
+    unicode_home.mkdir()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: unicode_home))
+    output = io.TextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(
+        "omnigent.host.connect.subprocess.Popen",
+        lambda *args, **kwargs: _LiveProcess(),
+    )
+    host = _make_host_process()
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_unicode_log",
+            binding_token="tok_unicode_log",
+            workspace=str(workspace),
+        )
+    )
+
+    assert result.status == "launched"
+    assert result.runner_id in host._runners
     _cleanup_host(host)
 
 
@@ -2564,6 +2614,22 @@ async def test_login_redirect_prints_warning_to_terminal(
     assert "login page" in err
     # The exact remedy command, URL included, so the user can copy-paste.
     assert "omnigent login https://app.example.databricks.com" in err
+
+
+async def test_login_redirect_warning_survives_gbk_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warning glyph cannot turn an authentication retry into a disconnect."""
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="gbk", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stderr", stderr)
+    host = _host()
+
+    result = host._fatal_upgrade_error(
+        InvalidURI("https://w/oidc/authorize", "scheme isn't ws or wss")
+    )
+
+    assert result is None
+    assert host._login_redirect_streak == 1
 
 
 async def test_fresh_host_fails_loud_after_persistent_login_redirects(

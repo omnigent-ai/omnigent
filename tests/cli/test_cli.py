@@ -139,6 +139,28 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
     assert "Omnigent quick chat" not in result.stdout
 
 
+def test_cli_module_entrypoint_configures_stdio() -> None:
+    """``python -m omnigent.cli`` must use the hardened console entry point."""
+    marker = "__omnigent_stdio_configured__"
+    probe = (
+        "import runpy,sys;"
+        "from omnigent import _platform;"
+        f"_platform.configure_unicode_safe_stdio=lambda:print({marker!r});"
+        "sys.argv=['python -m omnigent.cli','--help'];"
+        "runpy.run_module('omnigent.cli',run_name='__main__')"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert marker in result.stdout.splitlines()
+
+
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [

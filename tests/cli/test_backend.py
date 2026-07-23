@@ -204,6 +204,19 @@ def test_ensure_host_daemon_local_inherits_data_dir_and_db_uri(
     assert env["OMNIGENT_DATABASE_URI"] == "postgresql://u:pw@h/db"
 
 
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+def test_build_host_daemon_env_forces_utf8_stdio(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Daemon print output uses the same UTF-8 encoding as its log handler."""
+    monkeypatch.setenv("PYTHONIOENCODING", "cp936")
+
+    env = _build_host_daemon_env(server_url=server_url)
+
+    assert env["PYTHONIOENCODING"] == "utf-8:replace"
+
+
 def test_build_host_daemon_env_local_preserves_server_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
