@@ -68,6 +68,7 @@ from omnigent.runner.resource_registry import (
     CODEX_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
+    GROK_BUILD_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
     KIMI_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -2872,6 +2873,87 @@ async def _auto_create_hermes_terminal(
         "Auto-created hermes terminal + forwarder/approval-mirror for session %s; task=%s",
         session_id,
         _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
+async def _auto_create_grok_build_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Grok Build TUI terminal for a grok-build-native session.
+
+    Launches ``grok`` in a runner-owned tmux pane. Auth is Grok Build's own
+    (``grok`` opens a browser on first launch for OAuth), so no Omnigent-managed
+    key is required.
+    """
+    from omnigent.grok_build_native import resolve_grok_build_executable
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    await _cancel_auto_forwarder_task(session_id)
+    from omnigent.grok_build_native_bridge import (
+        bridge_dir_for_session_id,
+        write_tmux_target,
+    )
+
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    # No forwarder for grok-build-native in v1: the embedded terminal is the sole
+    # output surface. grok-build-native has no SQLite session store to mirror from
+    # (parity with the minimal goose-native setup without a transcript DB).
+
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    grok_build_command = resolve_grok_build_executable()
+    grok_build_env: dict[str, str] = {
+        "NO_COLOR": "1",
+    }
+    launch_epoch_s = time.time()
+    grok_build_launch_args = launch_config.terminal_launch_args or []
+    terminal_spec = TerminalEnvSpec(
+        command=grok_build_command,
+        args=grok_build_launch_args,
+        env=grok_build_env,
+        scrollback=100_000,
+        tmux_allow_passthrough=True,
+        tmux_start_on_attach=False,
+    )
+    grok_build_resource_role = GROK_BUILD_NATIVE_TERMINAL_ROLE
+    terminal_view = await resource_registry.ensure_terminal(
+        session_id=session_id,
+        terminal_name="grok-build",
+        session_key="main",
+        spec=terminal_spec,
+        cwd=workspace,
+        resource_role=grok_build_resource_role,
+        os_env=OSEnvSpec(type="caller_process", cwd=workspace, fork=False).as_dict(),
+    )
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "grok-build", "main")
+        if instance is not None and instance.running:
+            write_tmux_target(
+                bridge_dir,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    _logger.info(
+        "Auto-created grok-build terminal for session %s",
+        session_id,
     )
     return terminal_view
 
@@ -8311,6 +8393,7 @@ def create_runner_app(
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kimi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _grok_build_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     # Per-session lock guarding the claude-native terminal auto-create in
     # ``create_session``. Two ``POST /v1/sessions`` calls can land
     # concurrently on a host-launched runner — ``_on_runner_connect``
@@ -10252,6 +10335,40 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        if harness_name == "grok-build-native":
+            _grok_build_ensure_lock = _grok_build_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with _grok_build_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_grok_build_terminal = (
+                    _tr is not None
+                    and _tr.get(session_id, "grok-build", "main") is not None
+                )
+                if not _has_grok_build_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        await _auto_create_grok_build_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create grok-build terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Grok Build",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
         # Auto-bootstrap the Omnigent REPL terminal for non-native
         # (SDK-harness) top-level sessions: host the framework's own TUI
         # (``omnigent attach``) in a tmux pane so the web UI can embed it
@@ -10576,6 +10693,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _grok_build_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         # Stop any TUI→web transcript forwarder (cursor-/goose-native) for this
@@ -11265,6 +11383,7 @@ def create_runner_app(
             "cursor-native",
             "kiro-native",
             "goose-native",
+            "grok-build-native",
             "qwen-native",
             "kimi-native",
             "hermes-native",
@@ -17044,6 +17163,43 @@ def create_runner_app(
                 content=session_resource_view_to_dict(terminal_view),
             )
 
+        if (
+            body.get("ensure_native_terminal")
+            and terminal_name == "grok-build"
+            and session_key == "main"
+        ):
+            grok_build_terminal_id = terminal_resource_id("grok-build", "main")
+            ensure_lock = _grok_build_terminal_ensure_locks.setdefault(
+                session_id, asyncio.Lock()
+            )
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, grok_build_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    terminal_view = await _auto_create_grok_build_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "grok-build terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Grok Build")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
         from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
         cwd_override = body.get("cwd")
@@ -18812,6 +18968,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _grok_build_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await resource_registry.cleanup_session(session_id)
         # This is the runner endpoint the SERVER's session-delete actually
@@ -18882,6 +19039,7 @@ def create_runner_app(
         _qwen_terminal_ensure_locks.pop(session_id, None)
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
+        _grok_build_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         # Close terminals with ``session.resource.deleted`` events BEFORE
         # cleanup_session — cleanup_conversation would silently pop them

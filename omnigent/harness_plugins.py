@@ -19,6 +19,7 @@ from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
+    GROK_BUILD_NATIVE_WRAPPER_VALUE,
     HERMES_NATIVE_WRAPPER_VALUE,
     KIMI_NATIVE_WRAPPER_VALUE,
     KIRO_NATIVE_WRAPPER_VALUE,
@@ -198,6 +199,15 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="hermes",
 )
 
+GROK_BUILD_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="grok-build",
+    display_name="Grok Build",
+    agent_name="grok-build-native-ui",
+    harness="grok-build-native",
+    wrapper_label=GROK_BUILD_NATIVE_WRAPPER_VALUE,
+    terminal_name="grok-build",
+)
+
 
 # Declared capabilities for the built-in harnesses. Each value is backed by the
 # module that implements it; the derivable axes (model_family, subagents) are
@@ -341,6 +351,17 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
     "hermes-native": _C(
         _IM.NATIVE_TUI,
         _EL.APPROVAL_MIRROR,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    ),
+    "grok-build-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.NONE,
         _RS.WARM_REATTACH,
         _EF.NONE,
         _MF.MULTI,
@@ -521,6 +542,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "cursor-native",
             "goose",
             "goose-native",
+            "grok-build-native",
             "hermes",
             "hermes-native",
             "kimi",
@@ -548,6 +570,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "cursor-native": "omnigent.inner.cursor_native_harness",
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
+        "grok-build-native": "omnigent.inner.grok_build_native_harness",
         "hermes": "omnigent.inner.hermes_harness",
         "hermes-native": "omnigent.inner.hermes_native_harness",
         "kimi": "omnigent.inner.kimi_harness",
@@ -568,6 +591,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi-code": "kimi",
         "native-antigravity": "antigravity-native",
         "native-goose": "goose-native",
+        "native-grok-build": "grok-build-native",
         "native-hermes": "hermes-native",
         "native-kimi": "kimi-native",
         "native-kiro": "kiro-native",
@@ -585,6 +609,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "codex-native",
             "cursor-native",
             "goose-native",
+            "grok-build-native",
             "hermes-native",
             "kimi-native",
             "kiro-native",
@@ -593,6 +618,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-codex",
             "native-cursor",
             "native-goose",
+            "native-grok-build",
             "native-hermes",
             "native-kimi",
             "native-kiro",
@@ -616,6 +642,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         QWEN_NATIVE_CODING_AGENT,
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
+        GROK_BUILD_NATIVE_CODING_AGENT,
     ),
     model_env_keys={
         "acp": "HARNESS_ACP_MODEL",

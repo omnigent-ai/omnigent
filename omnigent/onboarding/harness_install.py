@@ -92,6 +92,9 @@ COPILOT_KEY = "copilot"
 # Omnigent-managed credentials). The ``hermes`` binary must be on PATH.
 HERMES_KEY = "hermes"
 
+_GROK_BUILD_INSTALL_HINT = "curl -fsSL https://x.ai/cli/install.sh | bash"
+GROK_BUILD_KEY = "grok-build"
+
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
 
@@ -202,6 +205,13 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_hint=_HERMES_INSTALL_HINT,
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
     ),
+    GROK_BUILD_KEY: HarnessInstallSpec(
+        "Grok Build",
+        "grok",
+        package=None,
+        install_hint=_GROK_BUILD_INSTALL_HINT,
+        install_command=("bash", "-c", _GROK_BUILD_INSTALL_HINT),
+    ),
 }
 
 
@@ -266,6 +276,10 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Grok Build TUI (``grok-build-native``) wraps the ``grok`` CLI;
+    # ``native-grok-build`` reversed spelling gates on the same binary.
+    "grok-build-native": GROK_BUILD_KEY,
+    "native-grok-build": GROK_BUILD_KEY,
 }
 
 

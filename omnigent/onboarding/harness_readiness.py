@@ -39,6 +39,7 @@ from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
     GOOSE_KEY,
+    GROK_BUILD_KEY,
     HERMES_KEY,
     KIMI_KEY,
     KIRO_KEY,
@@ -126,6 +127,11 @@ _KIMI_NATIVE_HARNESSES: frozenset[str] = frozenset({"kimi-native", "native-kimi"
 # native CLI harnesses. Hermes owns its own auth (``hermes setup`` /
 # ``hermes model``); the headless ``hermes`` harness gates on the same binary.
 _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-hermes"})
+
+# Native Grok Build TUI harnesses (``omnigent grok-build``). Boot the ``grok``
+# TUI and can't launch without the ``grok`` binary on ``PATH`` — gate on it.
+# Grok Build owns its own auth (browser OAuth on first launch).
+_GROK_BUILD_NATIVE_HARNESSES: frozenset[str] = frozenset({"grok-build-native", "native-grok-build"})
 
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
@@ -228,6 +234,12 @@ def harness_is_configured(harness: str) -> bool:
         # Research). Auth/provider config surfaces at run time via Hermes' own
         # ``hermes model`` flow; gate only on binary presence.
         return harness_cli_installed(HERMES_KEY)
+    if canonical in _GROK_BUILD_NATIVE_HARNESSES or canonical == GROK_BUILD_KEY:
+        # Grok Build — the native TUI (``grok-build-native`` /
+        # ``native-grok-build``, via ``omni grok-build``) — wraps the ``grok``
+        # CLI (installed via a curl script from xAI). Auth surfaces at run time
+        # via Grok Build's own browser OAuth; gate only on binary presence.
+        return harness_cli_installed(GROK_BUILD_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -368,6 +380,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_GOOSE_NATIVE_HARNESSES)
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
+    spellings.update(_GROK_BUILD_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)
