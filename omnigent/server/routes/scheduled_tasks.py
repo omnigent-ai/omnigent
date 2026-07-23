@@ -19,7 +19,7 @@ import uuid
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -316,7 +316,7 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list() if t.user_id == owner_id]
+        tasks = store.list(owner_user_id=owner_id)
         running = store.list_running_runs_for_tasks([t.id for t in tasks])
         force_fail_stale_runs(store, running)
         return {"scheduled_tasks": [_to_response(t) for t in tasks]}
@@ -336,13 +336,20 @@ def create_scheduled_tasks_router(
     async def list_scheduled_task_runs(
         request: Request,
         scheduled_task_id: str,
-    ) -> dict[str, list[dict[str, Any]]]:
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
         """List the run history for one of the caller's scheduled tasks.
 
         Owner-scoped: a task owned by someone else (or absent) 404s via
         ``_require_owned``, so runs aren't enumerable across users. Runs come
         back most-recent-first (``scheduled_at DESC``); an empty history is an
         empty list.
+
+        Cursor-paginated so history is never silently truncated: pass ``limit``
+        (1-1000, default 100) and ``after`` (a prior page's ``next_cursor``).
+        The response is ``{"runs": [...], "next_cursor": <id or null>}``; a
+        ``null`` cursor marks the last page.
 
         Lazy-on-read backstop: before listing, force-fail any of this task's
         runs still ``running`` past the 6h max age (``incomplete``). Completion
@@ -356,8 +363,12 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)
-        runs = force_fail_stale_runs(store, store.list_runs(scheduled_task_id))
-        return {"runs": [_run_to_response(r) for r in runs]}
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        runs = force_fail_stale_runs(store, runs)
+        return {
+            "runs": [_run_to_response(r) for r in runs],
+            "next_cursor": next_cursor,
+        }
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(

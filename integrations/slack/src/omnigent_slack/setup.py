@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from slack_bolt.async_app import AsyncApp
 
 from omnigent_slack.auth_manager import AuthManager, pack_user_key, slack_client_id
+from omnigent_slack.events import host_id_of
 from omnigent_slack.models import UserConfig
 from omnigent_slack.oauth import DeviceGrantUnavailableError, OAuthError
 from omnigent_slack.omnigent import (
@@ -17,6 +20,7 @@ from omnigent_slack.omnigent import (
     ValidatedServer,
 )
 from omnigent_slack.store import SQLiteStore
+from omnigent_slack.text import truncate_option
 
 # Block Kit identifiers shared by the modal builders and the submission
 # handlers. Keeping them in one place avoids drift between what a modal renders
@@ -42,6 +46,10 @@ WORKSPACE_ACTION = "workspace_input"
 # below that in practice, but truncate defensively so a huge server never
 # produces an invalid view payload.
 _MAX_SELECT_OPTIONS = 100
+
+# Pause after views.open before the first views_update, so the client has
+# rendered the modal and won't drop the update (see _open_connecting_modal).
+_MODAL_SETTLE_SECONDS = 0.6
 
 
 class _ViewUpdateAck:
@@ -89,17 +97,46 @@ class SetupFlow:
         pool: OmnigentClientPool,
         server_url: str,
         auth_manager: AuthManager | None = None,
+        enrollment_url: Callable[[str, str, str, str], str | None] | None = None,
     ) -> None:
         self._store = store
         self._pool = pool
         self._server_url = server_url
         self._auth = auth_manager
+        # In Databricks web-auth mode, returns the signed enrollment link for a
+        # (team, user, email) or ``None`` if the web server isn't configured.
+        # ``None`` here means the historical device-grant / OIDC-ticket login
+        # is used.
+        self._enrollment_url = enrollment_url
         self._logger = logging.getLogger(__name__)
 
     def register(self, app: AsyncApp) -> None:
         app.command(COMMAND_NAME)(self._handle_config_command)
         app.action(ACTION_SETUP_START)(self._handle_setup_start)
         app.view(CALLBACK_SELECT_MODAL)(self._handle_select_submit)
+
+    async def _dm_user(
+        self,
+        client: Any,
+        user_id: str,
+        *,
+        text: str,
+        blocks: list[dict[str, Any]] | None = None,
+        purpose: str,
+    ) -> bool:
+        """Open a DM with ``user_id`` and post ``text`` (+ optional ``blocks``).
+
+        Centralizes the ``conversations_open`` → resolve-channel → post-or-warn
+        dance shared by the setup/re-login/logout DM prompts. ``purpose`` labels
+        the "could not open DM" warning. Returns whether the DM was delivered.
+        """
+        opened = await client.conversations_open(users=user_id)
+        dm_channel = _dm_channel_id(opened)
+        if dm_channel is None:
+            self._logger.warning("Could not open DM for %s user=%s", purpose, user_id)
+            return False
+        await client.chat_postMessage(channel=dm_channel, text=text, blocks=blocks)
+        return True
 
     async def _handle_config_command(self, ack: Any, command: dict[str, Any], client: Any) -> None:
         # ``/omnigent`` (or ``/omnigent config``) opens setup against the fixed
@@ -111,6 +148,15 @@ class SetupFlow:
         await ack()
         team_id = str(command.get("team_id") or "")
         user_id = str(command.get("user_id") or "")
+        # Fail closed on a missing team/user. Tokens and configs are keyed by
+        # (team, user); an empty team_id would collapse keys across workspaces,
+        # so a blank one must never reach the store. Matches the event path,
+        # which raises on a missing team.
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Config command missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            return
         subcommand = str(command.get("text") or "").split()[:1]
 
         if subcommand and subcommand[0].lower() == "logout":
@@ -132,25 +178,22 @@ class SetupFlow:
         saved settings (agent/host/workspace plus thread→session mappings),
         then DMs a confirmation.
         """
-        opened = await client.conversations_open(users=user_id)
-        dm_channel = _dm_channel_id(opened)
         revoked = 0
         if self._auth is not None and self._auth.enabled:
             revoked = await self._auth.logout_all(team_id, user_id)
             # Drop any pooled clients holding the just-revoked tokens.
             await self._pool.invalidate_user(pack_user_key(team_id, user_id))
         await self._store.clear_user_data(team_id, user_id)
-        if dm_channel:
-            servers = f" and revoked {revoked} server login(s)" if revoked else ""
-            await client.chat_postMessage(
-                channel=dm_channel,
-                text=(
-                    f":wave: Logged out{servers}. Your Omnigent settings were "
-                    "cleared — run `/omnigent` to set up again."
-                ),
-            )
-        else:
-            self._logger.warning("Could not open DM to confirm logout user=%s", user_id)
+        servers = f" and revoked {revoked} server login(s)" if revoked else ""
+        await self._dm_user(
+            client,
+            user_id,
+            text=(
+                f":wave: Logged out{servers}. Your Omnigent settings were "
+                "cleared — run `/omnigent` to set up again."
+            ),
+            purpose="logout confirmation",
+        )
 
     async def prompt_unconfigured(
         self,
@@ -168,17 +211,13 @@ class SetupFlow:
         knows to check their DM rather than waiting for a reply that never
         comes.
         """
-        opened = await client.conversations_open(users=user_id)
-        dm_channel = _dm_channel_id(opened)
-        if dm_channel:
-            await client.chat_postMessage(
-                channel=dm_channel,
-                text="Set up Omnigent to start using me.",
-                blocks=setup_prompt_blocks(),
-            )
-        else:
-            self._logger.warning("Could not open DM for setup user=%s", user_id)
-
+        await self._dm_user(
+            client,
+            user_id,
+            text="Set up Omnigent to start using me.",
+            blocks=setup_prompt_blocks(),
+            purpose="setup",
+        )
         if in_channel:
             await client.chat_postEphemeral(
                 channel=channel,
@@ -186,6 +225,44 @@ class SetupFlow:
                 thread_ts=thread_ts,
                 text="Let's get you set up — check your DM with me to configure Omnigent.",
             )
+
+    async def prompt_relogin(
+        self,
+        client: Any,
+        user_id: str,
+        *,
+        channel: str,
+        thread_ts: str | None,
+        in_channel: bool,
+    ) -> bool:
+        """DM a configured user whose token expired the re-login setup button.
+
+        Reached when a stored grant can no longer be refreshed (revoked, or the
+        refresh token itself expired) — the bot drops the token and prompts a
+        fresh sign-in. A DM (not a thread ephemeral) is used because it is
+        persisted and reliably delivered, and it carries the setup button —
+        pressing it re-runs the same login flow as first-time setup. When
+        triggered from a channel, an ephemeral pointer nudges the user to their
+        DM. Returns whether the DM was delivered.
+        """
+        delivered = await self._dm_user(
+            client,
+            user_id,
+            text="Your Omnigent login has expired. Sign in again to keep going.",
+            blocks=relogin_prompt_blocks(),
+            purpose="re-login",
+        )
+        if not delivered:
+            return False
+
+        if in_channel:
+            await client.chat_postEphemeral(
+                channel=channel,
+                user=user_id,
+                thread_ts=thread_ts,
+                text=("Your Omnigent login has expired — check your DM with me to sign in again."),
+            )
+        return True
 
     async def _handle_setup_start(self, ack: Any, body: dict[str, Any], client: Any) -> None:
         await ack()
@@ -195,6 +272,14 @@ class SetupFlow:
             return
         team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
         user_id = str((body.get("user") or {}).get("id") or "")
+        # Fail closed on a missing team/user: tokens/configs key on (team, user),
+        # so an empty team_id would collapse keys across workspaces. Matches the
+        # guard in the slash-command path.
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Setup start missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            return
         view_id = await self._open_connecting_modal(client, trigger_id)
         if view_id:
             await self._begin_setup(client, team_id=team_id, user_id=user_id, view_id=view_id)
@@ -213,6 +298,13 @@ class SetupFlow:
             return None
         view = resp.get("view") if hasattr(resp, "get") else None
         view_id = view.get("id") if isinstance(view, dict) else None
+        # Let the just-opened modal settle on the client before any views_update.
+        # views.open returns as soon as Slack's backend accepts the view, but the
+        # user's client renders it over a separate push channel; an update issued
+        # within a few hundred ms (our validate() is ~100ms) is accepted by the
+        # backend (ok:true) yet dropped by the not-yet-materialized client, so the
+        # modal stays stuck on "Connecting…". A short settle closes that window.
+        await asyncio.sleep(_MODAL_SETTLE_SECONDS)
         return str(view_id) if view_id else None
 
     async def _begin_setup(self, client: Any, *, team_id: str, user_id: str, view_id: str) -> None:
@@ -293,6 +385,67 @@ class SetupFlow:
             view=select_modal(server_url, validated, workspace_default=workspace_default),
         )
 
+    async def _revalidate_and_advance(
+        self,
+        client: Any,
+        *,
+        team_id: str,
+        user_id: str,
+        server_url: str,
+        view_id: str,
+        context: str,
+    ) -> None:
+        """Post-login/enrollment success: re-validate as the user, advance the modal.
+
+        Shared by the device-login and Databricks-enrollment success hooks. Drops
+        the tokenless client pooled during the pre-login probe so the pool rebuilds
+        it with the freshly-stored token — otherwise ``validate`` re-hits the auth
+        wall and the modal stalls. A ``views_update`` can fail if the user already
+        closed the modal — logged (with ``context``), never raised (the token is
+        stored regardless, and this runs in a background task).
+        """
+        user_key = pack_user_key(team_id, user_id)
+        await self._pool.invalidate(server_url, user_key)
+        omnigent = await self._pool.get(server_url, user_key)
+        try:
+            validated = await omnigent.validate()
+            await self._advance_to_select(
+                _ViewUpdateAck(client, view_id), omnigent, server_url, validated
+            )
+        except Exception as exc:
+            # The token was stored (the callback/login succeeded), but validating
+            # it against the server failed — most often the granted scope doesn't
+            # satisfy the server proxy, so the browser shows success while the
+            # modal would otherwise hang. Surface it instead of swallowing it, and
+            # log with a traceback so the deployed logs pinpoint the cause.
+            self._logger.warning(
+                "Post-%s modal advance failed team=%s user=%s server=%s: %s",
+                context,
+                team_id,
+                user_id,
+                server_url,
+                exc,
+                exc_info=True,
+            )
+            await self._fail_modal(
+                client,
+                view_id,
+                server_url,
+                "you're signed in, but the server rejected the sign-in when "
+                "validating it. Ask your Omnigent operator to confirm the OAuth "
+                "app's scopes are accepted by the server.",
+                context=context.capitalize(),
+            )
+
+    async def _fail_modal(
+        self, client: Any, view_id: str, server_url: str, reason: str, *, context: str
+    ) -> None:
+        """Swap the modal to the login-failed screen; best-effort, never raises."""
+        try:
+            await client.views_update(view_id=view_id, view=login_failed_modal(server_url, reason))
+        except Exception as exc:
+            self._logger.info("%s-failure modal update failed: %s", context, exc)
+
     async def _begin_in_modal_login(
         self,
         client: Any,
@@ -302,8 +455,18 @@ class SetupFlow:
         server_url: str,
         view_id: str,
     ) -> None:
-        """Show the login link in the modal and advance it once approved."""
+        """Show the login link in the modal and advance it once complete.
+
+        Dispatches on the configured login style: the Databricks web-auth
+        enrollment link (when wired) or the historical device-grant / OIDC
+        ticket flow.
+        """
         assert self._auth is not None
+        if self._enrollment_url is not None:
+            await self._begin_databricks_enrollment(
+                client, team_id=team_id, user_id=user_id, server_url=server_url, view_id=view_id
+            )
+            return
         client_id = slack_client_id(await self._team_name(client, team_id))
         try:
             pending = await self._auth.authorize(server_url=server_url, client_id=client_id)
@@ -326,36 +489,108 @@ class SetupFlow:
             )
             return
 
-        # Swap the modal to the "open the link and approve" screen.
-        await client.views_update(
-            view_id=view_id,
-            view=login_waiting_modal(server_url, pending.verification_url, pending.user_code),
-        )
+        # Swap the modal to the "open the link and approve" screen. If this fails
+        # (e.g. the user closed the modal) before the background poll is spawned,
+        # close ``pending`` — otherwise its open httpx client would leak, since
+        # nothing else owns it until the poll takes over below.
+        try:
+            await client.views_update(
+                view_id=view_id,
+                view=login_waiting_modal(server_url, pending.verification_url, pending.user_code),
+            )
+        except Exception:
+            await pending.close()
+            raise
 
         async def _on_success() -> None:
-            # Re-validate as the now-authenticated user and advance the same
-            # modal to the agent/host picker via views_update. A views_update
-            # can fail if the user already closed the modal — log, don't crash
-            # the background task (the token is stored regardless).
-            omnigent = await self._pool.get(server_url, pack_user_key(team_id, user_id))
-            try:
-                validated = await omnigent.validate()
-                await self._advance_to_select(
-                    _ViewUpdateAck(client, view_id), omnigent, server_url, validated
-                )
-            except Exception as exc:
-                self._logger.info("Post-login modal advance failed: %s", exc)
+            await self._revalidate_and_advance(
+                client,
+                team_id=team_id,
+                user_id=user_id,
+                server_url=server_url,
+                view_id=view_id,
+                context="login",
+            )
 
         async def _on_failure(reason: str) -> None:
-            try:
-                await client.views_update(
-                    view_id=view_id, view=login_failed_modal(server_url, reason)
-                )
-            except Exception as exc:
-                self._logger.info("Login-failure modal update failed: %s", exc)
+            await self._fail_modal(client, view_id, server_url, reason, context="Login")
 
         self._auth.await_authorization_in_background(
             pending=pending,
+            team_id=team_id,
+            user_id=user_id,
+            server_url=server_url,
+            on_success=_on_success,
+            on_failure=_on_failure,
+        )
+
+    async def _begin_databricks_enrollment(
+        self,
+        client: Any,
+        *,
+        team_id: str,
+        user_id: str,
+        server_url: str,
+        view_id: str,
+    ) -> None:
+        """Show the Databricks enrollment link and advance once the user signs in.
+
+        Unlike the device flow, there's no code to poll: the user completes SSO
+        in their browser and the enrollment web server stores the token. We poll
+        the shared token store (via the auth manager) for it to appear, keyed by
+        the same (team, user) the signed link is bound to.
+        """
+        assert self._auth is not None and self._enrollment_url is not None
+        # The enrollment link is bound to the Slack user's email so the callback
+        # can require the browser's X-Forwarded-Email to match — closing the
+        # confused-deputy where one user's link captures another's token. If we
+        # can't resolve the email, fail closed rather than issue an unverifiable
+        # link. (Needs the `users:read.email` Slack scope.)
+        email = await self._user_email(client, user_id)
+        if not email:
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(
+                    server_url,
+                    "couldn't read your email from Slack, which is required to "
+                    "sign in securely. Ask the bot operator to grant the "
+                    "`users:read.email` scope, then run `/omnigent` again.",
+                ),
+            )
+            return
+        # Workspace name is display-only (shown on the enrollment success page).
+        team_name = await self._team_name(client, team_id)
+        link = self._enrollment_url(team_id, user_id, email, team_name)
+        if not link:
+            await client.views_update(
+                view_id=view_id,
+                view=login_failed_modal(
+                    server_url,
+                    "sign-in isn't fully configured (no enrollment URL). "
+                    "Contact your Omnigent operator.",
+                ),
+            )
+            return
+
+        await client.views_update(
+            view_id=view_id,
+            view=enrollment_waiting_modal(server_url, link),
+        )
+
+        async def _on_success() -> None:
+            await self._revalidate_and_advance(
+                client,
+                team_id=team_id,
+                user_id=user_id,
+                server_url=server_url,
+                view_id=view_id,
+                context="enrollment",
+            )
+
+        async def _on_failure(reason: str) -> None:
+            await self._fail_modal(client, view_id, server_url, reason, context="Enrollment")
+
+        self._auth.await_enrollment_in_background(
             team_id=team_id,
             user_id=user_id,
             server_url=server_url,
@@ -379,12 +614,31 @@ class SetupFlow:
         team = resp.get("team") if hasattr(resp, "get") else None
         return str(team.get("name") or "") if isinstance(team, dict) else ""
 
+    async def _user_email(self, client: Any, user_id: str) -> str:
+        """Resolve the Slack user's email via ``users.info``.
+
+        Signed into the enrollment state and matched against the browser's
+        ``X-Forwarded-Email`` in the callback, so security depends on it — a
+        lookup failure (missing ``users:read.email`` scope, network) returns an
+        empty string and the caller fails closed rather than issuing an
+        unverifiable link.
+        """
+        try:
+            resp = await client.users_info(user=user_id)
+        except Exception as exc:
+            self._logger.info("users.info lookup failed user=%s error=%s", user_id, exc)
+            return ""
+        user = resp.get("user") if hasattr(resp, "get") else None
+        profile = user.get("profile") if isinstance(user, dict) else None
+        email = profile.get("email") if isinstance(profile, dict) else None
+        return str(email) if isinstance(email, str) and email else ""
+
     async def _resolve_default_workspace(
         self, client: OmnigentClient, online_hosts: list[dict[str, Any]]
     ) -> str:
         for host in online_hosts:
-            host_id = host.get("host_id") or host.get("id")
-            if not isinstance(host_id, str):
+            host_id = host_id_of(host)
+            if host_id is None:
                 continue
             try:
                 home = await client.get_host_home(host_id)
@@ -435,6 +689,14 @@ class SetupFlow:
 
         team_id = str((body.get("team") or {}).get("id") or body.get("team_id") or "")
         user_id = str((body.get("user") or {}).get("id") or "")
+        # Fail closed: an empty team/user would write the config under a key that
+        # collapses across workspaces (configs key on (team, user)).
+        if not team_id or not user_id:
+            self._logger.warning(
+                "Setup submit missing team/user (team=%r user=%r)", team_id, user_id
+            )
+            await ack()
+            return
         await self._store.upsert_user_config(team_id, user_id, config)
         await ack()
         self._logger.info(
@@ -446,18 +708,17 @@ class SetupFlow:
             host_id,
         )
 
-        opened = await client.conversations_open(users=user_id)
-        dm_channel = _dm_channel_id(opened)
-        if dm_channel:
-            host_line = f" on host *{host_name}*" if host_name else ""
-            await client.chat_postMessage(
-                channel=dm_channel,
-                text=(
-                    f":white_check_mark: You're set up! I'll use *{config.agent_name}*"
-                    f"{host_line} on {server_url}. Mention me in a channel or message me "
-                    "here to start."
-                ),
-            )
+        host_line = f" on host *{host_name}*" if host_name else ""
+        await self._dm_user(
+            client,
+            user_id,
+            text=(
+                f":white_check_mark: You're set up! I'll use *{config.agent_name}*"
+                f"{host_line} on {server_url}. Mention me in a channel or message me "
+                "here to start."
+            ),
+            purpose="setup confirmation",
+        )
 
 
 def default_workspace() -> str:
@@ -494,6 +755,34 @@ def setup_prompt_blocks() -> list[dict[str, Any]]:
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "⚙️ Set up Omnigent"},
+                    "style": "primary",
+                    "action_id": ACTION_SETUP_START,
+                }
+            ],
+        },
+    ]
+
+
+def relogin_prompt_blocks() -> list[dict[str, Any]]:
+    # Same setup button as first-time setup — pressing it re-runs the login flow
+    # (``_begin_setup`` shows the verification link when the server needs auth).
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    ":lock: *Your Omnigent login has expired.*\n"
+                    "Sign in again to keep running sessions."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🔑 Sign in to Omnigent"},
                     "style": "primary",
                     "action_id": ACTION_SETUP_START,
                 }
@@ -594,6 +883,39 @@ def login_waiting_modal(server_url: str, verification_url: str, user_code: str) 
     }
 
 
+def enrollment_waiting_modal(server_url: str, enrollment_url: str) -> dict[str, Any]:
+    # Databricks web-auth variant of ``login_waiting_modal``. The user opens the
+    # enrollment link, which authenticates them through the bot's own Databricks
+    # proxy and stores an app-scoped token; the modal then advances itself to the
+    # agent/host picker once the token lands. No submit button — this just waits.
+    return {
+        "type": "modal",
+        "callback_id": CALLBACK_SETUP_INFO,
+        "title": {"type": "plain_text", "text": "Set up Omnigent"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*{server_url}* is hosted on Databricks and needs a quick "
+                        "sign-in.\n\n"
+                        f"1. <{enrollment_url}|Sign in with Databricks> in your browser.\n"
+                        "2. This window will continue automatically once you're done."
+                    ),
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": "Waiting for sign-in… keep this window open."}
+                ],
+            },
+        ],
+    }
+
+
 def login_failed_modal(server_url: str, reason: str) -> dict[str, Any]:
     # Terminal screen when login is denied, expires, or errors. The user
     # re-runs /omnigent to try again.
@@ -688,28 +1010,23 @@ def _agent_options(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         name = agent.get("name") or agent_id
         if not isinstance(agent_id, str):
             continue
-        options.append(_option(_plain(str(name)), agent_id))
+        options.append(_option(truncate_option(str(name)), agent_id))
     return options
 
 
 def _host_options(hosts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     for host in hosts[:_MAX_SELECT_OPTIONS]:
-        host_id = host.get("host_id") or host.get("id")
-        name = host.get("name") or host_id
-        if not isinstance(host_id, str):
+        host_id = host_id_of(host)
+        if host_id is None:
             continue
-        options.append(_option(_plain(str(name)), host_id))
+        name = host.get("name") or host_id
+        options.append(_option(truncate_option(str(name)), host_id))
     return options
 
 
 def _option(text: str, value: str) -> dict[str, Any]:
     return {"text": {"type": "plain_text", "text": text}, "value": value}
-
-
-def _plain(text: str) -> str:
-    # Slack option text is capped at 75 characters.
-    return text if len(text) <= 75 else text[:74] + "…"
 
 
 def _input_value(view: dict[str, Any], block_id: str, action_id: str) -> str:

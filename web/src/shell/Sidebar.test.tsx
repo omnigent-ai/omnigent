@@ -7,6 +7,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -19,15 +20,21 @@ const {
   projectsMock,
   moveToProjectSpy,
   deleteProjectSpy,
+  renameProjectSpy,
+  createProjectSpy,
   fetchProjectSessionIdsMock,
   conversationsRef,
   projectSessionsMock,
+  useHostsMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
-  // Server-side "ids in this project" check that gates the remove
-  // confirmation. Defaults to "no other sessions"; tests override per case.
+  renameProjectSpy: vi.fn(),
+  createProjectSpy: vi.fn(),
+  // Stub for the exported fetchProjectSessionIds helper (kept so the module
+  // mock stays complete). Remove-from-project no longer gates on a
+  // last-session check, so nothing in these tests depends on its value.
   fetchProjectSessionIdsMock: vi.fn(() => Promise.resolve([] as string[])),
   // Latest conversations handed to the global-list mock. The useProjectSessions
   // mock derives each folder's rows from this by label, mirroring the server's
@@ -38,6 +45,11 @@ const {
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
+  useHostsMock: vi.fn(),
+}));
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: useHostsMock,
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -56,7 +68,11 @@ vi.mock("@/hooks/useConversations", () => ({
   // Project feature: the sidebar reads the project list to build project
   // sections, and rows fire useMoveToProject from the kebab menu. Both must
   // be stubbed or the Sidebar throws on render.
-  useProjects: () => ({ data: projectsMock }),
+  // Tests push project NAMES into projectsMock; expose them as first-class
+  // {id, name} folders (synthetic id per name) to match useProjects' shape.
+  useProjects: () => ({
+    data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
+  }),
   // Each project folder fetches its own sessions (server-side ?project=). Derive
   // them from the global-list fixture by label so existing tests keep seeding
   // project sessions there. Single page, no pagination, in this mock.
@@ -85,6 +101,8 @@ vi.mock("@/hooks/useConversations", () => ({
   },
   useMoveToProject: () => ({ mutate: moveToProjectSpy }),
   useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
   fetchProjectSessionIds: fetchProjectSessionIdsMock,
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -179,6 +197,8 @@ function showSharedTab() {
 
 beforeEach(() => {
   useConvMock.mockReset();
+  useHostsMock.mockReset();
+  useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
@@ -239,23 +259,41 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("renders the footer Settings as an icon-only floating control on mobile", () => {
+  it("renders Search, Settings, and Collapse as compact header actions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
+    const headerActions = screen.getByTestId("sidebar-header-actions");
+    const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
-    // Accessible name survives even though the label is visually dropped on
-    // mobile (the icon stands alone there).
+
+    expect(search).toHaveAttribute("aria-label", "Search");
+    expect(search).toHaveAttribute("data-size", "icon-xs");
+    expect(search).toHaveClass("size-6");
     expect(settings).toHaveAttribute("aria-label", "Settings");
-    // Mobile: compact square icon button, out of flow at the bottom-left.
-    expect(settings.className).toContain("max-md:size-9");
-    // The text label is desktop-only.
-    const label = within(settings).getByText("Settings");
-    expect(label.className).toContain("max-md:hidden");
+    expect(settings).toHaveAttribute("data-size", "icon-xs");
+    expect(settings).toHaveClass("size-6");
+    const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
+    expect(collapse).toHaveAttribute("data-size", "icon-xs");
+    expect(collapse).toHaveClass("size-6");
+    expect(within(headerActions).queryByTestId("inbox-button")).toBeNull();
   });
 
-  it("does NOT close the sidebar when the footer Settings is tapped", () => {
-    // No onNavClick on the footer Settings link: on mobile the overlay stays
+  it("renders Inbox as its own primary navigation row", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const primaryNav = screen.getByTestId("sidebar-primary-nav");
+    const inbox = within(primaryNav).getByTestId("inbox-button");
+
+    expect(inbox).toHaveAttribute("href", "/inbox");
+    expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
+    expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
+    expect(within(primaryNav).getByTestId("toggle-selection-mode")).toBeInTheDocument();
+  });
+
+  it("does NOT close the sidebar when the header Settings is tapped", () => {
+    // No onNavClick on the header Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto
     // the default section's content.
     mockConversations(THREE_TYPE_CONVERSATIONS);
@@ -288,7 +326,7 @@ describe("Sidebar session list", () => {
     // Active sessions still render in the Sessions list.
     const recentSection = screen.getByText("Sessions").closest("section")!;
     expect(within(recentSection).getByText("conv_active")).toBeInTheDocument();
-    // The footer Settings link points at the settings page.
+    // The header Settings link points at the settings page.
     expect(screen.getByTestId("settings-button")).toHaveAttribute("href", "/settings");
   });
 
@@ -319,9 +357,9 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("shows the session-state badge OR the timestamp, never both", () => {
-    // Fresh updated_at → relativeTime renders "now", reproducing the
-    // reported bug: a status marker AND "now" side by side.
+  it("shows session-state badges without rendering session timestamps", () => {
+    // Fresh updated_at would render "now" if timestamps leaked back into
+    // session rows.
     const freshSeconds = Math.floor(Date.now() / 1000);
     mockConversations([
       conv("conv_working", "Codex", { status: "running", updated_at: freshSeconds }),
@@ -333,9 +371,7 @@ describe("Sidebar session list", () => {
     ]);
     renderSidebar();
 
-    // Working row: the running dot takes the time-marker slot and the
-    // redundant "now" is suppressed. Both appearing = the either/or rule
-    // regressed.
+    // Working rows keep their lifecycle badge without a timestamp.
     const workingRow = screen.getByRole("link", { name: /conv_working/ }).closest("li")!;
     expect(within(workingRow).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
@@ -343,8 +379,7 @@ describe("Sidebar session list", () => {
     );
     expect(within(workingRow).queryByText("now")).toBeNull();
 
-    // Awaiting row: same rule for the "Needs response" tag — any non-null
-    // session state replaces the timestamp, not just the working dot.
+    // Awaiting rows keep the "Needs response" badge without a timestamp.
     const awaitingRow = screen.getByRole("link", { name: /conv_awaiting/ }).closest("li")!;
     expect(within(awaitingRow).getByTestId("session-state-badge")).toHaveAttribute(
       "data-state",
@@ -352,10 +387,95 @@ describe("Sidebar session list", () => {
     );
     expect(within(awaitingRow).queryByText("now")).toBeNull();
 
-    // Idle row: no badge, so the timestamp must still render — suppressing
-    // it everywhere would be an over-broad fix.
+    // Idle rows render neither a lifecycle badge nor a timestamp.
     const idleRow = screen.getByRole("link", { name: /conv_idle/ }).closest("li")!;
-    expect(within(idleRow).getByText("now")).toBeInTheDocument();
+    expect(within(idleRow).queryByTestId("session-state-badge")).toBeNull();
+    expect(within(idleRow).queryByText("now")).toBeNull();
+  });
+
+  it("shows the full session title in a styled tooltip on hover", async () => {
+    const title = "A long session title that is truncated in the compact sidebar row";
+    const now = new Date("2026-07-23T00:00:00Z").getTime();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    mockConversations([
+      conv("conv_tooltip", "Codex", {
+        title,
+        updated_at: (now - 2 * 24 * 60 * 60 * 1000) / 1000,
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: title });
+    expect(row).not.toHaveAttribute("title");
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    await waitFor(() => {
+      const tooltip = screen.getByTestId("session-tooltip-content");
+      expect(tooltip).toHaveTextContent(title);
+      expect(tooltip.className).toContain("bg-card-solid");
+      expect(tooltip.className).not.toContain("bg-popover");
+      expect(tooltip).toHaveTextContent("2d");
+      expect(within(tooltip).getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(
+        "Local machine",
+      );
+    });
+    nowSpy.mockRestore();
+  });
+
+  it("shares one hosts observer across multiple ordinary session rows", () => {
+    const observerMounted = vi.fn();
+    useHostsMock.mockImplementation(() => {
+      useEffect(() => {
+        observerMounted();
+      }, []);
+      return { data: [] };
+    });
+    mockConversations([
+      conv("conv_one", "Codex", { host_id: "host_one" }),
+      conv("conv_two", "Claude Code", { host_id: "host_two" }),
+      conv("conv_three", "Codex", { host_id: "host_three" }),
+    ]);
+
+    renderSidebar();
+
+    expect(screen.getByRole("link", { name: "conv_one" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "conv_two" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "conv_three" })).toBeInTheDocument();
+    expect(observerMounted).toHaveBeenCalledTimes(1);
+    expect(useHostsMock).toHaveBeenCalledWith({ includeSandbox: true });
+  });
+
+  it.each([
+    {
+      title: "resolved remote host name",
+      hostId: "host_remote",
+      hosts: [{ host_id: "host_remote", name: "Build Mac", sandbox_provider: null }],
+      expected: "Build Mac",
+    },
+    {
+      title: "sandbox provider label",
+      hostId: "host_sandbox",
+      hosts: [{ host_id: "host_sandbox", name: "Managed host", sandbox_provider: "modal" }],
+      expected: "Modal Sandbox",
+    },
+    {
+      title: "unknown host fallback",
+      hostId: "host_missing",
+      hosts: [],
+      expected: "host_missing",
+    },
+  ])("shows the $title in the session tooltip", async ({ hostId, hosts, expected }) => {
+    useHostsMock.mockReturnValue({ data: hosts });
+    mockConversations([conv("conv_location", "Codex", { host_id: hostId })]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_location" }), {
+      pointerType: "mouse",
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(expected);
+    });
   });
 });
 
@@ -918,10 +1038,37 @@ describe("Sidebar project sections", () => {
     fireEvent.click(await screen.findByTestId("delete-project"));
 
     // The confirmation makes clear it removes every session, then fires the
-    // delete with the project name.
+    // delete with the folder's { id, name }.
     expect(screen.getByText(/all of its sessions/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
-    expect(deleteProjectSpy).toHaveBeenCalledWith("Customer X", expect.anything());
+    expect(deleteProjectSpy).toHaveBeenCalledWith(
+      { id: "p_Customer X", name: "Customer X" },
+      expect.anything(),
+    );
+  });
+
+  it("folds the new-session pencil into the kebab on mobile", async () => {
+    // The pencil is desktop-only (max-md:hidden); on mobile the same action is
+    // offered as a md:hidden "New session" kebab item pre-filed under the
+    // project (same ?project= link as the pencil).
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    // Pencil stays in the tree but is hidden below the md breakpoint.
+    expect(screen.getByTestId("project-new-session")).toHaveClass("max-md:hidden");
+
+    // Open the kebab → a mobile-only "New session" item linking to the same
+    // pre-filed composer.
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    const menuItem = await screen.findByTestId("project-new-session-menu");
+    expect(menuItem).toHaveClass("md:hidden");
+    expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 });
 
@@ -1085,16 +1232,17 @@ describe("Sidebar move-to-project action", () => {
     expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_move", project: "Sprint 42" });
   });
 
-  it("confirms removal only when it's the project's last session", async () => {
+  it("removes a session from its project immediately, with no confirmation", async () => {
+    // A first-class project persists when emptied, so removing a session never
+    // deletes anything — it just unfiles, even if it's the last member. No
+    // last-session check, no confirmation dialog.
     projectsMock.push("Sprint 42");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
     ]);
-    // Server reports this is the only session in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed"]);
     renderSidebar();
 
-    // Expand the project folder, open the filed row's kebab → Change project.
+    // Expand the project folder, open the filed row's kebab → project submenu.
     fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
     const row = screen.getByRole("link", { name: /conv_filed/ }).closest("li")!;
     fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
@@ -1103,40 +1251,8 @@ describe("Sidebar move-to-project action", () => {
     });
     fireEvent.click(await screen.findByTestId("move-to-project"));
 
-    // Last session → "Remove from <project>" opens a confirmation that says the
-    // project will be removed too; it does NOT remove immediately.
+    // "Remove from <project>" unfiles immediately (project: "") — no dialog.
     fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
-    expect(await screen.findByText(/the project will be removed as well/i)).toBeInTheDocument();
-    expect(moveToProjectSpy).not.toHaveBeenCalled();
-
-    // Confirming fires the removal with an empty project (server deletes the
-    // label; the implicit project vanishes with its last session).
-    fireEvent.click(screen.getByRole("button", { name: "Remove from project" }));
-    expect(moveToProjectSpy).toHaveBeenCalledWith(
-      { id: "conv_filed", project: "" },
-      expect.anything(),
-    );
-  });
-
-  it("removes without confirmation when other sessions remain in the project", async () => {
-    projectsMock.push("Sprint 42");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Sprint 42" } }),
-    ]);
-    // Server reports another session is still in the project.
-    fetchProjectSessionIdsMock.mockResolvedValue(["conv_filed", "conv_other"]);
-    renderSidebar();
-
-    fireEvent.click(screen.getByRole("button", { name: "Sprint 42" }));
-    const row = screen.getByRole("link", { name: /conv_filed/ }).closest("li")!;
-    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("move-to-project"));
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from Sprint 42/ }));
-
-    // Not the last session → removes straight away, no confirmation dialog.
     await waitFor(() =>
       expect(moveToProjectSpy).toHaveBeenCalledWith({ id: "conv_filed", project: "" }),
     );

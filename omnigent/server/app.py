@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -293,6 +294,43 @@ def _request_status_code_for_metrics(
     if failed:
         return 500
     return None
+
+
+def _load_debug_routers(
+    module_paths: list[str] | None,
+) -> list[tuple[Any, str, list[str]]]:
+    """Import each dotted module and collect its ``DEBUG_ROUTERS`` entries.
+
+    Mirrors the ``policy_modules`` load-by-name pattern: a module that fails to
+    import (e.g. an out-of-tree ``dev/`` module absent from a production
+    install) or lacks a ``DEBUG_ROUTERS`` list is logged and skipped, never
+    raised — a stray config key must not take the server down.
+
+    :param module_paths: Dotted module paths naming modules that expose a
+        ``DEBUG_ROUTERS`` list of ``(router, prefix, tags)`` tuples. ``None``
+        or empty yields no routers.
+    :returns: The flattened ``(router, prefix, tags)`` tuples to mount.
+    """
+    routers: list[tuple[Any, str, list[str]]] = []
+    for module_path in module_paths or []:
+        try:
+            mod = import_module(module_path)
+        except ImportError:
+            _logger.warning(
+                "Failed to import debug router module %s; skipping",
+                module_path,
+                exc_info=True,
+            )
+            continue
+        entries = getattr(mod, "DEBUG_ROUTERS", None)
+        if not isinstance(entries, list):
+            _logger.warning(
+                "Module %s has no DEBUG_ROUTERS list; skipping",
+                module_path,
+            )
+            continue
+        routers.extend(entries)
+    return routers
 
 
 # MCP startup warming moved to runner; see designs/RUNNER_MCP.md.
@@ -1097,6 +1135,7 @@ def create_app(
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
+    debug_router_modules: list[str] | None = None,
     admins: list[str] | None = None,
     allowed_domains: list[str] | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
@@ -1153,6 +1192,15 @@ def create_app(
         ``["myorg.policies.safety"]``. Sourced from the server
         config's ``policy_modules`` key. ``None`` scans only
         the built-in modules.
+    :param debug_router_modules: Dotted module paths to import and
+        scan for a ``DEBUG_ROUTERS`` list of ``(router, prefix,
+        tags)`` tuples, mounted alongside ``extra_routers``. Sourced
+        from the server config's ``debug_router_modules`` key. Exists
+        for out-of-tree diagnostic routers (e.g. the benchmark
+        harness's request-counter endpoint under ``dev/``); a module
+        that fails to import is logged and skipped, so a config key
+        naming an absent module is a no-op. Production config leaves
+        this unset. ``None`` mounts no debug routers.
     :param admins: Admin identities from the server config's
         ``admins:`` key, e.g. ``["alice@example.com"]``. Union'd with
         the runtime-editable ``<data_dir>/admins`` file; a matching
@@ -1636,6 +1684,10 @@ def create_app(
             )
             set_request_duration_for_access_log(duration_seconds)
             route = request_route_template_for_metrics(request)
+            # Per-route tally (low-cardinality template key) for offline
+            # request-breakdown analysis, e.g. the benchmark harness's
+            # per-journey network appendix. Cheap; independent of the OTel path.
+            server_metrics.record_route(request.method, route)
             metrics_status_code = _request_status_code_for_metrics(
                 status_code,
                 failed=failed,
@@ -2743,11 +2795,13 @@ def create_app(
     # ``index.html`` for the literal root and directory paths, so a
     # refresh on ``/c/abc`` would 404.
     # Extra routers injected by callers (e.g. test fixtures that
-    # mount legacy routes). Registered BEFORE the SPA static-files
+    # mount legacy routes) plus any debug routers loaded by dotted
+    # module path from config. Registered BEFORE the SPA static-files
     # mount so FastAPI resolves them before the catch-all fallback.
-    if extra_routers:
-        for router, prefix, tags in extra_routers:
-            app.include_router(router, prefix=prefix, tags=tags)
+    all_extra_routers = list(extra_routers or [])
+    all_extra_routers.extend(_load_debug_routers(debug_router_modules))
+    for router, prefix, tags in all_extra_routers:
+        app.include_router(router, prefix=prefix, tags=tags)
 
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()

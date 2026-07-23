@@ -156,7 +156,13 @@ _PROJECT_SESSIONS_BODY = {
 }
 
 # Two project folders: one expanded (seeded below), one left collapsed/empty.
-_PROJECTS_BODY = [_PROJECT_OPEN, _PROJECT_EMPTY]
+# GET /v1/sessions/projects returns the dual-read union as {id, name} objects
+# (id=None for a label-only project); "Moonshot" holds a label-filed session,
+# "Fixit" is an empty first-class project.
+_PROJECTS_BODY = [
+    {"id": None, "name": _PROJECT_OPEN},
+    {"id": "p_fixit", "name": _PROJECT_EMPTY},
+]
 
 
 @pytest.mark.visual

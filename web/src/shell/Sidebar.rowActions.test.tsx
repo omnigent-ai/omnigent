@@ -52,7 +52,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: mocks.projects }),
+  useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
   // (this suite keeps its test row unfiled; the picker only needs the name).
@@ -67,6 +67,8 @@ vi.mock("@/hooks/useConversations", () => ({
   }),
   useMoveToProject: () => mocks.moveToProject,
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -136,6 +138,8 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    harness_install_enabled: false,
+    installable_harnesses: [],
     dictation_available: false,
     ...overrides,
   };
@@ -187,6 +191,19 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("quick pin/unpin hover button", () => {
+  it("uses compact controls and positions the actions trigger in the right gutter", () => {
+    renderSidebar();
+
+    expect(screen.getByTestId("quick-pin-conversation")).toHaveClass("size-6", "right-[14px]");
+    expect(screen.getByTestId("quick-pin-conversation")).not.toHaveClass("right-[30px]");
+    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6", "-right-3");
+    expect(screen.getByTestId("conversation-actions")).not.toHaveClass("right-1");
+
+    const rowLink = screen.getByRole("link", { name: "My Session" });
+    expect(rowLink).toHaveClass("w-[calc(100%+1rem)]");
+    expect(rowLink).not.toHaveClass("w-full");
+  });
+
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
     renderSidebar();
 

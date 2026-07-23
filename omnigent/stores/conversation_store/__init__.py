@@ -700,15 +700,17 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
         harness_override: str | None = None,
+        _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
 
-        For ``reasoning_effort``, ``model_override``, and
-        ``cost_control_mode_override``, ``None`` means "leave
-        unchanged". To explicitly clear them back to ``None``, pass
+        For ``reasoning_effort``, ``model_override``,
+        ``cost_control_mode_override``, and ``harness_override``,
+        ``None`` means "leave unchanged". To explicitly clear them
+        back to ``None``, pass
         the matching ``_unset_*`` flag.
 
         :param conversation_id: Unique conversation identifier,

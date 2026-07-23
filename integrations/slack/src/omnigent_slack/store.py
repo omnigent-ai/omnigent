@@ -211,3 +211,17 @@ class SQLiteStore:
             await db.execute("DELETE FROM slack_events WHERE created_at < ?", (now - ttl_seconds,))
             await db.commit()
         return claimed
+
+    async def unclaim_event(self, event_id: str | None) -> None:
+        """Release a previously claimed event so it can be processed again.
+
+        Called when handling a claimed event fails before the turn is underway:
+        Bolt has already auto-acked, so Slack won't redeliver, and the claim would
+        otherwise permanently swallow the message. Dropping the marker lets a
+        redelivery — or the user re-sending — be processed. No-op without an id.
+        """
+        if not event_id:
+            return
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute("DELETE FROM slack_events WHERE event_id = ?", (event_id,))
+            await db.commit()

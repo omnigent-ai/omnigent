@@ -98,9 +98,24 @@ export interface Permission {
 }
 
 export async function listPermissions(sessionId: string): Promise<Permission[]> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/permissions`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return (await res.json()) as Permission[];
+  // The endpoint is cursor-paginated ({permissions, next_cursor}); follow the
+  // cursor and concatenate so callers always see the full grant list.
+  const all: Permission[] = [];
+  let after: string | null = null;
+  do {
+    const path = `/v1/sessions/${encodeURIComponent(sessionId)}/permissions${
+      after !== null ? `?after=${encodeURIComponent(after)}` : ""
+    }`;
+    const res = await authenticatedFetch(path);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const data = (await res.json()) as {
+      permissions: Permission[];
+      next_cursor: string | null;
+    };
+    all.push(...data.permissions);
+    after = data.next_cursor;
+  } while (after !== null);
+  return all;
 }
 
 export async function getSessionOwner(sessionId: string): Promise<string | null> {

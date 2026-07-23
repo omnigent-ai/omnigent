@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from dev.benchmarks.omnigent import run as bench_run
-from dev.benchmarks.omnigent.environment import BenchEnvironment
+from dev.benchmarks.omnigent.environment import BenchEnvironment, _sse_session_status
 from dev.benchmarks.omnigent.journeys import ALL_JOURNEYS, Journey, run_latency, run_throughput
 from dev.benchmarks.omnigent.measure import RunResult, aggregate, check_thresholds
 from dev.benchmarks.omnigent.schema import SCHEMA_VERSION, build_report
@@ -29,6 +29,8 @@ _SMOKE_JOURNEYS = [
     "get_session",
     "load_conversation_history",
     "search_sessions",
+    "list_projects",
+    "list_project_sessions",
     "fork_session",
     "add_comment",
 ]
@@ -51,6 +53,7 @@ def _smoke_args(**overrides: object) -> argparse.Namespace:
         "runs": 1,
         "warmup": 1,
         "output": None,
+        "network_delay_ms": 0.0,
         "min_rps": None,
         "max_p50_ms": None,
         "max_p99_ms": None,
@@ -83,6 +86,7 @@ def test_aggregate_summary_keys() -> None:
     block = aggregate(runs)
     run_rows = cast(list[dict[str, object]], block["runs"])
     assert len(run_rows) == 2
+    # No http_requests recorded → no network key in the summary.
     assert set(_d(block["summary"])) == {
         "runs_total",
         "runs_ok",
@@ -95,6 +99,78 @@ def test_aggregate_summary_keys() -> None:
     assert _d(block["summary"])["runs_total"] == 2
     assert _d(block["summary"])["runs_ok"] == 2
     assert run_rows[0]["n_success"] == 2
+    # The per-run row still carries the network fields, as null when uncounted.
+    assert run_rows[0]["http_requests"] is None
+    assert run_rows[0]["http_requests_per_op"] is None
+
+
+def test_aggregate_includes_network_block_when_counted() -> None:
+    """When runs carry a server request count, the summary reports per-op volume."""
+    # Two ops, four server requests → 2.0 requests/op.
+    runs = [RunResult(latencies_ms=[5.0, 15.0], wall_time=1.0, http_requests=4) for _ in range(2)]
+    block = aggregate(runs)
+    summary = _d(block["summary"])
+    assert summary["avg_http_requests_per_op"] == 2.0
+    run_rows = cast(list[dict[str, object]], block["runs"])
+    assert run_rows[0]["http_requests"] == 4
+    assert run_rows[0]["http_requests_per_op"] == 2.0
+
+
+def test_aggregate_route_appendix_groups_and_orders() -> None:
+    """The per-route appendix sums across runs, divides by ops, sorts by per_op."""
+    # 2 ops/run × 2 runs = 4 ops. GET seen 2×/run (→4 total → 1.0/op),
+    # POST 1×/run (→2 → 0.5/op).
+    runs = [
+        RunResult(
+            latencies_ms=[5.0, 6.0],
+            wall_time=1.0,
+            http_requests=6,
+            route_requests={"GET /v1/sessions/{id}": 2, "POST /v1/sessions": 1},
+        )
+        for _ in range(2)
+    ]
+    summary = _d(aggregate(runs)["summary"])
+    appendix = cast(list[dict[str, object]], summary["network_routes"])
+    assert [r["route"] for r in appendix] == ["GET /v1/sessions/{id}", "POST /v1/sessions"]
+    assert appendix[0]["requests"] == 4 and appendix[0]["per_op"] == 1.0
+    assert appendix[1]["requests"] == 2 and appendix[1]["per_op"] == 0.5
+    # Per-run row carries its own raw breakdown.
+    run_rows = cast(list[dict[str, object]], aggregate(runs)["runs"])
+    assert run_rows[0]["route_requests"] == {"GET /v1/sessions/{id}": 2, "POST /v1/sessions": 1}
+
+
+def test_aggregate_no_route_appendix_when_uncounted() -> None:
+    """No route breakdown recorded → no network_routes key (not an empty list)."""
+    runs = [RunResult(latencies_ms=[5.0], wall_time=1.0) for _ in range(2)]
+    assert "network_routes" not in _d(aggregate(runs)["summary"])
+
+
+def test_requests_per_op_none_when_uncounted_or_no_success() -> None:
+    """requests_per_op distinguishes uncounted (None) from a real zero."""
+    assert RunResult(latencies_ms=[5.0]).requests_per_op() is None  # http_requests unset
+    # Counted but no successful op → None, not a divide-by-zero.
+    failed = RunResult(wall_time=1.0, http_requests=3)
+    failed.record_failure("HTTP 500")
+    assert failed.requests_per_op() is None
+    # Counted with successes → the ratio.
+    assert RunResult(latencies_ms=[1.0, 1.0], http_requests=6).requests_per_op() == 3.0
+
+
+def test_sse_session_status_parses_both_shapes_and_ignores_noise() -> None:
+    """drive_turn's SSE completion parser: status shapes + non-status lines."""
+    # Nested shape (API.md) and flat shape (observed on the wire) both work.
+    assert _sse_session_status('{"type":"session.status","data":{"status":"idle"}}') == "idle"
+    assert (
+        _sse_session_status('{"type":"session.status","status":"running","conversation_id":"x"}')
+        == "running"
+    )
+    # Non-status events, the [DONE] sentinel, empty, and non-JSON → None.
+    assert _sse_session_status('{"type":"response.completed","response":{}}') is None
+    assert _sse_session_status("[DONE]") is None
+    assert _sse_session_status("") is None
+    assert _sse_session_status("not json") is None
+    # A session.status without a usable status field → None (not a crash).
+    assert _sse_session_status('{"type":"session.status","data":{}}') is None
 
 
 def test_aggregate_excludes_fully_failed_run_from_summary() -> None:
@@ -349,6 +425,8 @@ async def test_benchmark_smoke_end_to_end() -> None:
     assert _d(report["config"])["with_runner"] is False
     # No --database-uri → the throwaway-SQLite path, labelled "sqlite".
     assert _d(report["config"])["backend"] == "sqlite"
+    # The delay knob is recorded in config; default run injects none.
+    assert _d(report["config"])["network_delay_ms"] == 0.0
 
     journeys = _d(report["journeys"])
     for name in _SMOKE_JOURNEYS:
@@ -364,6 +442,16 @@ async def test_benchmark_smoke_end_to_end() -> None:
         # Zero failures — a failure here means the HTTP path itself broke.
         assert run_rows[0]["n_failures"] == 0, f"{name}: {run_rows[0]['failures']}"
         assert cast(float, _d(block["summary"])["avg_p50_ms"]) >= 0.0
+        # The CI-only debug router loaded, so the server request counter was
+        # readable: each HTTP journey issues at least one request per op.
+        per_op = _d(block["summary"]).get("avg_http_requests_per_op")
+        assert per_op is not None, f"{name} produced no request count"
+        assert cast(float, per_op) >= 1.0, f"{name}: {per_op} requests/op"
+        # Per-route appendix: at least one endpoint attributed, and its
+        # per-op figures sum to roughly the aggregate per-op count.
+        routes = cast(list[dict[str, object]], _d(block["summary"]).get("network_routes", []))
+        assert routes, f"{name} produced no route breakdown"
+        assert all(cast(float, r["per_op"]) > 0.0 for r in routes)
 
 
 @pytest.mark.timeout(180)
@@ -478,10 +566,13 @@ def test_seed_creates_listable_corpus(tmp_path: Path) -> None:
     from omnigent.stores.conversation_store.sqlalchemy_store import (
         SqlAlchemyConversationStore,
     )
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 
     db_uri = f"sqlite:///{tmp_path / 'seed.db'}"
 
-    created = seed_mod.seed(db_uri, sessions=6, items_per_session=4)
+    created = seed_mod.seed(
+        db_uri, sessions=6, items_per_session=4, projects=2, filed_fraction=0.5
+    )
     assert created == 6
 
     conv = SqlAlchemyConversationStore(db_uri)
@@ -494,8 +585,22 @@ def test_seed_creates_listable_corpus(tmp_path: Path) -> None:
     assert len(listing.data) == 6  # all seeded sessions listable as "local"
     assert len(conv.list_items(listing.data[0].id, limit=100).data) == 4
 
+    # Projects were seeded (owner-scoped to "local") and sessions filed into them.
+    projects = SqlAlchemyProjectStore(db_uri).list(owner_user_id=RESERVED_USER_LOCAL)
+    assert len(projects) == 2
+    # 3 of 6 sessions filed (0.5), listable via the owner-scoped ?project= filter.
+    filed = conv.list_conversations(
+        limit=100,
+        accessible_by=RESERVED_USER_LOCAL,
+        owned_by=RESERVED_USER_LOCAL,
+        project=projects[0].name,
+    )
+    assert len(filed.data) >= 1  # round-robin puts ~1-2 sessions in each folder
+
     # Idempotent: a matching re-seed is a no-op.
-    assert seed_mod.seed(db_uri, sessions=6, items_per_session=4) == 0
+    assert (
+        seed_mod.seed(db_uri, sessions=6, items_per_session=4, projects=2, filed_fraction=0.5) == 0
+    )
 
     # NOTE: seed() builds the store, which runs migrations to the current head,
     # so this test always exercises the live schema — it is the safety net that

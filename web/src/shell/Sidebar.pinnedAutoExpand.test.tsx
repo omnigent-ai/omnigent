@@ -26,10 +26,12 @@ vi.mock("@/hooks/useConversations", () => ({
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: ["Repro 2506"] }),
+  useProjects: () => ({ data: [{ id: "p_repro", name: "Repro 2506" }] }),
   useProjectSessions: vi.fn(),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));

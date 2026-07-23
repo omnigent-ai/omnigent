@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from omnigent.codex_native_app_server import CodexAppServerClient
     from omnigent.terminals.registry import TerminalListEntry
 
+import click
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -5614,6 +5615,8 @@ async def _auto_create_claude_terminal(
     skills_filter: str | list[str] = "all",
     session_init: RunnerSessionInitEnvelope | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
+    record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -5654,6 +5657,10 @@ async def _auto_create_claude_terminal(
         isolated legacy callback path.
     :param auth_token_factory: Runner-owned refreshable bearer factory.
         ``None`` preserves direct-call behavior by resolving one locally.
+    :param resolve_launch_config: Optional per-session resolver shared with
+        the model-options endpoint so launch and UI use one catalog query.
+    :param record_launch_config: Optional callback that stores the exact
+        provider/model snapshot used for this session's launch.
     :returns: The launched terminal's :class:`SessionResourceView`, so
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
@@ -5776,6 +5783,7 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native import (
         augment_claude_args,
         build_native_claude_terminal_env,
+        resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
 
@@ -5973,7 +5981,14 @@ async def _auto_create_claude_terminal(
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
     try:
-        claude_config = resolve_native_claude_config(spec=None)
+        if resolve_launch_config is not None:
+            claude_config = await resolve_launch_config()
+        else:
+            claude_config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+    except click.ClickException:
+        # An authoritative Databricks response with no Claude models is a
+        # configuration failure, not permission to bypass the gateway.
+        raise
     except Exception:  # noqa: BLE001 — best-effort; fall back to native auth
         _logger.warning(
             "native-claude: could not derive a provider/ucode launch config "
@@ -5983,6 +5998,8 @@ async def _auto_create_claude_terminal(
             "and that the secret resolves in this process.",
             exc_info=True,
         )
+    if record_launch_config is not None:
+        record_launch_config(session_id, claude_config)
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
         "env_keys=%s api_key_helper_set=%s model_set=%s",
@@ -5993,15 +6010,19 @@ async def _auto_create_claude_terminal(
         bool(claude_config.model) if claude_config is not None else False,
     )
 
+    launch_model = resolve_claude_native_model_selection(
+        session_model_override
+        or _claude_native_model_from_spec(agent_spec)
+        or (claude_config.model if claude_config is not None else None),
+        claude_config,
+    )
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,
         # Precedence: per-session ``/model`` override > agent-spec pin
         # (``executor.model``) > provider/ucode default. All three yield to an
         # explicit ``--model`` in the user's pass-through args (handled in the
         # helper).
-        model_override=session_model_override
-        or _claude_native_model_from_spec(agent_spec)
-        or (claude_config.model if claude_config is not None else None),
+        model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
     )
@@ -8290,6 +8311,50 @@ def create_runner_app(
     # dropped in ``delete_session``.
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    # Exact Claude provider/model snapshot used to launch each native session.
+    # The model-options endpoint reads this so the web picker and terminal can
+    # never disagree about a newly added or removed Databricks model.
+    _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
+    _session_claude_launch_config_tasks: dict[
+        str, asyncio.Task[ClaudeNativeUcodeConfig | None]
+    ] = {}
+
+    async def _resolve_session_claude_launch_config(
+        session_id: str,
+    ) -> ClaudeNativeUcodeConfig | None:
+        """Resolve one Claude launch catalog shared by terminal and picker."""
+        if session_id in _session_claude_launch_configs:
+            return _session_claude_launch_configs[session_id]
+        task = _session_claude_launch_config_tasks.get(session_id)
+        if task is None:
+            from omnigent.claude_native import resolve_native_claude_config
+
+            async def _load() -> ClaudeNativeUcodeConfig | None:
+                spec = await _resolve_session_agent_spec(session_id)
+                config = await asyncio.to_thread(resolve_native_claude_config, spec=spec)
+                _session_claude_launch_configs[session_id] = config
+                return config
+
+            task = asyncio.create_task(_load())
+            _session_claude_launch_config_tasks[session_id] = task
+
+            def _forget_completed(
+                completed: asyncio.Task[ClaudeNativeUcodeConfig | None],
+                sid: str = session_id,
+            ) -> None:
+                if _session_claude_launch_config_tasks.get(sid) is completed:
+                    _session_claude_launch_config_tasks.pop(sid, None)
+
+            task.add_done_callback(_forget_completed)
+        return await asyncio.shield(task)
+
+    def _drop_session_claude_launch_config(session_id: str) -> None:
+        """Forget one session's resolved or in-flight Claude catalog."""
+        _session_claude_launch_configs.pop(session_id, None)
+        task = _session_claude_launch_config_tasks.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     # Sub-agent name per session. Set from POST /v1/sessions body
     # for child sessions. _run_turn_bg uses this to resolve the
@@ -8437,6 +8502,27 @@ def create_runner_app(
         return False
 
     app.state.has_active_work = _has_active_work
+
+    def _drain_session_streams() -> None:
+        """Signal end-of-stream to every open ``GET /stream`` subscriber.
+
+        Called once on graceful (idle-reaper) shutdown, before the tunnel is
+        torn down. Enqueues the ``None`` sentinel to each session event queue
+        so its stream generator emits ``[DONE]`` (see ``_event_generator``)
+        instead of being severed mid-flight. The server relay treats ``[DONE]``
+        as a clean return — no ``runner_disconnected`` failure and no durable
+        error label — so an idle-reaped session settles quietly rather than
+        showing a scary error banner. Mirror of the per-session ``put(None)``
+        the session-delete path already does; this is the whole-runner variant.
+
+        Snapshots the queues before iterating. The loop is synchronous (no
+        await, so nothing can interleave today), but the snapshot keeps the
+        drain robust if a queue mutation ever moves off this atomic path.
+        """
+        for queue in list(_session_event_queues.values()):
+            queue.put_nowait(None)
+
+    app.state.drain_session_streams = _drain_session_streams
 
     def _publish_event(session_id: str, event: dict[str, Any]) -> None:
         """Put an event on the session's queue for GET /stream.
@@ -9787,6 +9873,10 @@ def create_runner_app(
                             skills_filter=_native_skills_filter,
                             session_init=init_context.envelope,
                             auth_token_factory=auth_token_factory,
+                            resolve_launch_config=lambda: _resolve_session_claude_launch_config(
+                                session_id
+                            ),
+                            record_launch_config=_session_claude_launch_configs.__setitem__,
                         )
                         terminal_ready = True
                     except Exception as exc:
@@ -10607,6 +10697,7 @@ def create_runner_app(
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
@@ -12564,6 +12655,9 @@ def create_runner_app(
             503 if the tmux target isn't yet advertised (best-effort
             failure).
         """
+        from omnigent.claude_native import (
+            resolve_claude_native_model_selection,
+        )
         from omnigent.claude_native_bridge import (
             bridge_dir_for_bridge_id,
             inject_slash_command,
@@ -12583,7 +12677,12 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        command = f"/model {model.strip()}"
+        selected_model = model.strip()
+        resolved_model = resolve_claude_native_model_selection(
+            selected_model,
+            _session_claude_launch_configs.get(conv_id),
+        )
+        command = f"/model {resolved_model}"
         try:
             # Short timeout: missing tmux.json means the pane isn't
             # attached; persisted model still applies on next spawn.
@@ -14349,6 +14448,7 @@ def create_runner_app(
             )
             _session_spec_cache.pop(conv, None)
             _session_skills_cache.pop(conv, None)
+            _drop_session_claude_launch_config(conv)
             _session_tool_schemas.pop(conv, None)
             # The AP snapshot carries external_session_id + labels, which the
             # switch just changed (cleared id, stamped carry-history); re-fetch.
@@ -16613,6 +16713,10 @@ def create_runner_app(
                         server_client=server_client,
                         agent_spec=claude_agent_spec,
                         auth_token_factory=auth_token_factory,
+                        resolve_launch_config=lambda: _resolve_session_claude_launch_config(
+                            session_id
+                        ),
+                        record_launch_config=_session_claude_launch_configs.__setitem__,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -18500,6 +18604,61 @@ def create_runner_app(
                 },
             )
 
+    @app.get("/v1/sessions/{session_id}/claude-model-options")
+    async def get_session_claude_model_options(session_id: str) -> JSONResponse:
+        """Return the model catalog used by a Claude-native session.
+
+        The endpoint and terminal launch share one per-session resolution task,
+        so concurrent startup reads cannot observe a different gateway catalog.
+
+        :param session_id: Session/conversation identifier.
+        :returns: JSON ``{"models": [...]}`` with provider-neutral picker ids.
+        """
+        if _session_harness_name(session_id) != "claude-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        try:
+            claude_config = await _resolve_session_claude_launch_config(session_id)
+        except click.ClickException as exc:
+            # Configuration failure (e.g. the workspace authoritatively
+            # exposes no Claude models) — retrying cannot fix it, so answer
+            # with a non-503 status the AP server does not treat as a
+            # "still booting" retry window. The message is the same
+            # user-facing text the terminal-launch path surfaces.
+            _logger.warning(
+                "Claude-native model options unavailable for session=%s: %s",
+                session_id,
+                exc.message,
+            )
+            return JSONResponse(
+                status_code=424,
+                content={
+                    "error": "claude_native_model_options_config",
+                    "detail": exc.message,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — retryable model-options failure
+            _logger.warning(
+                "Claude-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc,
+                        context="claude-native model options",
+                    ),
+                },
+            )
+        from omnigent.claude_native import claude_native_model_options
+
+        return JSONResponse(
+            status_code=200,
+            content={"models": claude_native_model_options(claude_config)},
+        )
+
     # Note: neither cursor-native nor pi-native has a model-options route.
     # Cursor's catalog is a curated *static* base list served directly by the
     # AP server (see ``_fetch_model_options`` in
@@ -18781,6 +18940,7 @@ def create_runner_app(
         """Drop cached spec/tool data derived from a session's agent bundle."""
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)

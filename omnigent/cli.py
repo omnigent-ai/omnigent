@@ -1096,99 +1096,63 @@ def _ensure_sqlite_parent_dir(db_uri: str) -> None:
     Path(url.database).parent.mkdir(parents=True, exist_ok=True)
 
 
-def _maybe_prompt_first_admin(account_store: Any, auth_provider: Any, *, auto_open: bool) -> None:  # type: ignore[explicit-any]  # SqlAlchemyAccountStore | None, AuthProvider
-    """Interactively claim the first admin on a TTY when setup is pending.
+def _apply_bind_auth_defaults(host: str) -> None:
+    """Set auth env defaults from the server's bind interface.
 
-    The "terminal" entry point of first-run setup. It's the FALLBACK,
-    not the default: when the browser is about to auto-open the web
-    Create-admin form (the default ``--open`` on a loopback server), we
-    skip the prompt and let the browser own setup — otherwise the
-    terminal prompt would block before the lifespan ever opens the
-    browser, so the form would never appear.
+    The bind address is the discriminator for the *implicit* (env-unset)
+    auth posture. Explicit operator choices always win — an
+    ``OMNIGENT_AUTH_PROVIDER`` keeps header/oidc, and
+    ``OMNIGENT_AUTH_ENABLED`` (or its deprecated alias) pins auth on/off.
 
-    No-ops unless ALL of:
+    Decision matrix for the env-unset default:
 
-    - accounts mode is active (``account_store`` is not ``None``);
-    - no password-having account exists yet (a ``--admin-password`` /
-      ``INIT_ADMIN_PASSWORD`` would already have created one, and a
-      re-boot already has an admin);
-    - stdin AND stdout are a TTY — a headless / piped / agent run must
-      NOT block on a prompt (it falls through to the web form);
-    - the browser is NOT auto-opening a usable form, i.e. ``--no-open``
-      was passed OR the base URL isn't loopback (remote-over-SSH, where
-      opening a browser on the server box is useless but a terminal IS
-      available).
+    - **Loopback** (``127.0.0.1`` / ``localhost`` / ``::1``) + header
+      default → set ``OMNIGENT_LOCAL_SINGLE_USER=1``: the no-login
+      header-mode ``"local"`` fallback. The user's own machine, no proxy
+      to inject identity — same posture as the daemon / ``omnigent run``
+      spawn paths.
+    - **Non-loopback** (``0.0.0.0``, a network-exposed deploy) + no
+      explicit auth → set ``OMNIGENT_AUTH_ENABLED=1``: accounts (login)
+      mode. For an end user binding to a network interface there's no
+      realistic way to inject an identity header, so we opt them into
+      login. First-admin setup happens via the web Create-admin form
+      (the server boots and serves; no terminal prompt). Mirrors the
+      Docker/Cloudflare/k8s entrypoints.
 
-    On success, creates the admin and mints the loopback CLI token so a
-    subsequent ``omnigent run`` against this server is signed in.
+    Uses ``setdefault`` throughout so an operator's explicit value wins.
+    Must run before ``create_auth_provider()``, which reads these vars.
 
-    :param account_store: The accounts store, or ``None`` in
-        header/OIDC mode (then this is a no-op).
-    :param auth_provider: The active auth provider; its accounts config
-        supplies the cookie secret / base URL / session TTL.
-    :param auto_open: The resolved ``--open/--no-open`` flag. When True
-        and the base URL is loopback, the lifespan opens the browser to
-        the form, so we defer to it and skip the prompt.
+    :param host: The resolved bind host, e.g. ``"127.0.0.1"`` or
+        ``"0.0.0.0"``.
     :returns: None.
     """
-    if account_store is None:
-        return
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return
-    if any(u.has_password for u in account_store.list_users()):
-        return
+    from omnigent.server.auth import resolve_auth_source as _resolve_auth_source
 
-    from omnigent.server.accounts_bootstrap import (
-        _is_loopback_base_url,
-        _mint_loopback_cli_token,
-        resolve_admin_username,
+    _is_loopback_bind = host in ("127.0.0.1", "localhost", "::1")
+    # Compose-style deploys pass OMNIGENT_AUTH_PROVIDER as an empty
+    # string when unset ("${VAR:-}"), so empty and missing both mean
+    # "not explicitly pinned".
+    _raw_auth_provider = os.environ.get("OMNIGENT_AUTH_PROVIDER")
+    _auth_provider_explicit = bool(_raw_auth_provider and _raw_auth_provider.strip())
+
+    # Loopback + header default → single-user marker (no login).
+    if _is_loopback_bind and not _auth_provider_explicit and _resolve_auth_source() == "header":
+        os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
+
+    # Non-loopback + no explicit auth → accounts (login) mode.
+    _raw_auth_enabled = os.environ.get("OMNIGENT_AUTH_ENABLED", "").strip()
+    _auth_enabled_explicit = bool(
+        _raw_auth_enabled or os.environ.get("OMNIGENT_ACCOUNTS_ENABLED", "").strip()
     )
-    from omnigent.server.auth import UnifiedAuthProvider
-    from omnigent.server.passwords import hash_password
-    from omnigent.server.routes.accounts_auth import _MIN_PASSWORD_LENGTH
-
-    # Read the accounts config off the concrete provider (same direct
-    # access app.py uses). isinstance-narrowed so mypy sees the attribute
-    # rather than reaching through getattr(..., "<literal>").
-    base_url: str | None = None
-    if isinstance(auth_provider, UnifiedAuthProvider):
-        cfg = auth_provider._accounts_config
-        base_url = cfg.base_url if cfg is not None else None
-    # Defer to the browser form when it's going to open (default --open
-    # on a loopback server). Only prompt when no browser form will appear.
-    if auto_open and base_url is not None and _is_loopback_base_url(base_url):
-        return
-
-    click.echo("\n  First-run setup — create the admin account for this server.")
-    username = click.prompt("  Username", default=resolve_admin_username()).strip().lower()
-    while True:
-        password = click.prompt("  Password", hide_input=True, confirmation_prompt=True)
-        if len(password) >= _MIN_PASSWORD_LENGTH:
-            break
-        click.echo(f"  Password must be at least {_MIN_PASSWORD_LENGTH} characters.", err=True)
-
-    try:
-        account_store.create_user_with_password(username, hash_password(password), is_admin=True)
-    except ValueError:
-        # Raced another claimer (e.g. someone hit the web form first).
-        click.echo("  An admin was just created elsewhere — skipping.", err=True)
-        return
-
-    # Mint the loopback CLI token so `omnigent run` is signed in.
-    # (Reuses cfg/base_url resolved above.)
-    if (
-        cfg is not None
-        and base_url is not None
-        and cfg.cookie_secret is not None
-        and _is_loopback_base_url(base_url)
-    ):
-        _mint_loopback_cli_token(
-            username,
-            base_url=base_url,
-            cookie_secret=cfg.cookie_secret,
-            session_ttl_hours=cfg.session_ttl_hours,
+    if not _is_loopback_bind and not _auth_provider_explicit and not _auth_enabled_explicit:
+        os.environ.setdefault("OMNIGENT_AUTH_ENABLED", "1")
+        click.echo(
+            f"  ⚠ Binding to non-local interface {host}: enabling accounts "
+            "(login) mode to prevent unauthorized access.\n"
+            "    Open the server URL in a browser to create the first admin "
+            "account.",
+            err=True,
         )
-    click.echo(f"  ✓ Admin '{username}' created. Sign in at the server URL.\n")
 
 
 def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any]  # returns ArtifactStore protocol (optional deps)
@@ -3216,6 +3180,19 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
         "ignored with a warning if an admin already exists."
     ),
 )
+@click.option(
+    "--background",
+    "background",
+    is_flag=True,
+    default=False,
+    help=(
+        "Spawn the server as a detached background process (the managed "
+        "local server recorded in ~/.omnigent/local_server.pid) instead of "
+        "running it in the foreground. Reuses a healthy background server if "
+        "one is already up; otherwise spawns a detached one on a free "
+        "loopback port and prints its URL."
+    ),
+)
 @click.pass_context
 def server(
     ctx: click.Context,
@@ -3229,13 +3206,16 @@ def server(
     agent_dirs: tuple[str, ...],
     auto_open: bool,
     admin_password: str | None,
+    background: bool,
 ) -> None:
-    """Start the Omnigent server in the foreground, or manage the background server.
+    """Start the Omnigent server, or manage the background server.
 
     Bare ``omnigent server`` runs the server in the FOREGROUND (Ctrl-C to
-    stop) — for deploys / Docker. Subcommands manage the detached background
-    server that ``run`` / ``claude`` / ``codex`` use: ``start`` (ensure it's
-    up), ``stop`` (stop it and the local host daemon), ``status`` (is it up?).
+    stop) — for deploys / Docker. Pass ``--background`` to spawn it as a
+    detached background process instead (the managed local server that
+    ``run`` / ``claude`` / ``codex`` reuse). Subcommands manage that
+    background server: ``stop`` (stop it and the local host daemon),
+    ``status`` (is it up?).
 
     :param host: Interface to bind, e.g. ``"127.0.0.1"``.
     :param ctx: Click invocation context used to tell whether
@@ -3259,12 +3239,36 @@ def server(
         from ``--admin-password``, e.g. ``"hunter2"``. Folded into the
         ``OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`` env var that
         bootstrap reads; ``None`` leaves the env var untouched.
+    :param background: When True, spawn the server as a detached background
+        process (the managed local server) instead of running it in the
+        foreground.
     :returns: None.
     """
     if ctx.invoked_subcommand is not None:
-        # A subcommand (start/stop/status) handles this invocation; the body
-        # below is the foreground-server path for the bare ``server`` group.
+        # A subcommand (stop/status) handles this invocation; the body
+        # below is the server path for the bare ``server`` group.
         return
+
+    if background:
+        # `omnigent server --background` replaces the removed `server start`
+        # subcommand: ensure (or reuse) the managed detached local server and
+        # return immediately instead of running uvicorn in-process.
+        startup = ensure_local_omnigent_server()
+        verb = (
+            "Started background server at"
+            if startup.spawned
+            else "Background server already running at"
+        )
+        click.echo(f"{verb} {startup.url}")
+        # Surface the exact log file so a detached server isn't a black box —
+        # `server --background` is otherwise the only signal it ever emits.
+        # Known for a spawned server and (via the log-path sidecar) for a
+        # reused one too; absent only for a foreground `omnigent server` whose
+        # logs stream to its own terminal.
+        if startup.log_path is not None:
+            click.echo(f"  log: {_display_path(startup.log_path)}")
+        return
+
     port_source = ctx.get_parameter_source("port")
     port_was_explicit = port_source is click.core.ParameterSource.COMMANDLINE
     if port_was_explicit:
@@ -3311,31 +3315,10 @@ def server(
         and not port_was_explicit
     )
 
-    # Single-user marker: ANY loopback-bound `omnigent server` running
-    # the env-unset header default IS a local single-user runtime — the
-    # user's own machine, no proxy to inject identity — so it keeps the
-    # no-login header-mode "local" fallback (same posture as the daemon
-    # / `omnigent run` spawn paths, which set this var themselves). The
-    # bind address is the discriminator, NOT the port/db-uri: a
-    # dedicated `omnigent server --port 9001 --database-uri …` on
-    # loopback (manual local runs, the e2e harness) is still single
-    # user, so it must not 401 its own headerless traffic. What stays
-    # fail-closed: a non-loopback bind (`--host 0.0.0.0`,
-    # a network-exposed deploy — those MUST front a proxy or use
-    # accounts/oidc) and an explicit OMNIGENT_AUTH_PROVIDER=header
-    # deploy behind an identity-injecting proxy. setdefault so an
-    # operator's explicit OMNIGENT_LOCAL_SINGLE_USER=0 wins. Must run
-    # before create_auth_provider() below, which reads the var.
-    from omnigent.server.auth import resolve_auth_source as _resolve_auth_source
-
-    _is_loopback_bind = host in ("127.0.0.1", "localhost", "::1")
-    # Compose-style deploys pass OMNIGENT_AUTH_PROVIDER as an empty
-    # string when unset ("${VAR:-}"), so empty and missing both mean
-    # "not explicitly pinned".
-    _raw_auth_provider = os.environ.get("OMNIGENT_AUTH_PROVIDER")
-    _auth_provider_explicit = bool(_raw_auth_provider and _raw_auth_provider.strip())
-    if _is_loopback_bind and not _auth_provider_explicit and _resolve_auth_source() == "header":
-        os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    # Resolve auth defaults from the bind interface. MUST run before
+    # create_auth_provider() below, which reads the vars this sets.
+    # See _apply_bind_auth_defaults for the full decision matrix.
+    _apply_bind_auth_defaults(host)
 
     if _is_canonical_local_server:
         from omnigent.host.local_server import (
@@ -3566,6 +3549,7 @@ def server(
         host_store=host_store,
         account_store=account_store,
         policy_modules=cfg.get("policy_modules"),
+        debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
@@ -3576,14 +3560,6 @@ def server(
     click.echo(f"  database:  {db_uri}")
     click.echo(f"  artifacts: {art_loc}")
     click.echo(f"  log:       {_display_path(server_log_path)}")
-
-    # First-run terminal setup: the FALLBACK entry point. Fires only on
-    # an interactive TTY when no admin exists AND the browser isn't about
-    # to open the web Create-admin form (i.e. --no-open, or a non-loopback
-    # base URL). The default `omnigent server` on loopback opens the
-    # browser to the form instead, so this no-ops there. (The other entry
-    # points are --admin-password and the web form.)
-    _maybe_prompt_first_admin(account_store, auth_provider, auto_open=auto_open)
 
     # Warn loudly when the SPA bundle is absent: the server still boots
     # but serves an API-only JSON landing at "/", so the operator hits
@@ -3709,33 +3685,6 @@ def _stop_local_server_and_daemon(*, force: bool) -> bool:
     # running" while one was still listening on the default port).
     orphan_pid = stop_untracked_local_server()
     return was_running or orphan_pid is not None
-
-
-@server.command("start")
-def server_start() -> None:
-    """Ensure the managed background Omnigent server is running.
-
-    Reuses a healthy background server if one is already up (started here or
-    by a prior ``run`` / ``host``); otherwise spawns a detached one on a
-    free loopback port and prints its URL. The background counterpart to the
-    foreground bare ``omnigent server``.
-
-    :returns: None.
-    """
-    startup = ensure_local_omnigent_server()
-    verb = (
-        "Started background server at"
-        if startup.spawned
-        else "Background server already running at"
-    )
-    click.echo(f"{verb} {startup.url}")
-    # Surface the exact log file so a detached server isn't a black box —
-    # `server start` is otherwise the only signal it ever emits. Known for a
-    # spawned server and (via the log-path sidecar) for a reused one too;
-    # absent only for a foreground `omnigent server` whose logs stream to
-    # its own terminal.
-    if startup.log_path is not None:
-        click.echo(f"  log: {_display_path(startup.log_path)}")
 
 
 @server.command("stop")
