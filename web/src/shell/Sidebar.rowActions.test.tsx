@@ -191,17 +191,21 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("quick pin/unpin hover button", () => {
-  it("uses compact controls and positions the actions trigger in the right gutter", () => {
+  it("keeps the row full-width and the trailing controls inset from the right edge", () => {
+    // The row link is `w-full` (not `w-[calc(100%+1rem)]`) so its highlight
+    // stays inset from the right edge, aligning with the project/folder rows.
+    // The pin + kebab controls sit inside that edge (right-[30px] / right-1),
+    // not in a bled-past overflow gutter (right-[14px] / -right-3).
     renderSidebar();
 
-    expect(screen.getByTestId("quick-pin-conversation")).toHaveClass("size-6", "right-[14px]");
-    expect(screen.getByTestId("quick-pin-conversation")).not.toHaveClass("right-[30px]");
-    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6", "-right-3");
-    expect(screen.getByTestId("conversation-actions")).not.toHaveClass("right-1");
+    expect(screen.getByTestId("quick-pin-conversation")).toHaveClass("size-6", "right-[30px]");
+    expect(screen.getByTestId("quick-pin-conversation")).not.toHaveClass("right-[14px]");
+    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6", "right-1");
+    expect(screen.getByTestId("conversation-actions")).not.toHaveClass("-right-3");
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
-    expect(rowLink).toHaveClass("w-[calc(100%+1rem)]");
-    expect(rowLink).not.toHaveClass("w-full");
+    expect(rowLink).toHaveClass("w-full");
+    expect(rowLink).not.toHaveClass("w-[calc(100%+1rem)]");
   });
 
   it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
@@ -389,7 +393,13 @@ describe("pinned row project flyout", () => {
     fireEvent.focus(screen.getByRole("link", { name: /My Session/ }));
     const flyout = await screen.findByTestId("pinned-project-flyout");
     expect(within(flyout).getByText("Moonshot")).toBeInTheDocument();
-    expect(within(flyout).getByText("My Session")).toBeInTheDocument();
+    const flyoutTitle = within(flyout).getByText("My Session");
+    expect(flyoutTitle).toBeInTheDocument();
+    // The flyout title is sized to match the sidebar row name (fixed
+    // --sidebar-font-size via `sidebar-compact-text`), not the rem-based
+    // `text-sm` that scaled with the UI font-size setting.
+    expect(flyoutTitle).toHaveClass("sidebar-compact-text");
+    expect(flyoutTitle).not.toHaveClass("text-sm");
   });
 
   it("renders no project flyout for a pinned row with no project", () => {

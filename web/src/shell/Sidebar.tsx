@@ -2385,24 +2385,27 @@ function SessionTooltipContent({
   return (
     <TooltipContent
       side="right"
-      sideOffset={12}
+      align="start"
+      sideOffset={8}
       data-testid="session-tooltip-content"
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch gap-3 rounded-xl bg-card-solid px-4 py-3 whitespace-normal shadow-lg"
+      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
+      // then a muted, small-icon metadata line.
+      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-md ring-1 ring-foreground/10"
     >
-      <div className="text-sm font-medium leading-snug">
+      <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
         <span className="font-normal text-muted-foreground">
           {" · "}
           {relativeTime(conversation.updated_at * 1000)}
         </span>
-      </div>
-      <div
+      </p>
+      <p
         data-testid="session-tooltip-location"
-        className="flex items-center gap-2 text-sm text-muted-foreground"
+        className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
       >
-        <LaptopIcon aria-hidden className="size-4 shrink-0" />
+        <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
         <span className="truncate">{locationLabel}</span>
-      </div>
+      </p>
     </TooltipContent>
   );
 }
@@ -2742,7 +2745,9 @@ function ConversationRow({
       className={cn(
         "sidebar-compact-text relative flex min-h-7 flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
         SIDEBAR_HOVER_HIGHLIGHT,
-        selectionMode ? "w-full" : "w-[calc(100%+1rem)]",
+        // Full width (not 100%+1rem) so the highlight stays inset from the
+        // right edge, aligning with the project/folder rows above.
+        "w-full",
         !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-14"),
         selectionMode && "pr-10",
         isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -2900,7 +2905,7 @@ function ConversationRow({
           aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
           data-testid="quick-pin-conversation"
           className={cn(
-            "-translate-y-1/2 absolute top-1/2 right-[14px] transition-opacity",
+            "-translate-y-1/2 absolute top-1/2 right-[30px] transition-opacity",
             // Desktop-only quick affordance: hidden on mobile (the kebab's
             // Pin item below covers that), hover/focus-revealed from `md` up.
             // Pinned rows no longer keep a persistent pin marker, since the
@@ -2942,7 +2947,7 @@ function ConversationRow({
               // surfaced while the menu is open so the trigger doesn't
               // vanish under the cursor.
               className={cn(
-                "-translate-y-1/2 absolute top-1/2 -right-3 transition-opacity",
+                "-translate-y-1/2 absolute top-1/2 right-1 transition-opacity",
                 "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
                 "md:aria-expanded:opacity-100",
               )}
@@ -3112,7 +3117,7 @@ function PinnedProjectFlyoutContent({
       {/* Titles have no length cap (server + rename input are unbounded), so
           clamp to 3 wrapped lines to keep the card tidy — full text stays in
           the DOM. */}
-      <p className="line-clamp-3 font-medium text-sm">{title}</p>
+      <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
         <FolderIcon className="size-3.5 shrink-0" />
         <span className="truncate">{projectName}</span>
