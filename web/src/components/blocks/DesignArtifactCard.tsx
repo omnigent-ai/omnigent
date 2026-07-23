@@ -1,8 +1,9 @@
-import { ChevronRightIcon, FileCode2Icon } from "lucide-react";
-import { useMemo } from "react";
+import { ChevronRightIcon, Code2Icon, Loader2Icon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { useArtifactPreview } from "@/hooks/useArtifactPreview";
 import { cn } from "@/lib/utils";
 import { useArtifactViewer } from "@/shell/ArtifactViewerContext";
-import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
+import { useFileViewerConversationId } from "@/shell/FileViewerContext";
 
 export interface DesignArtifactData {
   entryPath: string;
@@ -83,50 +84,141 @@ interface DesignArtifactCardProps {
   data: DesignArtifactData;
 }
 
-export function DesignArtifactCard({ data }: DesignArtifactCardProps) {
-  const openArtifact = useArtifactViewer();
-  const resourceLabel = useMemo(
-    () => `${data.resourceCount} ${data.resourceCount === 1 ? "file" : "files"}`,
-    [data.resourceCount],
-  );
+const PREVIEW_VIEWPORT_WIDTH = 1024;
+const PREVIEW_WELL_HEIGHT = 168;
+
+interface ArtifactPreviewWellProps {
+  title: string;
+  url?: string;
+  loading?: boolean;
+}
+
+function ArtifactPreviewWell({ title, url, loading = false }: ArtifactPreviewWellProps) {
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const [wellWidth, setWellWidth] = useState(560);
+
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width;
+      if (width && width > 0) setWellWidth(width);
+    });
+    observer.observe(wrapper);
+    return () => observer.disconnect();
+  }, []);
+
+  const scale = wellWidth / PREVIEW_VIEWPORT_WIDTH;
+  const iframeHeight = Math.round(PREVIEW_WELL_HEIGHT / (scale || 1));
 
   return (
-    <button
-      type="button"
+    <div
+      data-testid="design-artifact-preview-well"
+      className="mx-3 mb-3 overflow-hidden rounded-lg border border-border bg-muted/40 shadow-inner"
+    >
+      <div className="flex items-center gap-1.5 border-b border-border px-2.5 py-1.5">
+        <span className="size-1.5 rounded-full bg-muted-foreground/40" />
+        <span className="size-1.5 rounded-full bg-muted-foreground/40" />
+        <span className="size-1.5 rounded-full bg-muted-foreground/40" />
+        <span className="ml-1.5 h-3 flex-1 rounded border border-border bg-background/70" />
+      </div>
+      <div
+        ref={wrapperRef}
+        className="relative overflow-hidden bg-white"
+        style={{ height: PREVIEW_WELL_HEIGHT }}
+      >
+        {url ? (
+          <iframe
+            title={`${title} card preview`}
+            src={url}
+            sandbox="allow-same-origin"
+            tabIndex={-1}
+            aria-hidden="true"
+            loading="lazy"
+            className="pointer-events-none absolute left-0 top-0 border-0 bg-white"
+            style={{
+              width: PREVIEW_VIEWPORT_WIDTH,
+              height: iframeHeight,
+              transform: `scale(${scale})`,
+              transformOrigin: "top left",
+            }}
+          />
+        ) : (
+          <div className="flex h-full items-center justify-center bg-muted/20 text-muted-foreground">
+            {loading ? (
+              <Loader2Icon className="size-4 animate-spin" />
+            ) : (
+              <Code2Icon className="size-5" />
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ConnectedArtifactPreview({
+  conversationId,
+  entryPath,
+  title,
+}: {
+  conversationId: string;
+  entryPath: string;
+  title: string;
+}) {
+  const preview = useArtifactPreview(conversationId, entryPath);
+  return <ArtifactPreviewWell title={title} url={preview.data?.url} loading={preview.isLoading} />;
+}
+
+export function DesignArtifactCard({ data }: DesignArtifactCardProps) {
+  const openArtifact = useArtifactViewer();
+  const conversationId = useFileViewerConversationId();
+  const resourceLabel = `${data.resourceCount} ${data.resourceCount === 1 ? "file" : "files"}`;
+  const operationLabel = data.operation === "created" ? "Created" : "Updated";
+  const open = () => openArtifact?.(data.entryPath);
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
       data-testid="design-artifact-card"
-      onClick={() => openArtifact?.(data.entryPath)}
+      onClick={open}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          open();
+        }
+      }}
       className={cn(
-        "not-prose my-1 flex items-center gap-3 rounded-lg border border-border bg-card px-3 py-3 text-left shadow-sm transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        TOOL_SURFACE_WIDTH_CLASS,
+        "not-prose my-1 w-full min-w-0 cursor-pointer overflow-hidden rounded-xl border border-border bg-card text-left shadow-sm transition-colors hover:bg-muted/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
       )}
       aria-label={`Open design artifact ${data.title}`}
     >
-      <span className="flex size-10 shrink-0 items-center justify-center rounded-md border border-border bg-muted text-muted-foreground">
-        <FileCode2Icon className="size-5" aria-hidden="true" />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="flex items-center gap-2">
-          <span className="truncate text-sm font-medium text-foreground">{data.title}</span>
-          <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-            {data.operation === "created" ? "Created" : "Updated"}
+      <div className="flex items-center gap-3 px-4 pb-3 pt-3.5">
+        <span className="flex size-[34px] shrink-0 items-center justify-center rounded-lg bg-muted text-foreground">
+          <Code2Icon className="size-[18px]" aria-hidden="true" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-semibold text-foreground">{data.title}</span>
+          <span className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="font-mono font-medium text-foreground/80">HTML</span>
+            <span aria-hidden="true" className="size-0.5 rounded-full bg-muted-foreground" />
+            <span>{resourceLabel}</span>
+            <span aria-hidden="true" className="size-0.5 rounded-full bg-muted-foreground" />
+            <span>{operationLabel}</span>
           </span>
         </span>
-        <span className="mt-0.5 block truncate font-mono text-xs text-muted-foreground">
-          {data.entryPath}
-        </span>
-        <span className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
-          <span>HTML</span>
-          <span aria-hidden="true">·</span>
-          <span>{resourceLabel}</span>
-          {data.summary !== undefined && (
-            <>
-              <span aria-hidden="true">·</span>
-              <span className="truncate">{data.summary}</span>
-            </>
-          )}
-        </span>
-      </span>
-      <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
-    </button>
+        <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+      </div>
+      {conversationId ? (
+        <ConnectedArtifactPreview
+          conversationId={conversationId}
+          entryPath={data.entryPath}
+          title={data.title}
+        />
+      ) : (
+        <ArtifactPreviewWell title={data.title} />
+      )}
+    </div>
   );
 }

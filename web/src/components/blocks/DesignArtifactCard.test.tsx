@@ -1,6 +1,20 @@
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { useArtifactPreview } from "@/hooks/useArtifactPreview";
+import { FileViewerContext } from "@/shell/FileViewerContext";
 import { DesignArtifactCard, parseDesignArtifactResult } from "./DesignArtifactCard";
+
+vi.mock("@/hooks/useArtifactPreview", () => ({ useArtifactPreview: vi.fn() }));
+
+const artifactPreviewMock = vi.mocked(useArtifactPreview);
+
+const FILE_VIEWER_CONTEXT_VALUE = {
+  openFile: vi.fn(),
+  isChangedPath: () => false,
+  conversationId: "conv_preview",
+  workspaceRoot: null,
+  workspaceHome: null,
+};
 
 afterEach(cleanup);
 
@@ -55,7 +69,7 @@ describe("parseDesignArtifactResult", () => {
 });
 
 describe("DesignArtifactCard", () => {
-  it("renders the reviewed artifact metadata", () => {
+  it("renders the current full-row SP2K HTML card hierarchy", () => {
     const data = parseDesignArtifactResult(
       { entry_path: "artifacts/revenue-dashboard/index.html" },
       VALID_OUTPUT,
@@ -64,10 +78,40 @@ describe("DesignArtifactCard", () => {
 
     render(<DesignArtifactCard data={data!} />);
 
-    expect(screen.getByTestId("design-artifact-card")).toBeDefined();
+    const card = screen.getByTestId("design-artifact-card");
+    expect(card.className).toContain("w-full");
+    expect(card.className).toContain("bg-card");
+    expect(screen.getByTestId("design-artifact-preview-well")).toBeDefined();
     expect(screen.getByText("Revenue dashboard")).toBeDefined();
-    expect(screen.getByText("artifacts/revenue-dashboard/index.html")).toBeDefined();
+    expect(screen.getByText("HTML")).toBeDefined();
     expect(screen.getByText("4 files")).toBeDefined();
     expect(screen.getByText("Created")).toBeDefined();
+    expect(screen.queryByText("artifacts/revenue-dashboard/index.html")).toBeNull();
+    expect(screen.queryByText("Revenue health and account-level drill-downs.")).toBeNull();
+  });
+
+  it("renders the real capability URL inside the recessed preview well", () => {
+    artifactPreviewMock.mockReturnValue({
+      data: {
+        url: "http://preview.localhost:6767/p/grant/artifacts/revenue-dashboard/index.html",
+        expires_at: 1234,
+      },
+      isLoading: false,
+      isError: false,
+    } as ReturnType<typeof useArtifactPreview>);
+    const data = parseDesignArtifactResult(
+      { entry_path: "artifacts/revenue-dashboard/index.html" },
+      VALID_OUTPUT,
+    );
+
+    render(
+      <FileViewerContext.Provider value={FILE_VIEWER_CONTEXT_VALUE}>
+        <DesignArtifactCard data={data!} />
+      </FileViewerContext.Provider>,
+    );
+
+    const frame = screen.getByTitle("Revenue dashboard card preview");
+    expect(frame.getAttribute("src")).toContain("preview.localhost");
+    expect(frame.getAttribute("sandbox")).toBe("allow-same-origin");
   });
 });
