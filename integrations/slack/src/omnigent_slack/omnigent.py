@@ -147,6 +147,22 @@ _STREAM_RECONNECT_MAX_ATTEMPTS = 6
 _STREAM_RECONNECT_MAX_TOTAL = 200
 _STREAM_RECONNECT_BACKOFF_S = 1.0
 
+# Terminal ``response.*`` lifecycle events the in-process harness scaffold emits
+# at a turn's end (completed/failed/cancelled/incomplete). Their presence marks
+# a turn as having PRODUCED output — an id-less idle that follows one is a real
+# end, not a claude-native cold-start PTY flap (claude-native emits no
+# ``response.*`` lifecycle events at all). ``response.failed``/``cancelled`` are
+# handled as hard-terminal separately; they are listed here too so the
+# production signal is set even on the paths that don't reach that branch.
+_RESPONSE_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        "response.completed",
+        "response.failed",
+        "response.cancelled",
+        "response.incomplete",
+    }
+)
+
 # Path fragments that mark a redirect Location as an auth/login bounce (the
 # Databricks Apps proxy 302s an unauthenticated request to its OAuth authorize
 # endpoint). Used to tell an auth wall apart from a benign canonical redirect.
@@ -656,12 +672,26 @@ class OmnigentClient:
         # freshly-resumed session's stream (``idle=false``) replays the session's
         # CURRENT status first — which, hours after the last turn, is a stale
         # ``idle`` (no response_id) that arrives before our just-submitted
-        # message's ``running`` edge. Without this guard the ``id_less_end`` branch
-        # below would treat that pre-turn idle as the end and return 0 events
-        # ("Omnigent completed without returning response text"). We only honor a
-        # terminal idle/failed once we've seen the turn begin: a running/waiting
-        # edge, a forwarded answer delta, or a hard-terminal event.
+        # message's ``running`` edge. Without this guard the ``id_bearing_match``
+        # branch below (``not saw_open_running``) would treat that pre-turn idle as
+        # the end and return 0 events. We only honor such an idle once we've seen
+        # the turn begin: a running/waiting edge, a forwarded answer delta, or a
+        # hard-terminal event.
         turn_started = False
+        # Whether THIS turn has PRODUCED anything on the stream — an answer delta or
+        # a terminal ``response.*`` lifecycle event. Stricter than ``turn_started``,
+        # which a bare id-less ``running`` edge also sets. The id-less end branch
+        # keys off this, not ``turn_started``: claude-native's PTY-activity watcher
+        # emits an id-less ``running`` then an id-less ``idle`` flap during cold
+        # start (runner booted, message submitted, but the LLM hasn't returned its
+        # first token). That pair looks identical on the wire to the in-process
+        # harness's real id-less end — EXCEPT the in-process harness always produces
+        # first (a delta, or a terminal ``response.*`` envelope from the scaffold;
+        # even a policy-deny notice emits a bare ``output_text.delta``). Gating on
+        # production lets the flap fall through (kept reading until the real
+        # id-bearing Stop idle, or the idle-grace backstop) while a genuinely-empty
+        # in-process turn still ends promptly on its id-less idle.
+        turn_produced = False
         emitted: dict[str | None, str] = {}
         attempt = 0
         total_reconnects = 0
@@ -734,7 +764,17 @@ class OmnigentClient:
                                 # would defeat the stale-idle guard below.
                                 if event.get("type") == "response.output_text.delta":
                                     turn_started = True
+                                    turn_produced = True
                                 yield reconciled
+
+                            # A terminal ``response.*`` lifecycle envelope also counts
+                            # as production: the in-process harness always emits one
+                            # (the scaffold's completed/failed/cancelled) before its
+                            # id-less idle, so an id-less idle that follows one is a
+                            # real end, not a claude-native cold-start flap (which
+                            # emits no ``response.*`` at all).
+                            if event.get("type") in _RESPONSE_TERMINAL_EVENT_TYPES:
+                                turn_produced = True
 
                             if is_hard_terminal_event(event):
                                 self._logger.info(
@@ -782,15 +822,30 @@ class OmnigentClient:
                                 #      saw no id-bearing open — some paths only stamp
                                 #      the end);
                                 #  (b) id-less AND no id-bearing response is open — the
-                                #      in-process (debby/claude-sdk) real end.
-                                #      `waiting` would have kept us going; only
-                                #      `idle`/`failed` here.
+                                #      in-process (debby/claude-sdk) real end. `waiting`
+                                #      would have kept us going; only `idle`/`failed`.
                                 # An id-less idle WHILE an id-bearing response is open
                                 # is a claude-native PTY flap → ignored (falls through).
+                                # An id-less IDLE with NOTHING produced is a
+                                # claude-native cold-start flap (id-less PTY
+                                # running→idle before the first token) → ignored; the
+                                # real end is the later id-bearing Stop idle, with the
+                                # idle-grace timeout as the backstop. This
+                                # produced-gate applies to `idle` ONLY: `failed` is
+                                # never a PTY flap (it comes solely from the
+                                # authoritative StopFailure hook / a setup-phase
+                                # failure — the PTY watcher emits only `idle`), so a
+                                # bare id-less `failed` must end the turn promptly even
+                                # with nothing produced.
                                 id_bearing_match = response_id is not None and (
                                     not saw_open_running or response_id == open_response_id
                                 )
-                                id_less_end = response_id is None and not saw_open_running
+                                produced_or_failed = turn_produced or status == "failed"
+                                id_less_end = (
+                                    response_id is None
+                                    and not saw_open_running
+                                    and produced_or_failed
+                                )
                                 if id_bearing_match or id_less_end:
                                     self._logger.info(
                                         "Omnigent turn ended session_id=%s status=%s "

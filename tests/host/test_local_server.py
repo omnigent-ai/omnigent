@@ -602,7 +602,7 @@ def test_clear_local_server_record_leaves_other_pids_alone(
 
 
 # ---------------------------------------------------------------------------
-# Server log-path sidecar — so `server start`/`status` name the exact log
+# Server log-path sidecar — so `server --background`/`status` name the exact log
 # ---------------------------------------------------------------------------
 
 
@@ -612,7 +612,7 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
 ) -> None:
     """A spawned server returns its captured-log path and records it for status.
 
-    ``omnigent server start`` used to be a black box — it printed only the
+    ``omnigent server --background`` used to be a black box — it printed only the
     URL. The spawn now threads the captured stdout/stderr log file out via
     ``LocalServerStartup.log_path`` AND into the log-path sidecar, so both
     the spawning call and a later ``server status`` can name the exact file.
@@ -674,7 +674,7 @@ def test_ensure_local_omnigent_server_reuse_reads_log_path_sidecar(
 
     The reuse path never sees the original spawn's ``log_path`` variable, so
     it must read the recorded path back from the sidecar — otherwise a
-    ``server start`` that reuses an existing background server could not name
+    ``server --background`` that reuses an existing background server could not name
     its log. Popen must not fire (the stub fails the test if it does).
     """
     monkeypatch.setattr(

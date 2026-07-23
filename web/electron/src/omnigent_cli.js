@@ -1,7 +1,7 @@
 // Discovery and invocation of the local `omnigent` CLI for the desktop shell.
 //
 // The desktop manages servers by shelling out to the same `omnigent` binary a
-// user would run by hand — `server start|stop|status` and `host status` (the
+// user would run by hand — `server --background/stop/status` and `host status` (the
 // long-lived `host` connection is spawned by server_manager.js, which owns its
 // lifetime). This module locates the binary, runs the short exit-quick
 // commands, and parses their `--json` output. The CLI is the single source of
@@ -49,7 +49,7 @@ function normalizeServerUrl(value) {
 
 /**
  * True when a server URL points at the local machine — loopback host. Only
- * loopback servers expose the local-server start/stop controls. Reuses the
+ * loopback servers expose the local-server background/stop controls. Reuses the
  * shared LOCAL_HOSTS set from url.js so the desktop never disagrees on what
  * "local" means.
  *
@@ -525,13 +525,13 @@ async function getServerStatus(cliPath) {
 
 /**
  * Start (or reuse) the local background server, then re-read status for a
- * reliable URL. `server start` is idempotent on the CLI side.
+ * reliable URL. `server --background` is idempotent on the CLI side.
  *
  * @param {string} cliPath
  * @returns {Promise<{ ok: boolean, url?: string, port?: number, pid?: number, error?: string }>}
  */
 async function startLocalServer(cliPath) {
-  const res = await runCli(cliPath, ["server", "start"], { timeoutMs: 30000 });
+  const res = await runCli(cliPath, ["server", "--background"], { timeoutMs: 30000 });
   const status = await getServerStatus(cliPath);
   if (status && status.running && typeof status.url === "string") {
     return { ok: true, url: status.url, port: status.port, pid: status.pid };

@@ -140,6 +140,59 @@ async def test_rename_missing_project_404(project_client: httpx.AsyncClient) -> 
     assert resp.status_code == 404
 
 
+async def test_create_defaults_to_empty_config(project_client: httpx.AsyncClient) -> None:
+    """A project created without a config field reports an empty config."""
+    body = (await project_client.post("/v1/projects", json={"name": "P"})).json()
+    assert body["config"] == {}
+
+
+async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClient) -> None:
+    """A config passed on create round-trips through the create + get responses."""
+    cfg = {"host_id": "host_abc", "workspace": "/work/repo", "model": "claude-opus-4-8"}
+    created = (
+        await project_client.post("/v1/projects", json={"name": "Configured", "config": cfg})
+    ).json()
+    assert created["config"] == cfg
+    fetched = (await project_client.get(f"/v1/projects/{created['id']}")).json()
+    assert fetched["config"] == cfg
+
+
+async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
+    """PATCH with a new config replaces the stored one and stamps updated_at."""
+    created = (
+        await project_client.post("/v1/projects", json={"name": "P", "config": {"host_id": "old"}})
+    ).json()
+    resp = await project_client.patch(
+        f"/v1/projects/{created['id']}", json={"config": {"host_id": "new", "model": "m"}}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["config"] == {"host_id": "new", "model": "m"}
+    assert body["updated_at"] is not None
+
+
+async def test_patch_without_config_preserves_it(project_client: httpx.AsyncClient) -> None:
+    """A PATCH that omits config (e.g. a rename) leaves the stored config intact."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "config": {"host_id": "keep"}}
+        )
+    ).json()
+    renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "P2"})
+    assert renamed.json()["config"] == {"host_id": "keep"}
+
+
+async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -> None:
+    """PATCH with config={} clears the stored defaults (distinct from omitting)."""
+    created = (
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "config": {"host_id": "drop"}}
+        )
+    ).json()
+    resp = await project_client.patch(f"/v1/projects/{created['id']}", json={"config": {}})
+    assert resp.json()["config"] == {}
+
+
 async def test_delete_project(project_client: httpx.AsyncClient) -> None:
     """DELETE removes the project; a second delete 404s."""
     created = (await project_client.post("/v1/projects", json={"name": "Doomed"})).json()

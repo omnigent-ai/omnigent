@@ -1171,6 +1171,12 @@
         "additionalProperties": false,
         "description": "Request body for `POST /v1/projects`.",
         "properties": {
+          "config": {
+            "additionalProperties": true,
+            "description": "Optional default session settings (opaque JSON object). Omitted / empty stores no defaults.",
+            "title": "Config",
+            "type": "object"
+          },
           "name": {
             "description": "Human-readable project name. Trimmed; must be non-empty and at most 100 characters; unique among the caller's projects.",
             "title": "Name",
@@ -6176,6 +6182,19 @@
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/projects/{project_id}`.\n\nAll fields optional; `None` leaves a field unchanged.",
         "properties": {
+          "config": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New config object to replace the stored one. `None` leaves it unchanged; an empty object `{}` clears the stored defaults.",
+            "title": "Config"
+          },
           "name": {
             "anyOf": [
               {

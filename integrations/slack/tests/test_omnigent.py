@@ -560,6 +560,89 @@ async def test_run_turn_ends_on_idless_idle_for_in_process_harness() -> None:
 
 
 @respx.mock
+async def test_run_turn_ignores_idless_idle_flap_on_claude_native_cold_start() -> None:
+    # Incident: a claude-native turn on a freshly-launched runner posted
+    # "Omnigent completed without returning response text" ~5s after submit, even
+    # though the agent later produced a full answer. During cold start (runner
+    # booted, message submitted, but the LLM hasn't returned its first token) the
+    # PTY-activity watcher emits an id-less `running` then an id-less `idle` flap.
+    # That pair looks like the in-process harness's real id-less end, so the turn
+    # ended with 0 events. It must instead be IGNORED (the turn has produced
+    # nothing) and the turn must end only on the later id-bearing Stop idle, once
+    # the answer has streamed.
+    async def _cold_start_stream() -> AsyncIterator[bytes]:
+        # PTY-activity cold-start flap: id-less running, then id-less idle, both
+        # BEFORE any answer token. No response_id, no delta, no response.* event.
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"session.status","status":"idle"}\n\n'  # cold-start flap
+        await asyncio.sleep(0.1)
+        # The LLM finally responds; claude-native forwards the answer + the
+        # id-bearing Stop idle (its authoritative turn-end edge).
+        yield b'data: {"type":"session.status","status":"running","response_id":"resp_1"}\n\n'
+        yield b'data: {"type":"response.output_text.delta","delta":"The real answer."}\n\n'
+        yield b'data: {"type":"session.status","status":"idle","response_id":"resp_1"}\n\n'
+        await asyncio.sleep(30)  # server keeps the stream open after idle
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_cold_start_stream())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[str | None]:
+        return [
+            event.get("delta")
+            async for event in client.run_turn("conv_1", "review", idle_grace_seconds=5.0)
+            if event.get("type") == "response.output_text.delta"
+        ]
+
+    try:
+        deltas = await asyncio.wait_for(_drain(), timeout=5.0)
+    finally:
+        await client.aclose()
+
+    # The cold-start flap was ignored; the real answer streamed and the id-bearing
+    # idle ended the turn — not 0 chars.
+    assert deltas == ["The real answer."]
+
+
+@respx.mock
+async def test_run_turn_ends_promptly_on_bare_idless_failed_with_no_output() -> None:
+    # The cold-start guard requires PRODUCTION before an id-less TERMINAL ends the
+    # turn — but that gate applies to `idle` only. A bare id-less `failed` is never
+    # a PTY-activity flap (the watcher emits only `idle`; `failed` comes solely
+    # from the authoritative StopFailure hook / a setup-phase failure), so a turn
+    # that fails before producing anything must END on that `failed` immediately,
+    # NOT hang to the idle-grace backstop. The long trailing silence would trip
+    # the (here 5s) idle-grace timeout, so ending well inside it proves the
+    # `failed` edge — not the timeout — ended the turn.
+    async def _fail_before_output() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"session.status","status":"failed"}\n\n'  # id-less, no output
+        await asyncio.sleep(30)  # server keeps the stream open; must not be reached
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_fail_before_output())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[dict[str, object]]:
+        return [event async for event in client.run_turn("conv_1", "go", idle_grace_seconds=5.0)]
+
+    try:
+        # Ends on the `failed` edge, well within both the 5s idle-grace and this
+        # 3s cap — a hang-to-timeout would blow the 3s wait.
+        await asyncio.wait_for(_drain(), timeout=3.0)
+    finally:
+        await client.aclose()
+
+
+@respx.mock
 async def test_run_turn_ignores_stale_idle_when_resuming_idle_session() -> None:
     # Incident: resuming a session that's been idle for hours. The stream
     # (idle=false) replays the session's CURRENT status first — a stale id-less
