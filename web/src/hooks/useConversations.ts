@@ -853,13 +853,16 @@ async function resolveOrCreateProjectId(name: string): Promise<string> {
   if (existing) return existing.id;
   try {
     return (await apiCreateProject(name)).id;
-  } catch {
-    // Lost the create race (or a transient failure) — re-list and use the
-    // now-existing row; only rethrow if it still isn't there.
+  } catch (err) {
+    // The create may have lost a race (a concurrent move created the same
+    // name → 409) or genuinely failed (500 / network). Distinguish the two by
+    // re-listing: if the row now exists, a racer won — use it. Otherwise the
+    // create really failed, so rethrow the ORIGINAL error rather than a generic
+    // message, so the true cause (status, network) isn't masked.
     const after = await apiListProjects();
     const created = after.find((p) => p.name === name);
     if (created) return created.id;
-    throw new Error(`Could not resolve or create project "${name}"`);
+    throw err;
   }
 }
 
