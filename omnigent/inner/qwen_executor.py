@@ -831,7 +831,9 @@ class QwenExecutor(Executor):
             read_result = await env.read(path, offset=offset, limit=read_limit)
             if "error" in read_result:
                 message = str(read_result["error"])
-                code = _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
+                code = (
+                    _ACP_RESOURCE_NOT_FOUND_CODE if _looks_like_missing_file(message) else -32603
+                )
                 raise _AcpRequestError(code, message)
             if read_result.get("encoding") != "utf-8":
                 raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
@@ -898,7 +900,9 @@ class QwenExecutor(Executor):
                 error="blocked by result policy",
             )
             raise _AcpRequestError(-32603, f"{path}: blocked by result policy")
-        self._record_fs_op("write_text_file", args, status=ToolCallStatus.SUCCESS, result=write_result)
+        self._record_fs_op(
+            "write_text_file", args, status=ToolCallStatus.SUCCESS, result=write_result
+        )
         return {}
 
     @staticmethod

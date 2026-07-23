@@ -1501,8 +1501,9 @@ async def test_fs_write_records_tool_call_events() -> None:
     """A delegated write buffers a paired ToolCallRequest + ToolCallComplete."""
     from omnigent.inner.datamodel import OSEnvSpec
 
+    write_result = {"bytes": 3}
     executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
-    executor._os_environment = _FakeOSEnv(write_result={})  # type: ignore[assignment]
+    executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[assignment]
     executor._send = AsyncMock()  # type: ignore[method-assign]
 
     await executor._respond_to_agent_request(
@@ -1518,6 +1519,7 @@ async def test_fs_write_records_tool_call_events() -> None:
     assert req.name == "write_text_file"
     assert req.args == {"path": "out.txt", "content": "abc"}
     assert done.status is ToolCallStatus.SUCCESS
+    assert done.result == write_result
     assert req.metadata["call_id"] == done.metadata["call_id"]
 
 
@@ -1572,6 +1574,38 @@ async def test_fs_read_blocked_by_result_policy() -> None:
     )
 
     assert policy.await_args.args == ("PHASE_TOOL_RESULT", {"result": "secret"})
+    assert "error" in sent[0]
+    assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_fs_write_blocked_by_result_policy() -> None:
+    """A TOOL_RESULT-phase DENY on the write result records BLOCKED."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    write_result = {"path": "out.txt", "bytes": 3, "marker": "actual"}
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(write_result=write_result)  # type: ignore[assignment]
+
+    async def _policy(phase: str, data: dict) -> MagicMock:  # type: ignore[type-arg]
+        action = "POLICY_ACTION_DENY" if phase == "PHASE_TOOL_RESULT" else "POLICY_ACTION_ALLOW"
+        return MagicMock(action=action)
+
+    policy = AsyncMock(side_effect=_policy)
+    executor._policy_evaluator = policy  # type: ignore[assignment]
+    sent: list[dict] = []
+    executor._send = AsyncMock(side_effect=lambda m: sent.append(m))  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "fs/write_text_file",
+            "params": {"path": "out.txt", "content": "abc"},
+        }
+    )
+
+    assert policy.await_args_list[-1].args == ("PHASE_TOOL_RESULT", {"result": write_result})
     assert "error" in sent[0]
     assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
 
