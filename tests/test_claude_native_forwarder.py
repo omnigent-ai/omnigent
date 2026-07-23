@@ -7024,6 +7024,174 @@ async def test_precompact_miss_is_counted_and_warned(tmp_path: Path) -> None:
     assert forwarder._compaction_skip_stats.expected_skip == 1
 
 
+@pytest.mark.asyncio
+async def test_stale_completion_ack_does_not_swallow_a_later_boundary(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: a completion ack is bound to its seq and is one-shot per boundary.
+
+    The lost-boundary hazard: compaction A persists via the transcript path
+    and arms ``expect_completion_ack``; A's own ``SessionStart source=compact``
+    hook never fires (flaky), so the flag stays armed. A later compaction B's
+    ``PreCompact`` is *also* dropped, then B's completion hook fires. With a
+    bare unattributed flag, B's hook would be absorbed as A's stale ack and
+    B's boundary lost.
+
+    Binding the ack to a ``seq`` and making absorption one-shot fixes it: the
+    window is consumed exactly once (the trailing hook for A), and any
+    *further* standalone completion — B's — falls through to a fresh persist
+    instead of being swallowed.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    await _note_precompact(bridge_dir, claude_session_id="claude-1", transcript_path=None)
+
+    persist = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", persist):
+        # Compaction A persists via the transcript path → arms the ack for A's seq.
+        await _handle_compact_summary_item(
+            AsyncMock(),
+            session_id="conv_p21",
+            bridge_dir=bridge_dir,
+            item=_compact_summary_item(),
+            retry_tracker=_PostRetryTracker(),
+        )
+    armed = _read_compaction_state(bridge_dir)
+    assert armed.expect_completion_ack is True
+    assert armed.expect_completion_ack_seq == 1  # bound to A's seq, not a bare bool
+    assert armed.persisted_seqs == (1,)
+
+    # A's own trailing completion hook arrives late and is absorbed (one-shot).
+    absorbed = await _claim_standalone_completion(bridge_dir)
+    assert absorbed is None
+    after_absorb = _read_compaction_state(bridge_dir)
+    assert after_absorb.expect_completion_ack is False
+    assert after_absorb.expect_completion_ack_seq == 0  # window closed
+
+    # Compaction B: its PreCompact was dropped too, so B arrives as a
+    # standalone completion hook with NO pending token and NO armed ack. It
+    # must persist a fresh boundary, not be swallowed as A's stale ack.
+    b_seq = await _claim_standalone_completion(bridge_dir)
+    assert b_seq == 2, "B's boundary must be persisted, not lost to a stale ack"
+    final = _read_compaction_state(bridge_dir)
+    assert final.pending is not None
+    assert final.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_completion_ack_armed_for_unpersisted_seq_biases_to_persist(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-1: an ack armed for a seq that is NOT persisted persists (bias-to-safe).
+
+    If durable state is somehow armed (corrupt/partial write, or a legacy
+    ``compaction_forwarder.json`` from before ``expect_completion_ack_seq``
+    existed so the seq reads back as ``0``) the standalone path cannot prove
+    the arriving hook is a duplicate. A lost boundary reloads the full
+    pre-compaction history on resume — far worse than an at-most-once
+    duplicate — so the path biases to persisting a fresh boundary rather than
+    silently absorbing the hook.
+    """
+    from omnigent.claude_native_forwarder import _write_compaction_state
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    # Legacy/corrupt shape: flag armed but the seq it points at is not in
+    # persisted_seqs (here it reads back as 0, mimicking an old state file).
+    _write_compaction_state(
+        bridge_dir,
+        CompactionForwardState(
+            pending=None,
+            last_seq=1,
+            persisted_seqs=(),
+            expect_completion_ack=True,
+            expect_completion_ack_seq=0,
+        ),
+    )
+    seq = await _claim_standalone_completion(bridge_dir)
+    assert seq == 2, "bias-to-safe: persist rather than absorb an unprovable ack"
+    state = _read_compaction_state(bridge_dir)
+    assert state.pending is not None
+    assert state.pending.seq == 2
+
+
+@pytest.mark.asyncio
+async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
+    tmp_path: Path,
+) -> None:
+    """
+    P2-2: a standalone-completion persist failure holds the hook cursor.
+
+    A ``SessionStart source=compact`` with no pending token and no transcript
+    summary is a hook-only standalone compaction. If its boundary POST fails
+    transiently the forwarder must NOT advance past the hook (losing the
+    boundary, since no transcript summary will ever retry it) — it holds the
+    hook cursor and retries next poll, mirroring the transcript path. The
+    pending token minted by ``_claim_standalone_completion`` makes the retry
+    idempotent: the re-seen hook re-consumes the same seq. A later successful
+    POST persists exactly one boundary.
+    """
+    bridge_dir = tmp_path / "bridge"
+    # A lone compact SessionStart (no preceding PreCompact) — standalone.
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": "claude-standalone",
+        },
+    )
+    start_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+
+    request = httpx.Request("POST", "http://test/items")
+    response = httpx.Response(503, request=request)
+    failing = AsyncMock(
+        side_effect=httpx.HTTPStatusError("boom", request=request, response=response)
+    )
+
+    async def _run_once(state: forwarder.HookForwardState) -> forwarder.HookForwardState:
+        # The best-effort spinner status post is orthogonal to the durable
+        # persist under test; stub it so the client mock stays quiet.
+        with patch(
+            "omnigent.claude_native_forwarder._post_external_compaction_status",
+            AsyncMock(return_value=None),
+        ):
+            return await forwarder._forward_available_status_events(
+                client=AsyncMock(),
+                session_id="conv_p22",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=_PostRetryTracker(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+
+    # Poll 1: persist fails → cursor is held BEFORE the compaction hook record,
+    # a pending token is minted, and no boundary is marked persisted.
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", failing):
+        after_fail = await _run_once(start_state)
+    assert failing.await_count == 1
+    assert after_fail.event_cursor == start_state.event_cursor  # cursor held
+    held = _read_compaction_state(bridge_dir)
+    assert held.pending is not None  # token minted, awaiting a durable persist
+    assert not held.persisted_seqs  # nothing marked persisted on failure
+    minted_seq = held.pending.seq
+
+    # Poll 2 (retry): the same hook record is re-seen; the persist succeeds and
+    # re-consumes the SAME seq (idempotent), marking exactly one boundary.
+    ok = _persist_mock()
+    with patch("omnigent.claude_native_forwarder._persist_native_compaction_item", ok):
+        after_ok = await _run_once(after_fail)
+    assert ok.await_count == 1
+    persisted = _read_compaction_state(bridge_dir)
+    assert persisted.persisted_seqs == (minted_seq,)  # exactly one boundary
+    assert persisted.pending is None
+    assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
+
+
 def test_forward_failures_escalate_to_degraded_once() -> None:
     """
     Sustained forward failures flip the degraded latch exactly once (#1120).
