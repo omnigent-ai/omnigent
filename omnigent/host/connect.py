@@ -1048,6 +1048,20 @@ class HostProcess:
                 + self._login_fix_hint()
             )
         if status == 403:
+            # An expired stored login is the common way to land here: the
+            # token loader yields nothing, the dial goes out
+            # unauthenticated, and the server's refusal looks like an
+            # authorization or version-skew problem. Name the real cause.
+            from omnigent.cli_auth import stored_token_status
+
+            if stored_token_status(self._server_url) == "expired":
+                return HostConnectError(
+                    "Connection refused (HTTP 403): your stored login "
+                    f"session for {self._server_url} has EXPIRED, so the "
+                    "tunnel was dialed without credentials. Run `omnigent "
+                    f"login {self._server_url}` to re-authenticate, then "
+                    "restart the host."
+                )
             return HostConnectError(
                 "Connection refused (HTTP 403): the credentials authenticated, "
                 "but the server did not accept the host tunnel. Either your "
