@@ -299,68 +299,120 @@ def _fetch_context_window_from_mlflow(model: str) -> int | None:
 
 def _fetch_live_openrouter_pricing(model: str) -> ModelPricing | None:
     """
-    Fetch per-token pricing from the OpenRouter models API.
+    Fetch per-token pricing from the OpenRouter models LIST endpoint.
 
     Last-resort fallback for models absent from the MLflow openrouter
-    catalog (e.g. ``z-ai/glm-5.2``, ``moonshotai/kimi-k3``).  The
-    response carries per-token prices (prompt/completion/cache_read) as
-    strings; non-token components (request, image, reasoning) are not
-    modeled so this is an estimate.
+    catalog (e.g. ``z-ai/glm-5.2``).  The per-model endpoint
+    (``/api/v1/models/{id}``) returns 404 for all models, so pricing is
+    fetched from the list endpoint (``/api/v1/models``), which returns
+    ~342 entries as a JSON array under ``data`` (NB: NOT keyed on id;
+    not a dict).
 
-    Returns ``None`` (without raising) on any network / parse error or
-    404, and caches failures to avoid re-fire during a transient outage.
+    The entire list is fetched once per call (bounded by the 3 s timeout)
+    and indexed into a dict keyed on each entry's ``id`` field.  The
+    result is cached (positive and negative) for :data:`_OPENROUTER_LIVE_TTL_SECONDS`
+    so repeated calls for *any* model amortise the network cost.
 
-    :param model: The full OpenRouter model id, e.g.
-        ``"z-ai/glm-5.2"``.
+    The ``model`` argument may carry an ``openrouter/`` prefix (bare
+    ``vendor/model`` is the expected form, but the prefix is stripped for
+    safety).
+
+    Pricing fields in the response are per-token *strings* (e.g.
+    ``"0.0000007938"``).  A value of ``"0"`` is an authoritative zero;
+    absent or unparseable fields are treated as unknown (``None``).  The
+    helper never raises into the caller.
+
+    :param model: The model id as reported by pi, e.g.
+        ``"z-ai/glm-5.2"`` or ``"openrouter/z-ai/glm-5.2"``.
     :returns: :class:`ModelPricing` or ``None``.
     """
-    import json
+    import json as _json
     import urllib.request
+    import urllib.error
+
+    # Normalise: strip a leading "openrouter/" so the bare vendor/model
+    # matches the list-endpoint's ``id`` field.
+    lookup_key = model
+    if lookup_key.startswith("openrouter/"):
+        lookup_key = lookup_key[len("openrouter/"):]
+    elif "/" in lookup_key:
+        _implicit_provider, _bare = lookup_key.split("/", 1)
+        # If the implicit provider IS a real OpenRouter package (no slash
+        # in the remainder after one more split), keep as-is.  If it looks
+        # like another layer of namespace, leave the whole string; the
+        # list-endpoint id is always the bare vendor/model.
+        pass
 
     with _live_pricing_cache_lock:
-        cached = _live_pricing_cache.get(model, _LIVE_PRICING_MISS)
+        cached = _live_pricing_cache.get(lookup_key, _LIVE_PRICING_MISS)
         if cached is not _LIVE_PRICING_MISS:
             return cached
 
-    url = f"https://openrouter.ai/api/v1/models/{model}"
+    url = "https://openrouter.ai/api/v1/models"
     try:
         with urllib.request.urlopen(url, timeout=3) as resp:
-            data = json.loads(resp.read())
+            raw = _json.loads(resp.read())
     except Exception:
         with _live_pricing_cache_lock:
-            _live_pricing_cache[model] = None
+            _live_pricing_cache[lookup_key] = None
         return None
 
-    pricing_raw = data.get("data", {}).get("pricing")
-    if not isinstance(pricing_raw, dict):
-        with _live_pricing_cache_lock:
-            _live_pricing_cache[model] = None
-        return None
-
-    def _to_float(val: object) -> float | None:
-        """Parse a pricing string to float, returning ``None`` on failure."""
-        if val is None:
-            return None
-        try:
-            return float(val)
-        except (TypeError, ValueError):
+    # Guard: the response may be malformed; never raise.
+    try:
+        data = raw.get("data") if isinstance(raw, dict) else raw
+        if not isinstance(data, list):
+            with _live_pricing_cache_lock:
+                _live_pricing_cache[lookup_key] = None
             return None
 
-    input_pt = _to_float(pricing_raw.get("prompt"))
-    output_pt = _to_float(pricing_raw.get("completion"))
-    if input_pt is None or output_pt is None:
+        by_id: dict[str, object] = {}
+        for entry in data:
+            if isinstance(entry, dict):
+                eid = entry.get("id")
+                if isinstance(eid, str):
+                    by_id[eid] = entry
+
+        match = by_id.get(lookup_key)
+        if not isinstance(match, dict):
+            with _live_pricing_cache_lock:
+                _live_pricing_cache[lookup_key] = None
+            return None
+
+        pricing_raw = match.get("pricing")
+        if not isinstance(pricing_raw, dict):
+            with _live_pricing_cache_lock:
+                _live_pricing_cache[lookup_key] = None
+            return None
+
+        def _to_float(val: object) -> float | None:
+            """Parse a pricing string to float; ``None`` on failure."""
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        input_pt = _to_float(pricing_raw.get("prompt"))
+        output_pt = _to_float(pricing_raw.get("completion"))
+        if input_pt is None or output_pt is None:
+            with _live_pricing_cache_lock:
+                _live_pricing_cache[lookup_key] = None
+            return None
+
+        result = ModelPricing(
+            input_per_token=input_pt,
+            output_per_token=output_pt,
+            cache_read_per_token=_to_float(pricing_raw.get("input_cache_read")),
+            cache_write_per_token=None,  # OpenRouter doesn't publish cache-write
+        )
+    except Exception:
         with _live_pricing_cache_lock:
-            _live_pricing_cache[model] = None
+            _live_pricing_cache[lookup_key] = None
         return None
 
-    result = ModelPricing(
-        input_per_token=input_pt,
-        output_per_token=output_pt,
-        cache_read_per_token=_to_float(pricing_raw.get("input_cache_read")),
-        cache_write_per_token=None,  # OpenRouter doesn't publish cache-write
-    )
     with _live_pricing_cache_lock:
-        _live_pricing_cache[model] = result
+        _live_pricing_cache[lookup_key] = result
     return result
 
 
@@ -578,6 +630,18 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         if base and base != bare:
             return fetch_model_pricing(base)
 
+    # --- Precedence for vendor/model ids (e.g. "xiaomi/mimo-v2.5-pro") ---
+    #
+    # 1.  Own-provider catalog  (step 1 above: "xiaomi" -> xiaomi.json)
+    # 2.  OpenRouter MLflow catalog  (step below: full key lookup + family-prefix)
+    # 3.  Live OpenRouter API list  (step below: last-resort, cached)
+    #
+    # This means a model priced by its own provider catalog is never
+    # overridden by the OpenRouter catalog, even when both carry the key.
+    # Unresolved vendor/model ids fall through to OpenRouter rates by
+    # design, because the bare form is what pi reports for all OpenRouter
+    # dispatches.
+
     # OpenRouter vendor/model retry.  For bare ``vendor/model`` ids
     # (e.g. ``xiaomi/mimo-v2.5-pro``, ``moonshotai/kimi-k3``) the initial
     # split treats ``vendor`` as the MLflow provider, which has no catalog.
@@ -601,9 +665,8 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
                     return next(iter(prices))
 
     # Live OpenRouter API fallback for models absent from MLflow entirely
-    # (e.g. ``z-ai/glm-5.2``, ``moonshotai/kimi-k3`` when the family-
-    # prefix doesn't match).  Caches results; never raises into the
-    # turn-completion path.
+    # (e.g. ``z-ai/glm-5.2``).  Fetches the models LIST endpoint once,
+    # caches results for 1 h, never raises into the turn-completion path.
     if "/" in model:
         return _fetch_live_openrouter_pricing(model)
 
