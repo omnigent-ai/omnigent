@@ -84,16 +84,18 @@ def test_non_sqlite_engine_has_pool_settings(
     assert captured_kwargs.get("pool_recycle") == 1800
 
 
-def test_sqlite_engine_pool_capacity_and_wal(
+def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    SQLite engines must outgrow SQLAlchemy's default QueuePool ceiling
-    (5 + 10 overflow) and must enable WAL journal mode and a 20s
-    ``busy_timeout`` on every connection so multi-process workloads
-    (REPL + Omnigent server + runner subprocess + DBOS scheduler all
-    hitting the same ``chat.db``) don't surface as ``disk I/O error`` /
+    SQLite engines must NOT receive server-DB pool settings
+    (``pool_pre_ping`` / ``pool_recycle``) — those are meaningful
+    only for multi-connection server databases. They must, however,
+    enable WAL journal mode and a 20s ``busy_timeout`` on every
+    connection so multi-process workloads (REPL + Omnigent server +
+    runner subprocess + DBOS scheduler all hitting the same
+    ``chat.db``) don't surface as ``disk I/O error`` /
     ``database is locked`` under default ``journal_mode=DELETE``.
 
     Uses a real SQLite engine on a tempfile (rather than a
@@ -115,18 +117,6 @@ def test_sqlite_engine_pool_capacity_and_wal(
     # carrying options meant for postgres/mysql.
     assert engine.url.get_backend_name() == "sqlite"
 
-    # Behavioral check: more than 15 simultaneous checkouts must succeed,
-    # proving the default QueuePool ceiling (5 + 10 overflow, where the
-    # 16th checkout waits 30s and dies with ``QueuePool limit ... reached``)
-    # is gone. The exact pool geometry (size/overflow/timeout) is
-    # deliberately not pinned - it's an implementation detail.
-    checkouts = [engine.connect() for _ in range(16)]
-    try:
-        assert len(checkouts) == 16
-    finally:
-        for checkout in checkouts:
-            checkout.close()
-
     with engine.connect() as conn:
         # WAL is the entire point of this fix: it allows readers
         # and a single writer to coexist, where DELETE serializes
@@ -143,79 +133,6 @@ def test_sqlite_engine_pool_capacity_and_wal(
         # synchronous=NORMAL is the WAL-recommended mode — durable
         # at commit, much faster than FULL.
         assert conn.exec_driver_sql("PRAGMA synchronous").scalar() == 1
-
-
-def test_sqlite_engine_checkpoints_wal_and_collects_stats(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Opening a SQLite database through ``get_or_create_engine`` must fold
-    an accumulated WAL back into the main file and give the query
-    planner statistics.
-
-    Long-lived readers (session event streams) starve SQLite's automatic
-    checkpoint, so on a busy server the WAL grows without bound and
-    every read pays to consult it. And without ``sqlite_stat1`` the
-    planner guesses row counts, which can turn indexed window-function
-    joins (the ``child_sessions`` latest-message query) into full-table
-    scans. Both are cheap to fix at engine creation, when this process
-    holds no other connections.
-    """
-    monkeypatch.setattr(
-        "omnigent.db.utils._run_migrations",
-        lambda engine, db_uri: None,
-    )
-
-    db_path = tmp_path / "tuned.db"
-    wal_path = tmp_path / "tuned.db-wal"
-
-    # Seed a database with enough indexed rows that ANALYZE has
-    # something to record, leaving a non-empty WAL behind. Raw sqlite3
-    # in autocommit mode rather than a SQLAlchemy engine: the
-    # journal-mode PRAGMA must run outside any transaction, and the
-    # DBAPI's implicit BEGIN handling varies across SQLite builds
-    # enough to silently leave the database in rollback-journal mode
-    # (no -wal file at all).
-    import sqlite3
-
-    seed = sqlite3.connect(db_path, isolation_level=None)
-    assert seed.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
-    seed.execute("CREATE TABLE items (conversation_id INTEGER, body TEXT)")
-    seed.execute("CREATE INDEX ix_items_conversation_id ON items (conversation_id)")
-    seed.execute(
-        "WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 500) "
-        "INSERT INTO items SELECT i, printf('%.100c', 'x') FROM seq"
-    )
-    # A closing connection checkpoints and deletes the WAL whenever it
-    # can take the database exclusively - an idle second connection is
-    # not enough to stop that on every platform. Pin an open read
-    # transaction across the close (like the runner/REPL readers that
-    # share a real chat.db): a held read mark makes WAL deletion
-    # impossible. Released right after, so it cannot block the
-    # engine-creation wal_checkpoint(TRUNCATE) under test.
-    holder = sqlite3.connect(db_path, isolation_level=None)
-    holder.execute("BEGIN")
-    holder.execute("SELECT count(*) FROM items").fetchone()
-    try:
-        seed.close()
-        assert wal_path.stat().st_size > 0
-        holder.execute("COMMIT")
-
-        engine = get_or_create_engine(f"sqlite:///{db_path}")
-
-        # The WAL was folded into the main file and truncated. Some
-        # platforms/builds remove the -wal file outright rather than
-        # leaving a zero-byte one - both mean the same thing.
-        assert not wal_path.exists() or wal_path.stat().st_size == 0
-        # ANALYZE collected planner statistics for the seeded table.
-        with engine.connect() as conn:
-            stat_row = conn.exec_driver_sql(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
-            ).fetchone()
-            assert stat_row is not None
-    finally:
-        holder.close()
 
 
 # ── Lakebase token-aware engine ─────────────────────────
