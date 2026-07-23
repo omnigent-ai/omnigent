@@ -3652,12 +3652,17 @@ function ComposerStatusLine({
   // the other status-line values rather than a separate fetch.
   const gitBranch = useChatStore((s) => s.gitBranch);
 
+  // Host binding drives whether the HostBadge has anything to show — read it
+  // from the same source the badge does so the tray's render guard matches.
+  const { session } = useSession(conversationId);
+  const isHostBound = !!session?.hostId;
+
   const showBranch = !!conversationId && !!gitBranch;
   // Host indicator (green/red dot + host name), left of the worktree branch.
   // Hidden on sub-agent sessions — the header's child-session slot owns the
   // back affordance there, mirroring where this badge used to live. HostBadge
-  // self-hides when the session isn't host-bound, so this is a visibility gate,
-  // not a host-presence claim.
+  // self-hides when the session isn't host-bound, so also gate on isHostBound
+  // (below) before treating the badge as a reason to render the tray.
   const showHost = !!conversationId && !isSubAgentSession;
   const showPlanMode = !!conversationId && codexPlanMode;
   const showGoal = !!conversationId && goal != null;
@@ -3671,7 +3676,12 @@ function ComposerStatusLine({
   // never host-bound — a stranded child is `local_stranded`, which keeps its
   // banner elsewhere.
   const showReconnect = showHost && !!onHostReconnect;
-  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showReconnect) return null;
+  // A host-bound session shows the badge, so the tray must render for it even
+  // with no branch/ring yet — otherwise the host + context footer vanishes for
+  // sessions with no worktree branch (e.g. codex) until the ring populates.
+  const showHostBadge = showHost && isHostBound;
+  if (!showBranch && !showPlanMode && !showGoal && !showRing && !showReconnect && !showHostBadge)
+    return null;
 
   return (
     <div
@@ -5404,9 +5414,8 @@ function SessionConfigModal({
   const { llmModel, usesServerModelOptions, modelOptions, pickerSelectedModel } =
     useResolvedComposerModel(modelPickerKind, codexModelOptions);
 
-  // Claude folds Smart Routing into the Model dropdown as an option; other
-  // routable agents get a standalone Switch (matches HarnessConfigModal).
-  const claudeModelPicker = modelPickerKind === "claude";
+  // Agents with a Model dropdown fold Smart Routing into it as an option; those
+  // without one get a standalone Switch (matches HarnessConfigModal).
   const liveRoutingOn = costRoutingEligible && costControlModeOverride === "on";
 
   // Resolve the row the current model maps to, matching the old picker's
@@ -5509,10 +5518,10 @@ function SessionConfigModal({
         </DialogHeader>
 
         <div className="flex flex-col gap-5 py-1">
-          {/* Smart Routing as a standalone toggle for routable agents with no
-          Claude-style Model dropdown to fold it into. Claude offers it as a
-          Model option below instead. */}
-          {costRoutingEligible && !claudeModelPicker && (
+          {/* Smart Routing as a standalone toggle only for routable agents with
+          no Model dropdown to fold it into (e.g. Polly). Agents that render a
+          Model dropdown (Claude, Codex, …) offer it as a Model option below. */}
+          {costRoutingEligible && !showModels && (
             <ConfigRow label="Smart Routing" description="Auto-pick the model per turn by task">
               <div className="flex h-8 items-center justify-end">
                 <Switch
@@ -5541,7 +5550,7 @@ function SessionConfigModal({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  {costRoutingEligible && claudeModelPicker && (
+                  {costRoutingEligible && (
                     <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
                   )}
                   <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
@@ -5760,9 +5769,9 @@ function useSessionConfigSummary({
     const effortValue = formatStatusEffortLabel(selectedEffort, modelPickerKind === "codex");
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
-  // Non-Claude routable agents surface Smart Routing as a standalone row (Claude
-  // folds it into Model above).
-  if (costRoutingEligible && modelPickerKind !== "claude" && routingOn) {
+  // Routable agents with no Model row surface Smart Routing as a standalone row;
+  // those with a Model dropdown fold it into Model above (shown as the value).
+  if (costRoutingEligible && !showModels && routingOn) {
     rows.push({ label: "Smart Routing", value: "On" });
   }
   return rows;

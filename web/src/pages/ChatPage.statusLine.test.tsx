@@ -284,6 +284,19 @@ describe("Composer status line (branch + context ring)", () => {
     );
   });
 
+  it("renders the tray for a host-bound session with no branch or ring", () => {
+    // Regression: removing the harness label from the tray must not take the
+    // host badge + context footer with it. A host-bound session (e.g. a codex
+    // session with no worktree branch, before the ring populates) still shows
+    // the tray so the host indicator is visible.
+    bindHost("mac-laptop");
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer();
+
+    expect(statusLine()).not.toBeNull();
+    expect(screen.getByTestId("host-badge")).toHaveTextContent("mac-laptop");
+  });
+
   it("shows the host badge to the left of the worktree branch", () => {
     // The host indicator moved out of the chat header into this tray; it
     // sits immediately left of the worktree branch.

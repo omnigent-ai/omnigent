@@ -1651,14 +1651,17 @@ describe("Composer config gear", () => {
     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
-  it("offers a standalone Smart Routing switch for non-Claude routable agents (applied on Save)", async () => {
+  it("offers a standalone Smart Routing switch for routable agents with no Model dropdown (applied on Save)", async () => {
+    // An SDK/bundle agent (Polly) has no Model dropdown, so Smart Routing gets a
+    // standalone switch. Agents WITH a dropdown (Claude, Codex) fold it in — see
+    // the fold-in test below.
     const setCostControlMode = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ setCostControlMode });
     renderWithTooltips(
       <Composer
         {...composerProps({
-          showModels: true,
-          modelPickerKind: "codex",
+          showModels: false,
+          modelPickerKind: null,
           costRoutingEligible: true,
         })}
       />,
@@ -1670,6 +1673,24 @@ describe("Composer config gear", () => {
     expect(setCostControlMode).not.toHaveBeenCalled();
     fireEvent.click(screen.getByTestId("composer-config-save"));
     await waitFor(() => expect(setCostControlMode).toHaveBeenCalledWith("on"));
+  });
+
+  it("folds Smart Routing into the Codex Model dropdown (no standalone switch)", async () => {
+    // Regression: Codex has a Model dropdown, so Smart Routing must be an option
+    // inside it (like Claude) — NOT a separate switch alongside the dropdown.
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "codex",
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
   });
 
   it("applies drafted model + effort only on Save, model before effort", async () => {
@@ -1795,8 +1816,10 @@ describe("Composer config gear", () => {
     renderWithTooltips(
       <Composer
         {...composerProps({
-          showModels: true,
-          modelPickerKind: "codex",
+          // SDK/bundle agent (no Model dropdown) so the standalone routing
+          // switch renders — the knob toggled here.
+          showModels: false,
+          modelPickerKind: null,
           costRoutingEligible: true,
         })}
       />,
