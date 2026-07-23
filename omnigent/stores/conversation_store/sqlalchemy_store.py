@@ -2876,7 +2876,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .scalars()
                 .all()
             )
-        return [_to_conversation(r, meta_by_id.get(r.id)) for r in ap_rows]
+            # Hydrate labels (one batched query, no N+1): the runner
+            # session-init envelope is built from ``conversation.labels``, and
+            # the reconnect path (``_on_runner_connect``) sources its
+            # conversations here. Without this the envelope ships empty labels,
+            # so fork directives (carry-history / source transcript) never reach
+            # the runner and a forked native session launches without history.
+            labels_by_conv = _fetch_labels_bulk(ap_sess, conv_ids)
+        return [
+            _to_conversation(r, meta_by_id.get(r.id), labels_by_conv.get(r.id, {}))
+            for r in ap_rows
+        ]
 
     def set_host_id(
         self,
@@ -3056,10 +3066,43 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``parent_conversation_id`` is set but no such
             conversation exists.
         """
+        return self._create_session_with_agent_with_id(
+            generate_conversation_id(),
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_bundle_location=agent_bundle_location,
+            agent_description=agent_description,
+            title=title,
+            labels=labels,
+            reasoning_effort=reasoning_effort,
+            workspace=workspace,
+            terminal_launch_args=terminal_launch_args,
+            parent_conversation_id=parent_conversation_id,
+            runner_id=runner_id,
+        )
+
+    def _create_session_with_agent_with_id(
+        self,
+        conversation_id: str,
+        *,
+        agent_id: str,
+        agent_name: str,
+        agent_bundle_location: str,
+        agent_description: str | None,
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        terminal_launch_args: list[str] | None = None,
+        parent_conversation_id: str | None = None,
+        runner_id: str | None = None,
+    ) -> CreatedSession:
+        """Body of :meth:`create_session_with_agent` under a caller-supplied
+        ``conversation_id``. The public method generates a fresh id; this seam
+        lets a subclass inject one (MAS's WHS-homed store injects the WHS node id)."""
         from omnigent.stores.conversation_store import ConversationNotFoundError
 
         now = now_epoch()
-        conversation_id = generate_conversation_id()
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.
         # Get parent root_id from AP first.
@@ -3212,8 +3255,45 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises ValueError: If *up_to_response_id* is set but no item in
             the source conversation has that ``response_id``.
         """
+        return self._fork_conversation_with_id(
+            generate_conversation_id(),
+            source_conversation_id,
+            title=title,
+            agent_id=agent_id,
+            cloned_agent_name=cloned_agent_name,
+            cloned_agent_bundle_location=cloned_agent_bundle_location,
+            cloned_agent_description=cloned_agent_description,
+            copy_model_settings=copy_model_settings,
+            copy_terminal_launch_args=copy_terminal_launch_args,
+            carry_history_into_native=carry_history_into_native,
+            resume_source_native_session=resume_source_native_session,
+            presentation_labels=presentation_labels,
+            up_to_response_id=up_to_response_id,
+        )
+
+    def _fork_conversation_with_id(
+        self,
+        conversation_id: str,
+        source_conversation_id: str,
+        *,
+        title: str | None = None,
+        agent_id: str | None = None,
+        cloned_agent_name: str | None = None,
+        cloned_agent_bundle_location: str | None = None,
+        cloned_agent_description: str | None = None,
+        copy_model_settings: bool = True,
+        copy_terminal_launch_args: bool = True,
+        carry_history_into_native: bool = False,
+        resume_source_native_session: bool = True,
+        presentation_labels: dict[str, str] | None = None,
+        up_to_response_id: str | None = None,
+    ) -> Conversation:
+        """Body of :meth:`fork_conversation` under a caller-supplied
+        ``conversation_id``. The public method generates a fresh id; this seam
+        lets a subclass inject one (MAS's WHS-homed store injects the WHS node id
+        so a forked session keeps a single identity across storage backends)."""
         now = now_epoch()
-        new_conv_id = generate_conversation_id()
+        new_conv_id = conversation_id
 
         # Fetch source metadata (workspace, external_session_id, terminal_launch_args)
         # from the Omnigent DB before opening the AP session.
