@@ -1510,6 +1510,11 @@ def _resolve_llm_model(conv: Conversation | None) -> str | None:
     if conv is None or conv.agent_id is None:
         return None
     try:
+        # Import ``get_agent_cache`` from the runtime at call time so a test
+        # patching ``omnigent.runtime.get_agent_cache`` is honored (the
+        # module-level name is a facade proxy that bypasses that patch).
+        from omnigent.runtime import get_agent_cache
+
         agent_cache = get_agent_cache()
         # The agent store is injected at app startup; access it
         # through the runtime globals.
@@ -1567,6 +1572,7 @@ def _resolve_harness_impl(conv: Conversation | None) -> str | None:
         return None
     try:
         from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.runtime import get_agent_cache
         from omnigent.runtime._globals import _agent_store
 
         if _agent_store is None:
@@ -1619,6 +1625,7 @@ def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     if value is None:
         return None
     from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.runtime import get_agent_cache
     from omnigent.spec._omnigent_compat import (
         OMNIGENT_EXECUTOR_TYPE,
         OMNIGENT_HARNESSES,
@@ -1662,6 +1669,7 @@ def _validated_harness_override_executor_type(agent: Agent) -> None:
     :raises OmnigentError: ``invalid_input`` when the agent is not an
         omnigent executor type or the bundle cannot be loaded.
     """
+    from omnigent.runtime import get_agent_cache
     from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 
     try:
