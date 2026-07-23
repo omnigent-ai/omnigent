@@ -526,6 +526,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "kimi",
             "kimi-native",
             "kiro-native",
+            "omp",
             "open-responses",
             "openai-agents",
             "opencode-native",
@@ -553,6 +554,10 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi": "omnigent.inner.kimi_harness",
         "kimi-native": "omnigent.inner.kimi_native_harness",
         "kiro-native": "omnigent.inner.kiro_native_harness",
+        # omp (Oh My Pi) is driven over ACP (``omp acp``) — same wrap as the
+        # generic ``acp`` harness, but with the command pinned by its spawn-env
+        # builder so the built-in omp agent works with no user ``acp:`` config.
+        "omp": "omnigent.inner.acp_harness",
         "openai-agents": "omnigent.inner.openai_agents_sdk_harness",
         "opencode-native": "omnigent.inner.opencode_native_harness",
         "pi": "omnigent.inner.pi_harness",
@@ -640,6 +645,12 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
+        "omp": "Oh My Pi",
+    },
+    spawn_env_builders={
+        # omp's ACP command is pinned here (not resolved from the user's ``acp:``
+        # config block like the generic ``acp`` harness).
+        "omp": "omnigent.runtime.workflow._build_omp_spawn_env",
     },
     capabilities=_BUILTIN_CAPABILITIES,
 )
