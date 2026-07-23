@@ -5231,6 +5231,227 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
 
+# Fields on an exported item that belong to the store/envelope, not the typed
+# ``data`` payload — dropped before rebuilding the item for re-append.
+_IMPORT_ITEM_ENVELOPE_FIELDS = frozenset(
+    {"record_type", "id", "type", "status", "response_id", "created_by"}
+)
+
+
+def _import_agent_aliased_types() -> frozenset[str]:
+    """
+    Return the item types whose ``agent`` field serializes as ``model``.
+
+    ``to_api_dict`` renders items with ``by_alias=True``, so a data model with
+    ``agent: ... = Field(serialization_alias="model")`` exports ``agent`` as
+    ``model``. On import that must be reversed — but ONLY for those types.
+    Other types (``compaction``, ``routing_decision``) carry a genuine ``model``
+    field that must be left alone; ``routing_decision`` even has both ``model``
+    and ``agent``. Derive the set from the field definitions so it can't drift
+    if aliases are added or removed.
+
+    :returns: Item-type strings whose ``model`` export must map back to
+        ``agent`` on import, e.g. ``{"message", "function_call", ...}``.
+    """
+    from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
+
+    aliased: set[str] = set()
+    for item_type, cls in ITEM_TYPE_TO_DATA_CLS.items():
+        field = cls.model_fields.get("agent")
+        if field is not None and field.serialization_alias == "model":
+            aliased.add(item_type)
+    return frozenset(aliased)
+
+
+def _import_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+    """
+    Rebuild one exported item into a ``{"type", "data"}`` create payload.
+
+    Strips envelope fields the server reassigns, reverses the ``agent``→
+    ``model`` serialization alias (only for the types that carry it), and
+    validates the result with :func:`parse_item_data` so a malformed item
+    fails loud client-side before the create request.
+
+    :param item: One ``record_type == "item"`` object from an export JSONL.
+    :returns: A ``SessionEventInput``-shaped dict for ``initial_items``.
+    :raises click.ClickException: If the item has no ``type`` or its payload
+        does not validate for that type.
+    """
+    from omnigent.entities.conversation import parse_item_data
+
+    item_type = item.get("type")
+    if not isinstance(item_type, str) or not item_type:
+        raise click.ClickException(f"Export item is missing a 'type': {item!r}")
+    raw = {key: value for key, value in item.items() if key not in _IMPORT_ITEM_ENVELOPE_FIELDS}
+    # Reverse the agent→model alias only for types that actually use it, so a
+    # genuine ``model`` field on other types (compaction, routing_decision) is
+    # preserved rather than corrupted.
+    if item_type in _import_agent_aliased_types() and "model" in raw:
+        raw["agent"] = raw.pop("model")
+    try:
+        parse_item_data(item_type, raw)
+    except (TypeError, ValueError) as exc:
+        raise click.ClickException(
+            f"Export contains an invalid {item_type!r} item: {exc}"
+        ) from exc
+    return {"type": item_type, "data": raw}
+
+
+@session.command("import")
+@click.option(
+    "--input",
+    "-i",
+    "input_path",
+    required=True,
+    metavar="FILE",
+    help="Path to a JSONL file produced by 'omnigent session export'.",
+)
+@click.option(
+    "--title",
+    default=None,
+    help="Override the imported session title (defaults to the exported title).",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+def session_import(input_path: str, title: str | None, server: str | None) -> None:
+    """Import a session transcript from a portable JSONL file.
+
+    The inverse of ``omnigent session export``: reads the ``session_meta`` +
+    ``item`` lines and recreates the conversation on the target server as a new
+    session (a fresh conversation id each time). Distinct from ``omnigent
+    import``, which reads native harness history rather than an export file.
+
+    The session is created as history-only (no runner is launched); open it in
+    the UI or resume it to continue. Note: per-turn ``response_id`` grouping is
+    not preserved — replayed items are seeded under a single response id — and
+    item authorship is re-attributed to the importing user (original
+    ``created_by`` is not carried over).
+
+    \b
+    Examples:
+      omnigent session import -i my_session.jsonl
+      omnigent session import -i my_session.jsonl --title "Repro of ES-2065116"
+      omnigent session import -i my_session.jsonl --server https://myserver.com
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+    src_path = Path(input_path)
+    if not src_path.is_file():
+        raise click.ClickException(f"Import file not found: {input_path}")
+
+    meta: dict[str, Any] | None = None
+    items: list[dict[str, Any]] = []
+    with src_path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError as exc:
+                raise click.ClickException(
+                    f"{input_path}:{line_no}: not valid JSON ({exc})."
+                ) from exc
+            kind = record.get("record_type")
+            if kind == "session_meta":
+                meta = record
+            elif kind == "item":
+                items.append(record)
+            # Unknown record_type lines are ignored for forward compatibility.
+
+    if meta is None:
+        raise click.ClickException(
+            f"{input_path}: no 'session_meta' line found — is this a session export?"
+        )
+    if not items:
+        raise click.ClickException(f"{input_path}: no 'item' lines to import.")
+
+    initial_items = [_import_item_payload(item) for item in items]
+
+    # Agent binding: reuse the exported agent_id when it exists on the target
+    # server; otherwise fall back to the built-in native agent for the export's
+    # harness (mirrors the /v1/imports fallback).
+    exported_agent_id = meta.get("agent_id")
+    harness = meta.get("harness") or meta.get("harness_override")
+    fallback_agent_id: str | None = None
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is not None:
+        fallback_agent_id = builtin_agent_id(native_agent.agent_name)
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        base_url = ensure_local_omnigent_server().url
+    base_url = base_url.rstrip("/")
+
+    resolved_title = title if title is not None else meta.get("title")
+
+    def _create(agent_id: str, client: httpx.Client) -> httpx.Response:
+        body: dict[str, Any] = {
+            "agent_id": agent_id,
+            "initial_items": initial_items,
+            # Explicitly external with no host_id so the server seeds
+            # initial_items as history-only and launches no runner.
+            "host_type": "external",
+        }
+        if resolved_title:
+            body["title"] = resolved_title
+        for key in (
+            "workspace",
+            "harness_override",
+            "model_override",
+            "reasoning_effort",
+            "cost_control_mode_override",
+            "terminal_launch_args",
+        ):
+            value = meta.get(key)
+            if value is not None:
+                body[key] = value
+        return client.post("/v1/sessions", json=body)
+
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=120.0
+    ) as client:
+        candidates = [a for a in (exported_agent_id, fallback_agent_id) if a]
+        if not candidates:
+            raise click.ClickException(
+                "Could not resolve an agent to bind: the export has no agent_id "
+                f"and harness {harness!r} has no built-in native agent. "
+                "Register the agent on the target server, then retry."
+            )
+        resp: httpx.Response | None = None
+        for idx, agent_id in enumerate(candidates):
+            resp = _create(agent_id, client)
+            if resp.status_code == 404 and idx + 1 < len(candidates):
+                # Exported agent absent on this server — try the native fallback.
+                continue
+            break
+        assert resp is not None
+        if resp.status_code == 404:
+            raise click.ClickException(
+                f"Agent not found on server for import (tried {candidates}). "
+                "Register the agent on the target server, then retry."
+            )
+        if resp.status_code >= 400:
+            raise click.ClickException(
+                f"Failed to import session ({resp.status_code}): {resp.text[:500]}"
+            )
+        created = resp.json()
+
+    new_id = created.get("id") or created.get("session_id")
+    click.echo(f"Imported {len(initial_items)} item(s) into {new_id}")
+
+
 # Shared option help for ``run`` and the harness commands. These are the same
 # flags the legacy argparse CLI exposed — keeping them on the unified
 # click CLI so users don't regress when a YAML declares no executor
