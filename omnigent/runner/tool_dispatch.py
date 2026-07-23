@@ -1405,7 +1405,7 @@ async def _execute_list_models_tool(
     config files and the listing fetches hit provider HTTP APIs (TTL-
     cached in :mod:`omnigent.model_catalog`).
 
-    :param args: Optional ``workers`` and ``model_ids`` filters.
+    :param args: Already-parsed optional ``workers`` and ``model_ids`` filters.
     :param agent_spec: The calling session's agent spec; its
         ``sub_agents`` define the worker rows.
     :returns: JSON mapping of worker name (plus ``"self"``) to its

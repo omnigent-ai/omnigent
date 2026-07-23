@@ -136,3 +136,33 @@ def test_filter_model_catalog_filters_independently_and_preserves_rows() -> None
         "self": {"source": "none", "models": [], "note": "unavailable"},
     }
     assert len(catalog["worker"]["models"]) == 2
+
+
+def test_filter_model_catalog_empty_or_unknown_workers_return_empty_catalog() -> None:
+    """Explicit selections with no matching workers do not leak unrelated rows."""
+    catalog = {
+        "worker": {"models": [{"id": "claude-sonnet-5"}]},
+        "self": {"models": [{"id": "gpt-5.6-sol"}]},
+    }
+
+    assert filter_model_catalog(catalog, {"workers": []}) == {}
+    assert filter_model_catalog(catalog, {"workers": ["missing"]}) == {}
+
+
+def test_filter_model_catalog_unknown_model_keeps_workers_with_empty_models() -> None:
+    """Unknown model ids retain worker preflight metadata and empty model lists."""
+    catalog = {
+        "worker": {
+            "source": "static",
+            "models": [{"id": "claude-sonnet-5"}],
+        },
+        "self": {
+            "source": "env",
+            "models": [{"id": "gpt-5.6-sol"}],
+        },
+    }
+
+    assert filter_model_catalog(catalog, {"model_ids": ["missing-model"]}) == {
+        "worker": {"source": "static", "models": []},
+        "self": {"source": "env", "models": []},
+    }
