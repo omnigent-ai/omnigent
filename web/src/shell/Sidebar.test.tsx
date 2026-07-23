@@ -386,14 +386,29 @@ describe("Sidebar session list", () => {
 
   it("shows the full session title in a styled tooltip on hover", async () => {
     const title = "A long session title that is truncated in the compact sidebar row";
-    mockConversations([conv("conv_tooltip", "Codex", { title })]);
+    const now = new Date("2026-07-23T00:00:00Z").getTime();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    mockConversations([
+      conv("conv_tooltip", "Codex", {
+        title,
+        updated_at: (now - 2 * 24 * 60 * 60 * 1000) / 1000,
+      }),
+    ]);
     renderSidebar();
 
     const row = screen.getByRole("link", { name: title });
     expect(row).not.toHaveAttribute("title");
 
     fireEvent.pointerMove(row, { pointerType: "mouse" });
-    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent(title));
+    await waitFor(() => {
+      const tooltip = screen.getByRole("tooltip");
+      expect(tooltip).toHaveTextContent(title);
+      expect(tooltip).toHaveTextContent("2d");
+      expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
+        "Local machine",
+      );
+    });
+    nowSpy.mockRestore();
   });
 });
 

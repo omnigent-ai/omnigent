@@ -29,6 +29,7 @@ import {
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
+  LaptopIcon,
   Loader2Icon,
   MailIcon,
   Maximize2Icon,
@@ -111,10 +112,12 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
+import { useHosts } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
@@ -2341,6 +2344,41 @@ function ConversationMenuItems({
   );
 }
 
+function SessionTooltipContent({ conversation }: { conversation: Conversation }) {
+  const { data: hosts = [] } = useHosts({ includeSandbox: true });
+  const host = conversation.host_id
+    ? hosts.find((candidate) => candidate.host_id === conversation.host_id)
+    : undefined;
+  const locationLabel = !conversation.host_id
+    ? "Local machine"
+    : host?.sandbox_provider
+      ? sandboxOptionLabel(host.sandbox_provider)
+      : (host?.name ?? conversation.host_id);
+
+  return (
+    <TooltipContent
+      side="right"
+      sideOffset={12}
+      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch gap-3 rounded-xl px-4 py-3 whitespace-normal shadow-lg"
+    >
+      <div className="text-sm font-medium leading-snug">
+        {conversation.title ?? conversation.id}
+        <span className="font-normal text-muted-foreground">
+          {" · "}
+          {relativeTime(conversation.updated_at * 1000)}
+        </span>
+      </div>
+      <div
+        data-testid="session-tooltip-location"
+        className="flex items-center gap-2 text-sm text-muted-foreground"
+      >
+        <LaptopIcon aria-hidden className="size-4 shrink-0" />
+        <span className="truncate">{locationLabel}</span>
+      </div>
+    </TooltipContent>
+  );
+}
+
 function ConversationRow({
   conversation,
   isPinned,
@@ -2756,9 +2794,7 @@ function ConversationRow({
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <TooltipContent side="right" sideOffset={8} className="max-w-72 whitespace-normal">
-              {conversation.title ?? conversation.id}
-            </TooltipContent>
+            <SessionTooltipContent conversation={conversation} />
           </Tooltip>
         )
       ) : projectFlyoutName ? (
@@ -2807,9 +2843,7 @@ function ConversationRow({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <TooltipContent side="right" sideOffset={8} className="max-w-72 whitespace-normal">
-            {conversation.title ?? conversation.id}
-          </TooltipContent>
+          <SessionTooltipContent conversation={conversation} />
         </Tooltip>
       )}
       {selectionMode ? (
