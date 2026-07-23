@@ -508,7 +508,7 @@ async def route_session_harness(
     *,
     session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
-) -> tuple[str | None, str | None, dict[str, Any] | None]:
+) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
     Builds a candidate set from the live runner catalog when *session_id* and
@@ -519,18 +519,19 @@ async def route_session_harness(
     :param user_message: The user's first message text, used to size the task.
     :param session_id: Session id for the live catalog fetch (optional).
     :param runner_client: HTTP client pointed at the runner (optional).
-    :returns: ``(harness, model, verdict)`` on success; ``(None, None, None)``
-        when routing is unavailable, the message is empty, or the router fails.
+    :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
+        ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
+        and ``error`` carries a human-readable reason shown in the UI.
     """
     if not user_message:
-        return None, None, None
+        return None, None, None, None
     try:
         from omnigent.runtime._globals import _caps
     except ImportError:
-        return None, None, None
+        return None, None, None, "Intelligent routing is not available."
 
     if _caps is None or _caps.routing_client is None:
-        return None, None, None
+        return None, None, None, "Intelligent routing is not configured on this server."
 
     # Fetch live catalog and restrict to our known SDK harnesses.
     live_catalog: dict[str, list[str]] | None = None
@@ -548,16 +549,16 @@ async def route_session_harness(
                 harness_models[h] = models
 
     if not harness_models:
-        return None, None, None
+        return None, None, None, "No routable harnesses are available on this runner."
 
     try:
         result = await _caps.routing_client.route(user_message, harness_models)
-    except Exception:  # routing failures must not block session creation
+    except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
-        return None, None, None
+        return None, None, None, f"Routing call failed: {exc}"
 
     if result is None:
-        return None, None, None
+        return None, None, None, "The router returned no verdict; using default harness."
 
     # Use the router's harness pick only when it names one of our candidates
     # AND the chosen model is in that harness's list (avoids mismatches).
@@ -589,7 +590,12 @@ async def route_session_harness(
         result.model,
         result.rationale,
     )
-    return chosen_harness, result.model, {"model": result.model, "rationale": result.rationale}
+    return (
+        chosen_harness,
+        result.model,
+        {"model": result.model, "rationale": result.rationale},
+        None,
+    )
 
 
 async def route_turn(

@@ -730,11 +730,12 @@ async def test_route_session_harness_picks_harness_and_model() -> None:
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, verdict = await route_session_harness("refactor the auth module")
+        harness, model, verdict, error = await route_session_harness("refactor the auth module")
     assert harness == "claude-sdk"
     assert model == "databricks-claude-opus-4-8"
     assert verdict is not None
     assert "rationale" in verdict
+    assert error is None
 
 
 @pytest.mark.asyncio
@@ -799,7 +800,7 @@ async def test_route_session_harness_uses_live_catalog_skips_absent_harness() ->
 
     caps = _FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, _verdict = await route_session_harness(
+        harness, model, _verdict, _error = await route_session_harness(
             "hello",
             session_id="conv_test",
             runner_client=mock_client,
@@ -814,13 +815,14 @@ async def test_route_session_harness_uses_live_catalog_skips_absent_harness() ->
 
 @pytest.mark.asyncio
 async def test_route_session_harness_returns_none_when_no_client() -> None:
-    """route_session_harness returns (None, None, None) when no routing client."""
+    """route_session_harness returns (None, None, None, error) when no routing client."""
     caps = _FakeCaps(routing_client=None)
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, verdict = await route_session_harness("hello")
+        harness, model, verdict, error = await route_session_harness("hello")
     assert harness is None
     assert model is None
     assert verdict is None
+    assert error is not None  # error message propagated
 
 
 @pytest.mark.asyncio
@@ -828,7 +830,7 @@ async def test_route_session_harness_returns_none_for_empty_message() -> None:
     """route_session_harness returns (None, None, None) for empty user text."""
     caps = _FakeCaps(routing_client=_FakeRoutingClient(None))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, _verdict = await route_session_harness("")
+        harness, model, _verdict, _error = await route_session_harness("")
     assert harness is None
     assert model is None
 
@@ -843,6 +845,6 @@ async def test_route_session_harness_falls_back_by_model_when_harness_absent() -
     )
     caps = _FakeCaps(routing_client=_FakeRoutingClient(expected))
     with patch("omnigent.runtime._globals._caps", new=caps):
-        harness, model, _verdict = await route_session_harness("what time is it?")
+        harness, model, _verdict, _error = await route_session_harness("what time is it?")
     assert harness in ("codex", "pi")
     assert model == "databricks-gpt-5-4-nano"

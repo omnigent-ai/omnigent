@@ -9320,9 +9320,10 @@ async def _emit_server_routing_decision(
     from omnigent.runtime import session_stream
 
     rationale = verdict.get("rationale", "")
+    applied = verdict.get("applied", True)
     item_data: dict[str, Any] = {
         "model": model,
-        "applied": True,
+        "applied": bool(applied),
         "rationale": rationale if isinstance(rationale, str) else "",
     }
     if agent is not None:
@@ -9528,7 +9529,7 @@ async def _forward_event_to_runner(
 
         _auto_text = _extract_user_text_for_routing(body)
         if _auto_text:
-            _auto_harness, _auto_model, _auto_verdict = await route_session_harness(
+            _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
                 _auto_text,
                 session_id=session_id,
                 runner_client=runner_client,
@@ -9564,6 +9565,15 @@ async def _forward_event_to_runner(
                     conversation_store,
                     _auto_model,
                     _auto_verdict,
+                )
+            elif _auto_error is not None:
+                # Routing failed — emit a routing card (applied=False) so the
+                # user sees why auto-harness fell back to defaults.
+                await _emit_server_routing_decision(
+                    session_id,
+                    conversation_store,
+                    "unavailable",
+                    {"rationale": _auto_error, "applied": False},
                 )
 
     # ── Server-side intelligent routing ──────────────────────────────
