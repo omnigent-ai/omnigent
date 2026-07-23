@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from omnigent.entities import Conversation
+from omnigent.runtime import get_runner_router, set_runner_router
 from omnigent.server.artifact_previews import (
     ArtifactPreviewHostMiddleware,
     ArtifactPreviewNotFound,
@@ -140,6 +143,69 @@ def test_authenticated_session_broker_returns_capability_url() -> None:
     assert response.status_code == 201
     assert response.json()["url"].startswith("http://preview.localhost:6767/p/")
     assert response.json()["expires_at"] > 0
+
+
+def test_authenticated_session_lists_runner_managed_artifacts() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_preview/artifacts"
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "path": "artifacts/revenue/index.html",
+                        "name": "index.html",
+                        "type": "file",
+                        "bytes": 200,
+                        "modified_at": 2,
+                    }
+                ],
+                "has_more": False,
+            },
+            request=request,
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://runner",
+    )
+
+    class RunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> SimpleNamespace:
+            assert session_id == "conv_preview"
+            return SimpleNamespace(client=runner_client)
+
+    class ConversationStore:
+        def get_conversation(self, conversation_id: str) -> Conversation | None:
+            if conversation_id != "conv_preview":
+                return None
+            return Conversation(
+                id=conversation_id,
+                created_at=1,
+                updated_at=1,
+                root_conversation_id=conversation_id,
+                title="Preview",
+                agent_id="ag_willy",
+            )
+
+    prior_router = get_runner_router()
+    set_runner_router(RunnerRouter())  # type: ignore[arg-type]
+    try:
+        app = FastAPI()
+        app.include_router(
+            create_sessions_router(
+                conversation_store=ConversationStore(),  # type: ignore[arg-type]
+                agent_store=object(),  # type: ignore[arg-type]
+            ),
+            prefix="/v1",
+        )
+        response = TestClient(app).get("/v1/sessions/conv_preview/artifacts")
+    finally:
+        set_runner_router(prior_router)
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["path"] == "artifacts/revenue/index.html"
 
 
 def test_preview_hostname_cannot_reach_application_routes() -> None:

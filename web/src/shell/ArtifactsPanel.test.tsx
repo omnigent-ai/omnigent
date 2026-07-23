@@ -1,17 +1,14 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
-  return { ...actual, useWorkspaceFileSearch: vi.fn() };
-});
+vi.mock("@/hooks/useManagedArtifacts", () => ({ useManagedArtifacts: vi.fn() }));
 vi.mock("@/hooks/useArtifactPreview", () => ({ useArtifactPreview: vi.fn() }));
 
 import { useArtifactPreview } from "@/hooks/useArtifactPreview";
-import { useWorkspaceFileSearch } from "@/hooks/useWorkspaceChangedFiles";
+import { useManagedArtifacts } from "@/hooks/useManagedArtifacts";
 import { artifactEntriesFromFiles, ArtifactsPanel } from "./ArtifactsPanel";
 
-const fileSearchMock = vi.mocked(useWorkspaceFileSearch);
+const managedArtifactsMock = vi.mocked(useManagedArtifacts);
 const artifactPreviewMock = vi.mocked(useArtifactPreview);
 
 describe("artifactEntriesFromFiles", () => {
@@ -54,7 +51,7 @@ describe("artifactEntriesFromFiles", () => {
   });
 
   it("renders the selected artifact in the dedicated-origin sandbox", () => {
-    fileSearchMock.mockReturnValue({
+    managedArtifactsMock.mockReturnValue({
       data: [
         {
           path: "artifacts/revenue/index.html",
@@ -66,7 +63,7 @@ describe("artifactEntriesFromFiles", () => {
       ],
       isLoading: false,
       isError: false,
-    } as ReturnType<typeof useWorkspaceFileSearch>);
+    } as ReturnType<typeof useManagedArtifacts>);
     artifactPreviewMock.mockReturnValue({
       data: {
         url: "http://preview.localhost:6767/p/grant/artifacts/revenue/index.html",
@@ -81,12 +78,12 @@ describe("artifactEntriesFromFiles", () => {
         conversationId="conv_preview"
         selectedPath="artifacts/revenue/index.html"
         onSelect={vi.fn()}
-        onOpenFile={vi.fn()}
       />,
     );
 
     const frame = screen.getByTitle("Revenue preview");
     expect(frame.getAttribute("src")).toContain("preview.localhost");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-same-origin");
+    expect(screen.getByText("Managed by Omnigent")).toBeDefined();
   });
 });

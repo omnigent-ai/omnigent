@@ -466,7 +466,6 @@ export function WorkspacePanel({
             conversationId={conversationId}
             selectedPath={selectedArtifactPath}
             onSelect={onArtifactSelect}
-            onOpenFile={openFileViewer}
           />
         ) : rightRailTab === "browser" && showBrowserTab ? (
           // Embedded browser (Electron only) — BrowserPane self-gates and

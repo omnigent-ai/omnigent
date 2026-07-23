@@ -9700,6 +9700,10 @@ def create_runner_app(
             harness_name = "runner-test-default"
             spawn_env = None
 
+        from omnigent.runner.managed_artifacts import with_artifact_spawn_env
+
+        spawn_env = with_artifact_spawn_env(spawn_env, session_id)
+
         try:
             await process_manager.get_client(
                 session_id,
@@ -15001,6 +15005,10 @@ def create_runner_app(
 
             spawn_env = build_kimi_native_spawn_env(conv_id)
 
+        from omnigent.runner.managed_artifacts import with_artifact_spawn_env
+
+        spawn_env = with_artifact_spawn_env(spawn_env, conv_id)
+
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
             if agent_version > _version_cache[conv_id]:
@@ -18070,6 +18078,32 @@ def create_runner_app(
             order=order,
         )
 
+    @app.get("/v1/sessions/{session_id}/artifacts")
+    async def list_managed_artifacts(session_id: str) -> JSONResponse:
+        """List canonical HTML entries in the session's managed artifact root."""
+        from omnigent.runner.managed_artifacts import discover_managed_artifacts
+
+        await _ensure_session_registered(session_id)
+        entries = await asyncio.to_thread(discover_managed_artifacts, session_id)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "object": "list",
+                "data": [
+                    {
+                        "object": "session.artifact.entry",
+                        "path": entry.path,
+                        "name": entry.name,
+                        "type": "file",
+                        "bytes": entry.bytes,
+                        "modified_at": entry.modified_at,
+                    }
+                    for entry in entries
+                ],
+                "has_more": False,
+            },
+        )
+
     @app.api_route(
         "/v1/sessions/{session_id}/artifact-preview/{relative_path:path}",
         methods=["GET", "HEAD"],
@@ -18084,15 +18118,12 @@ def create_runner_app(
     ) -> Response:
         """Read one preview resource with atomic no-follow confinement."""
         from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
-        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+        from omnigent.runner.managed_artifacts import read_managed_artifact
 
-        await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        agent_spec = await _resolve_session_agent_spec(session_id)
-        env = resource_registry.resolve_environment(session_id, "default", agent_spec)
-        fs = CallerProcessFilesystem(env)
         try:
-            content = await fs.read_artifact(
+            content = await read_managed_artifact(
+                session_id,
                 relative_path,
                 artifact_root=artifact_root,
                 max_bytes=max_bytes,

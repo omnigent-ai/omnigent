@@ -18,6 +18,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+from omnigent.runner.managed_artifacts import managed_artifact_dir
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
 
@@ -92,9 +93,11 @@ async def test_list_environment_root(
 @pytest.mark.asyncio
 async def test_artifact_preview_reads_relative_resource_atomically(
     client: httpx.AsyncClient,
-    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    artifact = workspace / "artifacts" / "revenue"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    artifact = managed_artifact_dir("conv_test") / "revenue"
     artifact.mkdir(parents=True)
     (artifact / "app.js").write_text("console.log('preview')")
 
@@ -105,16 +108,17 @@ async def test_artifact_preview_reads_relative_resource_atomically(
 
     assert resp.status_code == 200, resp.text
     assert resp.text == "console.log('preview')"
-    assert resp.headers["content-type"].startswith("text/javascript")
+    assert "javascript" in resp.headers["content-type"]
 
 
 @pytest.mark.asyncio
 async def test_artifact_preview_rejects_symlinked_resource(
     client: httpx.AsyncClient,
-    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    artifact = workspace / "artifacts" / "revenue"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    artifact = managed_artifact_dir("conv_test") / "revenue"
     artifact.mkdir(parents=True)
     secret = tmp_path / "secret.js"
     secret.write_text("TOP_SECRET")
@@ -127,6 +131,28 @@ async def test_artifact_preview_rejects_symlinked_resource(
 
     assert resp.status_code == 404
     assert "TOP_SECRET" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_list_managed_artifacts_returns_virtual_paths(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    root = managed_artifact_dir("conv_test")
+    (root / "overview.html").parent.mkdir(parents=True)
+    (root / "overview.html").write_text("overview")
+    (root / "revenue").mkdir()
+    (root / "revenue" / "index.html").write_text("revenue")
+
+    resp = await client.get("/v1/sessions/conv_test/artifacts")
+
+    assert resp.status_code == 200, resp.text
+    assert [entry["path"] for entry in resp.json()["data"]] == [
+        "artifacts/overview.html",
+        "artifacts/revenue/index.html",
+    ]
 
 
 @pytest.mark.asyncio

@@ -18363,6 +18363,18 @@ def create_sessions_router(
             ) from exc
         return {"url": grant.url, "expires_at": grant.expires_at}
 
+    @router.get("/sessions/{session_id}/artifacts", response_model=None)
+    async def list_managed_artifacts(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """List canonical HTML entries from the runner-managed artifact root."""
+        await _validate_session(session_id, request, LEVEL_READ)
+        return await _proxy_get_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/artifacts",
+        )
+
     async def _proxy_get_to_runner(
         session_id: str,
         path: str,
