@@ -497,6 +497,43 @@ def test_build_record_promotes_host_installation_id() -> None:
     assert "host_installation_id" not in params
 
 
+def test_session_created_event_agent_name_polly() -> None:
+    """``agent_name`` is set for polly sessions."""
+    from omnigent.telemetry.events import SessionCreatedEvent
+
+    event = SessionCreatedEvent(
+        installation_id=None,
+        session_id="sess_polly",
+        agent_id="ag_001",
+        harness="claude-sdk",
+        surface="web",
+        anon_user_id=None,
+        host_installation_id=None,
+        is_fork=False,
+        is_sub_agent=False,
+        agent_name="polly",
+    )
+    assert event.agent_name == "polly"
+
+
+def test_session_created_event_agent_name_none_for_custom() -> None:
+    """``agent_name`` defaults to ``None`` for custom (non-built-in) agents."""
+    from omnigent.telemetry.events import SessionCreatedEvent
+
+    event = SessionCreatedEvent(
+        installation_id=None,
+        session_id="sess_custom",
+        agent_id="ag_002",
+        harness="claude-sdk",
+        surface="web",
+        anon_user_id=None,
+        host_installation_id=None,
+        is_fork=False,
+        is_sub_agent=False,
+    )
+    assert event.agent_name is None
+
+
 # ── _resolve_harness ─────────────────────────────────────────────────────────
 
 
