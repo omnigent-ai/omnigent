@@ -4954,13 +4954,24 @@ def _assistant_message_item(
     )
 
 
-# Placeholder text substituted for inline base64 image data in tool
-# results. A single Read of an image returns a full-resolution base64
-# PNG; serialized verbatim it costs hundreds of thousands of tokens and
-# is replayed as prompt text on every resume, overflowing the context
-# window and wedging compaction. The model cannot use raw base64 as
-# text anyway, so a reference is strictly better.
-_STRIPPED_IMAGE_PLACEHOLDER = "[image omitted from history]"
+def _stripped_image_placeholder(source: dict[str, Any]) -> str:
+    """
+    Build the placeholder text for a stripped inline image block.
+
+    Names the media type when known and points the agent back at the
+    originating tool call, so it can re-read the file to view the image
+    again instead of the data being silently lost.
+
+    :param source: The image block's ``source`` dict, e.g.
+        ``{"type": "base64", "media_type": "image/png", "data": ...}``.
+    :returns: Human/agent-readable placeholder string.
+    """
+    media_type = source.get("media_type")
+    label = f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
+    return (
+        f"[{label} omitted from history to save context — "
+        "re-run the tool call above (e.g. Read the same path) to view it again]"
+    )
 
 
 def _strip_inline_image_data(value: Any) -> Any:
@@ -4969,8 +4980,13 @@ def _strip_inline_image_data(value: Any) -> Any:
 
     Walks list/dict tool-result content and rewrites any Anthropic
     ``{"type": "image", "source": {"type": "base64", ...}}`` block to a
-    short text block, dropping the base64 ``data``. Non-image content
-    is returned unchanged.
+    short text block, dropping the base64 ``data``. A single Read of an
+    image returns a full-resolution base64 PNG; serialized verbatim it
+    costs hundreds of thousands of tokens and is replayed as prompt text
+    on every resume, overflowing the context window and wedging
+    compaction. The model cannot use raw base64 as text anyway, and the
+    placeholder points back at the tool call so the image stays
+    recoverable on demand. Non-image content is returned unchanged.
 
     :param value: Decoded tool-result content (list, dict, or scalar).
     :returns: The same structure with image base64 data removed.
@@ -4978,8 +4994,9 @@ def _strip_inline_image_data(value: Any) -> Any:
     if isinstance(value, list):
         return [_strip_inline_image_data(item) for item in value]
     if isinstance(value, dict):
-        if value.get("type") == "image" and isinstance(value.get("source"), dict):
-            return {"type": "text", "text": _STRIPPED_IMAGE_PLACEHOLDER}
+        source = value.get("source")
+        if value.get("type") == "image" and isinstance(source, dict):
+            return {"type": "text", "text": _stripped_image_placeholder(source)}
         return {key: _strip_inline_image_data(val) for key, val in value.items()}
     return value
 

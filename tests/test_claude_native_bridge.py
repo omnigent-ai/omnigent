@@ -696,8 +696,11 @@ def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) ->
     assert len(outputs) == 1
     output = outputs[0].data["output"]
     assert huge_b64 not in output, "base64 image data must not be replayed as text"
-    assert "[image omitted from history]" in output
-    assert len(output) < 200
+    # The placeholder names the media type and tells the agent how to
+    # recover the image (re-run the tool call), so it is not silently lost.
+    assert "image/png image omitted from history" in output
+    assert "re-run the tool call" in output
+    assert len(output) < 300
 
 
 def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Path) -> None:
