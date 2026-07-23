@@ -679,17 +679,25 @@ async def route_session_harness(
     user_message: str,
     *,
     session_id: str | None = None,
+    catalog_session_id: str | None = None,
     runner_client: httpx.AsyncClient | None = None,
 ) -> tuple[str | None, str | None, dict[str, Any] | None, str | None]:
     """Pick the best harness + model for a new session via the routing client.
 
-    Builds a candidate set from the live runner catalog when *session_id* and
-    *runner_client* are provided, falling back to the static ``infer_models``
-    table for any harness not represented in the live data.  Only harnesses in
-    :data:`_AUTO_ROUTING_HARNESSES` are offered as candidates.
+    Builds a candidate set from the live runner catalog when *catalog_session_id*
+    (defaulting to *session_id*) and *runner_client* are provided, falling back
+    to the static ``infer_models`` table for any harness not represented in the
+    live data.  Only harnesses in :data:`_AUTO_ROUTING_HARNESSES` are offered as
+    candidates.
 
     :param user_message: The user's first message text, used to size the task.
-    :param session_id: Session id for the live catalog fetch (optional).
+    :param session_id: Session being routed (optional).
+    :param catalog_session_id: Session whose catalog defines the candidate set.
+        For a sub-agent this should be the PARENT session id — the parent's
+        catalog enumerates the spawnable workers (claude_code/codex/pi) with
+        their full model lists, whereas the child's own leaf catalog only has a
+        ``"self"`` row and would force the static fallback. Defaults to
+        *session_id* when unset.
     :param runner_client: HTTP client pointed at the runner (optional).
     :returns: ``(harness, model, verdict, error)`` — on success ``error`` is
         ``None``; on failure ``harness``, ``model``, and ``verdict`` are ``None``
@@ -707,10 +715,13 @@ async def route_session_harness(
 
     # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
     # names + "self"), so normalize those to harness ids before matching
-    # against _AUTO_ROUTING_HARNESSES.
+    # against _AUTO_ROUTING_HARNESSES. Prefer catalog_session_id (the parent
+    # for a sub-agent) so the candidate set is the full spawnable-worker map,
+    # independent of whether the routed session is top-level or a sub-agent.
+    _catalog_sid = catalog_session_id or session_id
     live_catalog: dict[str, list[str]] | None = None
-    if session_id and runner_client is not None:
-        live_catalog = await fetch_runner_models(session_id, runner_client)
+    if _catalog_sid and runner_client is not None:
+        live_catalog = await fetch_runner_models(_catalog_sid, runner_client)
 
     # NOTE: we do NOT filter incompatible (harness, model) pairs out of the
     # candidate set here. The external router (task_v0) enforces a required

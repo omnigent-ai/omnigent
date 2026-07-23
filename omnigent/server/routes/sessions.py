@@ -9539,9 +9539,12 @@ async def _forward_event_to_runner(
         _auto_text = _extract_user_text_for_routing(body)
         if _auto_text:
             _auto_resolved_this_turn = True
+            # For a forced-auto child, route against the parent's catalog (full
+            # spawnable-worker map) rather than the child's leaf "self" catalog.
             _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
                 _auto_text,
                 session_id=session_id,
+                catalog_session_id=conv.parent_conversation_id,
                 runner_client=runner_client,
             )
             try:
@@ -9620,9 +9623,14 @@ async def _forward_event_to_runner(
                 # sys_session_send.
                 from omnigent.server.smart_routing import route_session_harness
 
+                # Route against the PARENT's catalog: it enumerates the
+                # spawnable workers (claude_code/codex/pi) with full model
+                # lists, whereas this child's own leaf catalog is "self"-only
+                # and would force the static fallback (a smaller/different set).
                 _routed_harness, _routed_model, _verdict, _route_err = await route_session_harness(
                     _user_text,
                     session_id=session_id,
+                    catalog_session_id=conv.parent_conversation_id,
                     runner_client=runner_client,
                 )
                 if _routed_model is not None:

@@ -855,6 +855,54 @@ async def test_route_session_harness_passes_all_sdk_harnesses_static() -> None:
 
 
 @pytest.mark.asyncio
+async def test_route_session_harness_uses_catalog_session_id_for_fetch() -> None:
+    """catalog_session_id (the parent) drives the catalog fetch, not session_id.
+
+    A sub-agent's own catalog is "self"-only; routing must use the parent's
+    full spawnable-worker catalog so the candidate set is stable.
+    """
+    from unittest.mock import MagicMock
+
+    fetched_paths: list[str] = []
+
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "workers": {
+            "claude_code": {
+                "source": "catalog",
+                "verified": True,
+                "models": [{"id": "m1"}],
+                "note": "",
+            },
+        }
+    }
+    mock_response.raise_for_status = MagicMock()
+
+    async def _get(path: str, **_: Any) -> Any:
+        fetched_paths.append(path)
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.get = _get
+
+    caps = _FakeCaps(
+        routing_client=_FakeRoutingClient(
+            RoutingResult(model="m1", rationale="x", harness="claude-sdk")
+        )
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        await route_session_harness(
+            "hi",
+            session_id="child_sess",
+            catalog_session_id="parent_sess",
+            runner_client=mock_client,
+        )
+    # The catalog was fetched for the PARENT, not the child.
+    assert any("parent_sess" in p for p in fetched_paths)
+    assert not any("child_sess" in p for p in fetched_paths)
+
+
+@pytest.mark.asyncio
 async def test_route_session_harness_uses_live_catalog_skips_absent_harness() -> None:
     """With a runner_client, harnesses absent from the live catalog are excluded."""
     from unittest.mock import AsyncMock, MagicMock
