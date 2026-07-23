@@ -139,9 +139,16 @@ async def test_query_times_out_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _FakeHostConn()
     registry = _SilentRegistry()
 
+    loop = asyncio.get_running_loop()
+    started = loop.time()
     result = await _query_host_runner_status(conn, registry, "runner_slow")  # type: ignore[arg-type]
+    elapsed = loop.time() - started
 
     assert result is None
+    # The facade-level patch must be honored: the wait bails at ~0.05s, not the
+    # real 3.0s default. Reading the timeout off the facade (not a stale
+    # star-import binding) is what makes the monkeypatch take effect.
+    assert elapsed < 0.5
     # The pending entry is cleaned up even on the timeout path.
     assert conn.pending_runner_status == {}
 

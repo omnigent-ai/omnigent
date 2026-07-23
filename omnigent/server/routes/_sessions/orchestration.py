@@ -2644,6 +2644,7 @@ async def _run_managed_wake(
         runner's connection. ``None`` in minimal test wirings.
     """
     from omnigent.server.managed_hosts import resume_managed_host
+    from omnigent.server.routes import sessions as _facade
 
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
@@ -2662,7 +2663,9 @@ async def _run_managed_wake(
             # can lag here (or land on another replica). Poll briefly so the runner
             # launches once it reconnects, instead of settling "ready" with no
             # runner; fail clearly if it never shows rather than losing the turn.
-            _host_reconnect_deadline = time.monotonic() + _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            _host_reconnect_deadline = (
+                time.monotonic() + _facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+            )
             while host_conn is None and time.monotonic() < _host_reconnect_deadline:
                 await asyncio.sleep(0.5)
                 host_conn = host_registry.get(conv.host_id)

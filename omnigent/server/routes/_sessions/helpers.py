@@ -3743,6 +3743,7 @@ async def _query_host_runner_status(
         plain connect grace, preserving the prior blind-wait behavior.
     """
     from omnigent.host.frames import HostRunnerStatusFrame, encode_host_frame
+    from omnigent.server.routes import sessions as _facade
 
     request_id = secrets.token_hex(8)
     future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
@@ -3755,7 +3756,7 @@ async def _query_host_runner_status(
             return None
         result = await asyncio.wait_for(
             future,
-            timeout=_HOST_RUNNER_STATUS_TIMEOUT_S,
+            timeout=_facade._HOST_RUNNER_STATUS_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
         return None
@@ -4157,9 +4158,11 @@ async def _wait_for_managed_runner_tunnel(
     :returns: ``True`` when the runner connected; ``False`` after publishing
         and retaining a failed launch status.
     """
+    from omnigent.server.routes import sessions as _facade
+
     runner = await tunnel_registry.wait_for_runner(
         runner_id,
-        timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+        timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
     )
     if runner is not None:
         return True
@@ -8484,6 +8487,7 @@ __all__ = [
     "_validate_terminal_launch_args",
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
+    "_validated_harness_override_executor_type",
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
     "announce_hosts_changed",
