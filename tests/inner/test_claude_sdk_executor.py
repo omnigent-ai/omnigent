@@ -1508,12 +1508,9 @@ class TestStreamEventStreaming(unittest.TestCase):
                 query_calls[0]["extra_args"],
                 {"no-session-persistence": None},
             )
-            # Skill is always in the base tool set so the Skill tool is
-            # actually exposed to the model when ``skills="all"`` (the
-            # SDK only adds Skill to ``allowedTools`` — without listing
-            # it in ``tools`` the CLI passes ``--tools ""`` and zeros
-            # the base set).
-            self.assertEqual(query_calls[0]["tools"], ["Skill"])
+            # Skill remains available for configured skills; ToolSearch
+            # keeps large MCP definitions deferred until they are needed.
+            self.assertEqual(query_calls[0]["tools"], ["Skill", "ToolSearch"])
             self.assertEqual(query_calls[0]["allowed_tools"], [])
             self.assertEqual(query_calls[1]["session_id"], "session-b")
             self.assertEqual(query_calls[2]["session_id"], "session-a")
@@ -1616,8 +1613,8 @@ class TestStreamEventStreaming(unittest.TestCase):
                     )
                 ]
             # OS operations route through sys_os_* MCP tools, not SDK
-            # built-ins. Only Skill remains in the native base set.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # built-ins. Skill and ToolSearch do not widen OS access.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertIn("mcp__omnigent__sleep", captured_options["allowed_tools"])
             self.assertNotIn("Bash", captured_options["allowed_tools"])
             self.assertIsInstance(events[-1], TurnComplete)
@@ -1702,14 +1699,13 @@ class TestStreamEventStreaming(unittest.TestCase):
                         "",
                     )
                 ]
-            # Default ``skills_filter="all"`` exposes the ``Skill``
-            # tool so the model can invoke discovered skills via
-            # the Claude SDK plugin mechanism. The OS tools
+            # Default ``skills_filter="all"`` exposes the ``Skill`` tool
+            # through the Claude SDK plugin mechanism. ToolSearch defers
+            # MCP definitions until needed. The OS tools
             # (Bash/Read/Edit/Write/Glob/Grep) stay absent — that's
-            # what this test pins. ``Skill`` itself doesn't widen
-            # the FS attack surface; it only loads pre-approved
-            # SKILL.md content.
-            self.assertEqual(captured_options["tools"], ["Skill"])
+            # what this test pins. Neither base tool widens the FS attack
+            # surface.
+            self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
             self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent__sleep"])
             self.assertIsInstance(events[-1], TurnComplete)
 

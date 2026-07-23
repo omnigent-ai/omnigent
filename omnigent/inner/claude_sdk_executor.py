@@ -2165,9 +2165,9 @@ class ClaudeSDKExecutor(Executor):
         # via its own conversation store.
         # OS-environment tools are provided via Omnigent ``sys_os_*``
         # MCP tools (declared via ``os_env`` in the spec), not the
-        # SDK's native Bash/Read/Edit/Write.  Only the Skill tool
-        # needs to be in the SDK's base set.
-        base_tools: list[str] = ["Skill"]
+        # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
+        # the base set so MCP definitions can be discovered on demand.
+        base_tools: list[str] = ["Skill", "ToolSearch"]
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
