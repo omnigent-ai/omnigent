@@ -4,6 +4,7 @@ import { ChatPage } from "@/pages/ChatPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { AgiLaunchAnimation } from "@/components/AgiLaunchAnimation";
 
 // Lazy-load the accounts pages so the bundle a header / OIDC
 // deploy ships (where accounts is off) doesn't include them in the
@@ -97,54 +98,60 @@ function App({ basename }: AppProps = {}) {
   // after the first admin exists.
   if (info.accounts_enabled && info.needs_setup) {
     return (
-      <Suspense fallback={null}>
-        <Routes>
-          <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
-        </Routes>
-      </Suspense>
+      <>
+        <AgiLaunchAnimation />
+        <Suspense fallback={null}>
+          <Routes>
+            <Route path={basename ? `${prefix}/*` : "*"} element={<SetupPage />} />
+          </Routes>
+        </Suspense>
+      </>
     );
   }
 
   return (
-    <Suspense fallback={null}>
-      <Routes>
-        {info.accounts_enabled && (
-          <>
-            <Route path={`${prefix}/login`} element={<LoginPage />} />
-            <Route path={`${prefix}/register`} element={<RegisterPage />} />
-          </>
-        )}
-        <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
-        <Route element={<AppShell />}>
-          <Route path={prefix || "/"} element={<ChatPage />} />
-          <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
-          <Route path={`${prefix}/inbox`} element={<InboxPage />} />
-          {/* Settings renders into the chat outlet so the conversations
+    <>
+      <AgiLaunchAnimation />
+      <Suspense fallback={null}>
+        <Routes>
+          {info.accounts_enabled && (
+            <>
+              <Route path={`${prefix}/login`} element={<LoginPage />} />
+              <Route path={`${prefix}/register`} element={<RegisterPage />} />
+            </>
+          )}
+          <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
+          <Route element={<AppShell />}>
+            <Route path={prefix || "/"} element={<ChatPage />} />
+            <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+            <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+            {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
               is carried in the URL (/settings/<section>); bare /settings
               defaults to Appearance. */}
-          <Route path={`${prefix}/settings`} element={<SettingsPage />} />
-          <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
-          {/* Members / Policies are now settings sub-categories
+            <Route path={`${prefix}/settings`} element={<SettingsPage />} />
+            <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
+            {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
               keeps the settings sidebar nav instead of dropping back to
               the conversation list. Redirect the old standalone paths so
               existing bookmarks / links still land in the right place.
               Registered in every multi-user mode (accounts AND OIDC) —
               the sections self-gate to admins. */}
-          <Route
-            path={`${prefix}/members`}
-            element={<Navigate to={`${prefix}/settings/members`} replace />}
-          />
-          <Route
-            path={`${prefix}/policies`}
-            element={<Navigate to={`${prefix}/settings/policies`} replace />}
-          />
-          <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
-        </Route>
-      </Routes>
-    </Suspense>
+            <Route
+              path={`${prefix}/members`}
+              element={<Navigate to={`${prefix}/settings/members`} replace />}
+            />
+            <Route
+              path={`${prefix}/policies`}
+              element={<Navigate to={`${prefix}/settings/policies`} replace />}
+            />
+            <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
+          </Route>
+        </Routes>
+      </Suspense>
+    </>
   );
 }
 
