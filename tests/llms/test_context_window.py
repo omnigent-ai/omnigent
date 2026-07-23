@@ -8,6 +8,8 @@ cache-write rates from a catalog entry.
 
 from __future__ import annotations
 
+import json as _json_test
+import urllib.request
 from typing import Any
 
 import pytest
@@ -518,10 +520,6 @@ def test_fetch_model_pricing_already_prefixed_still_works(
     assert pricing.output_per_token == pytest.approx(3.0e-6)
 
 
-import json as _json_test
-import urllib.request
-
-
 class _ListResp:
     """Fake urllib response for the OpenRouter list-endpoint."""
 
@@ -531,7 +529,7 @@ class _ListResp:
     def read(self) -> bytes:
         return _json_test.dumps(self._payload).encode()
 
-    def __enter__(self) -> "_ListResp":
+    def __enter__(self) -> _ListResp:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -550,12 +548,14 @@ def _make_catalog(or_catalog: dict[str, Any] | None = None, other: dict[str, Any
     ``or_catalog`` is the ``openrouter`` provider catalog;
     ``other`` is any other provider (e.g. "anthropic").
     """
+
     def _catalog(provider: str) -> dict[str, Any] | None:
         if provider == "openrouter":
             return or_catalog
         if provider == "anthropic":
             return other
         return None
+
     return _catalog
 
 
@@ -579,9 +579,9 @@ def test_fetch_model_pricing_unknown_bare_id_falls_through(
     monkeypatch.setattr(
         urllib.request,
         "urlopen",
-        lambda url, timeout=3: _ListResp(_or_list_response(
-            {"id": "other/model", "pricing": {"prompt": "1", "completion": "2"}}
-        )),
+        lambda url, timeout=3: _ListResp(
+            _or_list_response({"id": "other/model", "pricing": {"prompt": "1", "completion": "2"}})
+        ),
     )
 
     assert fetch_model_pricing("nonexistent-model") is None
@@ -593,9 +593,7 @@ def test_fetch_model_pricing_single_segment_unknown_returns_none(
     """A single-segment id with no catalog entry returns ``None`` cleanly."""
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
     context_window._live_pricing_cache.clear()
-    monkeypatch.setattr(
-        context_window, "_fetch_mlflow_provider_catalog", lambda _: None
-    )
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", lambda _: None)
     monkeypatch.setenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
 
     assert fetch_model_pricing("unknown-model") is None
@@ -744,8 +742,7 @@ def test_fetch_model_pricing_live_fallback_malformed_list_returns_none(
         )
         result = fetch_model_pricing("test/model-v1")
         assert result is None, (
-            f"Malformed payload returned non-None: {result!r}"
-            f"  payload={malformed_payload!r}"
+            f"Malformed payload returned non-None: {result!r}  payload={malformed_payload!r}"
         )
 
 

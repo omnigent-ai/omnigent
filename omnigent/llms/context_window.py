@@ -327,21 +327,20 @@ def _fetch_live_openrouter_pricing(model: str) -> ModelPricing | None:
     :returns: :class:`ModelPricing` or ``None``.
     """
     import json as _json
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     # Normalise: strip a leading "openrouter/" so the bare vendor/model
     # matches the list-endpoint's ``id`` field.
     lookup_key = model
     if lookup_key.startswith("openrouter/"):
-        lookup_key = lookup_key[len("openrouter/"):]
+        lookup_key = lookup_key[len("openrouter/") :]
     elif "/" in lookup_key:
         _implicit_provider, _bare = lookup_key.split("/", 1)
         # If the implicit provider IS a real OpenRouter package (no slash
         # in the remainder after one more split), keep as-is.  If it looks
         # like another layer of namespace, leave the whole string; the
         # list-endpoint id is always the bare vendor/model.
-        pass
 
     with _live_pricing_cache_lock:
         cached = _live_pricing_cache.get(lookup_key, _LIVE_PRICING_MISS)
