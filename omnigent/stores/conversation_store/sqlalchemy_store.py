@@ -1490,6 +1490,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        See :meth:`ConversationStore.sum_daily_cost`. Day strings compare
+        lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
+        a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
+        an empty range, coalesced to ``0.0``.
+        """
+        with self._session() as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(SqlUserDailyCost.cost_usd), 0.0))
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+            ).scalar_one()
+            return float(total or 0.0)
+
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
         Return a user's daily cost rollup state for one UTC day.

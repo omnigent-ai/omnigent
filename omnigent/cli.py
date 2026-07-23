@@ -1478,6 +1478,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "uninstall",
         "update",
         "upgrade",
+        "usage",
         "version",
     }
 )
@@ -4965,6 +4966,163 @@ def import_session_command(
         click.echo(f"Failed: {failed_count}")
         if failed_count:
             raise click.ClickException(f"{failed_count} session(s) failed to import")
+
+
+def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[explicit-any]
+    """
+    Print the usage report: a daily-rollup cost summary plus per-session detail.
+
+    Styling routes through :mod:`omnigent.inner.ui` — the CLI palette SOT —
+    so headers/borders use the brand semantic tokens (``omni.accent`` /
+    ``omni.muted``) and adapt to light / dark terminals (no hard-coded colors).
+
+    The per-session block mirrors the web session sidebar: an authoritative
+    session total, then each model's recorded cost indented beneath. The
+    per-model costs are shown faithfully and may not sum to the session total
+    (native harnesses report one cumulative figure attributed to the active
+    model — see :class:`omnigent.server.schemas.SessionUsage`).
+
+    :param report: The decoded ``GET /v1/usage`` JSON body.
+    :param limit: Maximum number of sessions to show.
+    """
+    from rich.markup import escape
+    from rich.style import Style
+    from rich.text import Text
+
+    from omnigent.inner import ui
+
+    # rich resolves a theme token combined with an attribute only via a Style
+    # object or inline single-token markup, not a "bold omni.accent" style
+    # string — so build the accent header style explicitly.
+    accent_bold = ui.console.get_style("omni.accent") + Style(bold=True)
+
+    def money(value: float) -> str:
+        return f"${value:,.2f}"
+
+    ui.console.print()
+    ui.console.print(
+        "[omni.muted]Costs are best-effort estimates; consult your provider for "
+        "actual billing.[/omni.muted]"
+    )
+    ui.console.print()
+    ui.console.print(Text("Summary", style=accent_bold))
+    ui.kv("  Today", money(report.get("cost_today", 0.0)), label_width=15)
+    ui.kv("  Last 7 days", money(report.get("cost_last_7d", 0.0)), label_width=15)
+    ui.kv("  Last 30 days", money(report.get("cost_last_30d", 0.0)), label_width=15)
+    ui.kv("  All time", money(report.get("total_cost_usd", 0.0)), label_width=15)
+    ui.console.print()
+
+    all_sessions = report.get("sessions", [])
+    shown = all_sessions[:limit]
+    # Empty base Text so the muted count hint doesn't inherit the accent.
+    header = Text()
+    header.append("Per session", style=accent_bold)
+    header.append(f" (last {len(shown)})", style="omni.muted")
+    ui.console.print(header)
+    if not all_sessions:
+        ui.console.print("  [omni.muted]No usage recorded yet.[/omni.muted]")
+        return
+
+    # Three columns: Session ID · Model · Cost. A single-model session fits on
+    # one line; a multi-model session leaves the Model column blank on the
+    # session line (id + bold authoritative total) and lists each model on its
+    # own row beneath, cost muted to mark it as breakdown detail. The border
+    # uses the shared muted token so it adapts to light / dark.
+    tbl = Table(
+        box=box.SIMPLE_HEAVY,
+        show_edge=False,
+        header_style="bold",
+        border_style="omni.muted",
+    )
+    tbl.add_column("Session ID", style="omni.muted", no_wrap=True)
+    tbl.add_column("Model", no_wrap=True)
+    tbl.add_column("Cost", justify="right", no_wrap=True)
+    for s in shown:
+        sid = escape(str(s.get("id", "")))
+        total = f"[bold]{money(s.get('cost_usd', 0.0))}[/bold]"
+        # Dominant model first, so the biggest spend leads (cost desc).
+        models = sorted((s.get("models") or {}).items(), key=lambda kv: kv[1], reverse=True)
+        if len(models) <= 1:
+            model_cell = escape(str(models[0][0])) if models else "[omni.muted]—[/omni.muted]"
+            tbl.add_row(sid, model_cell, total)
+        else:
+            tbl.add_row(sid, "", total)
+            for name, cost in models:
+                tbl.add_row(
+                    "",
+                    escape(str(name)),
+                    f"[omni.muted]{money(float(cost))}[/omni.muted]",
+                )
+    ui.console.print(tbl)
+
+
+@cli.command("usage")
+@click.option(
+    "--limit",
+    default=10,
+    show_default=True,
+    help="Number of most-recent sessions to show in the per-session table.",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the raw usage report as JSON instead of the table.",
+)
+def usage(limit: int, server: str | None, as_json: bool) -> None:
+    """Show your Omnigent LLM cost for today / the last 7 / 30 days.
+
+    The summary is sourced from the per-user daily cost rollup, which
+    attributes spend to the UTC calendar day it occurred on — so the
+    windows reflect when spend actually happened, not just a session's
+    last-activity time. Below it, the most-recent sessions are listed with
+    each session's total and its per-model cost breakdown.
+
+    \b
+    Per-model costs are shown as recorded and may not sum to the session
+    total: native harnesses report one cumulative session figure attributed
+    to the active model, so a session that switched models mid-run shows a
+    snapshot per model rather than each model's own spend (the same
+    convention as the web session sidebar).
+
+    \b
+    Examples:
+      omnigent usage
+      omnigent usage --limit 25
+      omnigent usage --json
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        startup = ensure_local_omnigent_server()
+        base_url = startup.url
+    base_url = base_url.rstrip("/")
+
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=60.0
+    ) as client:
+        resp = client.get("/v1/usage")
+        resp.raise_for_status()
+        report = resp.json()
+
+    if as_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    _render_usage(report, limit)
 
 
 @cli.group("session", invoke_without_command=True)

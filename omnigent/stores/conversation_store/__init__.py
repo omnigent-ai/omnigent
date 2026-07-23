@@ -1003,6 +1003,27 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        Backs the ``omni usage`` rolling-window summary: the daily rollup
+        is time-attributed per calendar day, so summing the days in a
+        window gives spend that actually happened in that window (a
+        weeks-old session touched today no longer dumps its whole cost
+        into "today"). Day strings sort lexicographically because they are
+        zero-padded ``"YYYY-MM-DD"``, so the ``>=`` range works as a plain
+        string comparison.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as an ISO date
+            string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+        :returns: The summed ``cost_usd`` across matching days, or ``0.0``
+            when no rows fall in the range.
+        """
+        ...
+
+    @abstractmethod
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
         Return a user's daily cost rollup state for one UTC day.

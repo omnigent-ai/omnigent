@@ -87,6 +87,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -2295,6 +2296,16 @@ def create_app(
         ),
         prefix="/v1",
         tags=["imports"],
+    )
+    # Per-user LLM cost report (omni usage). User-scoped, not session-scoped,
+    # so it gets its own router rather than living under /sessions.
+    app.include_router(
+        create_usage_router(
+            conversation_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["usage"],
     )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
