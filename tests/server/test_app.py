@@ -688,6 +688,9 @@ def test_ensure_default_willy_agent_seeds_design_bundle(seed_stores: _SeedStores
         "review-product-ui",
     ]
     assert [tool.name for tool in loaded.spec.local_tools] == ["publish_design_artifact"]
+    artifact_instructions = server_app._WILLY_BUNDLE_SOURCE / "artifacts.md"
+    assert loaded.spec.instructions == artifact_instructions.read_text()
+    assert "virtual `artifacts/`" in loaded.spec.instructions
 
 
 def test_ensure_default_agents_includes_willy(seed_stores: _SeedStores) -> None:

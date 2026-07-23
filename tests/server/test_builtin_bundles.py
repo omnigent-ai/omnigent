@@ -75,6 +75,18 @@ def test_bundle_builder_produces_valid_tarball(
     )
 
 
+def test_willy_bundle_contains_editable_artifact_instructions() -> None:
+    """Willy ships its human-editable artifact contract inside the bundle."""
+    if _shipped_example_missing("_build_willy_bundle"):
+        pytest.skip("willy source not packaged in this deployment")
+
+    members = _tar_members(app._build_willy_bundle())
+    assert any(
+        member.lstrip("./") == "artifacts.md" or member.endswith("/artifacts.md")
+        for member in members
+    ), f"Willy bundle is missing artifacts.md; members={members!r}."
+
+
 @pytest.mark.parametrize(("builder", "spec_entry", "shipped_example"), _BUILDERS)
 def test_bundle_builder_is_reproducible(
     builder: str, spec_entry: str, shipped_example: bool
