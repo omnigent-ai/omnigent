@@ -6,9 +6,17 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
-import { useSyncExternalStore } from "react";
+import { type PointerEvent as ReactPointerEvent, useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -52,6 +60,11 @@ const mocks = vi.hoisted(() => {
     moveToProject: { mutate: vi.fn() },
     conversations: [] as unknown[],
     pinnedStore,
+    // Archive + stop mutations, so the swipe tests can assert the swipe→archive
+    // path drives the same stop→archive handler the kebab uses.
+    archive: { mutate: vi.fn() },
+    stopSession: { mutate: vi.fn() },
+    del: { mutate: vi.fn(), reset: vi.fn() },
   };
 });
 
@@ -66,8 +79,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
+    mutate: mocks.del.mutate,
+    reset: mocks.del.reset,
     isPending: false,
     isError: false,
     variables: undefined,
@@ -89,11 +102,11 @@ vi.mock("@/hooks/useConversations", () => ({
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
+  useArchiveConversation: () => mocks.archive,
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
+  useStopSession: () => mocks.stopSession,
   useProjects: () => ({ data: mocks.projects.map((name: string) => ({ id: `p_${name}`, name })) }),
   // A non-empty `useProjects` renders a project folder, which queries its
   // sessions — return the collapsed (disabled) shape so the folder is inert
@@ -127,7 +140,8 @@ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { __resetReadStateForTests, seedReadState } from "@/hooks/useUnseenConversations";
-import { Sidebar } from "./Sidebar";
+import { writeSwipeActions } from "@/lib/swipeActionPreferences";
+import { Sidebar, useRowSwipe } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -219,6 +233,24 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   mocks.moveToProject.mutate.mockReset();
+  // Resolve archive callbacks synchronously so the transient "Archiving…"
+  // status row settles back to the interactive row within the test.
+  mocks.archive.mutate.mockReset();
+  mocks.archive.mutate.mockImplementation(
+    (_args: unknown, opts?: { onSuccess?: () => void; onSettled?: () => void }) => {
+      opts?.onSuccess?.();
+      opts?.onSettled?.();
+    },
+  );
+  // The stop that precedes archiving (runArchive) fires its `onSettled` once
+  // the runner stop resolves; invoke it synchronously so the follow-on
+  // archive.mutate runs in tests.
+  mocks.stopSession.mutate.mockReset();
+  mocks.stopSession.mutate.mockImplementation((_id: string, opts?: { onSettled?: () => void }) => {
+    opts?.onSettled?.();
+  });
+  mocks.del.mutate.mockReset();
+  mocks.del.reset.mockReset();
   mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
@@ -672,6 +704,219 @@ describe("right-click context menu", () => {
     // inline rename input appears.
     fireEvent.click(screen.getByTestId("rename-conversation"));
     expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+  });
+});
+
+describe("touch swipe actions", () => {
+  // jsdom has no real touch, so drive the gesture with pointer events. The row
+  // handlers gate on a primary, non-mouse pointer (see useRowSwipe); default
+  // jsdom PointerEvents omit those, so set them explicitly. A swipe is a
+  // down → horizontal move past the commit threshold → up on the row's <li>.
+  const POINTER = { pointerId: 1, isPrimary: true, pointerType: "touch" as const };
+
+  function swipeRow(dx: number) {
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    // First move locks the axis; the second carries it past the commit point.
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + Math.sign(dx) * 20, clientY: 100 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+    fireEvent.pointerUp(li, { ...POINTER, clientX: 100 + dx, clientY: 100 });
+  }
+
+  it("runs the archive path when swiping the archive-configured direction", () => {
+    // Default: swipe-left → archive. Swipe left past the commit threshold.
+    mocks.isMobile = true;
+    renderSidebar();
+
+    swipeRow(-90);
+
+    // runArchive stops the runner first, then flips the archive flag — the same
+    // stop→archive handler the kebab's Archive item uses.
+    expect(mocks.stopSession.mutate).toHaveBeenCalledWith("conv_1", expect.anything());
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+    // Archive never routes through delete.
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("opens the delete confirm dialog (no immediate delete) when swiping the delete direction", () => {
+    // Map swipe-right → delete, then swipe right.
+    writeSwipeActions({ left: "archive", right: "delete" });
+    mocks.isMobile = true;
+    renderSidebar();
+
+    swipeRow(90);
+
+    // The confirm dialog opens — delete stays behind it, so no mutation yet.
+    expect(screen.getByText("Delete conversation?")).toBeInTheDocument();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+
+    // Confirming in the dialog fires the same delete the kebab flow uses.
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(mocks.del.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", deleteBranch: false },
+      expect.anything(),
+    );
+  });
+
+  it("does nothing when swiping a direction mapped to none", () => {
+    // Default: swipe-right → none. Swipe right; nothing should fire.
+    mocks.isMobile = true;
+    renderSidebar();
+
+    swipeRow(90);
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+    expect(screen.queryByText("Delete conversation?")).toBeNull();
+  });
+
+  it("supports both directions mapped to the same action", () => {
+    // Both directions archive — a swipe either way runs the archive path.
+    writeSwipeActions({ left: "archive", right: "archive" });
+    mocks.isMobile = true;
+    renderSidebar();
+
+    swipeRow(90);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+
+    mocks.archive.mutate.mockClear();
+    swipeRow(-90);
+    expect(mocks.archive.mutate).toHaveBeenCalledWith(
+      { id: "conv_1", archived: true },
+      expect.anything(),
+    );
+  });
+
+  it("does not fire the action for a short swipe below the commit threshold", () => {
+    mocks.isMobile = true;
+    renderSidebar();
+
+    // Past the activation lock (20px) but short of the commit distance (72px).
+    swipeRow(-40);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("ignores swipes on desktop (non-touch viewport)", () => {
+    // Desktop (default isMobile=false) leaves the gesture disabled entirely.
+    renderSidebar();
+
+    swipeRow(-90);
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  });
+
+  it("ignores non-touch pointers (pen/stylus/mouse) on mobile", () => {
+    // The gesture is touch-only; a pen swipe past the threshold must not fire.
+    mocks.isMobile = true;
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    const pen = { pointerId: 1, isPrimary: true, pointerType: "pen" as const };
+    fireEvent.pointerDown(li, { ...pen, clientX: 100, clientY: 100 });
+    fireEvent.pointerMove(li, { ...pen, clientX: 120, clientY: 100 });
+    fireEvent.pointerMove(li, { ...pen, clientX: 190, clientY: 100 });
+    fireEvent.pointerUp(li, { ...pen, clientX: 190, clientY: 100 });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+
+  it("yields a primarily-vertical drag to scroll (no action)", () => {
+    // A mostly-vertical move is scroll intent — the gesture bails and never
+    // fires, even though it travels well past the commit distance horizontally.
+    mocks.isMobile = true;
+    renderSidebar();
+
+    const li = screen.getByRole("link", { name: /My Session/ }).closest("li")!;
+    fireEvent.pointerDown(li, { ...POINTER, clientX: 100, clientY: 100 });
+    // First move is dominated by the vertical axis → decided="other".
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 105, clientY: 140 });
+    fireEvent.pointerMove(li, { ...POINTER, clientX: 10, clientY: 180 });
+    fireEvent.pointerUp(li, { ...POINTER, clientX: 10, clientY: 180 });
+
+    expect(mocks.archive.mutate).not.toHaveBeenCalled();
+    expect(mocks.del.mutate).not.toHaveBeenCalled();
+  });
+});
+
+describe("useRowSwipe — dnd coexistence", () => {
+  // Focused hook tests: driving real dnd-kit dragging in jsdom is unreliable,
+  // so control `isDragging` directly to prove the swipe yields to the drag.
+  const ACTIONS = { left: "archive", right: "none" } as const;
+
+  function makePointer(over: { pointerId: number; clientX: number; clientY: number }) {
+    // Minimal ReactPointerEvent stand-in — only the fields useRowSwipe reads,
+    // plus pointer-capture no-ops (jsdom's are stubbed in test-setup).
+    return {
+      pointerType: "touch",
+      isPrimary: true,
+      preventDefault: () => {},
+      currentTarget: {
+        setPointerCapture: () => {},
+        releasePointerCapture: () => {},
+        hasPointerCapture: () => false,
+      },
+      ...over,
+    } as unknown as ReactPointerEvent;
+  }
+
+  it("(a) yields a primarily-vertical move: decided=other, no translate, no action", () => {
+    const onAction = vi.fn();
+    const { result } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging: false, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    act(() => {
+      // Vertical dominates → the gesture hands off to scroll/drag.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
+    });
+    // No translate offset accumulated.
+    expect(result.current.dx).toBe(0);
+
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 105, clientY: 140 }));
+    });
+    expect(onAction).not.toHaveBeenCalled();
+  });
+
+  it("(b) bails once a dnd-kit drag begins mid-gesture: dx resets, no action on release", () => {
+    const onAction = vi.fn();
+    let isDragging = false;
+    const { result, rerender } = renderHook(() =>
+      useRowSwipe({ enabled: true, actions: ACTIONS, isDragging, onAction }),
+    );
+
+    act(() => {
+      result.current.onPointerDown(makePointer({ pointerId: 1, clientX: 100, clientY: 100 }));
+    });
+    act(() => {
+      // A real horizontal swipe left (the archive-configured direction) locks
+      // in and translates the row.
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 70, clientY: 100 }));
+    });
+    expect(result.current.dx).not.toBe(0);
+
+    // dnd-kit's long-press drag activates; re-render with isDragging=true.
+    isDragging = true;
+    rerender();
+    act(() => {
+      result.current.onPointerMove(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
+    });
+    // The swipe bailed: translate snaps back to rest.
+    expect(result.current.dx).toBe(0);
+
+    act(() => {
+      result.current.onPointerUp(makePointer({ pointerId: 1, clientX: 20, clientY: 100 }));
+    });
+    expect(onAction).not.toHaveBeenCalled();
   });
 });
 
