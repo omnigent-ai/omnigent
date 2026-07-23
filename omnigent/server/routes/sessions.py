@@ -4214,6 +4214,18 @@ def create_sessions_router(
         marker still goes through the declared-name gate (it would
         otherwise be an arbitrary-terminal bypass).
 
+        The exemption additionally requires the caller to be the
+        session **owner**. Skipping the declared-name gate lets the
+        body's ``spec`` supply the terminal's ``command``/``args``/
+        ``env``, which the runner's synthesize-from-body path then
+        executes — so an ``EDIT`` grantee reaching the exemption would
+        gain arbitrary command execution on the owner's runner. The
+        only legitimate senders of that body are the local CLI wrappers
+        (``omnigent claude``/``antigravity``/…), which always run as the
+        owner; a non-owner ``EDIT`` grantee falls through to the
+        declared-name gate instead, where an undeclared native name is
+        rejected.
+
         :param session_id: Session/conversation identifier.
         :param request: JSON body with ``terminal`` and
             ``session_key``.
@@ -4228,6 +4240,24 @@ def create_sessions_router(
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
             and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
+            # Owner-only: the exemption forwards the body's spec
+            # (command/args/env) verbatim to the runner's
+            # synthesize-from-body launch, so restricting it to the
+            # owner keeps an EDIT grantee from turning it into arbitrary
+            # code execution on the owner's runner. ``permission_store
+            # is None`` is the single-user / no-auth deployment, where
+            # every caller is effectively the owner.
+            and (
+                permission_store is None
+                or await asyncio.to_thread(
+                    check_session_access,
+                    _get_user_id(request, auth_provider),
+                    session_id,
+                    LEVEL_OWNER,
+                    permission_store,
+                    conversation_store,
+                )
+            )
         )
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
