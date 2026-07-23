@@ -9571,6 +9571,17 @@ async def _forward_event_to_runner(
                     _auto_model,
                     _auto_verdict,
                 )
+                # Mirror into the parent's transcript so the orchestrator's
+                # session shows which model was chosen for this sub-agent —
+                # the decision is otherwise only visible on the child screen.
+                if conv.parent_conversation_id is not None:
+                    await _emit_server_routing_decision(
+                        conv.parent_conversation_id,
+                        conversation_store,
+                        _auto_model,
+                        _auto_verdict,
+                        agent=agent_name or "",
+                    )
             elif _auto_error is not None:
                 # Routing failed — emit a routing card (applied=False) so the
                 # user sees why auto-harness fell back to defaults.
@@ -9580,6 +9591,14 @@ async def _forward_event_to_runner(
                     "unavailable",
                     {"rationale": _auto_error, "applied": False},
                 )
+                if conv.parent_conversation_id is not None:
+                    await _emit_server_routing_decision(
+                        conv.parent_conversation_id,
+                        conversation_store,
+                        "unavailable",
+                        {"rationale": _auto_error, "applied": False},
+                        agent=agent_name or "",
+                    )
 
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
