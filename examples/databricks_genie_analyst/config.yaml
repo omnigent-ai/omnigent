@@ -1,0 +1,77 @@
+# Databricks Genie Analyst — ask natural-language questions of governed data in
+# Databricks through a Genie space, over the Databricks-managed MCP server.
+#
+# This is the Databricks-on-AWS companion to the aws_analyst example: where
+# aws_analyst reaches Amazon Redshift + S3 Tables through the AWS Labs MCP
+# servers, this agent reaches Unity Catalog-governed tables through Databricks
+# Genie — the two together make a "better together" analyst that reasons across
+# both platforms.
+#
+# The Genie space is reached through the Databricks-managed MCP server (no custom
+# connector code): a plain HTTP MCP endpoint whose URL embeds the Genie space id.
+# Auth is handled by `databricks_profile` — omnigent resolves an OAuth token from
+# ~/.databrickscfg at connection time and injects it as `Authorization: Bearer …`,
+# so no token is ever written into this file.
+#
+# Prerequisites:
+#   - A Databricks workspace on AWS with a Genie space you can query.
+#   - The Databricks CLI configured with a profile (`databricks auth login
+#     --profile <name>`) that has access to that Genie space.
+#
+# Usage:
+#   DATABRICKS_HOSTNAME=my-workspace.cloud.databricks.com \
+#   DATABRICKS_GENIE_SPACE_ID=01ef... \
+#   DATABRICKS_PROFILE=my-profile \
+#     omnigent run examples/databricks_genie_analyst
+
+spec_version: 1
+name: databricks_genie_analyst
+description: >-
+  An analyst agent that answers natural-language questions over Unity
+  Catalog-governed data through a Databricks Genie space, reached over the
+  Databricks-managed MCP server (read-only, OAuth via a Databricks profile).
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+tools:
+  # Databricks Genie — the managed MCP server for a single Genie space. The URL
+  # follows the documented managed-MCP pattern:
+  #   https://<workspace-hostname>/api/2.0/mcp/genie/<space-id>
+  # `databricks_profile` makes omnigent mint an OAuth bearer token from
+  # ~/.databrickscfg at connect time (the `genie` scope) — nothing secret lives
+  # in this config. The Genie MCP surface is inherently read-only: it answers
+  # questions and returns SQL results; it does not mutate data.
+  genie:
+    type: mcp
+    transport: http
+    url: https://${DATABRICKS_HOSTNAME}/api/2.0/mcp/genie/${DATABRICKS_GENIE_SPACE_ID}
+    auth:
+      type: databricks
+      profile: ${DATABRICKS_PROFILE}
+    description: >-
+      Databricks Genie space over the managed MCP server — natural-language
+      questions become governed SQL over Unity Catalog tables.
+
+prompt: |
+  You are a Databricks data analyst. You answer questions over Unity
+  Catalog-governed data through a single toolset:
+
+  - `genie` — a Databricks Genie space, reached over the Databricks-managed MCP
+    server. You ask Genie natural-language questions about the data domain the
+    space is configured for; Genie translates them into governed SQL over Unity
+    Catalog and returns results (and the SQL it ran).
+
+  Rules:
+  - Genie is the source of truth for what data exists — don't assume tables or
+    columns. If a question is ambiguous or spans data the space may not cover,
+    ask Genie a scoping question first (or tell the user what the space covers).
+  - This surface is read-only: it answers analytical questions. Never imply you
+    can insert, update, or delete data.
+  - When Genie returns the SQL it ran, surface it — the value of a governed
+    analytics layer is that every answer is auditable back to a query.
+  - If Genie can't answer (the data isn't in this space), say so plainly rather
+    than guessing. In a Databricks-on-AWS "better together" setup, that data may
+    live in a source the aws_analyst example covers (Amazon Redshift / S3 Tables).
