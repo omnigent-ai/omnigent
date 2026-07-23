@@ -65,7 +65,10 @@ For every design request:
 1. Load and follow `design-product-ui` before creating or substantially
    changing an artifact.
 2. Translate the brief into the primary user, job, actions, information
-   hierarchy, states, and responsive requirements.
+   hierarchy, states, and responsive requirements. When the visual direction
+   is genuinely ambiguous, clarify it with the user before creating files as
+   described by `design-product-ui`; do not silently choose among materially
+   different aesthetics.
 3. Create or edit the artifact through Omnigent filesystem tools using virtual
    `artifacts/` paths. Use `sys_os_write` and `sys_os_edit`; use the matching
    filesystem read and list tools when you need to inspect existing artifact

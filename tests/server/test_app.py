@@ -691,6 +691,11 @@ def test_ensure_default_willy_agent_seeds_design_bundle(seed_stores: _SeedStores
     artifact_instructions = server_app._WILLY_BUNDLE_SOURCE / "artifacts.md"
     assert loaded.spec.instructions == artifact_instructions.read_text()
     assert "virtual `artifacts/`" in loaded.spec.instructions
+    assert "genuinely ambiguous" in loaded.spec.instructions
+    design_skill = next(skill for skill in loaded.spec.skills if skill.name == "design-product-ui")
+    assert "3–5 questions" in design_skill.content
+    assert "visual references, palette, typography" in design_skill.content
+    assert "says to use your judgment" in design_skill.content
     assert loaded.spec.guardrails is not None
     assert loaded.spec.guardrails.policies is not None
     deny_shell = next(
