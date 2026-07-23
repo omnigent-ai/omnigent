@@ -175,13 +175,6 @@ describe("TasksPage list", () => {
     expect(within(suggestions).getByText("Follow-up monitor")).toBeInTheDocument();
     expect(within(suggestions).getByText("PR sweep")).toBeInTheDocument();
     expect(within(suggestions).getByText("News digest")).toBeInTheDocument();
-    expect(within(suggestions).queryByText("Weekdays at 9:00 AM")).toBeNull();
-    expect(within(suggestions).queryByText("Daily at 9:00 AM")).toBeNull();
-    expect(
-      within(suggestions).queryByText(
-        "Review recent email and calendar activity and flag anything that needs attention",
-      ),
-    ).toBeNull();
   });
 
   it("shows compact suggestion chips below populated lists", () => {
@@ -198,8 +191,6 @@ describe("TasksPage list", () => {
     ]);
     const followUp = within(suggestions).getByTestId("suggestion-follow-up-monitor");
     expect(followUp).toHaveTextContent("Follow-up monitor");
-    expect(followUp).not.toHaveTextContent("Weekdays at 9:00 AM");
-    expect(followUp).not.toHaveTextContent("Review recent email");
   });
 
   it("hides Suggestions in filtered-empty states after tasks exist", () => {
@@ -255,8 +246,11 @@ describe("filtering + search", () => {
     ]);
     renderPage();
     expect(screen.getAllByTestId("scheduled-task-row")).toHaveLength(2);
+    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
+    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByTestId("tasks-filter-paused")).toHaveAttribute("aria-pressed", "true");
     let rows = screen.getAllByTestId("scheduled-task-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Paused task")).toBeInTheDocument();

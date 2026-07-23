@@ -3,8 +3,8 @@
  * tasks, a search + Active/Paused filter, a "New task" manual-create action,
  * and a static Suggestions section below.
  *
- * Data comes from `useScheduledTasks` (GET /v1/scheduled-tasks). Pause/resume
- * and delete go through the update/delete mutations, which invalidate the list.
+ * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
+ * update/delete mutations, which invalidate the list.
  * The human-readable schedule and next-run text are computed client-side from
  * each task's stored RRULE (`scheduleText`) — there is no backend next-run
  * endpoint.
@@ -143,13 +143,12 @@ export function TasksPage() {
           />
         </div>
         {hasAnyTasks && (
-          <div role="tablist" aria-label="Filter tasks" className="flex items-center gap-1">
+          <div aria-label="Filter tasks" className="flex items-center gap-1">
             {FILTER_TABS.map((tab) => (
               <button
                 key={tab.value}
                 type="button"
-                role="tab"
-                aria-selected={filter === tab.value}
+                aria-pressed={filter === tab.value}
                 data-testid={`tasks-filter-${tab.value}`}
                 onClick={() => setFilter(tab.value)}
                 className={cn(
@@ -278,10 +277,7 @@ function SuggestionsSection({
       data-testid="tasks-suggestions"
     >
       {showHeading && <h2 className="mb-3 text-sm text-muted-foreground">Suggestions</h2>}
-      {/* Compact chips that wrap onto multiple lines. Each chip is an icon +
-          TITLE only (no description) — a bordered, hoverable pill. Clicking a
-          chip prefills/creates the task, same as the old row. Icons are neutral
-          (muted) inside the neutral chip, matching the reference. */}
+      {/* Compact chips that wrap onto multiple lines. */}
       <div className="flex flex-wrap gap-2">
         {SCHEDULED_TASK_SUGGESTIONS.map((s) => {
           const Icon = s.icon;
