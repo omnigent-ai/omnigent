@@ -145,3 +145,54 @@ def test_remove_session_from_project(
     expect(_section(page, "Sessions").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     expect(page.get_by_role("button", name=project, exact=True)).to_have_count(1)
     expect(_section(page, project).locator(f'a[href="/c/{session_id}"]')).to_have_count(0)
+
+
+# A phone-width viewport: below the 768px `md` breakpoint, so the sidebar is the
+# mobile overlay and the folder header's new-session pencil (`max-md:hidden`)
+# collapses into the kebab.
+_MOBILE_VIEWPORT = {"width": 390, "height": 780}
+
+
+def test_project_new_session_folds_into_kebab_on_mobile(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """On mobile the folder pencil hides and its action lives in the kebab.
+
+    On desktop the project-folder header shows a hover-revealed pencil that
+    starts a new session pre-filed under the project. Below the ``md``
+    breakpoint the pencil is hidden (``max-md:hidden``) and the same action is
+    offered as a ``md:hidden`` "New session" item inside the folder kebab,
+    linking to the pre-filed composer (``/?project=<name>``). Drives the real
+    responsive chain the ``Sidebar`` unit test asserts via class names.
+    """
+    base_url, session_id = seeded_session
+    title = f"e2e-proj-mobile-{uuid.uuid4().hex[:8]}"
+    _set_title(base_url, session_id, title)
+    project = f"Project {uuid.uuid4().hex[:6]}"
+
+    # File the session into a fresh project on desktop first (the mobile overlay
+    # hides the row kebab's hover affordances), then shrink to phone width.
+    page.goto(f"{base_url}/c/{session_id}")
+    _move_to_new_project(page, _row(page, session_id), project)
+    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
+
+    # Shrink to phone width; the mobile sidebar starts closed, so reopen it via
+    # the one-shot ``?sidebar=open`` param (the notification-tap destination).
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}?sidebar=open")
+
+    header = page.get_by_role("button", name=project, exact=True)
+    expect(header).to_be_visible()
+
+    # The pencil is in the DOM but hidden at this width (max-md:hidden).
+    expect(page.get_by_test_id("project-new-session")).to_be_hidden()
+
+    # Open the folder kebab → the mobile-only "New session" item, pre-filed
+    # under this project via the ?project= composer link.
+    header.hover()
+    page.get_by_test_id("project-actions").click()
+    # asChild renders the item as the <a> itself, so the link href lives on it.
+    menu_item = page.get_by_test_id("project-new-session-menu")
+    expect(menu_item).to_be_visible()
+    expect(menu_item).to_have_attribute("href", f"/?project={project.replace(' ', '%20')}")
