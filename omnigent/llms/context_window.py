@@ -131,6 +131,18 @@ def _registry_context_window(model: str) -> int | None:
 _FALLBACK_CACHE_READ_INPUT_RATIO: float = 0.10
 _FALLBACK_CACHE_WRITE_INPUT_RATIO: float = 1.25
 
+# Live OpenRouter pricing lookup cache.  Used as a last-resort fallback when
+# neither the provider-specific MLflow catalog nor the openrouter MLflow
+# catalog prices a model.  Same TTL / maxsize / lock pattern as the catalog
+# cache above.  ``None`` is cached on 404/timeout/malformed-response so a
+# transient failure doesn't re-fire on every turn.
+_OPENROUTER_LIVE_TTL_SECONDS = 3600
+_live_pricing_cache: cachetools.TTLCache[str, ModelPricing | None] = cachetools.TTLCache(
+    maxsize=64, ttl=_OPENROUTER_LIVE_TTL_SECONDS
+)
+_live_pricing_cache_lock = threading.Lock()
+_LIVE_PRICING_MISS = object()  # sentinel distinguishing "absent" from cached ``None``
+
 
 def _infer_provider(bare: str) -> str | None:
     """
@@ -283,6 +295,73 @@ def _fetch_context_window_from_mlflow(model: str) -> int | None:
                 return int(next(iter(windows)))  # type: ignore[arg-type]
 
     return None
+
+
+def _fetch_live_openrouter_pricing(model: str) -> ModelPricing | None:
+    """
+    Fetch per-token pricing from the OpenRouter models API.
+
+    Last-resort fallback for models absent from the MLflow openrouter
+    catalog (e.g. ``z-ai/glm-5.2``, ``moonshotai/kimi-k3``).  The
+    response carries per-token prices (prompt/completion/cache_read) as
+    strings; non-token components (request, image, reasoning) are not
+    modeled so this is an estimate.
+
+    Returns ``None`` (without raising) on any network / parse error or
+    404, and caches failures to avoid re-fire during a transient outage.
+
+    :param model: The full OpenRouter model id, e.g.
+        ``"z-ai/glm-5.2"``.
+    :returns: :class:`ModelPricing` or ``None``.
+    """
+    import json
+    import urllib.request
+
+    with _live_pricing_cache_lock:
+        cached = _live_pricing_cache.get(model, _LIVE_PRICING_MISS)
+        if cached is not _LIVE_PRICING_MISS:
+            return cached
+
+    url = f"https://openrouter.ai/api/v1/models/{model}"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        with _live_pricing_cache_lock:
+            _live_pricing_cache[model] = None
+        return None
+
+    pricing_raw = data.get("data", {}).get("pricing")
+    if not isinstance(pricing_raw, dict):
+        with _live_pricing_cache_lock:
+            _live_pricing_cache[model] = None
+        return None
+
+    def _to_float(val: object) -> float | None:
+        """Parse a pricing string to float, returning ``None`` on failure."""
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    input_pt = _to_float(pricing_raw.get("prompt"))
+    output_pt = _to_float(pricing_raw.get("completion"))
+    if input_pt is None or output_pt is None:
+        with _live_pricing_cache_lock:
+            _live_pricing_cache[model] = None
+        return None
+
+    result = ModelPricing(
+        input_per_token=input_pt,
+        output_per_token=output_pt,
+        cache_read_per_token=_to_float(pricing_raw.get("input_cache_read")),
+        cache_write_per_token=None,  # OpenRouter doesn't publish cache-write
+    )
+    with _live_pricing_cache_lock:
+        _live_pricing_cache[model] = result
+    return result
 
 
 def get_model_context_window(model: str) -> int:
@@ -445,8 +524,6 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         return None
 
     models = _fetch_mlflow_provider_catalog(provider)
-    if models is None:
-        return None
 
     def _extract(entry: object) -> ModelPricing | None:
         """Extract per-token pricing (incl. cache rates) from a catalog entry."""
@@ -472,7 +549,7 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
             ),
         )
 
-    entry = models.get(bare)
+    entry = models.get(bare) if models is not None else None
     if entry is not None:
         result = _extract(entry)
         if result is not None:
@@ -480,7 +557,7 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
 
     # Family-prefix fallback: strip last hyphen segment and look for
     # entries that share the same pricing.
-    if "-" in bare:
+    if "-" in bare and models is not None:
         prefix = bare.rsplit("-", 1)[0]
         matched = [e for name, e in models.items() if name.startswith(prefix)]
         prices = {_extract(e) for e in matched if _extract(e) is not None}
@@ -500,6 +577,35 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         base = bare[len("databricks-") :]
         if base and base != bare:
             return fetch_model_pricing(base)
+
+    # OpenRouter vendor/model retry.  For bare ``vendor/model`` ids
+    # (e.g. ``xiaomi/mimo-v2.5-pro``, ``moonshotai/kimi-k3``) the initial
+    # split treats ``vendor`` as the MLflow provider, which has no catalog.
+    # Retry once against the ``openrouter`` MLflow catalog using the full
+    # ``vendor/model`` string as the key -- the MLflow openrouter.json
+    # stores these ids verbatim.
+    if "/" in model:
+        or_models = _fetch_mlflow_provider_catalog("openrouter")
+        if or_models is not None:
+            entry = or_models.get(model)
+            if entry is not None:
+                result = _extract(entry)
+                if result is not None:
+                    return result
+            # Family-prefix fallback within the openrouter catalog too.
+            if "-" in model:
+                prefix = model.rsplit("-", 1)[0]
+                matched = [e for n, e in or_models.items() if n.startswith(prefix)]
+                prices = {_extract(e) for e in matched if _extract(e) is not None}
+                if len(prices) == 1:
+                    return next(iter(prices))
+
+    # Live OpenRouter API fallback for models absent from MLflow entirely
+    # (e.g. ``z-ai/glm-5.2``, ``moonshotai/kimi-k3`` when the family-
+    # prefix doesn't match).  Caches results; never raises into the
+    # turn-completion path.
+    if "/" in model:
+        return _fetch_live_openrouter_pricing(model)
 
     return None
 
