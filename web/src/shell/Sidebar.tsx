@@ -695,7 +695,12 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
           <nav
             ref={scrollContainerRef}
-            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-gutter:stable]"
+            // `stable both-edges` reserves the scrollbar gutter symmetrically
+            // (left + right) so rows stay centered and content never reflows
+            // when the scrollbar appears/disappears — on classic-scrollbar
+            // platforms as well as overlay ones. Plain `stable` (right-only)
+            // left rows visually off-center against the left `px-2` inset.
+            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-gutter:stable_both-edges]"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -1526,7 +1531,9 @@ function ConversationList({
                     const allExpanded =
                       allNames.length > 0 && allNames.every((n) => expandedProjects.includes(n));
                     return (
-                      <div className="flex items-center">
+                      // gap-0.5 between the two controls mirrors the row/folder
+                      // icon spacing, so every right-gutter pair lines up.
+                      <div className="flex items-center gap-0.5">
                         {showExpandControls &&
                           (allExpanded ? (
                             <Tooltip>
@@ -1534,7 +1541,7 @@ function ConversationList({
                                 <Button
                                   type="button"
                                   variant="ghost"
-                                  size="icon-sm"
+                                  size="icon-xs"
                                   aria-label="Collapse to previous"
                                   data-testid="revert-projects"
                                   onClick={(e) => {
@@ -1553,7 +1560,7 @@ function ConversationList({
                                 <Button
                                   type="button"
                                   variant="ghost"
-                                  size="icon-sm"
+                                  size="icon-xs"
                                   aria-label="Expand all"
                                   data-testid="expand-all-projects"
                                   onClick={(e) => {
@@ -2385,24 +2392,27 @@ function SessionTooltipContent({
   return (
     <TooltipContent
       side="right"
-      sideOffset={12}
+      align="start"
+      sideOffset={8}
       data-testid="session-tooltip-content"
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch gap-3 rounded-xl bg-card-solid px-4 py-3 whitespace-normal shadow-lg"
+      // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
+      // then a muted, small-icon metadata line.
+      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-md ring-1 ring-foreground/10"
     >
-      <div className="text-sm font-medium leading-snug">
+      <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
         <span className="font-normal text-muted-foreground">
           {" · "}
           {relativeTime(conversation.updated_at * 1000)}
         </span>
-      </div>
-      <div
+      </p>
+      <p
         data-testid="session-tooltip-location"
-        className="flex items-center gap-2 text-sm text-muted-foreground"
+        className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
       >
-        <LaptopIcon aria-hidden className="size-4 shrink-0" />
+        <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
         <span className="truncate">{locationLabel}</span>
-      </div>
+      </p>
     </TooltipContent>
   );
 }
@@ -2742,7 +2752,9 @@ function ConversationRow({
       className={cn(
         "sidebar-compact-text relative flex min-h-7 flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
         SIDEBAR_HOVER_HIGHLIGHT,
-        selectionMode ? "w-full" : "w-[calc(100%+1rem)]",
+        // Full width (not 100%+1rem) so the highlight stays inset from the
+        // right edge, aligning with the project/folder rows above.
+        "w-full",
         !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-14"),
         selectionMode && "pr-10",
         isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -2889,83 +2901,90 @@ function ConversationRow({
           <SessionStateBadge state={sessionState} />
         </span>
       ) : null}
-      {/* Archived rows omit the pin entirely: pinning is meaningless there
-          (archive outranks pin), so there's no pin action even on hover. Also
-          hidden while selecting (bulk mode owns the row controls). */}
-      {!selectionMode && !isArchived && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-          data-testid="quick-pin-conversation"
-          className={cn(
-            "-translate-y-1/2 absolute top-1/2 right-[14px] transition-opacity",
-            // Desktop-only quick affordance: hidden on mobile (the kebab's
-            // Pin item below covers that), hover/focus-revealed from `md` up.
-            // Pinned rows no longer keep a persistent pin marker, since the
-            // "Pinned" section header (and pinned-first ordering inside a
-            // project) already conveys the pinned state. Revealed glyph:
-            // unpin if pinned, pin otherwise.
-            //
-            // `md:inline-flex` (not `md:block`): the Button base is
-            // `inline-flex` and relies on it for `items-center justify-center`
-            // to center the icon. `md:block` would override that display and
-            // collapse the centering, leaving the glyph pinned to the top-left
-            // of the button — so keep the flex display when revealing it.
-            "hidden md:inline-flex",
-            "md:opacity-0 md:group-hover:opacity-100",
-            "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-          )}
-          onClick={(e) => {
-            // Keep the toggle click off the surrounding Link (no navigation).
-            e.preventDefault();
-            e.stopPropagation();
-            onTogglePinned(conversation.id);
-          }}
-        >
-          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-        </Button>
-      )}
+      {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
+          row, so their spacing is defined once (gap-0.5) and stays aligned
+          with the project-folder header actions, which use the same pattern.
+          The kebab is the rightmost child (pinned to right-1); the pin sits a
+          gap to its left. Hidden entirely while selecting (bulk mode owns the
+          row controls). */}
       {!selectionMode && (
-        <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-          <DropdownMenuTrigger asChild>
+        <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+          {/* Archived rows omit the pin entirely: pinning is meaningless there
+              (archive outranks pin), so there's no pin action even on hover. */}
+          {!isArchived && (
             <Button
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label="Conversation actions"
-              data-testid="conversation-actions"
-              // Absolute-positioned trigger. On mobile (no hover state)
-              // it's always visible. On desktop it stays hidden until
-              // hover / keyboard focus, with `aria-expanded` keeping it
-              // surfaced while the menu is open so the trigger doesn't
-              // vanish under the cursor.
+              aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+              data-testid="quick-pin-conversation"
               className={cn(
-                "-translate-y-1/2 absolute top-1/2 -right-3 transition-opacity",
-                "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                "md:aria-expanded:opacity-100",
+                // Desktop-only quick affordance: hidden on mobile (the kebab's
+                // Pin item below covers that), hover/focus-revealed from `md`
+                // up. Pinned rows no longer keep a persistent pin marker, since
+                // the "Pinned" section header (and pinned-first ordering inside
+                // a project) already conveys the pinned state. Revealed glyph:
+                // unpin if pinned, pin otherwise.
+                //
+                // `md:inline-flex` (not `md:block`): the Button base is
+                // `inline-flex` and relies on it for `items-center
+                // justify-center` to center the icon. `md:block` would override
+                // that display and collapse the centering, leaving the glyph
+                // pinned to the top-left of the button — so keep the flex
+                // display when revealing it.
+                "transition-opacity",
+                "hidden md:inline-flex",
+                "md:opacity-0 md:group-hover:opacity-100",
+                "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
               )}
               onClick={(e) => {
-                // Keep the trigger click from bubbling into the Link.
+                // Keep the toggle click off the surrounding Link (no navigation).
                 e.preventDefault();
                 e.stopPropagation();
+                onTogglePinned(conversation.id);
               }}
             >
-              <MoreHorizontalIcon className="size-3.5" />
+              {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
             </Button>
-          </DropdownMenuTrigger>
-          {/* text-xs on every menu item (incl. the submenu trigger): a smaller,
-              denser kebab that reads closer to the row text. Scoped here so the
-              shared dropdown-menu component is untouched. */}
-          <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitem]]:text-xs">
-            <ConversationMenuItems
-              components={dropdownBundle}
-              setMenuOpen={setMenuOpen}
-              {...menuItemProps}
-            />
-          </DropdownMenuContent>
-        </DropdownMenu>
+          )}
+          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Conversation actions"
+                data-testid="conversation-actions"
+                // On mobile (no hover state) it's always visible. On desktop it
+                // stays hidden until hover / keyboard focus, with `aria-expanded`
+                // keeping it surfaced while the menu is open so the trigger
+                // doesn't vanish under the cursor.
+                className={cn(
+                  "transition-opacity",
+                  "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
+                  "md:aria-expanded:opacity-100",
+                )}
+                onClick={(e) => {
+                  // Keep the trigger click from bubbling into the Link.
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+              >
+                <MoreHorizontalIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            {/* text-xs on every menu item (incl. the submenu trigger): a smaller,
+                denser kebab that reads closer to the row text. Scoped here so the
+                shared dropdown-menu component is untouched. */}
+            <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitem]]:text-xs">
+              <ConversationMenuItems
+                components={dropdownBundle}
+                setMenuOpen={setMenuOpen}
+                {...menuItemProps}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       )}
       <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
       <Dialog
@@ -3112,7 +3131,7 @@ function PinnedProjectFlyoutContent({
       {/* Titles have no length cap (server + rename input are unbounded), so
           clamp to 3 wrapped lines to keep the card tidy — full text stays in
           the DOM. */}
-      <p className="line-clamp-3 font-medium text-sm">{title}</p>
+      <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
         <FolderIcon className="size-3.5 shrink-0" />
         <span className="truncate">{projectName}</span>
@@ -3228,7 +3247,9 @@ function ProjectFolderActions({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   return (
-    <div className="flex items-center">
+    // gap-0.5 (2px) between the pencil and kebab mirrors the session row's
+    // pin↔kebab spacing, so the two icon columns line up across row types.
+    <div className="flex items-center gap-0.5">
       {/* Desktop-only quick affordance; on mobile it folds into the kebab's
           "New session" item below. */}
       <Tooltip>
@@ -3237,7 +3258,7 @@ function ProjectFolderActions({
             asChild
             type="button"
             variant="ghost"
-            size="icon-sm"
+            size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
             className="max-md:hidden"
@@ -3295,7 +3316,7 @@ function ProjectFolderMenu({
           <Button
             type="button"
             variant="ghost"
-            size="icon-sm"
+            size="icon-xs"
             aria-label={`Project actions for ${projectName}`}
             data-testid="project-actions"
             // Sits on the folder header; keep its click off the collapse toggle.

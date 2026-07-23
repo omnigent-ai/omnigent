@@ -412,8 +412,15 @@ describe("Sidebar session list", () => {
     await waitFor(() => {
       const tooltip = screen.getByTestId("session-tooltip-content");
       expect(tooltip).toHaveTextContent(title);
-      expect(tooltip.className).toContain("bg-card-solid");
-      expect(tooltip.className).not.toContain("bg-popover");
+      // The tooltip mirrors the pinned-project flyout's compact HoverCard look
+      // (bg-popover surface), not the old wide card.
+      expect(tooltip.className).toContain("bg-popover");
+      expect(tooltip.className).not.toContain("bg-card-solid");
+      // The title is sized to match the sidebar row name (fixed
+      // --sidebar-font-size via `sidebar-compact-text`), not rem-based text-sm.
+      const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
+      expect(tooltipTitle).not.toBeNull();
+      expect(tooltipTitle).toHaveTextContent(title);
       expect(tooltip).toHaveTextContent("2d");
       expect(within(tooltip).getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(
         "Local machine",
