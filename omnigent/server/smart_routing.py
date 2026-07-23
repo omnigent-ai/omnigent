@@ -523,7 +523,12 @@ _WORKER_NAME_TO_HARNESS: dict[str, str] = {
     "pi": "pi",
 }
 
-# Per-harness model exclusions for auto routing.
+# Per-harness (harness, model) incompatibilities corrected AFTER the router
+# verdict. We do NOT prune these from the candidate set sent to the router —
+# the external task_v0 router enforces a required model set and 400s if any
+# required model is absent, so the full set must be offered. Instead, when the
+# router picks one of these pairs, _redirect_incompatible_pick moves it to a
+# harness that can actually run the model.
 #
 # The pi harness reaches Databricks two incompatible ways for these families:
 #   - Claude models ride pi's Anthropic Messages gateway, whose request path
@@ -534,9 +539,8 @@ _WORKER_NAME_TO_HARNESS: dict[str, str] = {
 #     there and rejects tool calls with "Function tools with reasoning_effort
 #     are not supported for gpt-5.5 ... use /v1/responses or set reasoning_effort
 #     to 'none'." pi's provider can't send that override, so tool turns 400.
-# Keep these off pi; claude-sdk serves Claude and codex serves gpt-5.5+ (the
-# codex harness uses the Responses API natively). The gpt-5.4 family works on
-# pi and stays available.
+# claude-sdk serves Claude and codex serves gpt-5.5+ (Responses API); the
+# gpt-5.4 family works on pi and is left alone.
 _HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
     "pi": (
         "databricks-claude-haiku-4-5",
@@ -547,14 +551,6 @@ _HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
         "databricks-gpt-5-6-sol",
     ),
 }
-
-
-def _filter_excluded_models(harness: str, models: list[str]) -> list[str]:
-    """Drop models known to be incompatible with *harness* (see _HARNESS_EXCLUDED_MODELS)."""
-    excluded = _HARNESS_EXCLUDED_MODELS.get(harness)
-    if not excluded:
-        return models
-    return [m for m in models if m not in excluded]
 
 
 def _redirect_incompatible_pick(harness: str | None, model: str) -> str | None:
@@ -624,23 +620,28 @@ async def route_session_harness(
     if session_id and runner_client is not None:
         live_catalog = await fetch_runner_models(session_id, runner_client)
 
+    # NOTE: we do NOT filter incompatible (harness, model) pairs out of the
+    # candidate set here. The external router (task_v0) enforces a required
+    # model set and 400s if any required model is missing, so dropping e.g.
+    # gpt-5-6-luna would break the whole request. Instead we send the full set
+    # and correct an incompatible verdict afterward via
+    # _redirect_incompatible_pick.
     harness_models: dict[str, list[str]] = {}
     if live_catalog:
         for worker_name, worker_models in live_catalog.items():
             harness = _WORKER_NAME_TO_HARNESS.get(worker_name)
             if harness is None or harness not in _AUTO_ROUTING_HARNESSES:
                 continue
-            models = _filter_excluded_models(harness, worker_models)
-            if models:
+            if worker_models:
                 # First worker wins for a given harness id (dedupe).
-                harness_models.setdefault(harness, models)
+                harness_models.setdefault(harness, worker_models)
 
     # Fall back to the static table when the live catalog produced no
     # routable candidates (e.g. a child session whose catalog only lists
     # "self" under an unrecognized worker name, or the runner was unreachable).
     if not harness_models:
         for h in _AUTO_ROUTING_HARNESSES:
-            models = _filter_excluded_models(h, infer_models(h) or [])
+            models = infer_models(h)
             if models:
                 harness_models[h] = models
 
