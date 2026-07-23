@@ -5073,11 +5073,6 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
 
-# Item-data fields carry a serialization alias in ``to_api_dict`` output
-# (``agent`` serializes as ``model``); the reverse map de-aliases them so the
-# payload validates as ``ItemData`` again on import.
-_IMPORT_ITEM_DATA_ALIASES = {"model": "agent"}
-
 # Fields on an exported item that belong to the store/envelope, not the typed
 # ``data`` payload — dropped before rebuilding the item for re-append.
 _IMPORT_ITEM_ENVELOPE_FIELDS = frozenset(
@@ -5085,13 +5080,39 @@ _IMPORT_ITEM_ENVELOPE_FIELDS = frozenset(
 )
 
 
+def _import_agent_aliased_types() -> frozenset[str]:
+    """
+    Return the item types whose ``agent`` field serializes as ``model``.
+
+    ``to_api_dict`` renders items with ``by_alias=True``, so a data model with
+    ``agent: ... = Field(serialization_alias="model")`` exports ``agent`` as
+    ``model``. On import that must be reversed — but ONLY for those types.
+    Other types (``compaction``, ``routing_decision``) carry a genuine ``model``
+    field that must be left alone; ``routing_decision`` even has both ``model``
+    and ``agent``. Derive the set from the field definitions so it can't drift
+    if aliases are added or removed.
+
+    :returns: Item-type strings whose ``model`` export must map back to
+        ``agent`` on import, e.g. ``{"message", "function_call", ...}``.
+    """
+    from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
+
+    aliased: set[str] = set()
+    for item_type, cls in ITEM_TYPE_TO_DATA_CLS.items():
+        field = cls.model_fields.get("agent")
+        if field is not None and field.serialization_alias == "model":
+            aliased.add(item_type)
+    return frozenset(aliased)
+
+
 def _import_item_payload(item: dict[str, Any]) -> dict[str, Any]:
     """
     Rebuild one exported item into a ``{"type", "data"}`` create payload.
 
-    Strips envelope fields the server reassigns, de-aliases ``model`` back to
-    ``agent``, and validates the result with :func:`parse_item_data` so a
-    malformed item fails loud client-side before the create request.
+    Strips envelope fields the server reassigns, reverses the ``agent``→
+    ``model`` serialization alias (only for the types that carry it), and
+    validates the result with :func:`parse_item_data` so a malformed item
+    fails loud client-side before the create request.
 
     :param item: One ``record_type == "item"`` object from an export JSONL.
     :returns: A ``SessionEventInput``-shaped dict for ``initial_items``.
@@ -5103,11 +5124,12 @@ def _import_item_payload(item: dict[str, Any]) -> dict[str, Any]:
     item_type = item.get("type")
     if not isinstance(item_type, str) or not item_type:
         raise click.ClickException(f"Export item is missing a 'type': {item!r}")
-    raw = {
-        _IMPORT_ITEM_DATA_ALIASES.get(key, key): value
-        for key, value in item.items()
-        if key not in _IMPORT_ITEM_ENVELOPE_FIELDS
-    }
+    raw = {key: value for key, value in item.items() if key not in _IMPORT_ITEM_ENVELOPE_FIELDS}
+    # Reverse the agent→model alias only for types that actually use it, so a
+    # genuine ``model`` field on other types (compaction, routing_decision) is
+    # preserved rather than corrupted.
+    if item_type in _import_agent_aliased_types() and "model" in raw:
+        raw["agent"] = raw.pop("model")
     try:
         parse_item_data(item_type, raw)
     except (TypeError, ValueError) as exc:
@@ -5149,7 +5171,9 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
 
     The session is created as history-only (no runner is launched); open it in
     the UI or resume it to continue. Note: per-turn ``response_id`` grouping is
-    not preserved — replayed items are seeded under a single response id.
+    not preserved — replayed items are seeded under a single response id — and
+    item authorship is re-attributed to the importing user (original
+    ``created_by`` is not carried over).
 
     \b
     Examples:
@@ -5260,7 +5284,10 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
                 f"Agent not found on server for import (tried {candidates}). "
                 "Register the agent on the target server, then retry."
             )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise click.ClickException(
+                f"Failed to import session ({resp.status_code}): {resp.text[:500]}"
+            )
         created = resp.json()
 
     new_id = created.get("id") or created.get("session_id")

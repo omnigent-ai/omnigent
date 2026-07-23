@@ -52,6 +52,48 @@ def test_import_item_payload_dealiases_model_to_agent() -> None:
     assert payload["data"]["role"] == "assistant"
 
 
+def test_import_item_payload_preserves_compaction_model() -> None:
+    """``compaction.model`` is a real field, not the agent alias — keep it."""
+    exported = {
+        "record_type": "item",
+        "id": "cmp_1",
+        "type": "compaction",
+        "status": "completed",
+        "response_id": "resp_1",
+        "summary": "did stuff",
+        "last_item_id": "msg_9",
+        "model": "openai/gpt-4o",
+        "token_count": 42,
+    }
+
+    payload = _import_item_payload(exported)
+
+    # Must NOT be renamed to agent, and must survive.
+    assert payload["data"]["model"] == "openai/gpt-4o"
+    assert "agent" not in payload["data"]
+
+
+def test_import_item_payload_preserves_routing_decision_model_and_agent() -> None:
+    """``routing_decision`` has both a required ``model`` and a real ``agent``."""
+    exported = {
+        "record_type": "item",
+        "id": "rt_1",
+        "type": "routing_decision",
+        "status": "completed",
+        "response_id": "resp_1",
+        "model": "databricks-claude-opus-4-8",
+        "applied": True,
+        "rationale": "deep reasoning",
+        "agent": "claude_code",
+    }
+
+    payload = _import_item_payload(exported)
+
+    # Both fields must survive intact — no collision, no loss.
+    assert payload["data"]["model"] == "databricks-claude-opus-4-8"
+    assert payload["data"]["agent"] == "claude_code"
+
+
 def test_import_item_payload_rejects_invalid_item() -> None:
     """A payload that does not validate for its type raises a click error."""
     import click
