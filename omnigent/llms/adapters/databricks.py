@@ -55,7 +55,7 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
 
                 sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
                 self._sdk_configs[profile] = Config(profile=sdk_profile)
-            except (ImportError, Exception):
+            except Exception:
                 self._sdk_configs[profile] = None
         return self._sdk_configs[profile]
 

@@ -9524,11 +9524,16 @@ async def _forward_event_to_runner(
     # harness + model are determined here on the first message where user
     # text is available.  After resolution the sentinel is replaced with
     # the concrete harness so subsequent turns behave normally.
+    # Tracks whether this block ran the router this turn, so the per-turn
+    # routing block below doesn't re-route the same message (which would
+    # double the judge call, emit two cards, and risk a mismatched pick).
+    _auto_resolved_this_turn = False
     if conv.harness_override == "auto" and body.type == "message":
         from omnigent.server.smart_routing import route_session_harness
 
         _auto_text = _extract_user_text_for_routing(body)
         if _auto_text:
+            _auto_resolved_this_turn = True
             _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
                 _auto_text,
                 session_id=session_id,
@@ -9604,6 +9609,9 @@ async def _forward_event_to_runner(
     _should_route = (
         _routing_enabled
         and body.type == "message"
+        # The auto-harness block above already routed this turn (harness +
+        # model) — don't re-run the router for the same message.
+        and not _auto_resolved_this_turn
         and (effective_runner_override is None or conv.parent_conversation_id is not None)
     )
     if _should_route:
