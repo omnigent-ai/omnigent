@@ -6,102 +6,37 @@ Verifies the `_stream_message_to_harness` shared helper covers both
 ``omnigent_runner_dispatched`` marker on intercepted events, and
 route MCP dispatch to the runner manager.
 """
+
 from __future__ import annotations
+
 import asyncio
-import contextlib
-import json
-import logging
-import shutil
-import sys
-import threading
 import uuid
-from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, cast
+from typing import Any
+
 import httpx
 import pytest
-from fastapi import FastAPI
+
 from omnigent import (
     claude_native_bridge,
-    codex_native_bridge,
-    cursor_native_bridge,
-    kiro_native_bridge,
-    qwen_native_bridge,
-)
-from omnigent.antigravity_native_bridge import (
-    ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
-)
-from omnigent.antigravity_native_bridge import (
-    is_placeholder_conversation_id as bridge_mod_is_placeholder,
 )
 from omnigent.claude_native_bridge import (
-    BRIDGE_ID_LABEL_KEY,
-    bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
-    prepare_bridge_dir,
-    read_permission_hook_config,
 )
-from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
-from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
-from omnigent.runner import tool_dispatch as _tool_dispatch
-from omnigent.runner.app import (
-    _RUNNER_DISPATCHED_FIELD,
-    _WAKE_POST_MAX_ATTEMPTS,
-    ResolvedSpec,
-    _agent_os_env_from_spec,
-    _auto_create_antigravity_terminal,
-    _auto_create_claude_terminal,
-    _auto_create_codex_terminal,
-    _auto_create_cursor_terminal,
-    _auto_create_kiro_terminal,
-    _auto_create_pi_terminal,
-    _auto_create_repl_terminal,
-    _deliver_subagent_wake_post,
-    _KiroNativeLaunchConfig,
-    _load_claude_launch_metadata,
-    _log_terminal_lookup_miss,
-    _PiNativeLaunchConfig,
-    _publish_native_terminal_start_error,
-    _publish_terminal_pending,
-    _refresh_claude_permission_hook_auth,
-    _resolved_workdir_for_spec,
-    _session_labels_for_runner_spawn,
-    _terminal_lookup_miss_log_state,
-    _wake_post_is_retryable,
-)
-from omnigent.runner.mcp_manager import McpSchemasResult
-from omnigent.runner.resource_registry import (
-    ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
-    CLAUDE_NATIVE_TERMINAL_ROLE,
-    CODEX_NATIVE_TERMINAL_ROLE,
-    KIRO_NATIVE_TERMINAL_ROLE,
-    OMNIGENT_REPL_TERMINAL_ROLE,
-    PI_NATIVE_TERMINAL_ROLE,
-    SessionResourceRegistry,
-)
-from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
-from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo, MCPServerConfig
-from omnigent.terminals import TerminalRegistry
-from tests.runner.helpers import NullServerClient
+from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _BlockingHarnessClient,
-    _NativeBlockingHarnessClient,
-    _FakeFileServerClient,
-    _FakeMcpManager,
-    _FakeProcessManager,
-    _McpToolsListServerClient,
-    _ReadTimeoutTransport,
-    _ScriptedHarnessClient,
-    _build_app_with_mcp_tool,
     _build_interrupt_app,
-    _build_lifecycle_app,
-    _build_native_app,
+    _drain_session_event_queue,
+    _FakeProcessManager,
+    _interrupt_markers,
     _runner_client,
+    _ScriptedHarnessClient,
     _spec_resolver_returning,
     _sse,
 )
+from tests.runner.helpers import NullServerClient
+
 
 @pytest.mark.asyncio
 async def test_interrupt_inserts_cancellation_items_in_history() -> None:
@@ -208,17 +143,6 @@ async def test_interrupt_inserts_cancellation_items_in_history() -> None:
         f"got {len(markers)}. If 0, _append_cancellation_items "
         f"didn't insert the marker."
     )
-
-
-def _interrupt_markers(histories: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return the synthetic ``[System: interrupted]`` marker messages."""
-    return [
-        h
-        for h in histories
-        if h.get("type") == "message"
-        and h.get("role") == "user"
-        and any("interrupted" in (b.get("text") or "").lower() for b in h.get("content", []))
-    ]
 
 
 @pytest.mark.asyncio
@@ -2486,7 +2410,3 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
         f"If non-empty, _publish_event fired before the 503 early "
         f"return — same reordering concern as the marker."
     )
-
-
-
-

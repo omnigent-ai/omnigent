@@ -50,6 +50,17 @@ def _drain_session_event_queue(queue: asyncio.Queue[Any] | None) -> list[dict[st
     return drained
 
 
+def _interrupt_markers(histories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the synthetic ``[System: interrupted]`` marker messages."""
+    return [
+        h
+        for h in histories
+        if h.get("type") == "message"
+        and h.get("role") == "user"
+        and any("interrupted" in (b.get("text") or "").lower() for b in h.get("content", []))
+    ]
+
+
 class _FakeMcpManager:
     """Stand-in for RunnerMcpManager that returns scripted schemas/names."""
 
