@@ -825,6 +825,21 @@ class SandboxLauncher(ABC):
         del sandbox_id
         return None
 
+    def exists(self, sandbox_id: str) -> bool | None:
+        """
+        Return whether the provider still has this sandbox.
+
+        Optional capability: ``None`` means the launcher cannot cheaply answer
+        or the provider could not be reached. Callers should fail closed and
+        preserve the existing sandbox binding in that case.
+
+        :param sandbox_id: The sandbox to inspect, e.g. ``"sb-a1b2c3"``.
+        :returns: ``True`` when present, ``False`` when definitively missing,
+            or ``None`` when existence is unknown.
+        """
+        del sandbox_id
+        return None
+
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """
         Run a command in the sandbox with stdio inherited from the

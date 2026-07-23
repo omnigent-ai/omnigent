@@ -2194,6 +2194,17 @@ def host_sandbox_is_running(
     return launcher.is_running(host.sandbox_id)
 
 
+def host_sandbox_exists(
+    host: Host,
+    config: ManagedSandboxConfig | None,
+) -> bool | None:
+    """Ask the matched provider whether this managed sandbox still exists."""
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or host.sandbox_id is None:
+        return None
+    return launcher.exists(host.sandbox_id)
+
+
 # ── Managed-host wake (resume a dormant host on demand) ─────────────────────
 
 # Per-host resume single-flight: one in-flight resume per host_id on this

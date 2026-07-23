@@ -184,6 +184,7 @@ class DaytonaSandboxLauncher(SandboxLauncher):
     """
 
     provider: ClassVar[str] = "daytona"
+    can_resume: ClassVar[bool] = True
     # Daytona preview links are sandbox→public only; there is no
     # local→sandbox path for the App OAuth callback port.
     supports_local_port_forward: ClassVar[bool] = False
@@ -387,6 +388,56 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             raise click.ClickException(
                 f"Could not attach to Daytona sandbox '{sandbox_id}': {exc}"
             ) from exc
+
+    def resume(self, sandbox_id: str) -> None:
+        """Resume a stopped sandbox without replacing its persistent workspace."""
+        handle = self._resolve(sandbox_id)
+        import daytona
+
+        try:
+            handle.refresh_data()
+            if handle.state != daytona.SandboxState.STARTED:
+                click.echo(f"▸ Resuming Daytona sandbox '{sandbox_id}'")
+                handle.start()
+        except daytona.DaytonaError as exc:
+            raise click.ClickException(
+                f"Could not resume Daytona sandbox '{sandbox_id}': {exc}"
+            ) from exc
+
+    def is_running(self, sandbox_id: str) -> bool | None:
+        """Return Daytona's current running state for a managed sandbox."""
+        _ensure_sdk()
+        import daytona
+
+        try:
+            handle = self._daytona().get(sandbox_id)
+            handle.refresh_data()
+        except daytona.DaytonaNotFoundError:
+            self._sandboxes.pop(sandbox_id, None)
+            return False
+        except daytona.DaytonaError:
+            return None
+        self._sandboxes[sandbox_id] = handle
+        if handle.state == daytona.SandboxState.STARTED:
+            return True
+        if handle.state == daytona.SandboxState.STOPPED:
+            return False
+        return None
+
+    def exists(self, sandbox_id: str) -> bool | None:
+        """Return whether Daytona still has the provider-side sandbox object."""
+        _ensure_sdk()
+        import daytona
+
+        try:
+            handle = self._daytona().get(sandbox_id)
+        except daytona.DaytonaNotFoundError:
+            self._sandboxes.pop(sandbox_id, None)
+            return False
+        except daytona.DaytonaError:
+            return None
+        self._sandboxes[sandbox_id] = handle
+        return True
 
     def keep_alive(self, sandbox_id: str) -> None:
         """

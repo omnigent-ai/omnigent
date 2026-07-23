@@ -180,6 +180,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     RepoWorkspace,
     host_resume_supported,
+    host_sandbox_exists,
     host_sandbox_is_running,
 )
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -7205,7 +7206,8 @@ async def _maybe_relaunch_managed_sandbox(
         # uses (host_resume_supported). Both run in the background through this
         # same tracker, so the message parks on the rendezvous either way; only
         # the provision step differs.
-        if host_resume_supported(host, sandbox_config):
+        sandbox_exists = await asyncio.to_thread(host_sandbox_exists, host, sandbox_config)
+        if host_resume_supported(host, sandbox_config) and sandbox_exists is not False:
             _kick_managed_wake(
                 session_id=session_id,
                 conv=conv,

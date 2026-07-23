@@ -1122,6 +1122,73 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     assert calls == ["wake"]
 
 
+async def test_deleted_resumable_sandbox_relaunches_instead_of_waking(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deleted provider object gets a replacement sandbox on the next message."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    host_id = "ef26926f4b091f61b11fb1c646314b3e"
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-deleted-islo",
+        user_id=RESERVED_USER_LOCAL,
+        token="tok-deleted-islo",
+        provider="islo",
+        sandbox_id="sb-deleted-islo",
+        token_expires_at=9_999_999_999,
+    )
+    conv = conv_store.create_conversation(
+        agent_id=None,
+        host_id=host_id,
+        workspace="/root/workspace",
+    )
+    fake = FakeSandboxLauncher(can_resume=True)
+    fake.provider = "islo"  # type: ignore[misc]
+    fake.exists = lambda _sandbox_id: False  # type: ignore[method-assign]
+    config = ManagedSandboxConfig(
+        server_url="https://managed-test.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        provider="islo",
+    )
+    tracker = ManagedLaunchTracker()
+    calls: list[str] = []
+
+    def _finish_relaunch(**kwargs: object) -> None:
+        del kwargs
+        calls.append("relaunch")
+        tracker.begin(conv.id)
+        tracker.finish(conv.id)
+
+    def _unexpected_wake(**kwargs: object) -> None:
+        del kwargs
+        calls.append("wake")
+
+    monkeypatch.setattr(sessions_module, "_kick_managed_relaunch", _finish_relaunch)
+    monkeypatch.setattr(sessions_module, "_kick_managed_wake", _unexpected_wake)
+    app_state = SimpleNamespace(
+        host_store=host_store,
+        sandbox_config=config,
+        managed_launches=tracker,
+        host_registry=SimpleNamespace(get=lambda _host_id: None),
+    )
+
+    assert (
+        await sessions_module._maybe_relaunch_managed_sandbox(
+            session_id=conv.id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conv_store,
+        )
+        is True
+    )
+    assert calls == ["relaunch"]
+
+
 async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_paused(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,

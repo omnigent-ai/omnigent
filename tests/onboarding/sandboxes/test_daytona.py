@@ -302,6 +302,8 @@ class _FakeDaytonaState:
     :param create_raises: Exception ``create`` raises instead of
         provisioning (e.g. a canned SDK authorization error), or
         ``None`` for normal creation.
+    :param get_raises: Exception ``get`` raises instead of resolving a
+        sandbox, or ``None`` for normal lookup.
     :param delete_raises: Exceptions successive ``delete`` calls raise
         before succeeding (popped front-first) — models the live
         "Sandbox state change in progress" conflict window.
@@ -312,6 +314,7 @@ class _FakeDaytonaState:
     deleted: list[str] = field(default_factory=list)
     client_count: int = 0
     create_raises: Exception | None = None
+    get_raises: Exception | None = None
     delete_raises: list[Exception] = field(default_factory=list)
 
 
@@ -357,6 +360,8 @@ def _install_fake_daytona(monkeypatch: pytest.MonkeyPatch) -> _FakeDaytonaState:
 
         def get(self, sandbox_id: str) -> _FakeSandbox:
             """Resolve a live sandbox or raise the not-found error."""
+            if state.get_raises is not None:
+                raise state.get_raises
             sandbox = state.sandboxes.get(sandbox_id)
             if sandbox is None:
                 raise _FakeNotFoundError(sandbox_id)
@@ -724,6 +729,58 @@ def test_attach_unknown_sandbox_fails_with_hint(fake_daytona: _FakeDaytonaState)
     """A vanished sandbox surfaces as a clear error naming the id."""
     with pytest.raises(click.ClickException, match="dt-gone"):
         DaytonaSandboxLauncher().attach("dt-gone")
+
+
+def test_resume_starts_stopped_sandbox_in_place(fake_daytona: _FakeDaytonaState) -> None:
+    """A managed wake starts the same Daytona sandbox instead of replacing it."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    sandbox = fake_daytona.sandboxes[sandbox_id]
+    sandbox.state = _FakeSandboxState.STOPPED
+
+    launcher.resume(sandbox_id)
+
+    assert launcher.can_resume is True
+    assert sandbox.refresh_data_calls == 1
+    assert sandbox.start_calls == 1
+    assert sandbox_id in fake_daytona.sandboxes
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (_FakeSandboxState.STARTED, True),
+        (_FakeSandboxState.STOPPED, False),
+    ],
+)
+def test_is_running_reports_daytona_state(
+    fake_daytona: _FakeDaytonaState,
+    state: _FakeSandboxState,
+    expected: bool,
+) -> None:
+    """Managed liveness follows the refreshed provider state."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+    fake_daytona.sandboxes[sandbox_id].state = state
+
+    assert launcher.is_running(sandbox_id) is expected
+    assert fake_daytona.sandboxes[sandbox_id].refresh_data_calls == 1
+
+
+def test_exists_distinguishes_deleted_from_unreachable(
+    fake_daytona: _FakeDaytonaState,
+) -> None:
+    """Only a definite not-found response permits replacement provisioning."""
+    launcher = DaytonaSandboxLauncher()
+    sandbox_id = launcher.provision("a")
+
+    assert launcher.exists(sandbox_id) is True
+
+    fake_daytona.sandboxes.pop(sandbox_id)
+    assert launcher.exists(sandbox_id) is False
+
+    fake_daytona.get_raises = _FakeDaytonaError("provider unavailable")
+    assert launcher.exists(sandbox_id) is None
 
 
 def test_keep_alive_disables_autostop(fake_daytona: _FakeDaytonaState) -> None:
