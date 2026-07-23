@@ -717,6 +717,41 @@ async def test_external_routing_client_sends_bearer_auth() -> None:
     assert captured["authorization"] == "Bearer dapi-XYZ"
 
 
+@pytest.mark.asyncio
+async def test_external_routing_client_mints_fresh_token_per_call_from_profile() -> None:
+    """With a databricks_profile, each call re-authenticates (OAuth refresh)."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    tokens = iter(["Bearer tok-1", "Bearer tok-2"])
+    captured: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request.headers.get("Authorization"))
+        return httpx.Response(
+            200,
+            json={"route_selection": [{"route_option": {"model": "m", "harness": "h"}}]},
+        )
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1", router_name="task_v0", databricks_profile="agent"
+    )
+
+    # Stub the SDK Config so each authenticate() yields the next token — proving
+    # the client re-resolves auth per call rather than caching a stale bearer.
+    class _FakeConfig:
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": next(tokens)}
+
+    client._sdk_config = _FakeConfig()  # type: ignore[attr-defined]
+
+    with _patch_httpx(httpx.MockTransport(handler)):
+        await client.route("hi", {"h": ["m"]})
+        await client.route("hi again", {"h": ["m"]})
+    assert captured == ["Bearer tok-1", "Bearer tok-2"]
+
+
 # ── route_session_harness ───────────────────────────────────────────────────
 
 

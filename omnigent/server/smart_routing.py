@@ -360,6 +360,7 @@ class ExternalRoutingClient:
         base_url: str,
         router_name: str,
         auth: Any = None,  # type: ignore[explicit-any]  # httpx.Auth, imported lazily
+        databricks_profile: str | None = None,
         model_prefixes: list[str] | None = None,
         request_timeout: float = 20.0,
     ) -> None:
@@ -368,8 +369,14 @@ class ExternalRoutingClient:
             ``"https://host/ai-gateway/routing/v1"``.
             ``/routes:select`` is appended.
         :param router_name: Router strategy name, e.g. ``"task_v0"``.
-        :param auth: Optional httpx auth (a Databricks bearer for the
-            router's host). ``None`` for an unauthenticated endpoint.
+        :param auth: Optional static httpx auth (e.g. a bearer built from an
+            explicit ``api_key``). ``None`` for an unauthenticated endpoint or
+            when *databricks_profile* supplies per-call OAuth instead.
+        :param databricks_profile: Optional Databricks CLI profile. When set
+            (and *auth* is ``None``), a fresh bearer is minted per :meth:`route`
+            call via the databricks-sdk ``Config`` — which refreshes OAuth
+            tokens transparently, so a long-lived server never sends a stale
+            token (the 401 an at-startup captured token hits after ~1h).
         :param model_prefixes: Optional prefixes this deployment's catalog
             attaches to model ids that the router does NOT expect. The
             first matching prefix is stripped from ids sent to the router
@@ -386,8 +393,41 @@ class ExternalRoutingClient:
         self._url = base_url.rstrip("/") + "/" + ROUTES_SELECT_PATH
         self._router_name = router_name
         self._auth = auth
+        self._databricks_profile = databricks_profile
+        # Cached SDK Config for the profile (created lazily), reused across
+        # calls; its authenticate() refreshes the OAuth token as needed.
+        self._sdk_config: Any = None
         self._model_prefixes = model_prefixes or []
         self._request_timeout = request_timeout
+
+    def _resolve_auth(self) -> Any:  # type: ignore[explicit-any]  # httpx.Auth | None
+        """Return the auth for a request, refreshing an OAuth token per call.
+
+        A static *auth* (explicit api_key) is returned as-is. When only a
+        Databricks profile is configured, mint a fresh bearer from the cached
+        SDK ``Config`` so token expiry never surfaces as a router 401.
+        """
+        if self._auth is not None:
+            return self._auth
+        if self._databricks_profile is None:
+            return None
+        try:
+            if self._sdk_config is None:
+                from databricks.sdk.config import Config
+
+                self._sdk_config = Config(profile=self._databricks_profile)
+            headers = self._sdk_config.authenticate()
+        except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+            _logger.warning(
+                "ExternalRoutingClient: could not resolve auth for profile %r",
+                self._databricks_profile,
+                exc_info=True,
+            )
+            return None
+        token = (headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+        if not token:
+            return None
+        return _bearer_auth(token)
 
     def _to_router_id(self, model: str) -> str:
         """Strip the first matching ``model_prefixes`` entry for the router.
@@ -432,13 +472,19 @@ class ExternalRoutingClient:
         body = json_format.MessageToDict(request, preserving_proto_field_name=True)
         _logger.info("ExternalRoutingClient: available_models=%s", dict(available_models))
         _logger.info("ExternalRoutingClient: POST %s body=%s", self._url, body)
+        # Resolve auth per call (SDK token refresh is a blocking HTTP call, so
+        # run it off the event loop) — keeps a long-lived server from sending a
+        # token that has expired since startup.
+        import asyncio
+
+        auth = await asyncio.to_thread(self._resolve_auth)
         try:
             async with httpx.AsyncClient(timeout=self._request_timeout) as http:
                 resp = await http.post(
                     self._url,
                     headers={"Content-Type": "application/json"},
                     json=body,
-                    auth=self._auth,
+                    auth=auth,
                 )
         except httpx.HTTPError as exc:
             # Transport-level failure (connect/timeout/DNS): no response body.
