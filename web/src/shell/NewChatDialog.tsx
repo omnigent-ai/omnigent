@@ -190,16 +190,6 @@ const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
 // session's terminal_launch_args. Keep in sync with `claude --help`.
-// Harnesses for which server-side smart routing is available.
-const _ROUTABLE_HARNESSES = new Set([
-  "claude-sdk",
-  "claude_sdk",
-  "claude-native",
-  "codex",
-  "codex-native",
-  "pi",
-]);
-
 const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
   { value: "default", label: "Default", description: "Prompts before edits and commands" },
@@ -2254,13 +2244,9 @@ export function NewChatLandingScreen() {
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Smart routing is offered in the config modal — as a Model choice for Claude,
-  // a standalone toggle otherwise — when the server enables it and the selected
-  // harness is routable. Use the EFFECTIVE harness (a bundle agent's brain-
-  // harness override wins over its spec harness), so overriding Polly/Debby to a
-  // non-routable harness (e.g. Cursor) correctly drops routing eligibility.
-  const effectiveHarness = pickedHarness ?? selectedAgent?.harness ?? "";
-  const smartRoutingEligible = smartRoutingEnabled && _ROUTABLE_HARNESSES.has(effectiveHarness);
+  // Smart Routing (per-session model selection) is superseded by the Auto
+  // harness which handles both harness + model. Hide it entirely for now.
+  const smartRoutingEligible = false;
   // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
@@ -2987,13 +2973,17 @@ export function NewChatLandingScreen() {
             model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
-            // Smart routing toggle — server-side. Only send it when routing is
-            // actually eligible for the effective harness, so a stale "on" (from
-            // a since-overridden harness, or the server flag flipping off) can't
-            // ride along invisibly with no control to clear it.
-            cost_control_mode_override: smartRoutingEligible
-              ? (costControlMode ?? undefined)
-              : undefined,
+            // Smart routing toggle — server-side. The "Auto" harness always
+            // routes (harness + model), so send "on" to keep the persisted
+            // state consistent with the lit routing icon. Otherwise only send
+            // it when routing is eligible for the effective harness, so a stale
+            // "on" can't ride along invisibly with no control to clear it.
+            cost_control_mode_override:
+              pickedHarness === AUTO_HARNESS_ID
+                ? "on"
+                : smartRoutingEligible
+                  ? (costControlMode ?? undefined)
+                  : undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });

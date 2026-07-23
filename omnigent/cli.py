@@ -138,24 +138,18 @@ def _build_external_routing_client(
     from omnigent.server.smart_routing import _bearer_auth
 
     # Auth precedence mirrors the ``llm:`` block: an explicit (provider-
-    # agnostic) api_key wins, else the Databricks ``profile`` convenience,
-    # else unauthenticated.
+    # agnostic) api_key wins (static bearer), else the Databricks ``profile``
+    # is passed through so the client mints a fresh bearer per call (OAuth
+    # refresh — a token captured once here would 401 after ~1h), else
+    # unauthenticated.
     auth = None
+    databricks_profile: str | None = None
     if api_key:
         from omnigent.spec import expand_env_vars
 
         auth = _bearer_auth(expand_env_vars({"api_key": api_key})["api_key"])
     elif profile:
-        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
-        try:
-            creds = resolve_databricks_workspace(profile)
-            auth = _bearer_auth(creds.token)
-        except OSError:
-            click.echo(
-                f"routing.profile={profile} could not be resolved; calling router unauthenticated",
-                err=True,
-            )
+        databricks_profile = profile
 
     from omnigent.server.smart_routing import ExternalRoutingClient
 
@@ -163,6 +157,7 @@ def _build_external_routing_client(
         base_url=base_url,
         router_name=router_name,
         auth=auth,
+        databricks_profile=databricks_profile,
         model_prefixes=model_prefixes,
     )
 

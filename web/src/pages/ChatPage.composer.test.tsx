@@ -731,7 +731,7 @@ describe("Composer model/effort label", () => {
   it("falls back to the harness identity for an SDK/bundle agent with no model/effort", () => {
     // Polly (claude-sdk/pi bundle) surfaces no model or effort, so the label
     // would be empty. It falls back to the harness identity ("Polly (Pi)") so
-    // the slot isn't blank — mirroring what the pre-gear picker trigger showed.
+    // the slot isn't blank.
     useChatStore.setState({
       selectedModel: null,
       selectedEffort: null,
