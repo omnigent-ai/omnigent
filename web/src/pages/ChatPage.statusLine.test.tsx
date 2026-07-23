@@ -67,9 +67,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     onSend: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
-    agentsLoading: false,
     selectedAgentId: null,
-    onSelectAgent: vi.fn(),
     permissionLevel: null,
     readOnlyReason: null,
     replyQuotes: [],
@@ -172,42 +170,23 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
   });
 
-  it("shows the harness label immediately left of the context ring", () => {
-    // The model/effort label moved to the picker trigger; the tray now shows
-    // the harness identity. Codex-native reads as the bare vendor name.
-    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000 });
-    renderComposer({ modelPickerKind: "codex" });
+  it("no longer renders the harness label in the status tray (moved to the config gear)", () => {
+    // The harness identity moved from the tray into the config gear's hover
+    // tooltip, so it must never resurface in the status line — for a native
+    // vendor session or an SDK/bundle session.
+    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, sessionHarness: "pi" });
+    renderComposer({
+      modelPickerKind: "codex",
+      agents: [{ id: "a1", name: "polly" }],
+      selectedAgentId: "a1",
+    });
 
-    const harness = screen.getByTestId("composer-harness");
-    const ring = screen.getByLabelText("25% of context used");
-    expect(harness).toHaveTextContent("Codex");
-    expect(harness.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
+    expect(screen.queryByTestId("composer-harness")).toBeNull();
   });
 
-  it("shows the agent + brain harness identity for SDK sessions", () => {
-    // SDK/bundle agents read as "<Agent> (<Harness>)" — e.g. Polly on Pi.
-    useChatStore.setState({ sessionHarness: "pi" });
-    renderComposer({ agents: [{ id: "a1", name: "polly" }], selectedAgentId: "a1" });
-
-    expect(screen.getByTestId("composer-harness")).toHaveTextContent("Polly (Pi)");
-  });
-
-  it("names the sub-agent head, not the bundle, for a head session", () => {
-    // A Debby GPT head session: the tray identifies the head being viewed
-    // ("Gpt"), not the bundle orchestrator ("Debby").
-    useChatStore.setState({ sessionHarness: "codex", subAgentName: "gpt" });
-    renderComposer({ agents: [{ id: "a1", name: "debby" }], selectedAgentId: "a1" });
-
-    const harness = screen.getByTestId("composer-harness");
-    expect(harness).toHaveTextContent("Gpt (Codex)");
-    expect(harness).not.toHaveTextContent("Debby");
-  });
-
-  it("no longer renders model/effort in the status tray (moved to the picker trigger)", () => {
+  it("no longer renders model/effort in the status tray (moved to the composer label)", () => {
     // The swap moved the model/effort label out of the tray and into the
-    // AgentPicker trigger, so it must never resurface here — even for a
+    // composer's read-only label, so it must never resurface here — even for a
     // vendor-owned native session where the model used to be (wrongly) shown.
     useChatStore.setState({
       llmModel: "claude-sonnet-4-6",
@@ -294,15 +273,28 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("composer-plan-mode")).toHaveTextContent("Plan mode");
   });
 
-  it("places Plan mode to the left of the harness label", () => {
-    useChatStore.setState({ codexPlanMode: true });
+  it("places Plan mode to the left of the context ring", () => {
+    useChatStore.setState({ codexPlanMode: true, contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer({ modelPickerKind: "codex" });
 
     const plan = screen.getByTestId("composer-plan-mode");
-    const harness = screen.getByTestId("composer-harness");
-    expect(plan.compareDocumentPosition(harness) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+    const ring = screen.getByLabelText("25% of context used");
+    expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+  });
+
+  it("renders the tray for a host-bound session with no branch or ring", () => {
+    // Regression: removing the harness label from the tray must not take the
+    // host badge + context footer with it. A host-bound session (e.g. a codex
+    // session with no worktree branch, before the ring populates) still shows
+    // the tray so the host indicator is visible.
+    bindHost("mac-laptop");
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer();
+
+    expect(statusLine()).not.toBeNull();
+    expect(screen.getByTestId("host-badge")).toHaveTextContent("mac-laptop");
   });
 
   it("shows the host badge to the left of the worktree branch", () => {

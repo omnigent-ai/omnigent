@@ -227,29 +227,41 @@ community packages.
 
 ### Phase 0 — Prep: split the oversized dispatch files
 
-The refactor is concentrated in files that are already too large to edit safely
-(`sessions.py` 22.6k lines, `runner/app.py` 19.7k, `cli.py` 14.5k). Before
-adding the seam, carve the native-specific code into cohesive modules so the
-provider rewrite touches small files with clear boundaries. This is behavior
--preserving and independently reviewable/mergeable.
+The refactor is concentrated in files that are already too large to edit safely.
+The goal is **< 10k lines per file**. Before adding the seam, carve the
+native-specific code into cohesive modules so the provider rewrite touches small
+files with clear boundaries. This is behavior-preserving and independently
+reviewable/mergeable. Each extraction is a mechanical move + import fix, verified
+by the existing test suite and `pre-commit run --all-files`. No behavior change;
+no `if key ==` arm removed yet.
 
-- **`runner/app.py`** → extract native orchestration into
-  `omnigent/runner/native/` (e.g. `terminals.py` for the `_auto_create_*`
-  builders, `supervise.py` for the `_supervise_*_bridges` mirrors,
-  `interrupt.py` for interrupt/stop handlers). `app.py` keeps the (soon-to-be
-  registry-driven) dispatch entry points and imports from the new package.
-- **`cli.py`** → move the native subcommand bodies into
-  `omnigent/cli_native.py` (they already delegate to `run_<x>_native`), leaving
-  `cli.py` to register them.
-- **`server/routes/sessions.py`** → extract native fork/switch/status gating
-  into `omnigent/server/routes/_native_sessions.py`.
-- **`chat.py`** → move the `_run_<x>_native_resume_redirect` helpers into
+Done:
+
+- **`cli.py`** ✅ (#3047) — native subcommand bodies moved into
+  `omnigent/cli_native.py` (they already delegate to `run_<x>_native`); `cli.py`
+  registers them. `cli.py` is now 9.6k lines; `cli_native.py` 1.3k.
+- **`server/routes/sessions.py`** ✅ (#3097) — split into a facade
+  (`sessions.py`, now 7.8k) that star-imports an impl package
+  (`omnigent/server/routes/_sessions/`: `common.py`, `helpers.py`,
+  `orchestration.py`). `create_sessions_router` stays in the facade.
+
+Remaining (the two files still over 10k — can proceed in parallel):
+
+- **`runner/app.py`** (~20.1k lines — the epicenter) → extract native
+  orchestration into `omnigent/runner/native/` (e.g. `terminals.py` for the
+  `_auto_create_*` builders, `supervise.py` for the `_supervise_*_bridges`
+  mirrors, `interrupt.py` for interrupt/stop handlers). `app.py` keeps the
+  (soon-to-be registry-driven) dispatch entry points and imports from the new
+  package.
+- **`tests/runner/test_app_sessions_native.py`** (~19.0k lines) → split the
+  native-dispatch test suite along the same seams as the `runner/native/`
+  extraction so each module's tests sit beside it.
+
+Deferred (under the 10k target already; fold into Phase 1 when the seam lands):
+
+- **`chat.py`** (4.2k) → move the `_run_<x>_native_resume_redirect` helpers into
   `resume_dispatch.py` (they duplicate its dispatch anyway) as the first step of
   collapsing the two resume paths into one.
-
-Each extraction is a mechanical move + import fix, verified by the existing test
-suite and `pre-commit run --all-files`. No behavior change; no `if key ==` arm
-removed yet.
 
 ### Phase 1 — Internal provider seam (core-only)
 

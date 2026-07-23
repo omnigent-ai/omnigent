@@ -15,6 +15,7 @@ import {
   type CompactionBlock,
   type ErrorBlock,
   type NativeToolBlock,
+  type ReasoningBlock,
   type RoutingDecisionBlock,
   type SlashCommandBlock,
   type TerminalCommandBlock,
@@ -35,6 +36,7 @@ import {
   type FunctionCallOutputItem,
   type MessageItem,
   type NativeToolItem,
+  type ReasoningItem,
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
@@ -44,6 +46,7 @@ import {
   isFunctionCallOutputItem,
   isMessageItem,
   isNativeToolItem,
+  isReasoningItem,
   isRoutingDecisionItem,
   isSlashCommandItem,
   isTerminalCommandItem,
@@ -99,6 +102,9 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   }
   if (isErrorItem(item)) {
     return errorToBlock(item);
+  }
+  if (isReasoningItem(item)) {
+    return reasoningToBlock(item);
   }
   if (isNativeToolItem(item)) {
     return nativeToolToBlock(item);
@@ -230,6 +236,15 @@ function errorToBlock(item: ErrorItem): ErrorBlock {
     source: item.source,
     code: item.code,
     message: item.message,
+  };
+}
+
+function reasoningToBlock(item: ReasoningItem): ReasoningBlock {
+  return {
+    type: "reasoning_block",
+    ctx: ctxFor(item),
+    reasoningText: (item.content ?? []).map((block) => block.text).join("\n\n"),
+    summaryText: item.summary.map((block) => block.text).join("\n\n"),
   };
 }
 
