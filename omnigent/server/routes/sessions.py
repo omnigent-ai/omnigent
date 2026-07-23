@@ -7616,8 +7616,9 @@ async def _get_runner_client_for_resource_access(
 ) -> httpx.AsyncClient | None:
     """Return the authoritative runner client for session resources.
 
-    Requires the session to be bound to a runner via
-    ``PATCH /v1/sessions/{id}``; raises ``conflict`` otherwise. If no
+    Returns ``None`` when the session is not bound to a runner or the
+    bound runner is offline, so callers can choose a graceful fallback
+    (e.g. 502, local registry) instead of catching an error class. If no
     runner router is configured (unit-test/in-process setups), callers
     may fall back to local registries.
     """
@@ -7625,8 +7626,11 @@ async def _get_runner_client_for_resource_access(
 
     runner_router = get_runner_router()
     if runner_router is not None:
-        routed_runner = runner_router.client_for_session_resources(session_id)
-        return routed_runner.client
+        try:
+            routed_runner = runner_router.client_for_session_resources(session_id)
+            return routed_runner.client
+        except OmnigentError:
+            return None
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
