@@ -1640,8 +1640,11 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
-        _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
     }
+    # Don't disable betas when gateway-aware mode (CLAUDE_CODE_USE_GATEWAY=1)
+    # is selected: that mode keeps tool search on so MCP schemas load on demand.
+    if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1":
+        env[_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV] = "1"
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
@@ -1746,13 +1749,13 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
     return ClaudeNativeUcodeConfig(
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
-            # Disable Claude Code's experimental anthropic-beta flags. Gateways
-            # (Databricks serving-endpoints and the like) reject beta flags they
-            # don't implement with a 400 "invalid beta flag", which kills every
-            # turn. The ucode/databricks path already sets this; mirror it here
-            # so the generic key/gateway/local provider path is equally
-            # gateway-safe.
-            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+            # Disable beta flags gateways reject (400 "invalid beta flag");
+            # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
+            **(
+                {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
+                if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                else {}
+            ),
         },
         api_key_helper=api_key_helper,
         model=family.default_model,
