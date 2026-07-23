@@ -32,6 +32,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
+    HostDetectCredentialsFrame,
     HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
@@ -318,6 +319,48 @@ async def _proxy_store_secret(
             ) from exc
     finally:
         host_conn.pending_secret_writes.pop(request_id, None)
+
+
+async def _proxy_detect_credentials(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+) -> dict[str, Any]:
+    """Forward a ``host.detect_credentials`` frame and await the result.
+
+    Mirrors :func:`_proxy_store_secret`. The result carries only non-secret
+    descriptors (family + source label + env var name).
+
+    :param host_registry: Server-side registry; used to enqueue the frame.
+    :param host_conn: Live host connection.
+    :returns: Dict with a ``credentials`` list of non-secret descriptors.
+    :raises HTTPException: 504 on timeout, 502 on connection drop.
+    """
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_credential_detects[request_id] = future
+    frame = encode_host_frame(HostDetectCredentialsFrame(request_id=request_id))
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not respond to detect_credentials "
+                    f"within {_STORE_SECRET_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        host_conn.pending_credential_detects.pop(request_id, None)
 
 
 class CreateDirectoryRequest(BaseModel):
@@ -1272,6 +1315,46 @@ def create_hosts_router(
             "object": "harness_credential",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
+        }
+
+    @router.get("/hosts/{host_id}/credentials/detected")
+    async def detect_host_credentials(
+        request: Request,
+        host_id: str,
+    ) -> dict[str, Any]:
+        """List adoptable credentials already present on a connected host.
+
+        Backs the setup dialog's "adopt an existing credential" affordance: the
+        host reports which UI-auth-family credentials it already has as
+        NON-secret descriptors (family + source label + env var name), so the UI
+        can offer a one-click "Use it". Owner-scoped and flag-gated like the
+        credential-write route (404 when disabled). Never returns a secret value.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier.
+        :returns: ``{"object": "detected_credentials", "credentials": [...]}``.
+        :raises HTTPException: 404 when disabled or host unknown, 403 when not
+            the owner, 409 when offline, 502/504 on host failure/timeout.
+        """
+        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+            raise HTTPException(status_code=404, detail="not found")
+
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
+        return {
+            "object": "detected_credentials",
+            "credentials": result.get("credentials") or [],
         }
 
     @router.get("/hosts/{host_id}/worktrees")

@@ -25,6 +25,8 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostInstallHarnessFrame,
@@ -2352,6 +2354,24 @@ def test_handle_store_secret_surfaces_core_failure(monkeypatch: pytest.MonkeyPat
     assert result.status == "failed"
     assert result.error == "a gateway requires a base_url"
     assert result.configured_harnesses is None
+
+
+def test_handle_detect_credentials_returns_non_secret_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detect handler returns the core's descriptors as plain dicts."""
+    from omnigent.onboarding.harness_auth import DetectedCredential
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_auth.detect_adoptable_credentials",
+        lambda: [DetectedCredential("anthropic", "$ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")],
+    )
+    host = _make_host_process()
+    result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d1"))
+    assert isinstance(result, HostDetectCredentialsResultFrame)
+    assert result.credentials == [
+        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+    ]
 
 
 # --- Fail-loud on permanent tunnel failures ----------------------------

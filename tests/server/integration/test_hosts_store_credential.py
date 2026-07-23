@@ -24,6 +24,8 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from omnigent.host.frames import (
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
     HostHelloFrame,
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
@@ -129,6 +131,26 @@ async def cred_setup(
             if not isinstance(text, str):
                 continue
             frame = decode_host_frame(text)
+            if isinstance(frame, HostDetectCredentialsFrame):
+                # Fixed non-secret descriptor set for the adopt-detect test.
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostDetectCredentialsResultFrame(
+                                request_id=frame.request_id,
+                                credentials=[
+                                    {
+                                        "family": "anthropic",
+                                        "source": "$ANTHROPIC_API_KEY",
+                                        "env_var": "ANTHROPIC_API_KEY",
+                                    }
+                                ],
+                            )
+                        ),
+                    }
+                )
+                continue
             if not isinstance(frame, HostStoreSecretFrame):
                 continue
             received.append(frame)
@@ -352,3 +374,35 @@ async def test_non_owner_returns_403(
             headers={"X-Test-User": "bob@example.com"},
         )
     assert resp.status_code == 403
+
+
+# ── Adopt-detect ────────────────────────────────────────
+
+
+async def test_detect_credentials_returns_non_secret_descriptors(
+    cred_setup: tuple[
+        FastAPI, HostRegistry, list[HostStoreSecretFrame], dict[str, dict[str, Any]]
+    ],
+) -> None:
+    """The detect route returns the host's adoptable creds (non-secret)."""
+    app, _reg, _received, _replies = cred_setup
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "detected_credentials"
+    assert body["credentials"] == [
+        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+    ]
+
+
+async def test_detect_credentials_hidden_when_flag_off(
+    cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the flag off the detect route is 404."""
+    monkeypatch.setenv("OMNIGENT_HARNESS_INSTALL_ENABLED", "0")
+    app, _reg, _hs, _cs = cred_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
+    assert resp.status_code == 404

@@ -62,6 +62,8 @@ class HostFrameKind(str, Enum):
     INSTALL_HARNESS_RESULT = "host.install_harness_result"
     STORE_SECRET = "host.store_secret"
     STORE_SECRET_RESULT = "host.store_secret_result"
+    DETECT_CREDENTIALS = "host.detect_credentials"
+    DETECT_CREDENTIALS_RESULT = "host.detect_credentials_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
 
@@ -701,6 +703,38 @@ class HostStoreSecretResultFrame:
 
 
 @dataclass
+class HostDetectCredentialsFrame:
+    """Server → host: list adoptable credentials already present on the host.
+
+    Backs the setup dialog's "adopt an existing credential" affordance: the host
+    reports which UI-auth-family credentials it already has (env vars, a CLI
+    login) so the UI can offer a one-click "Use it" instead of asking the user
+    to paste a key they already have. Read-only; carries only a request id.
+
+    :param request_id: Correlates the result, e.g. ``"req_detect_1"``.
+    """
+
+    request_id: str
+
+
+@dataclass
+class HostDetectCredentialsResultFrame:
+    """Host → server: the adoptable credentials found, as NON-secret descriptors.
+
+    Carries only metadata — the family and a source label / env var name — never
+    a secret value. The UI shows "Use $ANTHROPIC_API_KEY" and adopts it by
+    reference (``api_key_ref: env:<VAR>``); the value is never read or sent.
+
+    :param request_id: Correlates to the :class:`HostDetectCredentialsFrame`.
+    :param credentials: List of ``{"family": ..., "source": ..., "env_var": ...}``
+        dicts (non-secret). Empty when nothing adoptable was found.
+    """
+
+    request_id: str
+    credentials: list[dict[str, str | None]] = field(default_factory=list)
+
+
+@dataclass
 class HostFsRequestFrame:
     """Server → host: read-only workspace filesystem request.
 
@@ -1066,6 +1100,21 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostDetectCredentialsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.DETECT_CREDENTIALS.value,
+                "request_id": frame.request_id,
+            }
+        )
+    if isinstance(frame, HostDetectCredentialsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.DETECT_CREDENTIALS_RESULT.value,
+                "request_id": frame.request_id,
+                "credentials": frame.credentials,
+            }
+        )
     if isinstance(frame, HostFsRequestFrame):
         return _encode_payload(
             {
@@ -1199,6 +1248,10 @@ def _decode_known_host_frame(
             return _decode_store_secret(msg)
         case HostFrameKind.STORE_SECRET_RESULT:
             return _decode_store_secret_result(msg)
+        case HostFrameKind.DETECT_CREDENTIALS:
+            return HostDetectCredentialsFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.DETECT_CREDENTIALS_RESULT:
+            return _decode_detect_credentials_result(msg)
         case HostFrameKind.FS_REQUEST:
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
@@ -1607,6 +1660,40 @@ def _decode_store_secret_result(msg: dict[str, Any]) -> HostStoreSecretResultFra
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_detect_credentials_result(msg: dict[str, Any]) -> HostDetectCredentialsResultFrame:
+    """Decode a host.detect_credentials_result frame.
+
+    Coerces each credential entry to a ``{family, source, env_var}`` dict of
+    strings (env_var nullable), ignoring malformed entries — a spoofed/garbled
+    payload can never inject a non-string field the UI would trust.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.detect_credentials_result frame.
+    """
+    raw = msg.get("credentials")
+    creds: list[dict[str, str | None]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            family = item.get("family")
+            source = item.get("source")
+            env_var = item.get("env_var")
+            if not isinstance(family, str) or not isinstance(source, str):
+                continue
+            creds.append(
+                {
+                    "family": family,
+                    "source": source,
+                    "env_var": env_var if isinstance(env_var, str) else None,
+                }
+            )
+    return HostDetectCredentialsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        credentials=creds,
     )
 
 

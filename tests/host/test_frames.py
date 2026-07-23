@@ -12,6 +12,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
@@ -1242,6 +1244,45 @@ def test_store_secret_result_round_trip() -> None:
     assert decoded_f.status == "failed"
     assert decoded_f.error == "a gateway requires a base_url"
     assert decoded_f.configured_harnesses is None
+
+
+def test_detect_credentials_round_trip() -> None:
+    """The detect request + result round-trip; the result carries only descriptors."""
+    req = HostDetectCredentialsFrame(request_id="req_detect_1")
+    decoded_req = decode_host_frame(encode_host_frame(req))
+    assert isinstance(decoded_req, HostDetectCredentialsFrame)
+    assert decoded_req.request_id == "req_detect_1"
+
+    result = HostDetectCredentialsResultFrame(
+        request_id="req_detect_1",
+        credentials=[
+            {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(result))
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    assert decoded.credentials == [
+        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+    ]
+
+
+def test_detect_credentials_result_drops_malformed_entries() -> None:
+    """A garbled credentials payload keeps only well-formed string entries."""
+    encoded = json.dumps(
+        {
+            "kind": "host.detect_credentials_result",
+            "request_id": "r1",
+            "credentials": [
+                {"family": "anthropic", "source": "$X", "env_var": "X"},  # kept
+                {"family": 123, "source": "$Y"},  # dropped (non-str family)
+                "not-a-dict",  # dropped
+                {"source": "$Z"},  # dropped (no family)
+            ],
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    assert decoded.credentials == [{"family": "anthropic", "source": "$X", "env_var": "X"}]
 
 
 def test_fs_request_round_trip() -> None:

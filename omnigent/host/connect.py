@@ -31,6 +31,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
@@ -1711,6 +1713,29 @@ class HostProcess:
             configured_harnesses=configured_harness_map(),
         )
 
+    def _handle_detect_credentials(
+        self, frame: HostDetectCredentialsFrame
+    ) -> HostDetectCredentialsResultFrame:
+        """Handle a ``host.detect_credentials`` request from the server.
+
+        Returns the adoptable credentials already on this host as NON-secret
+        descriptors (family + source label + env var name) so the UI can offer
+        a one-click "adopt". Never reads or returns a secret value; never raises
+        (a detection failure yields an empty list).
+
+        :param frame: The detect request (carries only a request id).
+        :returns: Result frame with the non-secret credential descriptors.
+        """
+        from omnigent.onboarding.harness_auth import detect_adoptable_credentials
+
+        detected = detect_adoptable_credentials()
+        return HostDetectCredentialsResultFrame(
+            request_id=frame.request_id,
+            credentials=[
+                {"family": d.family, "source": d.source, "env_var": d.env_var} for d in detected
+            ],
+        )
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -2361,6 +2386,11 @@ class HostProcess:
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
             result = await asyncio.to_thread(self._handle_store_secret, frame)
+            await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostDetectCredentialsFrame):
+            # Ambient detection may probe files / a localhost socket, so run it
+            # off the event loop.
+            result = await asyncio.to_thread(self._handle_detect_credentials, frame)
             await ws.send(encode_host_frame(result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
