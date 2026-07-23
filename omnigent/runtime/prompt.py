@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from typing import Any
 
@@ -119,6 +120,69 @@ def _strip_output_annotations(
     return result
 
 
+def _strip_output_image_data(value: Any) -> Any:
+    """Rewrite inline base64 image blocks to a text placeholder.
+
+    Walks a tool result's decoded content and replaces any Anthropic
+    ``{"type": "image", "source": {"type": "base64", ...}}`` block with a
+    short text block, dropping the base64 ``data``. Non-image content is
+    returned unchanged.
+
+    :param value: Decoded ``function_call_output`` content (list, dict, or
+        scalar).
+    :returns: The same structure with image base64 payloads removed.
+    """
+    if isinstance(value, list):
+        return [_strip_output_image_data(item) for item in value]
+    if isinstance(value, dict):
+        source = value.get("source")
+        if value.get("type") == "image" and isinstance(source, dict):
+            media_type = source.get("media_type")
+            label = (
+                f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
+            )
+            return {
+                "type": "text",
+                "text": (
+                    f"[{label} omitted from history to save context — "
+                    "re-run the tool call above (e.g. Read the same path) "
+                    "to view it again]"
+                ),
+            }
+        return {key: _strip_output_image_data(val) for key, val in value.items()}
+    return value
+
+
+def _dedupe_tool_output_images(output: str) -> str:
+    """Strip inline base64 image data from a persisted tool-result string.
+
+    Older stored ``function_call_output`` items (and any harness ingest that
+    predates the strip-on-write path) can carry a full base64 image — a single
+    ``Read`` of an image inlines hundreds of KB, which is replayed as prompt
+    text on every resume and overflows the context window, wedging compaction.
+    Strip it here at the replay boundary so already-stored large-image sessions
+    resume cleanly without a store migration. Plain-text outputs (the common
+    case) are returned unchanged.
+
+    :param output: The persisted ``function_call_output.output`` string.
+    :returns: The output with any inline base64 image data replaced by a
+        placeholder, or the original string when it holds no image JSON.
+    """
+    # Fast path: only JSON arrays/objects can carry an image block, and every
+    # such payload contains the ``"image"`` type tag. Skip the parse otherwise.
+    stripped = output.lstrip()
+    if stripped[:1] not in ("[", "{") or '"image"' not in output:
+        return output
+    try:
+        decoded = json.loads(output)
+    except (ValueError, TypeError):
+        return output
+    sanitized = _strip_output_image_data(decoded)
+    if sanitized == decoded:
+        return output
+    return json.dumps(sanitized, separators=(",", ":"))
+
+
 def history_to_input_items(
     items: list[ConversationItem],
 ) -> list[dict[str, Any]]:
@@ -170,7 +234,10 @@ def history_to_input_items(
                 {
                     "type": "function_call_output",
                     "call_id": item.data.call_id,
-                    "output": item.data.output,
+                    # Strip inline base64 image data on the way into the
+                    # prompt so already-stored large-image sessions resume
+                    # without overflowing the context window.
+                    "output": _dedupe_tool_output_images(item.data.output),
                 }
             )
 
