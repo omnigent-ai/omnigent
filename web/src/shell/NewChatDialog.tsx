@@ -3092,13 +3092,17 @@ export function NewChatLandingScreen() {
             model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
-            // Smart routing toggle — server-side. Only send it when routing is
-            // actually eligible for the effective harness, so a stale "on" (from
-            // a since-overridden harness, or the server flag flipping off) can't
-            // ride along invisibly with no control to clear it.
-            cost_control_mode_override: smartRoutingEligible
-              ? (costControlMode ?? undefined)
-              : undefined,
+            // Smart routing toggle — server-side. The "Auto" harness always
+            // routes (harness + model), so send "on" to keep the persisted
+            // state consistent with the lit routing icon. Otherwise only send
+            // it when routing is eligible for the effective harness, so a stale
+            // "on" can't ride along invisibly with no control to clear it.
+            cost_control_mode_override:
+              pickedHarness === AUTO_HARNESS_ID
+                ? "on"
+                : smartRoutingEligible
+                  ? (costControlMode ?? undefined)
+                  : undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });

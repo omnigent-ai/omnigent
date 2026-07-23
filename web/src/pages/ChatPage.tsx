@@ -159,10 +159,8 @@ import { ComposerMicButton } from "@/components/ComposerMicButton";
 import {
   IntelligentModelControl,
   type CostRoutingVerdict,
-  isCostRoutingSession,
   parseCostRoutingVerdict,
 } from "@/components/CostRoutingControl";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -854,13 +852,11 @@ export function ChatPage() {
     () => parseCostRoutingVerdict(activeSessionLabels),
     [activeSessionLabels],
   );
-  // Orchestrator-only: polly's children inherit its agentName, so the gate
-  // needs the session predicate (parent linkage), not a bare name check.
-  const serverInfo = useServerInfo();
-  const costRoutingEligible =
-    serverInfo !== "loading" &&
-    serverInfo.smart_routing_enabled &&
-    isCostRoutingSession(activeSession);
+  // The per-turn composer routing toggle is deprecated in favour of the
+  // "Auto" harness (chosen at session start, routes harness + model). Auto
+  // sessions always route by design, so a per-turn on/off toggle is redundant
+  // and its "off" state is misleading — hide the composer icon entirely.
+  const costRoutingEligible = false;
 
   // Non-null only when the active session is a sub-agent (child): the
   // composer then peeks a "Chatting with sub-agent …" tray and the
