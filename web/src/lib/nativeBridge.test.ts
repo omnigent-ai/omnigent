@@ -222,6 +222,18 @@ describe("reportColorScheme", () => {
     expect(androidSetColorScheme).toHaveBeenNthCalledWith(1, "light");
     expect(androidSetColorScheme).toHaveBeenNthCalledWith(2, "dark");
   });
+
+  it("replays an explicit scheme when Android installs after the first report", () => {
+    setAndroid(false);
+    reportColorScheme("light", "light");
+    expect(androidSetColorScheme).not.toHaveBeenCalled();
+
+    setAndroid(true);
+    window.dispatchEvent(new Event("omnigent-native-ready"));
+
+    expect(androidSetColorScheme).toHaveBeenCalledOnce();
+    expect(androidSetColorScheme).toHaveBeenCalledWith("light");
+  });
 });
 
 describe("nativeNotify", () => {

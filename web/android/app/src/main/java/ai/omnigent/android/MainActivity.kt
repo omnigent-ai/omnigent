@@ -136,6 +136,7 @@ class MainActivity : ComponentActivity() {
                 webViewClient =
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
+                        onTopLevelNavigation = ::resetColorSchemeToSystem,
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
                     )
@@ -313,6 +314,13 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightStatusBars = isLight
             isAppearanceLightNavigationBars = isLight
         }
+    }
+
+    private fun resetColorSchemeToSystem() {
+        val isLight =
+            resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
+                Configuration.UI_MODE_NIGHT_YES
+        applyColorScheme(isLight)
     }
 
     /**

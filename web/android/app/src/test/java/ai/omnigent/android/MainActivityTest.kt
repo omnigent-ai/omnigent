@@ -48,6 +48,28 @@ class MainActivityTest {
         assertEquals(navigationBarsWereLight, insetsController.isAppearanceLightNavigationBars)
     }
 
+    @Test
+    @Config(sdk = [35], qualifiers = "night")
+    fun `top level navigation resets system bars to the OS fallback`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = activity.webView()
+        val insetsController = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        assertEquals(
+            Configuration.UI_MODE_NIGHT_YES,
+            activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK,
+        )
+
+        activity.applyColorScheme(isLight = true)
+        assertTrue(insetsController.isAppearanceLightStatusBars)
+        assertTrue(insetsController.isAppearanceLightNavigationBars)
+
+        webView.webViewClient.onPageStarted(webView, "https://example.com/next", null)
+
+        assertFalse(insetsController.isAppearanceLightStatusBars)
+        assertFalse(insetsController.isAppearanceLightNavigationBars)
+    }
+
     private fun MainActivity.applyColorScheme(isLight: Boolean) {
         MainActivity::class
             .java

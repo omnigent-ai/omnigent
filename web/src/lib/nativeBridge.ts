@@ -117,6 +117,10 @@ interface NativeShellApi {
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
 }
 
+const ANDROID_BRIDGE_READY_EVENT = "omnigent-native-ready";
+let pendingAndroidColorScheme: "light" | "dark" | undefined;
+let waitingForAndroidBridge = false;
+
 /** Footprints (CSS px) of the native floating bars, reported by the shell. */
 export interface NativeInsets {
   /** Server switcher pill height + its top padding. */
@@ -281,6 +285,35 @@ function nativeApi(): NativeShellApi | undefined {
   const api = (window as unknown as { omnigentNative?: NativeShellApi }).omnigentNative;
   if (api?.kind === "ios" || api?.kind === "android" || api?.kind === "electron") return api;
   return electronApi();
+}
+
+function applyAndroidColorScheme(scheme: "light" | "dark"): boolean {
+  const android = nativeApi();
+  if (android?.kind !== "android" || !android.setColorScheme) return false;
+  try {
+    android.setColorScheme(scheme);
+  } catch (err) {
+    console.warn("[nativeBridge] setColorScheme failed:", err);
+  }
+  return true;
+}
+
+function queueAndroidColorScheme(scheme: "light" | "dark"): void {
+  pendingAndroidColorScheme = scheme;
+  if (typeof window === "undefined" || waitingForAndroidBridge) return;
+
+  waitingForAndroidBridge = true;
+  window.addEventListener(
+    ANDROID_BRIDGE_READY_EVENT,
+    () => {
+      waitingForAndroidBridge = false;
+      const pendingScheme = pendingAndroidColorScheme;
+      if (!pendingScheme) return;
+      if (applyAndroidColorScheme(pendingScheme)) pendingAndroidColorScheme = undefined;
+      else queueAndroidColorScheme(pendingScheme);
+    },
+    { once: true },
+  );
 }
 
 /** True when running inside the Electron desktop shell. */
@@ -482,13 +515,11 @@ export function reportColorScheme(
     return;
   }
 
-  const android = nativeApi();
-  if (android?.kind !== "android" || !android.setColorScheme) return;
-  try {
-    android.setColorScheme(resolvedScheme);
-  } catch (err) {
-    console.warn("[nativeBridge] setColorScheme failed:", err);
+  if (applyAndroidColorScheme(resolvedScheme)) {
+    pendingAndroidColorScheme = undefined;
+    return;
   }
+  queueAndroidColorScheme(resolvedScheme);
 }
 
 export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {

@@ -13,6 +13,8 @@ package ai.omnigent.android
  * frames on the pinned origin. `notify()` resolves `true` optimistically (as on
  * iOS) since the post is fire-and-forget. native -> web is driven by
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
+ * Once installed, the facade emits `omnigent-native-ready` so a SPA whose
+ * first color-scheme report raced the injection can replay it.
  */
 object NativeBridgeScript {
     val source: String =
@@ -251,6 +253,7 @@ object NativeBridgeScript {
               return () => insetCallbacks.delete(callback);
             },
           });
+          window.dispatchEvent(new Event("omnigent-native-ready"));
         })();
         """.trimIndent()
 }

@@ -21,6 +21,7 @@ import androidx.webkit.WebViewFeature
  */
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
+    private val onTopLevelNavigation: () -> Unit,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
 ) : WebViewClient() {
@@ -30,6 +31,7 @@ class OmnigentWebViewClient(
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
+        onTopLevelNavigation()
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
