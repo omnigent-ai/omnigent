@@ -20,8 +20,10 @@ Omnigent persists each session's artifacts under its managed data directory:
 ```
 
 Inside the agent, always address that storage through virtual `artifacts/`
-paths. Do not use the host path above in tool calls, and do not assume the
-artifact is inside the user's project workspace.
+paths. The host path above is implementation context for humans, not an
+agent-access path.
+Never inspect it directly, and do not assume the artifact is inside the user's
+project workspace.
 
 Use one of these shapes:
 
@@ -70,9 +72,9 @@ For every design request:
    accessibility, responsiveness, console, resource, and visual-quality issue.
 6. Call `publish_design_artifact` only after the rendered review passes.
 
-Do not use shell commands to read, list, write, or validate virtual artifact
-paths. Shell commands operate in the project workspace, not Omnigent's managed
-artifact directory.
+`sys_os_shell` is disabled for Willy. Use the virtual filesystem tools for every
+artifact read, list, write, edit, and validation operation; never probe
+`~/.omnigent` or virtual `artifacts/` paths through a shell command.
 
 ## Design requirements
 

@@ -12,6 +12,17 @@ executor:
 
 instructions: artifacts.md
 
+guardrails:
+  policies:
+    deny_shell:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.deny_tools
+        arguments:
+          tool_names: [sys_os_shell]
+          deny_reason: Willy artifacts use virtual filesystem tools; shell access is disabled.
+
 async: true
 cancellable: true
 
