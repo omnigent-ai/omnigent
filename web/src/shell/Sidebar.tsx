@@ -1523,7 +1523,9 @@ function ConversationList({
                     const allExpanded =
                       allNames.length > 0 && allNames.every((n) => expandedProjects.includes(n));
                     return (
-                      <div className="flex items-center">
+                      // gap-0.5 between the two controls mirrors the row/folder
+                      // icon spacing, so every right-gutter pair lines up.
+                      <div className="flex items-center gap-0.5">
                         {showExpandControls &&
                           (allExpanded ? (
                             <Tooltip>
@@ -2891,83 +2893,90 @@ function ConversationRow({
           <SessionStateBadge state={sessionState} />
         </span>
       ) : null}
-      {/* Archived rows omit the pin entirely: pinning is meaningless there
-          (archive outranks pin), so there's no pin action even on hover. Also
-          hidden while selecting (bulk mode owns the row controls). */}
-      {!selectionMode && !isArchived && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-          data-testid="quick-pin-conversation"
-          className={cn(
-            "-translate-y-1/2 absolute top-1/2 right-[30px] transition-opacity",
-            // Desktop-only quick affordance: hidden on mobile (the kebab's
-            // Pin item below covers that), hover/focus-revealed from `md` up.
-            // Pinned rows no longer keep a persistent pin marker, since the
-            // "Pinned" section header (and pinned-first ordering inside a
-            // project) already conveys the pinned state. Revealed glyph:
-            // unpin if pinned, pin otherwise.
-            //
-            // `md:inline-flex` (not `md:block`): the Button base is
-            // `inline-flex` and relies on it for `items-center justify-center`
-            // to center the icon. `md:block` would override that display and
-            // collapse the centering, leaving the glyph pinned to the top-left
-            // of the button — so keep the flex display when revealing it.
-            "hidden md:inline-flex",
-            "md:opacity-0 md:group-hover:opacity-100",
-            "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-          )}
-          onClick={(e) => {
-            // Keep the toggle click off the surrounding Link (no navigation).
-            e.preventDefault();
-            e.stopPropagation();
-            onTogglePinned(conversation.id);
-          }}
-        >
-          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-        </Button>
-      )}
+      {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
+          row, so their spacing is defined once (gap-0.5) and stays aligned
+          with the project-folder header actions, which use the same pattern.
+          The kebab is the rightmost child (pinned to right-1); the pin sits a
+          gap to its left. Hidden entirely while selecting (bulk mode owns the
+          row controls). */}
       {!selectionMode && (
-        <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
-          <DropdownMenuTrigger asChild>
+        <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
+          {/* Archived rows omit the pin entirely: pinning is meaningless there
+              (archive outranks pin), so there's no pin action even on hover. */}
+          {!isArchived && (
             <Button
               type="button"
               variant="ghost"
               size="icon-xs"
-              aria-label="Conversation actions"
-              data-testid="conversation-actions"
-              // Absolute-positioned trigger. On mobile (no hover state)
-              // it's always visible. On desktop it stays hidden until
-              // hover / keyboard focus, with `aria-expanded` keeping it
-              // surfaced while the menu is open so the trigger doesn't
-              // vanish under the cursor.
+              aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+              data-testid="quick-pin-conversation"
               className={cn(
-                "-translate-y-1/2 absolute top-1/2 right-1 transition-opacity",
-                "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
-                "md:aria-expanded:opacity-100",
+                // Desktop-only quick affordance: hidden on mobile (the kebab's
+                // Pin item below covers that), hover/focus-revealed from `md`
+                // up. Pinned rows no longer keep a persistent pin marker, since
+                // the "Pinned" section header (and pinned-first ordering inside
+                // a project) already conveys the pinned state. Revealed glyph:
+                // unpin if pinned, pin otherwise.
+                //
+                // `md:inline-flex` (not `md:block`): the Button base is
+                // `inline-flex` and relies on it for `items-center
+                // justify-center` to center the icon. `md:block` would override
+                // that display and collapse the centering, leaving the glyph
+                // pinned to the top-left of the button — so keep the flex
+                // display when revealing it.
+                "transition-opacity",
+                "hidden md:inline-flex",
+                "md:opacity-0 md:group-hover:opacity-100",
+                "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
               )}
               onClick={(e) => {
-                // Keep the trigger click from bubbling into the Link.
+                // Keep the toggle click off the surrounding Link (no navigation).
                 e.preventDefault();
                 e.stopPropagation();
+                onTogglePinned(conversation.id);
               }}
             >
-              <MoreHorizontalIcon className="size-3.5" />
+              {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
             </Button>
-          </DropdownMenuTrigger>
-          {/* text-xs on every menu item (incl. the submenu trigger): a smaller,
-              denser kebab that reads closer to the row text. Scoped here so the
-              shared dropdown-menu component is untouched. */}
-          <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitem]]:text-xs">
-            <ConversationMenuItems
-              components={dropdownBundle}
-              setMenuOpen={setMenuOpen}
-              {...menuItemProps}
-            />
-          </DropdownMenuContent>
-        </DropdownMenu>
+          )}
+          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Conversation actions"
+                data-testid="conversation-actions"
+                // On mobile (no hover state) it's always visible. On desktop it
+                // stays hidden until hover / keyboard focus, with `aria-expanded`
+                // keeping it surfaced while the menu is open so the trigger
+                // doesn't vanish under the cursor.
+                className={cn(
+                  "transition-opacity",
+                  "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
+                  "md:aria-expanded:opacity-100",
+                )}
+                onClick={(e) => {
+                  // Keep the trigger click from bubbling into the Link.
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+              >
+                <MoreHorizontalIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            {/* text-xs on every menu item (incl. the submenu trigger): a smaller,
+                denser kebab that reads closer to the row text. Scoped here so the
+                shared dropdown-menu component is untouched. */}
+            <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitem]]:text-xs">
+              <ConversationMenuItems
+                components={dropdownBundle}
+                setMenuOpen={setMenuOpen}
+                {...menuItemProps}
+              />
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
       )}
       <PermissionsModal sessionId={conversation.id} open={shareOpen} onOpenChange={setShareOpen} />
       <Dialog

@@ -194,14 +194,23 @@ describe("quick pin/unpin hover button", () => {
   it("keeps the row full-width and the trailing controls inset from the right edge", () => {
     // The row link is `w-full` (not `w-[calc(100%+1rem)]`) so its highlight
     // stays inset from the right edge, aligning with the project/folder rows.
-    // The pin + kebab controls sit inside that edge (right-[30px] / right-1),
-    // not in a bled-past overflow gutter (right-[14px] / -right-3).
     renderSidebar();
 
-    expect(screen.getByTestId("quick-pin-conversation")).toHaveClass("size-6", "right-[30px]");
-    expect(screen.getByTestId("quick-pin-conversation")).not.toHaveClass("right-[14px]");
-    expect(screen.getByTestId("conversation-actions")).toHaveClass("size-6", "right-1");
-    expect(screen.getByTestId("conversation-actions")).not.toHaveClass("-right-3");
+    // The pin + kebab share ONE absolutely-positioned flex container anchored
+    // at right-1 with gap-0.5, mirroring the project-folder header actions —
+    // so the spacing is defined once and can't drift (no per-button fixed-px
+    // offsets like the old right-[30px] / -right-3).
+    const pin = screen.getByTestId("quick-pin-conversation");
+    const kebab = screen.getByTestId("conversation-actions");
+    expect(pin).toHaveClass("size-6");
+    expect(kebab).toHaveClass("size-6");
+    // Both buttons live in the same wrapper, which owns the position + gap.
+    const controls = pin.parentElement!;
+    expect(controls).toBe(kebab.parentElement);
+    expect(controls).toHaveClass("absolute", "right-1", "flex", "items-center", "gap-0.5");
+    // The old per-button offsets are gone.
+    expect(pin).not.toHaveClass("right-[30px]", "right-[1.875rem]", "right-[14px]", "absolute");
+    expect(kebab).not.toHaveClass("-right-3", "absolute");
 
     const rowLink = screen.getByRole("link", { name: "My Session" });
     expect(rowLink).toHaveClass("w-full");
