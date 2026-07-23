@@ -60,6 +60,8 @@ class HostFrameKind(str, Enum):
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
     INSTALL_HARNESS_RESULT = "host.install_harness_result"
+    STORE_SECRET = "host.store_secret"
+    STORE_SECRET_RESULT = "host.store_secret_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
 
@@ -631,6 +633,74 @@ class HostInstallHarnessResultFrame:
 
 
 @dataclass
+class HostStoreSecretFrame:
+    """Server → host: write a harness provider credential on the host.
+
+    Backs ``POST /v1/hosts/{id}/harnesses/{harness}/credential``, used by the
+    Web UI's setup dialog so a user can configure a Claude / Codex / Pi
+    credential on a connected host without a terminal. The host writes it with
+    the same non-interactive core (:func:`store_harness_credential`) the
+    ``omnigent setup`` wizard's "add a key / gateway" path uses: the secret goes
+    to the OS keychain (else ``~/.omnigent/secrets.json``), and ``config.yaml``
+    gets a ``providers:`` entry referencing it by ``keychain:<name>`` — never
+    the raw secret.
+
+    Security: ``secret_value`` is the only credential-bearing field and is named
+    so telemetry redaction masks it on spans (see ``_REDACT_KEY_SUBSTRINGS``).
+    The server is an authz'd pass-through — it validates ownership + the
+    allowlist, forwards this frame over the (TLS) tunnel, and never persists the
+    secret. The daemon writes it on the runner.
+
+    :param request_id: Correlates the result, e.g. ``"req_cred_1"``.
+    :param harness: Harness identifier being configured, e.g. ``"claude"`` /
+        ``"codex"`` / ``"pi"``. The host maps it to its provider family.
+    :param kind: ``"key"`` (a vendor API key) or ``"gateway"`` (a compatible
+        proxy at ``base_url``) or ``"adopt"`` (reference an existing host env
+        var by name — carries ``env_var``, not ``secret_value``).
+    :param secret_value: The API key / gateway token for ``key`` / ``gateway``;
+        ``None`` for ``adopt`` (which references ``env_var`` instead).
+    :param base_url: The gateway base URL for ``kind="gateway"``; ``None``
+        otherwise.
+    :param default_model: Optional family default model id to pin.
+    :param wire_api: Optional OpenAI wire protocol (``"chat"`` / ``"responses"``).
+    :param env_var: For ``kind="adopt"``, the host env var to reference
+        (``api_key_ref: env:<env_var>``); ``None`` otherwise.
+    """
+
+    request_id: str
+    harness: str
+    kind: str
+    secret_value: str | None = None
+    base_url: str | None = None
+    default_model: str | None = None
+    wire_api: str | None = None
+    env_var: str | None = None
+
+
+@dataclass
+class HostStoreSecretResultFrame:
+    """Host → server: outcome of a store-secret request.
+
+    Carries the freshly-recomputed readiness map so the UI can flip the harness
+    badge (yellow → green) without waiting for a reconnect. Never echoes the
+    secret or the provider name's credential — only the outcome + readiness.
+
+    :param request_id: Correlates to the :class:`HostStoreSecretFrame`.
+    :param status: ``"ok"`` when the credential was written, ``"failed"``
+        otherwise (paired with a non-secret ``error``).
+    :param configured_harnesses: Readiness recomputed after the write, e.g.
+        ``{"claude-native": True}``. ``None`` when the write could not run.
+    :param error: Non-secret failure reason, e.g. ``"a gateway requires a
+        base_url"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostFsRequestFrame:
     """Server → host: read-only workspace filesystem request.
 
@@ -972,6 +1042,30 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostStoreSecretFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.STORE_SECRET.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "kind_": frame.kind,
+                "secret_value": frame.secret_value,
+                "base_url": frame.base_url,
+                "default_model": frame.default_model,
+                "wire_api": frame.wire_api,
+                "env_var": frame.env_var,
+            }
+        )
+    if isinstance(frame, HostStoreSecretResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.STORE_SECRET_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostFsRequestFrame):
         return _encode_payload(
             {
@@ -1101,6 +1195,10 @@ def _decode_known_host_frame(
             return _decode_install_harness(msg)
         case HostFrameKind.INSTALL_HARNESS_RESULT:
             return _decode_install_harness_result(msg)
+        case HostFrameKind.STORE_SECRET:
+            return _decode_store_secret(msg)
+        case HostFrameKind.STORE_SECRET_RESULT:
+            return _decode_store_secret_result(msg)
         case HostFrameKind.FS_REQUEST:
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
@@ -1473,6 +1571,38 @@ def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessRes
     :returns: Typed host.install_harness_result frame.
     """
     return HostInstallHarnessResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_store_secret(msg: dict[str, Any]) -> HostStoreSecretFrame:
+    """Decode a host.store_secret request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.store_secret frame.
+    """
+    return HostStoreSecretFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+        kind=_required_str(msg, "kind_"),
+        secret_value=_optional_nullable_str(msg, "secret_value"),
+        base_url=_optional_nullable_str(msg, "base_url"),
+        default_model=_optional_nullable_str(msg, "default_model"),
+        wire_api=_optional_nullable_str(msg, "wire_api"),
+        env_var=_optional_nullable_str(msg, "env_var"),
+    )
+
+
+def _decode_store_secret_result(msg: dict[str, Any]) -> HostStoreSecretResultFrame:
+    """Decode a host.store_secret_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.store_secret_result frame.
+    """
+    return HostStoreSecretResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),

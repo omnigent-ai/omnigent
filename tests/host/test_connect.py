@@ -40,6 +40,8 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
@@ -2218,6 +2220,137 @@ def test_handle_install_harness_rejects_non_allowlisted(
 
     assert result.status == "failed"
     assert result.error is not None and "hermes" in result.error
+    assert result.configured_harnesses is None
+
+
+def test_handle_store_secret_key_writes_and_returns_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key store-secret request calls the core and returns fresh readiness.
+
+    The handler is a thin wrapper: resolve family, call the non-interactive
+    core, then recompute readiness so the server flips the badge (yellow →
+    green) without a reconnect.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    calls: list[dict[str, object]] = []
+
+    def _store(**kwargs: object) -> StoreCredentialResult:
+        calls.append(kwargs)
+        return StoreCredentialResult(True, "anthropic", None)
+
+    monkeypatch.setattr("omnigent.onboarding.harness_auth.store_harness_credential", _store)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"claude-native": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c1",
+            harness="claude",
+            kind="key",
+            secret_value="sk-ant-x",
+            default_model="claude-sonnet-4-6",
+        )
+    )
+    assert isinstance(result, HostStoreSecretResultFrame)
+    assert result.status == "ok"
+    assert result.configured_harnesses == {"claude-native": True}
+    # The core was called with the resolved family + the frame's fields.
+    assert calls == [
+        {
+            "family": "anthropic",
+            "kind": "key",
+            "secret": "sk-ant-x",
+            "base_url": None,
+            "default_model": "claude-sonnet-4-6",
+            "wire_api": None,
+        }
+    ]
+
+
+def test_handle_store_secret_pi_maps_to_anthropic_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi (which consumes both families) writes to its preferred anthropic family."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _store(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "anthropic", None)
+
+    monkeypatch.setattr("omnigent.onboarding.harness_auth.store_harness_credential", _store)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c2", harness="pi", kind="key", secret_value="sk-x")
+    )
+    assert result.status == "ok"
+    assert seen["family"] == "anthropic"
+
+
+def test_handle_store_secret_adopt_calls_adopt_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An adopt request references an env var via the adopt core."""
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _adopt(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "openai", None)
+
+    monkeypatch.setattr("omnigent.onboarding.harness_auth.adopt_env_credential", _adopt)
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"codex-native": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c3", harness="codex", kind="adopt", env_var="OPENAI_API_KEY"
+        )
+    )
+    assert result.status == "ok"
+    assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
+
+
+def test_handle_store_secret_rejects_non_ui_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A harness outside the UI-auth families is refused without a write."""
+
+    def _must_not_write(**kwargs: object) -> object:
+        raise AssertionError("credential core reached for a non-UI-auth harness")
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_auth.store_harness_credential", _must_not_write
+    )
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c4", harness="cursor", kind="key", secret_value="x")
+    )
+    assert result.status == "failed"
+    assert result.error is not None and "cursor" in result.error
+
+
+def test_handle_store_secret_surfaces_core_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A core write failure surfaces its non-secret reason as ``failed``."""
+    from omnigent.onboarding.harness_auth import StoreCredentialResult
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_auth.store_harness_credential",
+        lambda **k: StoreCredentialResult(False, None, "a gateway requires a base_url"),
+    )
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c5", harness="codex", kind="gateway", secret_value="x")
+    )
+    assert result.status == "failed"
+    assert result.error == "a gateway requires a base_url"
     assert result.configured_harnesses is None
 
 

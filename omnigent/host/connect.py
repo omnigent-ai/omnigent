@@ -53,6 +53,8 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -1622,6 +1624,93 @@ class HostProcess:
             configured_harnesses=configured_harness_map(),
         )
 
+    def _handle_store_secret(self, frame: HostStoreSecretFrame) -> HostStoreSecretResultFrame:
+        """Handle a ``host.store_secret`` request from the server.
+
+        Writes a harness provider credential on THIS host via the same
+        non-interactive core (:func:`store_harness_credential` /
+        :func:`adopt_env_credential`) the ``omnigent setup`` wizard's
+        "add a key / gateway" path uses — the secret goes to the OS keychain
+        (else ``~/.omnigent/secrets.json``) and ``config.yaml`` gets a
+        ``providers:`` entry referencing it, never the raw secret. Then it
+        recomputes readiness so the result frame flips the badge (yellow →
+        green) without a reconnect.
+
+        The ``ui_install_key`` guard re-checks the allowlist as defence in depth
+        against a spoofed frame — only the UI-auth families (Claude/Codex/Pi)
+        can drive the writer. The secret is never logged. Runs off the event
+        loop (keychain / file I/O).
+
+        :param frame: The store-secret request. ``frame.harness`` is a UI
+            harness id; ``frame.kind`` is ``"key"`` / ``"gateway"`` / ``"adopt"``.
+        :returns: Result with ``status`` ``"ok"``/``"failed"``, refreshed
+            readiness on success, and a non-secret reason on failure.
+        """
+        from omnigent.onboarding.harness_auth import (
+            adopt_env_credential,
+            store_harness_credential,
+        )
+        from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
+
+        # Resolve the harness to a provider family, re-checking the allowlist.
+        # claude→anthropic, codex→openai; pi consumes both and prefers anthropic
+        # (its first fallback family), so a pi credential lands on anthropic.
+        install_key = ui_install_key(frame.harness)
+        family = {
+            ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
+            OPENAI_FAMILY: OPENAI_FAMILY,
+            "pi": ANTHROPIC_FAMILY,
+        }.get(install_key or "")
+        if family is None:
+            return HostStoreSecretResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"harness {frame.harness!r} is not configurable from the UI",
+            )
+
+        if frame.kind == "adopt":
+            if not frame.env_var:
+                return HostStoreSecretResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="adopt requires an env_var",
+                )
+            result = adopt_env_credential(family=family, env_var=frame.env_var)
+        elif frame.kind in ("key", "gateway"):
+            result = store_harness_credential(
+                family=family,
+                kind=frame.kind,
+                secret=frame.secret_value or "",
+                base_url=frame.base_url,
+                default_model=frame.default_model,
+                wire_api=frame.wire_api,
+            )
+        else:
+            return HostStoreSecretResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"unknown credential kind {frame.kind!r}",
+            )
+
+        if not result.stored:
+            return HostStoreSecretResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=result.reason or "could not write the credential",
+            )
+        # Deliberately log only the non-secret entry name, never the secret.
+        _logger.info(
+            "Wrote %s credential for %s (family %s) via UI request",
+            frame.kind,
+            frame.harness,
+            family,
+        )
+        return HostStoreSecretResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            configured_harnesses=configured_harness_map(),
+        )
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -2267,6 +2356,11 @@ class HostProcess:
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
             result = await asyncio.to_thread(self._handle_install_harness, frame)
+            await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostStoreSecretFrame):
+            # The credential write touches the OS keychain / config file, so run
+            # it off the event loop and reply when it completes.
+            result = await asyncio.to_thread(self._handle_store_secret, frame)
             await ws.send(encode_host_frame(result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))

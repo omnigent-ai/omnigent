@@ -35,6 +35,7 @@ from omnigent.host.frames import (
     HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
+    HostStoreSecretFrame,
     encode_host_frame,
 )
 from omnigent.onboarding.harness_install import ui_install_key, ui_installable_harnesses
@@ -268,6 +269,57 @@ async def _proxy_install_harness(
         host_conn.pending_installs.pop(request_id, None)
 
 
+# The credential write is local keychain/file I/O on the host — fast, unlike the
+# npm install — so a short timeout is plenty and surfaces a hung host quickly.
+_STORE_SECRET_TIMEOUT_S = 30.0
+
+
+async def _proxy_store_secret(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    frame: HostStoreSecretFrame,
+) -> dict[str, Any]:
+    """Forward a ``host.store_secret`` frame and await the result.
+
+    Mirrors :func:`_proxy_install_harness`: register a future on the host
+    connection's ``pending_secret_writes`` map, enqueue the frame, await with a
+    timeout, and clean up in a finally block. The server never inspects,
+    persists, or logs the secret in *frame* — it is a pass-through to the host
+    daemon, which does the write on the runner.
+
+    :param host_registry: Server-side registry; used to enqueue the frame.
+    :param host_conn: Live host connection.
+    :param frame: The store-secret frame to forward (carries the secret).
+    :returns: Dict with ``status`` / ``configured_harnesses`` / ``error``.
+    :raises HTTPException: 504 on timeout, 502 on connection drop.
+    """
+    request_id = frame.request_id
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_secret_writes[request_id] = future
+    try:
+        try:
+            host_registry.send_text(host_conn, encode_host_frame(frame))
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not respond to store_secret "
+                    f"within {_STORE_SECRET_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        host_conn.pending_secret_writes.pop(request_id, None)
+
+
 class CreateDirectoryRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/directories``.
 
@@ -278,6 +330,31 @@ class CreateDirectoryRequest(BaseModel):
     """
 
     path: str
+
+
+class StoreHarnessCredentialRequest(BaseModel):
+    """Request body for ``POST /v1/hosts/{id}/harnesses/{harness}/credential``.
+
+    Carries the credential in the body (never the URL). The secret field is
+    optional so the ``adopt`` kind — which references an existing host env var
+    by name rather than sending a value — can omit it.
+
+    :param kind: ``"key"`` (a vendor API key), ``"gateway"`` (a compatible
+        proxy at ``base_url``), or ``"adopt"`` (reference host env ``env_var``).
+    :param secret: The API key / gateway token for ``key`` / ``gateway``;
+        ``None`` for ``adopt``.
+    :param base_url: The gateway base URL, required for ``kind="gateway"``.
+    :param default_model: Optional family default model id to pin.
+    :param wire_api: Optional OpenAI wire protocol (``"chat"`` / ``"responses"``).
+    :param env_var: For ``kind="adopt"``, the host env var to reference.
+    """
+
+    kind: str
+    secret: str | None = None
+    base_url: str | None = None
+    default_model: str | None = None
+    wire_api: str | None = None
+    env_var: str | None = None
 
 
 class LaunchRunnerRequest(BaseModel):
@@ -1104,6 +1181,95 @@ def create_hosts_router(
 
         return {
             "object": "harness_install",
+            "harness": harness,
+            "configured_harnesses": result.get("configured_harnesses") or {},
+        }
+
+    @router.post("/hosts/{host_id}/harnesses/{harness}/credential")
+    async def store_host_harness_credential(
+        request: Request,
+        host_id: str,
+        harness: str,
+        body: StoreHarnessCredentialRequest,
+    ) -> dict[str, Any]:
+        """
+        Write a harness provider credential onto a connected host.
+
+        Backs the Web UI setup dialog's "Add a credential" action so a user can
+        configure a Claude / Codex / Pi credential on a connected host without a
+        terminal. Owner-scoped, allowlisted, and gated behind
+        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` exactly like the install route
+        (404 when disabled). The host daemon does the write with the same
+        non-interactive core the ``omnigent setup`` wizard uses.
+
+        Security: the server is an authz'd pass-through — it validates
+        ownership + the allowlist and forwards the secret over the (TLS) tunnel;
+        it never persists the secret or logs it. The secret rides in the request
+        body (not the URL), and the frame field is redaction-named so it never
+        lands on a telemetry span.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier.
+        :param harness: Harness being configured, e.g. ``"claude"``.
+        :param body: The credential payload (kind + secret / gateway / adopt).
+        :returns: ``{"object": "harness_credential", "harness": ...,
+            "configured_harnesses": {...}}`` — refreshed readiness so the UI can
+            flip the badge without a reconnect.
+        :raises HTTPException: 404 when disabled or host unknown, 400 when the
+            harness isn't UI-configurable or the body is invalid, 403 when not
+            the owner, 409 when offline, 502 on host-side failure, 504 on
+            timeout.
+        """
+        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+            raise HTTPException(status_code=404, detail="not found")
+
+        # Allowlist before ownership (403) so error codes can't enumerate
+        # ownership. Only UI-installable harnesses are UI-configurable.
+        if harness not in ui_installable_harnesses():
+            raise HTTPException(
+                status_code=400,
+                detail=f"harness {harness!r} is not configurable from the UI",
+            )
+        if body.kind not in ("key", "gateway", "adopt"):
+            raise HTTPException(status_code=400, detail=f"unknown credential kind {body.kind!r}")
+
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        frame = HostStoreSecretFrame(
+            request_id=secrets.token_hex(8),
+            harness=harness,
+            kind=body.kind,
+            secret_value=body.secret,
+            base_url=body.base_url,
+            default_model=body.default_model,
+            wire_api=body.wire_api,
+            env_var=body.env_var,
+        )
+        result = await _proxy_store_secret(
+            host_registry=host_registry,
+            host_conn=conn,
+            frame=frame,
+        )
+
+        if result.get("status") == "failed":
+            # The host's reason is non-secret (validation / write failure).
+            raise HTTPException(
+                status_code=502,
+                detail=f"host credential write failed: {result.get('error') or 'unknown error'}",
+            )
+
+        return {
+            "object": "harness_credential",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
         }

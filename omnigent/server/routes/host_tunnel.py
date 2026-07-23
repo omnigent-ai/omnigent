@@ -41,6 +41,7 @@ from omnigent.host.frames import (
     HostRunnerStatusResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
@@ -612,6 +613,18 @@ async def _receive_loop(
             install_future = conn.pending_installs.pop(frame.request_id, None)
             if install_future is not None and not install_future.done():
                 install_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostStoreSecretResultFrame):
+            secret_future = conn.pending_secret_writes.pop(frame.request_id, None)
+            if secret_future is not None and not secret_future.done():
+                secret_future.set_result(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
