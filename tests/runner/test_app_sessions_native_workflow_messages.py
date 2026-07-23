@@ -1138,7 +1138,7 @@ async def test_session_creation_does_not_replay_trailing_user_for_codex_native(
     """
     import asyncio as _aio
 
-    import omnigent.runner.app as runner_app_mod
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "c5bceafbef391eeff567c144d1d33f3f"
     runner_app_mod._session_histories_ref.pop(session_id, None)
@@ -1196,7 +1196,7 @@ async def test_catch_up_scan_skips_codex_native_history_entries(
     """
     import asyncio as _aio
 
-    import omnigent.runner.app as runner_app_mod
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "97990a9c3b849bb4710a9fb1e9fdc6c8"
     saved_histories = dict(runner_app_mod._session_histories_ref)

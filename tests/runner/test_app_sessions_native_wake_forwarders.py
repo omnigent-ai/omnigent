@@ -10,12 +10,12 @@ from typing import Any
 import httpx
 import pytest
 
-import omnigent.runner.app as runner_app_mod
 from omnigent import (
     claude_native_bridge,
     codex_native_bridge,
 )
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.runner import app as runner_app_mod
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
 

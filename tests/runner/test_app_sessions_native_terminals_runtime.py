@@ -345,7 +345,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     :returns: None.
     """
     import omnigent.codex_native_app_server as codex_app_mod
-    import omnigent.runner.app as runner_app_mod
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
@@ -632,9 +632,9 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     :returns: None.
     """
     import omnigent.codex_native_app_server as codex_app_mod
-    import omnigent.runner.app as runner_app_mod
     from omnigent import codex_native
     from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.runner import app as runner_app_mod
     from omnigent.stores.conversation_store import (
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -902,9 +902,9 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     :returns: None.
     """
     import omnigent.codex_native_app_server as codex_app_mod
-    import omnigent.runner.app as runner_app_mod
     from omnigent import codex_native
     from omnigent.codex_native_bridge import bridge_dir_for_bridge_id, codex_home_for_bridge_dir
+    from omnigent.runner import app as runner_app_mod
     from omnigent.stores.conversation_store import (
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -1160,8 +1160,8 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     :returns: None.
     """
     import omnigent.codex_native_app_server as codex_app_mod
-    import omnigent.runner.app as runner_app_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "54e4d4410c43954c11e702f5a8646483"
     # Three distinct dirs so the assertion can only pass for the worktree:
@@ -1412,7 +1412,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     :returns: None.
     """
     import omnigent.codex_native_app_server as codex_app_mod
-    import omnigent.runner.app as runner_app_mod
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "de154ca6405fb8912623984a14a2b044"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -1730,11 +1730,11 @@ async def _run_antigravity_auto_create(
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
     import omnigent.antigravity_native_launch as launch_mod
     import omnigent.antigravity_native_reader as reader_mod
     import omnigent.antigravity_native_rpc as rpc_mod
-    import omnigent.runner.app as runner_app_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -2066,9 +2066,9 @@ async def test_cold_start_agy_conversation_returns_early_on_real_id_in_bridge_st
     early-return BEFORE probing for a port or calling ``StartCascade`` — so even a
     future caller that forgets the resume gate cannot cold-start over a real id.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
     import omnigent.antigravity_native_rpc as rpc_mod
-    import omnigent.runner.app as runner_app_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
 
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
     session_id = "0f44894f77886259ee71e892a9e2afd7"
@@ -2165,14 +2165,14 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
       with ``{elicitation_id, params}``, then — on the human verdict — delivers
       the answer to agy via ``handle_user_interaction`` (the bridge default).
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
-    import omnigent.antigravity_native_interactions as interactions_mod
     import omnigent.antigravity_native_launch as launch_mod
     import omnigent.antigravity_native_reader as reader_mod
     import omnigent.antigravity_native_rpc as rpc_mod
-    import omnigent.runner.app as runner_app_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent import antigravity_native_interactions as interactions_mod
     from omnigent.antigravity_native_interactions import agy_elicitation_id
     from omnigent.antigravity_native_steps import pending_interaction
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "b68c3f1da613f48fb4126e965ab594a3"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2349,11 +2349,11 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
       env does not override ``HOME``, so agy keeps platform auth such as macOS
       Keychain but loads the bridge-scoped config.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
     import omnigent.antigravity_native_launch as launch_mod
     import omnigent.antigravity_native_reader as reader_mod
     import omnigent.antigravity_native_rpc as rpc_mod
-    import omnigent.runner.app as runner_app_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "1fd85439049bbfc88cbf04221bad5079"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
@@ -2486,11 +2486,11 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
     argv is preserved verbatim. This guards that invariant against a future change
     to the argv-composition line in ``_auto_create_antigravity_terminal``.
     """
-    import omnigent.antigravity_native_bridge as bridge_mod
     import omnigent.antigravity_native_launch as launch_mod
     import omnigent.antigravity_native_reader as reader_mod
     import omnigent.antigravity_native_rpc as rpc_mod
-    import omnigent.runner.app as runner_app_mod
+    from omnigent import antigravity_native_bridge as bridge_mod
+    from omnigent.runner import app as runner_app_mod
 
     session_id = "976793baf55bcdf96830aa376e394f80"
     monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")

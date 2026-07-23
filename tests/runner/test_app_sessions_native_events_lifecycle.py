@@ -1091,7 +1091,7 @@ async def test_events_stop_on_codex_native_cancels_mcp_startup_without_active_tu
     # ``clear_bridge_state`` — otherwise the seeded bridge state below is
     # wiped on hosts where the codex CLI/provider config exist (in CI the
     # auto-create aborts on its own before the clear).
-    import omnigent.runner.app as runner_app_module
+    from omnigent.runner import app as runner_app_module
 
     async def _fail_launch_config(**kwargs: Any) -> None:
         """Abort codex auto-create before it clears bridge state."""
@@ -1225,7 +1225,7 @@ async def test_events_interrupt_on_codex_native_with_turn_and_mcp_stops_both(
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     # Keep the seeded bridge state alive through session create (see the
     # sister startup-cancel test for why auto-create must abort early).
-    import omnigent.runner.app as runner_app_module
+    from omnigent.runner import app as runner_app_module
 
     async def _fail_launch_config(**kwargs: Any) -> None:
         """Abort codex auto-create before it clears bridge state."""
@@ -1340,7 +1340,7 @@ async def test_events_interrupt_on_codex_native_without_turn_or_mcp_is_noop(
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     # Keep the seeded bridge state alive through session create (see the
     # sister startup-cancel test for why auto-create must abort early).
-    import omnigent.runner.app as runner_app_module
+    from omnigent.runner import app as runner_app_module
 
     async def _fail_launch_config(**kwargs: Any) -> None:
         """Abort codex auto-create before it clears bridge state."""
