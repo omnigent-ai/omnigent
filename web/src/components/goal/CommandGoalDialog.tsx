@@ -16,14 +16,16 @@ export interface CommandGoalDialogProps {
   onOpenChange: (open: boolean) => void;
   readOnly: boolean;
   onStartGoal: (condition: string) => void;
+  backendLabel?: string;
 }
 
-/** Start a Claude goal by sending its native slash command as the next turn. */
+/** Start a vendor goal by sending its native slash command as the next turn. */
 export function CommandGoalDialog({
   open,
   onOpenChange,
   readOnly,
   onStartGoal,
+  backendLabel = "The agent",
 }: CommandGoalDialogProps) {
   const [condition, setCondition] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -56,8 +58,8 @@ export function CommandGoalDialog({
               <span>Goal</span>
             </DialogTitle>
             <DialogDescription>
-              Claude keeps working until this condition is met. Progress and completion appear in
-              the conversation.
+              {backendLabel} keeps working until this condition is met. Progress and completion
+              appear in the conversation.
             </DialogDescription>
           </DialogHeader>
 
