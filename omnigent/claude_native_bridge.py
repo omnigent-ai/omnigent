@@ -4954,9 +4954,43 @@ def _assistant_message_item(
     )
 
 
+# Placeholder text substituted for inline base64 image data in tool
+# results. A single Read of an image returns a full-resolution base64
+# PNG; serialized verbatim it costs hundreds of thousands of tokens and
+# is replayed as prompt text on every resume, overflowing the context
+# window and wedging compaction. The model cannot use raw base64 as
+# text anyway, so a reference is strictly better.
+_STRIPPED_IMAGE_PLACEHOLDER = "[image omitted from history]"
+
+
+def _strip_inline_image_data(value: Any) -> Any:
+    """
+    Replace base64 image payloads with a lightweight placeholder.
+
+    Walks list/dict tool-result content and rewrites any Anthropic
+    ``{"type": "image", "source": {"type": "base64", ...}}`` block to a
+    short text block, dropping the base64 ``data``. Non-image content
+    is returned unchanged.
+
+    :param value: Decoded tool-result content (list, dict, or scalar).
+    :returns: The same structure with image base64 data removed.
+    """
+    if isinstance(value, list):
+        return [_strip_inline_image_data(item) for item in value]
+    if isinstance(value, dict):
+        if value.get("type") == "image" and isinstance(value.get("source"), dict):
+            return {"type": "text", "text": _STRIPPED_IMAGE_PLACEHOLDER}
+        return {key: _strip_inline_image_data(val) for key, val in value.items()}
+    return value
+
+
 def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
     """
     Return the UI-facing output string for a Claude tool result.
+
+    Inline base64 image data (e.g. from reading an image file) is
+    stripped to a placeholder so the stored output stays small and can
+    be replayed on resume without overflowing the context window.
 
     :param entry: Decoded Claude transcript record containing
         optional ``toolUseResult`` metadata.
@@ -4967,12 +5001,12 @@ def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     if content is not None:
-        return json.dumps(content, separators=(",", ":"))
+        return json.dumps(_strip_inline_image_data(content), separators=(",", ":"))
     tool_use_result = entry.get("toolUseResult")
     if isinstance(tool_use_result, str):
         return tool_use_result
     if tool_use_result is not None:
-        return json.dumps(tool_use_result, separators=(",", ":"))
+        return json.dumps(_strip_inline_image_data(tool_use_result), separators=(",", ":"))
     return ""
 
 
