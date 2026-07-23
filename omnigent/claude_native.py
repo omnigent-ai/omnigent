@@ -3881,6 +3881,15 @@ def _claude_transcript_record_from_session_item(
         output = item.get("output")
         if not isinstance(output, str):
             output = "" if output is None else json.dumps(output, separators=(",", ":"))
+        # An intact base64 image rehydrates into a real image block below (cheap
+        # for the model, so it is kept as-is). But a payload clipped at the
+        # conversation-store byte cap holds corrupt/partial base64 that no
+        # longer parses — rehydration fails and the raw ~250K-char string would
+        # be sent as text on ``--resume``, re-overflowing the context and
+        # wedging compaction. Collapse only that truncated case to a
+        # placeholder, so both the tool_result content and the toolUseResult
+        # metadata stay small while intact images still resume as images.
+        output = _strip_unparseable_image_output(output)
         record_type = "user"
         # Image (and other structured) tool results are persisted as a
         # stringified content-block array. Rehydrate them into real blocks
@@ -4047,6 +4056,32 @@ def _json_safe_tool_use_result(output: str) -> str:
         json.loads(output)
     except (json.JSONDecodeError, ValueError):
         return json.dumps(output)
+    return output
+
+
+def _strip_unparseable_image_output(output: str) -> str:
+    """Collapse a truncated/corrupt base64 image tool result to a placeholder.
+
+    Intact image outputs (valid JSON) are returned unchanged so the caller can
+    rehydrate them into real image blocks for ``--resume``. Only a payload that
+    *looks* like an image but no longer parses as JSON — the shape produced when
+    the conversation store clipped it at its byte cap — is replaced with a short
+    placeholder, so the corrupt ~250K-char base64 is never sent as prompt text.
+
+    :param output: The persisted tool-result string.
+    :returns: The original string, or a placeholder JSON array when the output
+        is an unparseable image payload.
+    """
+    stripped = output.lstrip()
+    if stripped[:1] not in ("[", "{") or '"image"' not in output or '"base64"' not in output:
+        return output
+    try:
+        json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        from omnigent.runtime.prompt import _image_omitted_placeholder
+
+        placeholder = {"type": "text", "text": _image_omitted_placeholder(None)}
+        return json.dumps([placeholder], separators=(",", ":"))
     return output
 
 
