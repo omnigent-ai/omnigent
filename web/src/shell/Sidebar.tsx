@@ -693,7 +693,15 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           )}
 
-          <nav ref={scrollContainerRef} className="relative flex-1 overflow-y-auto px-2 pb-3">
+          <nav
+            ref={scrollContainerRef}
+            // `stable both-edges` reserves the scrollbar gutter symmetrically
+            // (left + right) so rows stay centered and content never reflows
+            // when the scrollbar appears/disappears — on classic-scrollbar
+            // platforms as well as overlay ones. Plain `stable` (right-only)
+            // left rows visually off-center against the left `px-2` inset.
+            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-gutter:stable_both-edges]"
+          >
             <ConversationList
               conversationsQuery={conversationsQuery}
               scrollContainerRef={scrollContainerRef}
