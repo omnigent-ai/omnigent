@@ -423,12 +423,10 @@ def test_fetch_model_pricing_bare_openrouter_id_via_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A bare ``vendor/model`` id (no ``openrouter/`` prefix) is priced from
-    the openrouter MLflow catalog on retry.
-
-    ``xiaomi/mimo-v2.5-pro`` is reported as ``xiaomi`` provider on first
-    lookup (no ``xiaomi.json`` exists); the openrouter catalog stores it
-    under the full ``vendor/model`` key, so the retry must find it.
+    A bare ``vendor/model`` id (no ``openrouter/`` prefix) from an
+    unrecognized provider is priced from the openrouter MLflow catalog
+    on retry.  ``xiaomi`` has no own-provider catalog, so the fallback
+    fires correctly.
     """
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
 
@@ -461,9 +459,9 @@ def test_fetch_model_pricing_kimi_k3_via_openrouter_catalog(
     """
     ``moonshotai/kimi-k3`` prices via the openrouter catalog retry.
 
-    The initial split treats ``moonshotai`` as the MLflow provider (no
-    catalog exists). The openrouter catalog contains ``moonshotai/kimi-k2.5``
-    so the family-prefix fallback should match ``kimi-k3``.
+    ``moonshotai`` has no own-provider catalog, so the fallback fires.
+    The openrouter catalog contains ``moonshotai/kimi-k2.5`` so the
+    family-prefix fallback should match ``kimi-k3``.
     """
     monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
 
@@ -855,3 +853,374 @@ def test_fetch_model_pricing_own_catalog_precedence_over_openrouter(
     assert pricing.input_per_token == pytest.approx(OWN_PRICE / 1_000_000), (
         "Own-provider catalog price must take precedence over openrouter"
     )
+
+
+# ---------------------------------------------------------------------------
+# New tests for review items
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_model_pricing_multi_match_distinct_prices_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (#1) Family-prefix fallback with >1 distinct price returns None.
+
+    When multiple entries share a family prefix but have DIFFERENT pricing,
+    the fallback cannot disambiguate. The old code built a set of
+    ModelPricing objects which would TypeError on a non-frozen dataclass;
+    the fix dedupes on a tuple key. This test exercises that path.
+
+    Uses entries like "vendor/model-v1" and "vendor/model-v2" so
+    rsplit("-", 1)[0] yields "vendor/model" and startswith("vendor/model-")
+    matches both entries.  A query for "vendor/model-v99" (absent) should
+    match the family prefix but return None because prices differ.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        if provider == "openrouter":
+            return {
+                "vendor/model-v1": {
+                    "pricing": {
+                        "input_per_million_tokens": 1.0,
+                        "output_per_million_tokens": 3.0,
+                    }
+                },
+                "vendor/model-v2": {
+                    "pricing": {
+                        # DIFFERENT price from model-v1
+                        "input_per_million_tokens": 2.0,
+                        "output_per_million_tokens": 6.0,
+                    }
+                },
+            }
+        return None
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+
+    # vendor/model-v99 shares the family prefix "vendor/model" with both
+    # model-v1 and model-v2 (via startswith("vendor/model-")), but they
+    # have different prices.
+    pricing = fetch_model_pricing("vendor/model-v99")
+    assert pricing is None, (
+        f"Multi-match with >1 distinct price should return None, got {pricing!r}"
+    )
+
+
+def test_fetch_model_pricing_openrouter_prefixed_id_via_catalog_no_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (#2) An ``openrouter/vendor/model`` id resolves via catalog without
+    hitting the network.
+
+    The ``openrouter/`` prefix is stripped before the catalog retry lookup,
+    so ``openrouter/vendor/model`` matches the openrouter catalog key
+    ``vendor/model``. No network (live API) call should be made.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+
+    network_called = False
+
+    def _boom(url: str, timeout: int = 3):
+        nonlocal network_called
+        network_called = True
+        raise AssertionError("Network should not be called for catalog-resolved id")
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        if provider == "openrouter":
+            return {
+                "vendor/model-x": {
+                    "pricing": {
+                        "input_per_million_tokens": 1.0,
+                        "output_per_million_tokens": 3.0,
+                    }
+                }
+            }
+        return None
+
+    # vendor has no own-provider catalog (returns None), so the fallback fires
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+
+    pricing = fetch_model_pricing("openrouter/vendor/model-x")
+    assert pricing is not None, "openrouter/vendor/model-x was not priced via catalog"
+    assert pricing.input_per_token == pytest.approx(1.0e-6)
+    assert not network_called, "Network was called despite catalog match"
+
+
+def test_fetch_model_pricing_directly_routed_id_no_openrouter_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (#3) A directly-routed ``openai/gpt-4o``-style id does NOT get OpenRouter
+    pricing via the fallback path.
+
+    When the own-provider catalog has no entry for a directly-routed id,
+    the function returns None -- it must NOT fall through to OpenRouter's
+    public rates (which may differ from the provider's contract rates).
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+
+    or_api_called = False
+
+    def _boom(url: str, timeout: int = 3):
+        nonlocal or_api_called
+        or_api_called = True
+        raise AssertionError("OpenRouter API should not be called for directly-routed provider id")
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        # openai catalog EXISTS and is recognized, but lacks gpt-4o
+        if provider == "openai":
+            return {
+                "gpt-5": {
+                    "pricing": {
+                        "input_per_million_tokens": 5.0,
+                        "output_per_million_tokens": 15.0,
+                    }
+                }
+            }
+        # openrouter catalog has gpt-4o at a different price (should NOT be reached)
+        if provider == "openrouter":
+            return {
+                "openai/gpt-4o": {
+                    "pricing": {
+                        "input_per_million_tokens": 99.0,
+                        "output_per_million_tokens": 99.0,
+                    }
+                }
+            }
+        return None
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+
+    pricing = fetch_model_pricing("openai/gpt-4o")
+    # The own-provider catalog has gpt-5 which matches gpt-4o's family prefix
+    # "gpt-" (via startswith("gpt-")).  This is correct own-provider pricing.
+    # The key assertion: it must NOT get OpenRouter's $99/M rate.
+    assert pricing is not None, (
+        "openai/gpt-4o should be priced via own-provider family-prefix "
+        "(gpt-5 matches gpt-), but got None"
+    )
+    assert pricing.input_per_token == pytest.approx(5e-6), (
+        f"openai/gpt-4o should get own-provider rate (5e-6), "
+        f"not OpenRouter rate (99e-6). Got {pricing.input_per_token}"
+    )
+    assert not or_api_called, "OpenRouter API was called for a directly-routed provider id"
+
+
+def test_fetch_model_pricing_two_cold_models_single_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (#4) Two different cold models trigger only one network download.
+
+    The live OpenRouter list endpoint (~342 entries) is fetched once and
+    cached under a singleton key. Per-model lookups are plain dict.get()
+    against this cached map, so the "one network call" property holds
+    across different models.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+    context_window._live_pricing_failure_cache.clear()
+
+    download_count = 0
+
+    list_payload = _or_list_response(
+        {"id": "vendor/model-a", "pricing": {"prompt": "1e-6", "completion": "5e-6"}},
+        {"id": "vendor/model-b", "pricing": {"prompt": "2e-6", "completion": "8e-6"}},
+    )
+
+    def _counting_urlopen(url: str, timeout: int = 3) -> _ListResp:
+        nonlocal download_count
+        download_count += 1
+        return _ListResp(list_payload)
+
+    monkeypatch.setattr(
+        context_window, "_fetch_mlflow_provider_catalog", _make_catalog(or_catalog=None)
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", _counting_urlopen)
+
+    p1 = fetch_model_pricing("vendor/model-a")
+    p2 = fetch_model_pricing("vendor/model-b")
+
+    assert p1 is not None, "vendor/model-a was not priced"
+    assert p2 is not None, "vendor/model-b was not priced"
+    assert p1.input_per_token == pytest.approx(1e-6)
+    assert p2.input_per_token == pytest.approx(2e-6)
+    assert download_count == 1, (
+        f"Expected 1 network download, got {download_count}. "
+        "The full list should be cached under a singleton key."
+    )
+
+
+def test_fetch_model_pricing_transient_failure_short_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (#5) Transient failures (timeout/DNS/5xx) are cached for a short TTL,
+    not the full 1-hour "not found" TTL.
+
+    After the short TTL expires, the next call should retry the network.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+    context_window._live_pricing_failure_cache.clear()
+
+    attempt_count = 0
+
+    def _timeout_then_succeed(url: str, timeout: int = 3):
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            raise TimeoutError("simulated timeout")
+        return _ListResp(
+            _or_list_response(
+                {"id": "vendor/model", "pricing": {"prompt": "1e-6", "completion": "5e-6"}},
+            )
+        )
+
+    monkeypatch.setattr(
+        context_window, "_fetch_mlflow_provider_catalog", _make_catalog(or_catalog=None)
+    )
+    monkeypatch.setattr(urllib.request, "urlopen", _timeout_then_succeed)
+
+    # First call: timeout -> cached as failure
+    p1 = fetch_model_pricing("vendor/model")
+    assert p1 is None
+    assert attempt_count == 1
+
+    # Simulate TTL expiry by clearing the failure cache
+    context_window._live_pricing_failure_cache.clear()
+
+    # Second call: should retry and succeed
+    p2 = fetch_model_pricing("vendor/model")
+    assert p2 is not None, "Should succeed after failure cache expires"
+    assert p2.input_per_token == pytest.approx(1e-6)
+    assert attempt_count == 2, f"Expected 2 attempts (failure + retry), got {attempt_count}"
+
+
+def test_fetch_model_pricing_pinned_bare_id_xiaomi_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pinned bare id ``xiaomi/mimo-v2.5-pro`` (no ``openrouter/`` prefix)
+    resolves to OpenRouter pricing via the catalog retry.
+
+    ``xiaomi`` is not a recognized MLflow provider (catalog is None), so the
+    OpenRouter fallback fires and the openrouter catalog stores the id
+    verbatim.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        if provider == "openrouter":
+            return {
+                "xiaomi/mimo-v2.5-pro": {
+                    "pricing": {
+                        "input_per_million_tokens": 1.0,
+                        "output_per_million_tokens": 3.0,
+                        "cache_read_per_million_tokens": 0.2,
+                        "cache_write_per_million_tokens": 0.0,
+                    }
+                }
+            }
+        return None
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+
+    pricing = fetch_model_pricing("xiaomi/mimo-v2.5-pro")
+    assert pricing is not None, (
+        "Pinned bare id xiaomi/mimo-v2.5-pro must be priced (via openrouter catalog retry)"
+    )
+    assert pricing.input_per_token == pytest.approx(1.0e-6)
+    assert pricing.output_per_token == pytest.approx(3.0e-6)
+    assert pricing.cache_read_per_token == pytest.approx(0.2e-6)
+
+
+def test_fetch_model_pricing_pinned_bare_id_kimi_k3_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pinned bare id ``moonshotai/kimi-k3`` (no ``openrouter/`` prefix)
+    resolves to OpenRouter pricing via catalog family-prefix fallback.
+
+    ``moonshotai`` is not a recognized MLflow provider. The openrouter
+    catalog contains ``moonshotai/kimi-k2.5`` so the family-prefix fallback
+    matches.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        if provider == "openrouter":
+            return {
+                "moonshotai/kimi-k2.5": {
+                    "pricing": {
+                        "input_per_million_tokens": 0.6,
+                        "output_per_million_tokens": 3.0,
+                        "cache_read_per_million_tokens": 0.1,
+                    }
+                }
+            }
+        return None
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+
+    pricing = fetch_model_pricing("moonshotai/kimi-k3")
+    assert pricing is not None, (
+        "Pinned bare id moonshotai/kimi-k3 must be priced (via openrouter family-prefix)"
+    )
+    assert pricing.input_per_token == pytest.approx(0.6e-6)
+    assert pricing.output_per_token == pytest.approx(3.0e-6)
+
+
+def test_fetch_model_pricing_pinned_bare_id_glm52_prices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pinned bare id ``z-ai/glm-5.2`` (no ``openrouter/`` prefix)
+    resolves to OpenRouter pricing via the live API fallback.
+
+    ``z-ai`` is not a recognized MLflow provider and is absent from the
+    openrouter MLflow catalog, so the live list-endpoint fallback fires.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+    context_window._live_pricing_failure_cache.clear()
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        return None
+
+    list_payload = _or_list_response(
+        {"id": "some/other", "pricing": {"prompt": "1", "completion": "2"}},
+        {
+            "id": "z-ai/glm-5.2",
+            "pricing": {
+                "prompt": "0.0000007938",
+                "completion": "0.0000024948",
+                "input_cache_read": "0.00000014742",
+            },
+        },
+    )
+
+    def _fake_urlopen(url: str, timeout: int = 3) -> _ListResp:
+        assert "openrouter.ai/api/v1/models" in url
+        return _ListResp(list_payload)
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+    pricing = fetch_model_pricing("z-ai/glm-5.2")
+    assert pricing is not None, (
+        "Pinned bare id z-ai/glm-5.2 must be priced (via live OpenRouter API)"
+    )
+    assert pricing.input_per_token == pytest.approx(7.938e-7)
+    assert pricing.output_per_token == pytest.approx(2.4948e-6)
+    assert pricing.cache_read_per_token == pytest.approx(1.4742e-7)
