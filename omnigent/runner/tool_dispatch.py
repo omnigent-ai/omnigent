@@ -271,6 +271,10 @@ _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 # NimbleResearchTool.invoke, the same posture as web_search.
 _NIMBLE_RESEARCH_TOOLS = frozenset({"nimble_research"})
 
+# nimble_extract — Nimble Extract Templates (template run → structured JSON).
+# Runner-local for the same reason.
+_NIMBLE_EXTRACT_TOOLS = frozenset({"nimble_extract"})
+
 # Hindsight long-term memory builtins. Runner-local (like web_search) so that a
 # wrapped harness's (claude-sdk / codex / cursor / pi) tool call resolves to the
 # spec-configured Hindsight tool via its ``invoke``. Without this entry the call
@@ -541,6 +545,7 @@ _ALL_LOCAL_TOOLS = (
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _NIMBLE_RESEARCH_TOOLS
+    | _NIMBLE_EXTRACT_TOOLS
     | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
@@ -2711,6 +2716,65 @@ async def _execute_nimble_research_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _nimble_extract_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``nimble_extract`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_nimble_research_config_from_spec`: scans
+    ``spec.tools.builtins`` for the entry named ``"nimble_extract"`` and
+    returns its ``config`` (credentials + optional template/timeout). Empty
+    dict when the builtin is a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The nimble_extract config dict, e.g.
+        ``{"api_key": "...", "template": "google_search"}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "nimble_extract":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_nimble_extract_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``nimble_extract`` tool call to Nimble's Extract Templates run
+    endpoint.
+
+    Builds ``NimbleExtractTool`` from the spec's ``nimble_extract`` builtin
+    config and runs its synchronous ``invoke`` off the event loop (the backend
+    makes a blocking HTTP call), mirroring :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``params`` (required object).
+    :param agent_spec: Parent agent's spec; carries the nimble_extract config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The structured JSON, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
+
+    config = _nimble_extract_config_from_spec(agent_spec)
+    tool = NimbleExtractTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "nimble_extract",
+        agent_id=agent_id or "nimble_extract",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
     """
     Return a Hindsight builtin's config dict from the parent spec.
@@ -4796,6 +4860,14 @@ async def execute_tool(
             )
         elif tool_name in _NIMBLE_RESEARCH_TOOLS:
             output = await _execute_nimble_research_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _NIMBLE_EXTRACT_TOOLS:
+            output = await _execute_nimble_extract_tool(
                 args,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,

@@ -116,6 +116,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 # Instantiable
                 "web_search",
                 "nimble_research",
+                "nimble_extract",
                 "upload_file",
                 "list_files",
                 "download_file",
