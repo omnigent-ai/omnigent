@@ -617,7 +617,7 @@ def test_azure_vanity_url_falls_back_to_probed_canonical_host(
     Drives the real ``_workspace_api_server_url`` with only httpx scripted, so it
     catches what a stubbed expander cannot: that function drops the ``?o=``
     selector before probing, so the fallback has to compare against the root it
-    actually probed rather than the URL it was handed (#2781).
+    actually probed rather than the URL it was handed.
     """
     vanity_root = "https://mydomain.azuredatabricks.net"
     canonical_root = "https://adb-4173618801742158.18.azuredatabricks.net"

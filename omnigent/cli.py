@@ -13289,7 +13289,7 @@ def _canonical_azure_databricks_url(server: str) -> str | None:
     Azure workspaces can front a custom (vanity) URL such as
     ``https://mydomain.azuredatabricks.net``, but that edge 303-redirects an
     unauthenticated request to ``/login`` instead of answering the probe, so the
-    login/host flow can't detect the Databricks posture (#2781). The canonical
+    login/host flow can't detect the Databricks posture. The canonical
     host does answer, and the ``?o=<workspace_id>`` selector already carries the
     id needed to build it.
 
@@ -13379,7 +13379,7 @@ def _resolve_server_url(server: str) -> str:
 
     The URL is always tried as the user gave it first. Only when that fails
     to resolve, and only for an Azure custom (vanity) workspace URL, is the
-    canonical ``adb-`` host synthesized (#2781) — and it is probed before
+    canonical ``adb-`` host synthesized — and it is probed before
     being adopted, so a wrong guess falls back to the user's URL instead of
     stranding them on a host they never typed.
 
