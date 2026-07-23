@@ -27,8 +27,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
     # graph (they are imported lazily inside the codex-native helpers).
+    from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.terminals.registry import TerminalListEntry
 
+import click
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -1879,6 +1881,45 @@ def create_runner_app(
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
+    _session_claude_launch_config_tasks: dict[
+        str, asyncio.Task[ClaudeNativeUcodeConfig | None]
+    ] = {}
+
+    async def _resolve_session_claude_launch_config(
+        session_id: str,
+    ) -> ClaudeNativeUcodeConfig | None:
+        if session_id in _session_claude_launch_configs:
+            return _session_claude_launch_configs[session_id]
+        task = _session_claude_launch_config_tasks.get(session_id)
+        if task is None:
+            from omnigent.claude_native import resolve_native_claude_config
+
+            async def _load() -> ClaudeNativeUcodeConfig | None:
+                spec = await _resolve_session_agent_spec(session_id)
+                config = await asyncio.to_thread(resolve_native_claude_config, spec=spec)
+                _session_claude_launch_configs[session_id] = config
+                return config
+
+            task = asyncio.create_task(_load())
+            _session_claude_launch_config_tasks[session_id] = task
+
+            def _forget_completed(
+                completed: asyncio.Task[ClaudeNativeUcodeConfig | None],
+                sid: str = session_id,
+            ) -> None:
+                if _session_claude_launch_config_tasks.get(sid) is completed:
+                    _session_claude_launch_config_tasks.pop(sid, None)
+
+            task.add_done_callback(_forget_completed)
+        return await asyncio.shield(task)
+
+    def _drop_session_claude_launch_config(session_id: str) -> None:
+        _session_claude_launch_configs.pop(session_id, None)
+        task = _session_claude_launch_config_tasks.pop(session_id, None)
+        if task is not None:
+            task.cancel()
+
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
     _session_tool_schemas: dict[str, list[dict[str, Any]]] = {}  # session_id → cached tool schemas
@@ -1932,6 +1973,12 @@ def create_runner_app(
         return False
 
     app.state.has_active_work = _has_active_work
+
+    def _drain_session_streams() -> None:
+        for queue in list(_session_event_queues.values()):
+            queue.put_nowait(None)
+
+    app.state.drain_session_streams = _drain_session_streams
 
     def _publish_event(session_id: str, event: dict[str, Any]) -> None:
         queue = _session_event_queues.get(session_id)
@@ -2922,6 +2969,10 @@ def create_runner_app(
                             skills_filter=_native_skills_filter,
                             session_init=init_context.envelope,
                             auth_token_factory=auth_token_factory,
+                            resolve_launch_config=lambda: _resolve_session_claude_launch_config(
+                                session_id
+                            ),
+                            record_launch_config=_session_claude_launch_configs.__setitem__,
                         )
                         terminal_ready = True
                     except Exception as exc:
@@ -3609,6 +3660,7 @@ def create_runner_app(
 
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
         _session_workspace_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
@@ -4888,6 +4940,9 @@ def create_runner_app(
         conv_id: str,
         model: str | None,
     ) -> Response:
+        from omnigent.claude_native import (
+            resolve_claude_native_model_selection,
+        )
         from omnigent.claude_native_bridge import (
             bridge_dir_for_bridge_id,
             inject_slash_command,
@@ -4900,7 +4955,12 @@ def create_runner_app(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        command = f"/model {model.strip()}"
+        selected_model = model.strip()
+        resolved_model = resolve_claude_native_model_selection(
+            selected_model,
+            _session_claude_launch_configs.get(conv_id),
+        )
+        command = f"/model {resolved_model}"
         try:
             await asyncio.to_thread(
                 inject_slash_command,
@@ -5808,6 +5868,7 @@ def create_runner_app(
             )
             _session_spec_cache.pop(conv, None)
             _session_skills_cache.pop(conv, None)
+            _drop_session_claude_launch_config(conv)
             _session_tool_schemas.pop(conv, None)
             _session_snapshot_cache.pop(conv, None)
             if process_manager is not None:
@@ -7419,6 +7480,10 @@ def create_runner_app(
                         server_client=server_client,
                         agent_spec=claude_agent_spec,
                         auth_token_factory=auth_token_factory,
+                        resolve_launch_config=lambda: _resolve_session_claude_launch_config(
+                            session_id
+                        ),
+                        record_launch_config=_session_claude_launch_configs.__setitem__,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -8748,6 +8813,48 @@ def create_runner_app(
                 },
             )
 
+    @app.get("/v1/sessions/{session_id}/claude-model-options")
+    async def get_session_claude_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "claude-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        try:
+            claude_config = await _resolve_session_claude_launch_config(session_id)
+        except click.ClickException as exc:
+            _logger.warning(
+                "Claude-native model options unavailable for session=%s: %s",
+                session_id,
+                exc.message,
+            )
+            return JSONResponse(
+                status_code=424,
+                content={
+                    "error": "claude_native_model_options_config",
+                    "detail": exc.message,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 — retryable model-options failure
+            _logger.warning(
+                "Claude-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_model_options_failed",
+                    "detail": _client_safe_error_detail(
+                        exc,
+                        context="claude-native model options",
+                    ),
+                },
+            )
+        from omnigent.claude_native import claude_native_model_options
+
+        return JSONResponse(
+            status_code=200,
+            content={"models": claude_native_model_options(claude_config)},
+        )
+
     @app.post("/v1/sessions/{session_id}/skills/resolve")
     async def resolve_session_skill(session_id: str, request: Request) -> JSONResponse:
         try:
@@ -8951,6 +9058,7 @@ def create_runner_app(
     def _clear_session_agent_caches(session_id: str, agent_id: str | None = None) -> None:
         _session_spec_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
+        _drop_session_claude_launch_config(session_id)
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)

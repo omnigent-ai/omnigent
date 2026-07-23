@@ -160,6 +160,30 @@ class SkillSummary(BaseModel):
     description: str
 
 
+class NativeReasoningEffortOption(BaseModel):
+    """Reasoning-effort metadata advertised by a native model catalog."""
+
+    model_config = ConfigDict(extra="allow")
+
+    reasoningEffort: str
+    description: str | None = None
+
+
+class NativeModelOption(BaseModel):
+    """One runner-owned native model-picker row."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    model: str | None = None
+    # Optional: Codex model/list and OpenCode /api/model rows are
+    # provider-supplied and may omit it; the UI falls back to ``id``.
+    displayName: str | None = None
+    defaultReasoningEffort: str | None = None
+    supportedReasoningEfforts: list[NativeReasoningEffortOption] = Field(default_factory=list)
+    isDefault: bool | None = None
+
+
 class PolicySummary(BaseModel):
     """
     Safe subset of a policy's spec for API exposure.
@@ -1754,10 +1778,9 @@ class SessionResponse(BaseModel):
         runner at startup. Empty list when the agent spec
         cannot be loaded, or when bundled + host discovery
         yields nothing.
-    :param model_options: Codex app-server ``model/list`` options
-        for codex-native sessions, including each model's supported
-        reasoning efforts. Empty for non-codex-native sessions or while
-        the bound runner / Codex app-server cannot answer yet.
+    :param model_options: Runner-owned model-picker options for native
+        sessions. Claude supplies launch-time gateway aliases; Codex includes
+        each model's supported reasoning efforts. Empty while unavailable.
     :param terminal_pending: ``True`` while the runner is auto-creating
         a terminal-first session's terminal (claude-native /
         codex-native), so the Web UI shows a spinner on the Terminal
@@ -1830,7 +1853,7 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     skills: list[SkillSummary] = Field(default_factory=list)
-    model_options: list[dict[str, Any]] = Field(default_factory=list)
+    model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions
@@ -2296,6 +2319,77 @@ class ChildSessionList(BaseModel):
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False
+
+
+class SessionUsage(BaseModel):
+    """
+    One session's rolled-up LLM spend for the ``GET /v1/usage`` report.
+
+    ``cost_usd`` is the subtree total — the session plus every sub-agent it
+    spawned — read from ``session_usage`` via
+    :func:`omnigent.runtime.policies.builder.load_session_usage`. It is the
+    authoritative session figure (the same value the web session sidebar
+    shows as "Session cost" and the daily rollup records).
+
+    ``models`` is the per-model cost breakdown, mirroring the web session
+    sidebar's per-model list. Deliberately **not guaranteed to sum to
+    ``cost_usd``**: native harnesses report a single cumulative session
+    total and the server attributes it to the currently-active model, so on
+    a session that switched models mid-run each model's bucket is a snapshot
+    of the running total rather than that model's own spend. The header
+    ``cost_usd`` stays authoritative; the per-model values are shown
+    faithfully as recorded (same convention as the web UI).
+
+    :param id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of last activity.
+    :param title: Optional human-readable title.
+    :param cost_usd: Authoritative cumulative USD spend for this session's
+        subtree.
+    :param models: Per-model recorded cost, keyed by the raw harness model
+        id (e.g. ``{"claude-opus-4-8": 14.03}``). Empty when no per-model
+        cost was recorded. May not sum to ``cost_usd`` (see above).
+    """
+
+    id: str
+    created_at: int
+    updated_at: int
+    title: str | None = None
+    cost_usd: float = 0.0
+    models: dict[str, float] = Field(default_factory=dict)
+
+
+class UsageReport(BaseModel):
+    """
+    Aggregated LLM usage for the calling user, powering ``omni usage``.
+
+    The cost summary is sourced from the per-user daily-cost rollup
+    (``user_daily_cost``), which attributes spend to the UTC calendar day it
+    occurred on. Windows are therefore calendar-day buckets summed back from
+    today — ``cost_today`` / ``cost_last_7d`` / ``cost_last_30d`` — not
+    rolling wall-clock hours, so a weeks-old session touched today is not
+    counted wholly in "today".
+
+    The ``sessions`` list is a separate detail view built from each session's
+    cumulative ``session_usage`` (newest activity first), so the summary and
+    the per-session list come from different sources and are not guaranteed
+    to tie out to the cent (the summary counts every priced turn ever
+    recorded for the user; the list only covers the user's currently-listed
+    top-level sessions).
+
+    :param cost_today: Total spend on the current UTC day.
+    :param cost_last_7d: Total spend over the last 7 UTC days (incl. today).
+    :param cost_last_30d: Total spend over the last 30 UTC days (incl. today).
+    :param total_cost_usd: All-time total spend from the daily rollup.
+    :param sessions: Per-session detail, newest activity first.
+    """
+
+    object: Literal["usage_report"] = "usage_report"
+    cost_today: float = 0.0
+    cost_last_7d: float = 0.0
+    cost_last_30d: float = 0.0
+    total_cost_usd: float = 0.0
+    sessions: list[SessionUsage] = Field(default_factory=list)
 
 
 # ── Permissions ────────────────────────────────────────────────────
@@ -2809,14 +2903,12 @@ class SessionSkillsEvent(_SSEEventBase):
 
 class SessionModelOptionsEvent(_SSEEventBase):
     """
-    Signal that a codex-native session's model catalog has resolved.
+    Signal that a native session's model catalog has resolved.
 
-    Model options are fetched from the bound runner's live
-    Codex app-server via ``model/list`` and cached on the session
-    snapshot. The initial snapshot can return an empty list while
-    this background fetch is in flight; this event tells connected
-    clients to re-read the snapshot and apply its now-populated
-    ``model_options``.
+    Model options are fetched from the bound runner and cached on the session
+    snapshot. The initial snapshot can return an empty list while this
+    background fetch is in flight; this event tells connected clients to
+    re-read the snapshot and apply its now-populated ``model_options``.
 
     Carries no payload beyond the conversation id. The snapshot's
     ``model_options`` field remains the source of truth.
@@ -2826,7 +2918,7 @@ class SessionModelOptionsEvent(_SSEEventBase):
         e.g. ``"conv_abc123"``.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
-    Codex model / effort controls from the session snapshot.
+    Native model / effort controls from the session snapshot.
     """
 
     type: Literal["session.model_options"]
@@ -4149,6 +4241,11 @@ class ProjectObject(BaseModel):
     :param name: Human-readable project name, unique per owner.
     :param created_at: Unix epoch seconds at creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    :param config: Default session settings as an opaque JSON object (host,
+        workspace, harness, model, reasoning effort, git base-branch, …). Empty
+        when the project stores no defaults. The key vocabulary is owned by the
+        client; the server persists and returns it whole. Values are hints the
+        new-chat dialog pre-fills, not enforced requirements.
     """
 
     id: str
@@ -4156,6 +4253,7 @@ class ProjectObject(BaseModel):
     name: str
     created_at: int
     updated_at: int | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProjectList(BaseModel):
@@ -4169,17 +4267,35 @@ class ProjectList(BaseModel):
     data: list[ProjectObject]
 
 
+class SessionProjectSummary(BaseModel):
+    """One entry of ``GET /v1/sessions/projects`` — a sidebar project folder.
+
+    Dual-read union of first-class projects and legacy ``omni_project``
+    label-projects, keyed by name.
+
+    :param id: First-class project id when one exists, or ``None`` for a
+        label-only project not yet promoted to the ``projects`` table.
+    :param name: Project name (the folder's display name and union key).
+    """
+
+    id: str | None = None
+    name: str
+
+
 class CreateProjectRequest(BaseModel):
     """
     Request body for ``POST /v1/projects``.
 
     :param name: Human-readable project name. Trimmed; must be non-empty and
         at most 100 characters; unique among the caller's projects.
+    :param config: Optional default session settings (opaque JSON object).
+        Omitted / empty stores no defaults.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    config: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("name")
     @classmethod
@@ -4206,11 +4322,14 @@ class UpdateProjectRequest(BaseModel):
 
     :param name: New project name. ``None`` leaves it unchanged; otherwise
         trimmed, non-empty, at most 100 characters.
+    :param config: New config object to replace the stored one. ``None`` leaves
+        it unchanged; an empty object ``{}`` clears the stored defaults.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
+    config: dict[str, Any] | None = None
 
     @field_validator("name")
     @classmethod

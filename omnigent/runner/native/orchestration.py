@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.codex_native_app_server import CodexAppServerClient
 
+import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
@@ -5339,6 +5340,8 @@ async def _auto_create_claude_terminal(
     skills_filter: str | list[str] = "all",
     session_init: RunnerSessionInitEnvelope | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
+    record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -5379,6 +5382,10 @@ async def _auto_create_claude_terminal(
         isolated legacy callback path.
     :param auth_token_factory: Runner-owned refreshable bearer factory.
         ``None`` preserves direct-call behavior by resolving one locally.
+    :param resolve_launch_config: Optional per-session resolver shared with
+        the model-options endpoint so launch and UI use one catalog query.
+    :param record_launch_config: Optional callback that stores the exact
+        provider/model snapshot used for this session's launch.
     :returns: The launched terminal's :class:`SessionResourceView`, so
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
@@ -5501,6 +5508,7 @@ async def _auto_create_claude_terminal(
     from omnigent.claude_native import (
         augment_claude_args,
         build_native_claude_terminal_env,
+        resolve_claude_native_model_selection,
         resolve_native_claude_config,
     )
 
@@ -5698,7 +5706,14 @@ async def _auto_create_claude_terminal(
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
     try:
-        claude_config = resolve_native_claude_config(spec=None)
+        if resolve_launch_config is not None:
+            claude_config = await resolve_launch_config()
+        else:
+            claude_config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+    except click.ClickException:
+        # An authoritative Databricks response with no Claude models is a
+        # configuration failure, not permission to bypass the gateway.
+        raise
     except Exception:  # noqa: BLE001 — best-effort; fall back to native auth
         _logger.warning(
             "native-claude: could not derive a provider/ucode launch config "
@@ -5708,6 +5723,8 @@ async def _auto_create_claude_terminal(
             "and that the secret resolves in this process.",
             exc_info=True,
         )
+    if record_launch_config is not None:
+        record_launch_config(session_id, claude_config)
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
         "env_keys=%s api_key_helper_set=%s model_set=%s",
@@ -5718,15 +5735,19 @@ async def _auto_create_claude_terminal(
         bool(claude_config.model) if claude_config is not None else False,
     )
 
+    launch_model = resolve_claude_native_model_selection(
+        session_model_override
+        or _claude_native_model_from_spec(agent_spec)
+        or (claude_config.model if claude_config is not None else None),
+        claude_config,
+    )
     base_claude_args = _build_claude_native_base_args(
         reasoning_effort=session_effort,
         # Precedence: per-session ``/model`` override > agent-spec pin
         # (``executor.model``) > provider/ucode default. All three yield to an
         # explicit ``--model`` in the user's pass-through args (handled in the
         # helper).
-        model_override=session_model_override
-        or _claude_native_model_from_spec(agent_spec)
-        or (claude_config.model if claude_config is not None else None),
+        model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
     )

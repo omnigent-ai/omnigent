@@ -108,6 +108,15 @@ import {
   writeUiFontSizePx,
 } from "@/lib/uiFontPreferences";
 import {
+  applySidebarFontSize,
+  clampSidebarFontSizePx,
+  readSidebarFontSizePx,
+  SIDEBAR_FONT_SIZE_MAX,
+  SIDEBAR_FONT_SIZE_MIN,
+  SIDEBAR_FONT_SIZE_STEP,
+  writeSidebarFontSizePx,
+} from "@/lib/sidebarFontPreferences";
+import {
   clampCodeFontSizePx,
   CODE_FONT_FAMILY_DEFAULT,
   CODE_FONT_SIZE_MAX,
@@ -830,6 +839,8 @@ function AppearanceSection() {
 
         <HideUnconfiguredHarnessesControl />
 
+        <SidebarAppearanceGroup />
+
         <UiFontSizeControl />
 
         <UiFontFamilyControl />
@@ -895,6 +906,108 @@ function DefaultBaseBranchControl() {
   );
 }
 
+function SidebarAppearanceGroup() {
+  return (
+    <section
+      role="group"
+      aria-label="Sidebar settings"
+      className="rounded-xl border border-border bg-muted/30 p-4"
+    >
+      <div className="mb-5 flex flex-col gap-1 border-b border-border/70 pb-4">
+        <h2 className="text-base font-semibold">Sidebar</h2>
+        <p className="text-sm text-muted-foreground">
+          Tune navigation readability without changing conversation or code text.
+        </p>
+      </div>
+      <SidebarFontSizeControl />
+    </section>
+  );
+}
+
+function SidebarFontSizeControl() {
+  const [px, setPx] = useState(() => readSidebarFontSizePx());
+  const [draft, setDraft] = useState(() => String(px));
+
+  const commit = useCallback((next: number) => {
+    const clamped = clampSidebarFontSizePx(next);
+    setPx(clamped);
+    setDraft(String(clamped));
+    writeSidebarFontSizePx(clamped);
+    applySidebarFontSize(clamped);
+  }, []);
+
+  const onDraftChange = useCallback((text: string) => {
+    setDraft(text);
+    if (/^\d+$/.test(text)) {
+      const value = Number(text);
+      if (value >= SIDEBAR_FONT_SIZE_MIN && value <= SIDEBAR_FONT_SIZE_MAX) {
+        setPx(value);
+        writeSidebarFontSizePx(value);
+        applySidebarFontSize(value);
+      }
+    }
+  }, []);
+
+  const commitDraft = useCallback(() => {
+    const value = Number(draft);
+    commit(Number.isFinite(value) && draft.trim() !== "" ? value : px);
+  }, [commit, draft, px]);
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <span className="text-sm font-medium">Font size</span>
+        <span className="text-sm text-muted-foreground">
+          Adjust session names, project labels, and navigation rows.
+        </span>
+      </div>
+      <div
+        role="group"
+        aria-label="Sidebar font size"
+        className={cn(
+          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
+        )}
+      >
+        <StepperButton
+          label="Decrease sidebar font size"
+          testId="sidebar-font-size-dec"
+          disabled={px <= SIDEBAR_FONT_SIZE_MIN}
+          onClick={() => commit(px - SIDEBAR_FONT_SIZE_STEP)}
+        >
+          <MinusIcon className="size-4" />
+        </StepperButton>
+        <div className="flex items-center border-x border-input px-2 tabular-nums">
+          <input
+            type="number"
+            inputMode="numeric"
+            min={SIDEBAR_FONT_SIZE_MIN}
+            max={SIDEBAR_FONT_SIZE_MAX}
+            step={SIDEBAR_FONT_SIZE_STEP}
+            aria-label="Sidebar font size in pixels"
+            data-testid="sidebar-font-size-input"
+            className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+            value={draft}
+            onChange={(e) => onDraftChange(e.target.value)}
+            onBlur={commitDraft}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+            }}
+          />
+        </div>
+        <StepperButton
+          label="Increase sidebar font size"
+          testId="sidebar-font-size-inc"
+          disabled={px >= SIDEBAR_FONT_SIZE_MAX}
+          onClick={() => commit(px + SIDEBAR_FONT_SIZE_STEP)}
+        >
+          <PlusIcon className="size-4" />
+        </StepperButton>
+      </div>
+    </div>
+  );
+}
+
 /**
  * UI font size stepper. Scales the whole rem-based UI via the --ui-font-scale
  * variable (see lib/uiFontPreferences.ts). Applied live and persisted on every
@@ -946,23 +1059,23 @@ function UiFontSizeControl() {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <div className="flex flex-col">
-        <span className="text-sm font-medium">Font size</span>
+        <span className="text-sm font-medium">Interface font size</span>
         <span className="text-sm text-muted-foreground">
-          Scale the interface text and spacing on this device.
+          Scale text and spacing across the rest of the interface.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
       <div
         role="group"
-        aria-label="Font size"
+        aria-label="Interface font size"
         className={cn(
           "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
         <StepperButton
-          label="Decrease font size"
+          label="Decrease interface font size"
           testId="ui-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - UI_FONT_SIZE_STEP)}
@@ -976,7 +1089,7 @@ function UiFontSizeControl() {
             min={UI_FONT_SIZE_MIN}
             max={UI_FONT_SIZE_MAX}
             step={UI_FONT_SIZE_STEP}
-            aria-label="Font size in pixels"
+            aria-label="Interface font size in pixels"
             data-testid="ui-font-size-input"
             className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -988,7 +1101,7 @@ function UiFontSizeControl() {
           />
         </div>
         <StepperButton
-          label="Increase font size"
+          label="Increase interface font size"
           testId="ui-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + UI_FONT_SIZE_STEP)}

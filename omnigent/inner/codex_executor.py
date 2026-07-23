@@ -24,7 +24,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -764,6 +764,77 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
             dest_path.write_text(tomlkit.dumps(minimal_document))
             continue
         shutil.copy2(source_file, dest_path)
+        if filename == "config.toml":
+            _normalize_copied_codex_effort(dest_path)
+
+
+# Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
+# leading whitespace and a trailing comment. Only applied to lines *before*
+# the first table header so keys inside ``[profiles.*]`` etc. are never
+# rewritten (they may target other providers with different ladders).
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
+
+
+def _normalize_copied_codex_effort(config_path: Path) -> None:
+    """Rewrite a deprecated top-level ``model_reasoning_effort`` in the
+    session's private copy of ``config.toml``.
+
+    The ChatGPT desktop app manages ``~/.codex/config.toml`` on machines
+    where it is installed and writes ``model_reasoning_effort = "ultra"`` —
+    a value the codex CLI maps to the retired ``max`` wire value, which the
+    OpenAI Responses API rejects with ``invalid_value: 'max'`` (its ladder
+    tops out at ``xhigh``). Because this executor copies the user's config
+    verbatim into every per-session ``CODEX_HOME``, that one app-written key
+    fails **every** codex turn on such machines.
+
+    Values already in :data:`CODEX_EFFORTS` are left untouched, as are
+    values with no known alias (codex surfaces its own error for those) and
+    anything below the first table header. Only the session's private copy
+    is modified — never the user's real ``~/.codex/config.toml``.
+
+    :param config_path: The copied ``config.toml`` inside the per-session
+        ``CODEX_HOME``. Unreadable/unwritable files are skipped (best
+        effort — the copy already succeeded, so this only degrades back to
+        the pre-normalization behavior).
+    """
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    lines = text.splitlines(keepends=True)
+    changed = False
+    array_depth = 0  # net unclosed '[' from a top-level multiline array value
+    for index, line in enumerate(lines):
+        content = line.rstrip("\r\n")
+        if array_depth == 0:
+            # At top-level statement position a leading '[' is a real table
+            # header ([table] / [[array-of-tables]]) -- top-level keys end here.
+            if content.lstrip().startswith("["):
+                break
+            match = _EFFORT_KEY_RE.match(content)
+            if match is not None:
+                value = match.group(2)
+                if value not in CODEX_EFFORTS:
+                    replacement = EFFORT_ALIASES.get(value)
+                    if replacement is not None:
+                        line_ending = line[len(content) :]
+                        lines[index] = (
+                            f"{match.group(1)}{replacement}{match.group(3)}{line_ending}"
+                        )
+                        changed = True
+                continue  # an effort-key line never opens an array
+        # Track array nesting (this is a bracket-counting heuristic, not a
+        # full TOML parser, but sufficient for this narrow config shape) so
+        # bracketed *array content* (which may start with '[') is not
+        # mistaken for a table header.
+        array_depth += content.count("[") - content.count("]")
+        if array_depth < 0:
+            array_depth = 0
+    if changed:
+        try:
+            config_path.write_text("".join(lines), encoding="utf-8")
+        except OSError:
+            logger.warning("could not normalize model_reasoning_effort in %s", config_path)
 
 
 def _databricks_codex_base_url(host: str) -> str:

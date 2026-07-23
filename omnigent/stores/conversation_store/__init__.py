@@ -700,15 +700,17 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         _unset_cost_control_mode_override: bool = False,
         harness_override: str | None = None,
+        _unset_harness_override: bool = False,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
     ) -> Conversation | None:
         """
         Update mutable fields on a conversation.
 
-        For ``reasoning_effort``, ``model_override``, and
-        ``cost_control_mode_override``, ``None`` means "leave
-        unchanged". To explicitly clear them back to ``None``, pass
+        For ``reasoning_effort``, ``model_override``,
+        ``cost_control_mode_override``, and ``harness_override``,
+        ``None`` means "leave unchanged". To explicitly clear them
+        back to ``None``, pass
         the matching ``_unset_*`` flag.
 
         :param conversation_id: Unique conversation identifier,
@@ -997,6 +999,27 @@ class ConversationStore(ABC):
             ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
         :returns: The accumulated ``cost_usd`` for that
             ``(user_id, day_utc)``, or ``0.0`` when no row exists.
+        """
+        ...
+
+    @abstractmethod
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        Backs the ``omni usage`` rolling-window summary: the daily rollup
+        is time-attributed per calendar day, so summing the days in a
+        window gives spend that actually happened in that window (a
+        weeks-old session touched today no longer dumps its whole cost
+        into "today"). Day strings sort lexicographically because they are
+        zero-padded ``"YYYY-MM-DD"``, so the ``>=`` range works as a plain
+        string comparison.
+
+        :param user_id: The user to read, e.g. ``"alice@example.com"``.
+        :param since_day_utc: Inclusive lower-bound UTC day as an ISO date
+            string ``"YYYY-MM-DD"``, e.g. ``"2026-06-05"``.
+        :returns: The summed ``cost_usd`` across matching days, or ``0.0``
+            when no rows fall in the range.
         """
         ...
 

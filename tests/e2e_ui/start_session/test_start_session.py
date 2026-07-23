@@ -5,16 +5,17 @@ The landing composer (``NewChatLandingScreen`` in
 the textarea is the new session's first message and the footer chips —
 host, working directory, git worktree — plus the unified agent/harness
 picker supply every create parameter. The picker is a single dropdown
-(``new-chat-landing-agent-select``); each agent's run-config knobs live in a
-per-entry submenu (see :func:`_open_entry_config`). Hitting Send POSTs
-``/v1/sessions`` and navigates to the new session; there is no modal.
+(``new-chat-landing-agent-select``) that only SELECTS the agent; each
+agent's run-config knobs live in a gear-icon **modal** beside it (see
+:func:`_open_entry_config`). Hitting Send POSTs ``/v1/sessions`` and
+navigates to the new session.
 
 These tests cover the three configuration affordances the user reaches
 before sending:
 
 1. **Permission mode** — Claude Code's ``--permission-mode`` choices, in
-   the agent picker's per-entry config submenu. A non-default pick rides
-   along as ``terminal_launch_args``.
+   the gear-icon config modal. A non-default pick rides along as
+   ``terminal_launch_args``.
 2. **Working directory** — the file-browser popover behind the working-
    directory chip. Browsing into a folder sets the session's
    ``workspace``.
@@ -221,9 +222,9 @@ def _bundle_agents_body() -> str:
     Polly and Debby are multi-agent bundles, not native terminal wrappers, so
     their spec declares a brain harness (``harness: "claude-sdk"``) that lands
     them in ``BRAIN_HARNESS_LABELS``. That — and the fact that neither is named
-    ``claude-native-ui`` — is what makes the composer render the harness picker
-    (an **Agent Harness** radio group) instead of Claude Code's permission-mode
-    pill. Polly is
+    ``claude-native-ui`` — is what makes the config modal render the harness
+    picker (an **Agent Harness** select) instead of Claude Code's permission
+    select. Polly is
     ranked ahead of Debby by ``AGENT_DISPLAY_ORDER``, so it auto-selects and no
     explicit agent pick is needed. ``harness: null`` would suppress the section
     entirely, so it must be a real harness id here.
@@ -484,33 +485,47 @@ async def _register_common_routes(
 
 
 async def _open_entry_config(page, agent_id: str) -> None:
-    """Open the agent/harness picker and drill into one entry's config submenu.
+    """Select one agent and open its run-config modal via the composer gear.
 
-    The redesigned composer replaces the old per-control pills/triggers (the
-    run-mode pill, the model trigger, the harness trigger) with a single
-    agent/harness dropdown (``new-chat-landing-agent-select``). Each agent is a
-    row; a knobbed entry's run-config (model / effort / permission / approval /
-    brain-harness override) lives in a per-entry **submenu**. A plain *click* on
-    a knobbed row COMMITS that agent and closes the menu, so config flows hover
-    the row and nudge it with ``ArrowRight`` to open the submenu without
-    committing — the Playwright counterpart of the unit test's
-    ``openAgentConfig`` helper.
+    The composer's agent/harness dropdown (``new-chat-landing-agent-select``)
+    only SELECTS the agent now; each agent's run-config (model / effort /
+    permission / approval / brain-harness override) lives in a **modal** opened
+    from the gear icon (``new-chat-landing-config-gear``) beside the picker.
+    Clicking a row commits the agent and closes the dropdown; the gear then
+    opens the selected agent's config modal — the Playwright counterpart of the
+    unit test's ``openAgentConfig`` helper.
 
     :param page: The Playwright page (the landing picker is already mounted).
-    :param agent_id: The stubbed agent id whose submenu to open, e.g.
+    :param agent_id: The stubbed agent id whose config modal to open, e.g.
         ``"ag_claude_e2e"``.
     """
     await page.get_by_test_id("new-chat-landing-agent-select").click()
-    row = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
-    await row.hover()
-    await row.press("ArrowRight")
+    await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+    await page.get_by_test_id("new-chat-landing-config-gear").click()
+
+
+async def _pick_config_select(page, trigger_test_id: str, option_label: str) -> None:
+    """Open a config-modal Radix Select and click the option with ``option_label``.
+
+    :param page: The Playwright page (the config modal is open).
+    :param trigger_test_id: The select trigger's test id, e.g.
+        ``"new-chat-landing-config-permission"``.
+    :param option_label: The visible option text to click, e.g. ``"Accept edits"``.
+    """
+    await page.get_by_test_id(trigger_test_id).click()
+    await page.get_by_role("option", name=option_label, exact=True).click()
+
+
+async def _save_config(page) -> None:
+    """Commit the config modal's draft by clicking Save."""
+    await page.get_by_test_id("new-chat-landing-config-save").click()
 
 
 def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default permission mode rides along to the create call.
 
-    Selecting "Accept edits" in the Claude Code entry's config submenu
-    must (a) check that radio as immediate feedback and
+    Selecting "Accept edits" in the Claude Code config modal
+    must (a) update the permission select as immediate feedback and
     (b) reach ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--permission-mode", "acceptEdits"]``.
     """
@@ -532,10 +547,9 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             # the picker. The landing picker merges `/v1/agents` with agents found
             # by scanning the caller's sessions (`/v1/sessions?kind=any`); on the
             # shared e2e_ui server a native agent another test left behind would
-            # otherwise leak in and — ranking ahead — auto-select, so opening
-            # Claude's submenu and picking a knob would SWITCH agent mid-flow
-            # (remounting the submenu and detaching the next row). Registered
-            # after _register_common_routes so it wins the kind=any scan.
+            # otherwise leak in and — ranking ahead — auto-select, so the gear
+            # would open the wrong agent's config modal. Registered after
+            # _register_common_routes so it wins the kind=any scan.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
@@ -561,23 +575,26 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Claude Code auto-selects (only built-in, ranked first); its config
-            # lives in the picker's per-entry submenu (model / effort / permission
-            # mode), opened without committing the row.
+            # (model / effort / permission mode) lives in the gear-icon modal.
             await _open_entry_config(page, "ag_claude_e2e")
-            # All six Claude permission modes render as radio rows in the submenu.
-            for mode in ("default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"):
-                await expect(
-                    page.get_by_test_id(f"new-chat-landing-permission-{mode}")
-                ).to_be_visible()
-            accept_edits = page.get_by_test_id("new-chat-landing-permission-acceptEdits")
-            await accept_edits.click()
-
-            # The radio reflects the non-default pick immediately; the submenu
-            # stays open after a permission pick, so close it (submenu, then root)
-            # before typing into the composer.
-            await expect(accept_edits).to_have_attribute("aria-checked", "true")
-            await page.keyboard.press("Escape")
-            await page.keyboard.press("Escape")
+            # The permission select offers all six Claude permission modes.
+            perm = page.get_by_test_id("new-chat-landing-config-permission")
+            await expect(perm).to_be_visible()
+            await perm.click()
+            perm_labels = (
+                "Default",
+                "Auto",
+                "Accept edits",
+                "Plan",
+                "Don't ask",
+                "Bypass permissions",
+            )
+            for label in perm_labels:
+                await expect(page.get_by_role("option", name=label, exact=True)).to_be_visible()
+            await page.get_by_role("option", name="Accept edits", exact=True).click()
+            # The trigger reflects the non-default pick; Save commits it.
+            await expect(perm).to_contain_text("Accept edits")
+            await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -914,11 +931,11 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
 def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
     """Picking a model + reasoning effort rides along to the create call.
 
-    For the Claude-native agent the config submenu shows a model/effort
-    picker that starts with NOTHING selected — no model/effort default is
+    For the Claude-native agent the config modal shows model/effort
+    selects that start with NOTHING selected — no model/effort default is
     forced, so an untouched picker omits the override and Claude Code keeps its
-    own configured model. Explicitly selecting "Opus" and "High" must (a) check
-    those radios as immediate feedback and (b) reach ``POST /v1/sessions`` as
+    own configured model. Explicitly selecting "Opus" and "High" must (a) update
+    those selects as immediate feedback and (b) reach ``POST /v1/sessions`` as
     ``model_override: "opus"`` + ``reasoning_effort: "high"`` (the runner reads
     them as ``--model`` / ``--effort`` at terminal launch).
     """
@@ -938,10 +955,9 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
 
             # Neutralize agent discovery so ONLY the stubbed Claude agent feeds
             # the picker (see _drive_permission_mode for the full rationale): a
-            # leaked native agent auto-selecting ahead of Claude would make the
-            # model pick SWITCH agent, remounting the submenu and detaching the
-            # effort row before it can be clicked. Registered after
-            # _register_common_routes so it wins the kind=any scan.
+            # leaked native agent auto-selecting ahead of Claude would open the
+            # wrong agent's config modal. Registered after _register_common_routes
+            # so it wins the kind=any scan.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
@@ -950,6 +966,28 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 )
 
             await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            # This isolated host fixture has no live harness bridge, so provide
+            # the catalog the new-session picker now resolves through the host.
+            async def handle_model_options(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "models": [
+                                {"id": "opus", "displayName": "Opus 4.8"},
+                                {"id": "sonnet", "displayName": "Sonnet 4.6"},
+                                {"id": "haiku", "displayName": "Haiku 4.5"},
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route(
+                f"**/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
+                handle_model_options,
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -962,48 +1000,25 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Claude Code auto-selects; open its config submenu, which carries the
-            # model + effort radio groups. No default is forced, so both groups
-            # start with NOTHING checked — an untouched picker omits the override
-            # and Claude Code uses its own configured model. Verify the unselected
-            # default, then make an explicit pick.
+            # Claude Code auto-selects; open its config modal, which carries the
+            # model + effort selects. No default is forced, so both the model and
+            # effort selects sit at "Default" (unselected) — an untouched picker
+            # omits the override and Claude Code uses its own configured model.
+            # Verify the unselected defaults, then make an explicit pick.
             await _open_entry_config(page, "ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
-                "aria-checked", "false"
-            )
-            await expect(page.get_by_test_id("new-chat-landing-effort-medium")).to_have_attribute(
-                "aria-checked", "false"
-            )
+            model = page.get_by_test_id("new-chat-landing-config-model")
+            effort = page.get_by_test_id("new-chat-landing-config-effort")
+            await expect(model).to_contain_text("Default")
+            await expect(effort).to_contain_text("Default")
 
-            # Pick model and effort in SEPARATE submenu visits. Picking a knob
-            # COMMITS the agent, which collapses the submenu (its model / effort /
-            # permission rows unmount) while the ROOT menu stays open — so a second
-            # knob clicked in the same visit chases a row that has already detached
-            # and flakes ("detached from the DOM, retrying" until the click times
-            # out). Reopen the submenu between the two picks: the picks persist as
-            # screen state, and each click then lands in a fresh, stable submenu.
-            opus = page.get_by_test_id("new-chat-landing-model-opus")
-            await opus.click()
-            await expect(opus).to_have_attribute("aria-checked", "true")
-            # The model pick collapsed the submenu; wait for it to fully unmount,
-            # then reopen it. The root menu never closed (the radio's preventDefault
-            # keeps it open), so reopen via the row — re-hover + ArrowRight — rather
-            # than re-clicking the trigger (which would race the still-settling
-            # dismiss and fail to reopen).
-            row = page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
-            await expect(page.get_by_test_id("new-chat-landing-effort-high")).to_have_count(0)
-            await row.hover()
-            await row.press("ArrowRight")
-            # The model pick persisted across the reopen.
-            await expect(page.get_by_test_id("new-chat-landing-model-opus")).to_have_attribute(
-                "aria-checked", "true"
-            )
-            high = page.get_by_test_id("new-chat-landing-effort-high")
-            await high.click()
-            await expect(high).to_have_attribute("aria-checked", "true")
-            # Close the submenu then the root menu before typing the prompt.
-            await page.keyboard.press("Escape")
-            await page.keyboard.press("Escape")
+            # Pick model + effort in the same modal visit (each select commits to
+            # a local draft; Save commits both at once). The model rows carry the
+            # host catalog's live display names, not the static alias labels.
+            await _pick_config_select(page, "new-chat-landing-config-model", "Opus 4.8")
+            await expect(model).to_contain_text("Opus 4.8")
+            await _pick_config_select(page, "new-chat-landing-config-effort", "High")
+            await expect(effort).to_contain_text("High")
+            await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -1020,11 +1035,10 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """Picking a non-default approval preset rides along to the create call.
 
-    Selecting "Full access" in the Codex entry's config submenu must reach
+    Selecting "Full access" in the Codex config modal and saving must reach
     ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
-    "--ask-for-approval", "never"]``. (Unlike the model/permission radios, an
-    approval pick commits and closes the menu.)
+    "--ask-for-approval", "never"]``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_approval_mode(base_url, session_id))
@@ -1146,17 +1160,16 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in); its approval presets live in the
-            # picker's per-entry config submenu.
+            # Codex auto-selects (only built-in); its approval presets live in
+            # the gear-icon config modal.
             await _open_entry_config(page, "ag_codex_e2e")
-            # All three Codex approval presets render as radio rows in the submenu.
-            for mode in ("default", "full-access", "read-only"):
-                await expect(
-                    page.get_by_test_id(f"new-chat-landing-approval-{mode}")
-                ).to_be_visible()
-            # Picking an approval preset commits and closes the menu (unlike the
-            # model/permission radios), leaving the composer ready for the prompt.
-            await page.get_by_test_id("new-chat-landing-approval-full-access").click()
+            approval = page.get_by_test_id("new-chat-landing-config-approval")
+            await expect(approval).to_be_visible()
+            await approval.click()
+            for label in ("Default", "Full access", "Read only"):
+                await expect(page.get_by_role("option", name=label, exact=True)).to_be_visible()
+            await page.get_by_role("option", name="Full access", exact=True).click()
+            await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -1177,17 +1190,14 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_bypass_sandbox(seeded_session: tuple[str, str]) -> None:
-    """Arming the DANGEROUS Codex full-bypass toggle rides along to the create.
+    """Arming DANGEROUS Codex full-bypass rides along to the create.
 
-    The bypass switch in the Codex entry's config submenu is the first-class
-    opt-in for Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance. It
-    is deliberately hard to arm: the Switch stays **disabled** until the user
-    types the confirmation phrase *verbatim* (a click alone, or a near-miss
-    phrase, never arms it), and once on, a persistent red banner shows under the
-    composer — surviving the menu's close. When armed, the create
-    ``POST /v1/sessions`` must carry the
-    ``omnigent.codex_native.bypass_sandbox: "1"`` conversation label so the
-    runner launches Codex with the bypass flag.
+    Bypass is the most-permissive option in the Codex config modal's Approval
+    dropdown — Codex's ``--dangerously-bypass-approvals-and-sandbox`` stance.
+    Picking it and saving raises a persistent red banner under the composer —
+    surviving the modal's close. When armed, the create ``POST /v1/sessions``
+    must carry the ``omnigent.codex_native.bypass_sandbox: "1"`` conversation
+    label so the runner launches Codex with the bypass flag.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_bypass_sandbox(base_url, session_id))
@@ -1228,31 +1238,22 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Codex auto-selects (only built-in); the bypass opt-in lives inside
-            # its config submenu, below the approval presets.
+            # Codex auto-selects (only built-in); bypass is the most-permissive
+            # option in its config-modal Approval dropdown.
             await _open_entry_config(page, "ag_codex_e2e")
 
-            # Guardrail: the bypass Switch is DISABLED until the verbatim phrase
-            # is typed — a click alone can never arm the dangerous mode.
-            switch = page.get_by_test_id("new-chat-landing-bypass-sandbox-switch")
-            await expect(switch).to_be_disabled()
+            # Pick "Bypass approvals & sandbox" in the Approval dropdown; the
+            # in-modal danger banner confirms it, then Save to commit.
+            await _pick_config_select(
+                page, "new-chat-landing-config-approval", "Bypass approvals & sandbox"
+            )
+            await expect(
+                page.get_by_test_id("new-chat-landing-bypass-sandbox-banner")
+            ).to_be_visible()
+            await _save_config(page)
 
-            # A near-miss phrase (different case) keeps it disabled — the match
-            # is verbatim, no case-folding or trimming.
-            confirm = page.get_by_test_id("new-chat-landing-bypass-sandbox-confirm")
-            await confirm.fill("Bypass Sandbox")
-            await expect(switch).to_be_disabled()
-
-            # The exact phrase arms the Switch; flip it on.
-            await confirm.fill("bypass sandbox")
-            await expect(switch).to_be_enabled()
-            await switch.click()
-
-            # Close the submenu then the root menu; the in-menu banner goes with
-            # them, but the persistent red banner under the composer must remain —
-            # proof the armed stance stays visible after the menu closes.
-            await page.keyboard.press("Escape")
-            await page.keyboard.press("Escape")
+            # After the modal closes, the persistent red banner under the
+            # composer must remain — proof the armed stance stays visible.
             await expect(
                 page.get_by_test_id("new-chat-landing-bypass-sandbox-active-banner")
             ).to_be_visible()
@@ -1276,9 +1277,9 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
 def test_start_session_select_harness(seeded_session: tuple[str, str]) -> None:
     """For a bundle agent (Polly/Debby), the composer offers an agent-harness pick.
 
-    Unlike Claude Code — whose submenu shows permission/model knobs — Polly and
-    Debby declare a brain harness, so their config submenu renders an "Agent
-    Harness" radio group. Selecting a dynamically registered community harness
+    Unlike Claude Code — whose modal shows permission/model knobs — Polly and
+    Debby declare a brain harness, so their config modal renders an "Agent
+    Harness" select. Selecting a dynamically registered community harness
     must (a) show the label from ``/v1/harnesses`` and (b) reach
     ``POST /v1/sessions`` as ``harness_override: "community-brain"``.
     """
@@ -1341,10 +1342,11 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
             # Polly auto-selects (ranked ahead of Debby); its brain-harness
-            # override radios live in the picker's per-entry config submenu.
+            # override select lives in the gear-icon config modal.
             await _open_entry_config(page, "ag_polly_e2e")
-            # The built-in brain harnesses render as radio rows, in registry
-            # order (openai-agents is intentionally not offered in the picker).
+            await page.get_by_test_id("new-chat-landing-config-harness").click()
+            # The built-in brain harnesses render as options, in registry order
+            # (openai-agents is intentionally not offered in the picker).
             for harness in ("claude-sdk", "codex", "pi"):
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-harness-{harness}")
@@ -1354,9 +1356,10 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             community_harness = page.get_by_test_id("new-chat-landing-harness-community-brain")
             await expect(community_harness).to_be_visible()
             await expect(community_harness).to_contain_text("Community Brain")
-            # Picking a harness commits and closes the menu (the agent chip keeps
-            # the bare agent label "Polly"); the override rides along on create.
+            # Picking a harness updates the select; Save commits the override
+            # (the agent chip keeps the bare agent label "Polly").
             await community_harness.click()
+            await _save_config(page)
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -2288,22 +2291,22 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
             # Open the agent picker dropdown.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
-            # The real built-in Claude Code is offered...
+            # The real built-in Claude Code is offered inline...
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
             ).to_be_visible(timeout=30_000)
-            # ...the genuinely custom agent survives...
-            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
             # ...and BOTH fork clones of the built-in are dropped. Pre-fix the
             # fork-of-fork (ag_forkfork) rendered as a duplicate "Claude Code".
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_fork1")).to_have_count(0)
             await expect(page.get_by_test_id("new-chat-landing-agent-ag_forkfork")).to_have_count(
                 0
             )
-            # Three options total: the built-in + the one custom agent +
-            # the "Create custom agent" action — no duplicate "Claude Code"
-            # sneaks in via a leaked clone.
-            await expect(page.get_by_role("menuitem")).to_have_count(3)
+            # Top level: the built-in Claude row + the "Custom agents" submenu
+            # trigger — no duplicate "Claude Code" sneaks in via a leaked clone.
+            await expect(page.get_by_role("menuitem")).to_have_count(2)
+            # The genuinely custom agent survives, inside the Custom agents submenu.
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-ag_doc")).to_be_visible()
         finally:
             await browser.close()
 
@@ -2334,10 +2337,12 @@ async def _drive_project_prefill(base_url: str, session_id: str) -> None:
 
             async def handle_projects(route: Route) -> None:
                 # One project so exactly one folder (and pencil) renders.
+                # GET /v1/sessions/projects returns the dual-read union as
+                # {id, name} objects (id=None for a label-only project).
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
-                    body=json.dumps([project]),
+                    body=json.dumps([{"id": None, "name": project}]),
                 )
 
             async def handle_worktrees(route: Route) -> None:

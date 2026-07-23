@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CodexModelOption } from "@/lib/types";
+import type { NativeModelOption } from "@/lib/types";
 
 import {
   effortLevelsForConv,
@@ -9,7 +9,7 @@ import {
   shouldShowModelPicker,
 } from "./ChatPage";
 
-const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+const CODEX_MODEL_OPTIONS: NativeModelOption[] = [
   {
     id: "gpt-5.5",
     model: "databricks-gpt-5-5",

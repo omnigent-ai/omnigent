@@ -192,6 +192,61 @@ def test_non_name_integrity_error_is_not_masked(store: SqlAlchemyProjectStore) -
         store.create(_uid("p1"), "Different name", "alice@example.com")
 
 
+# ── config (default session settings) ──────────────────────────────────────
+
+
+def test_create_defaults_to_empty_config(store: SqlAlchemyProjectStore) -> None:
+    """A project created without config reads back an empty dict (SQL NULL)."""
+    project = store.create(_uid("p1"), "No Config", "alice@example.com")
+    assert project.config == {}
+    assert store.get(_uid("p1"), owner_user_id="alice@example.com").config == {}
+
+
+def test_create_persists_config(store: SqlAlchemyProjectStore) -> None:
+    """A config passed to ``create`` round-trips through ``get``/``list``."""
+    cfg = {"host_id": "host_abc", "workspace": "/work/repo", "model": "claude-opus-4-8"}
+    store.create(_uid("p1"), "Configured", "alice@example.com", cfg)
+    assert store.get(_uid("p1"), owner_user_id="alice@example.com").config == cfg
+    assert store.list(owner_user_id="alice@example.com")[0].config == cfg
+
+
+def test_update_replaces_config_and_stamps_updated_at(store: SqlAlchemyProjectStore) -> None:
+    """Passing a new ``config`` replaces the stored one and stamps updated_at."""
+    store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "old"})
+    updated = store.update(
+        _uid("p1"), owner_user_id="alice@example.com", config={"host_id": "new", "model": "m"}
+    )
+    assert updated is not None
+    assert updated.config == {"host_id": "new", "model": "m"}
+    assert updated.updated_at is not None
+
+
+def test_update_config_none_leaves_it_unchanged(store: SqlAlchemyProjectStore) -> None:
+    """``config=None`` (the default) leaves the stored config untouched."""
+    store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "keep"})
+    # Rename only — config omitted — must not wipe the stored defaults.
+    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", name="Renamed")
+    assert updated is not None
+    assert updated.config == {"host_id": "keep"}
+
+
+def test_update_empty_config_clears_defaults(store: SqlAlchemyProjectStore) -> None:
+    """An explicit ``config={}`` clears the stored defaults (distinct from None)."""
+    store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "drop"})
+    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", config={})
+    assert updated is not None
+    assert updated.config == {}
+    assert updated.updated_at is not None
+
+
+def test_update_same_config_is_noop(store: SqlAlchemyProjectStore) -> None:
+    """Re-setting the identical config changes nothing, leaving updated_at None."""
+    store.create(_uid("p1"), "P", "alice@example.com", {"host_id": "x"})
+    updated = store.update(_uid("p1"), owner_user_id="alice@example.com", config={"host_id": "x"})
+    assert updated is not None
+    assert updated.updated_at is None
+
+
 # ── update ─────────────────────────────────────────────────────────────────
 
 
