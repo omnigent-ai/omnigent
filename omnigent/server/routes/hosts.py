@@ -480,6 +480,69 @@ def create_hosts_router(
             "runners": [],
         }
 
+    @router.delete("/hosts/{host_id}")
+    async def delete_host(request: Request, host_id: str) -> dict[str, Any]:
+        """Delete a retired external (self-registered) host.
+
+        Removes the host row so a permanently decommissioned machine
+        stops polluting the session-creation host picker (issue #2038).
+        Scoped to **external self-registered** hosts
+        (``sandbox_provider is None``): server-managed sandbox hosts
+        have their own teardown lifecycle and are refused here.
+
+        Session history is preserved, never destroyed: any conversations
+        still bound to this host have their ``host_id`` nulled -- the DB
+        no longer FK-cascades this after the R032 FK removal -- so those
+        sessions survive and stay readable with no host binding. This
+        reuses the same store operation as managed-host teardown
+        (:meth:`HostStore.delete_host`).
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``{"host_id": ..., "deleted": True}`` on success.
+        :raises HTTPException: 404 if the host does not exist, 403 if
+            the caller does not own it, 409 if it is a server-managed
+            host or is currently connected.
+        """
+        # Mirror get_host's authz exactly: require_user 401s an
+        # unauthenticated caller; a 404 hides existence from non-owners,
+        # and an authenticated non-owner gets 403 -- never the delete.
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.owner != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        # External self-registered hosts only (issue #2038). A managed
+        # sandbox host (sandbox_provider set) is torn down by the
+        # managed-launch lifecycle, not by hand -- deleting its row here
+        # would orphan a live sandbox binding.
+        if host.sandbox_provider is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="cannot delete a server-managed host",
+            )
+        # Refuse while the host is connected. A live host re-registers
+        # via upsert_on_connect on its next heartbeat, so deleting the
+        # row mid-tunnel is self-defeating (it reappears) and races the
+        # connection -- the operator must stop the daemon first. No
+        # force override: force-deleting a live host is never useful.
+        if host_is_live(host):
+            raise HTTPException(
+                status_code=409,
+                detail=("host is currently connected; stop the host daemon before deleting it"),
+            )
+        # SET-NULL "cascade" at the application layer (no DB FK after
+        # R032): delete_host nulls conversations.host_id for sessions
+        # bound to this host -- history is preserved, only the dangling
+        # host binding is cleared -- then removes the row.
+        await asyncio.to_thread(host_store.delete_host, host_id)
+        # Drop any stale in-memory connection on THIS replica (best
+        # effort; the registry is per-replica, like every other host
+        # route's live-connection view).
+        host_registry.deregister(host_id)
+        return {"host_id": host_id, "deleted": True}
+
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
         request: Request,

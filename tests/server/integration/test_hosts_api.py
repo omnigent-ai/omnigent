@@ -1255,3 +1255,140 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     # The callback got the exact runner id and error string off the frame.
     assert received == [("runner_x", "exited with code 1")]
+
+
+# ── DELETE /v1/hosts/{id} — retire an external self-registered host (#2038) ──
+
+
+async def test_delete_offline_external_host_removes_row(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE /v1/hosts/{id} removes an offline external host's row so a
+    retired machine stops polluting the picker.
+
+    If the row survives, the #2038 gap (register is automatic,
+    deregister impossible) is not closed.
+    """
+    app, _reg, host_store, _cs = host_api_app
+    host_store.upsert_on_connect("host_retired", "old-runner", "local")
+    host_store.set_offline("host_retired")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/host_retired")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"host_id": "host_retired", "deleted": True}
+        # The row is gone: a follow-up GET 404s and the picker omits it.
+        follow = await client.get("/v1/hosts/host_retired")
+        assert follow.status_code == 404, follow.text
+    assert host_store.get_host("host_retired") is None
+
+
+async def test_delete_host_preserves_bound_session_history(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Deleting a host nulls ``host_id`` on sessions bound to it but never
+    destroys the session rows themselves (post-R032 there is no DB FK
+    cascade; the route reuses HostStore.delete_host's app-level SET NULL).
+
+    If the conversation vanishes, host deletion is silently shredding
+    history — the exact outcome the design forbids.
+    """
+    app, _reg, host_store, conv_store = host_api_app
+    host_store.upsert_on_connect("host_bound", "bound-runner", "local")
+    host_store.set_offline("host_bound")
+    conv = conv_store.create_conversation(
+        host_id="host_bound",
+        workspace="/tmp/session-workspace",
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/host_bound")
+    assert resp.status_code == 200, resp.text
+
+    survived = conv_store.get_conversation(conv.id)
+    assert survived is not None, "host delete destroyed a bound session's history"
+    assert survived.host_id is None, (
+        f"bound session should have its host_id nulled after host delete, got {survived.host_id!r}"
+    )
+    assert host_store.get_host("host_bound") is None
+
+
+async def test_delete_host_404_when_absent(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """DELETE of an unknown host_id returns 404, not a silent success."""
+    app, *_ = host_api_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/host_does_not_exist")
+    assert resp.status_code == 404, resp.text
+
+
+async def test_delete_connected_host_refused_409(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    A currently-connected host cannot be deleted: 409, row untouched.
+
+    Deleting a live host's row mid-tunnel is a footgun — it would just
+    reappear on the next upsert_on_connect heartbeat — so the route
+    refuses and tells the operator to stop the daemon first.
+    """
+    app, _reg, host_store, _cs = host_api_app
+    # upsert_on_connect leaves the row online + fresh => host_is_live.
+    host_store.upsert_on_connect("host_live", "live-runner", "local")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/host_live")
+    assert resp.status_code == 409, resp.text
+    assert host_store.get_host("host_live") is not None, (
+        "a refused delete must leave the connected host's row intact"
+    )
+
+
+async def test_delete_managed_host_refused_409(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Server-managed sandbox hosts (``sandbox_provider`` set) are out of
+    scope for this endpoint (#2038 is external self-registered hosts):
+    409, row untouched. Managed hosts are torn down by their own
+    lifecycle; deleting one here would orphan a live sandbox binding.
+    """
+    app, _reg, host_store, _cs = host_api_app
+    host_store.register_managed_host(
+        host_id="host_managed",
+        name="managed-runner",
+        owner="local",
+        token="tok-managed",
+        provider="modal",
+        sandbox_id="sb-123",
+        token_expires_at=time.time_ns() // 1_000_000_000 + 3600,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/host_managed")
+    assert resp.status_code == 409, resp.text
+    assert host_store.get_host("host_managed") is not None
+
+
+async def test_delete_host_403_wrong_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE /v1/hosts/{id} returns 403 when the caller doesn't own the
+    host, and the row survives — mirrors get_host's ownership gate so a
+    user can't retire another user's host.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect("host_alice_del", "alice-laptop", "alice@test.com")
+    host_store.set_offline("host_alice_del")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(
+            "/v1/hosts/host_alice_del",
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403, resp.text
+    assert host_store.get_host("host_alice_del") is not None

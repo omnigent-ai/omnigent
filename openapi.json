@@ -6751,6 +6751,50 @@
       }
     },
     "/v1/hosts/{host_id}": {
+      "delete": {
+        "description": "Delete a retired external (self-registered) host.\n\nRemoves the host row so a permanently decommissioned machine\nstops polluting the session-creation host picker (issue #2038).\nScoped to **external self-registered** hosts\n(`sandbox_provider is None`): server-managed sandbox hosts\nhave their own teardown lifecycle and are refused here.\n\nSession history is preserved, never destroyed: any conversations\nstill bound to this host have their `host_id` nulled -- the DB\nno longer FK-cascades this after the R032 FK removal -- so those\nsessions survive and stay readable with no host binding. This\nreuses the same store operation as managed-host teardown\n(`HostStore.delete_host`).\n\n**Returns:** `{\"host_id\": ..., \"deleted\": True}` on success.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist, 403 if the caller does not own it, 409 if it is a server-managed host or is currently connected.",
+        "operationId": "delete_host_v1_hosts__host_id__delete",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Host V1 Hosts  Host Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Host",
+        "tags": [
+          "hosts"
+        ]
+      },
       "get": {
         "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
