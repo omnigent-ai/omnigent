@@ -185,13 +185,19 @@ def test_project_new_session_folds_into_kebab_on_mobile(
     header = page.get_by_role("button", name=project, exact=True)
     expect(header).to_be_visible()
 
+    # Scope to THIS project's controls by their per-project accessible names —
+    # the shared server carries other tests' folders, so the bare test-ids match
+    # multiple pencils/kebabs (strict-mode violation).
+    pencil = page.get_by_role("link", name=f"New session in {project}")
+    kebab = page.get_by_role("button", name=f"Project actions for {project}")
+
     # The pencil is in the DOM but hidden at this width (max-md:hidden).
-    expect(page.get_by_test_id("project-new-session")).to_be_hidden()
+    expect(pencil).to_be_hidden()
 
     # Open the folder kebab → the mobile-only "New session" item, pre-filed
     # under this project via the ?project= composer link.
     header.hover()
-    page.get_by_test_id("project-actions").click()
+    kebab.click()
     # asChild renders the item as the <a> itself, so the link href lives on it.
     menu_item = page.get_by_test_id("project-new-session-menu")
     expect(menu_item).to_be_visible()
