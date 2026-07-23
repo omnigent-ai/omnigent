@@ -228,8 +228,15 @@ OMNIGENT_ENDPOINTS: list[tuple[str, str, bool]] = [
     # Internal (hidden from the public schema).
     ("POST", "/v1/sessions/{session_id}/events", False),
     ("POST", "/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve", False),
+    # Device-grant login (oauth.py, accounts mode): authorize starts the grant;
+    # /oauth/token both polls for the device-code token AND refreshes;
+    # /oauth/revoke logs out.
     ("POST", "/oauth/device/authorize", False),
-    ("POST", "/oauth/device/token", False),
+    ("POST", "/oauth/token", False),
+    ("POST", "/oauth/revoke", False),
+    # OIDC ticket login (oauth.py, oidc mode): start a CLI-login ticket, then poll.
+    ("POST", "/auth/cli-login", False),
+    ("GET", "/auth/cli-poll", False),
 ]
 
 # Response fields the client actually reads off the two richest documented
