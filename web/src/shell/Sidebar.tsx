@@ -3223,59 +3223,58 @@ function ProjectFolderMenu({
           <DialogHeader>
             <DialogTitle>Rename project</DialogTitle>
           </DialogHeader>
-          <input
-            autoFocus
-            className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none"
-            value={renameValue}
-            onChange={(e) => setRenameValue(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                (e.currentTarget.closest("form") ?? e.currentTarget)
-                  .querySelector<HTMLButtonElement>('[data-testid="rename-project-confirm"]')
-                  ?.click();
+          {/* A <form> so Enter in the input submits natively (Radix Dialog
+              doesn't wrap children in one) instead of relying on a manual
+              key handler + button lookup. */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const newName = renameValue.trim();
+              if (newName === "" || newName === projectName) {
+                setRenameOpen(false);
+                setMenuOpen(false);
+                return;
               }
-            }}
-          />
-          {renameProject.isError && (
-            <p className="text-sm text-destructive" role="alert">
-              {(renameProject.error as Error).message}
-            </p>
-          )}
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setRenameOpen(false)}
-              disabled={renameProject.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              data-testid="rename-project-confirm"
-              disabled={renameProject.isPending || renameValue.trim() === ""}
-              onClick={() => {
-                const newName = renameValue.trim();
-                if (newName === "" || newName === projectName) {
-                  setRenameOpen(false);
-                  setMenuOpen(false);
-                  return;
-                }
-                renameProject.mutate(
-                  { id: projectId, oldName: projectName, newName },
-                  {
-                    onSuccess: () => {
-                      setRenameOpen(false);
-                      setMenuOpen(false);
-                    },
+              renameProject.mutate(
+                { id: projectId, oldName: projectName, newName },
+                {
+                  onSuccess: () => {
+                    setRenameOpen(false);
+                    setMenuOpen(false);
                   },
-                );
-              }}
-            >
-              {renameProject.isPending ? "Renaming…" : "Rename"}
-            </Button>
-          </DialogFooter>
+                },
+              );
+            }}
+          >
+            <input
+              autoFocus
+              className="w-full rounded-md border bg-transparent px-3 py-2 text-sm outline-none"
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+            />
+            {renameProject.isError && (
+              <p className="text-sm text-destructive" role="alert">
+                {(renameProject.error as Error).message}
+              </p>
+            )}
+            <DialogFooter className="border-t-0 bg-transparent">
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => setRenameOpen(false)}
+                disabled={renameProject.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                data-testid="rename-project-confirm"
+                disabled={renameProject.isPending || renameValue.trim() === ""}
+              >
+                {renameProject.isPending ? "Renaming…" : "Rename"}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>

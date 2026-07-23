@@ -30,8 +30,9 @@ const {
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
   createProjectSpy: vi.fn(),
-  // Server-side "ids in this project" check that gates the remove
-  // confirmation. Defaults to "no other sessions"; tests override per case.
+  // Stub for the exported fetchProjectSessionIds helper (kept so the module
+  // mock stays complete). Remove-from-project no longer gates on a
+  // last-session check, so nothing in these tests depends on its value.
   fetchProjectSessionIdsMock: vi.fn(() => Promise.resolve([] as string[])),
   // Latest conversations handed to the global-list mock. The useProjectSessions
   // mock derives each folder's rows from this by label, mirroring the server's

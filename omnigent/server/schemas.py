@@ -4169,6 +4169,21 @@ class ProjectList(BaseModel):
     data: list[ProjectObject]
 
 
+class SessionProjectSummary(BaseModel):
+    """One entry of ``GET /v1/sessions/projects`` — a sidebar project folder.
+
+    Dual-read union of first-class projects and legacy ``omni_project``
+    label-projects, keyed by name.
+
+    :param id: First-class project id when one exists, or ``None`` for a
+        label-only project not yet promoted to the ``projects`` table.
+    :param name: Project name (the folder's display name and union key).
+    """
+
+    id: str | None = None
+    name: str
+
+
 class CreateProjectRequest(BaseModel):
     """
     Request body for ``POST /v1/projects``.

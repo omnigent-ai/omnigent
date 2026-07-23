@@ -4409,6 +4409,33 @@
         "title": "SessionPresenceEvent",
         "type": "object"
       },
+      "SessionProjectSummary": {
+        "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
+            "title": "Id"
+          },
+          "name": {
+            "description": "Project name (the folder's display name and union key).",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "SessionProjectSummary",
+        "type": "object"
+      },
       "SessionReasoningEffortEvent": {
         "description": "Active reasoning-effort update from a terminal-backed integration.\n\nEmitted after an `external_reasoning_effort_change` POST from a native\nterminal forwarder when the user changes the thinking level inside the\nterminal UI. Lets the web effort picker reflect a TUI-side switch without\na reload.",
         "properties": {
@@ -8119,13 +8146,19 @@
     },
     "/v1/sessions/projects": {
       "get": {
-        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** List of `{\"id\": str | None, \"name\": str}` ordered by name.",
+        "description": "Return the caller's projects as `{\"id\", \"name\"}` pairs, ordered\nalphabetically by name.\n\nDual-reads both project representations and unions them by name:\n- **First-class projects** (`project_store`) \u2014 carry an `id` and\n  appear even when empty (the whole point of the first-class entity).\n- **Legacy label-projects** (implicit `omni_project` label) \u2014 exist\n  while at least one owned session carries the label; `id` is\n  `None` until such a project is promoted to first-class.\n\nA name present in both sources collapses to one entry that keeps the\nfirst-class `id`. Filing is owner-only, so both halves are scoped to\nthe caller (label-projects to their owned sessions, first-class to\ntheir owned rows) \u2014 a project shared to them but owned by another user\ndoes not surface as one of their own folders.\n\n**Returns:** List of `SessionProjectSummary` ordered by name.",
         "operationId": "list_session_projects_v1_sessions_projects_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SessionProjectSummary"
+                  },
+                  "title": "Response List Session Projects V1 Sessions Projects Get",
+                  "type": "array"
+                }
               }
             },
             "description": "Successful Response"

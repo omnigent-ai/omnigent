@@ -1116,16 +1116,19 @@ export function useRenameProject() {
       const created = await apiCreateProject(newName);
       const memberIds = await fetchAllProjectSessionIds(oldName);
       await Promise.all(
-        memberIds.map((sid) =>
-          authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
+        memberIds.map(async (sid) => {
+          const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               project_id: created.id,
               labels: { [PROJECT_LABEL_KEY]: "" },
             }),
-          }),
-        ),
+          });
+          // Surface a failed re-file: a resolved-but-4xx/5xx response would
+          // otherwise report success while leaving members unfiled.
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        }),
       );
     },
     onSuccess: () => {

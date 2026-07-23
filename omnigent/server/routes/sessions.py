@@ -271,6 +271,7 @@ from omnigent.server.schemas import (
     SessionMcpStartupEvent,
     SessionModelEvent,
     SessionModelOptionsEvent,
+    SessionProjectSummary,
     SessionReasoningEffortEvent,
     SessionResourceListPage,
     SessionResourceObject,
@@ -15335,13 +15336,10 @@ def create_sessions_router(
     # would otherwise be captured by the ``{session_id}`` path param and 404
     # as a missing conversation.
 
-    @router.get(
-        "/sessions/projects",
-        response_model=None,
-    )
+    @router.get("/sessions/projects")
     async def list_session_projects(
         request: Request,
-    ) -> list[dict[str, Any]]:
+    ) -> list[SessionProjectSummary]:
         """
         Return the caller's projects as ``{"id", "name"}`` pairs, ordered
         alphabetically by name.
@@ -15359,19 +15357,19 @@ def create_sessions_router(
         their owned rows) — a project shared to them but owned by another user
         does not surface as one of their own folders.
 
-        :returns: List of ``{"id": str | None, "name": str}`` ordered by name.
+        :returns: List of :class:`SessionProjectSummary` ordered by name.
         """
         user_id = _require_user(request, auth_provider)
 
-        def _list_union() -> list[dict[str, Any]]:
+        def _list_union() -> list[SessionProjectSummary]:
             # First-class first so its id wins when a name exists in both.
-            by_name: dict[str, dict[str, Any]] = {}
+            by_name: dict[str, SessionProjectSummary] = {}
             if project_store is not None:
                 for proj in project_store.list(owner_user_id=user_id):
-                    by_name[proj.name] = {"id": proj.id, "name": proj.name}
+                    by_name[proj.name] = SessionProjectSummary(id=proj.id, name=proj.name)
             # Legacy path: label-derived projects (id=None unless already first-class).
             for name in conversation_store.list_projects(owned_by=user_id):
-                by_name.setdefault(name, {"id": None, "name": name})
+                by_name.setdefault(name, SessionProjectSummary(id=None, name=name))
             return [by_name[name] for name in sorted(by_name)]
 
         return await asyncio.to_thread(_list_union)
