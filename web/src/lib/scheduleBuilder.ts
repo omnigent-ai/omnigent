@@ -63,8 +63,11 @@ export function buildRRule(model: ScheduleModel): string {
   const { hour, minute } = model;
   switch (model.preset) {
     case "hourly":
-      // Every hour on the minute — meets the 1h floor exactly.
-      return "FREQ=HOURLY;BYMINUTE=0";
+      // Fires once per hour at the chosen minute-of-hour (0/15/30/45) — still
+      // one fire/hour, so it meets the server's 1h floor. `minute` is the same
+      // snapped value the daily branch uses; honoring it here is what makes the
+      // "Hourly at :30" selection actually fire at :30 (was hard-coded to :00).
+      return `FREQ=HOURLY;BYMINUTE=${minute}`;
     case "daily":
       return `FREQ=DAILY;BYHOUR=${hour};BYMINUTE=${minute}`;
     case "weekdays":
