@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useManagedArtifacts", () => ({ useManagedArtifacts: vi.fn() }));
@@ -84,6 +84,55 @@ describe("artifactEntriesFromFiles", () => {
     const frame = screen.getByTitle("Revenue preview");
     expect(frame.getAttribute("src")).toContain("preview.localhost");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-same-origin");
-    expect(screen.getByText("Managed by Omnigent")).toBeDefined();
+    expect(screen.getByRole("combobox", { name: "Select artifact" })).toBeDefined();
+    expect(screen.queryByText("Design artifacts")).toBeNull();
+    expect(screen.queryByText("Managed by Omnigent")).toBeNull();
+  });
+
+  it("switches artifacts from the compact selector", () => {
+    managedArtifactsMock.mockReturnValue({
+      data: [
+        {
+          path: "artifacts/overview.html",
+          name: "overview.html",
+          type: "file",
+          bytes: 100,
+          modified_at: 1,
+        },
+        {
+          path: "artifacts/revenue/index.html",
+          name: "index.html",
+          type: "file",
+          bytes: 200,
+          modified_at: 2,
+        },
+      ],
+      isLoading: false,
+      isError: false,
+    } as ReturnType<typeof useManagedArtifacts>);
+    artifactPreviewMock.mockReturnValue({
+      data: {
+        url: "http://preview.localhost:6767/p/grant/artifacts/revenue/index.html",
+        expires_at: 1234,
+      },
+      isLoading: false,
+      isError: false,
+    } as ReturnType<typeof useArtifactPreview>);
+    const onSelect = vi.fn();
+
+    render(
+      <ArtifactsPanel
+        conversationId="conv_preview"
+        selectedPath="artifacts/revenue/index.html"
+        onSelect={onSelect}
+      />,
+    );
+
+    const selector = screen.getByRole("combobox", { name: "Select artifact" });
+    selector.focus();
+    fireEvent.keyDown(selector, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("option", { name: "Overview" }));
+
+    expect(onSelect).toHaveBeenCalledWith("artifacts/overview.html");
   });
 });

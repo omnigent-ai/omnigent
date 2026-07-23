@@ -4,7 +4,13 @@ import { useArtifactPreview } from "@/hooks/useArtifactPreview";
 import { useManagedArtifacts } from "@/hooks/useManagedArtifacts";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 export interface ArtifactEntry {
   entryPath: string;
@@ -82,9 +88,9 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
         <FileCode2Icon className="size-8 text-muted-foreground/60" />
-        <p className="text-sm font-medium">No design artifacts yet</p>
+        <p className="text-sm font-medium">No artifacts yet</p>
         <p className="text-xs text-muted-foreground">
-          Willy publishes reviewed HTML entry points to Omnigent-managed storage.
+          Published HTML artifacts appear here for preview.
         </p>
       </div>
     );
@@ -92,64 +98,54 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="border-b border-border px-3 py-2">
-        <p className="text-xs font-medium text-muted-foreground">Design artifacts</p>
+      <div className="flex shrink-0 items-center border-b border-border px-2 py-1.5">
+        <Select value={selected?.entryPath} onValueChange={onSelect}>
+          <SelectTrigger
+            aria-label="Select artifact"
+            className="h-8 min-w-0 flex-1 justify-start border-0 bg-transparent px-2 shadow-none hover:bg-muted *:data-[slot=select-value]:flex-1 *:data-[slot=select-value]:text-left dark:bg-transparent dark:hover:bg-muted"
+          >
+            <FileCode2Icon data-icon="inline-start" className="size-4 text-muted-foreground" />
+            <SelectValue placeholder="Choose an artifact" />
+          </SelectTrigger>
+          <SelectContent position="popper" align="start">
+            {entries.map((entry) => (
+              <SelectItem key={entry.entryPath} value={entry.entryPath}>
+                {entry.title}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
-      <div className={cn("overflow-y-auto p-2", selected === null ? "min-h-0 flex-1" : "max-h-40")}>
-        <div className="space-y-1">
-          {entries.map((entry) => (
-            <button
-              key={entry.entryPath}
-              type="button"
-              onClick={() => onSelect(entry.entryPath)}
-              className={cn(
-                "flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-muted",
-                entry.entryPath === selectedPath && "bg-muted",
-              )}
-            >
-              <FileCode2Icon className="size-4 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium">{entry.title}</span>
-                <span className="block truncate font-mono text-[11px] text-muted-foreground">
-                  {entry.entryPath}
-                </span>
-              </span>
-            </button>
-          ))}
+      {selected === null ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">
+          Choose an artifact to preview.
         </div>
-      </div>
-      {selected !== null && (
-        <div className="flex min-h-0 flex-1 flex-col border-t border-border">
-          <div className="flex items-center justify-between gap-2 px-3 py-2">
-            <p className="truncate text-xs font-medium">{selected.title}</p>
-            <span className="text-[11px] text-muted-foreground">Managed by Omnigent</span>
-          </div>
-          <div className="relative min-h-0 flex-1 bg-muted/30">
-            {preview.isLoading ? (
-              <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
-                <Loader2Icon className="size-4 animate-spin" />
-                Starting preview…
-              </div>
-            ) : preview.isError || preview.data === undefined ? (
-              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-                <p className="text-sm font-medium">Browser preview is unavailable</p>
-                <p className="text-xs text-muted-foreground">
-                  The runner may be asleep, or this host may not provide an isolated preview origin.
-                </p>
-                <Button variant="outline" size="sm" onClick={() => void preview.refetch()}>
-                  <RefreshCwIcon className="size-3.5" />
-                  Retry
-                </Button>
-              </div>
-            ) : (
-              <iframe
-                title={`${selected.title} preview`}
-                src={preview.data.url}
-                sandbox={ARTIFACT_PREVIEW_SANDBOX}
-                className="h-full w-full border-0 bg-white"
-              />
-            )}
-          </div>
+      ) : (
+        <div className="relative min-h-0 flex-1 bg-muted/30">
+          {preview.isLoading ? (
+            <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+              <Loader2Icon className="size-4 animate-spin" />
+              Starting preview…
+            </div>
+          ) : preview.isError || preview.data === undefined ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+              <p className="text-sm font-medium">Browser preview is unavailable</p>
+              <p className="text-xs text-muted-foreground">
+                The runner may be asleep, or this host may not provide an isolated preview origin.
+              </p>
+              <Button variant="outline" size="sm" onClick={() => void preview.refetch()}>
+                <RefreshCwIcon className="size-3.5" />
+                Retry
+              </Button>
+            </div>
+          ) : (
+            <iframe
+              title={`${selected.title} preview`}
+              src={preview.data.url}
+              sandbox={ARTIFACT_PREVIEW_SANDBOX}
+              className="h-full w-full border-0 bg-white"
+            />
+          )}
         </div>
       )}
     </div>
