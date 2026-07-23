@@ -60,25 +60,41 @@ async def _configure_user(
     )
 
 
-async def _wait_for_stream_stop(client: RecordingSlackClient, tries: int = 100) -> None:
-    for _ in range(tries):
-        if client.streams and client.stream.stopped:
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("timed out waiting for a stream to stop")
+# Generous ceiling for the waits below. These are event-driven (they await the
+# actual turn task), so a healthy run returns near-instantly and never spends
+# this budget; it only bounds a genuine hang. Kept well above any real turn so a
+# loaded CI runner doesn't spuriously time out (see the isolation note in the
+# module docstring's history).
+_WAIT_TIMEOUT_S = 10.0
 
 
-async def _wait_for_turns(service: SlackOmnigentService, tries: int = 100) -> None:
+async def _wait_for_turns(service: SlackOmnigentService, timeout: float = _WAIT_TIMEOUT_S) -> None:
     """Wait until the service's spawned turn tasks have finished.
 
     A turn runs as a background task; ``shutdown`` would CANCEL it, so tests that
-    assert on a turn's outcome must let it complete first.
+    assert on a turn's outcome must let it complete first. Event-driven: awaits
+    the tracked tasks directly (no polling), so it returns the instant the turn
+    ends and the ``timeout`` only bounds a real hang. Turn tasks never propagate
+    (``_run_turn_tracked`` swallows exceptions), so gather won't raise.
     """
-    for _ in range(tries):
-        if all(t.done() for t in service._turn_tasks):
-            return
-        await asyncio.sleep(0.02)
-    raise AssertionError("timed out waiting for turn tasks to finish")
+    tasks = list(service._turn_tasks)
+    if not tasks:
+        return
+    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+
+
+async def _wait_for_stream_stop(
+    client: RecordingSlackClient,
+    service: SlackOmnigentService,
+    timeout: float = _WAIT_TIMEOUT_S,
+) -> None:
+    """Wait for the turn to finish, then assert it delivered a stream.
+
+    The stream is stopped from inside the turn task, so awaiting the task
+    (event-driven) is a stronger, non-polling signal than watching for the
+    side effect."""
+    await _wait_for_turns(service, timeout)
+    assert client.streams and client.stream.stopped, "turn finished without stopping a stream"
 
 
 # ── Scenario 1: /omnigent against an auth-required server → login link ─────────
@@ -187,7 +203,7 @@ async def test_app_mention_runs_full_turn_and_streams_answer(tmp_path: Path) -> 
             client=client,
             context={"bot_user_id": "B1"},
         )
-        await _wait_for_stream_stop(client)
+        await _wait_for_stream_stop(client, service)
     finally:
         await service.shutdown()
         await pool.aclose_all()
@@ -282,7 +298,7 @@ async def test_runner_unavailable_triggers_launch_and_retry(tmp_path: Path) -> N
             client=client,
             context={"bot_user_id": "B1"},
         )
-        await _wait_for_stream_stop(client)
+        await _wait_for_stream_stop(client, service)
     finally:
         await service.shutdown()
         await pool.aclose_all()
@@ -416,7 +432,7 @@ async def test_mid_stream_drop_reconnects_without_double_render(tmp_path: Path) 
             client=client,
             context={"bot_user_id": "B1"},
         )
-        await _wait_for_stream_stop(client)
+        await _wait_for_stream_stop(client, service)
     finally:
         await service.shutdown()
         await pool.aclose_all()
@@ -469,7 +485,7 @@ async def test_no_delta_turn_recovers_committed_answer(tmp_path: Path) -> None:
             client=client,
             context={"bot_user_id": "B1"},
         )
-        await _wait_for_stream_stop(client)
+        await _wait_for_stream_stop(client, service)
     finally:
         await service.shutdown()
         await pool.aclose_all()

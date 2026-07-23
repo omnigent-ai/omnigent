@@ -609,6 +609,40 @@ async def test_run_turn_ignores_idless_idle_flap_on_claude_native_cold_start() -
 
 
 @respx.mock
+async def test_run_turn_ends_promptly_on_bare_idless_failed_with_no_output() -> None:
+    # The cold-start guard requires PRODUCTION before an id-less TERMINAL ends the
+    # turn — but that gate applies to `idle` only. A bare id-less `failed` is never
+    # a PTY-activity flap (the watcher emits only `idle`; `failed` comes solely
+    # from the authoritative StopFailure hook / a setup-phase failure), so a turn
+    # that fails before producing anything must END on that `failed` immediately,
+    # NOT hang to the idle-grace backstop. The long trailing silence would trip
+    # the (here 5s) idle-grace timeout, so ending well inside it proves the
+    # `failed` edge — not the timeout — ended the turn.
+    async def _fail_before_output() -> AsyncIterator[bytes]:
+        yield b'data: {"type":"session.status","status":"running"}\n\n'
+        yield b'data: {"type":"session.status","status":"failed"}\n\n'  # id-less, no output
+        await asyncio.sleep(30)  # server keeps the stream open; must not be reached
+
+    respx.get("http://omnigent.test/v1/sessions/conv_1/stream").mock(
+        return_value=httpx.Response(200, stream=_fail_before_output())
+    )
+    respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    async def _drain() -> list[dict[str, object]]:
+        return [event async for event in client.run_turn("conv_1", "go", idle_grace_seconds=5.0)]
+
+    try:
+        # Ends on the `failed` edge, well within both the 5s idle-grace and this
+        # 3s cap — a hang-to-timeout would blow the 3s wait.
+        await asyncio.wait_for(_drain(), timeout=3.0)
+    finally:
+        await client.aclose()
+
+
+@respx.mock
 async def test_run_turn_ignores_stale_idle_when_resuming_idle_session() -> None:
     # Incident: resuming a session that's been idle for hours. The stream
     # (idle=false) replays the session's CURRENT status first — a stale id-less

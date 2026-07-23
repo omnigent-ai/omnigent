@@ -821,23 +821,30 @@ class OmnigentClient:
                                 #  (a) id-bearing and matches the open response (or we
                                 #      saw no id-bearing open — some paths only stamp
                                 #      the end);
-                                #  (b) id-less AND no id-bearing response is open AND
-                                #      the turn has PRODUCED (a delta or a terminal
-                                #      ``response.*``) — the in-process (debby/
-                                #      claude-sdk) real end. `waiting` would have kept
-                                #      us going; only `idle`/`failed` here.
+                                #  (b) id-less AND no id-bearing response is open — the
+                                #      in-process (debby/claude-sdk) real end. `waiting`
+                                #      would have kept us going; only `idle`/`failed`.
                                 # An id-less idle WHILE an id-bearing response is open
                                 # is a claude-native PTY flap → ignored (falls through).
-                                # An id-less idle with NOTHING produced is a
+                                # An id-less IDLE with NOTHING produced is a
                                 # claude-native cold-start flap (id-less PTY
-                                # running→idle before the first token) → also ignored;
-                                # the real end is the later id-bearing Stop idle, with
-                                # the idle-grace timeout as the backstop.
+                                # running→idle before the first token) → ignored; the
+                                # real end is the later id-bearing Stop idle, with the
+                                # idle-grace timeout as the backstop. This
+                                # produced-gate applies to `idle` ONLY: `failed` is
+                                # never a PTY flap (it comes solely from the
+                                # authoritative StopFailure hook / a setup-phase
+                                # failure — the PTY watcher emits only `idle`), so a
+                                # bare id-less `failed` must end the turn promptly even
+                                # with nothing produced.
                                 id_bearing_match = response_id is not None and (
                                     not saw_open_running or response_id == open_response_id
                                 )
+                                produced_or_failed = turn_produced or status == "failed"
                                 id_less_end = (
-                                    response_id is None and not saw_open_running and turn_produced
+                                    response_id is None
+                                    and not saw_open_running
+                                    and produced_or_failed
                                 )
                                 if id_bearing_match or id_less_end:
                                     self._logger.info(

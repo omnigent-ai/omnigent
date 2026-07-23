@@ -275,7 +275,12 @@ class _AnswerReply:
             and not self._streamed.endswith("\n")
         ):
             self._streamed += "\n\n"
-            await self._reply.append("\n\n")
+            # Honor the separator's flush too: if the 2-char append is the one
+            # that crosses the SDK buffer threshold (and the following delta only
+            # buffers), this is where content first hits the screen — clear the
+            # placeholder now rather than leaving it up until the next flush.
+            if await self._reply.append("\n\n"):
+                await self._clear_ack()
         self._last_message_id = message_id
         self._streamed += delta
         if await self._reply.append(delta):
