@@ -936,12 +936,13 @@ async def test_route_session_harness_returns_none_for_empty_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_session_harness_excludes_claude_haiku_from_pi() -> None:
-    """pi's candidate list must not include databricks-claude-haiku-4-5.
+async def test_route_session_harness_excludes_incompatible_models_from_pi() -> None:
+    """pi's candidate list must drop models incompatible with its Databricks paths.
 
-    pi routes Claude models through the Anthropic gateway, which rejects the
-    eager_input_streaming field with a 400 when tools are present. The model
-    must be filtered out of pi's candidates (static path here).
+    pi routes Claude models through the Anthropic gateway (rejects
+    eager_input_streaming with tools) and gpt-5.5/5.6 reasoning models through
+    openai-completions (rejects tools + reasoning_effort). Both families must
+    be filtered from pi's candidates; the gpt-5.4 family stays.
     """
     pi_models: list[str] = []
 
@@ -955,11 +956,15 @@ async def test_route_session_harness_excludes_claude_haiku_from_pi() -> None:
     caps = _FakeCaps(routing_client=_CapturingClient())
     with patch("omnigent.runtime._globals._caps", new=caps):
         await route_session_harness("hello")
-    assert "databricks-claude-haiku-4-5" not in pi_models, (
-        "haiku must be filtered from pi candidates"
-    )
-    # pi still offers its GPT models.
-    assert any("gpt" in m for m in pi_models)
+    for excluded in (
+        "databricks-claude-haiku-4-5",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+        "databricks-gpt-5-6-sol",
+    ):
+        assert excluded not in pi_models, f"{excluded} must be filtered from pi candidates"
+    # pi still offers the compatible gpt-5.4 family.
+    assert any("gpt-5-4" in m for m in pi_models)
 
 
 @pytest.mark.asyncio

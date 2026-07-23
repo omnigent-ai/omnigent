@@ -515,13 +515,29 @@ _WORKER_NAME_TO_HARNESS: dict[str, str] = {
     "pi": "pi",
 }
 
-# Per-harness model exclusions for auto routing. The pi harness routes Claude
-# models through the Anthropic Messages gateway, whose request path adds an
-# ``eager_input_streaming`` field the Databricks serving endpoint rejects with
-# a 400 when tools are present. Until pi's Databricks-anthropic path is fixed,
-# keep Claude models off pi — claude-sdk serves them instead.
+# Per-harness model exclusions for auto routing.
+#
+# The pi harness reaches Databricks two incompatible ways for these families:
+#   - Claude models ride pi's Anthropic Messages gateway, whose request path
+#     adds an ``eager_input_streaming`` field the serving endpoint rejects with
+#     a 400 when tools are present.
+#   - The gpt-5.5 / gpt-5.6 reasoning models ride pi's openai-completions path
+#     (``/chat/completions``); Databricks applies a default ``reasoning_effort``
+#     there and rejects tool calls with "Function tools with reasoning_effort
+#     are not supported for gpt-5.5 ... use /v1/responses or set reasoning_effort
+#     to 'none'." pi's provider can't send that override, so tool turns 400.
+# Keep these off pi; claude-sdk serves Claude and codex serves gpt-5.5+ (the
+# codex harness uses the Responses API natively). The gpt-5.4 family works on
+# pi and stays available.
 _HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
-    "pi": ("databricks-claude-haiku-4-5",),
+    "pi": (
+        "databricks-claude-haiku-4-5",
+        "databricks-gpt-5-5",
+        "databricks-gpt-5-5-pro",
+        "databricks-gpt-5-6-luna",
+        "databricks-gpt-5-6-terra",
+        "databricks-gpt-5-6-sol",
+    ),
 }
 
 
