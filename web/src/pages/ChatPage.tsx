@@ -858,11 +858,10 @@ export function ChatPage() {
   const { session: activeSession, isLoading: sessionLoading } = useSession(urlConvId ?? null);
 
   // Orchestrator-only: polly's children inherit its agentName, so the gate
-  // needs the session predicate (parent linkage), not a bare name check.
-  // Same predicate the prior IntelligentModelControl used, so eligibility is
-  // unchanged — the gear modal just relocates where an eligible session's
-  // Smart Routing toggle lives (Claude folds it into the Model dropdown; other
-  // routable agents get a standalone Switch row).
+  // needs the session predicate (parent linkage), not a bare name check. An
+  // eligible session's Smart Routing toggle lives in the gear modal — Claude
+  // folds it into the Model dropdown; other routable agents get a standalone
+  // Switch row.
   const serverInfo = useServerInfo();
   const costRoutingEligible =
     serverInfo !== "loading" &&
@@ -3589,10 +3588,8 @@ export function formatModelEffortStatusLabel(
  * Identity label for the composer status tray: which harness/agent is
  * running this session. Native vendor wrappers read as the bare vendor
  * name ("Claude" / "Codex"); SDK/bundle agents read as the agent name
- * with the brain harness in parens ("Polly (Pi)"). This moved OUT of the
- * picker trigger (which now shows model/effort) — the trigger is the
- * model/effort control, so the harness identity belongs in the read-only
- * shelf below.
+ * with the brain harness in parens ("Polly (Pi)"). Lives in the status tray
+ * below the composer, separate from the read-only model/effort label.
  *
  * @param modelPickerKind - Native picker family, when the session is a
  *   claude-/codex-/cursor-native wrapper.
@@ -3898,8 +3895,8 @@ export function Composer({
   );
 
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
-  // Harness/agent identity shown in the status tray below the card. The
-  // picker trigger owns model/effort now, so the identity moves here.
+  // Harness/agent identity shown in the status tray below the card, separate
+  // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
   const subAgentName = useChatStore((s) => s.subAgentName);
   const brainHarnessLabels = useBrainHarnessLabels();
@@ -4941,10 +4938,10 @@ export function Composer({
               }}
             />
           </div>
-          {/* Agent picker + config gear + Send — right side. Smart Routing is
-              no longer a standalone toggle here; it folds into the gear modal's
-              Model control (Claude) or a Smart Routing switch (other routable
-              agents), mirroring the new-session composer. */}
+          {/* Right side: read-only model/effort label + config gear + Send.
+              Smart Routing lives inside the gear modal — folded into the Model
+              dropdown for Claude, a standalone Switch for other routable
+              agents. */}
           <div className="flex min-w-0 items-center gap-0.5">
             {showCodexPlanMode && (
               <Tooltip>
@@ -5419,11 +5416,10 @@ function SessionConfigModal({
   // without one get a standalone Switch (matches HarnessConfigModal).
   const liveRoutingOn = costRoutingEligible && costControlModeOverride === "on";
 
-  // Resolve the row the current model maps to, matching the old picker's
-  // active-row rule: the explicit override wins, else the bound `llmModel`
-  // implicitly selects its row (so a launch-resolved model shows without an
-  // explicit pick), else the catalog default. Falls back to the "Default"
-  // sentinel when nothing resolves.
+  // Resolve the row the current model maps to: the explicit override wins,
+  // else the bound `llmModel` implicitly selects its row (so a launch-resolved
+  // model shows without an explicit pick), else the catalog default. Falls back
+  // to the "Default" sentinel when nothing resolves.
   const implicitModelId =
     pickerSelectedModel === null
       ? ((usesServerModelOptions
@@ -5935,11 +5931,10 @@ function ComposerModelEffortLabel({
   // showModels gates only the modal control, not this read-out.
   const model = showModels || modelPickerKind === null ? modelLabel : null;
   // SDK/bundle agents (e.g. Polly) that resolve no model/effort fall back to
-  // the harness identity ("Polly (Pi)") so the slot isn't empty — mirrors what
-  // the pre-gear picker trigger showed there. Scoped to SDK/bundle
-  // (modelPickerKind === null): native wrappers keep an empty label when their
-  // model is unresolved rather than resurfacing the bare vendor name, which the
-  // gear tooltip owns now.
+  // the harness identity ("Polly (Pi)") so the slot isn't empty. Scoped to
+  // SDK/bundle (modelPickerKind === null): native wrappers keep an empty label
+  // when their model is unresolved rather than surfacing the bare vendor name,
+  // which the gear tooltip already shows.
   if (!model && !effortLabel) {
     if (modelPickerKind !== null || !harnessLabel) return null;
     return (
