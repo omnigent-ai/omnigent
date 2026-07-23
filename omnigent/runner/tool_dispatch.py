@@ -266,6 +266,11 @@ _WEB_FETCH_TOOLS = frozenset({"web_fetch"})
 # web_search known-failure.
 _WEB_SEARCH_TOOLS = frozenset({"web_search"})
 
+# nimble_research — Nimble Agent API v2 research runs (start → poll → result).
+# Runner-local so a non-OpenAI model's nimble_research call resolves to
+# NimbleResearchTool.invoke, the same posture as web_search.
+_NIMBLE_RESEARCH_TOOLS = frozenset({"nimble_research"})
+
 # Hindsight long-term memory builtins. Runner-local (like web_search) so that a
 # wrapped harness's (claude-sdk / codex / cursor / pi) tool call resolves to the
 # spec-configured Hindsight tool via its ``invoke``. Without this entry the call
@@ -535,6 +540,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_SELF_WRITE_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
+    | _NIMBLE_RESEARCH_TOOLS
     | _HINDSIGHT_TOOLS
     | _TIMER_TOOLS
     | _TASK_LIFECYCLE_TOOLS
@@ -2646,6 +2652,65 @@ async def _execute_web_search_tool(
     return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
 
 
+def _nimble_research_config_from_spec(agent_spec: Any | None) -> dict[str, str]:
+    """
+    Return the ``nimble_research`` builtin's config dict from the parent spec.
+
+    Mirrors :func:`_web_search_config_from_spec`: scans ``spec.tools.builtins``
+    for the entry named ``"nimble_research"`` and returns its ``config``
+    (credentials + agent instance id + polling knobs). Empty dict when the
+    builtin is a bare string or absent.
+
+    :param agent_spec: Parent agent's spec, or ``None``.
+    :returns: The nimble_research config dict, e.g.
+        ``{"api_key": "...", "agent_id": "wsa_..."}``.
+    """
+    if agent_spec is None:
+        return {}
+    tools = getattr(agent_spec, "tools", None)
+    builtins = getattr(tools, "builtins", None) or []
+    for entry in builtins:
+        if getattr(entry, "name", None) == "nimble_research":
+            return getattr(entry, "config", None) or {}
+    return {}
+
+
+async def _execute_nimble_research_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
+    """
+    Dispatch a ``nimble_research`` tool call to Nimble's Agent API v2.
+
+    Builds ``NimbleResearchTool`` from the spec's ``nimble_research`` builtin config
+    and runs its synchronous ``invoke`` off the event loop (the backend blocks
+    on the start → poll → result lifecycle), mirroring
+    :func:`_execute_web_search_tool`.
+
+    :param args: Parsed LLM arguments — ``task`` (required), ``effort`` (optional).
+    :param agent_spec: Parent agent's spec; carries the nimble_research config.
+    :param conversation_id: Parent session id, threaded into the context.
+    :param task_id: Calling task id, threaded into the context.
+    :param agent_id: Calling agent id, threaded into the context.
+    :returns: The JSON envelope, or an error string.
+    """
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.nimble_research import NimbleResearchTool
+
+    config = _nimble_research_config_from_spec(agent_spec)
+    tool = NimbleResearchTool(config=config)
+    ctx = ToolContext(
+        task_id=task_id or "nimble_research",
+        agent_id=agent_id or "nimble_research",
+        conversation_id=conversation_id,
+    )
+    return await asyncio.to_thread(tool.invoke, json.dumps(args), ctx)
+
+
 def _hindsight_config_from_spec(agent_spec: Any | None, tool_name: str) -> dict[str, str]:
     """
     Return a Hindsight builtin's config dict from the parent spec.
@@ -4723,6 +4788,14 @@ async def execute_tool(
             )
         elif tool_name in _WEB_SEARCH_TOOLS:
             output = await _execute_web_search_tool(
+                args,
+                agent_spec=agent_spec,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                agent_id=agent_id,
+            )
+        elif tool_name in _NIMBLE_RESEARCH_TOOLS:
+            output = await _execute_nimble_research_tool(
                 args,
                 agent_spec=agent_spec,
                 conversation_id=conversation_id,
