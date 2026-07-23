@@ -1393,7 +1393,11 @@ def _normalize_subagent_model(
     return normalized
 
 
-async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
+async def _execute_list_models_tool(
+    args: dict[str, Any],
+    *,
+    agent_spec: Any | None,
+) -> str:
     """
     Dispatch ``sys_list_models``: per-worker model availability.
 
@@ -1401,6 +1405,7 @@ async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
     config files and the listing fetches hit provider HTTP APIs (TTL-
     cached in :mod:`omnigent.model_catalog`).
 
+    :param args: Optional ``workers`` and ``model_ids`` filters.
     :param agent_spec: The calling session's agent spec; its
         ``sub_agents`` define the worker rows.
     :returns: JSON mapping of worker name (plus ``"self"``) to its
@@ -1409,9 +1414,10 @@ async def _execute_list_models_tool(*, agent_spec: Any | None) -> str:
     if agent_spec is None:
         return "Error: sys_list_models requires an agent spec"
     from omnigent.model_catalog import catalog_for_spec
+    from omnigent.tools.builtins.list_models import filter_model_catalog
 
     catalog = await asyncio.to_thread(catalog_for_spec, agent_spec)
-    return json.dumps(catalog)
+    return json.dumps(filter_model_catalog(catalog, args))
 
 
 async def _execute_subagent_tool(
@@ -4687,7 +4693,7 @@ async def execute_tool(
                 session_inbox=session_inbox,
             )
         elif tool_name in _LIST_MODELS_TOOLS:
-            output = await _execute_list_models_tool(agent_spec=agent_spec)
+            output = await _execute_list_models_tool(args, agent_spec=agent_spec)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,
