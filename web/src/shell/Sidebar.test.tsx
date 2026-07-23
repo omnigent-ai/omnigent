@@ -7,6 +7,7 @@
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -24,6 +25,7 @@ const {
   fetchProjectSessionIdsMock,
   conversationsRef,
   projectSessionsMock,
+  useHostsMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   moveToProjectSpy: vi.fn(),
@@ -43,6 +45,11 @@ const {
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
+  useHostsMock: vi.fn(),
+}));
+
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: useHostsMock,
 }));
 
 // Mutation hooks are only invoked on row actions; stub them. useConversations
@@ -190,6 +197,8 @@ function showSharedTab() {
 
 beforeEach(() => {
   useConvMock.mockReset();
+  useHostsMock.mockReset();
+  useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
   projectsMock.length = 0;
   moveToProjectSpy.mockReset();
@@ -411,6 +420,62 @@ describe("Sidebar session list", () => {
       );
     });
     nowSpy.mockRestore();
+  });
+
+  it("shares one hosts observer across multiple ordinary session rows", () => {
+    const observerMounted = vi.fn();
+    useHostsMock.mockImplementation(() => {
+      useEffect(() => {
+        observerMounted();
+      }, []);
+      return { data: [] };
+    });
+    mockConversations([
+      conv("conv_one", "Codex", { host_id: "host_one" }),
+      conv("conv_two", "Claude Code", { host_id: "host_two" }),
+      conv("conv_three", "Codex", { host_id: "host_three" }),
+    ]);
+
+    renderSidebar();
+
+    expect(screen.getByRole("link", { name: "conv_one" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "conv_two" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "conv_three" })).toBeInTheDocument();
+    expect(observerMounted).toHaveBeenCalledTimes(1);
+    expect(useHostsMock).toHaveBeenCalledWith({ includeSandbox: true });
+  });
+
+  it.each([
+    {
+      title: "resolved remote host name",
+      hostId: "host_remote",
+      hosts: [{ host_id: "host_remote", name: "Build Mac", sandbox_provider: null }],
+      expected: "Build Mac",
+    },
+    {
+      title: "sandbox provider label",
+      hostId: "host_sandbox",
+      hosts: [{ host_id: "host_sandbox", name: "Managed host", sandbox_provider: "modal" }],
+      expected: "Modal Sandbox",
+    },
+    {
+      title: "unknown host fallback",
+      hostId: "host_missing",
+      hosts: [],
+      expected: "host_missing",
+    },
+  ])("shows the $title in the session tooltip", async ({ hostId, hosts, expected }) => {
+    useHostsMock.mockReturnValue({ data: hosts });
+    mockConversations([conv("conv_location", "Codex", { host_id: hostId })]);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_location" }), {
+      pointerType: "mouse",
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(expected);
+    });
   });
 });
 

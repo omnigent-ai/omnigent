@@ -112,7 +112,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
-import { useHosts } from "@/hooks/useHosts";
+import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -182,6 +182,23 @@ const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 // ``useProjects()`` subscription. Keeps row renders O(1) and avoids spinning up
 // a query observer per row (which would also re-run on every project mutation).
 const ProjectNamesContext = createContext<Map<string, string>>(new Map());
+const HostsByIdContext = createContext<ReadonlyMap<string, Host>>(new Map());
+
+function SidebarRowDataProvider({
+  projectNamesById,
+  hostsById,
+  children,
+}: {
+  projectNamesById: Map<string, string>;
+  hostsById: ReadonlyMap<string, Host>;
+  children: ReactNode;
+}) {
+  return (
+    <ProjectNamesContext.Provider value={projectNamesById}>
+      <HostsByIdContext.Provider value={hostsById}>{children}</HostsByIdContext.Provider>
+    </ProjectNamesContext.Provider>
+  );
+}
 
 /**
  * Which session tab the sidebar is showing. ``"mine"`` is the viewer's own
@@ -972,6 +989,13 @@ function ConversationList({
 }: ConversationListProps) {
   // Viewer id for the owner-based My/Shared split below.
   const viewerId = useViewerId();
+  // Host metadata is shared by every row tooltip. Resolve it once at the list
+  // owner so ordinary rows do not each create their own polling observer.
+  const { data: hosts = [] } = useHosts({ includeSandbox: true });
+  const hostsById = useMemo(
+    () => new Map(hosts.map((host) => [host.host_id, host] as const)),
+    [hosts],
+  );
   // All loaded conversations from the single paginated list (for pinned
   // backfill, normalization, and the flat session list).
   const allConversations = useMemo(
@@ -1418,7 +1442,7 @@ function ConversationList({
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
   return (
-    <ProjectNamesContext.Provider value={projectNamesById}>
+    <SidebarRowDataProvider projectNamesById={projectNamesById} hostsById={hostsById}>
       <DndContext
         sensors={sensors}
         collisionDetection={pointerWithin}
@@ -1630,7 +1654,7 @@ function ConversationList({
           ) : null}
         </DragOverlay>
       </DndContext>
-    </ProjectNamesContext.Provider>
+    </SidebarRowDataProvider>
   );
 }
 
@@ -2344,11 +2368,14 @@ function ConversationMenuItems({
   );
 }
 
-function SessionTooltipContent({ conversation }: { conversation: Conversation }) {
-  const { data: hosts = [] } = useHosts({ includeSandbox: true });
-  const host = conversation.host_id
-    ? hosts.find((candidate) => candidate.host_id === conversation.host_id)
-    : undefined;
+function SessionTooltipContent({
+  conversation,
+  hostsById,
+}: {
+  conversation: Conversation;
+  hostsById: ReadonlyMap<string, Host>;
+}) {
+  const host = conversation.host_id ? hostsById.get(conversation.host_id) : undefined;
   const locationLabel = !conversation.host_id
     ? "Local machine"
     : host?.sandbox_provider
@@ -2399,6 +2426,7 @@ function ConversationRow({
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
 }) {
+  const hostsById = useContext(HostsByIdContext);
   // `useParams` reads from the active matched route. On `/`, the param is
   // undefined; on `/c/:conversationId`, it carries the active id.
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
@@ -2796,7 +2824,7 @@ function ConversationRow({
         ) : (
           <Tooltip>
             <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-            <SessionTooltipContent conversation={conversation} />
+            <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
           </Tooltip>
         )
       ) : projectFlyoutName ? (
@@ -2845,7 +2873,7 @@ function ConversationRow({
               />
             </ContextMenuContent>
           </ContextMenu>
-          <SessionTooltipContent conversation={conversation} />
+          <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
         </Tooltip>
       )}
       {selectionMode ? (
