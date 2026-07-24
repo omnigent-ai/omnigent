@@ -1653,13 +1653,14 @@ class HostProcess:
         """
         from omnigent.onboarding.harness_auth import (
             adopt_env_credential,
+            detect_adoptable_credentials,
             store_harness_credential,
         )
         from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
         # Resolve the harness to a provider family, re-checking the allowlist.
         # claude→anthropic, codex→openai; pi consumes both and prefers anthropic
-        # (its first fallback family), so a pi credential lands on anthropic.
+        # (its first fallback family), so a typed pi key lands on anthropic.
         install_key = ui_install_key(frame.harness)
         family = {
             ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
@@ -1680,7 +1681,18 @@ class HostProcess:
                     status="failed",
                     error="adopt requires an env_var",
                 )
-            result = adopt_env_credential(family=family, env_var=frame.env_var)
+            # Adopt an env var by its OWN family, not the harness-derived one.
+            # pi consumes both anthropic + openai, so it can offer e.g.
+            # $OPENAI_API_KEY — writing that under anthropic (the harness default)
+            # would mis-route it to anthropic's endpoint. Look the env var up in
+            # the host's detected credentials and use its detected family; fall
+            # back to the harness family if it isn't detected (shouldn't happen,
+            # since the UI only offers detected vars).
+            detected_family = next(
+                (d.family for d in detect_adoptable_credentials() if d.env_var == frame.env_var),
+                family,
+            )
+            result = adopt_env_credential(family=detected_family, env_var=frame.env_var)
         elif frame.kind in ("key", "gateway"):
             result = store_harness_credential(
                 family=family,

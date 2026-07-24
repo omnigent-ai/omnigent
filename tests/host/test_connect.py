@@ -2340,7 +2340,7 @@ def test_handle_store_secret_adopt_calls_adopt_core(
 ) -> None:
     """An adopt request references an env var via the adopt core."""
     import omnigent.host.connect as connect
-    from omnigent.onboarding.harness_auth import StoreCredentialResult
+    from omnigent.onboarding.harness_auth import DetectedCredential, StoreCredentialResult
 
     seen: dict[str, object] = {}
 
@@ -2349,6 +2349,12 @@ def test_handle_store_secret_adopt_calls_adopt_core(
         return StoreCredentialResult(True, "openai", None)
 
     monkeypatch.setattr("omnigent.onboarding.harness_auth.adopt_env_credential", _adopt)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_auth.detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
+        ],
+    )
     monkeypatch.setattr(connect, "configured_harness_map", lambda: {"codex-native": True})
 
     host = _make_host_process()
@@ -2358,6 +2364,44 @@ def test_handle_store_secret_adopt_calls_adopt_core(
         )
     )
     assert result.status == "ok"
+    assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
+
+
+def test_handle_store_secret_pi_adopt_uses_detected_family_not_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopting an OpenAI env var for pi writes it under the OPENAI family.
+
+    pi consumes both anthropic + openai, so the UI can offer $OPENAI_API_KEY as
+    adoptable for pi. The harness-derived family for pi is anthropic; adopting
+    under it would write an anthropic provider pointing at an OpenAI key
+    (mis-routed, fails at run time). The daemon must use the env var's OWN
+    detected family instead.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential, StoreCredentialResult
+
+    seen: dict[str, object] = {}
+
+    def _adopt(**kwargs: object) -> StoreCredentialResult:
+        seen.update(kwargs)
+        return StoreCredentialResult(True, "openai", None)
+
+    monkeypatch.setattr("omnigent.onboarding.harness_auth.adopt_env_credential", _adopt)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_auth.detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
+        ],
+    )
+    monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(request_id="c4", harness="pi", kind="adopt", env_var="OPENAI_API_KEY")
+    )
+    assert result.status == "ok"
+    # openai (the env var's family), NOT anthropic (pi's harness-derived default).
     assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
 
 
