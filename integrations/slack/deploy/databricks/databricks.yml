@@ -23,7 +23,7 @@ variables:
       Custom U2M OAuth app client id. Public (not a secret) — passed inline.
   server_url:
     description: "Base URL of the Omnigent server app (the bot talks to this)."
-  webauth_base_url:
+  app_url:
     description: >
       This bot app's own public URL, used to build the enrollment link posted
       into Slack. The platform does NOT inject an app-URL env var, so it must be
@@ -77,7 +77,7 @@ resources:
             permission: READ
 
       config:
-        command: ["python", "app.py"]
+        command: ["uv", "run", "python", "app.py"]
         env:
           # Slack credentials + at-rest encryption + enrollment state secret.
           - name: OMNIGENT_SLACK_BOT_TOKEN
@@ -96,17 +96,15 @@ resources:
           # from the OAuth client secret so rotating one doesn't affect the other.
           - name: OMNIGENT_SLACK_DATABRICKS_STATE_SECRET
             value_from: databricks-state-secret
-          # Databricks web-auth mode + non-secret config. The workspace host
-          # defaults to the platform-injected DATABRICKS_HOST, and the bot's own
-          # public URL to DATABRICKS_APP_URL, so they need no value here.
+          # Databricks web-auth mode + non-secret config.
           - name: OMNIGENT_SLACK_SERVER_AUTH
             value: databricks
           - name: OMNIGENT_SERVER_URL
             value: ${var.server_url}
           # This app's own public URL (the enrollment link base). The platform
           # injects no app-URL env var, so it's passed explicitly.
-          - name: OMNIGENT_SLACK_WEBAUTH_BASE_URL
-            value: ${var.webauth_base_url}
+          - name: OMNIGENT_SLACK_DATABRICKS_APP_URL
+            value: ${var.app_url}
           # SQLite store on ephemeral disk — tokens are encrypted and
           # re-enrolled after a restart, so no durable volume is needed.
           - name: OMNIGENT_DATA_DIR

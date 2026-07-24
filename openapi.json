@@ -8364,6 +8364,17 @@
               ],
               "title": "Project"
             }
+          },
+          {
+            "description": "When `True`, return only sessions the user has pinned (the `omnigent.pinned` label). Lets the sidebar enumerate pinned sessions that fall outside the loaded pagination window. `False` (default) disables it.",
+            "in": "query",
+            "name": "pinned",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Pinned",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

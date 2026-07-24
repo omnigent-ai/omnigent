@@ -82,6 +82,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ConversationAlreadyExistsError,
@@ -89,6 +90,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     SessionConnectivity,
+    pinned_label_key,
 )
 
 _logger = logging.getLogger(__name__)
@@ -2129,6 +2131,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        pinned: bool = False,
+        pinned_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -2182,6 +2186,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` disables the filter. The name→id resolution is scoped to
             ``owned_by`` (projects are owner-private), so pass ``owned_by``
             alongside a specific name for the first-class half to resolve.
+        :param pinned: When ``True``, restrict to sessions ``pinned_owner`` has
+            pinned (their per-user ``omnigent.pinned.<user>`` label — the
+            sidebar's Pinned section). ``False`` (default) disables the filter.
+            Lets the client enumerate its pinned sessions independent of the
+            loaded pagination window.
+        :param pinned_owner: The user whose pins ``pinned=True`` filters to.
+            ``None`` → the single-user ``local`` sentinel.
         :param owned_by: When set, restrict to sessions the user owns
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
@@ -2384,6 +2395,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                             ),
                         )
                     )
+            if pinned:
+                # Restrict to sessions the caller has pinned. Pins are per-user,
+                # so match the caller's own key (``omnigent.pinned.<user>``), not
+                # a shared key — otherwise one user's pin would surface for every
+                # user with access. The row exists only while pinned (unpin
+                # deletes it), so key presence alone is the filter; the value is
+                # the pin timestamp, not a flag. Colocated on the AP DB, so an
+                # inline IN-subquery is enough (no cross-DB prefetch).
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlConversationLabel.conversation_id).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.key == pinned_label_key(pinned_owner),
+                        )
+                    )
+                )
             if after:
                 stmt = self._apply_cursor(
                     stmt,
@@ -3512,10 +3539,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # message instead of dropping it. Forks of chat-only sources
             # (no workspace) get no such label and resume in-process like
             # a brand-new chat session.
+            # Per-user pin keys (``omnigent.pinned.<user>``) are dynamic-suffix,
+            # so they're never in the exact-match drop sets — drop them by prefix
+            # instead. A fork is a NEW conversation; inheriting the source's pins
+            # would show the clone as pinned for the forker AND carry every other
+            # user's pin key along as dead data.
             fork_labels = {
                 key: value
                 for key, value in _fetch_labels(session, source_conversation_id).items()
                 if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
+                and not key.startswith(f"{PINNED_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None
