@@ -842,7 +842,7 @@ def _build_models_json(
 # declares ``reasoning: true``; without it the stream carries no ``content``
 # and the turn dies with "Stream ended without finish_reason". Extend this
 # tuple when the gateway grows another reasoning-first model family.
-_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("glm", "deepseek", "kimi")
+_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("glm", "deepseek", "kimi", "inkling")
 
 
 def _pi_model_is_reasoning(model: str) -> bool:

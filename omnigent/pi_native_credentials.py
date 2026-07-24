@@ -443,7 +443,17 @@ def _fetch_pi_model_lists(
         else:
             is_llm = any(
                 t in name_lower
-                for t in ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi", "glm")
+                for t in (
+                    "claude",
+                    "gpt",
+                    "codex",
+                    "gemini",
+                    "llama",
+                    "qwen",
+                    "kimi",
+                    "glm",
+                    "inkling",
+                )
             )
         if not is_llm:
             continue
@@ -456,7 +466,7 @@ def _fetch_pi_model_lists(
         # Pi's openai-completions parser requires reasoning:true on the model
         # entry to consume that channel; without it the turn ends with
         # "Stream ended without finish_reason".
-        if any(frag in name_lower for frag in ("kimi", "glm", "deepseek")):
+        if any(frag in name_lower for frag in ("kimi", "glm", "deepseek", "inkling")):
             entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
