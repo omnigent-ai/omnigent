@@ -448,52 +448,30 @@ class CompactionForwardState:
     """
     Durable compaction-boundary reconciliation state.
 
-    Persisted at ``{bridge_dir}/compaction_forwarder.json`` and shared by
-    BOTH the hook forwarder and the transcript forwarder — a compaction is
-    bracketed by a ``PreCompact`` hook and completed by *either* the
-    transcript's ``isCompactSummary`` record *or* the
-    ``SessionStart source=compact`` hook, and both must reconcile against
-    one durable token so exactly one Omnigent ``compaction`` boundary is
-    persisted per compaction, regardless of arrival order or a missing
-    (flaky) completion hook.
+    Persisted at ``{bridge_dir}/compaction_forwarder.json`` and shared by the
+    hook and transcript forwarders. A compaction is bracketed by a
+    ``PreCompact`` hook and completed by *either* the transcript's
+    ``isCompactSummary`` record *or* the ``SessionStart source=compact`` hook;
+    both reconcile against one durable token so exactly one Omnigent
+    ``compaction`` boundary is persisted per compaction, regardless of arrival
+    order or a missing completion hook.
 
-    :param pending: The compaction awaiting a boundary persist, or ``None``
-        when no compaction is in flight.
-    :param last_seq: The highest sequence number minted so far. Each
-        ``PreCompact`` increments it, so repeated compactions never reuse a
-        key.
-    :param persisted_seqs: Sequence numbers whose boundary POST already
-        succeeded, bounded to the most recent
-        :data:`_MAX_PERSISTED_COMPACTION_SEQS`. Blocks a re-persist after a
-        crash/restart or cursor rewind re-reads an already-handled summary.
-    :param last_precompact_cursor: Highest hook ``event_cursor`` already
-        minted into a pending token. A ``PreCompact`` edge is noted at most
-        once even though it is scanned twice per poll — a pre-items prescan
-        (so the token exists before the transcript summary in the same poll
-        is processed) and again by the main hook phase. Zero means no
-        cursor-keyed ``PreCompact`` has been minted yet.
-    :param expect_completion_ack: ``True`` when the transcript
-        ``isCompactSummary`` path has just persisted a boundary and a paired
-        ``SessionStart source=compact`` completion hook may still trail it.
-        The two are completion signals for the *same* compaction, but once
-        the pending token is consumed the durable state is indistinguishable
-        from a fresh standalone compaction — so this one-shot flag tells the
-        standalone-completion path to absorb (not re-persist) the trailing
-        hook. Cleared when the hook is absorbed or a new ``PreCompact`` opens
-        the next cycle, bounding it to a single compaction.
-    :param expect_completion_ack_seq: The ``seq`` of the boundary that armed
-        :attr:`expect_completion_ack`, binding the ack window to a specific
-        persisted compaction rather than a bare, unattributed flag. The
-        standalone-completion path only absorbs a trailing hook when this seq
-        is genuinely present in :attr:`persisted_seqs` — i.e. the boundary it
-        would be acking really was stored. If the flag is somehow armed for a
-        seq that is not persisted (corruption, partial write, a state file
-        from before this field existed), the path biases to the *safe*
-        direction and persists a fresh boundary rather than silently
-        absorbing the hook, because a lost boundary (a full pre-compaction
-        history reload on resume) is far worse than an at-most-once duplicate.
-        Zero means no ack is armed, or the ack came from a legacy state file
-        with no recorded seq. Cleared alongside :attr:`expect_completion_ack`.
+    :param pending: The compaction awaiting a boundary persist, or ``None``.
+    :param last_seq: Highest sequence number minted so far; each ``PreCompact``
+        increments it so keys are never reused.
+    :param persisted_seqs: Sequence numbers whose boundary POST succeeded,
+        bounded to :data:`_MAX_PERSISTED_COMPACTION_SEQS`; blocks re-persist on
+        a cursor rewind or restart.
+    :param last_precompact_cursor: Highest hook ``event_cursor`` already minted;
+        de-dupes the ``PreCompact`` edge across the twice-per-poll scan.
+    :param expect_completion_ack: One-shot flag: a transcript boundary just
+        persisted and a paired completion hook may still trail it, so the
+        standalone-completion path absorbs (not re-persists) that hook.
+    :param expect_completion_ack_seq: The ``seq`` that armed
+        :attr:`expect_completion_ack`; the trailing hook is absorbed only when
+        this seq is in :attr:`persisted_seqs`, otherwise the path biases to
+        persisting a fresh boundary. Zero means no ack armed (or a legacy state
+        file).
     """
 
     pending: _PendingCompaction | None = None
