@@ -32,9 +32,11 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -607,6 +609,18 @@ async def _receive_loop(
                 )
             continue
 
+        if isinstance(frame, HostInstallHarnessResultFrame):
+            install_future = conn.pending_installs.pop(frame.request_id, None)
+            if install_future is not None and not install_future.done():
+                install_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
         if isinstance(frame, HostFsResultFrame):
             fs_future = conn.pending_fs_requests.pop(frame.request_id, None)
             if fs_future is not None and not fs_future.done():
@@ -616,6 +630,18 @@ async def _receive_loop(
                         "payload": frame.payload,
                         "error_status": frame.error_status,
                         "error_code": frame.error_code,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostModelOptionsResultFrame):
+            model_future = conn.pending_model_options.pop(frame.request_id, None)
+            if model_future is not None and not model_future.done():
+                model_future.set_result(
+                    {
+                        "status": frame.status,
+                        "models": frame.models,
                         "error": frame.error,
                     }
                 )

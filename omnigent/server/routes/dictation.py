@@ -60,6 +60,7 @@ import time
 from collections.abc import Callable
 from typing import Final
 
+import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
@@ -143,8 +144,13 @@ def create_dictation_router(
                 await websocket.send_text(json.dumps({"type": "ready"}))
                 await _pump_dictation(websocket, handle)
             finally:
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(handle.close)
+                # An abrupt disconnect tears the ASGI task down via
+                # cancellation, which would cancel this close mid-await and
+                # leak the take (the remote engine holds a worker slot until
+                # close). Shield it so cleanup always completes.
+                with anyio.CancelScope(shield=True):
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(handle.close)
 
     return router
 

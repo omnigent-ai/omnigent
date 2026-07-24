@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -366,6 +368,148 @@ def test_install_harness_cli_requires_npm(monkeypatch: pytest.MonkeyPatch) -> No
     assert hi.install_harness_cli(ANTHROPIC_FAMILY) is False
 
 
+def test_try_install_harness_cli_missing_npm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No npm on PATH → ``(False, reason)`` naming the missing installer.
+
+    The UI-driven install shows this reason instead of a bare failure, so the
+    user knows the host lacks npm rather than guessing.
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not shell out")),
+    )
+    installed, reason = hi.try_install_harness_cli(ANTHROPIC_FAMILY)
+    assert installed is False
+    assert reason is not None and "npm" in reason
+
+
+def test_try_install_harness_cli_manual_only() -> None:
+    """A manual-only CLI (no npm package, no install_command) → ``(False, reason)``.
+
+    Cursor installs out-of-band; the reason tells the caller it can't be
+    auto-installed so the UI can fall back to showing the install hint.
+    """
+    installed, reason = hi.try_install_harness_cli(hi.CURSOR_KEY)
+    assert installed is False
+    assert reason is not None and "automatically" in reason
+
+
+def test_try_install_harness_cli_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-zero installer exit with the binary still absent → ``(False, reason)``.
+
+    Surfaces the installer's exit code so a failed npm install is actionable.
+    """
+
+    def _which(name: str) -> str | None:
+        return "/usr/bin/npm" if name == "npm" else None
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=1),
+    )
+    installed, reason = hi.try_install_harness_cli(OPENAI_FAMILY)
+    assert installed is False
+    assert reason is not None and "code 1" in reason
+
+
+def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful install → ``(True, None)``; the bool wrapper agrees."""
+    state = {"installed": False}
+
+    def _which(name: str) -> str | None:
+        if name == "npm":
+            return "/usr/bin/npm"
+        if name == "codex":
+            return "/usr/bin/codex" if state["installed"] else None
+        return None
+
+    def _run(argv: list[str], **k: object):
+        state["installed"] = True
+        return subprocess.CompletedProcess(args=argv, returncode=0)
+
+    monkeypatch.setattr(hi.shutil, "which", _which)
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+
+
+def test_try_install_harness_cli_success_when_binary_off_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A binary installed into a global dir but off bare ``PATH`` reads success.
+
+    Regression: the install verdict and the readiness badge must use the SAME
+    resolver. On a host whose frozen ``PATH`` omits the npm/nvm/homebrew bin dir,
+    npm lands the binary there — off ``PATH`` but on ``resolve_cli_binary``'s
+    fallback ladder. Judging install success with bare ``shutil.which`` reported
+    a spurious "not found" failure (red toast) while readiness resolved it via
+    the ladder (green tick) — the two verdicts disagreeing on one install.
+    """
+    fallback_dir = tmp_path / "bin"
+    fallback_dir.mkdir()
+    codex = fallback_dir / "codex"
+    codex.write_text("#!/bin/sh\n")
+    codex.chmod(0o755)
+
+    # npm is on PATH; the installed codex binary never is — only the ladder finds it.
+    monkeypatch.setattr(hi.shutil, "which", lambda name: "/usr/bin/npm" if name == "npm" else None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
+    )
+
+    # Install verdict agrees with readiness: both see it installed.
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    assert hi.harness_cli_installed(OPENAI_FAMILY) is True
+
+
+def test_try_install_prepends_resolved_dir_so_login_can_find_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After install, the resolving dir is on ``PATH`` for the later login step.
+
+    The install verdict resolves via the full ladder, but the setup wizard's
+    subsequent ``harness_login`` / ``harness_cli_logged_in`` shell out with the
+    bare binary name and only bare ``shutil.which`` (i.e. ``PATH``). If install
+    succeeds via a fallback dir (nvm/homebrew/…) without putting that dir on
+    ``PATH``, login would fail to find the binary just installed. Assert the
+    install prepends the resolving dir so a bare ``PATH`` lookup then succeeds —
+    converging install, readiness, and login on the same binary.
+    """
+    fallback_dir = tmp_path / "nvm" / "bin"
+    fallback_dir.mkdir(parents=True)
+    codex = fallback_dir / "codex"
+    codex.write_text("#!/bin/sh\n")
+    codex.chmod(0o755)
+
+    # A PATH that has npm but NOT the fallback dir; use the REAL shutil.which so
+    # the prepend is observable via a genuine PATH lookup (what login does).
+    npm_dir = tmp_path / "npmhome"
+    npm_dir.mkdir()
+    (npm_dir / "npm").write_text("#!/bin/sh\n")
+    (npm_dir / "npm").chmod(0o755)
+    monkeypatch.setenv("PATH", str(npm_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    monkeypatch.setattr(
+        hi.subprocess,
+        "run",
+        lambda argv, **k: subprocess.CompletedProcess(args=argv, returncode=0),
+    )
+
+    # Before: a bare PATH lookup (what harness_login uses) can't find codex.
+    assert shutil.which("codex") is None
+    assert hi.try_install_harness_cli(OPENAI_FAMILY) == (True, None)
+    # After: the resolving dir was prepended, so the login step's bare lookup
+    # now resolves the binary that was just installed.
+    assert shutil.which("codex") == str(codex)
+    assert str(fallback_dir) in os.environ["PATH"].split(os.pathsep)
+
+
 def test_install_harness_cli_runs_npm_then_rechecks(monkeypatch: pytest.MonkeyPatch) -> None:
     """Installs via ``npm install -g <package>`` and reports the post-install
     PATH state (True once the binary appears)."""
@@ -424,23 +568,26 @@ def test_install_harness_cli_runs_hermes_installer_then_rechecks(
 def test_install_harness_cli_refreshes_user_local_bin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A vendor install into ~/.local/bin is usable without restarting setup."""
+    """A vendor install into ~/.local/bin is usable without restarting setup.
+
+    The install resolves the binary via ``resolve_cli_binary`` (whose ladder
+    includes ~/.local/bin) and prepends the resolving dir to ``PATH``, so the
+    wizard's later bare-``PATH`` login steps find the just-installed CLI.
+    """
     user_bin = tmp_path / ".local" / "bin"
     user_bin.mkdir(parents=True)
     hermes = user_bin / "hermes"
     hermes.write_text("#!/bin/sh\n")
     hermes.chmod(0o755)
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-
-    def _which(name: str) -> str | None:
-        if name == "bash":
-            return "/bin/bash"
-        if name == "hermes" and str(user_bin) in hi.os.environ["PATH"].split(hi.os.pathsep):
-            return str(hermes)
-        return None
-
-    monkeypatch.setattr(hi.shutil, "which", _which)
+    # bash (the hermes installer) is on PATH; hermes is only in the fallback
+    # dir, off bare PATH — the real resolver must find it via the ladder.
+    bin_dir = tmp_path / "sysbin"
+    bin_dir.mkdir()
+    (bin_dir / "bash").write_text("#!/bin/sh\n")
+    (bin_dir / "bash").chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (user_bin,))
     monkeypatch.setattr(
         hi.subprocess,
         "run",
@@ -448,7 +595,10 @@ def test_install_harness_cli_refreshes_user_local_bin(
     )
 
     assert hi.install_harness_cli(hi.HERMES_KEY) is True
+    # The resolving dir (~/.local/bin) is now first on PATH, so a bare
+    # shutil.which — what harness_login uses — finds hermes.
     assert hi.os.environ["PATH"].split(hi.os.pathsep)[0] == str(user_bin)
+    assert shutil.which("hermes") == str(hermes)
 
 
 def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -798,3 +948,66 @@ def test_harness_cli_logged_in_false_for_harness_without_status(
 
     monkeypatch.setattr(hi.subprocess, "run", _explode)
     assert hi.harness_cli_logged_in(hi.PI_KEY) is False
+
+
+# ── UI setup-step descriptor ─────────────────────────────
+
+
+def test_ui_install_key_resolves_bare_and_native_spellings() -> None:
+    """The UI may pass either the bare id or the native executor spelling."""
+    assert hi.ui_install_key("codex") == OPENAI_FAMILY
+    assert hi.ui_install_key("codex-native") == OPENAI_FAMILY
+    assert hi.ui_install_key("qwen-native") == hi.QWEN_KEY
+    assert hi.ui_install_key("claude-native") == ANTHROPIC_FAMILY
+    # Non-installable (curl/OAuth/SDK) harnesses resolve to None.
+    assert hi.ui_install_key("cursor") is None
+    assert hi.ui_install_key("cursor-native") is None
+    assert hi.ui_install_key("claude-sdk") is None
+
+
+def test_ui_installable_harnesses_includes_native_spellings() -> None:
+    installable = hi.ui_installable_harnesses()
+    assert {"claude", "codex", "pi", "opencode", "qwen"} <= installable
+    assert {"codex-native", "qwen-native", "opencode-native"} <= installable
+    assert "cursor" not in installable
+    assert "claude-sdk" not in installable
+
+
+def test_ui_setup_steps_install_then_command_auth_for_codex() -> None:
+    """Codex: one-click install, then a status-tracked login command."""
+    steps = hi.ui_setup_steps("codex")
+    assert [s.kind for s in steps] == ["install", "auth"]
+    install, auth = steps
+    assert install.action == "install"
+    assert install.status_key == "installed"
+    assert install.command is None
+    assert auth.action == "command"
+    assert auth.command == "codex login"
+    assert auth.status_key == "authed"
+
+
+def test_ui_setup_steps_native_spelling_matches_bare() -> None:
+    """The native spelling yields the same steps as the bare id."""
+    assert [s.as_dict() for s in hi.ui_setup_steps("codex-native")] == [
+        s.as_dict() for s in hi.ui_setup_steps("codex")
+    ]
+
+
+def test_ui_setup_steps_pi_auth_is_untracked_setup_fallback() -> None:
+    """Pi's credential (API key / gateway) can't be driven from the UI yet, so
+    its auth step points at ``omnigent setup`` and is not status-tracked."""
+    steps = hi.ui_setup_steps("pi")
+    assert [s.kind for s in steps] == ["install", "auth"]
+    assert steps[1].action == "setup"
+    assert steps[1].command == "omnigent setup"
+    assert steps[1].status_key is None
+
+
+def test_ui_setup_steps_generic_for_non_installable() -> None:
+    """A non-installable harness (cursor) gets a single generic setup step."""
+    for harness in ("cursor", "claude-sdk"):
+        steps = hi.ui_setup_steps(harness)
+        assert len(steps) == 1
+        assert steps[0].action == "setup"
+        assert steps[0].command == "omnigent setup"
+        assert steps[0].status_key is None

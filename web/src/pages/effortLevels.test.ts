@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CodexModelOption } from "@/lib/types";
+import type { NativeModelOption } from "@/lib/types";
 
 import {
   effortLevelsForConv,
@@ -7,9 +7,11 @@ import {
   shouldShowEffortPicker,
   shouldShowGoalControl,
   shouldShowModelPicker,
+  shouldShowPollyClaudeGoalControl,
+  shouldShowPollyCodexGoalControl,
 } from "./ChatPage";
 
-const CODEX_MODEL_OPTIONS: CodexModelOption[] = [
+const CODEX_MODEL_OPTIONS: NativeModelOption[] = [
   {
     id: "gpt-5.5",
     model: "databricks-gpt-5-5",
@@ -173,5 +175,71 @@ describe("shouldShowGoalControl", () => {
     );
     expect(shouldShowGoalControl({ labels: {} })).toBe(false);
     expect(shouldShowGoalControl(null)).toBe(false);
+  });
+});
+
+describe("shouldShowPollyClaudeGoalControl", () => {
+  it("returns true only for top-level Polly sessions on Claude SDK", () => {
+    expect(
+      shouldShowPollyClaudeGoalControl({
+        agentName: "polly",
+        harness: "claude-sdk",
+        parentSessionId: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowPollyClaudeGoalControl({
+        agentName: "polly",
+        harness: "pi",
+        parentSessionId: null,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowPollyClaudeGoalControl({
+        agentName: "polly",
+        harness: "claude-sdk",
+        parentSessionId: "conv_parent",
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowPollyClaudeGoalControl({
+        agentName: "claude",
+        harness: "claude-sdk",
+        parentSessionId: null,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("shouldShowPollyCodexGoalControl", () => {
+  it("returns true only for top-level Polly sessions on Codex", () => {
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "polly",
+        harness: "codex",
+        parentSessionId: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "polly",
+        harness: "claude-sdk",
+        parentSessionId: null,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "polly",
+        harness: "codex",
+        parentSessionId: "conv_parent",
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "codex",
+        harness: "codex",
+        parentSessionId: null,
+      }),
+    ).toBe(false);
   });
 });

@@ -1,8 +1,10 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
+import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { MicIcon, SquareIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -68,6 +70,15 @@ export type ComposerMicButtonProps = {
   onInterim?: (text: string) => void;
   disabled?: boolean;
   lang?: string;
+  /** Bind the global ⌘⌥V dictation hotkey to this mic. Enable on exactly one
+   *  mounted mic (the primary composer) so two don't fight for the device. */
+  enableHotkey?: boolean;
+  /** Fired when dictation begins. The parent should snapshot the composer text
+   *  here so {@link onVoiceDiscard} can revert to it. */
+  onVoiceStart?: () => void;
+  /** Fired when Esc ends dictation. The parent should restore the text it
+   *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
+  onVoiceDiscard?: () => void;
 };
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -80,6 +91,9 @@ export const ComposerMicButton = ({
   onInterim,
   disabled,
   lang = "en-US",
+  enableHotkey = false,
+  onVoiceStart,
+  onVoiceDiscard,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary whenever the browser has the constructor
   // (Chrome/Safari, unchanged behavior); with no constructor at all
@@ -105,6 +119,14 @@ export const ComposerMicButton = ({
   onTranscriptRef.current = onTranscript;
   const onInterimRef = useRef(onInterim);
   onInterimRef.current = onInterim;
+  // Synced refs so the mount-time listeners call the latest callbacks.
+  const onVoiceStartRef = useRef(onVoiceStart);
+  onVoiceStartRef.current = onVoiceStart;
+  const onVoiceDiscardRef = useRef(onVoiceDiscard);
+  onVoiceDiscardRef.current = onVoiceDiscard;
+  // Set by the Esc handler so late results after a discard don't repopulate the
+  // composer the parent just reverted. Cleared on the next start.
+  const discardingRef = useRef(false);
   // Synced prop ref so the recognition result handler (closure over the
   // mount-time effect) can drop late events when the composer goes
   // disabled mid-utterance.
@@ -142,8 +164,11 @@ export const ComposerMicButton = ({
     const handleStart = () => {
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
+      discardingRef.current = false;
       setError(null);
       setIsListening(true);
+      // Snapshot point: let the parent record the text so Esc can revert to it.
+      onVoiceStartRef.current?.();
     };
     const handleEnd = () => {
       if (serverTakeOwnsState()) return;
@@ -172,8 +197,9 @@ export const ComposerMicButton = ({
       setIsListening(false);
     };
     const handleResult = (event: Event) => {
-      // Drop late events that arrive after the composer went disabled.
-      if (disabledRef.current) return;
+      // Drop late events that arrive after the composer went disabled, or after
+      // an Esc discard the parent has already reverted.
+      if (disabledRef.current || discardingRef.current) return;
       const speechEvent = event as SpeechRecognitionEventLike;
       let finalTranscript = "";
       for (let i = speechEvent.resultIndex; i < speechEvent.results.length; i += 1) {
@@ -322,13 +348,20 @@ export const ComposerMicButton = ({
       return;
     }
     try {
+      // Snapshot point: let the parent record the text so Esc can revert to it.
+      discardingRef.current = false;
+      onVoiceStartRef.current?.();
       const next = await DictationSession.start({
         onPartial: (text) => {
-          if (!disabledRef.current) onInterimRef.current?.(text);
+          // Drop late partials after an Esc discard — they'd repopulate the
+          // composer the parent just reverted.
+          if (!disabledRef.current && !discardingRef.current) onInterimRef.current?.(text);
         },
         onFinal: (text) => {
           const trimmed = text.trim();
-          if (trimmed && !disabledRef.current) onTranscriptRef.current(trimmed);
+          if (trimmed && !disabledRef.current && !discardingRef.current) {
+            onTranscriptRef.current(trimmed);
+          }
         },
         onError: () => {
           sessionRef.current = null;
@@ -361,7 +394,12 @@ export const ComposerMicButton = ({
       void toggleServer();
       return;
     }
-    if (!Ctor) {
+    // In Electron the SpeechRecognition constructor exists but has no backend,
+    // so a Web Speech take always fails with "network" and only THEN falls back
+    // to the server — a visible ~1s "fail then recover" on every first take.
+    // When the server can serve, go straight to it and skip the doomed attempt.
+    // (Real browsers keep Web Speech primary; it genuinely works there.)
+    if (!Ctor || (serverAvailable && isElectronShell())) {
       if (serverAvailable) void toggleServer();
       return;
     }
@@ -379,6 +417,52 @@ export const ComposerMicButton = ({
       transitionRef.current = false;
     }
   }, [isListening, Ctor, serverAvailable, toggleServer]);
+
+  // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
+  // whenever dictation could run (Web Speech OR the server path) and the
+  // composer isn't disabled, so the chord is inert when it can't do anything.
+  useVoiceDictationHotkey(toggle, enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled);
+
+  // While listening, Enter commits (end the take, keep the text) and Esc
+  // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
+  // the capture phase so it preempts the composer's own Enter-sends / Esc-stops.
+  // Path-aware: a live server take is torn down via the DictationSession, a Web
+  // Speech take via the recognizer.
+  useEffect(() => {
+    if (!isListening) return;
+    const handler = (e: globalThis.KeyboardEvent): void => {
+      if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "Enter" && !e.shiftKey) {
+        // Commit: end the take and keep the text. toggle() routes to the right
+        // path — Web Speech stop, or a server stop that flushes the tail.
+        e.preventDefault();
+        e.stopPropagation();
+        toggle();
+      } else if (e.key === "Escape") {
+        // Cancel: flag the discard so trailing results are dropped, revert the
+        // composer, then tear the take down immediately (no tail flush).
+        e.preventDefault();
+        e.stopPropagation();
+        discardingRef.current = true;
+        onVoiceDiscardRef.current?.();
+        const session = sessionRef.current;
+        if (session) {
+          sessionRef.current = null;
+          serverBusyRef.current = false;
+          session.cancel();
+          setIsListening(false);
+        } else {
+          try {
+            recognitionRef.current?.stop();
+          } catch {
+            // Already stopping — the end event will reconcile state.
+          }
+        }
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [isListening, toggle]);
 
   if (!Ctor && !serverAvailable) return null;
 

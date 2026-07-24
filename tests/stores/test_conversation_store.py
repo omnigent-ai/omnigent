@@ -2393,6 +2393,36 @@ def test_list_conversations_by_runner_id_filters(
     assert result[0].runner_id == "runner_token_a"
 
 
+def test_list_conversations_by_runner_id_hydrates_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Conversations from the reconnect lookup carry their labels.
+
+    ``_on_runner_connect`` sources conversations here and feeds them to
+    the runner session-init envelope, which is built from
+    ``conversation.labels``. If this path returns label-less entities the
+    envelope ships empty labels, so a forked native session's fork
+    directives (carry-history / source transcript id) never reach the
+    runner and it launches without history. Guards that regression.
+    """
+    bound = conversation_store.create_conversation(runner_id="runner_token_a")
+    conversation_store.set_labels(
+        bound.id,
+        {
+            "omnigent.fork.carry_history": "1",
+            "omnigent.fork.source_external_session_id": "src-claude-sid",
+        },
+    )
+
+    result = conversation_store.list_conversations_by_runner_id("runner_token_a")
+
+    assert [c.id for c in result] == [bound.id]
+    assert result[0].labels == {
+        "omnigent.fork.carry_history": "1",
+        "omnigent.fork.source_external_session_id": "src-claude-sid",
+    }
+
+
 # ── Host id ─────────────────────────────────────────
 
 
@@ -4774,6 +4804,65 @@ def test_list_conversations_project_none_disables_filter(
     assert ids >= {filed.id, unfiled.id}
 
 
+def test_set_conversation_project_files_and_unfiles(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``set_conversation_project`` sets and clears first-class membership."""
+    project_id = "b" * 32
+    conv = conversation_store.create_conversation()
+    assert conv.project_id is None
+
+    filed = conversation_store.set_conversation_project(conv.id, project_id)
+    assert filed is True
+    assert conversation_store.get_conversation(conv.id).project_id == project_id
+
+    # Unfile.
+    unfiled = conversation_store.set_conversation_project(conv.id, None)
+    assert unfiled is True
+    assert conversation_store.get_conversation(conv.id).project_id is None
+
+
+def test_set_conversation_project_unknown_session_returns_false(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Filing a non-existent session updates nothing and returns ``False``."""
+    result = conversation_store.set_conversation_project("f" * 32, "b" * 32)
+    assert result is False
+
+
+def test_list_conversations_filters_by_project_name_dual_read(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``list_conversations(project="Name")`` dual-reads by project NAME:
+    a session matches if it has EITHER the first-class membership (its
+    ``metadata.project_id`` points at the owner's project of that name) OR the
+    legacy ``omni_project`` label with that value. ``""`` returns sessions in
+    NEITHER (unfiled)."""
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+
+    project_store = SqlAlchemyProjectStore(db_uri)
+    # Single-user: null owner. The route passes owned_by=None to match.
+    project = project_store.create("c" * 32, "Work", None)
+
+    first_class = conversation_store.create_conversation(title="first-class")
+    labelled = conversation_store.create_conversation(title="labelled")
+    unfiled = conversation_store.create_conversation(title="unfiled")
+    # One member via the first-class entity, one via the legacy label — both
+    # under the same name "Work".
+    conversation_store.set_conversation_project(first_class.id, project.id)
+    conversation_store.set_labels(labelled.id, {"omni_project": "Work"})
+
+    members = conversation_store.list_conversations(project="Work", owned_by=None)
+    assert {c.id for c in members.data} == {first_class.id, labelled.id}
+
+    unfiled_page = conversation_store.list_conversations(project="", owned_by=None)
+    unfiled_ids = {c.id for c in unfiled_page.data}
+    assert unfiled.id in unfiled_ids
+    assert first_class.id not in unfiled_ids
+    assert labelled.id not in unfiled_ids
+
+
 def test_list_projects_owned_by_excludes_shared_only_projects(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
@@ -4964,3 +5053,139 @@ def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
             assert updated.pending_elicitation_count == 3
     finally:
         session_live_state.configure(None)
+
+
+# ── Item-data serialization seam ─────────────────────
+
+
+def _stored_item_data(store: SqlAlchemyConversationStore, conversation_id: str) -> list[object]:
+    """Raw, undecoded ``data`` column values for a conversation, in position
+    order — what actually sits in the row before :func:`_to_item` decodes it."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    with store._conv_session() as session:
+        return list(
+            session.execute(
+                select(SqlConversationItem.data)
+                .where(SqlConversationItem.conversation_id == conversation_id)
+                .order_by(SqlConversationItem.position)
+            ).scalars()
+        )
+
+
+def test_item_data_seam_default_stores_plaintext_json(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The default ``_encode_item_data`` is identity: the column holds plaintext
+    JSON and reads round-trip unchanged (the seam is a no-op out of the box)."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_seam",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "plaintext-marker"}]
+                ),
+            )
+        ],
+    )
+
+    [stored] = _stored_item_data(conversation_store, conv.id)
+    assert isinstance(stored, str)
+    assert "plaintext-marker" in stored  # not encoded/encrypted
+
+    [item] = conversation_store.list_items(conv.id).data
+    assert item.data.content[0]["text"] == "plaintext-marker"
+
+
+def test_item_data_seam_subclass_encodes_and_decodes(db_uri: str) -> None:
+    """A subclass overriding the seam transforms ``data`` on write and reverses
+    it on read: the row holds an opaque (base64) blob, yet reads round-trip.
+
+    base64 is deliberately not valid item JSON, so a read that skipped
+    ``_decode_item_data_batch`` would fail in ``json.loads`` — a clean round-trip
+    proves both hooks are wired onto the write and read paths.
+
+    The transform stays a ``str``: OSS maps ``data`` to a text column, and raw
+    ``bytes`` round-trip there only under SQLite's dynamic typing — Postgres and
+    MySQL stringify the bytes object (its ``repr``) and corrupt it. A subclass
+    needing true bytes maps the column to a binary type and covers it in that
+    store's own tests.
+    """
+    import base64
+
+    class _Base64ItemDataStore(SqlAlchemyConversationStore):
+        def _encode_item_data(self, data_json: str) -> str:
+            return base64.b64encode(data_json.encode("utf-8")).decode("ascii")
+
+        def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+            return [base64.b64decode(s).decode("utf-8") for s in stored]
+
+    store = _Base64ItemDataStore(db_uri)
+    conv = store.create_conversation()
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_enc",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "secret-payload"}]
+                ),
+            )
+        ],
+    )
+
+    # Stored form is the opaque transform, not the plaintext JSON.
+    [stored] = _stored_item_data(store, conv.id)
+    assert "secret-payload" not in str(stored)
+    assert "secret-payload" in base64.b64decode(stored).decode("utf-8")
+
+    # Reads reverse the transform and recover the entity.
+    [item] = store.list_items(conv.id).data
+    assert item.data.content[0]["text"] == "secret-payload"
+
+
+def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
+    """The ``_item_search_text`` hook controls what lands in ``search_text``.
+
+    (Returning ``None`` from the hook — to skip the column on a schema that
+    omits it — is exercised by such a backend; the OSS SQLite schema keeps
+    ``search_text`` NOT NULL, so this asserts the string-returning path.)
+    """
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    class _CustomSearchTextStore(SqlAlchemyConversationStore):
+        def _item_search_text(self, item: NewConversationItem) -> str:
+            return "custom-search-text"
+
+    store = _CustomSearchTextStore(db_uri)
+    conv = store.create_conversation()
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_st",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "body text"}]
+                ),
+            )
+        ],
+    )
+
+    with store._conv_session() as session:
+        stored = list(
+            session.execute(
+                select(SqlConversationItem.search_text).where(
+                    SqlConversationItem.conversation_id == conv.id
+                )
+            ).scalars()
+        )
+    assert stored == ["custom-search-text"]

@@ -320,6 +320,8 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    harness_install_enabled: false,
+    installable_harnesses: [],
     dictation_available: false,
     ...overrides,
   };
@@ -1609,6 +1611,27 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("reserves the visible pane width plus its two desktop margins from the header", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_offset", permission_level: null }]);
+
+    renderShell("/c/conv_offset");
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    const panelWidth = Number.parseFloat(panel.style.width);
+    const headerGroup = panel.parentElement;
+    expect(headerGroup?.querySelector("header")).not.toBeNull();
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
+      `${panelWidth + 16}px`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
+  });
+
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
     // A no-os_env agent (available: false) with no shells and no todos
     // still has the unconditional Agents tab (the panel lists at least

@@ -24,6 +24,7 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -35,6 +36,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -42,6 +45,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -61,7 +66,12 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
-from omnigent.onboarding.harness_install import harness_setup_hint
+from omnigent.onboarding.harness_install import (
+    harness_cli_installed,
+    harness_setup_hint,
+    try_install_harness_cli,
+    ui_install_key,
+)
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -1277,7 +1287,8 @@ class HostProcess:
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
-        :returns: None. Returns silently for intentional stops.
+        :returns: None. Returns silently for intentional stops and clean
+            (exit-code-0) shutdowns.
         """
         handle = self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
@@ -1287,6 +1298,15 @@ class HostProcess:
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
+            return
+        if handle.proc.returncode == 0:
+            # A clean exit (code 0) is a graceful shutdown, not a crash — the
+            # idle reaper shutting an inactive runner down, or any orderly
+            # self-exit. Reporting it as host.runner_exited would attach a
+            # scary "runner process exited" error to a session the user only
+            # has to message to reactivate, so stay silent. A non-zero exit
+            # below is a genuine crash and still reports its cause.
+            _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
@@ -1558,6 +1578,53 @@ class HostProcess:
             path=created,
         )
 
+    def _handle_install_harness(
+        self, frame: HostInstallHarnessFrame
+    ) -> HostInstallHarnessResultFrame:
+        """Handle a ``host.install_harness`` request from the server.
+
+        Runs the same installer :func:`try_install_harness_cli` (hence
+        ``omnigent setup``) uses, then recomputes readiness so the result frame
+        carries a fresh ``configured_harnesses`` map. The ``ui_install_key``
+        guard re-checks the allowlist as defence in depth against a spoofed
+        frame. Idempotent: an already-installed CLI skips the install. Runs off
+        the event loop (it shells out / probes ``PATH``).
+
+        :param frame: The install request frame. ``frame.harness`` is a UI
+            harness identifier, e.g. ``"claude"``.
+        :returns: Result frame with ``status`` ``"ok"``/``"failed"``, the
+            refreshed readiness map on success, and a reason on failure.
+        """
+        key = ui_install_key(frame.harness)
+        if key is None:
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"harness {frame.harness!r} is not installable from the UI",
+            )
+        if harness_cli_installed(key):
+            # Already installed — skip the slow npm re-resolve and just report
+            # current readiness (which may still be "needs-auth", e.g. codex).
+            _logger.info("Harness %s already installed; skipping install", frame.harness)
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                configured_harnesses=configured_harness_map(),
+            )
+        installed, reason = try_install_harness_cli(key)
+        if not installed:
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=reason or "install failed",
+            )
+        _logger.info("Installed harness %s via UI request", frame.harness)
+        return HostInstallHarnessResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            configured_harnesses=configured_harness_map(),
+        )
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -1628,6 +1695,45 @@ class HostProcess:
             request_id=frame.request_id,
             status="ok",
             payload=payload,
+        )
+
+    async def _handle_model_options(
+        self,
+        frame: HostModelOptionsFrame,
+    ) -> HostModelOptionsResultFrame:
+        """Resolve the launch picker catalog on the machine that will run it.
+
+        This is a pre-launch PREVIEW of the host's ambient default
+        configuration (``spec=None`` — no session exists yet, so there is no
+        agent spec to pin). A session whose spec pins a different provider
+        resolves its own catalog at launch, and the in-session picker
+        re-reads that authoritative snapshot after bind.
+        """
+        if canonicalize_harness(frame.harness) != "claude-native":
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"model options are unsupported for harness {frame.harness!r}",
+            )
+        try:
+            from omnigent.claude_native import (
+                claude_native_model_options,
+                resolve_native_claude_config,
+            )
+
+            config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+            models = await asyncio.to_thread(claude_native_model_options, config)
+        except Exception:
+            _logger.exception("Failed to resolve pre-launch Claude model options")
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="failed to resolve Claude model options",
+            )
+        return HostModelOptionsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            models=models,
         )
 
     @staticmethod
@@ -2199,6 +2305,11 @@ class HostProcess:
             await ws.send(encode_host_frame(self._handle_list_dir(frame)))
         elif isinstance(frame, HostCreateDirFrame):
             await ws.send(encode_host_frame(self._handle_create_dir(frame)))
+        elif isinstance(frame, HostInstallHarnessFrame):
+            # The installer shells out (npm) and can run for minutes, so run
+            # it off the event loop and reply when it completes.
+            result = await asyncio.to_thread(self._handle_install_harness, frame)
+            await ws.send(encode_host_frame(result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
@@ -2210,6 +2321,8 @@ class HostProcess:
             # off the event loop and reply when it completes.
             result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostModelOptionsFrame):
+            await ws.send(encode_host_frame(await self._handle_model_options(frame)))
 
 
 def run_host_process(

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HostBadge, resolveHostBadge } from "./HostBadge";
@@ -216,6 +216,39 @@ describe("HostBadge", () => {
     useSessionHostOnlineMock.mockReturnValue(null);
     render(<HostBadge sessionId="conv_1" />);
     expect(screen.getByTestId("host-badge").textContent).toBe("mac-laptop, status unknown");
+  });
+
+  it("renders a clickable reconnect affordance in the badge slot when onReconnect is set", () => {
+    // host_offline moves the reconnect prompt up into the host badge: the
+    // passive name + dot is replaced by a button carrying the host-offline
+    // copy, and clicking it opens the reconnect help.
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_a1b2",
+          name: "mac-laptop",
+          owner: "alice",
+          status: "offline",
+          sandbox_provider: null,
+        },
+      ],
+    });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onReconnect = vi.fn();
+    render(<HostBadge sessionId="conv_1" onReconnect={onReconnect} />);
+    const badge = screen.getByTestId("host-badge");
+    expect(badge.tagName).toBe("BUTTON");
+    expect(badge.textContent).toMatch(/Host is offline/);
+    fireEvent.click(badge);
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders nothing when onReconnect is set but the session isn't host-bound", () => {
+    // The reconnect affordance still gates on there being a host to reconnect
+    // to — an unbound session has no badge slot to host it.
+    useSessionMock.mockReturnValue({ session: { hostId: null }, isLoading: false, error: null });
+    render(<HostBadge sessionId="conv_1" onReconnect={vi.fn()} />);
+    expect(screen.queryByTestId("host-badge")).toBeNull();
   });
 
   it("shows unknown while the host list is still loading", () => {

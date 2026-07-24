@@ -2,7 +2,7 @@
 // query-invalidation contract of the stop mutation hook.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
@@ -608,6 +608,235 @@ describe("useRenameConversation cache patching", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
   });
+
+  it("cancels in-flight list queries so a stale reconcile can't clobber the new title", async () => {
+    const { queryClient, rendered } = seedAndRename();
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // onMutate must cancel both list-cache families before overlaying, or an
+    // in-flight reconcile poll / WS-triggered fetch could resolve afterward
+    // and overwrite the optimistic title with the stale search-indexed name.
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+  });
+
+  it("paints the new title optimistically before the PATCH resolves", async () => {
+    // Hold the PATCH open so we can observe the cache between mutate() and
+    // the server response — the window where the sidebar used to show the
+    // stale name.
+    let resolvePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useRenameConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+
+    // Before the PATCH resolves, the cached row already shows the new title.
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("New name");
+    });
+
+    resolvePatch(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "New name",
+        created_at: 0,
+        updated_at: 200,
+        labels: {},
+      }),
+    );
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+  });
+
+  it("rolls back to the old title when the PATCH fails", async () => {
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+    queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useRenameConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // A failed rename must not leave the optimistic title stranded in the
+    // cache — the row reverts to what it showed before.
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("Old name");
+    const backfill = queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"]);
+    expect(backfill!.title).toBe("Old name");
+  });
+
+  it("re-renders a subscribed list component with the new title before the PATCH resolves", async () => {
+    // The cache-level assertions above prove onMutate writes the cache, but
+    // not that a component reading it through useConversations actually
+    // re-paints. This renders the real subscription + the real rename hook
+    // together so a regression to server-first (or a stale subscription)
+    // fails here — this is the path the user sees in the sidebar.
+    let resolvePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    // useConversations does an initial fetch on mount, then the PATCH.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [
+          {
+            id: "conv_x",
+            object: "conversation",
+            title: "Old name",
+            created_at: 0,
+            updated_at: 100,
+            labels: {},
+          },
+        ],
+        first_id: "conv_x",
+        last_id: "conv_x",
+        has_more: false,
+      }),
+    );
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+
+    function Harness() {
+      const { data } = useConversations();
+      const rename = useRenameConversation();
+      const title = data?.pages.flatMap((p) => p.data).find((c) => c.id === "conv_x")?.title;
+      return createElement(
+        "div",
+        null,
+        createElement("span", { "data-testid": "title" }, title ?? ""),
+        createElement(
+          "button",
+          { onClick: () => rename.mutate({ id: "conv_x", title: "New name" }) },
+          "rename",
+        ),
+      );
+    }
+
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    render(createElement(Harness), { wrapper });
+
+    // The list loads the old title.
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("Old name"));
+
+    // Fire the rename; the subscribed span must flip to the new title while
+    // the PATCH is still in flight (optimistic), not after it resolves.
+    screen.getByRole("button").click();
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+
+    resolvePatch(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "New name",
+        created_at: 0,
+        updated_at: 200,
+        labels: {},
+      }),
+    );
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+  });
+
+  it("re-renders a project-folder row (['project-sessions']) with the new title optimistically", async () => {
+    // A session filed in a project renders from its own
+    // ["project-sessions", name] cache, NOT the flat ["conversations"] list.
+    // Renaming it must overlay that cache too, or the folder row keeps the
+    // stale title until the WS reconcile — the reported bug.
+    let resolvePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({
+      // staleTime Infinity so the seeded folder cache doesn't background-refetch
+      // on mount and consume the PATCH mock below.
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    // Seed only the project-folder cache; the flat list is empty (the folder
+    // is the sole place this row appears).
+    queryClient.setQueryData(
+      ["project-sessions", "Sprint 42"],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+
+    function Harness() {
+      const { data } = useProjectSessions("Sprint 42", true);
+      const rename = useRenameConversation();
+      const title = data?.pages.flatMap((p) => p.data).find((c) => c.id === "conv_x")?.title;
+      return createElement(
+        "div",
+        null,
+        createElement("span", { "data-testid": "title" }, title ?? ""),
+        createElement(
+          "button",
+          { onClick: () => rename.mutate({ id: "conv_x", title: "New name" }) },
+          "rename",
+        ),
+      );
+    }
+
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    render(createElement(Harness), { wrapper });
+
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("Old name"));
+
+    screen.getByRole("button").click();
+    // The folder row flips to the new title while the PATCH is still in flight.
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+
+    resolvePatch(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "New name",
+        created_at: 0,
+        updated_at: 200,
+        labels: {},
+      }),
+    );
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+  });
 });
 
 describe("useStopSession invalidation", () => {
@@ -807,8 +1036,11 @@ describe("useBulkStopSessions", () => {
 });
 
 describe("useProjects", () => {
-  it("GETs /v1/sessions/projects and returns the project list", async () => {
-    const projects = ["Customer X", "Sprint 42"];
+  it("GETs /v1/sessions/projects and returns the {id, name} project list", async () => {
+    const projects = [
+      { id: "p_x", name: "Customer X" },
+      { id: null, name: "Sprint 42" },
+    ];
     fetchMock.mockResolvedValueOnce(mockResponse(projects));
 
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -917,17 +1149,25 @@ describe("useNewestProjectSession", () => {
 });
 
 describe("useMoveToProject", () => {
-  it("PATCHes /v1/sessions/{id} with the project label", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        id: "conv_move",
-        object: "conversation",
-        title: "t",
-        created_at: 0,
-        updated_at: 1,
-        labels: { omni_project: "Sprint 42" },
-      }),
-    );
+  it("resolves the project name to an id, then PATCHes project_id", async () => {
+    // Filing by name first lists projects to resolve the id, then PATCHes.
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [{ id: "p_sprint", name: "Sprint 42" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_sprint",
+        }),
+      );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
@@ -936,13 +1176,55 @@ describe("useMoveToProject", () => {
     result.current.mutate({ id: "conv_move", project: "Sprint 42" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects");
+    const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_move");
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(init.body as string)).toEqual({ labels: { omni_project: "Sprint 42" } });
+    expect(JSON.parse(init.body as string)).toEqual({
+      project_id: "p_sprint",
+      labels: { omni_project: "" },
+    });
   });
 
-  it("invalidates both the conversations and projects queries on success", async () => {
+  it("creates the project on demand when the name has no first-class row", async () => {
+    fetchMock
+      // No project of this name exists yet → list is empty …
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      // … so it's created …
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", object: "project", name: "Fresh" }))
+      // … then the session is filed under the new id.
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_new",
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Fresh" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [createUrl, createInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(createUrl).toBe("/v1/projects");
+    expect(createInit.method).toBe("POST");
+    expect(JSON.parse(createInit.body as string)).toEqual({ name: "Fresh" });
+    const [patchUrl, patchInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(patchUrl).toBe("/v1/sessions/conv_move");
+    expect(JSON.parse(patchInit.body as string)).toEqual({
+      project_id: "p_new",
+      labels: { omni_project: "" },
+    });
+  });
+
+  it("unfiles with project_id='' (no id resolution) and invalidates the lists", async () => {
+    // Unfiling clears membership directly — no project lookup needed.
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         id: "conv_move",
@@ -950,7 +1232,7 @@ describe("useMoveToProject", () => {
         title: "t",
         created_at: 0,
         updated_at: 1,
-        labels: {},
+        project_id: null,
       }),
     );
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -961,6 +1243,13 @@ describe("useMoveToProject", () => {
 
     result.current.mutate({ id: "conv_move", project: "" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_move");
+    expect(JSON.parse(init.body as string)).toEqual({
+      project_id: "",
+      labels: { omni_project: "" },
+    });
 
     // Both keys must refresh: conversations so the row re-groups into its new
     // section, projects so the sidebar list updates.
@@ -1014,8 +1303,9 @@ describe("useDeleteProject", () => {
     });
   }
 
-  it("archives every session in the project (keeping the label) and refreshes the lists", async () => {
-    // 1st call: page of project members. Then one PATCH archive per member.
+  it("archives + unfiles every member, then deletes the first-class project", async () => {
+    // 1st call: page of project members. Then one PATCH per member, then the
+    // DELETE of the first-class container.
     fetchMock
       .mockResolvedValueOnce(
         mockResponse({
@@ -1029,7 +1319,8 @@ describe("useDeleteProject", () => {
         }),
       )
       .mockResolvedValueOnce(archivedConv("conv_a"))
-      .mockResolvedValueOnce(archivedConv("conv_b"));
+      .mockResolvedValueOnce(archivedConv("conv_b"))
+      .mockResolvedValueOnce(mockResponse({ id: "p_1", object: "project.deleted", deleted: true }));
 
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
@@ -1037,7 +1328,7 @@ describe("useDeleteProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useDeleteProject(), { wrapper });
 
-    result.current.mutate("Sprint 42");
+    result.current.mutate({ id: "p_1", name: "Sprint 42" });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     // The list fetch is filtered by project and includes archived members.
@@ -1045,9 +1336,9 @@ describe("useDeleteProject", () => {
     expect(listUrl).toContain("project=Sprint+42");
     expect(listUrl).toContain("include_archived=true");
 
-    // Each member is archived via PATCH — NOT deleted, and the project label is
-    // left intact so unarchiving restores the session to its project.
-    const patches = (fetchMock.mock.calls.slice(1) as [string, RequestInit][]).map(
+    // Each member is archived AND detached (project_id cleared + label removed)
+    // via PATCH — never deleted.
+    const patches = (fetchMock.mock.calls.slice(1, 3) as [string, RequestInit][]).map(
       ([url, init]) => ({ url, init }),
     );
     expect(patches.map((p) => p.url).sort()).toEqual([
@@ -1056,8 +1347,17 @@ describe("useDeleteProject", () => {
     ]);
     for (const { init } of patches) {
       expect(init.method).toBe("PATCH");
-      expect(JSON.parse(init.body as string)).toEqual({ archived: true });
+      expect(JSON.parse(init.body as string)).toEqual({
+        archived: true,
+        project_id: "",
+        labels: { omni_project: "" },
+      });
     }
+
+    // Finally the first-class container is removed.
+    const [delUrl, delInit] = fetchMock.mock.calls[3] as [string, RequestInit];
+    expect(delUrl).toBe("/v1/projects/p_1");
+    expect(delInit.method).toBe("DELETE");
 
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
@@ -1084,7 +1384,7 @@ describe("useDeleteProject", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useDeleteProject(), { wrapper });
 
-    result.current.mutate("Sprint 42");
+    result.current.mutate({ id: "p_1", name: "Sprint 42" });
     await waitFor(() => expect(result.current.isError).toBe(true));
 
     const err = result.current.error as unknown as {

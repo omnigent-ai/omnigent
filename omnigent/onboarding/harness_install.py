@@ -41,9 +41,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 from omnigent._platform import resolve_cli_binary
-from omnigent.harness_install_spec import HarnessInstallSpec
+from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -268,6 +269,176 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
 }
 
 
+# UI-installable harnesses: the identifiers the web UI's New Chat dialog may
+# request an install for, mapped to their :data:`_HARNESS_INSTALL` key. Single
+# source of truth for both the host install handler (which runs the installer)
+# and the server route (which allowlists the request). Scope is deliberately
+# narrow — npm-installable, key/env-auth harnesses only; curl/brew/shell
+# installers (cursor, kimi, hermes, …) are absent, so an install request for
+# them is rejected before any installer runs.
+_UI_INSTALLABLE_HARNESS_TO_KEY: dict[str, str] = {
+    "claude": ANTHROPIC_FAMILY,
+    "codex": OPENAI_FAMILY,
+    PI_KEY: PI_KEY,
+    OPENCODE_KEY: OPENCODE_KEY,
+    QWEN_KEY: QWEN_KEY,
+}
+
+
+# Family keys the UI may install, derived once from the allowlist so the
+# executor-spelling fallback in ``ui_install_key`` can't admit a non-installable
+# family (e.g. cursor) that happens to share the name map.
+_UI_INSTALLABLE_KEYS: frozenset[str] = frozenset(_UI_INSTALLABLE_HARNESS_TO_KEY.values())
+
+
+def ui_install_key(harness: str) -> str | None:
+    """Resolve a harness identifier to its UI-installable install-spec key.
+
+    Accepts both the bare install ids (``"claude"``, ``"codex"``, ``"pi"``,
+    ``"opencode"``, ``"qwen"``) and the executor spellings a session actually
+    carries — the native TUI wrappers (``"codex-native"``, ``"qwen-native"``,
+    …) resolve through the shared :data:`_HARNESS_NAME_TO_KEY` map to the same
+    family key. Any harness that doesn't map onto the UI-installable family set
+    (SDK harnesses like ``"claude-sdk"``, or curl/OAuth harnesses like
+    ``"cursor"``/``"hermes"``) returns ``None`` so the caller rejects it.
+
+    :param harness: A harness identifier from the web UI, e.g. ``"claude"`` or
+        ``"codex-native"``.
+    :returns: The :data:`_HARNESS_INSTALL` key (e.g. ``"anthropic"``) when the
+        harness is UI-installable; ``None`` otherwise (caller rejects it).
+    """
+    direct = _UI_INSTALLABLE_HARNESS_TO_KEY.get(harness)
+    if direct is not None:
+        return direct
+    # Fall back to the executor-spelling map, but only accept keys that are
+    # themselves UI-installable — this keeps curl/OAuth harnesses (cursor,
+    # hermes, …) out even though they appear in _HARNESS_NAME_TO_KEY.
+    key = _all_harness_name_to_key().get(harness)
+    if key is not None and key in _UI_INSTALLABLE_KEYS:
+        return key
+    return None
+
+
+def ui_installable_harnesses() -> frozenset[str]:
+    """Return every harness identifier the web UI may install.
+
+    Includes the bare install ids and all executor spellings that resolve to a
+    UI-installable family (e.g. ``"codex-native"``, ``"qwen-native"``), so the
+    New Chat dialog can offer setup for the harness a session actually declares
+    — not just the bare ids.
+
+    :returns: The full set of accepted harness identifiers, e.g.
+        ``{"claude", "claude-native", "codex", "codex-native", "pi", ...}``.
+    """
+    resolvable = set(_UI_INSTALLABLE_HARNESS_TO_KEY)
+    for name, mapped in _all_harness_name_to_key().items():
+        if mapped in _UI_INSTALLABLE_KEYS:
+            resolvable.add(name)
+    return frozenset(resolvable)
+
+
+# The auth step per UI-installable family, for the setup checklist. These are
+# display-only checklist rows (the command is shown for the user to run on the
+# host, never executed server-side), so the commands are literal here rather
+# than derived from ``HarnessInstallSpec.login_args`` — keep them in sync with
+# that spec by hand if a harness's login command changes.
+# ``command`` steps run on the host and are status-tracked; ``setup`` steps
+# (pi/qwen: API key or gateway) can't be driven from the UI yet, so M1 points at
+# ``omnigent setup`` and does not track their status.
+#   claude/codex: subscription login via the CLI's own login command.
+#   opencode: its own `opencode auth login`.
+#   pi/qwen: a provider credential (API key or gateway) — configured by setup.
+_UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
+    ANTHROPIC_FAMILY: SetupStep(
+        kind="auth",
+        title="Sign in to Claude",
+        detail="Uses your Claude subscription — sign in on the host.",
+        action="command",
+        command="claude auth login --claudeai",
+        status_key="authed",
+    ),
+    OPENAI_FAMILY: SetupStep(
+        kind="auth",
+        title="Sign in to Codex",
+        detail="Uses your ChatGPT subscription — sign in on the host.",
+        action="command",
+        command="codex login",
+        status_key="authed",
+    ),
+    OPENCODE_KEY: SetupStep(
+        kind="auth",
+        title="Sign in to OpenCode",
+        detail="OpenCode manages its own credentials — sign in on the host.",
+        action="command",
+        command="opencode auth login",
+        status_key="authed",
+    ),
+    PI_KEY: SetupStep(
+        kind="auth",
+        title="Add a Pi credential",
+        detail="Pi needs an API key or gateway. Set it up on the host for now.",
+        action="setup",
+        command="omnigent setup",
+        status_key=None,
+    ),
+    QWEN_KEY: SetupStep(
+        kind="auth",
+        title="Add a Qwen credential",
+        detail="Qwen needs an API key or gateway. Set it up on the host for now.",
+        action="setup",
+        command="omnigent setup",
+        status_key=None,
+    ),
+}
+
+
+def ui_setup_steps(harness: str) -> list[SetupStep]:
+    """Return the ordered setup checklist for a UI harness identifier.
+
+    Mirrors what ``omnigent setup`` walks a user through for the harness: an
+    install step, then (for the five first-class families) an auth step. The
+    install step's label uses the harness's :class:`HarnessInstallSpec` display
+    name; the auth step's command is a display-only literal from
+    :data:`_UI_AUTH_STEP_BY_KEY` (shown for the user to run, not executed).
+    Harnesses outside the UI-installable set get a single generic
+    "run ``omnigent setup``" step (M1 scope).
+
+    :param harness: A harness identifier the UI holds, e.g. ``"codex"`` or the
+        native spelling ``"codex-native"`` (both resolve to the same steps).
+    :returns: Ordered :class:`SetupStep` list; never empty.
+    """
+    key = ui_install_key(harness)
+    if key is None:
+        # Not UI-installable (curl/OAuth/SDK harness): one generic step.
+        return [
+            SetupStep(
+                kind="install",
+                title="Set up on the host",
+                detail="Run omnigent setup on the host to configure this agent.",
+                action="setup",
+                command="omnigent setup",
+                status_key=None,
+            )
+        ]
+
+    spec = _all_harness_install().get(key)
+    display = spec.display if spec is not None else harness
+    steps = [
+        SetupStep(
+            kind="install",
+            title=f"Install {display}",
+            detail=f"We'll install {display} on the host for you.",
+            action="install",
+            command=None,
+            status_key="installed",
+        )
+    ]
+    auth = _UI_AUTH_STEP_BY_KEY.get(key)
+    if auth is not None:
+        steps.append(auth)
+    return steps
+
+
 def _all_harness_install() -> dict[str, HarnessInstallSpec]:
     from omnigent.harness_plugins import install_specs
 
@@ -408,52 +579,91 @@ def harness_install_command(key: str) -> list[str]:
     return ["npm", "install", "-g", package]
 
 
-def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI; return whether it landed on ``PATH``.
+class HarnessInstallResult(NamedTuple):
+    """Outcome of :func:`try_install_harness_cli`.
 
-    Shells out to :func:`harness_install_command` and re-checks
-    :func:`harness_cli_installed`. Surfaces the installer's own output (no
-    capture) so a failing install is visible. Harnesses without an npm package
-    or explicit installer command remain manual-only.
+    :param installed: Whether the CLI resolves after the attempt, via the same
+        :func:`resolve_cli_binary` ladder readiness uses (``PATH`` plus the
+        common global install dirs), not bare ``PATH`` alone.
+    :param reason: Human-readable failure reason when ``installed`` is False;
+        ``None`` on success.
+    """
+
+    installed: bool
+    reason: str | None
+
+
+def try_install_harness_cli(key: str) -> HarnessInstallResult:
+    """Install the harness CLI, returning whether it landed and why not.
+
+    Same behavior and side effects as :func:`install_harness_cli` (the
+    installer's output streams to this process, uncaptured, so failures stay
+    visible in the setup terminal / host log), but returns a human-readable
+    reason so a UI-driven install can surface "npm is not available on the
+    host" instead of a silent boolean failure.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH`` after the install attempt
-        (including the no-op case where npm reports success but the binary is
-        present), ``False`` if npm is missing or the install failed.
+    :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
+        resolves via :func:`resolve_cli_binary` (including the no-op where it
+        was already present), otherwise ``(False, reason)`` naming the failure
+        (manual-only spec, missing installer, timeout, OS error, non-zero exit,
+        or a post-install binary-not-found).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
     if spec is not None and spec.package is None and spec.install_command is None:
         # Manual-only CLI (e.g. cursor-agent): caller shows install_hint.
-        return False
+        return HarnessInstallResult(False, f"{spec.binary!r} is not installable automatically")
     cmd = harness_install_command(key)
     if shutil.which(cmd[0]) is None:
-        return False
+        return HarnessInstallResult(False, f"{cmd[0]!r} is not available on the host")
     try:
-        subprocess.run(cmd, check=False, timeout=300)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+        result = subprocess.run(cmd, check=False, timeout=300)
+    except subprocess.TimeoutExpired:
+        return HarnessInstallResult(False, "install timed out after 300s")
+    except OSError as exc:
+        return HarnessInstallResult(False, f"install command failed to run: {exc}")
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
-    # This is the setup flow's own process: check bare ``PATH`` (not the
-    # resolve_cli_binary ladder), because the point of the ~/.local/bin refresh
-    # below is to make the binary reachable via ``PATH`` for this process — the
-    # subsequent harness_login/harness_cli_logged_in shell out with the bare
-    # binary name and rely on the inherited ``PATH``.
-    if shutil.which(spec.binary) is not None:
-        return True
+    # Resolve the freshly-installed binary via the SAME ladder readiness uses
+    # (:func:`resolve_cli_binary` — ``PATH`` plus the nvm/npm-global/homebrew
+    # fallback dirs), so the install verdict and the readiness badge can never
+    # disagree. A bare ``shutil.which`` here would report "not found" for a
+    # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
+    # via the ladder — the spurious "failed" toast next to a green "ready" tick.
+    resolved = resolve_cli_binary(spec.binary)
+    if resolved is not None:
+        # Put the resolving dir on ``PATH`` for this process so the setup
+        # wizard's *later* steps — harness_login / harness_cli_logged_in /
+        # harness_logout — which shell out with the bare binary name and only
+        # bare ``shutil.which``, can find it too. Without this, an install that
+        # succeeded via a fallback dir (nvm/homebrew/…) would be followed by a
+        # login step that can't locate the very binary just installed.
+        resolved_dir = str(Path(resolved).resolve().parent)
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        if resolved_dir not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
+        return HarnessInstallResult(True, None)
+    if result.returncode != 0:
+        return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
+    return HarnessInstallResult(
+        False, f"installer completed but {spec.binary!r} could not be found"
+    )
 
-    # uv-based vendor installers commonly place entry points here and update
-    # shell startup files, which cannot change this already-running process.
-    user_bin = Path.home() / ".local" / "bin"
-    candidate = user_bin / spec.binary
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        current_path = os.environ.get("PATH", "")
-        path_entries = current_path.split(os.pathsep) if current_path else []
-        if str(user_bin) not in path_entries:
-            os.environ["PATH"] = os.pathsep.join([str(user_bin), *path_entries])
-    return shutil.which(spec.binary) is not None
+
+def install_harness_cli(key: str) -> bool:
+    """Install the harness CLI; return whether it landed on ``PATH``.
+
+    Thin wrapper over :func:`try_install_harness_cli` that discards the failure
+    reason, preserving the boolean contract the setup wizard relies on.
+
+    :param key: A harness family or :data:`PI_KEY`.
+    :returns: ``True`` when the CLI is on ``PATH`` after the install attempt,
+        ``False`` if the installer is missing or the install failed.
+    :raises KeyError: If *key* has no install spec.
+    """
+    return try_install_harness_cli(key).installed
 
 
 def harness_cli_logged_in(key: str) -> bool:

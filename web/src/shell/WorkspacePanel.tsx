@@ -1,7 +1,16 @@
-import { BotIcon, FileIcon, GlobeIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
-import { useCallback, useEffect, useRef } from "react";
+import {
+  BotIcon,
+  FileIcon,
+  FilePenLineIcon,
+  GlobeIcon,
+  ListTodoIcon,
+  SquareTerminalIcon,
+  XIcon,
+} from "lucide-react";
+import { type ReactElement, useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
@@ -10,6 +19,17 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+
+function WorkspaceTabTooltip({ label, children }: { label: string; children: ReactElement }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex shrink-0">{children}</span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // FileTabsStrip — open file tabs rendered in the top rail tab strip, as peers
@@ -265,19 +285,13 @@ export function WorkspacePanel({
     <aside
       aria-label="Workspace"
       inert={inert}
-      // Floating card on desktop: detached from the chat + window edges by
-      // margins (no left margin — the left edge hosts the resize handle and
-      // butts against main), rounded, bordered, and lifted off the
-      // bg-sidebar canvas with a shadow — matching the sidebar's card
-      // treatment. ``mt-14`` clears the fixed 56px chat header (the header
-      // is an absolute overlay); it's tunable alongside the chat's
-      // ``pt-20`` clearance. ``z-40`` lifts the card above the header
-      // (``z-30``) — the card starts below the button row, so sitting
-      // above the header never covers a control.
+      // Floating desktop surface: 8px from every edge. AppShell reserves the
+      // panel width from ChatHeader, so the pane can extend to the top without
+      // sitting underneath the existing session action cluster.
       // ``@container/rail`` makes the rail a named container-query context so
       // the tab strip can switch scroll behavior on the rail's own width
       // (see the strip below) without a JS width listener.
-      className="@container/rail relative z-40 hidden md:flex md:shrink-0 md:flex-col md:overflow-hidden md:mt-14 md:mr-2 md:mb-2 md:rounded-xl md:border md:border-border md:bg-card md:shadow-lg md:min-h-0"
+      className="@container/rail relative z-40 hidden md:m-2 md:flex md:min-h-0 md:shrink-0 md:flex-col md:overflow-hidden md:rounded-lg md:border md:border-border md:bg-card md:shadow-lg"
       style={{ width }}
     >
       {/* Left-edge horizontal resize handle. */}
@@ -302,7 +316,7 @@ export function WorkspacePanel({
             overflow-x-auto) and the file region just overflows into it.
           overflow-y stays hidden so overflow-x:auto can't spawn a vertical
           scrollbar that eats horizontal space. */}
-      <div className="shrink-0 flex items-center overflow-x-auto overflow-y-hidden border-b border-border px-2 py-1.5 [scrollbar-width:thin] @min-[500px]/rail:overflow-x-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+      <div className="shrink-0 flex items-center overflow-x-auto overflow-y-hidden border-b border-border px-2 py-2 [scrollbar-width:thin] @min-[500px]/rail:overflow-x-hidden [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
         <Tabs
           // Static group — never compresses (shrink-0) so it stays anchored on
           // the left in the ≥500px case and contributes its full width to the
@@ -314,75 +328,84 @@ export function WorkspacePanel({
           value={selectedFilePath !== null ? "__file__" : rightRailTab}
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
-          <TabsList variant="pill">
+          <TabsList variant="pill" className="gap-1">
             {showFilesPanel && (
-              <TabsTrigger
-                value="files"
-                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
-              >
-                <FileIcon className="size-4" />
-                Files
-                {changedCount > 0 && (
-                  <span className={cn(TAB_BADGE_BASE, "ml-0.5 bg-muted text-muted-foreground")}>
-                    {changedCount}
-                  </span>
-                )}
-              </TabsTrigger>
+              <WorkspaceTabTooltip label="Files">
+                <TabsTrigger
+                  value="files"
+                  aria-label={changedCount > 0 ? `Files ${changedCount} changed` : "Files"}
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <FilePenLineIcon className="size-4" />
+                  <span className="sr-only">Files</span>
+                  {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
             )}
-            <TabsTrigger
-              value="subagents"
-              className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
-            >
-              <BotIcon className="size-4" />
-              Agents
-              <span
-                className={cn(
-                  TAB_BADGE_BASE,
-                  "ml-0.5",
+            <WorkspaceTabTooltip label="Agents">
+              <TabsTrigger
+                value="subagents"
+                aria-label={
                   subagentsWorking > 0
-                    ? "bg-success/15 text-success"
-                    : "bg-muted text-muted-foreground",
-                )}
+                    ? `Agents ${subagentsWorking}/${agentCount}`
+                    : `Agents ${agentCount}`
+                }
+                className="size-8 shrink-0 rounded-md p-0"
               >
-                {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
-              </span>
-            </TabsTrigger>
-            {showShellsTab && (
-              <TabsTrigger
-                value="terminals"
-                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
-              >
-                <TerminalIcon className="size-4" />
-                Shells
-                {/* No badge before the first shell — a "0" next to a
-                    default-visible tab reads as an error state. */}
-                {terminalsLength > 0 && (
-                  <span className={cn(TAB_BADGE_BASE, "ml-0.5 bg-muted text-muted-foreground")}>
-                    {terminalsLength}
-                  </span>
-                )}
-              </TabsTrigger>
-            )}
-            {todosSupported && todosTotal > 0 && (
-              <TabsTrigger
-                value="todos"
-                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
-              >
-                <ListTodoIcon className="size-4" />
-                Tasks
-                <span className={cn(TAB_BADGE_BASE, "ml-0.5 bg-muted text-muted-foreground")}>
-                  {todosCompleted}/{todosTotal}
+                <BotIcon className="size-4" />
+                <span className="sr-only">Agents</span>
+                <span
+                  className={cn(
+                    TAB_BADGE_BASE,
+                    "sr-only",
+                    subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
+                  )}
+                >
+                  {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
                 </span>
               </TabsTrigger>
+            </WorkspaceTabTooltip>
+            {showShellsTab && (
+              <WorkspaceTabTooltip label="Shells">
+                <TabsTrigger
+                  value="terminals"
+                  aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <SquareTerminalIcon className="size-4" />
+                  <span className="sr-only">Shells</span>
+                  {terminalsLength > 0 && (
+                    <span className="sr-only text-muted-foreground">{terminalsLength}</span>
+                  )}
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {todosSupported && todosTotal > 0 && (
+              <WorkspaceTabTooltip label="Tasks">
+                <TabsTrigger
+                  value="todos"
+                  aria-label={`Tasks ${todosCompleted} of ${todosTotal} completed`}
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <ListTodoIcon className="size-4" />
+                  <span className="sr-only">Tasks</span>
+                  <span className="sr-only">
+                    {todosCompleted}/{todosTotal}
+                  </span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
             )}
             {showBrowserTab && (
-              <TabsTrigger
-                value="browser"
-                className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
-              >
-                <GlobeIcon className="size-4" />
-                Browser
-              </TabsTrigger>
+              <WorkspaceTabTooltip label="Browser">
+                <TabsTrigger
+                  value="browser"
+                  aria-label="Browser"
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <GlobeIcon className="size-4" />
+                  <span className="sr-only">Browser</span>
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
             )}
           </TabsList>
         </Tabs>

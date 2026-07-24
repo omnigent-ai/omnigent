@@ -19,10 +19,10 @@ import uuid
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from omnigent.entities import ScheduledTask
+from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
@@ -33,6 +33,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
 )
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -110,6 +111,24 @@ def _to_response(task: ScheduledTask) -> dict[str, Any]:
         "last_run_at": task.last_run_at,
         "last_run_conversation_id": task.last_run_conversation_id,
         "updated_at": task.updated_at,
+    }
+
+
+def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
+    """Serialize a :class:`ScheduledTaskRun` to a JSON-safe dict.
+
+    Excludes the free-text ``error`` blob (never SQL-queried, potentially
+    large); ``error_code`` carries the queryable failure classification.
+    """
+    return {
+        "id": run.id,
+        "scheduled_task_id": run.scheduled_task_id,
+        "status": run.status,
+        "scheduled_at": run.scheduled_at,
+        "conversation_id": run.conversation_id,
+        "fired_at": run.fired_at,
+        "finished_at": run.finished_at,
+        "error_code": run.error_code,
     }
 
 
@@ -284,10 +303,22 @@ def create_scheduled_tasks_router(
 
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:
-        """List the caller's scheduled tasks."""
+        """List the caller's scheduled tasks.
+
+        Lazy-on-read stale backstop: before returning, force-fail any of this
+        owner's runs still ``running`` past the 6h max age (``incomplete``), so
+        a future Tasks-list "last-run status" badge never shows a stale orphan
+        as ``running``. Pure age check — one indexed, owner-scoped query for the
+        owner's running runs, then a conditional ``update_run``; NO per-run
+        conversation I/O. Young in-flight runs are untouched, and completion of
+        a normal run is handled event-driven (the ``_publish_status`` hook), not
+        here.
+        """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list() if t.user_id == owner_id]
+        tasks = store.list(owner_user_id=owner_id)
+        running = store.list_running_runs_for_tasks([t.id for t in tasks])
+        force_fail_stale_runs(store, running)
         return {"scheduled_tasks": [_to_response(t) for t in tasks]}
 
     @router.get("/scheduled-tasks/{scheduled_task_id}")
@@ -300,6 +331,44 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
         return _to_response(task)
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}/runs")
+    async def list_scheduled_task_runs(
+        request: Request,
+        scheduled_task_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """List the run history for one of the caller's scheduled tasks.
+
+        Owner-scoped: a task owned by someone else (or absent) 404s via
+        ``_require_owned``, so runs aren't enumerable across users. Runs come
+        back most-recent-first (``scheduled_at DESC``); an empty history is an
+        empty list.
+
+        Cursor-paginated so history is never silently truncated: pass ``limit``
+        (1-1000, default 100) and ``after`` (a prior page's ``next_cursor``).
+        The response is ``{"runs": [...], "next_cursor": <id or null>}``; a
+        ``null`` cursor marks the last page.
+
+        Lazy-on-read backstop: before listing, force-fail any of this task's
+        runs still ``running`` past the 6h max age (``incomplete``). Completion
+        itself is event-driven (the ``_publish_status`` hook); this only
+        catches a genuine orphan — a run whose terminal event never fired (host
+        died mid-turn) — so the "every run eventually terminal" invariant holds
+        without a background poll or startup sweep. Pure age check (no
+        conversation I/O); a young in-flight run is untouched, and the
+        conditional ``update_run`` never clobbers an already-terminal row.
+        """
+        owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
+        _require_owned(scheduled_task_id, owner_id)
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        runs = force_fail_stale_runs(store, runs)
+        return {
+            "runs": [_run_to_response(r) for r in runs],
+            "next_cursor": next_cursor,
+        }
 
     @router.patch("/scheduled-tasks/{scheduled_task_id}")
     async def update_scheduled_task(

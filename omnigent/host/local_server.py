@@ -28,6 +28,7 @@ from pathlib import Path
 import click
 import psutil
 
+from omnigent.config import global_config_path
 from omnigent.inner import _proc
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
@@ -80,7 +81,7 @@ _LOCAL_SERVER_PID_PATH = _local_data_dir() / "local_server.pid"
 _LOCAL_SERVER_SIG_PATH = _local_data_dir() / "local_server.sig"
 
 # Sidecar carrying the absolute path of the background server's captured
-# stdout/stderr log file (one line). Lets `server start` / `server status`
+# stdout/stderr log file (one line). Lets `server --background` / `server status`
 # point at the exact ``logs/server/server-*.log`` even when reusing a
 # server this invocation didn't spawn. Absent for a foreground
 # ``omnigent server`` (its logs stream to the terminal, not a file).
@@ -427,7 +428,7 @@ class LocalServerStartup:
         started independently.
     :param log_path: Absolute path of the background server's captured log
         file, e.g. ``Path("/Users/alice/.omnigent/logs/server/server-ab12cd.log")``
-        — surfaced so callers (``server start``) can point the user at the
+        — surfaced so callers (``server --background``) can point the user at the
         exact log. For a spawned server this is the freshly created log; for
         a reused one it is read back from the log-path sidecar, and may be
         ``None`` when the running server is a foreground ``omnigent server``
@@ -661,6 +662,7 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
                     db_uri,
                     "--artifact-location",
                     str(artifact_path),
+                    *(["--config", str(p)] if (p := global_config_path()).exists() else []),
                 ],
                 env=child_env,
                 stdout=log_fh,

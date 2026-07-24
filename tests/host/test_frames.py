@@ -16,6 +16,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -23,6 +25,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -35,6 +39,43 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+
+
+def test_model_options_frames_round_trip() -> None:
+    """Pre-launch model catalogs survive both directions of the host tunnel."""
+    request = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsFrame(request_id="req_models", harness="claude-native"),
+        )
+    )
+    assert request == HostModelOptionsFrame(
+        request_id="req_models",
+        harness="claude-native",
+    )
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsResultFrame(
+                request_id="req_models",
+                status="ok",
+                models=[
+                    {
+                        "id": "sonnet",
+                        "model": "system.ai.claude-sonnet-4-6[1m]",
+                        "displayName": "Sonnet 4.6",
+                    }
+                ],
+            )
+        )
+    )
+    assert isinstance(result, HostModelOptionsResultFrame)
+    assert result.models == [
+        {
+            "id": "sonnet",
+            "model": "system.ai.claude-sonnet-4-6[1m]",
+            "displayName": "Sonnet 4.6",
+        }
+    ]
 
 
 def test_encode_injects_traceparent_under_active_span() -> None:
@@ -1081,6 +1122,70 @@ def test_create_dir_result_error_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.path is None
     assert decoded.error == "directory already exists"
+
+
+def test_install_harness_frame_round_trip() -> None:
+    """
+    Verify HostInstallHarnessFrame survives encode → decode.
+
+    The host maps ``harness`` to an install-spec key; a garbled value
+    would install (or reject) the wrong harness.
+    """
+    original = HostInstallHarnessFrame(
+        request_id="req_install_1",
+        harness="claude",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessFrame)
+    assert decoded.request_id == "req_install_1"
+    assert decoded.harness == "claude"
+
+
+def test_install_harness_result_success_round_trip() -> None:
+    """
+    Verify a successful install result round-trips with the refreshed
+    readiness map intact.
+
+    The server flips the UI badge off this map, so a dropped or garbled
+    ``configured_harnesses`` would leave a stale "binary missing" badge
+    after a successful install. The map mixes bool and string values
+    (``"needs-auth"`` for an installed-but-unauthed harness), so both
+    must survive the wire.
+    """
+    original = HostInstallHarnessResultFrame(
+        request_id="req_install_2",
+        status="ok",
+        configured_harnesses={"claude-native": True, "codex-native": "needs-auth"},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessResultFrame)
+    assert decoded.status == "ok"
+    assert decoded.configured_harnesses == {
+        "claude-native": True,
+        "codex-native": "needs-auth",
+    }
+    assert decoded.error is None
+
+
+def test_install_harness_result_failure_round_trip() -> None:
+    """
+    Verify a failed install round-trips the reason and leaves the
+    readiness map ``None``.
+
+    The dialog surfaces ``error`` inline so the user sees why the
+    install failed; when the installer never ran there is no fresh
+    readiness to report, so the server keeps its prior view.
+    """
+    original = HostInstallHarnessResultFrame(
+        request_id="req_install_3",
+        status="failed",
+        error="npm not found",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostInstallHarnessResultFrame)
+    assert decoded.status == "failed"
+    assert decoded.configured_harnesses is None
+    assert decoded.error == "npm not found"
 
 
 def test_fs_request_round_trip() -> None:

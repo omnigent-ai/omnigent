@@ -3174,7 +3174,6 @@ dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
     { name = "pydantic-settings" },
-    { name = "python-dotenv" },
     { name = "slack-bolt" },
     { name = "slack-sdk" },
 ]
@@ -3186,7 +3185,6 @@ requires-dist = [
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "pydantic-settings", specifier = ">=2.10.0" },
-    { name = "python-dotenv", specifier = ">=1.1.0" },
     { name = "slack-bolt", specifier = ">=1.29.0" },
     { name = "slack-sdk", specifier = ">=3.43.0" },
 ]

@@ -73,7 +73,11 @@ def subprocess_bridge_root() -> Iterator[Path]:
         ``python -m omnigent.claude_native_bridge`` accepts bridge
         writes without inheriting pytest monkeypatches.
     """
-    production_root = Path("/tmp") / f"omnigent-{os.getuid()}" / "claude-native"
+    production_root = (
+        Path(tempfile.gettempdir())
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+    )
     production_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(production_root.parent, 0o700)
     os.chmod(production_root, 0o700)
@@ -334,6 +338,21 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     # Confirm the bearer token did NOT land in the attacker-controlled
     # directory — the refusal happened before any file write.
     assert not (attacker_dir / "bridge.json").exists()
+
+
+def test_ensure_secure_dir_succeeds_without_getuid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows lacks ``os.getuid()``; bridge dir creation must still work."""
+    monkeypatch.delattr(os, "getuid", raising=False)
+
+    bridge_dir = tmp_path / "bridge-without-getuid"
+
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+
+    assert bridge_dir.is_dir()
 
 
 def test_trusted_parent_accepts_qwen_native_bridge_dir(
@@ -600,6 +619,124 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
         "content": [{"type": "output_text", "text": "Done."}],
     }
     assert current_response_id == tool_call.response_id
+
+
+def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
+    """
+    Reading an image file must not replay its base64 data as prompt text.
+
+    Claude's ``Read`` tool returns image files as a list of
+    ``{"type": "image", "source": {"type": "base64", ...}}`` blocks.
+    Serialized verbatim, a single image costs hundreds of thousands of
+    tokens and overflows the context window on resume. The stored
+    ``function_call_output`` must drop the base64 payload.
+    """
+    huge_b64 = "iVBORw0KGgo" + "A" * 100_000
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-tool-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_read_img",
+                                    "name": "Read",
+                                    "input": {"file_path": "chart.png"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "tool-result-1",
+                        "parentUuid": "assistant-tool-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_read_img",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/png",
+                                                "data": huge_b64,
+                                            },
+                                        }
+                                    ],
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    outputs = [item for item in items if item.item_type == "function_call_output"]
+    assert len(outputs) == 1
+    output = outputs[0].data["output"]
+    assert huge_b64 not in output, "base64 image data must not be replayed as text"
+    # The placeholder names the media type and tells the agent how to
+    # recover the image (re-run the tool call), so it is not silently lost.
+    assert "image/png image omitted from history" in output
+    assert "re-run the tool call" in output
+    assert len(output) < 300
+
+
+def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Path) -> None:
+    task_notification = (
+        "<task-notification>\n"
+        "<task-id>b1mhekpmy</task-id>\n"
+        '<summary>Monitor event: "PR 2086 E2E UI + npm test CI results"</summary>\n'
+        "<event>E2E UI Tests (shard 2/3)\tfail\t1m50s\thttps://example.test</event>\n"
+        "</task-notification>"
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "task-notification-1",
+                "message": {"role": "user", "content": task_notification},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert current_response_id is None
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": task_notification}],
+    }
 
 
 @pytest.mark.parametrize(
@@ -2088,18 +2225,18 @@ def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
 ) -> None:
     """Claude native appends framework instructions supplied by its launcher."""
-    from omnigent.tools.builtins.session_rename import SESSION_RENAME_INSTRUCTION
+    framework_instruction = "Keep framework metadata separate."
 
     args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt=SESSION_RENAME_INSTRUCTION,
+        append_system_prompt=framework_instruction,
     )
 
     assert args.count("--append-system-prompt") == 1
     index = args.index("--append-system-prompt")
-    assert args[index + 1] == SESSION_RENAME_INSTRUCTION
+    assert args[index + 1] == framework_instruction
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -2354,7 +2491,10 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
     Code would refuse to start with that capability advertised under
     org policy, breaking the native wrapper.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -3280,7 +3420,10 @@ async def test_channel_server_relays_active_omnigent_tools(
     This fails if Claude Code can receive web-channel inputs but cannot
     call the Omnigent tools made available to the server-side agent.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_tools", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -3487,7 +3630,10 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     ``-32000: Connection closed``). Without the guard, the decode error kills
     ``_serve_mcp`` and the ``tools/list`` read below times out.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_crash", workspace=tmp_path)
 

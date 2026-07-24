@@ -35,6 +35,12 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { stopSession } from "@/lib/sessionsApi";
+import {
+  createProject as apiCreateProject,
+  deleteProject as apiDeleteProject,
+  listProjects as apiListProjects,
+  renameProject as apiRenameProject,
+} from "@/lib/projectsApi";
 import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
@@ -160,6 +166,13 @@ export interface Conversation {
    * invalidate the parent's child-sessions cache when the child changes.
    */
   parent_session_id?: string | null;
+  /**
+   * First-class project this session is filed under (`projects.id`), or
+   * `null`/absent when unfiled. Distinct from the legacy `omni_project`
+   * label in `labels`; the sidebar groups a folder's members by EITHER this
+   * id OR the label during the dual-read transition.
+   */
+  project_id?: string | null;
 }
 
 export interface ConversationsPage {
@@ -350,59 +363,135 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
 /**
  * Rename a conversation via `PATCH /v1/sessions/{id}`.
  *
- * Patches the new title into every cached list/snapshot query in
- * place instead of invalidating. `GET /v1/sessions` may serve titles
- * from a search index that catches up to the rename asynchronously
- * (the Databricks deployment lists via search-midtier over WHS), so
- * an immediate refetch races the reindex and loses — the sidebar
- * would keep the old name until the next reconciliation. The PATCH
- * response is server-confirmed truth; overlaying it is always safe.
- * List membership and ordering converge later via the
+ * Optimistic: the new title is overlaid into every cached list/snapshot
+ * query in `onMutate`, so the sidebar row repaints on the next frame
+ * rather than after the PATCH round-trips (which showed the old name
+ * for the request's duration). `onSuccess` re-overlays the
+ * server-confirmed row to pick up the authoritative `updated_at`;
+ * `onError` restores the pre-rename title.
+ *
+ * Overlaying in place instead of invalidating is deliberate:
+ * `GET /v1/sessions` may serve titles from a search index that catches
+ * up to the rename asynchronously (the Databricks deployment lists via
+ * search-midtier over WHS), so an immediate refetch races the reindex
+ * and loses — the sidebar would keep the old name until the next
+ * reconciliation. List membership and ordering converge later via the
  * `WS /v1/sessions/updates` stream and the low-rate reconciliation
  * polls. Callers (the sidebar row) trigger this on blur / Enter in
  * the inline-edit input.
  */
+// Project folders (["project-sessions", name]) are non-archived, unsearched
+// lists — the same filters the push-delta merge uses to overlay them.
+const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+
 export function useRenameConversation() {
   const queryClient = useQueryClient();
+
+  // Overlay a title into every cache that holds a row for this session.
+  // Only the fields the rename changes are written — the full PATCH
+  // snapshot carries nulls for absent fields that would clobber
+  // list-shaped rows (see `nullsToUndefined` in sessionListCache).
+  const overlayTitle = (id: string, title: string | null, updatedAt?: number) => {
+    const wire: SessionListWireItem = {
+      id,
+      title,
+      ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+    };
+    const itemsById = new Map([[id, wire]]);
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["conversations"],
+    })) {
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        itemsById,
+        filtersFromConversationQueryKey(key),
+        // activeId only gates `needsRefetch`, which is unused here —
+        // we deliberately skip the refetch (see hook docstring).
+        undefined,
+      );
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+    // A filed session renders from its own ["project-sessions", name] list,
+    // not the flat ["conversations"] cache, so patch those (non-archived,
+    // unsearched — PROJECT_FOLDER_FILTERS) too or the folder row stays stale.
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["project-sessions"],
+    })) {
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        itemsById,
+        PROJECT_FOLDER_FILTERS,
+        undefined,
+      );
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+    // The pinned-row backfill cache (staleTime 60s) and the per-session
+    // snapshot (staleTime Infinity) are not covered by the list patch and
+    // would serve the old title long after.
+    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+      old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
+    );
+    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
+  };
+
   return useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => renameConversation(id, title),
+    // Paint the new name immediately; snapshot the current title so a
+    // failed PATCH can roll back to whatever the caches held before. The
+    // sidebar reads from the ["conversations"] lists, so prefer that row's
+    // title and fall back to the snapshot / backfill caches.
+    onMutate: async ({ id, title }) => {
+      // Cancel any in-flight list refetch (the reconcile poll or a WS-triggered
+      // fetch) so it can't resolve after this overlay and clobber the new title
+      // with the stale search-indexed name.
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["conversations"] }),
+        queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+      ]);
+      // Find the row's current title in whichever list cache holds it — the
+      // flat sidebar list or a project folder — so a failed PATCH can revert.
+      let listTitle: string | null | undefined;
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const row = data?.pages.flatMap((page) => page.data).find((conv) => conv.id === id);
+          if (row) {
+            listTitle = row.title;
+            break;
+          }
+        }
+        if (listTitle !== undefined) break;
+      }
+      const previous = {
+        list: listTitle,
+        session: queryClient.getQueryData<Session>(["session", id])?.title,
+        backfill: queryClient.getQueryData<Conversation | null>(["conversation-backfill", id])
+          ?.title,
+      };
+      overlayTitle(id, title);
+      return previous;
+    },
+    onError: (_err, { id }, previous) => {
+      // Restore the first title we managed to snapshot. A snapshotted null
+      // (previously-untitled row) is a real value to restore; only skip
+      // when we never captured a title at all (all sources undefined).
+      const restored =
+        previous?.list !== undefined
+          ? previous.list
+          : previous?.session !== undefined
+            ? previous.session
+            : previous?.backfill;
+      if (restored !== undefined) overlayTitle(id, restored);
+    },
     onSuccess: (updated) => {
       // The PATCH bumps server `updated_at`, which the unseen tracker
       // would otherwise read as new messages even though the user
       // initiated this themselves. Anchor the seen-baseline to the
       // server's new updated_at so the next refetch reports not unseen.
       markConversationSeen(updated.id, updated.updated_at);
-      // Overlay only the fields the rename changes — the full PATCH
-      // snapshot carries nulls for absent fields that would clobber
-      // list-shaped rows (see `nullsToUndefined` in sessionListCache).
-      const wire: SessionListWireItem = {
-        id: updated.id,
-        title: updated.title,
-        updated_at: updated.updated_at,
-      };
-      const itemsById = new Map([[updated.id, wire]]);
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["conversations"],
-      })) {
-        const { data: next } = mergeItemsIntoPages(
-          data,
-          itemsById,
-          filtersFromConversationQueryKey(key),
-          // activeId only gates `needsRefetch`, which is unused here —
-          // we deliberately skip the refetch (see hook docstring).
-          undefined,
-        );
-        if (next !== data) queryClient.setQueryData(key, next);
-      }
-      // The pinned-row backfill cache (staleTime 60s) and the
-      // per-session snapshot (staleTime Infinity) are not covered by
-      // the list patch and would serve the old title long after.
-      queryClient.setQueryData<Conversation | null>(["conversation-backfill", updated.id], (old) =>
-        old ? { ...old, title: updated.title, updated_at: updated.updated_at } : old,
-      );
-      queryClient.setQueryData<Session>(["session", updated.id], (old) =>
-        old ? { ...old, title: updated.title } : old,
-      );
+      // Reconcile with the server-confirmed title + authoritative updated_at.
+      overlayTitle(updated.id, updated.title, updated.updated_at);
     },
   });
 }
@@ -731,14 +820,31 @@ export function usePinnedConversationBackfill(
 // without a value import cycle; re-exported here for the existing consumers.
 export { PROJECT_LABEL_KEY };
 
-/** Fetch all project names from `GET /v1/sessions/projects`. */
+/**
+ * A sidebar project folder. During the label→first-class transition a folder
+ * is keyed by `name` (the union key that merges a first-class project and a
+ * legacy label-project of the same name into one folder). `id` is the
+ * first-class project id when one exists, or `null` for a label-only project
+ * (which has no `projects` row yet). Operations that need an id
+ * (rename/delete/file) use it, promoting label-only projects on demand.
+ */
+export interface ProjectSummary {
+  id: string | null;
+  name: string;
+}
+
+/**
+ * Fetch the caller's projects from `GET /v1/sessions/projects`, which
+ * dual-reads first-class projects (with id, incl. empty ones) and legacy
+ * label-projects (id=null), unioned by name and sorted.
+ */
 export function useProjects() {
-  return useQuery<string[]>({
+  return useQuery<ProjectSummary[]>({
     queryKey: ["projects"],
     queryFn: async () => {
       const res = await authenticatedFetch("/v1/sessions/projects");
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as string[];
+      return (await res.json()) as ProjectSummary[];
     },
     staleTime: 30_000,
   });
@@ -808,12 +914,58 @@ export function useArchivedProjectNames() {
   });
 }
 
-async function moveConversationToProject(id: string, project: string): Promise<Conversation> {
+/**
+ * Resolve a project NAME to its first-class id, creating the `projects` row on
+ * demand when only a legacy label-project of that name exists (or nothing does).
+ * This is how filing/renaming a label-only folder promotes it to first-class.
+ *
+ * Create-on-demand races: two concurrent moves to the same new name can both
+ * see no existing project and both POST; the second gets a 409. Treat that as
+ * benign — re-list and return the id the winner created.
+ */
+async function resolveOrCreateProjectId(name: string): Promise<string> {
+  const projects = await apiListProjects();
+  const existing = projects.find((p) => p.name === name);
+  if (existing) return existing.id;
+  try {
+    return (await apiCreateProject(name)).id;
+  } catch (err) {
+    // The create may have lost a race (a concurrent move created the same
+    // name → 409) or genuinely failed (500 / network). Distinguish the two by
+    // re-listing: if the row now exists, a racer won — use it. Otherwise the
+    // create really failed, so rethrow the ORIGINAL error rather than a generic
+    // message, so the true cause (status, network) isn't masked.
+    const after = await apiListProjects();
+    const created = after.find((p) => p.name === name);
+    if (created) return created.id;
+    throw err;
+  }
+}
+
+/**
+ * File a session into a project (by name) or unfile it (`project === ""`), via
+ * the first-class `project_id` membership on `PATCH /v1/sessions/{id}`. A
+ * non-empty name is resolved to its project id (creating the row on demand for
+ * a label-only folder); `""` clears membership. Exported for the new-session
+ * flow, which files a freshly created session under the picked project name.
+ *
+ * The legacy `omni_project` label is cleared in the same PATCH: during the
+ * dual-read transition the sidebar groups a folder by `project_id` OR that
+ * label, so leaving a stale label would keep the session in its old
+ * label-folder (and make it match two folders at once). First-class
+ * `project_id` is the single source of truth after a move.
+ */
+export async function moveConversationToProject(
+  id: string,
+  project: string,
+): Promise<Conversation> {
+  const projectId = project === "" ? "" : await resolveOrCreateProjectId(project);
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    // Empty string signals "remove from project" (server deletes the label row).
-    body: JSON.stringify({ labels: { [PROJECT_LABEL_KEY]: project } }),
+    // "" clears membership (unfile); a non-empty id files into that project.
+    // Clear the legacy label either way so the two representations don't diverge.
+    body: JSON.stringify({ project_id: projectId, labels: { [PROJECT_LABEL_KEY]: "" } }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
@@ -956,21 +1108,36 @@ export function useNewestProjectSession(project: string | null) {
   });
 }
 
+/** Archive a session AND detach it from its project (clear project_id + the
+ * legacy omni_project label) in a single PATCH — used by "Delete project". */
+async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    // project_id="" clears first-class membership; the empty omni_project label
+    // value removes the legacy label row, so the session is fully detached.
+    body: JSON.stringify({ archived: true, project_id: "", labels: { [PROJECT_LABEL_KEY]: "" } }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
 /**
- * Delete a whole project by ARCHIVING every session filed under it. The
- * sessions keep their `omni_project` label (so unarchiving restores them to
- * this project) and their history; they only leave the active sidebar. The
- * project is implicit and the server's project list excludes all-archived
- * projects, so the folder disappears once its last member is archived. Throws
- * `{ failed, succeeded, total }` if any session failed (e.g. a shared session
- * the user can't modify), leaving those sessions in place.
+ * Delete a project: archive AND unfile every member session, then delete the
+ * first-class `projects` row (when the folder has one). Sessions are never
+ * deleted — they are detached (project_id + omni_project label cleared) and
+ * archived, so they leave the sidebar but keep their history. Accepts the
+ * folder's `{ id, name }`: `name` drives the member sweep (dual-read
+ * `?project=`), `id` deletes the container (skipped for a label-only folder,
+ * which has none). Throws `{ failed, succeeded, total }` if any member failed
+ * (e.g. a shared session the user can't modify), leaving those in place.
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (project: string) => {
-      const ids = await fetchAllProjectSessionIds(project);
-      const results = await Promise.allSettled(ids.map((id) => archiveConversation(id, true)));
+    mutationFn: async ({ id, name }: ProjectSummary) => {
+      const ids = await fetchAllProjectSessionIds(name);
+      const results = await Promise.allSettled(ids.map((sid) => archiveAndUnfileConversation(sid)));
       const succeeded: string[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
@@ -985,6 +1152,10 @@ export function useDeleteProject() {
         }
       }
       if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      // All members detached — remove the first-class container if present.
+      // (A label-only folder has no row; clearing the labels above already
+      // makes it vanish from the project list.)
+      if (id !== null) await apiDeleteProject(id);
       return { succeeded, failed };
     },
     onSettled: () => {
@@ -995,6 +1166,87 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       // Deleting a project archives its members, growing the archived set.
+      void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+    },
+  });
+}
+
+/**
+ * Create an empty first-class project (`POST /v1/projects`). This is the
+ * capability the label model can't express — a project with no members. The
+ * server rejects a duplicate name (409); the error message is surfaced to the
+ * caller for inline display.
+ */
+export function useCreateProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => apiCreateProject(name),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+}
+
+/**
+ * Rename a project. A first-class project renames its row via
+ * `PATCH /v1/projects/{id}`; a label-only folder (`id === null`) is promoted on
+ * demand — a row created under the new name.
+ *
+ * Either way, the folder's members are swept via the dual-read
+ * `?project=<oldName>` and re-filed onto the target `project_id` with their
+ * legacy `omni_project` label cleared. That keeps the rename coherent across
+ * both membership representations during the transition: a first-class row's
+ * members that were still matched by the legacy label don't get stranded in an
+ * `oldName` folder, and nothing ends up matching two folders at once.
+ */
+export function useRenameProject() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      oldName,
+      newName,
+    }: {
+      id: string | null;
+      oldName: string;
+      newName: string;
+    }) => {
+      // The target project id: rename the existing row (first-class), or
+      // create one on demand (label-only folder being promoted).
+      let projectId: string;
+      if (id !== null) {
+        await apiRenameProject(id, newName);
+        projectId = id;
+      } else {
+        projectId = (await apiCreateProject(newName)).id;
+      }
+      // Reconcile the folder's members either way. During the dual-read
+      // transition a member can still sit in the oldName folder via the legacy
+      // omni_project label; re-file each onto project_id and clear that label so
+      // the rename is coherent for both membership representations and nothing
+      // is left behind in an oldName folder.
+      const memberIds = await fetchAllProjectSessionIds(oldName);
+      await Promise.all(
+        memberIds.map(async (sid) => {
+          const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sid)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              project_id: projectId,
+              labels: { [PROJECT_LABEL_KEY]: "" },
+            }),
+          });
+          // Surface a failed re-file: a resolved-but-4xx/5xx response would
+          // otherwise report success while leaving members behind.
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+        }),
+      );
+    },
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
