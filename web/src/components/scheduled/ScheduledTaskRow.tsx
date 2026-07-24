@@ -64,14 +64,14 @@ export function ScheduledTaskRow({
         // Flat row — NO card chrome (no border/bg/shadow box) and no per-row
         // divider. `group relative` so the absolutely-positioned ⋯ trigger can
         // hover-reveal; vertical padding gives the flat-list spacing.
-        // `-mx-2 rounded-lg` + `hover:bg-muted/50` gives a subtle FULL-ROW hover
+        // `-mx-2 rounded-lg` + `hover:bg-muted/70` gives a subtle FULL-ROW hover
         // highlight (like the sidebar conversation rows) that extends past the
         // content while keeping the title aligned with the page. `pl-2` (left
         // content inset) is mirrored by the ⋯ button's `right-2` inset so the
         // two edges are symmetric within the highlight; `pr-10` keeps the text
         // clear of the inset button. Paused rows are NOT dimmed — the title must
         // stay legible (AA); the "Paused" pill is the sole signal.
-        "group relative -mx-2 flex items-center gap-3 rounded-lg py-[11px] pr-10 pl-2 transition-colors hover:bg-muted/50",
+        "group relative -mx-2 flex items-center gap-3 rounded-lg py-[11px] pr-10 pl-2 transition-colors hover:bg-muted/70",
       )}
     >
       <div className="flex min-w-0 flex-1 flex-col">
