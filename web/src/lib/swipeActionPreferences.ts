@@ -82,27 +82,38 @@ export function writeSwipeActions(value: SwipeActionPreferences): void {
   } catch {
     // localStorage quota or access errors shouldn't break the app.
   }
-  // Refresh same-tab subscribers (the `storage` event only fires in other tabs).
+  // Update the cached snapshot from what we just persisted, then refresh
+  // same-tab subscribers (the `storage` event only fires in other tabs).
+  refreshSnapshot();
   window.dispatchEvent(new Event(SWIPE_ACTIONS_EVENT));
 }
 
 // Cached snapshot so useSyncExternalStore's getSnapshot returns a stable
-// reference between changes — a fresh object every call would loop it. Kept
-// current by getSnapshot (re-reads and swaps only on a real change), so it's
-// never stale even after a write that had no active subscriber.
+// reference — a fresh object every call would loop it, and re-reading
+// localStorage on every call (getSnapshot runs each render of every subscribed
+// row) is needless parsing work. The cache is refreshed only on a real change:
+// same-tab writes (writeSwipeActions), cross-tab `storage` events, and on
+// subscribe (to catch a write that landed before this tab had a subscriber).
 let snapshot: SwipeActionPreferences = readSwipeActions();
 
-function getSnapshot(): SwipeActionPreferences {
+/** Re-read storage and swap the cache only when a direction actually changed. */
+function refreshSnapshot(): void {
   const next = readSwipeActions();
   if (next.left !== snapshot.left || next.right !== snapshot.right) snapshot = next;
+}
+
+function getSnapshot(): SwipeActionPreferences {
   return snapshot;
 }
 
 function subscribe(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => {};
+  // Catch up to any write that landed while this tab had no subscriber.
+  refreshSnapshot();
   const handler = (e: Event) => {
     // Ignore unrelated `storage` events; refresh on our key or the same-tab ping.
     if (e instanceof StorageEvent && e.key !== null && e.key !== STORAGE_KEY) return;
+    refreshSnapshot();
     onChange();
   };
   window.addEventListener("storage", handler);

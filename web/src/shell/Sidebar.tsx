@@ -217,17 +217,26 @@ export function useRowSwipe({
     decided: "swipe" | "other" | null;
     target: Element | null;
   } | null>(null);
+  // Set when a swipe commits so the click the browser synthesizes after
+  // pointer-up (the row is a <Link>) is swallowed instead of navigating into
+  // the session being archived/deleted. Cleared on the next tick.
+  const justCommittedRef = useRef(false);
 
-  const reset = useCallback(() => {
+  // Release pointer capture if we took it — guarded so it's safe when we never
+  // captured (vertical/none gestures) or the element is already gone.
+  const releaseCapture = useCallback(() => {
     const s = state.current;
-    // Release pointer capture if we took it — guarded so it's safe when we
-    // never captured (vertical/none gestures) or the element is already gone.
     if (s?.target && s.target.hasPointerCapture(s.pointerId)) {
       s.target.releasePointerCapture(s.pointerId);
+      s.target = null;
     }
+  }, []);
+
+  const reset = useCallback(() => {
+    releaseCapture();
     state.current = null;
     setDx(0);
-  }, []);
+  }, [releaseCapture]);
 
   const onPointerDown = useCallback(
     (e: ReactPointerEvent) => {
@@ -249,7 +258,10 @@ export function useRowSwipe({
       const s = state.current;
       if (!s || s.pointerId !== e.pointerId) return;
       // Once dnd-kit takes over (long-press drag), the swipe yields entirely.
+      // Release any capture we grabbed while locked so the drag's own pointer
+      // tracking isn't fighting a stale capture on this row.
       if (isDragging) {
+        releaseCapture();
         s.decided = "other";
         setDx(0);
         return;
@@ -278,7 +290,7 @@ export function useRowSwipe({
       const clamped = Math.max(-SWIPE_MAX_PX, Math.min(SWIPE_MAX_PX, deltaX));
       setDx(clamped);
     },
-    [actions.left, actions.right, isDragging],
+    [actions.left, actions.right, isDragging, releaseCapture],
   );
 
   const onPointerUp = useCallback(
@@ -288,12 +300,30 @@ export function useRowSwipe({
       const committed = s.decided === "swipe" && Math.abs(dx) >= SWIPE_COMMIT_PX;
       const action = dx < 0 ? actions.left : actions.right;
       reset();
-      if (committed && action !== "none") onAction(action);
+      if (committed && action !== "none") {
+        // Flag the commit so the trailing synthesized click is swallowed
+        // (see onClickCapture); clear on the next tick once that click passed.
+        justCommittedRef.current = true;
+        setTimeout(() => {
+          justCommittedRef.current = false;
+        }, 0);
+        onAction(action);
+      }
     },
     [actions.left, actions.right, dx, onAction, reset],
   );
 
-  return { dx, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: reset };
+  // Capture-phase click guard: after a committed swipe the row's <Link> would
+  // otherwise navigate on the click the browser synthesizes post-pointer-up.
+  // Swallow that one click before it reaches the link.
+  const onClickCapture = useCallback((e: MouseEvent) => {
+    if (!justCommittedRef.current) return;
+    justCommittedRef.current = false;
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  return { dx, onPointerDown, onPointerMove, onPointerUp, onPointerCancel: reset, onClickCapture };
 }
 
 // Highlight applied to a drop target while a draggable session hovers it: a
@@ -2841,17 +2871,20 @@ function ConversationRow({
   // runArchive; swipe→delete opens the same confirm dialog the kebab uses
   // (never an immediate delete).
   const swipeActions = useSwipeActions();
-  const onSwipeAction = useCallback(
-    (action: Exclude<SwipeAction, "none">) => {
-      if (action === "archive") runArchive();
-      else setDeleteOpen(true);
-    },
-    // runArchive is a stable hoisted declaration; setDeleteOpen is a stable setter.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
+  // Keep the live handler in a ref refreshed each render so the stable callback
+  // handed to useRowSwipe always runs the current runArchive (and thus the live
+  // isArchived) rather than a closure captured at mount.
+  const swipeActionHandlerRef = useRef<(action: Exclude<SwipeAction, "none">) => void>(() => {});
+  swipeActionHandlerRef.current = (action) => {
+    if (action === "archive") runArchive();
+    else setDeleteOpen(true);
+  };
+  const onSwipeAction = useCallback((action: Exclude<SwipeAction, "none">) => {
+    swipeActionHandlerRef.current(action);
+  }, []);
+  const swipeEnabled = isMobile && !selectionMode && isOwner && !isEditing;
   const swipe = useRowSwipe({
-    enabled: isMobile && !selectionMode && isOwner && !isEditing,
+    enabled: swipeEnabled,
     actions: swipeActions,
     isDragging,
     onAction: onSwipeAction,
@@ -3054,6 +3087,82 @@ function ConversationRow({
     swipe.dx < 0 ? swipeActions.left : swipe.dx > 0 ? swipeActions.right : "none";
   const swipeCommitted = Math.abs(swipe.dx) >= SWIPE_COMMIT_PX;
 
+  // The interactive row surface (link + its context/hover/tooltip wrappers).
+  // Right-click anywhere on the row opens the same actions as the kebab.
+  // Suppressed in selection mode (bulk-select owns the row), where the bare
+  // link is rendered instead. ContextMenuTrigger preventDefaults the native
+  // contextmenu event, so right-click never navigates; asChild merges its
+  // handler onto the Link, preserving left-click / double-click. Pinned,
+  // project-owned rows nest a HoverCardTrigger around the Link so hovering
+  // surfaces the project flyout — the trigger sits innermost so both the
+  // context menu and the hover card keep their handlers/refs on the Link.
+  const rowSurface = selectionMode ? (
+    projectFlyoutName ? (
+      <HoverCard openDelay={150} closeDelay={0}>
+        <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+        <PinnedProjectFlyoutContent
+          title={conversation.title ?? conversation.id}
+          projectName={projectFlyoutName}
+        />
+      </HoverCard>
+    ) : isMobile ? (
+      rowLink
+    ) : (
+      <Tooltip>
+        <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+        <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+      </Tooltip>
+    )
+  ) : projectFlyoutName ? (
+    <HoverCard openDelay={150} closeDelay={0}>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
+        </ContextMenuTrigger>
+        <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+          <ConversationMenuItems
+            components={contextBundle}
+            setMenuOpen={() => {}}
+            {...menuItemProps}
+          />
+        </ContextMenuContent>
+      </ContextMenu>
+      <PinnedProjectFlyoutContent
+        title={conversation.title ?? conversation.id}
+        projectName={projectFlyoutName}
+      />
+    </HoverCard>
+  ) : isMobile ? (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+      <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+        <ConversationMenuItems
+          components={contextBundle}
+          setMenuOpen={() => {}}
+          {...menuItemProps}
+        />
+      </ContextMenuContent>
+    </ContextMenu>
+  ) : (
+    <Tooltip>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <div className="w-full">
+            <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
+          <ConversationMenuItems
+            components={contextBundle}
+            setMenuOpen={() => {}}
+            {...menuItemProps}
+          />
+        </ContextMenuContent>
+      </ContextMenu>
+      <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
+    </Tooltip>
+  );
+
   return (
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
@@ -3066,115 +3175,62 @@ function ConversationRow({
       onPointerMove={swipe.onPointerMove}
       onPointerUp={swipe.onPointerUp}
       onPointerCancel={swipe.onPointerCancel}
-      className={cn("group relative", isDragging && "opacity-40")}
+      // `touch-pan-y` (only while the swipe is live) keeps vertical scroll
+      // native and reserves horizontal travel for the gesture, so the browser
+      // doesn't commit to a scroll and pointercancel the pre-activation window.
+      className={cn("group relative", isDragging && "opacity-40", swipeEnabled && "touch-pan-y")}
     >
-      {/* Swipe reveal hint: sits behind the moving surface, showing the
-          configured action's icon on the side being revealed. Inert (no
-          pointer events); only visible while the row is mid-swipe. */}
-      {swipingAction !== "none" && (
-        <div
-          aria-hidden
-          className={cn(
-            "pointer-events-none absolute inset-0 flex items-center rounded-md px-4",
-            swipe.dx > 0 ? "justify-start" : "justify-end",
-            swipingAction === "delete" ? "bg-destructive/15" : "bg-primary/15",
-            swipeCommitted
-              ? swipingAction === "delete"
-                ? "text-destructive"
-                : "text-primary"
-              : "text-muted-foreground",
+      {/* The moving surface only exists while the swipe gesture is live. When
+          it isn't (selection mode, desktop, non-owner), the row surface is
+          rendered directly under the <li> so the DOM stays `<li> > link` and
+          the sibling checkbox/state slots keep their expected structure. */}
+      {swipeEnabled ? (
+        <>
+          {/* Swipe reveal hint: sits behind the moving surface, showing the
+              configured action's icon on the side being revealed. Inert (no
+              pointer events); only visible while the row is mid-swipe. */}
+          {swipingAction !== "none" && (
+            <div
+              aria-hidden
+              className={cn(
+                "pointer-events-none absolute inset-0 flex items-center rounded-md px-4",
+                swipe.dx > 0 ? "justify-start" : "justify-end",
+                swipingAction === "delete" ? "bg-destructive/15" : "bg-primary/15",
+                swipeCommitted
+                  ? swipingAction === "delete"
+                    ? "text-destructive"
+                    : "text-primary"
+                  : "text-muted-foreground",
+              )}
+            >
+              {swipingAction === "delete" ? (
+                <Trash2Icon className="size-4" />
+              ) : (
+                <ArchiveIcon className="size-4" />
+              )}
+            </div>
           )}
-        >
-          {swipingAction === "delete" ? (
-            <Trash2Icon className="size-4" />
-          ) : (
-            <ArchiveIcon className="size-4" />
-          )}
-        </div>
+          {/* Moving surface: translates 1:1 with the swipe over the hint above.
+              `bg-sidebar` keeps it opaque so the hint only shows in the gap it
+              opens. Transitions back to rest when the gesture ends (dx → 0).
+              `onClickCapture` is scoped here (not the <li>) so it swallows only
+              the synthesized click on the row link after a committed swipe —
+              never a click in the delete-confirm dialog, which lives outside
+              this surface but portals through the row's React subtree. */}
+          <div
+            className={cn(
+              "relative bg-sidebar",
+              swipe.dx === 0 && "transition-transform duration-200",
+            )}
+            style={swipe.dx !== 0 ? { transform: `translateX(${swipe.dx}px)` } : undefined}
+            onClickCapture={swipe.onClickCapture}
+          >
+            {rowSurface}
+          </div>
+        </>
+      ) : (
+        rowSurface
       )}
-      {/* Moving surface: translates 1:1 with the swipe over the hint above.
-          `bg-sidebar` keeps it opaque so the hint only shows in the gap it
-          opens. Transitions back to rest when the gesture ends (dx → 0). */}
-      <div
-        className={cn("relative bg-sidebar", swipe.dx === 0 && "transition-transform duration-200")}
-        style={swipe.dx !== 0 ? { transform: `translateX(${swipe.dx}px)` } : undefined}
-      >
-        {/* Right-click anywhere on the row opens the same actions as the kebab.
-          Suppressed in selection mode (bulk-select owns the row), where the
-          bare link is rendered instead. ContextMenuTrigger preventDefaults the
-          native contextmenu event, so right-click never navigates; asChild
-          merges its handler onto the Link, preserving left-click / double-click.
-          Pinned, project-owned rows nest a HoverCardTrigger around the Link so
-          hovering surfaces the project flyout — the trigger sits innermost so
-          both the context menu and the hover card keep their handlers/refs on
-          the Link. */}
-        {selectionMode ? (
-          projectFlyoutName ? (
-            <HoverCard openDelay={150} closeDelay={0}>
-              <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-              <PinnedProjectFlyoutContent
-                title={conversation.title ?? conversation.id}
-                projectName={projectFlyoutName}
-              />
-            </HoverCard>
-          ) : isMobile ? (
-            rowLink
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-              <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
-            </Tooltip>
-          )
-        ) : projectFlyoutName ? (
-          <HoverCard openDelay={150} closeDelay={0}>
-            <ContextMenu>
-              <ContextMenuTrigger asChild>
-                <HoverCardTrigger asChild>{rowLink}</HoverCardTrigger>
-              </ContextMenuTrigger>
-              <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
-                <ConversationMenuItems
-                  components={contextBundle}
-                  setMenuOpen={() => {}}
-                  {...menuItemProps}
-                />
-              </ContextMenuContent>
-            </ContextMenu>
-            <PinnedProjectFlyoutContent
-              title={conversation.title ?? conversation.id}
-              projectName={projectFlyoutName}
-            />
-          </HoverCard>
-        ) : isMobile ? (
-          <ContextMenu>
-            <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
-            <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
-              <ConversationMenuItems
-                components={contextBundle}
-                setMenuOpen={() => {}}
-                {...menuItemProps}
-              />
-            </ContextMenuContent>
-          </ContextMenu>
-        ) : (
-          <Tooltip>
-            <ContextMenu>
-              <ContextMenuTrigger asChild>
-                <div className="w-full">
-                  <TooltipTrigger asChild>{rowLink}</TooltipTrigger>
-                </div>
-              </ContextMenuTrigger>
-              <ContextMenuContent className="min-w-44 [&_[role=menuitem]]:text-xs">
-                <ConversationMenuItems
-                  components={contextBundle}
-                  setMenuOpen={() => {}}
-                  {...menuItemProps}
-                />
-              </ContextMenuContent>
-            </ContextMenu>
-            <SessionTooltipContent conversation={conversation} hostsById={hostsById} />
-          </Tooltip>
-        )}
-      </div>
       {selectionMode ? (
         <span className="-translate-y-1/2 pointer-events-none absolute top-1/2 right-2.5 flex items-center">
           {isSelected ? (
