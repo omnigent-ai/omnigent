@@ -442,6 +442,17 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(hostTrigger).toHaveClass("w-full");
   });
 
+  it("keeps the footer visible by letting only the dialog body scroll", () => {
+    renderDialog();
+    expect(screen.getByTestId("create-scheduled-task-dialog")).toHaveClass("flex", "flex-col");
+    expect(screen.getByTestId("scheduled-task-dialog-body")).toHaveClass(
+      "min-h-0",
+      "flex-1",
+      "overflow-y-auto",
+    );
+    expect(document.querySelector('[data-slot="dialog-footer"]')).toHaveClass("shrink-0");
+  });
+
   it("chooses a non-quarter-hour time from the compact picker", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });

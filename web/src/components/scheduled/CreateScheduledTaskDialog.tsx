@@ -268,7 +268,7 @@ export function CreateScheduledTaskDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="max-h-[90vh] overflow-hidden p-0 sm:max-w-[560px]"
+        className="flex max-h-[90vh] flex-col overflow-hidden p-0 sm:max-w-[560px]"
         data-testid="create-scheduled-task-dialog"
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
         // body / trigger while it's open) from closing the whole Dialog. See
@@ -278,7 +278,7 @@ export function CreateScheduledTaskDialog({
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
       >
-        <DialogHeader className="px-6 pt-6 pb-0">
+        <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
           <DialogTitle>{isEdit ? "Edit scheduled task" : "New scheduled task"}</DialogTitle>
           <DialogDescription>
             {isEdit
@@ -287,7 +287,10 @@ export function CreateScheduledTaskDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex max-h-[calc(90vh-8.5rem)] flex-col gap-4 overflow-y-auto px-6 py-4">
+        <div
+          className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-6 py-4"
+          data-testid="scheduled-task-dialog-body"
+        >
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="task-name">Name</Label>
             <Input
@@ -469,7 +472,7 @@ export function CreateScheduledTaskDialog({
           )}
         </div>
 
-        <DialogFooter className="mx-0 mb-0 rounded-none border-t-0 bg-transparent px-6 py-4 sm:justify-end">
+        <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none border-t-0 bg-transparent px-6 py-4 sm:justify-end">
           <Button variant="outline" onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>
