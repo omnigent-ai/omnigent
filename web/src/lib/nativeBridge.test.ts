@@ -124,6 +124,7 @@ afterEach(() => {
   setElectron(false);
   setIOS(false);
   setAndroid(false);
+  vi.restoreAllMocks();
 });
 
 describe("isNativeShell / isElectronShell", () => {
@@ -207,6 +208,50 @@ describe("supportsBrowser", () => {
 });
 
 describe("artifact surface bridge", () => {
+  it("disables native artifact surfaces in macOS Electron", async () => {
+    const sync = vi.fn().mockResolvedValue(true);
+    const destroy = vi.fn().mockResolvedValue(undefined);
+    const inspect = vi.fn().mockResolvedValue(true);
+    const select = vi.fn().mockResolvedValue(null);
+    const reload = vi.fn().mockResolvedValue(true);
+    const review = vi.fn().mockResolvedValue(null);
+    vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue(
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    );
+    setElectron(true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentDesktop as object, {
+      syncArtifactSurface: sync,
+      destroyArtifactSurface: destroy,
+      inspectArtifactSurface: inspect,
+      selectArtifactElement: select,
+      reloadArtifactSurface: reload,
+      reviewArtifactSurface: review,
+    });
+
+    expect(hasNativeArtifactSurface()).toBe(false);
+    expect(hasNativeArtifactInspector()).toBe(false);
+    expect(hasNativeArtifactReview()).toBe(false);
+    await expect(
+      syncNativeArtifactSurface({
+        id: "surface",
+        url: "http://preview.localhost/p/grant/a",
+        visible: true,
+        bounds: { x: 1, y: 2, width: 3, height: 4 },
+      }),
+    ).resolves.toBe(false);
+    await destroyNativeArtifactSurface("surface");
+    await expect(inspectNativeArtifactSurface("surface")).resolves.toBe(false);
+    await expect(selectNativeArtifactElement("surface")).resolves.toBeNull();
+    await expect(reloadNativeArtifactSurface("surface")).resolves.toBe(false);
+    await expect(reviewNativeArtifactSurface("surface")).resolves.toBeNull();
+    expect(sync).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(inspect).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
+    expect(review).not.toHaveBeenCalled();
+  });
+
   it("feature-detects new Electron methods and safely delegates", async () => {
     const sync = vi.fn().mockResolvedValue(true);
     const destroy = vi.fn().mockResolvedValue(undefined);
