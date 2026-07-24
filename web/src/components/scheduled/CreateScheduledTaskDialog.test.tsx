@@ -433,11 +433,11 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveClass("w-full");
   });
 
-  it("keeps Host compact instead of stretching it full-width", () => {
+  it("lays out Host full-width like the other top-level fields", () => {
     renderDialog();
     const hostField = screen.getByTestId("task-host-field");
     const hostTrigger = screen.getByTestId("task-host-trigger");
-    expect(hostField).toHaveClass("sm:w-64");
+    expect(hostField).not.toHaveClass("sm:w-64");
     expect(hostField).toContainElement(hostTrigger);
     expect(hostTrigger).toHaveClass("w-full");
   });
