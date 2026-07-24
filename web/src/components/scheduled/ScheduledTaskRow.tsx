@@ -2,14 +2,15 @@
 // border/background/shadow box, no per-row divider). Layout: bold task title on
 // line 1 (+ a small "Paused" pill when paused), a single muted subline on line 2
 // with the human-readable schedule summary ("Weekdays at 8:00 AM") followed by
-// the SERVER's next-run time ("· Next: Tomorrow 9:00 AM") when armed.
+// the next-run delta ("· Next run in 15h") when armed.
 //
-// The next-run time is the scheduler's authoritative `nextRunAt` (an ISO string
-// the server computes) — we only FORMAT it, never recompute it on the client,
-// because a client-computed next-run can't match the server anchor for
-// INTERVAL>1 rules (the original reason a client countdown was removed). Paused
-// rows are NOT dimmed — the title stays fully legible and the pill is the sole
-// paused signal. A hover-revealed ellipsis (⋯) action menu (Run now / Pause /
+// The next-run delta is derived from the scheduler's authoritative `nextRunAt`
+// (an ISO string the server computes): we format only how far away it is
+// (nextRunAt − now), never recompute WHICH instant is next on the client — so
+// the old "no client countdown" rule (a client-recomputed instant can't match
+// the server anchor for INTERVAL>1 rules) is not violated. Paused rows are NOT
+// dimmed — the title stays fully legible and the pill is the sole paused
+// signal. A hover-revealed ellipsis (⋯) action menu (Run now / Pause /
 // Resume / Edit / Delete) sits on the right.
 
 import { useMemo, useState } from "react";
@@ -53,10 +54,7 @@ export function ScheduledTaskRow({
   // (active tasks only — a paused task has null nextRunAt). We only format the
   // server value; we never recompute next-run on the client.
   const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
-  const nextRun = useMemo(
-    () => formatNextRunAt(task.nextRunAt, task.timezone),
-    [task.nextRunAt, task.timezone],
-  );
+  const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt), [task.nextRunAt]);
 
   return (
     <div
@@ -96,7 +94,7 @@ export function ScheduledTaskRow({
           {nextRun && (
             <>
               {" · "}
-              <span data-testid="task-next-run">Next: {nextRun}</span>
+              <span data-testid="task-next-run">Next run {nextRun}</span>
             </>
           )}
         </span>

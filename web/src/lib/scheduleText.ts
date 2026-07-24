@@ -29,6 +29,11 @@ import { RRule, rrulestr } from "rrule";
 const OCCURRENCE_ANCHOR = new Date(Date.UTC(2000, 0, 1, 0, 0, 0));
 const FIXED_PERIOD_SAFETY_MARGIN = 2;
 
+// Millisecond units for the compact relative next-run delta (formatNextRunAt).
+const MIN_MS = 60_000;
+const HOUR_MS = 60 * MIN_MS;
+const DAY_MS = 24 * HOUR_MS;
+
 /** Days-of-week bit set helpers. RRule weekday order is MO..SU (0..6). */
 const WEEKDAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR].map((d) => d.weekday);
 const ALL_DAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR, RRule.SA, RRule.SU].map(
@@ -58,99 +63,39 @@ export function formatClockTime(hour: number, minute: number): string {
 }
 
 /**
- * Format the SERVER's authoritative next-run instant (an ISO-8601 string from
- * the live scheduler) as a short human label in the task's timezone, e.g.
- * `Today 9:00 AM`, `Tomorrow 8:30 AM`, `Mon 6:00 AM`, `Mar 3, 9:00 AM`.
+ * Format the time until the SERVER's authoritative next-run instant as a
+ * compact relative delta, e.g. `in 30m`, `in 15h`, `in 6d`, or `soon`.
  *
- * This formats a value the SERVER computed — it does NOT recompute next-run on
- * the client (which can't match the server anchor for INTERVAL>1 rules). Pass
- * the task's `nextRunAt` straight through. Returns `null` for a null/unparseable
- * input so the caller renders nothing.
+ * `iso` is the server's `next_run_at` (the live scheduler's authoritative next
+ * fire). We compute ONLY the delta (`nextRunAt − now`) and format how far away
+ * it is — the instant itself stays server-authoritative. This is NOT the old
+ * client-recomputed countdown that was removed: that one recomputed WHICH
+ * instant is next on the client (and couldn't match the server anchor for
+ * INTERVAL>1 rules); here the instant comes from the server and only the
+ * "how far away" is derived, so the removal rule is not violated.
  *
- * "Today" / "Tomorrow" are decided by calendar-day difference in `timezone`
- * (not a 24h delta), so an 11pm-now / 1am-tomorrow fire still reads "Tomorrow".
+ * Buckets (floor of the chosen unit — standard time-remaining convention):
+ *   < 60 min → `in Xm` (minimum `in 1m`), < 24 h → `in Xh`, else `in Xd`.
+ * A delta at or below ~0 (imminent / just passed due to clock skew) → `soon`.
+ * Returns `null` for a null / unparseable `iso` so the caller renders nothing.
  *
  * @param iso The server's `next_run_at` ISO string, or `null`.
- * @param timezone IANA timezone the label is rendered in (the task timezone).
  * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
  */
 export function formatNextRunAt(
   iso: string | null | undefined,
-  timezone: string,
   now: Date = new Date(),
 ): string | null {
   if (!iso) return null;
   const instant = new Date(iso);
   if (Number.isNaN(instant.getTime())) return null;
 
-  const dayDelta = calendarDayDeltaInTz(now, instant, timezone);
-  const time = formatInstantClock(instant, timezone);
-  if (dayDelta === 0) return `Today ${time}`;
-  if (dayDelta === 1) return `Tomorrow ${time}`;
-  // Within the coming week, name the weekday ("Mon"); otherwise a short date.
-  if (dayDelta > 1 && dayDelta < 7) {
-    return `${formatInstantPart(instant, timezone, { weekday: "short" })} ${time}`;
-  }
-  const date = formatInstantPart(instant, timezone, { month: "short", day: "numeric" });
-  return `${date}, ${time}`;
-}
-
-/** 12-hour clock (`9:00 AM`) for an absolute instant, rendered in `timezone`. */
-function formatInstantClock(instant: Date, timezone: string): string {
-  return formatInstantPart(instant, timezone, {
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  });
-}
-
-/** Render an absolute instant in `timezone` with the given Intl options. */
-function formatInstantPart(
-  instant: Date,
-  timezone: string,
-  options: Intl.DateTimeFormatOptions,
-): string {
-  try {
-    return new Intl.DateTimeFormat("en-US", { timeZone: timezone, ...options }).format(instant);
-  } catch {
-    // Unknown timezone → fall back to the viewer's local zone rather than throw.
-    return new Intl.DateTimeFormat("en-US", options).format(instant);
-  }
-}
-
-/**
- * Whole-calendar-day difference (`b` − `a`) as counted in `timezone`, so
- * "today"/"tomorrow" reflect the wall-clock date boundary rather than a 24h
- * span. Returns e.g. 0 (same day), 1 (next day), or a negative number for a
- * past instant.
- */
-function calendarDayDeltaInTz(a: Date, b: Date, timezone: string): number {
-  const dayA = civilDayNumber(a, timezone);
-  const dayB = civilDayNumber(b, timezone);
-  if (dayA == null || dayB == null) return Math.round((b.getTime() - a.getTime()) / 86_400_000);
-  return dayB - dayA;
-}
-
-/** The instant's civil date in `timezone` as a day count (days since epoch). */
-function civilDayNumber(instant: Date, timezone: string): number | null {
-  try {
-    const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: timezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).formatToParts(instant);
-    const map: Record<string, number> = {};
-    for (const p of parts) {
-      if (p.type !== "literal") map[p.type] = Number(p.value);
-    }
-    if (map.year == null || map.month == null || map.day == null) return null;
-    // Days since the Unix epoch for that civil date (UTC math on the tz-local
-    // Y/M/D — a pure day index, so DST never shifts the count).
-    return Math.floor(Date.UTC(map.year, map.month - 1, map.day) / 86_400_000);
-  } catch {
-    return null;
-  }
+  const deltaMs = instant.getTime() - now.getTime();
+  // Imminent or just-passed (timing skew): don't render a "0m" / negative delta.
+  if (deltaMs < MIN_MS) return "soon";
+  if (deltaMs < HOUR_MS) return `in ${Math.floor(deltaMs / MIN_MS)}m`;
+  if (deltaMs < DAY_MS) return `in ${Math.floor(deltaMs / HOUR_MS)}h`;
+  return `in ${Math.floor(deltaMs / DAY_MS)}d`;
 }
 
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */

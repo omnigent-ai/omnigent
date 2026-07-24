@@ -53,15 +53,14 @@ function renderRow(
 
 afterEach(cleanup);
 
-describe("next-run text (server-sourced)", () => {
-  it("renders the formatted next-run when nextRunAt is set", () => {
-    // A fixed future instant so the formatter produces stable text.
-    renderRow(task({ nextRunAt: "2999-01-02T09:00:00Z", timezone: "UTC" }));
+describe("next-run text (server-sourced, relative)", () => {
+  it("renders the relative next-run with a 'Next run' prefix when nextRunAt is set", () => {
+    // ~2h in the future → "in 2h". Delta formatting is covered in
+    // scheduleText.test.ts; here we assert the row surfaces it with the prefix.
+    const future = new Date(Date.now() + 2 * 60 * 60 * 1000 + 60_000).toISOString();
+    renderRow(task({ nextRunAt: future }));
     const nextRun = screen.getByTestId("task-next-run");
-    expect(nextRun.textContent).toMatch(/Next:/);
-    // The date/time formatting is exercised in scheduleText.test.ts; here we
-    // just assert the row surfaces the server value.
-    expect(nextRun.textContent).toMatch(/9:00 AM|9:00 AM/);
+    expect(nextRun.textContent).toMatch(/^Next run in \d+h$/);
   });
 
   it("renders NO next-run text when nextRunAt is null (paused / unarmed)", () => {

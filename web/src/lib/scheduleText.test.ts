@@ -353,47 +353,51 @@ describe("nextRunAtMs", () => {
   });
 });
 
-describe("formatNextRunAt (formats the SERVER's next-run instant)", () => {
-  // A fixed "now" so Today/Tomorrow/weekday buckets are deterministic.
+describe("formatNextRunAt (compact relative delta from the server's next-run)", () => {
+  // A fixed "now" so the delta buckets are deterministic.
   const NOW = new Date("2026-03-10T12:00:00Z"); // Tue 2026-03-10, 12:00 UTC
+  const iso = (ms: number) => new Date(NOW.getTime() + ms).toISOString();
+  const MIN = 60_000;
+  const HR = 60 * MIN;
+  const DAY = 24 * HR;
 
   it("returns null for null / empty / unparseable input", () => {
-    expect(formatNextRunAt(null, "UTC", NOW)).toBeNull();
-    expect(formatNextRunAt(undefined, "UTC", NOW)).toBeNull();
-    expect(formatNextRunAt("", "UTC", NOW)).toBeNull();
-    expect(formatNextRunAt("not-a-date", "UTC", NOW)).toBeNull();
+    expect(formatNextRunAt(null, NOW)).toBeNull();
+    expect(formatNextRunAt(undefined, NOW)).toBeNull();
+    expect(formatNextRunAt("", NOW)).toBeNull();
+    expect(formatNextRunAt("not-a-date", NOW)).toBeNull();
   });
 
-  it("labels a same-day fire as 'Today <time>'", () => {
-    expect(formatNextRunAt("2026-03-10T18:30:00Z", "UTC", NOW)).toBe("Today 6:30 PM");
+  it("formats a sub-hour delta in minutes (floor)", () => {
+    expect(formatNextRunAt(iso(30 * MIN), NOW)).toBe("in 30m");
+    // Floor: 59m59s → "in 59m".
+    expect(formatNextRunAt(iso(59 * MIN + 59_000), NOW)).toBe("in 59m");
+    // Minimum bucket is 1m (just over the 'soon' threshold).
+    expect(formatNextRunAt(iso(MIN), NOW)).toBe("in 1m");
   });
 
-  it("labels the next calendar day as 'Tomorrow <time>'", () => {
-    expect(formatNextRunAt("2026-03-11T09:00:00Z", "UTC", NOW)).toBe("Tomorrow 9:00 AM");
+  it("formats a sub-day delta in hours (floor)", () => {
+    expect(formatNextRunAt(iso(HR), NOW)).toBe("in 1h");
+    expect(formatNextRunAt(iso(15 * HR), NOW)).toBe("in 15h");
+    // Floor: 23h59m → "in 23h".
+    expect(formatNextRunAt(iso(23 * HR + 59 * MIN), NOW)).toBe("in 23h");
   });
 
-  it("names the weekday for a fire later in the coming week", () => {
-    // 2026-03-13 is a Friday.
-    expect(formatNextRunAt("2026-03-13T08:00:00Z", "UTC", NOW)).toBe("Fri 8:00 AM");
+  it("formats a multi-day delta in days (floor)", () => {
+    expect(formatNextRunAt(iso(DAY), NOW)).toBe("in 1d");
+    expect(formatNextRunAt(iso(6 * DAY), NOW)).toBe("in 6d");
+    // Floor: 6d23h → "in 6d".
+    expect(formatNextRunAt(iso(6 * DAY + 23 * HR), NOW)).toBe("in 6d");
   });
 
-  it("uses a short date for a fire a week or more out", () => {
-    // 2026-03-20 is >7 days from NOW.
-    expect(formatNextRunAt("2026-03-20T06:00:00Z", "UTC", NOW)).toBe("Mar 20, 6:00 AM");
+  it("returns 'soon' for an imminent or just-passed delta (< 1 minute)", () => {
+    expect(formatNextRunAt(iso(20_000), NOW)).toBe("soon"); // 20s out
+    expect(formatNextRunAt(iso(0), NOW)).toBe("soon"); // exactly now
+    expect(formatNextRunAt(iso(-5 * MIN), NOW)).toBe("soon"); // 5m in the past (skew)
   });
 
-  it("renders in the TASK's timezone, not the viewer's", () => {
-    // 2026-03-11T04:00Z is still 2026-03-10 in America/Los_Angeles (PDT, UTC-7
-    // in March → 9:00 PM), so it reads 'Today' in LA even though it's already
-    // tomorrow in UTC.
-    expect(formatNextRunAt("2026-03-11T04:00:00Z", "America/Los_Angeles", NOW)).toBe(
-      "Today 9:00 PM",
-    );
-  });
-
-  it("crosses the calendar boundary by wall-clock date, not a 24h delta", () => {
-    // NOW is noon Tue; a fire at 1am Wed is <24h away but a DIFFERENT calendar
-    // day, so it must read 'Tomorrow', not 'Today'.
-    expect(formatNextRunAt("2026-03-11T01:00:00Z", "UTC", NOW)).toBe("Tomorrow 1:00 AM");
+  it("bucket boundaries: 60m → hours, 24h → days", () => {
+    expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1h");
+    expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1d");
   });
 });
