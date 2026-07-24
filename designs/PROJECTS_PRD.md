@@ -545,23 +545,41 @@ folder), carrying the first-class `id` when one exists.
     distinguishes `config=None` (leave unchanged) from `config={}` (clear), so
     a rename never wipes stored defaults. Exposed on `ProjectObject` /
     `CreateProjectRequest` / `UpdateProjectRequest` (openapi regenerated).
-  - ⬜ **Seed defaults into the new-chat dialog.** Read the stored `config` and
-    pre-fill host/workspace/harness/model in the composer, always overridable,
-    silently dropping any hint that isn't currently satisfiable (e.g. the
-    default host is offline). Land the deferred backend hardening here, once the
-    config key vocabulary firms up (from the #3108 review): (a) bound the
+  - ✅ **Settings editor.** A "Project settings" dialog
+    (`web/src/shell/ProjectSettingsDialog.tsx`, reached from the project-folder
+    kebab menu) writes a project's `config`: host, working directory, default
+    agent, and an opt-in "Random worktree" toggle. The `config` shape the client
+    owns is `{ host_id?, workspace?, agent_id?, use_worktree? }`. Fields are
+    optional (an unset one stores no key); an all-default dialog clears to `{}`.
+    Worktrees are **opt-in** — the toggle defaults OFF and only an explicit ON is
+    stored as `use_worktree: true` (matching "worktrees are opt-in at create
+    time"). The host/agent pickers and filesystem browser reuse the composer's
+    components.
+  - ✅ **Seed defaults into the new-chat dialog.** The composer reads the stored
+    `config` and pre-fills host / working directory / agent, always overridable,
+    silently dropping any hint that isn't currently satisfiable (e.g. the default
+    host is offline, or the configured agent is no longer registered). An unset
+    field falls through to the composer's generic defaults (last host, recent
+    workspace, last-used agent). The prefill machine waits while the projects
+    list (name → id) or the config query is still loading, so a generic default
+    can't win the race. An opt-in worktree (`use_worktree: true`) generates a
+    fresh `worktree-<hex>` branch once the workspace is in place and confirmed a
+    git repo — including for empty projects, where the workspace comes from the
+    config or the home-fallback. Still deferred (backend hardening, once the
+    config key vocabulary firms up — from the #3108 review): (a) bound the
     serialized `config` size on create/update — the value is persisted verbatim
     and reflected back, so an unbounded blob is a mild storage/response-size
     amplifier; (b) make `_decode_config` defensive — coerce a non-dict blob
     (future writer / manual DB edit) back to `{}` rather than returning it raw.
-  - ⬜ **Replace the inference-based prefill (PR #2133).** That merged PR
-    prefills the composer by *inferring* defaults from the project's newest
+  - ✅ **Replaced the inference-based prefill (PR #2133).** That merged PR
+    prefilled the composer by *inferring* defaults from the project's newest
     session (host/agent/repo + a fresh worktree branch) — an explicit non-goal
-    workaround for the absence of stored project defaults. Once the dialog reads
-    the stored `config`, retire that inference path
-    (`web/src/shell/projectPrefill.ts` and `useNewestProjectSession`) in favor
-    of the stored defaults, so there's one source of truth for a project's
-    defaults instead of guessing from history.
+    workaround for the absence of stored project defaults. Now that the dialog
+    reads the stored `config`, the inference path is retired: `projectPrefill.ts`
+    is collapsed to config-only seeding, and `useNewestProjectSession` (plus its
+    `["project-newest-session"]` cache invalidations) is removed. Stored config
+    is the single source of truth for a project's defaults; a project with no
+    config prefills nothing project-specific (just the generic defaults).
 - ⬜ **Phase 3 — memory & context (P4b/P4c)** — new `project_memory` /
   `project_context` tables + agent read/write + injection (§8.2/§8.3).
 - ⬜ **Phase 4 — label consolidation (deferred; not required for the feature).**
