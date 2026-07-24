@@ -118,10 +118,11 @@ def main() -> int:
         _check(failures, result.returncode == 0, "run exit code 0")
         _check(failures, result.stdout.strip() != "", "run captured stdout")
         _check(failures, marker_value in result.stdout, "injected env var visible inside sandbox")
-        # Tenki's file API is workdir-scoped (rejects paths outside it), so
-        # resolve $HOME and stage the upload there rather than /tmp.
-        home_result = launcher.run(sandbox_id, 'printf %s "$HOME"', check=True)
-        remote_bin = f"{home_result.stdout.strip() or '/home/tenki'}/oa-smoke.bin"
+        # Deliberately an absolute path OUTSIDE the workdir — the same shape
+        # ship_wheels uses (/tmp/oa-wheels.tgz). Tenki's fs API rejects such
+        # paths, so this pins the launcher's stage-in-workdir + shell-move
+        # handling that the real CLI bootstrap depends on.
+        remote_bin = "/tmp/oa-smoke.bin"
 
         print("\n[4/9] run: non-zero exit surfaced (not raised by the SDK)")
         # Tenki's exec returns the result even on non-zero exit; the launcher
