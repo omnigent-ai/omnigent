@@ -1892,6 +1892,42 @@ def _validated_spec_smart_routing_harness(spec: AgentSpec) -> str | None:
     return AUTO_HARNESS_SENTINEL
 
 
+# Conservative charset for a Claude Code profile name (issue #503). The name
+# is only a lookup key into the admin-controlled ``claude_profiles:`` config
+# block — the config_dir it resolves to comes from that block, never from
+# the user, so there is no path-injection surface. The charset still rejects
+# shell/path-shaped values so a garbled pick fails loud at create time
+# rather than reaching the runner as an unresolvable name.
+_CLAUDE_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _validated_claude_profile(value: str | None) -> str | None:
+    """Validate a session-create ``claude_profile`` name (issue #503).
+
+    Accepts a conservative profile-name charset (alphanumerics, dash,
+    underscore; 1-64 chars) so a malformed pick fails at create time
+    rather than reaching the runner as an unresolvable name. The name
+    resolves to a config_dir against the *runner's* local
+    ``~/.omnigent/config.yaml`` ``claude_profiles:`` block (see
+    :mod:`omnigent.onboarding.claude_profiles`), so existence is NOT
+    checked server-side — the runner host owns the profile registry.
+
+    :param value: The raw profile name from the request body, e.g.
+        ``"work"``. ``None`` means no override (use the spec's declared
+        profile, else the CLI default).
+    :returns: The validated name, or ``None`` when *value* is.
+    :raises OmnigentError: ``invalid_input`` for a bad charset/length.
+    """
+    if value is None:
+        return None
+    if not _CLAUDE_PROFILE_NAME_RE.match(value):
+        raise OmnigentError(
+            f"invalid claude_profile: must be 1-64 chars of [A-Za-z0-9_-], got {value!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return value
+
+
 def _utc_day(epoch_seconds: int) -> str:
     """
     Convert a Unix epoch timestamp to its UTC calendar day.
@@ -5679,6 +5715,11 @@ async def _dispatch_skill_slash_command_to_runner(
     # time and never forwarded verbatim.
     if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
+    # Per-session Claude Code account profile (issue #503) — create-time
+    # only; the persisted override is the source. The runner resolves the
+    # name to a config_dir and injects CLAUDE_CONFIG_DIR on the spawn env.
+    if conv.claude_profile is not None:
+        runner_body["claude_profile"] = conv.claude_profile
 
     try:
         await runner_client.post(
@@ -9404,6 +9445,7 @@ __all__ = [
     "_validate_external_reasoning_effort",
     "_validate_session_workspace",
     "_validate_terminal_launch_args",
+    "_validated_claude_profile",
     "_validated_cost_control_mode_override",
     "_validated_harness_override",
     "_validated_harness_override_executor_type",
