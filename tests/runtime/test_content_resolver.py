@@ -13,7 +13,10 @@ from omnigent.entities.conversation import (
     FunctionCallData,
     MessageData,
 )
-from omnigent.runtime.content_resolver import resolve_content_references
+from omnigent.runtime.content_resolver import (
+    extract_text_attachments,
+    resolve_content_references,
+)
 
 # ── Fake stores ──────────────────────────────────────────────────────
 
@@ -1071,3 +1074,86 @@ def test_client_server_attachment_extension_parity() -> None:
         if not server_accepts(f"file{ext}", mime)
     ]
     assert not rejected, f"client accepts but server would 415: {rejected}"
+
+
+# ── extract_text_attachments (request-phase PII scanning) ─────────
+
+
+def _stores_with(
+    file_id: str,
+    filename: str,
+    content_type: str,
+    blob: bytes,
+    session_id: str | None = None,
+) -> tuple[FakeFileStore, FakeArtifactStore]:
+    """Build fake stores holding one attachment.
+
+    :returns: ``(file_store, artifact_store)`` with the given file.
+    """
+    fs = FakeFileStore(
+        files={
+            file_id: StoredFile(
+                id=file_id,
+                created_at=1000,
+                filename=filename,
+                bytes=len(blob),
+                content_type=content_type,
+                session_id=session_id,
+            )
+        }
+    )
+    return fs, FakeArtifactStore(blobs={file_id: blob})
+
+
+def test_extracts_text_from_csv_attachment() -> None:
+    """A text/csv ``input_file`` attachment's content is decoded for scanning.
+
+    Regression for #2906: an attached CSV is base64-inlined to the model and
+    never appears in the typed message, so its PII must be surfaced here for
+    the request-phase PII policy to catch it.
+    """
+    csv = b"id,full_name,credit_card\n1,Alice,4111 1111 1111 1111\n"
+    fs, arts = _stores_with("file_csv", "data.csv", "text/csv", csv)
+    content = [
+        {"type": "input_text", "text": "print this"},
+        {"type": "input_file", "file_id": "file_csv"},
+    ]
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+    assert len(out) == 1
+    assert out[0]["filename"] == "data.csv"
+    assert out[0]["content_type"] == "text/csv"
+    assert "4111 1111 1111 1111" in out[0]["text"]
+
+
+def test_skips_binary_attachments() -> None:
+    """Non-text attachments (image/PDF) are not decoded."""
+    fs, arts = _stores_with("file_png", "photo.png", "image/png", PNG_BYTES)
+    content = [{"type": "input_file", "file_id": "file_png"}]
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
+def test_ignores_non_input_file_blocks() -> None:
+    """Only ``input_file`` blocks are considered; text blocks are left to the
+    normal user-text extraction path."""
+    fs, arts = _stores_with("file_csv", "data.csv", "text/csv", b"a,b\n1,2\n")
+    content = [{"type": "input_text", "text": "ssn 123-45-6789"}]
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
+def test_missing_file_is_best_effort() -> None:
+    """A dangling file_id is skipped, not raised — scanning must not break
+    message delivery."""
+    fs = FakeFileStore(files={})
+    arts = FakeArtifactStore(blobs={})
+    content = [{"type": "input_file", "file_id": "file_gone"}]
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
+def test_skips_foreign_session_file() -> None:
+    """A file owned by another session is not scanned (ownership guard)."""
+    fs, arts = _stores_with(
+        "file_csv", "data.csv", "text/csv", b"cc 4111 1111 1111 1111", session_id="other"
+    )
+    content = [{"type": "input_file", "file_id": "file_csv"}]
+    out = extract_text_attachments(content, fs, arts, session_id="mine")  # type: ignore[arg-type]
+    assert out == []

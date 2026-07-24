@@ -309,6 +309,8 @@ def register_events_routes(
                     agent_store,
                     runner_router,
                     actor=_actor,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
                 )
             except Exception as _policy_exc:
                 # Policy evaluation crashed (e.g. factory misconfigured).
@@ -358,6 +360,8 @@ def register_events_routes(
                 conversation_store,
                 agent_store,
                 runner_router,
+                file_store=file_store,
+                artifact_store=artifact_store,
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
