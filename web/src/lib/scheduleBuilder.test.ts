@@ -69,7 +69,49 @@ describe("parseRRuleToScheduleModel", () => {
     expect(parseRRuleToScheduleModel("FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0")).toBeNull();
   });
 
-  it("rejects minute values the visible picker would have to snap", () => {
-    expect(parseRRuleToScheduleModel("FREQ=DAILY;BYHOUR=9;BYMINUTE=17")).toBeNull();
+  it("round-trips non-quarter-hour daily minutes", () => {
+    expect(parseRRuleToScheduleModel("FREQ=DAILY;BYHOUR=17;BYMINUTE=7")).toMatchObject({
+      preset: "daily",
+      hour: 17,
+      minute: 7,
+    });
+  });
+
+  it("round-trips non-quarter-hour hourly minute selections", () => {
+    expect(parseRRuleToScheduleModel("FREQ=HOURLY;BYMINUTE=7")).toMatchObject({
+      preset: "hourly",
+      minute: 7,
+    });
+  });
+});
+
+describe("parseTimeOfDayInput", () => {
+  it("accepts common 12-hour and 24-hour time input", async () => {
+    const { parseTimeOfDayInput } = await import("./scheduleBuilder");
+    expect(parseTimeOfDayInput("5:00 PM")).toEqual({ hour: 17, minute: 0 });
+    expect(parseTimeOfDayInput("5:07 PM")).toEqual({ hour: 17, minute: 7 });
+    expect(parseTimeOfDayInput("17:07")).toEqual({ hour: 17, minute: 7 });
+  });
+
+  it("rejects invalid times", async () => {
+    const { parseTimeOfDayInput } = await import("./scheduleBuilder");
+    expect(parseTimeOfDayInput("25:00")).toBeNull();
+    expect(parseTimeOfDayInput("5:99 PM")).toBeNull();
+    expect(parseTimeOfDayInput("not a time")).toBeNull();
+  });
+});
+
+describe("parseMinuteOfHourInput", () => {
+  it("accepts any minute in an hour", async () => {
+    const { parseMinuteOfHourInput } = await import("./scheduleBuilder");
+    expect(parseMinuteOfHourInput(":00")).toBe(0);
+    expect(parseMinuteOfHourInput("7")).toBe(7);
+    expect(parseMinuteOfHourInput(":59")).toBe(59);
+  });
+
+  it("rejects invalid minute input", async () => {
+    const { parseMinuteOfHourInput } = await import("./scheduleBuilder");
+    expect(parseMinuteOfHourInput(":60")).toBeNull();
+    expect(parseMinuteOfHourInput("abc")).toBeNull();
   });
 });

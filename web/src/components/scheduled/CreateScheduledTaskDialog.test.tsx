@@ -291,7 +291,21 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     );
     expect(screen.getByTestId("task-agent-readonly")).toHaveTextContent("Polly");
     expect(screen.queryByTestId("agent-picker-stub")).not.toBeInTheDocument();
-    expect(screen.getByTestId("schedule-time")).toHaveTextContent("8:30 AM");
+    expect(screen.getByTestId("schedule-time")).toHaveValue("8:30 AM");
+  });
+
+  it("round-trips non-quarter-hour edit times through the update payload", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=17;BYMINUTE=7" })}
+      />,
+    );
+    expect(screen.getByTestId("schedule-time")).toHaveValue("5:07 PM");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
   });
 
   it("submits supported edits through the update mutation without changing agent defaults", async () => {
@@ -393,42 +407,48 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.queryByTestId("task-timezone-trigger")).toBeNull();
   });
 
-  it("renders the Time field as a 15-minute-slot dropdown (96 options, no free input)", async () => {
+  it("renders the Time field as a text input", () => {
     renderDialog();
     const timeField = screen.getByTestId("schedule-time");
-    // It's a Select trigger (combobox), not a free-form <input type=time>.
-    expect(timeField.getAttribute("type")).not.toBe("time");
-    fireEvent.keyDown(timeField, { key: "Enter" });
-    const options = await screen.findAllByRole("option");
-    expect(options).toHaveLength(96);
-    // First and last slots span the day at 15-min granularity.
-    expect(options[0]).toHaveTextContent("12:00 AM");
-    expect(options[options.length - 1]).toHaveTextContent("11:45 PM");
+    expect(timeField.tagName).toBe("INPUT");
+    expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
   });
 
-  it("picking a time slot flows into the submitted RRULE", async () => {
+  it("typing a non-quarter-hour time flows into the submitted RRULE", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
-    // Agent defaults to the first (polly); just pick 2:30 PM from the Time dropdown.
-    fireEvent.keyDown(screen.getByTestId("schedule-time"), { key: "Enter" });
-    fireEvent.click(await screen.findByRole("option", { name: "2:30 PM" }));
+    fireEvent.change(screen.getByTestId("schedule-time"), { target: { value: "5:07 PM" } });
 
     const submit = screen.getByTestId("create-scheduled-task-submit");
     await waitFor(() => expect(submit).toBeEnabled());
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    // Default preset is Daily → 14:30.
-    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=14;BYMINUTE=30");
+    // Default preset is Daily -> 17:07.
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
   });
 
-  it("Hourly preset shows a minute-only dropdown of 15-min slots", async () => {
+  it("blocks submit while the typed time is invalid", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.change(screen.getByTestId("schedule-time"), { target: { value: "25:99" } });
+    expect(screen.getByTestId("schedule-error")).toHaveTextContent("Enter a valid time");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+
+  it("Hourly preset shows a minute-only text input", async () => {
     renderDialog();
     fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
-    fireEvent.keyDown(screen.getByTestId("schedule-minute"), { key: "Enter" });
-    const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
-    expect(options).toEqual([":00", ":15", ":30", ":45"]);
+    const minuteField = screen.getByTestId("schedule-minute");
+    expect(minuteField.tagName).toBe("INPUT");
+    fireEvent.change(minuteField, { target: { value: ":07" } });
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=HOURLY;BYMINUTE=7");
   });
 
   it("offers exactly the four frequency presets with no Custom entry point", async () => {

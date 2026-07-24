@@ -89,7 +89,7 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
 
   const hour = parseNumberPart(parts.get("BYHOUR"), 0, 23);
   const minute = parseNumberPart(parts.get("BYMINUTE"), 0, 59);
-  if (minute === null || !isVisibleMinuteOption(minute)) return null;
+  if (minute === null) return null;
 
   if (freq === "HOURLY") {
     if (hasUnsupportedParts(parts, ["FREQ", "INTERVAL", "BYMINUTE"])) return null;
@@ -182,10 +182,6 @@ function parseWeekdaysPart(value: string | undefined): WeekdayCode[] | null {
   return normalizeWeekdays(codes);
 }
 
-function isVisibleMinuteOption(minute: number): boolean {
-  return minute === 0 || minute === 15 || minute === 30 || minute === 45;
-}
-
 /**
  * Validate the schedule model against the form's constraints. Returns a
  * human-readable error string when invalid (shown inline + gates submit), or
@@ -193,6 +189,16 @@ function isVisibleMinuteOption(minute: number): boolean {
  * schedule fails fast in the form rather than as a 400.
  */
 export function validateSchedule(model: ScheduleModel): string | null {
+  if (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59) {
+    return model.preset === "hourly" ? "Enter a valid minute from 0 to 59." : "Enter a valid time.";
+  }
+  if (
+    model.preset !== "hourly" &&
+    (!Number.isInteger(model.hour) || model.hour < 0 || model.hour > 23)
+  ) {
+    return "Enter a valid time.";
+  }
+
   // Multi-selects must have at least one selection.
   if (model.preset === "weekly" && model.weekdays.length === 0) {
     return "Pick at least one day of the week.";
@@ -252,4 +258,33 @@ function clampMonthDay(day: number): number | null {
 function clampMonth(m: number): number {
   if (!Number.isFinite(m)) return 1;
   return Math.min(12, Math.max(1, Math.trunc(m)));
+}
+
+export function parseTimeOfDayInput(input: string): { hour: number; minute: number } | null {
+  const value = input.trim().toUpperCase().replace(/\s+/g, " ");
+  const match = value.match(/^(\d{1,2})(?::(\d{1,2}))?\s*(AM|PM)?$/);
+  if (!match) return null;
+
+  const rawHour = Number(match[1]);
+  const minute = match[2] == null ? 0 : Number(match[2]);
+  const meridiem = match[3];
+  if (!Number.isInteger(rawHour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+    return null;
+  }
+
+  if (meridiem != null) {
+    if (rawHour < 1 || rawHour > 12) return null;
+    const hour = (rawHour % 12) + (meridiem === "PM" ? 12 : 0);
+    return { hour, minute };
+  }
+
+  if (rawHour < 0 || rawHour > 23) return null;
+  return { hour: rawHour, minute };
+}
+
+export function parseMinuteOfHourInput(input: string): number | null {
+  const value = input.trim().replace(/^:/, "");
+  if (!/^\d{1,2}$/.test(value)) return null;
+  const minute = Number(value);
+  return Number.isInteger(minute) && minute >= 0 && minute <= 59 ? minute : null;
 }
