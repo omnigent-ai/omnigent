@@ -4954,9 +4954,60 @@ def _assistant_message_item(
     )
 
 
+def _stripped_image_placeholder(source: dict[str, Any]) -> str:
+    """
+    Build the placeholder text for a stripped inline image block.
+
+    Names the media type when known and points the agent back at the
+    originating tool call, so it can re-read the file to view the image
+    again instead of the data being silently lost.
+
+    :param source: The image block's ``source`` dict, e.g.
+        ``{"type": "base64", "media_type": "image/png", "data": ...}``.
+    :returns: Human/agent-readable placeholder string.
+    """
+    media_type = source.get("media_type")
+    label = f"{media_type} image" if isinstance(media_type, str) and media_type else "image"
+    return (
+        f"[{label} omitted from history to save context — "
+        "re-run the tool call above (e.g. Read the same path) to view it again]"
+    )
+
+
+def _strip_inline_image_data(value: Any) -> Any:
+    """
+    Replace base64 image payloads with a lightweight placeholder.
+
+    Walks list/dict tool-result content and rewrites any Anthropic
+    ``{"type": "image", "source": {"type": "base64", ...}}`` block to a
+    short text block, dropping the base64 ``data``. A single Read of an
+    image returns a full-resolution base64 PNG; serialized verbatim it
+    costs hundreds of thousands of tokens and is replayed as prompt text
+    on every resume, overflowing the context window and wedging
+    compaction. The model cannot use raw base64 as text anyway, and the
+    placeholder points back at the tool call so the image stays
+    recoverable on demand. Non-image content is returned unchanged.
+
+    :param value: Decoded tool-result content (list, dict, or scalar).
+    :returns: The same structure with image base64 data removed.
+    """
+    if isinstance(value, list):
+        return [_strip_inline_image_data(item) for item in value]
+    if isinstance(value, dict):
+        source = value.get("source")
+        if value.get("type") == "image" and isinstance(source, dict):
+            return {"type": "text", "text": _stripped_image_placeholder(source)}
+        return {key: _strip_inline_image_data(val) for key, val in value.items()}
+    return value
+
+
 def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
     """
     Return the UI-facing output string for a Claude tool result.
+
+    Inline base64 image data (e.g. from reading an image file) is
+    stripped to a placeholder so the stored output stays small and can
+    be replayed on resume without overflowing the context window.
 
     :param entry: Decoded Claude transcript record containing
         optional ``toolUseResult`` metadata.
@@ -4967,12 +5018,12 @@ def _tool_result_output(entry: dict[str, Any], block: dict[str, Any]) -> str:
     if isinstance(content, str):
         return content
     if content is not None:
-        return json.dumps(content, separators=(",", ":"))
+        return json.dumps(_strip_inline_image_data(content), separators=(",", ":"))
     tool_use_result = entry.get("toolUseResult")
     if isinstance(tool_use_result, str):
         return tool_use_result
     if tool_use_result is not None:
-        return json.dumps(tool_use_result, separators=(",", ":"))
+        return json.dumps(_strip_inline_image_data(tool_use_result), separators=(",", ":"))
     return ""
 
 

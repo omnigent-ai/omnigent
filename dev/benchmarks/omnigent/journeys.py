@@ -15,6 +15,10 @@ v1 journeys are pure HTTP/API (server + DB, no runner, no LLM):
   ``external_conversation_item`` (see :meth:`BenchEnvironment.seed_items`).
 - ``fork_session`` — fork a session (deep-copy its items), then DELETE.
 - ``add_comment`` — create a review comment on a file (DB write).
+- ``list_projects`` — the sidebar project list (dual-read union of first-class
+  projects + legacy ``omni_project`` label-projects).
+- ``list_project_sessions`` — a project folder's session list, the
+  ``?project=`` dual-read filter behind clicking a project in the sidebar.
 
 ``read_runner_file`` needs a runner but no LLM turn: it plants a file in the
 runner environment (setup) and times the server → runner filesystem read proxy.
@@ -389,6 +393,53 @@ async def _measure_load_history(env: BenchEnvironment, ctx: JourneyContext) -> N
     resp.raise_for_status()
 
 
+# Project name for the folder-fetch journey. Self-seeded when the corpus has no
+# project so the ``?project=`` filter has a real member to resolve and return.
+_BENCH_PROJECT_NAME = "bench-project"
+
+
+async def _setup_project_name(env: BenchEnvironment) -> str:
+    """Return a project name to fetch: an existing corpus project, else seed one.
+
+    Mirrors ``_setup_target_session``: real runs read a representative project
+    from the seeded corpus (``seed.py`` files a configurable fraction of sessions
+    into first-class projects), so the folder fetch resolves a realistically
+    populated project. When none exists (empty-DB smoke path) we file one session
+    under a fresh project so the ``?project=`` filter still exercises the real
+    dual-read path instead of an empty match.
+    """
+    assert env.client is not None
+    listing = await env.client.get("/v1/sessions/projects")
+    listing.raise_for_status()
+    projects = listing.json()
+    if projects:
+        return str(projects[0]["name"])
+    # Empty DB: create a first-class project and file one session into it.
+    name = await env.ensure_agent()
+    agent_id = await env.agent_id(name)
+    session_id = await env.create_session(agent_id)
+    created = await env.client.post("/v1/projects", json={"name": _BENCH_PROJECT_NAME})
+    created.raise_for_status()
+    filed = await env.client.patch(
+        f"/v1/sessions/{session_id}", json={"project_id": created.json()["id"]}
+    )
+    filed.raise_for_status()
+    return _BENCH_PROJECT_NAME
+
+
+async def _measure_list_projects(env: BenchEnvironment, _ctx: JourneyContext) -> None:
+    assert env.client is not None
+    resp = await env.client.get("/v1/sessions/projects")
+    resp.raise_for_status()
+
+
+async def _measure_list_project_sessions(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    assert env.client is not None
+    project = cast(str, ctx)  # _setup_project_name
+    resp = await env.client.get("/v1/sessions", params={"limit": 20, "project": project})
+    resp.raise_for_status()
+
+
 @dataclass
 class _ForkContext:
     """Fork-journey context: the session to fork + the forks to clean up.
@@ -670,6 +721,21 @@ ALL_JOURNEYS: dict[str, Journey] = {
             measure=_measure_search_sessions,
             concurrency_safe=True,
             description="GET /v1/sessions?search_query= — unindexed LIKE over titles + items.",
+        ),
+        Journey(
+            name="list_projects",
+            kind="latency",
+            measure=_measure_list_projects,
+            concurrency_safe=True,
+            description="GET /v1/sessions/projects — sidebar project list (dual-read union).",
+        ),
+        Journey(
+            name="list_project_sessions",
+            kind="latency",
+            measure=_measure_list_project_sessions,
+            setup=_setup_project_name,
+            concurrency_safe=True,
+            description="GET /v1/sessions?project= — a project folder's sessions (dual-read).",
         ),
         Journey(
             name="fork_session",

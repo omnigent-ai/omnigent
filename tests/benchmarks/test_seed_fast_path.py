@@ -67,6 +67,32 @@ def _item_data_ordered(engine):
     return sorted((s_by_cid[cid], pos, d) for cid, pos, d in items)
 
 
+def _projects_ordered(engine):
+    """(id, name, owner) for every project, sorted — project ids are deterministic."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, name, owner_user_id FROM projects")).all()
+    return sorted((pid, name, owner) for pid, name, owner in rows)
+
+
+def _membership_counts(engine):
+    """(session s, project_id) for every filed session, sorted by session index.
+
+    Session ids are fresh per run, so membership is keyed by the RNG-stable
+    session index (recovered from the title) paired with the deterministic
+    project id — proving both paths file the same sessions into the same folders.
+    """
+    with engine.connect() as conn:
+        convs = conn.execute(text("SELECT id, title FROM conversations")).all()
+        s_by_cid = {cid: _s_of(t) for cid, t in convs}
+        rows = conn.execute(
+            text(
+                "SELECT id, project_id FROM omnigent_conversation_metadata "
+                "WHERE project_id IS NOT NULL"
+            )
+        ).all()
+    return sorted((s_by_cid[cid], pid) for cid, pid in rows)
+
+
 # ── fast path: row counts + read path through the store API ──
 
 
@@ -76,7 +102,9 @@ def test_seed_fast_path_row_counts_and_read_path(tmp_path: Path) -> None:
 
     db_uri = f"sqlite:///{tmp_path / 'fast.db'}"
 
-    created = seed_mod.seed(db_uri, sessions=50, items_per_session=10, _fast=True)
+    created = seed_mod.seed(
+        db_uri, sessions=50, items_per_session=10, projects=5, filed_fraction=0.6, _fast=True
+    )
     assert created == 50
 
     engine = get_or_create_engine(db_uri)
@@ -88,6 +116,27 @@ def test_seed_fast_path_row_counts_and_read_path(tmp_path: Path) -> None:
     assert _count(engine, "session_permissions") == 50
     assert _count(engine, "users") == 1
     assert _count(engine, "conversation_labels") == 1
+    assert _count(engine, "projects") == 5
+
+    with engine.connect() as conn:
+        # 30 of 50 sessions filed (0.6), spread round-robin across 5 projects,
+        # each owned by "local"; the other 20 stay unfiled (project_id IS NULL).
+        filed = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM omnigent_conversation_metadata WHERE project_id IS NOT NULL"
+            )
+        ).scalar_one()
+        assert filed == 30
+        owners = conn.execute(text("SELECT DISTINCT owner_user_id FROM projects")).all()
+        assert owners == [(RESERVED_USER_LOCAL,)]
+        # Round-robin: each of the 5 projects holds 30/5 = 6 sessions.
+        per_project = conn.execute(
+            text(
+                "SELECT project_id, COUNT(*) FROM omnigent_conversation_metadata "
+                "WHERE project_id IS NOT NULL GROUP BY project_id"
+            )
+        ).all()
+        assert sorted(c for _, c in per_project) == [6, 6, 6, 6, 6]
 
     with engine.connect() as conn:
         # next_position advanced to items_per_session on every conversation.
@@ -140,14 +189,22 @@ def test_seed_fast_path_row_counts_and_read_path(tmp_path: Path) -> None:
 def test_seed_fast_path_corpus_matches_store_path(tmp_path: Path) -> None:
     """Same config + RNG seed → identical corpus shape via either write path.
 
-    The uuid4 ids are fresh per run, so we compare the RNG-determined content
-    (titles, per-session search_text in draw order, JSON ``data`` blobs) and the
-    row counts — proving the fast path draws the RNG in the same order and
-    serializes rows identically to the store ORM loop.
+    Conversation/agent ids are fresh uuid4 per run, so we compare the
+    RNG-determined content (titles, per-session search_text in draw order, JSON
+    ``data`` blobs) and the row counts — proving the fast path draws the RNG in
+    the same order and serializes rows identically to the store ORM loop. The
+    project ids ARE deterministic (derived from the index), so project rows and
+    per-project membership counts are compared directly.
     """
     from dev.benchmarks.omnigent import seed as seed_mod
 
-    cfg = {"sessions": 50, "items_per_session": 10, "rng_seed": 1234}
+    cfg = {
+        "sessions": 50,
+        "items_per_session": 10,
+        "rng_seed": 1234,
+        "projects": 5,
+        "filed_fraction": 0.6,
+    }
     fast_uri = f"sqlite:///{tmp_path / 'fast.db'}"
     slow_uri = f"sqlite:///{tmp_path / 'slow.db'}"
 
@@ -166,6 +223,7 @@ def test_seed_fast_path_corpus_matches_store_path(tmp_path: Path) -> None:
         "session_permissions",
         "users",
         "conversation_labels",
+        "projects",
     ):
         assert _count(fe, table) == _count(se, table), table
 
@@ -174,6 +232,9 @@ def test_seed_fast_path_corpus_matches_store_path(tmp_path: Path) -> None:
     assert _item_text_ordered(fe) == _item_text_ordered(se)
     # JSON serialization (default separators, exclude_none) matches byte-for-byte.
     assert _item_data_ordered(fe) == _item_data_ordered(se)
+    # Deterministic project ids/names + membership counts match byte-for-byte.
+    assert _projects_ordered(fe) == _projects_ordered(se)
+    assert _membership_counts(fe) == _membership_counts(se)
 
 
 # ── non-SQLite slow path (skipped unless a non-SQLite DB is provided) ──

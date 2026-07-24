@@ -108,23 +108,28 @@ def test_codex_native_picker_uses_raw_model_metadata(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The model/effort label now lives in the picker trigger (it's the
-    # control that changes them); the harness identity moved to the tray.
-    trigger = page.get_by_test_id("agent-picker-trigger")
-    expect(trigger).to_contain_text("Codex Pretty 5.5 xhigh", timeout=15_000)
+    # The read-only composer label shows the resolved model + effort; the
+    # harness identity moved into the config gear's hover tooltip.
+    label = page.get_by_test_id("composer-model-effort-label")
+    expect(label).to_contain_text("Codex Pretty 5.5 xhigh", timeout=15_000)
 
-    expect(page.get_by_test_id("composer-harness")).to_contain_text("Codex")
+    page.get_by_test_id("composer-config-gear").hover()
+    expect(page.get_by_test_id("composer-config-gear-tooltip")).to_contain_text("Codex")
 
-    expect(trigger).to_be_visible()
-    trigger.click()
-
-    model_row = page.locator('[data-testid="model-picker-item"][data-model-id="gpt-5.5"]')
+    # Open the config modal; its Model dropdown renders Codex's displayName raw.
+    page.get_by_test_id("composer-config-gear").click()
+    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
+    page.get_by_test_id("composer-config-model").click()
+    model_row = page.locator('[role="option"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("Codex Pretty 5.5")
-
-    effort_row = page.locator('[data-testid="effort-picker-item"][data-effort-level="xhigh"]')
+    # Close the model listbox, then open the Effort dropdown.
+    page.keyboard.press("Escape")
+    page.get_by_test_id("composer-config-effort").click()
+    effort_row = page.locator('[role="option"][data-effort-level="xhigh"]')
     expect(effort_row).to_be_visible()
     expect(effort_row).to_contain_text("xhigh")
+    # Codex effort ids render raw (not title-cased) even in the shared Select.
     assert effort_row.evaluate("el => getComputedStyle(el).textTransform") == "none"
 
 

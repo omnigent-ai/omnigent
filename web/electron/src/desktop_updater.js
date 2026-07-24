@@ -183,6 +183,10 @@ function createDesktopUpdater({
         () => autoUpdater.checkForUpdates().catch(() => {}),
         PERIODIC_CHECK_INTERVAL_MS,
       );
+      // Don't let the 6-hourly re-check keep the Node event loop alive at quit
+      // (a ref'd interval can leave the main process lingering after the
+      // windows close on some platforms).
+      if (typeof updateCheckTimer.unref === "function") updateCheckTimer.unref();
     }
   }
 

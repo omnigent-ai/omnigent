@@ -1724,6 +1724,60 @@ def test_resolve_attach_server_defaults_scheme_https(monkeypatch: pytest.MonkeyP
     assert result == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
 
 
+@pytest.mark.parametrize(
+    ("workspace_id", "shard"),
+    [
+        # Real workspace/host pairs observed in public repositories, so this
+        # asserts a fact about Azure rather than restating the implementation's
+        # own arithmetic. Sources: databricks-industry-solutions/energy-sandbox
+        # (4173618801742158), posit-dev/chatlas VCR cassette (138962681435081);
+        # 6480446341130099 and 984752964297111 came from URLs that carried both
+        # the canonical host and ?o=<id>, so the id is self-confirming.
+        ("4173618801742158", "18"),
+        ("6480446341130099", "19"),
+        ("984752964297111", "11"),  # 15-digit id
+        ("8079947826164900", "0"),  # bare shard-0 rendering
+        ("138962681435081", "1"),
+    ],
+)
+def test_canonical_azure_databricks_url_matches_real_workspaces(
+    workspace_id: str, shard: str
+) -> None:
+    """The synthesized host matches the real canonical host for known workspaces."""
+    result = cli._canonical_azure_databricks_url(
+        f"https://mydomain.azuredatabricks.net/?o={workspace_id}"
+    )
+
+    assert result == (f"https://adb-{workspace_id}.{shard}.azuredatabricks.net/?o={workspace_id}")
+
+
+def test_canonical_azure_databricks_url_declines_other_urls() -> None:
+    """Canonical, non-Azure, and selector-less URLs yield no candidate."""
+    # Already canonical
+    assert (
+        cli._canonical_azure_databricks_url("https://adb-123.3.azuredatabricks.net/?o=123") is None
+    )
+    # AWS host (not azuredatabricks.net)
+    assert cli._canonical_azure_databricks_url("https://acme.cloud.databricks.com/?o=123") is None
+    # Azure vanity but no ?o= to derive the workspace id
+    assert cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net") is None
+    # Non-numeric selector is ignored
+    assert (
+        cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net/?o=notanid")
+        is None
+    )
+    # A non-ASCII "digit" that int() would reject is declined, not crashed
+    assert cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net/?o=²") is None
+    # Arabic-Indic digits satisfy isdecimal() and int(), so the ASCII guard is
+    # what stops a nonsensical host being synthesized here.
+    assert cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net/?o=٣") is None
+    # A malformed port must not crash the shared resolver
+    assert (
+        cli._canonical_azure_databricks_url("https://mydomain.azuredatabricks.net:notaport/?o=123")
+        is None
+    )
+
+
 def test_resolve_host_server_expands_explicit_workspace_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

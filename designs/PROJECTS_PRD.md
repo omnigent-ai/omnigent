@@ -425,10 +425,11 @@ user's memberships would be their own private metadata.
   (P1), move/create-in-project (P2), rename (P3), delete semantics. Reorder is
   **optional** and, if added, client-only (§7.2). No label backfill here — the
   server dual-reads (§13), so first-class projects work alongside existing
-  label-projects without migrating them. Shipped as two PRs: **1a** the project
-  container (table + store + CRUD) and **1b** session membership (the
-  `project_id` column, conversation-store dual-read, and the session-move HTTP
-  surfaces) — see §12.
+  label-projects without migrating them. Shipped as three PRs: **1a** the project
+  container (table + store + CRUD), **1b** session membership (the `project_id`
+  column, conversation-store dual-read, and the session-move HTTP surfaces), and
+  the **web UI** (sidebar create/rename/delete/move against the first-class
+  entity, dual-reading label-projects) — see §12.
 - **Phase 2 — Project defaults (P4a):** default host/workspace/harness/model
   seeded into the new-chat dialog when starting a session from within a project;
   graceful degradation when host offline / not owned.
@@ -451,8 +452,8 @@ projects. Session→project membership landed separately in Phase 1b (below).
   UNIQUE index on `(workspace_id, owner_user_id, name)` enforces per-owner name
   uniqueness at the DB layer for non-NULL owners (the store's `_name_taken`
   check guards NULL-owner / single-user rows, which SQL treats as distinct).
-  (No `config` column yet — deferred to Phase 2 as a small add-column migration
-  alongside the code that reads it, so we don't ship an unused column.)
+  (No `config` column in Phase 1a — deferred so we didn't ship an unused
+  column; added in Phase 2 via migration `b3c4d5e6f7a8`, see the TODO below.)
 - ✅ **Migration** `b1c2d3e4f5a6` — creates the `projects` table only;
   additive, no backfill. Chained after `d4f2a1b6c8e9`.
 - ✅ **Entity** — `Project` (`entities/project.py`).
@@ -488,28 +489,79 @@ Links sessions to projects and exposes it, completing Phase 1.
   cross-DB split-DB path); route move / unfile / list, single- and multi-user
   ownership boundaries.
 
+### Done (Web UI — first-class projects in the sidebar)
+Wires the web app to the first-class entity, keeping the label path working via
+dual-read so no migration is forced. Folders are keyed by **name** (the union
+key that merges a first-class project and a like-named label-project into one
+folder), carrying the first-class `id` when one exists.
+- ✅ **List dual-read** — `GET /v1/sessions/projects` now returns the UNION of
+  first-class projects (`project_store.list`, incl. empty, with `id`) and legacy
+  label-projects (`id=None`), merged by name and sorted. Response shape changed
+  from `list[str]` to `list[{id, name}]`; owner-scoped as before.
+- ✅ **First-class CRUD client** — `web/src/lib/projectsApi.ts`
+  (`list/create/rename/delete` against `/v1/projects`); hooks `useCreateProject`,
+  `useRenameProject`, and a reworked `useDeleteProject`. `useProjects` now
+  returns `{id, name}[]`.
+- ✅ **Create empty project** — a "New project" control (`NewProjectButton`) in
+  the always-visible Projects section (My-sessions tab), even with zero
+  projects (§5.3). `POST /v1/projects`.
+- ✅ **Membership by `project_id`** — filing/moving a session (composer picker,
+  row kebab, drag-drop) PATCHes `project_id`, resolving the picked name to an id
+  and **creating the first-class row on demand** for a label-only folder. `""`
+  unfiles. Sidebar groups a folder's members by first-class id OR the legacy
+  label, and a row's "current project" dual-reads both (so pinned first-class
+  members keep their project flyout).
+- ✅ **Rename** — `PATCH /v1/projects/{id}` (O(1)); a label-only folder is
+  promoted on demand (create + re-file members). **Delete** — archives and
+  unfiles every member (clears `project_id` + `omni_project` label), then
+  deletes the container; sessions are never deleted (§5.3, §7).
+- ✅ Tests: `projectsApi` unit tests; reworked hook tests (resolve→file,
+  create-on-demand, archive+unfile+delete); sidebar/composer suites updated;
+  server union test. Empty folders read "No sessions".
+- ⬜ **Deferred (kept on the name/label path via dual-read):** the new-session
+  prefill state machine and the Settings archived-only project picker still read
+  the `omni_project` label; retiring label reads from the UI is gated on the
+  Phase 4 backfill. TS client types are not codegen-regenerated (hand-written
+  `projectsApi`).
+
 ### TODO
-- ⬜ **Web UI** — always-visible Projects sidebar section; create empty project;
-  "New session here"; session-row kebab move; rename (§5–§7). No TS client
-  types regenerated yet.
-- ⬜ **Benchmark (when the UI ships).** Once the project sidebar is wired, add a
-  `list_project_sessions` journey to `dev/benchmarks/omnigent` (mirrors the
-  existing `list_sessions` hot read path), and consider a `list_projects`
-  journey. CRUD writes (create/rename/delete) are infrequent single-row ops and
-  don't need a benchmark. Nothing to add now — the routes aren't client-facing
-  yet, so there's no user journey to protect.
-- ⬜ **Phase 2 — project defaults (P4a)** — add a `config` JSON column (small
-  add-column migration) and plumb it through the store/entity/API; seed
-  host/workspace/harness/model into the new-chat dialog (§8.1).
-  - **Replace the inference-based prefill (PR #2133).** That merged PR prefills
-    the composer by *inferring* defaults from the project's newest session
-    (host/agent/repo + a fresh worktree branch) — an explicit non-goal
-    workaround for the absence of stored project defaults. Once `config` stores
-    real defaults, retire that inference path (`web/src/shell/projectPrefill.ts`
-    and `useNewestProjectSession`) in favor of reading the stored config, so
-    there's one source of truth for a project's defaults instead of guessing
-    from history. Track this cleanup here so it isn't forgotten when Phase 2
-    lands.
+- ✅ **Benchmark (#3094).** Added `list_projects` (sidebar project list,
+  dual-read union) and `list_project_sessions` (`?project=` folder fetch)
+  latency journeys to `dev/benchmarks/omnigent`, mirroring the `list_sessions`
+  hot read path. The corpus seeder now also seeds first-class `projects` rows
+  and files a configurable fraction of sessions into them (`--projects`,
+  `--filed-fraction`) so the journeys measure a realistic sidebar instead of an
+  empty project set, and the PR benchmark regression check runs on
+  `dev/benchmarks/**` changes. CRUD writes remain unbenchmarked (infrequent
+  single-row ops).
+- 🚧 **Phase 2 — project defaults (P4a).** In progress, split across PRs:
+  - ✅ **Backend `config` column.** Added a nullable `config` column to
+    `projects` (migration `b3c4d5e6f7a8`, additive with a clean downgrade) and
+    plumbed it through the store/entity/API. `config` is an **opaque JSON
+    object**, not a typed schema: the backend persists it whole and never
+    filters on it, so the key vocabulary (host/workspace/harness/model/
+    reasoning-effort/git base-branch, …) is owned by the client and can grow
+    without a schema change. Values are *hints* (§8.1). Store `update()`
+    distinguishes `config=None` (leave unchanged) from `config={}` (clear), so
+    a rename never wipes stored defaults. Exposed on `ProjectObject` /
+    `CreateProjectRequest` / `UpdateProjectRequest` (openapi regenerated).
+  - ⬜ **Seed defaults into the new-chat dialog.** Read the stored `config` and
+    pre-fill host/workspace/harness/model in the composer, always overridable,
+    silently dropping any hint that isn't currently satisfiable (e.g. the
+    default host is offline). Land the deferred backend hardening here, once the
+    config key vocabulary firms up (from the #3108 review): (a) bound the
+    serialized `config` size on create/update — the value is persisted verbatim
+    and reflected back, so an unbounded blob is a mild storage/response-size
+    amplifier; (b) make `_decode_config` defensive — coerce a non-dict blob
+    (future writer / manual DB edit) back to `{}` rather than returning it raw.
+  - ⬜ **Replace the inference-based prefill (PR #2133).** That merged PR
+    prefills the composer by *inferring* defaults from the project's newest
+    session (host/agent/repo + a fresh worktree branch) — an explicit non-goal
+    workaround for the absence of stored project defaults. Once the dialog reads
+    the stored `config`, retire that inference path
+    (`web/src/shell/projectPrefill.ts` and `useNewestProjectSession`) in favor
+    of the stored defaults, so there's one source of truth for a project's
+    defaults instead of guessing from history.
 - ⬜ **Phase 3 — memory & context (P4b/P4c)** — new `project_memory` /
   `project_context` tables + agent read/write + injection (§8.2/§8.3).
 - ⬜ **Phase 4 — label consolidation (deferred; not required for the feature).**

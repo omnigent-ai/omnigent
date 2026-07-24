@@ -60,6 +60,8 @@ see *Network* below).
 | `search_sessions` | `GET /v1/sessions?search_query=` — unindexed `LIKE` | total item count |
 | `fork_session` | `POST /v1/sessions/{id}/fork` — fork (deep-copy items); forks deleted in teardown, untimed | items/session |
 | `add_comment` | `POST /v1/sessions/{id}/comments` — create a review comment | write path |
+| `list_projects` | `GET /v1/sessions/projects` — sidebar project list (dual-read union) | project count |
+| `list_project_sessions` | `GET /v1/sessions?project=` — a project folder's sessions (dual-read filter) | sessions/project |
 
 Read journeys target a **pre-seeded** session when the DB has a corpus; against
 an empty DB they self-seed a small fallback session over HTTP (the
@@ -205,17 +207,26 @@ API (no HTTP, no runner) into the same DB the server then boots against:
 ```bash
 # Seed 5000 sessions × 50 items into a SQLite file, then benchmark against it.
 uv run --no-sync dev/benchmarks/omnigent/seed.py \
-    --database-uri sqlite:////abs/path/bench.db --sessions 5000 --items-per-session 50
+    --database-uri sqlite:////abs/path/bench.db --sessions 5000 --items-per-session 50 \
+    --projects 20 --filed-fraction 0.5
 uv run --no-sync dev/benchmarks/omnigent/run.py \
     --database-uri sqlite:////abs/path/bench.db --output bench.json
 ```
 
-Seeding is **idempotent**: a matching corpus (same sessions/items/schema) is
-detected and reused, so re-running is a fast no-op — pass `--reseed` to force,
-or a differing config to be warned. SQLite absolute paths need four slashes
-(`sqlite:////abs/...`). The reuse marker records the DB's Alembic head read at
-seed time, so a corpus from an older schema is automatically reseeded — no
-manual revision bookkeeping. `test_seed_creates_listable_corpus` (which seeds
+The corpus also seeds **first-class projects** and files a fraction of sessions
+into them, so `list_projects` / `list_project_sessions` measure a realistic
+sidebar instead of an empty project set. `--projects N` sets the folder count
+(0 = none) and `--filed-fraction F` the fraction of sessions filed (round-robin
+across the folders); the defaults (20 projects, 0.5) put ~1/40th of the corpus
+in each folder. Projects are owned by the reserved `"local"` user the loopback
+server resolves to, so the owner-scoped project reads see them.
+
+Seeding is **idempotent**: a matching corpus (same sessions/items/projects/
+schema) is detected and reused, so re-running is a fast no-op — pass `--reseed`
+to force, or a differing config to be warned. SQLite absolute paths need four
+slashes (`sqlite:////abs/...`). The reuse marker records the DB's Alembic head
+read at seed time, so a corpus from an older schema is automatically reseeded —
+no manual revision bookkeeping. `test_seed_creates_listable_corpus` (which seeds
 through the store, running migrations to the current head) is the safety net
 that a schema change hasn't broken seeding.
 

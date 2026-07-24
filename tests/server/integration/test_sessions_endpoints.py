@@ -146,7 +146,6 @@ async def test_first_message_schedules_background_semantic_title(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The first user turn returns normally while title generation runs separately."""
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     generated = asyncio.Event()
@@ -212,7 +211,6 @@ async def test_background_title_failure_does_not_break_subsequent_user_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed title job leaves the session able to accept later user turns."""
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     generator_started = asyncio.Event()
@@ -291,7 +289,6 @@ async def test_initial_item_schedules_background_semantic_title(
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     generated = asyncio.Event()
 
     async def generator(request: BackgroundTitleRequest) -> str:
@@ -334,9 +331,7 @@ async def test_initial_item_schedules_background_semantic_title(
 async def test_native_user_item_schedules_background_semantic_title(
     client: httpx.AsyncClient,
     app: Any,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_SESSION_RENAME", "1")
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     generated = asyncio.Event()

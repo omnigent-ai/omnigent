@@ -294,7 +294,7 @@ see step 3.)
 **Prefer the browser?** Start a server and register your machine as a host:
 
 ```bash
-omnigent server start   # start the local server and web UI in the background
+omnigent server --background   # start the local server and web UI in the background
 omnigent host           # (separate terminal) register this machine as a host
 ```
 
@@ -374,7 +374,7 @@ Omnigent supports **multi-user accounts**, controlled by one environment
 variable:
 
 ```bash
-OMNIGENT_AUTH_ENABLED=1 omnigent server start
+OMNIGENT_AUTH_ENABLED=1 omnigent server --background
 ```
 
 The **Docker deploy in [step 4](#4-deploy-a-server-and-use-it-from-your-phone)

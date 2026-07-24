@@ -9,6 +9,7 @@ import sys
 import textwrap
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -20,6 +21,13 @@ from omnigent.tools.local import (
     LocalToolLoadError,
     load_local_python_tools,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clean_container_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OMNIGENT_CONTAINER_RUNTIME never leaks from the host environment."""
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+
 
 # ─── Helpers ────────────────────────────────────────────────────────
 
@@ -417,7 +425,7 @@ def _make_tool(
     inline_deps: list[str] | None = None,
     container_image: str | None = None,
     docker_image: str | None = None,
-    container_runtime: str = "docker",
+    container_runtime: str | None = None,
     srt_available: bool = False,
     uv_available: bool = False,
     sandbox_enabled: bool = True,
@@ -432,11 +440,13 @@ def _make_tool(
         has_inline_deps=has_inline_deps,
         inline_deps=inline_deps,
     )
-    sandbox_config = SandboxConfig(
-        container_image=container_image,
-        docker_image=docker_image,
-        container_runtime=container_runtime,
-    )
+    sandbox_kwargs: dict[str, Any] = {
+        "container_image": container_image,
+        "docker_image": docker_image,
+    }
+    if container_runtime is not None:
+        sandbox_kwargs["container_runtime"] = container_runtime
+    sandbox_config = SandboxConfig(**sandbox_kwargs)
     tools = load_local_python_tools(
         [info],
         tmp_path,
@@ -530,6 +540,38 @@ def test_sandbox_config_rejects_invalid_runtime() -> None:
     """SandboxConfig.__post_init__ rejects unknown container_runtime values."""
     with pytest.raises(ValueError, match="container_runtime"):
         SandboxConfig(container_runtime="rkt")  # type: ignore[arg-type]
+
+
+def test_sandbox_config_env_var_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OMNIGENT_CONTAINER_RUNTIME env var overrides the built-in default."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    cfg = SandboxConfig()
+    assert cfg.container_runtime == "podman"
+
+
+def test_sandbox_config_explicit_beats_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit constructor argument takes precedence over the env var."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    cfg = SandboxConfig(container_runtime="docker")
+    assert cfg.container_runtime == "docker"
+
+
+def test_sandbox_config_env_var_invalid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An invalid env var value is rejected just like an invalid argument."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "rkt")
+    with pytest.raises(ValueError, match="container_runtime"):
+        SandboxConfig()
+
+
+def test_build_command_container_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_CONTAINER_RUNTIME env var is picked up by the tool command builder."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    tool = _make_tool(tmp_path, container_image="python:3.11")
+    cmd = tool._build_command(state_root=None)
+    assert cmd[0] == "podman"
 
 
 # ─── Schema + name plumbing ─────────────────────────────────────────

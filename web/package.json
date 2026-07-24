@@ -78,6 +78,7 @@
     "remark-breaks": "^4.0.0",
     "remark-emoji": "^5.0.2",
     "remark-gfm": "^4.0.1",
+    "rrule": "^2.8.1",
     "shadcn": "0.0.0-beta.9d3f70e54",
     "shiki": "^4.0.2",
     "streamdown": "^2.5.0",

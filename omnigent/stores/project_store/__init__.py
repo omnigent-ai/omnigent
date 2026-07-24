@@ -13,6 +13,7 @@ Projects have no ACL of their own (PRD §9): every method is scoped by
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import Project
 
@@ -40,6 +41,7 @@ class ProjectStore(ABC):
         project_id: str,
         name: str,
         owner_user_id: str | None,
+        config: dict[str, Any] | None = None,
     ) -> Project:
         """
         Insert a new, empty project.
@@ -48,6 +50,8 @@ class ProjectStore(ABC):
         :param name: Human-readable project name. Trimmed, non-empty, unique
             among the owner's projects.
         :param owner_user_id: Owning user, or ``None`` in single-user mode.
+        :param config: Optional default session settings (opaque JSON object);
+            ``None`` or empty stores no defaults.
         :returns: The newly created :class:`Project`.
         :raises OmnigentError: ``ALREADY_EXISTS`` if the owner already has a
             project with this name.
@@ -83,6 +87,7 @@ class ProjectStore(ABC):
         *,
         owner_user_id: str | None,
         name: str | None = None,
+        config: dict[str, Any] | None = None,
     ) -> Project | None:
         """
         Update mutable fields of an owned project.
@@ -94,6 +99,8 @@ class ProjectStore(ABC):
         :param owner_user_id: The requesting owner.
         :param name: New name, or ``None`` to leave unchanged. Trimmed,
             non-empty, unique among the owner's projects.
+        :param config: New config object to replace the stored one, or ``None``
+            to leave it unchanged. An empty dict clears the stored defaults.
         :returns: The updated :class:`Project`, or ``None`` if not found.
         :raises OmnigentError: ``ALREADY_EXISTS`` if the new name collides with
             another of the owner's projects.

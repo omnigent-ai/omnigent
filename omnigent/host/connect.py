@@ -24,6 +24,7 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -44,6 +45,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -1694,6 +1697,45 @@ class HostProcess:
             payload=payload,
         )
 
+    async def _handle_model_options(
+        self,
+        frame: HostModelOptionsFrame,
+    ) -> HostModelOptionsResultFrame:
+        """Resolve the launch picker catalog on the machine that will run it.
+
+        This is a pre-launch PREVIEW of the host's ambient default
+        configuration (``spec=None`` — no session exists yet, so there is no
+        agent spec to pin). A session whose spec pins a different provider
+        resolves its own catalog at launch, and the in-session picker
+        re-reads that authoritative snapshot after bind.
+        """
+        if canonicalize_harness(frame.harness) != "claude-native":
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"model options are unsupported for harness {frame.harness!r}",
+            )
+        try:
+            from omnigent.claude_native import (
+                claude_native_model_options,
+                resolve_native_claude_config,
+            )
+
+            config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+            models = await asyncio.to_thread(claude_native_model_options, config)
+        except Exception:
+            _logger.exception("Failed to resolve pre-launch Claude model options")
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="failed to resolve Claude model options",
+            )
+        return HostModelOptionsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            models=models,
+        )
+
     @staticmethod
     def _dispatch_fs_op(
         reader: object,
@@ -2279,6 +2321,8 @@ class HostProcess:
             # off the event loop and reply when it completes.
             result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostModelOptionsFrame):
+            await ws.send(encode_host_frame(await self._handle_model_options(frame)))
 
 
 def run_host_process(

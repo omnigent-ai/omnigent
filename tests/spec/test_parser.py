@@ -12,6 +12,12 @@ from omnigent.spec.parser import discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
+@pytest.fixture(autouse=True)
+def _clean_container_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure OMNIGENT_CONTAINER_RUNTIME never leaks from the host environment."""
+    monkeypatch.delenv("OMNIGENT_CONTAINER_RUNTIME", raising=False)
+
+
 @pytest.fixture()
 def agent_dir(tmp_path: Path) -> Path:
     """Create a minimal valid agent image directory."""
@@ -1299,6 +1305,67 @@ def test_parse_tools_sandbox_container_image_precedence(tmp_path: Path) -> None:
 
     assert spec.tools.sandbox.container_image == "python:3.12-slim"
     assert spec.tools.sandbox.docker_image == "python:3.12-slim"
+
+
+def test_parse_tools_sandbox_runtime_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_CONTAINER_RUNTIME env var is used when YAML omits container_runtime."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    config = {
+        "spec_version": 1,
+        "name": "env-var-runtime",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_runtime == "podman"
+    assert spec.tools.sandbox.container_image == "python:3.12-slim"
+
+
+def test_parse_tools_sandbox_yaml_beats_env_var(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit YAML container_runtime takes precedence over the env var."""
+    monkeypatch.setenv("OMNIGENT_CONTAINER_RUNTIME", "podman")
+    config = {
+        "spec_version": 1,
+        "name": "yaml-beats-env",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "container_runtime": "docker",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.tools.sandbox.container_runtime == "docker"
+
+
+def test_parse_tools_sandbox_null_runtime_rejected(tmp_path: Path) -> None:
+    """``container_runtime: null`` in YAML is rejected, not silently ignored."""
+    config = {
+        "spec_version": 1,
+        "name": "null-runtime",
+        "tools": {
+            "sandbox": {
+                "container_image": "python:3.12-slim",
+                "container_runtime": None,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(ValueError, match="container_runtime"):
+        parse(tmp_path)
 
 
 def test_parse_inline_mcp_skips_non_mcp_type_entries(tmp_path: Path) -> None:

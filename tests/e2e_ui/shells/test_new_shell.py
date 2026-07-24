@@ -27,9 +27,9 @@ Three behaviors are covered:
    it back via a file side-effect proved environment-fragile (the shell's
    cwd and the filesystem-API root coincide locally but not on CI).
 
-3. **The opened shell card lines up with the workspace rail.** The
-   expanded card and the rail both clear the 56px chat header, so their
-   top edges must agree; a clearance mismatch is asserted geometrically.
+3. **The workspace rail preserves its redesigned top inset.** The rail floats
+   beside the chat header at the 8px outer inset instead of clearing the
+   header like the main-column surfaces.
 
 Both use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
@@ -140,36 +140,31 @@ def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str
     expect(terminal_view).to_have_attribute("data-state", "connected")
 
 
-def test_expanded_shell_card_top_aligns_with_workspace_rail(
+def test_workspace_rail_preserves_outer_top_inset(
     page: Page, terminal_session: tuple[str, str]
 ) -> None:
-    """The expanded shell card's top edge lines up with the workspace rail.
+    """The workspace rail starts at the shell's 8px outer inset.
 
-    Both panels clear the same 56px absolute chat header: the terminal card
-    via ``pt-14`` on ``MainTerminalView``'s wrapper, the rail via ``mt-14``
-    on its ``<aside>``. When the two clearances disagree (the old ``pt-16``
-    left the card 8px lower than the rail) the panel tops read as visibly
-    ragged. Assert the two top edges agree within a hairline tolerance so a
-    future clearance drift is caught geometrically, not just by eye.
+    The old rail cleared the absolute chat header and aligned with expanded
+    main-column surfaces. The redesign deliberately extends it beside the
+    header, matching the sidebar's outer inset. Assert that geometry directly;
+    shell launch behavior remains covered by the two tests above.
     """
     base_url, session_id = terminal_session
 
     page.goto(f"{base_url}/c/{session_id}")
-    _open_new_shell(page)
-
-    main_terminal = page.get_by_test_id("main-terminal-view")
-    expect(main_terminal).to_be_visible(timeout=60_000)
-
-    # The bordered card is the wrapper's only child; its top edge is what
-    # the eye reads as the "top of the middle box". The rail's ``<aside>``
-    # is itself the floating card, so its own top edge is the comparison.
-    card = main_terminal.locator("> div").first
+    open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
+    header = page.get_by_role("banner")
     expect(rail).to_be_visible()
+    expect(header).to_be_visible()
 
-    card_top = card.evaluate("el => el.getBoundingClientRect().top")
     rail_top = rail.evaluate("el => el.getBoundingClientRect().top")
-    assert abs(card_top - rail_top) <= 2, (
-        f"terminal card top {card_top}px vs workspace rail top {rail_top}px "
-        "— the expanded shell card is not aligned with the rail"
+    header_bottom = header.evaluate("el => el.getBoundingClientRect().bottom")
+    assert abs(rail_top - 8) <= 2, (
+        f"workspace rail top {rail_top}px — expected the 8px outer inset"
+    )
+    assert rail_top < header_bottom, (
+        f"workspace rail top {rail_top}px vs header bottom {header_bottom}px "
+        "— expected the rail to extend beside the header"
     )

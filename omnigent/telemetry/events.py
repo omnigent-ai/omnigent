@@ -29,6 +29,9 @@ class SessionCreatedEvent:
         (``omnigent host``); ``None`` for CLI sessions.
     :param is_fork: ``True`` when the session was forked from another.
     :param is_sub_agent: ``True`` when ``sub_agent_name`` is set.
+    :param agent_name: Agent name for known multi-agent orchestrators
+        (e.g. ``"polly"``, ``"debby"``); ``None`` for all other agents to
+        avoid leaking user-defined agent names.
     """
 
     installation_id: str | None
@@ -40,6 +43,7 @@ class SessionCreatedEvent:
     host_installation_id: str | None
     is_fork: bool
     is_sub_agent: bool
+    agent_name: str | None = None
 
 
 @dataclass
