@@ -511,6 +511,24 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
   });
 
+  it("does not canonicalize partial time input while the field is focused", () => {
+    renderDialog();
+    const timeField = screen.getByTestId("schedule-time");
+
+    timeField.focus();
+    fireEvent.change(timeField, { target: { value: "" } });
+    fireEvent.change(timeField, { target: { value: "1" } });
+    expect(timeField).toHaveValue("1");
+    fireEvent.change(timeField, { target: { value: "1:" } });
+    expect(timeField).toHaveValue("1:");
+    fireEvent.change(timeField, { target: { value: "1:15" } });
+    expect(timeField).toHaveValue("1:15");
+    expect(screen.queryByTestId("schedule-error")).toBeNull();
+
+    fireEvent.blur(timeField);
+    expect(timeField).toHaveValue("01:15 AM");
+  });
+
   it("canonicalizes typed time on blur", () => {
     renderDialog();
     const timeField = screen.getByTestId("schedule-time");
