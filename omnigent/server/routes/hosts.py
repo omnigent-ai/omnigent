@@ -37,6 +37,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerFrame,
     HostListDirFrame,
     HostModelOptionsFrame,
+    HostOpenDirectoryDialogFrame,
     HostStoreSecretFrame,
     encode_host_frame,
 )
@@ -71,6 +72,15 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+# Per-call timeout for host.open_directory_dialog round-trips. The OS
+# folder chooser is user-driven — a slow user can take minutes to browse
+# and pick — so this is far more generous than the filesystem ops. The
+# host runs the dialog as a BACKGROUND task so its receive loop keeps
+# answering server keepalive pings while the user browses, so the tunnel
+# liveness window (PING_INTERVAL_S * PING_MISS_THRESHOLD ~= 90s) is NOT
+# the constraint here. If the host disconnects mid-dialog, deregister
+# fails the pending future promptly (well under this timeout).
+_NATIVE_DIRECTORY_DIALOG_TIMEOUT_S = 300.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -252,6 +262,68 @@ async def _proxy_create_dir(
         # Cleanup runs on every path so a cancelled caller doesn't
         # leave an orphan in the pending dict.
         host_conn.pending_create_dirs.pop(request_id, None)
+
+
+async def _proxy_open_directory_dialog(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+) -> dict[str, Any]:
+    """
+    Send a ``host.open_directory_dialog`` frame and await the result.
+
+    Mirrors :func:`_proxy_list_dir`: enqueue the frame, register a future
+    on the host connection's ``pending_directory_dialogs`` map, await with a
+    generous timeout (the user picks at their own pace), and clean up in a
+    finally block. The host's WS receive loop in ``host_tunnel.py`` resolves
+    the future when the result frame arrives.
+
+    :param host_registry: Server-side registry; used to enqueue the
+        outbound frame on the host's send queue.
+    :param host_conn: Live host connection.
+    :returns: Dict with the result fields: ``status`` (``"ok"``,
+    ``"cancelled"``, ``"unsupported"``, or ``"error"``), ``path`` (chosen
+    absolute path or ``None``), ``error`` (string or ``None``).
+    :raises HTTPException: 504 on timeout, 502 on connection drop.
+    """
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_directory_dialogs[request_id] = future
+
+    frame = encode_host_frame(
+        HostOpenDirectoryDialogFrame(request_id=request_id),
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_NATIVE_DIRECTORY_DIALOG_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not respond to the directory "
+                    f"dialog within {_NATIVE_DIRECTORY_DIALOG_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+        except ConnectionError as exc:
+            # The host disconnected mid-dialog (deregister failed this
+            # future fast); surface as 502 so the Web UI falls back to
+            # the in-app picker without waiting the full timeout.
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+    finally:
+        # Cleanup runs on every path so a cancelled caller doesn't leave an
+        # orphan in the pending dict.
+        host_conn.pending_directory_dialogs.pop(request_id, None)
 
 
 async def _proxy_install_harness(
@@ -522,6 +594,22 @@ async def _resolve_agent_harness(
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 
+def _live_host_capabilities(host_registry: HostRegistry, host_id: str) -> dict[str, Any] | None:
+    """Capabilities a live host advertised on THIS replica, else ``None``.
+
+    Surfaced from the in-memory registry (not the DB) on purpose: the native
+    directory dialog only works while the host's tunnel lands on this
+    replica (the dialog endpoint uses the same per-replica registry), so a
+    host connected to another replica must read as unsupported and fall back
+    to the in-app picker. ``None``/absent is the older-host posture — the
+    Web UI treats it as "no native dialog" and offers the picker unchanged.
+    """
+    conn = host_registry.get(host_id)
+    if conn is None:
+        return None
+    return conn.hello.capabilities
+
+
 def create_hosts_router(
     host_registry: HostRegistry,
     host_store: HostStore,
@@ -601,6 +689,7 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    "capabilities": _live_host_capabilities(host_registry, host.host_id),
                 }
             )
         return {"hosts": result}
@@ -639,6 +728,7 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "capabilities": _live_host_capabilities(host_registry, host.host_id),
             "runners": [],
         }
 
@@ -1204,6 +1294,66 @@ def create_hosts_router(
         return {
             "object": "directory",
             "path": result.get("path"),
+        }
+
+    @router.post("/hosts/{host_id}/native-directory-dialog")
+    async def open_host_native_directory_dialog(
+        request: Request,
+        host_id: str,
+    ) -> dict[str, Any]:
+        """Open the host's OS-native directory chooser.
+
+        Backs the Web UI new-session workspace picker's "Use system dialog"
+        action, shown only when the host advertises the
+        ``native_directory_dialog`` capability. The dialog runs ON THE HOST
+        (never the server) over the authenticated host tunnel and returns
+        the absolute POSIX path the user picked. Owner-scoped exactly like
+        the filesystem browse endpoints (``GET /v1/hosts/{id}/filesystem``):
+        only the host owner can request a dialog. The chosen path still
+        flows through the existing workspace validation at session-create
+        time, so this never weakens path/security checks.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``{"object": "native_directory_dialog", "status": ...,
+        "path": ..., "error": ...}``. ``status`` is ``"ok"`` (path set),
+        ``"cancelled"`` (user dismissed), ``"unsupported"`` (this host can't
+        show a native dialog — fall back to the in-app picker), or
+        ``"error"`` (the dialog failed — fall back to the picker).
+        :raises HTTPException: 404 if host not found, 403 if not owned by
+        caller, 409 if host is offline, 504 on host timeout, 502 on
+        connection drop.
+        """
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+        # Enforce the advertised capability server-side — never forward the
+        # dialog to a host that did not advertise ``native_directory_dialog``
+        # (older hosts, non-macOS, headless, or a GUI host a remote user
+        # selected). The 422 lets the Web UI fall back to the in-app picker
+        # without waiting on a host round-trip that would only say
+        # "unsupported".
+        caps = conn.hello.capabilities or {}
+        if not (isinstance(caps, dict) and caps.get("native_directory_dialog") is True):
+            raise HTTPException(
+                status_code=422,
+                detail="host does not support the native directory dialog",
+            )
+        result = await _proxy_open_directory_dialog(
+            host_registry=host_registry,
+            host_conn=conn,
+        )
+        return {
+            "object": "native_directory_dialog",
+            "status": result.get("status"),
+            "path": result.get("path"),
+            "error": result.get("error"),
         }
 
     @router.post("/hosts/{host_id}/harnesses/{harness}/install")

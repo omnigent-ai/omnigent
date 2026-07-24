@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
     HostModelOptionsResultFrame,
+    HostOpenDirectoryDialogResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -662,6 +663,17 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "models": frame.models,
+                        "error": frame.error,
+                    }
+                )
+            continue
+        if isinstance(frame, HostOpenDirectoryDialogResultFrame):
+            dialog_future = conn.pending_directory_dialogs.pop(frame.request_id, None)
+            if dialog_future is not None and not dialog_future.done():
+                dialog_future.set_result(
+                    {
+                        "status": frame.status,
+                        "path": frame.path,
                         "error": frame.error,
                     }
                 )

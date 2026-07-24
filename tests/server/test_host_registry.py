@@ -354,3 +354,39 @@ def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
     # Deregistering by any spelling removes the entry.
     registry.deregister(prefixed)
     assert registry.get(bare) is None
+
+
+async def test_deregister_fails_pending_directory_dialog_future() -> None:
+    """Disconnect fails in-flight dialog futures fast (no timeout hang).
+
+    When a host drops mid-dialog, its tunnel can never deliver the result,
+    so deregister must reject the pending future with a ConnectionError
+    promptly — otherwise the endpoint hangs to its 300s timeout. The same
+    guarantee covers list_dir / model_options / stat pending futures.
+    """
+    registry = HostRegistry()
+    conn = registry.register(
+        "host_dialog",
+        FakeWebSocket(),
+        _make_hello(),
+        owner="alice",
+    )
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, object]] = loop.create_future()
+    conn.pending_directory_dialogs["req_open"] = future
+    # Also seed a list_dir future to confirm ALL pending stores are drained.
+    list_future: asyncio.Future[dict[str, object]] = loop.create_future()
+    conn.pending_list_dirs["req_ls"] = list_future
+
+    registry.deregister("host_dialog")
+
+    assert registry.get("host_dialog") is None
+    assert future.done()
+    with pytest.raises(ConnectionError):
+        await future
+    assert list_future.done()
+    with pytest.raises(ConnectionError):
+        await list_future
+    # The pending stores are cleared so a late result can't resurrect them.
+    assert conn.pending_directory_dialogs == {}
+    assert conn.pending_list_dirs == {}

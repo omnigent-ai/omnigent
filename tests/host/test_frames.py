@@ -29,6 +29,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostOpenDirectoryDialogFrame,
+    HostOpenDirectoryDialogResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -1436,3 +1438,175 @@ def test_fs_result_null_payload_round_trip() -> None:
     assert isinstance(decoded, HostFsResultFrame)
     assert decoded.payload is None
     assert decoded.error_status == 500
+
+
+def test_open_directory_dialog_frames_round_trip() -> None:
+    """
+    Verify the open-directory-dialog frames survive encode → decode.
+
+    If a field is dropped, the server would never correlate a dialog
+    result back to its request (request_id) or lose the chosen path /
+    status, and the Web UI would fall back to the picker on a valid pick.
+    """
+    request = decode_host_frame(
+        encode_host_frame(HostOpenDirectoryDialogFrame(request_id="req_dialog")),
+    )
+    assert request == HostOpenDirectoryDialogFrame(request_id="req_dialog")
+
+    # Success: a chosen path survives the round-trip.
+    ok = decode_host_frame(
+        encode_host_frame(
+            HostOpenDirectoryDialogResultFrame(
+                request_id="req_dialog",
+                status="ok",
+                path="/Users/corey/projects/omnigent",
+                error=None,
+            ),
+        ),
+    )
+    assert ok == HostOpenDirectoryDialogResultFrame(
+        request_id="req_dialog",
+        status="ok",
+        path="/Users/corey/projects/omnigent",
+        error=None,
+    )
+
+    # Cancel + unsupported + error statuses all carry through with path
+    # left None so the UI can branch on status alone.
+    for status in ("cancelled", "unsupported", "error"):
+        decoded = decode_host_frame(
+            encode_host_frame(
+                HostOpenDirectoryDialogResultFrame(
+                    request_id="req_dialog",
+                    status=status,
+                    path=None,
+                    error="boom" if status == "error" else None,
+                ),
+            ),
+        )
+        assert decoded.status == status
+        assert decoded.path is None
+        assert decoded.error == ("boom" if status == "error" else None)
+
+
+def test_hello_frame_capabilities_round_trip() -> None:
+    """
+    Verify HostHelloFrame carries an advertised capabilities map.
+
+    A local macOS host advertises {native_directory_dialog: True}; if the
+    field is dropped on decode, the Web UI would never offer the native
+    dialog even on a host that supports it.
+    """
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="corey-laptop",
+        capabilities={"native_directory_dialog": True},
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capabilities == {"native_directory_dialog": True}
+
+
+def test_hello_frame_capabilities_default_none() -> None:
+    """
+    Verify an older host (no capabilities field) decodes as None.
+
+    Backward compatibility: a hello frame without the capabilities field
+    must decode to None, which the server surfaces as "no native dialog"
+    so the Web UI falls back to the in-app picker — never a KeyError or
+    a false "supported" read.
+    """
+    # Mimic the EXACT bytes an older host (pre-capabilities) would have
+    # sent: a hello payload with NO capabilities key at all. The decoder
+    # must treat its absence as None, never a KeyError — that is the
+    # backward-compat contract (a newer server still serves an older host
+    # and the Web UI falls back to the in-app picker).
+    legacy_payload = json.dumps(
+        {
+            "kind": "host.hello",
+            "version": "0.1.0",
+            "frame_protocol_version": 1,
+            "name": "laptop",
+            "runners": [],
+            "configured_harnesses": None,
+            "telemetry_opt_out": False,
+            "installation_id": None,
+        }
+    )
+    assert "capabilities" not in json.loads(legacy_payload)
+    decoded = decode_host_frame(legacy_payload)
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capabilities is None
+
+    # A new host encoding capabilities=None emits an explicit null (mirrors
+    # the existing configured_harnesses/installation_id posture); that too
+    # must decode to None so absence and explicit-null are interchangeable.
+    encoded = encode_host_frame(
+        HostHelloFrame(version="0.1.0", frame_protocol_version=1, name="laptop"),
+    )
+    assert json.loads(encoded)["capabilities"] is None
+    assert decode_host_frame(encoded).capabilities is None
+
+
+def test_decode_open_directory_dialog_result_rejects_non_absolute_ok_path() -> None:
+    """An 'ok' result must carry a non-empty absolute path (protocol boundary).
+
+    A buggy or malicious host could return a relative or empty path on
+    success; the decoder rejects it so a relative path can never reach the
+    workspace field (the in-app picker only ever yields absolute paths, and
+    session-create validation assumes an absolute workspace). Cancelled /
+    unsupported / error statuses are unaffected (path is None).
+    """
+    # Relative path on ok → rejected.
+    with pytest.raises(ValueError, match="absolute path"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.open_directory_dialog_result",
+                    "request_id": "r1",
+                    "status": "ok",
+                    "path": "relative/x",
+                    "error": None,
+                }
+            ),
+        )
+    # Empty path on ok → rejected.
+    with pytest.raises(ValueError, match="absolute path"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.open_directory_dialog_result",
+                    "request_id": "r1",
+                    "status": "ok",
+                    "path": "",
+                    "error": None,
+                }
+            ),
+        )
+    # Missing path on ok → rejected.
+    with pytest.raises(ValueError, match="absolute path"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.open_directory_dialog_result",
+                    "request_id": "r1",
+                    "status": "ok",
+                    "error": None,
+                }
+            ),
+        )
+    # An absolute ok path is accepted.
+    ok = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.open_directory_dialog_result",
+                "request_id": "r1",
+                "status": "ok",
+                "path": "/Users/corey/picked",
+                "error": None,
+            }
+        ),
+    )
+    assert isinstance(ok, HostOpenDirectoryDialogResultFrame)
+    assert ok.path == "/Users/corey/picked"

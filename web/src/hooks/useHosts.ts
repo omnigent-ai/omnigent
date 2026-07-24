@@ -20,6 +20,15 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
+  /**
+   * Live capabilities this host advertised on the replica the API request
+   * landed on (mirrored from the in-memory host registry, not persisted).
+   * `null`/absent means either the host is offline or connected to a
+   * different replica (so a capability-driven action like the native
+   * directory dialog must read as unsupported and fall back to the in-app
+   * picker). Today the only capability is `native_directory_dialog`.
+   */
+  capabilities?: { native_directory_dialog?: boolean } | null;
 }
 
 interface HostsResponse {
@@ -137,4 +146,22 @@ export function useInstallHarness(hostId: string) {
       );
     },
   });
+}
+
+/**
+ * Whether a host can show its OS-native directory chooser on THIS replica.
+ *
+ * True only when the host advertised `native_directory_dialog` over its
+ * tunnel on the replica serving the current API request (capabilities are
+ * read from the in-memory registry, not the DB). Older hosts, offline hosts,
+ * hosts on another replica, and non-macOS / headless hosts all read as
+ * `false` — the caller falls back to the in-app WorkspacePicker.
+ *
+ * @param host Host to check (e.g. the selected host from `useHosts`).
+ * @returns Whether the native directory dialog should be offered.
+ */
+export function hostSupportsNativeDirectoryDialog(
+  host: Pick<Host, "capabilities"> | null | undefined,
+): boolean {
+  return Boolean(host?.capabilities?.native_directory_dialog);
 }

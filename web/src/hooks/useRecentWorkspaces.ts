@@ -70,6 +70,10 @@ export function useRecentWorkspaces(hostId: string | null): RecentWorkspaces {
   // previous host's paths right after a host switch (a cross-host leak).
   const recent = useMemo(
     () => (hostId === null ? [] : (readAll()[hostId] ?? [])),
+    // `revision` is an intentional cache-buster: addRecent writes to
+    // localStorage then bumps revision so this memo recomputes. It is not
+    // referenced in the body, which exhaustive-deps flags — suppress.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [hostId, revision],
   );
 

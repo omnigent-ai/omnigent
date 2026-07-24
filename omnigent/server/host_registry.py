@@ -250,6 +250,12 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param pending_directory_dialogs: Per-``request_id`` futures for
+        in-flight ``host.open_directory_dialog`` requests (the OS-native
+        folder chooser). Resolved when the host sends
+        ``host.open_directory_dialog_result``. Values carry the result fields
+        (``status``, ``path``, ``error``). Same ``Any`` typing rationale as
+        ``pending_stats``.
     """
 
     workspace_id: int
@@ -306,6 +312,44 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_directory_dialogs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+
+
+def _fail_pending_futures(
+    conn: HostConnection,
+    reason: str,
+) -> None:
+    """Reject every in-flight host request future on a dropped connection.
+
+    Called from :meth:`HostRegistry.deregister` so a host disconnect fails
+    pending ``list_dir`` / ``model_options`` / ``open_directory_dialog``
+    requests promptly instead of hanging to their per-call timeout — the
+    host can never reply once its tunnel is gone. ``asyncio.Future`` is
+    loop-bound, so only futures not yet done are failed.
+
+    :param conn: The host connection being deregistered.
+    :param reason: Short human-readable cause stamped on the exception.
+    """
+    for store in (
+        conn.pending_stats,
+        conn.pending_list_dirs,
+        conn.pending_create_worktrees,
+        conn.pending_remove_worktrees,
+        conn.pending_list_worktrees,
+        conn.pending_create_dirs,
+        conn.pending_installs,
+        conn.pending_secret_writes,
+        conn.pending_credential_detects,
+        conn.pending_fs_requests,
+        conn.pending_model_options,
+        conn.pending_directory_dialogs,
+    ):
+        for future in list(store.values()):
+            if not future.done():
+                future.set_exception(ConnectionError(reason))
+        store.clear()
 
 
 class HostRegistry:
@@ -394,7 +438,12 @@ class HostRegistry:
         """
         ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
-            self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
+            conn = self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
+        if conn is not None:
+            _fail_pending_futures(
+                conn,
+                f"host '{_canonical_host_id(host_id)}' disconnected",
+            )
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.
