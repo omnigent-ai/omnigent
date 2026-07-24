@@ -4,8 +4,18 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ConfigError(Exception):
+    """A configuration problem stated in operator-friendly terms.
+
+    Raised by :func:`load_settings` instead of surfacing a raw pydantic
+    ``ValidationError`` (internal field names + a traceback). The message is
+    safe and useful to print straight to a terminal.
+    """
+
 
 # Auth posture the bot assumes for its Omnigent server. ``auto`` probes the
 # server (the historical behaviour — device grant / OIDC ticket). ``databricks``
@@ -85,9 +95,13 @@ def _local_data_dir() -> Path:
 
 
 class Settings(BaseSettings):
+    # Config is read from real environment variables only — no ``env_file``.
+    # This mirrors ``omni server`` / the core CLI, which load no ``.env``:
+    # whatever populates the environment (shell, ``uv run``, the Docker /
+    # Databricks deploy) is the single source of truth. For local dev, export
+    # the vars or run under a tool that injects them (e.g. ``uv run`` reading a
+    # ``.env``). See integrations/slack/README.
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
     )
@@ -148,18 +162,6 @@ class Settings(BaseSettings):
         validation_alias="OMNIGENT_SLACK_SERVER_AUTH",
     )
 
-    # Databricks workspace host the custom U2M OAuth app is registered in, e.g.
-    # ``https://my-workspace.cloud.databricks.com``. The bot hits its
-    # ``/oidc/v1/authorize`` and ``/oidc/v1/token`` endpoints. Distinct from
-    # server_url (the *.databricksapps.com app). Defaults to the platform-
-    # injected DATABRICKS_HOST when unset (the OAuth app lives in the same
-    # workspace the bot runs in); required — directly or via DATABRICKS_HOST —
-    # in databricks mode.
-    databricks_workspace_host: str | None = Field(
-        default_factory=lambda: _normalize_host(os.environ.get("DATABRICKS_HOST")),
-        validation_alias="OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST",
-    )
-
     # Custom U2M OAuth app credentials (client id + secret) registered in the
     # workspace above. The client id is public; the secret authenticates the
     # token/refresh calls. Both required in databricks mode.
@@ -195,18 +197,12 @@ class Settings(BaseSettings):
     )
 
     # Public base URL of this bot's own Databricks App (where the enrollment
-    # page is reachable), used to build the link posted into Slack. Defaults to
-    # DATABRICKS_APP_URL when the platform injects it.
-    databricks_webauth_base_url: str | None = Field(
+    # page is reachable), used to build the link posted into Slack and as the
+    # OAuth redirect base. The operator must supply it: the platform injects no
+    # app-URL env var, and the app's URL only exists after its first deploy.
+    databricks_app_url: str | None = Field(
         default=None,
-        validation_alias="OMNIGENT_SLACK_WEBAUTH_BASE_URL",
-    )
-
-    # Port the enrollment web server binds. Databricks Apps route to
-    # DATABRICKS_APP_PORT (8000 by convention); honour it by default.
-    databricks_webauth_port: int = Field(
-        default_factory=lambda: int(os.environ.get("DATABRICKS_APP_PORT", "8000")),
-        validation_alias="OMNIGENT_SLACK_WEBAUTH_PORT",
+        validation_alias="OMNIGENT_SLACK_DATABRICKS_APP_URL",
     )
 
     @field_validator("server_url")
@@ -227,9 +223,31 @@ class Settings(BaseSettings):
         return value
 
     @property
+    def databricks_workspace_host(self) -> str | None:
+        """Workspace host the custom U2M OAuth app is registered in.
+
+        The bot hits this host's ``/oidc/v1/authorize`` and ``/oidc/v1/token``
+        endpoints. Distinct from ``server_url`` (the *.databricksapps.com app).
+        Read from the platform-injected ``DATABRICKS_HOST`` — the OAuth app lives
+        in the same workspace the bot runs in. A scheme-less value is defaulted
+        to https; ``None`` when unset (a laptop run must export ``DATABRICKS_HOST``).
+        """
+        return _normalize_host(os.environ.get("DATABRICKS_HOST"))
+
+    @property
+    def databricks_webauth_port(self) -> int:
+        """Port the enrollment web server binds.
+
+        Databricks Apps route inbound traffic to ``DATABRICKS_APP_PORT`` (8000
+        by convention) and inject it into the container, so the server binds
+        that. Falls back to 8000 for a laptop run where it's unset.
+        """
+        return int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
+
+    @property
     def webauth_base_url(self) -> str | None:
         """Public base URL of this bot's enrollment page (for the Slack link)."""
-        base = self.databricks_webauth_base_url or os.environ.get("DATABRICKS_APP_URL")
+        base = self.databricks_app_url
         return base.strip().rstrip("/") if base else None
 
     @property
@@ -248,14 +266,6 @@ class Settings(BaseSettings):
         """Requested scopes with ``openid`` + ``offline_access`` forced on."""
         return _normalize_oauth_scopes(self.databricks_oauth_scopes)
 
-    @field_validator("databricks_workspace_host")
-    @classmethod
-    def _normalize_workspace_host(cls, value: str | None) -> str | None:
-        # A scheme-less host (e.g. DATABRICKS_HOST, or an operator typing just the
-        # hostname) is defaulted to https. The model validator then enforces https
-        # for any non-loopback host.
-        return _normalize_host(value)
-
     @model_validator(mode="after")
     def _check_databricks_config(self) -> Settings:
         """Fail fast when databricks mode is missing required config.
@@ -271,9 +281,9 @@ class Settings(BaseSettings):
                 ("OMNIGENT_SLACK_DATABRICKS_CLIENT_ID", self.databricks_oauth_client_id),
                 ("OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET", self.databricks_oauth_client_secret),
                 ("OMNIGENT_SLACK_DATABRICKS_STATE_SECRET", self.databricks_state_secret),
-                # workspace_host defaults to DATABRICKS_HOST (injected on the
-                # platform); still required for a laptop run where it's unset.
-                ("OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST", self.databricks_workspace_host),
+                # workspace_host is DATABRICKS_HOST (injected on the platform);
+                # still required for a laptop run where it's unset.
+                ("DATABRICKS_HOST", self.databricks_workspace_host),
             )
             if not value
         ]
@@ -291,7 +301,7 @@ class Settings(BaseSettings):
         host = self.databricks_workspace_host or ""
         if host.startswith("http://") and not _is_loopback_url(host):
             raise ValueError(
-                "OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST must use https:// "
+                "DATABRICKS_HOST must use https:// "
                 "(plaintext exposes the client secret and lets an on-path "
                 "attacker forge the id_token identity)"
             )
@@ -303,7 +313,7 @@ class Settings(BaseSettings):
         base = self.webauth_base_url or ""
         if base.startswith("http://") and not _is_loopback_url(base):
             raise ValueError(
-                "OMNIGENT_SLACK_WEBAUTH_BASE_URL must use https:// "
+                "OMNIGENT_SLACK_DATABRICKS_APP_URL must use https:// "
                 "(it is the OAuth redirect target — plaintext would expose the "
                 "authorization code and the consent page's identity data)"
             )
@@ -319,5 +329,68 @@ class Settings(BaseSettings):
         return self
 
 
+# Required env vars → a short human label, so a missing-config error can name
+# exactly what to set. Only the fields with no default are truly required.
+_REQUIRED_ENV_VARS: dict[str, str] = {
+    "OMNIGENT_SLACK_BOT_TOKEN": "Slack bot token (xoxb-…)",
+    "OMNIGENT_SLACK_APP_TOKEN": "Slack app-level token (xapp-…)",
+    "OMNIGENT_SERVER_URL": "Omnigent server URL (https://…)",
+}
+
+
 def load_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    """Load settings from the environment, with an operator-friendly error.
+
+    A missing/invalid config raises :class:`ConfigError` carrying a message
+    fit to print directly — naming the missing environment variables and how
+    to set them — instead of a raw pydantic ``ValidationError`` traceback.
+    Config is read from real environment variables only (no ``.env`` loading);
+    see the module docstring / integrations/slack/README.
+    """
+    try:
+        return Settings()  # type: ignore[call-arg]
+    except ValidationError as exc:
+        # Separate the two failure kinds so the message is precise: a required
+        # var not set at all (pydantic "missing") vs. a value that failed a
+        # validator (bad URL, bad auth mode, …).
+        missing: list[str] = []
+        invalid: list[str] = []
+        for err in exc.errors():
+            # The field's env alias is the useful name to show; fall back to
+            # the field name when a loc isn't a known field.
+            field = str(err["loc"][0]) if err["loc"] else ""
+            env_name = _env_alias_for(field)
+            if err["type"] == "missing":
+                missing.append(env_name)
+            else:
+                invalid.append(f"{env_name}: {err['msg']}")
+
+        lines: list[str] = []
+        if missing:
+            lines.append("Missing required configuration. Set these environment variables:")
+            for name in missing:
+                label = _REQUIRED_ENV_VARS.get(name, "")
+                lines.append(f"  • {name}" + (f"  — {label}" if label else ""))
+        if invalid:
+            if lines:
+                lines.append("")
+            lines.append("Invalid configuration:")
+            lines.extend(f"  • {item}" for item in invalid)
+        lines.append(
+            "\nThe bot reads config from the environment (it does NOT load a .env "
+            "file itself). Export the variables, or launch under a tool that "
+            "injects them — e.g. `uv run --env-file .env omni integration slack`. "
+            "See integrations/slack/.env.example for the full set."
+        )
+        raise ConfigError("\n".join(lines)) from exc
+
+
+def _env_alias_for(field_name: str) -> str:
+    """Return the env-var alias for a Settings field (fallback: the field name).
+
+    The friendly error names the environment variable the operator sets (e.g.
+    ``OMNIGENT_SERVER_URL``), not the internal snake_case field (``server_url``).
+    """
+    info = Settings.model_fields.get(field_name)
+    alias = getattr(info, "validation_alias", None) if info is not None else None
+    return alias if isinstance(alias, str) else field_name.upper()

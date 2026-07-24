@@ -68,6 +68,9 @@ async def test_start_login_device_grant() -> None:
     )
     pending = await start_login(_BASE, client_id="slack")
     try:
+        # One-click link: the code is prefilled (verification_uri_complete). The
+        # anti-phishing guarantee is the consent page's forced re-auth, not code
+        # entry, so the convenient prefilled link is retained.
         assert "user_code=ABCD-2345" in pending.verification_url
         assert pending.user_code == "ABCD-2345"
         # client_id is forwarded to the authorize call.

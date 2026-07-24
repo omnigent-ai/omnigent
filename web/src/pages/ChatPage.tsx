@@ -1134,6 +1134,8 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
+      showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
+      showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
       costRoutingEligible={costRoutingEligible}
       subAgentLabel={subAgentLabel}
     />
@@ -1363,6 +1365,10 @@ interface MainAgentSurfaceProps {
   showCodexPlanMode: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
+  /** Show Polly's Claude SDK command-backed Goal control. */
+  showClaudeGoalControl?: boolean;
+  /** Show Polly's Codex command-backed Goal control. */
+  showPollyCodexGoalControl?: boolean;
   /** Session passes `isCostRoutingSession` (polly orchestrator, not a child). */
   costRoutingEligible: boolean;
   /**
@@ -1433,6 +1439,8 @@ function MainAgentSurface({
   codexModelOptions,
   showCodexPlanMode,
   showGoalControl = false,
+  showClaudeGoalControl = false,
+  showPollyCodexGoalControl = false,
   costRoutingEligible,
   subAgentLabel,
 }: MainAgentSurfaceProps) {
@@ -1840,6 +1848,8 @@ function MainAgentSurface({
         codexModelOptions={codexModelOptions}
         showCodexPlanMode={showCodexPlanMode}
         showGoalControl={showGoalControl}
+        showClaudeGoalControl={showClaudeGoalControl}
+        showPollyCodexGoalControl={showPollyCodexGoalControl}
         isTerminalFirst={isTerminalFirst}
         isNativeWrapper={isNativeWrapper}
         reconnectHint={liveness.kind === "runner_asleep" || liveness.kind === "host_asleep"}
@@ -3360,6 +3370,10 @@ interface ComposerProps {
   showCodexPlanMode: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
+  /** Show Polly's Claude SDK command-backed Goal control. */
+  showClaudeGoalControl?: boolean;
+  /** Show Polly's Codex command-backed Goal control. */
+  showPollyCodexGoalControl?: boolean;
   /**
    * Terminal-first session (Chat/Terminal pill present). Presentation
    * only: tightens the composer's bottom padding to `pb-1.5` so it sits
@@ -3827,6 +3841,8 @@ export function Composer({
   codexModelOptions,
   showCodexPlanMode,
   showGoalControl = false,
+  showClaudeGoalControl = false,
+  showPollyCodexGoalControl = false,
   isTerminalFirst = false,
   isNativeWrapper = false,
   reconnectHint = false,
@@ -4983,6 +4999,24 @@ export function Composer({
                 backendLabel="Codex"
               />
             )}
+            {showClaudeGoalControl && (
+              <GoalControl
+                mode="command"
+                conversationId={conversationId}
+                readOnly={isReadOnly}
+                onStartGoal={(condition) => onSend(`/goal ${condition}`)}
+                backendLabel="Claude"
+              />
+            )}
+            {showPollyCodexGoalControl && (
+              <GoalControl
+                mode="command"
+                conversationId={conversationId}
+                readOnly={isReadOnly}
+                onStartGoal={(condition) => onSend(`/goal ${condition}`)}
+                backendLabel="Codex"
+              />
+            )}
             <ComposerModelEffortLabel
               showModels={showModels}
               showEffort={showEffort}
@@ -5348,6 +5382,28 @@ export function shouldShowGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
+}
+
+/** True for top-level Polly sessions running on the Claude SDK harness. */
+export function shouldShowPollyClaudeGoalControl(
+  session: Pick<Session, "agentName" | "harness" | "parentSessionId"> | null | undefined,
+): boolean {
+  return (
+    session?.parentSessionId == null &&
+    session?.agentName?.toLowerCase() === "polly" &&
+    session?.harness === "claude-sdk"
+  );
+}
+
+/** True for top-level Polly sessions running on the Codex harness. */
+export function shouldShowPollyCodexGoalControl(
+  session: Pick<Session, "agentName" | "harness" | "parentSessionId"> | null | undefined,
+): boolean {
+  return (
+    session?.parentSessionId == null &&
+    session?.agentName?.toLowerCase() === "polly" &&
+    session?.harness === "codex"
+  );
 }
 
 /**

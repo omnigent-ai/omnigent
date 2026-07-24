@@ -21,6 +21,7 @@ from omnigent.inner.codex_executor import (
     _CodexAppServerSession,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
+    _goal_objective_from_content,
     _prompt_for_turn,
     _to_codex_input_items,
 )
@@ -346,6 +347,28 @@ class TestCodexExecutor(unittest.TestCase):
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
 
+    def test_goal_objective_requires_a_standalone_command(self):
+        self.assertEqual(
+            _goal_objective_from_content("  /goal Finish the implementation  "),
+            "Finish the implementation",
+        )
+        self.assertIsNone(_goal_objective_from_content("/goal"))
+        self.assertIsNone(_goal_objective_from_content("Please run /goal now"))
+        self.assertEqual(
+            _goal_objective_from_content(
+                [{"type": "input_text", "text": "/goal Finish from the web"}]
+            ),
+            "Finish from the web",
+        )
+        self.assertIsNone(
+            _goal_objective_from_content(
+                [
+                    {"type": "input_text", "text": "/goal nope"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                ]
+            )
+        )
+
     def test_run_turn_delegates_to_app_server_session(self):
         async def _t():
             fake_session = _FakeAppSession(
@@ -520,6 +543,127 @@ class TestCodexExecutor(unittest.TestCase):
             params = thread_start_call.args[1]
             self.assertNotIn("shell_tool", params["config"]["features"])
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
+
+        _run(_t())
+
+    def test_app_server_run_turn_starts_goal_before_objective_turn(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "Finish and test"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "/goal Finish and test"}],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            calls = session._request.await_args_list
+            self.assertEqual(
+                [call.args[0] for call in calls],
+                ["thread/start", "thread/goal/set", "turn/start"],
+            )
+            self.assertEqual(
+                calls[1].args[1],
+                {"threadId": "thread-1", "objective": "Finish and test"},
+            )
+            self.assertEqual(
+                calls[2].args[1]["input"],
+                [{"type": "text", "text": "Finish and test"}],
+            )
+
+        _run(_t())
+
+    def test_app_server_new_goal_thread_replays_history_without_command(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "Finish and test"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[
+                    {"role": "user", "content": "Remember the passphrase is ORCHID."},
+                    {"role": "assistant", "content": "I will remember it."},
+                    {"role": "user", "content": "/goal Finish and test"},
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            calls = session._request.await_args_list
+            self.assertEqual(
+                calls[1].args[1],
+                {"threadId": "thread-1", "objective": "Finish and test"},
+            )
+            self.assertEqual(
+                calls[2].args[1]["input"],
+                [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Conversation so far:\n"
+                            "user: Remember the passphrase is ORCHID.\n"
+                            "assistant: I will remember it.\n"
+                            "user: Finish and test\n\n"
+                            "Respond to the latest user message, using the conversation "
+                            "above as context."
+                        ),
+                    }
+                ],
+            )
 
         _run(_t())
 

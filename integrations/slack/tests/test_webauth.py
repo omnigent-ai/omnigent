@@ -19,6 +19,13 @@ _WORKSPACE = "https://ws.cloud.databricks.com"
 _STATE_SECRET = "state-secret-0123456789abcdef0123456789"
 
 
+@pytest.fixture(autouse=True)
+def _workspace_host_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The workspace host is sourced from the platform-injected DATABRICKS_HOST
+    # (no bot-specific override), so provide it for the databricks-mode Settings.
+    monkeypatch.setenv("DATABRICKS_HOST", _WORKSPACE)
+
+
 def _settings() -> Settings:
     return Settings(
         _env_file=None,  # type: ignore[call-arg]
@@ -26,8 +33,7 @@ def _settings() -> Settings:
         OMNIGENT_SLACK_APP_TOKEN="xapp-x",
         OMNIGENT_SERVER_URL="https://omnigent.example.com",
         OMNIGENT_SLACK_SERVER_AUTH="databricks",
-        OMNIGENT_SLACK_WEBAUTH_BASE_URL="https://slackbot.example.com",
-        OMNIGENT_SLACK_DATABRICKS_WORKSPACE_HOST=_WORKSPACE,
+        OMNIGENT_SLACK_DATABRICKS_APP_URL="https://slackbot.example.com",
         OMNIGENT_SLACK_DATABRICKS_CLIENT_ID="client-id",
         OMNIGENT_SLACK_DATABRICKS_CLIENT_SECRET="client-secret",
         OMNIGENT_SLACK_DATABRICKS_STATE_SECRET=_STATE_SECRET,
@@ -144,8 +150,7 @@ def test_enrollment_url_none_without_email() -> None:
 
 
 def test_enrollment_url_none_without_base(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("DATABRICKS_APP_URL", raising=False)
-    settings = _settings().model_copy(update={"databricks_webauth_base_url": None})
+    settings = _settings().model_copy(update={"databricks_app_url": None})
     server = WebAuthServer(settings, InMemoryTokenStore(), oauth_client=FakeOAuthClient(_tokens()))  # type: ignore[arg-type]
     assert settings.webauth_base_url is None
     assert server.enrollment_url("T1", "U1", _EMAIL) is None

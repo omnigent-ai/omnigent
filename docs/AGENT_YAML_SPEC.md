@@ -260,11 +260,15 @@ Use `container_image` for new specs; `docker_image` remains accepted as a
 deprecated alias for backwards compatibility. Set `container_runtime: podman` to
 run the image with Podman instead of Docker.
 
+The runtime can also be set globally via the `OMNIGENT_CONTAINER_RUNTIME`
+environment variable (accepted values: `docker`, `podman`). The per-agent
+`container_runtime` YAML key takes precedence over the environment variable.
+
 ```yaml
 tools:
   sandbox:
     container_image: python:3.12-slim
-    container_runtime: podman  # optional; defaults to docker
+    container_runtime: podman  # optional; defaults to docker (or OMNIGENT_CONTAINER_RUNTIME)
 ```
 
 ### Sub-agent tool

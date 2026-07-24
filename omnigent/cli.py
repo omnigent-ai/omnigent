@@ -3409,20 +3409,19 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the routing client when the feature is enabled via
-    # OMNIGENT_SMART_ROUTING=1. Two mutually-exclusive providers, chosen
-    # by ``routing.provider``:
-    #   - ``external``: call an external ``routes:select`` service.
-    #   - ``llm`` (default): the built-in judge using the ``llm:`` block.
-    # Hidden by default — managed deployments override
+    # Build the routing client from configuration alone — no opt-in env needed.
+    # Two mutually-exclusive providers, chosen by ``routing.provider``:
+    #   - ``external``: call an external ``routes:select`` service (built when a
+    #     ``routing:`` block declares ``provider: external``).
+    #   - ``llm`` (default): the built-in judge using the ``llm:`` block (built
+    #     whenever a server ``llm:`` block is configured).
+    # Stays None when neither is configured. Managed deployments override
     # RuntimeCaps.routing_client with their own implementation.
-    routing_client = None
-    if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
-        routing_cfg = cfg.get("routing")
-        if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
-            routing_client = _build_external_routing_client(routing_cfg)
-        else:
-            routing_client = _build_local_llm_routing_client(server_llm)
+    routing_cfg = cfg.get("routing")
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        routing_client = _build_external_routing_client(routing_cfg)
+    else:
+        routing_client = _build_local_llm_routing_client(server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
@@ -8056,29 +8055,6 @@ def _slack_argv() -> list[str]:
     return [sys.executable, "-m", _SLACK_PACKAGE]
 
 
-def _slack_cwd() -> Path | None:
-    """Directory to run the Slack bot from, so its ``.env`` resolves.
-
-    The bot's ``Settings`` loads a CWD-relative ``.env``; a background daemon
-    otherwise inherits whatever directory ``omni`` was launched from and
-    silently misses config. For a source/editable install the package lives at
-    ``<integration>/src/omnigent_slack``, so the integration dir (holding the
-    ``.env``) is three parents up. Returns that dir only when it actually holds
-    a ``.env``; otherwise ``None`` (a wheel install has no such dir — config
-    then comes from real environment variables).
-    """
-    import importlib.util
-
-    spec = importlib.util.find_spec(_SLACK_PACKAGE)
-    if spec is None or not spec.origin:
-        return None
-    origin = Path(spec.origin)
-    if len(origin.parents) < 3:
-        return None
-    integration_dir = origin.parents[2]
-    return integration_dir if (integration_dir / ".env").is_file() else None
-
-
 def _integration_state_dir() -> Path:
     """Runtime dir for integration daemon records (honors OMNIGENT_DATA_DIR)."""
     from omnigent.host.local_server import _local_data_dir
@@ -8100,33 +8076,59 @@ def integration(ctx: click.Context) -> None:
       slack   The @omnigent Slack socket-mode bot.
 
     Run ``omni integration slack`` to start the Slack bot in the foreground,
-    or ``omni integration slack start`` to run it in the background.
+    or ``omni integration slack --background`` to run it in the background.
     """
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
 
 @integration.group("slack", invoke_without_command=True)
+@click.option(
+    "--background",
+    "background",
+    is_flag=True,
+    default=False,
+    help=(
+        "Spawn the Slack bot as a detached background daemon (returning "
+        "immediately) instead of running it in the foreground. Reuses a "
+        "healthy background daemon if one is already up."
+    ),
+)
 @click.pass_context
-def slack(ctx: click.Context) -> None:
-    """Run the @omnigent Slack socket-mode bot (foreground).
+def slack(ctx: click.Context, background: bool) -> None:
+    """Run the @omnigent Slack socket-mode bot.
 
     \b
     Bare invocation runs in the FOREGROUND (Ctrl-C to stop):
       omni integration slack
-    Manage a BACKGROUND daemon with the subcommands:
-      omni integration slack start    # spawn detached, return immediately
+    Pass --background to spawn it as a detached daemon instead:
+      omni integration slack --background   # spawn detached, return immediately
+    Manage that background daemon with the subcommands:
       omni integration slack status   # is it running?
       omni integration slack stop     # terminate the daemon
       omni integration slack logs     # where the daemon logs (-f to tail)
 
-    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from the environment
-    and the integration's .env file — see integrations/slack/.env.example.
+    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from environment
+    variables — the bot does not read a .env file itself (matching
+    ``omni server``). Export them, or launch under a tool that injects a .env
+    (e.g. ``uv run --env-file .env``). See integrations/slack/.env.example for
+    the full set; a missing required var prints a friendly error and exits.
+
+    :param background: When True, spawn the detached background daemon (the
+        former ``slack start`` behavior) instead of running in the foreground.
     """
     if ctx.invoked_subcommand is not None:
+        # A subcommand (stop/status/logs) handles this invocation.
         return
     if not _slack_installed():
         raise click.ClickException(_SLACK_INSTALL_HINT)
+
+    if background:
+        # `omni integration slack --background` replaces the removed `start`
+        # subcommand: spawn (or reuse) the detached daemon and return.
+        _start_slack_background()
+        return
+
     # A background daemon already holds the Slack socket; a second foreground
     # bot would contend on the same connection. Refuse rather than double-run.
     existing = _slack_daemon().running_record()
@@ -8136,24 +8138,28 @@ def slack(ctx: click.Context) -> None:
             "Stop it first with `omni integration slack stop`, or view it with "
             "`omni integration slack status`."
         )
-    # Foreground: inherit stdio, block until the bot exits (Ctrl-C).
+    # Foreground: inherit stdio, block until the bot exits (Ctrl-C). Config
+    # comes from the inherited environment only (no .env loading — matches
+    # `omni server`), so the child inherits our cwd; nothing to special-case.
     click.echo("Starting the Omnigent Slack bot (foreground). Press Ctrl-C to stop.")
-    result = subprocess.run(_slack_argv(), env=os.environ.copy(), cwd=_slack_cwd(), check=False)
+    result = subprocess.run(_slack_argv(), env=os.environ.copy(), check=False)
     raise SystemExit(result.returncode)
 
 
-@slack.command("start")
-def slack_start() -> None:
-    """Start the Slack bot as a background daemon."""
-    if not _slack_installed():
-        raise click.ClickException(_SLACK_INSTALL_HINT)
+def _start_slack_background() -> None:
+    """Spawn (or reuse) the detached background Slack daemon and report it.
+
+    The background counterpart to the foreground bare ``omni integration
+    slack``, invoked by the ``--background`` flag (the former ``start``
+    subcommand).
+    """
     daemon = _slack_daemon()
     existing = daemon.running_record()
     if existing is not None:
         click.echo(f"Slack bot already running (pid {existing.pid}).")
         click.echo(f"Logs: {_display_path(Path(existing.log_path))}")
         return
-    record = daemon.start(_slack_argv(), os.environ.copy(), cwd=_slack_cwd())
+    record = daemon.start(_slack_argv(), os.environ.copy())
     # A detached daemon that dies on startup (missing tokens, bad server URL)
     # leaves nothing on the terminal — confirm it survives a short grace and
     # surface the log tail if it didn't, instead of falsely reporting success.
@@ -8993,6 +8999,89 @@ def _workspace_api_server_url(server: str) -> str:
     return server
 
 
+def _canonical_azure_databricks_url(server: str) -> str | None:
+    """Build the canonical ``adb-`` host for an Azure custom-URL workspace.
+
+    Azure workspaces can front a custom (vanity) URL such as
+    ``https://mydomain.azuredatabricks.net``, but that edge 303-redirects an
+    unauthenticated request to ``/login`` instead of answering the probe, so the
+    login/host flow can't detect the Databricks posture. The canonical
+    host does answer, and the ``?o=<workspace_id>`` selector already carries the
+    id needed to build it.
+
+    The ``{workspace_id % 20}`` shard is an observed regularity, not a documented
+    contract: Microsoft calls the segment a random number and treats
+    ``properties.workspaceUrl`` from the ARM API as authoritative. It held on
+    every real workspace we could measure (170 live hosts, and probing all 20
+    shards on 6 of them answers only at the mod-20 value), but callers must probe
+    the result before adopting it rather than trust the arithmetic.
+
+    :param server: A scheme-bearing server URL, e.g.
+        ``"https://mydomain.azuredatabricks.net/?o=123"``.
+    :returns: The URL with the canonical Azure host, or ``None`` when *server* is
+        not a vanity Azure workspace URL carrying a numeric selector (AWS/GCP
+        hosts, already-canonical URLs, a missing or malformed selector).
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(server)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname.endswith(".azuredatabricks.net") or hostname.startswith("adb-"):
+        return None
+    org_id = _org_id_from_url(server)
+    # ASCII-only: str.isdecimal() also accepts non-ASCII digits (e.g. Arabic-Indic
+    # "٣") that int() parses too, which would synthesize a nonsensical host.
+    if org_id is None or not (org_id.isascii() and org_id.isdecimal()):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None  # malformed port: leave the URL for the probe to reject
+    canonical_host = f"adb-{org_id}.{int(org_id) % 20}.azuredatabricks.net"
+    netloc = f"{canonical_host}:{port}" if port else canonical_host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _probe_root(server: str) -> str:
+    """Reduce a URL to the root ``_workspace_api_server_url`` actually probes.
+
+    That function drops the query/fragment before probing (a query-bearing base
+    would push the appended path into the query, ``…/?o=123/v1/me``), so anything
+    comparing against its result — or probing alongside it — has to reduce the
+    same way.
+
+    :param server: A scheme-bearing server URL.
+    :returns: *server* without its query or fragment and without a trailing slash.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(server.rstrip("/"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")).rstrip("/")
+
+
+def _databricks_root_is_usable(server: str) -> bool:
+    """Report whether *server* answers a probe we know how to talk to.
+
+    Mirrors the two acceptance conditions ``_workspace_api_server_url`` applies to
+    its own root probe, so the two agree on what "this URL works" means.
+
+    :param server: A scheme-bearing server URL; its query/fragment is dropped
+        before probing, as ``_workspace_api_server_url`` does.
+    :returns: True when the host answers as an omnigent server or a recognized
+        Databricks login target.
+    """
+    import httpx as _httpx
+
+    root = _probe_root(server)
+    try:
+        probe = _httpx.get(f"{root}/v1/me", timeout=10.0)
+    except _httpx.HTTPError:
+        return False
+    if probe.status_code == 200:
+        return True
+    return _databricks_workspace_login_target(root, probe) is not None
+
+
 def _resolve_server_url(server: str) -> str:
     """
     Normalize a user-supplied ``--server`` value to the Omnigent API base.
@@ -9004,12 +9093,38 @@ def _resolve_server_url(server: str) -> str:
     web-UI URL the internal user guide hands out — to the
     ``/api/2.0/omnigent`` mount.
 
+    The URL is always tried as the user gave it first. Only when that fails
+    to resolve, and only for an Azure custom (vanity) workspace URL, is the
+    canonical ``adb-`` host synthesized — and it is probed before
+    being adopted, so a wrong guess falls back to the user's URL instead of
+    stranding them on a host they never typed.
+
     :param server: A non-empty ``--server`` value, e.g.
         ``"example.cloud.databricks.com/omnigent"``.
     :returns: The normalized API base URL without a trailing slash, e.g.
         ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
     """
-    return _workspace_api_server_url(_with_default_scheme(server.rstrip("/")))
+    from omnigent.conversation_browser import display_server_url
+
+    normalized = _with_default_scheme(server.rstrip("/"))
+    expanded = _workspace_api_server_url(normalized)
+    candidate = _canonical_azure_databricks_url(normalized)
+    if candidate is None:
+        return expanded  # not a vanity Azure workspace URL
+    # A URL "resolved" if the expansion adopted a mount for it, or if the root
+    # answers on its own. Compare against the root the expansion probed, not the
+    # raw input: it drops the ?o= selector first, and that selector is what makes
+    # a URL a candidate here, so comparing raw would always look like an adoption.
+    if expanded != _probe_root(normalized) or _databricks_root_is_usable(normalized):
+        return expanded
+    canonical = _workspace_api_server_url(candidate)
+    if canonical == _probe_root(candidate) and not _databricks_root_is_usable(candidate):
+        return expanded  # the canonical host is no better; keep what the user typed
+    click.echo(
+        f"Note: {display_server_url(normalized)} did not answer as a workspace; "
+        f"using its canonical host {display_server_url(canonical)}."
+    )
+    return canonical
 
 
 def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> str | None:

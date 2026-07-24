@@ -46,16 +46,27 @@ def _row(page: Page, session_id: str) -> Locator:
     return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
+def _create_project(page: Page, name: str) -> None:
+    """Create an empty project via the "Projects" group header's "New project"
+    (+) button, typing *name* into the dialog and confirming."""
+    page.get_by_test_id("new-project").click()
+    dialog_input = page.get_by_placeholder("Project name…")
+    dialog_input.fill(name)
+    page.get_by_test_id("new-project-confirm").click()
+
+
 def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
-    """Drive the row kebab → "Add to project" → "Create new project" flow,
-    typing *name* and committing with Enter."""
+    """File *row*'s session into a fresh project *name*.
+
+    Projects are created from the "Projects" group header's + button (the
+    picker no longer offers an inline "Create new project"), so this first
+    creates the empty project, then drives the row kebab → "Add to project" →
+    picking that project from the list."""
+    _create_project(page, name)
     row.hover()
     row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
-    page.get_by_role("menuitem", name="Create new project").click()
-    new_input = page.get_by_placeholder("Project name…")
-    new_input.fill(name)
-    new_input.press("Enter")
+    page.get_by_role("menuitem", name=name, exact=True).click()
 
 
 def test_pinned_project_row_hover_shows_project_name(

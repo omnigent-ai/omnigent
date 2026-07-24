@@ -235,7 +235,7 @@ def test_required_cli_for_cli_backed_harness(harness: str, binary: str) -> None:
 @pytest.mark.parametrize("harness", ["cursor-native", "native-cursor"])
 def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -> None:
     """Native Cursor's "not configured" hint names the curl installer + login,
-    never ``omnigent setup`` — which only configures the SDK ``cursor`` harness
+    never ``omni setup`` — which only configures the SDK ``cursor`` harness
     (``cursor-sdk`` + ``CURSOR_API_KEY``) and never installs ``cursor-agent``.
 
     A regression to the generic hint sends a native-Cursor user down a dead end
@@ -245,7 +245,7 @@ def test_setup_hint_for_native_cursor_points_at_vendor_installer(harness: str) -
     assert "cursor-agent" in hint
     assert "cursor.com/install" in hint
     assert "cursor-agent login" in hint
-    assert "omnigent setup" not in hint
+    assert "omni setup" not in hint
 
 
 @pytest.mark.parametrize("harness", ["kiro-native", "native-kiro"])
@@ -254,15 +254,15 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     hint = hi.harness_setup_hint(harness)
     assert "kiro-cli" in hint
     assert "cli.kiro.dev/install" in hint
-    assert "omnigent setup" not in hint
+    assert "omni setup" not in hint
 
 
 @pytest.mark.parametrize("harness", ["claude-native", "codex", "pi", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
-    """Harnesses whose CLI ``omnigent setup`` installs (npm CLIs) — and the
-    SDK / unknown / ``None`` cases — route to the ``omnigent setup`` hint."""
+    """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
+    SDK / unknown / ``None`` cases — route to the ``omni setup`` hint."""
     hint = hi.harness_setup_hint(harness)
-    assert "omnigent setup" in hint
+    assert "omni setup" in hint
 
 
 @pytest.mark.parametrize("harness", ["cursor", "claude-sdk", "openai-agents"])
@@ -993,13 +993,25 @@ def test_ui_setup_steps_native_spelling_matches_bare() -> None:
     ]
 
 
-def test_ui_setup_steps_pi_auth_is_untracked_setup_fallback() -> None:
-    """Pi's credential (API key / gateway) can't be driven from the UI yet, so
-    its auth step points at ``omnigent setup`` and is not status-tracked."""
+def test_ui_setup_steps_pi_auth_is_ui_authable_and_tracked() -> None:
+    """Pi is UI-authable: its auth step opens the credential form (action
+    ``"auth"``), carries no CLI login command (no subscription), and is
+    status-tracked (``"authed"``) so the dialog can't drop it as "unknown"
+    and wrongly read "ready"."""
     steps = hi.ui_setup_steps("pi")
     assert [s.kind for s in steps] == ["install", "auth"]
+    assert steps[1].action == "auth"
+    assert steps[1].command is None
+    assert steps[1].status_key == "authed"
+
+
+def test_ui_setup_steps_qwen_auth_stays_untracked_setup_fallback() -> None:
+    """Qwen is env-auth (not UI-authable), so its auth step stays an untracked
+    ``omni setup`` signpost — the case that must NOT gain the form."""
+    steps = hi.ui_setup_steps("qwen")
+    assert [s.kind for s in steps] == ["install", "auth"]
     assert steps[1].action == "setup"
-    assert steps[1].command == "omnigent setup"
+    assert steps[1].command == "omni setup"
     assert steps[1].status_key is None
 
 
@@ -1009,5 +1021,5 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         steps = hi.ui_setup_steps(harness)
         assert len(steps) == 1
         assert steps[0].action == "setup"
-        assert steps[0].command == "omnigent setup"
+        assert steps[0].command == "omni setup"
         assert steps[0].status_key is None

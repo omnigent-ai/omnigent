@@ -650,9 +650,10 @@ export async function updateSession(
     costControlModeOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
+    labels?: Record<string, string>;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null> = {};
+  const body: Record<string, string | boolean | null | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
@@ -667,6 +668,11 @@ export async function updateSession(
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
+  }
+  if (updates.labels !== undefined) {
+    // Merge-upsert on the server; an empty-string value clears a label
+    // (e.g. the pinned flag on unpin — see PATCH /v1/sessions handler).
+    body.labels = updates.labels;
   }
   if (updates.silent) {
     body.silent = true;

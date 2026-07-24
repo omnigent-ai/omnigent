@@ -42,10 +42,12 @@ class TestContentExtraction:
         content = [
             {"type": "input_text", "text": "one"},
             {"type": "text", "text": "two"},
-            # invalid data URI -> materialize_attachment returns None -> no line
+            # invalid data URI -> not materialized -> visible marker line
             {"type": "input_image", "image_url": "data:..."},
         ]
-        assert _content_to_text(content, tmp_path) == "one\n\ntwo"
+        assert _content_to_text(content, tmp_path) == (
+            "[Attachment attachment could not be loaded]\n\none\n\ntwo"
+        )
 
     def test_real_image_attachment_materialized(self, tmp_path: Path) -> None:
         # a tiny valid base64 PNG data URI should be written to disk + referenced

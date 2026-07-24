@@ -29,6 +29,7 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
+    HostDetectCredentialsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
@@ -42,6 +43,7 @@ from omnigent.host.frames import (
     HostRunnerStatusResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
@@ -619,6 +621,24 @@ async def _receive_loop(
                         "error": frame.error,
                     }
                 )
+            continue
+
+        if isinstance(frame, HostStoreSecretResultFrame):
+            secret_future = conn.pending_secret_writes.pop(frame.request_id, None)
+            if secret_future is not None and not secret_future.done():
+                secret_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostDetectCredentialsResultFrame):
+            detect_future = conn.pending_credential_detects.pop(frame.request_id, None)
+            if detect_future is not None and not detect_future.done():
+                detect_future.set_result({"credentials": frame.credentials})
             continue
 
         if isinstance(frame, HostFsResultFrame):

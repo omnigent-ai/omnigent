@@ -11,6 +11,7 @@ function loadMainHarness({
   settings = {},
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
+  serverShutdown = () => Promise.resolve(),
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
@@ -19,6 +20,7 @@ function loadMainHarness({
   const appEvents = new Map();
   const calls = {
     appQuit: 0,
+    appExit: 0,
     checkForUpdates: 0,
     downloadUpdate: 0,
     quitAndInstall: [],
@@ -68,6 +70,9 @@ function loadMainHarness({
       quit: () => {
         calls.appQuit += 1;
       },
+      exit: () => {
+        calls.appExit += 1;
+      },
       setAppUserModelId: () => {},
     },
     BrowserWindow: Object.assign(function BrowserWindow() {}, {
@@ -115,7 +120,7 @@ function loadMainHarness({
       getCliStatus: () => ({ installed: false }),
     },
     "./server_manager": {
-      shutdown: () => Promise.resolve(),
+      shutdown: () => serverShutdown(),
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
       ensureHostConnected: async () => ({ ok: true }),
@@ -133,7 +138,7 @@ function loadMainHarness({
   // into the menu, the IPC surface, and the before-quit install handoff.
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.__test = { buildMenu, registerIpc, windows, updater };";
+    '\nmodule.exports.__test = { buildMenu, registerIpc, windows, updater, setQuitTimeouts: (o) => { if (typeof (o && o.cleanup) === "number") quitCleanupTimeoutMs = o.cleanup; if (typeof (o && o.installFallback) === "number") quitInstallFallbackMs = o.installFallback; } }';
 
   const module = { exports: {} };
   const sandbox = {
@@ -144,6 +149,7 @@ function loadMainHarness({
     Buffer,
     URL,
     clearInterval,
+    clearTimeout,
     console,
     module,
     process: {
@@ -164,6 +170,7 @@ function loadMainHarness({
       return mainRequire(specifier);
     },
     setInterval,
+    setTimeout,
   };
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
@@ -400,6 +407,64 @@ describe("auto-update main-process wiring", () => {
     assert.equal(prevented, 1);
     assert.deepEqual(harness.calls.quitAndInstall, [[false, true]]);
     assert.equal(harness.calls.appQuit, 1);
+  });
+
+  it("force-exits when a pending update install doesn't re-issue app.quit", async (t) => {
+    // electron-updater's quitAndInstall() only re-issues app.quit() when it can
+    // actually install; if it can't (staged update gone, install() returned
+    // false), the before-quit handoff would otherwise leave the app up. The
+    // fallback forces an exit instead, so the app never stays up waiting for
+    // an update that won't install.
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+    harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+    harness.api.registerIpc();
+    await harness.ipcHandlers.get("omnigent:update-install")(harness.events.pinned);
+    assert.equal(harness.api.updater.installPending, true);
+    assert.equal(harness.calls.appQuit, 1); // installUpdateNow → app.quit()
+
+    // Shrink the fallback so the test doesn't wait 3s. quitAndInstall is a
+    // no-op in the harness (it never re-issues app.quit), simulating a failed
+    // install(), so only the fallback can quit.
+    harness.api.setQuitTimeouts({ installFallback: 10 });
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 1); // still no re-issued quit
+    assert.equal(harness.calls.appExit, 0); // fallback not fired yet
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(harness.calls.appExit, 1); // fallback forced the exit
+    assert.equal(harness.calls.appQuit, 1); // never re-issued
+  });
+
+  it("force-exits if before-quit cleanup hangs past the safety cap", async (t) => {
+    // A stuck shutdown (e.g. a hung `omnigent server stop`, or the known
+    // Electron hazard where re-issuing app.quit() after before-quit's
+    // preventDefault doesn't terminate) must not strand the quit. The hard cap
+    // force-exits. Here shutdown never settles, so the re-issued app.quit() in
+    // .finally never runs — only the cap can quit.
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+      serverShutdown: () => new Promise(() => {}),
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+    harness.api.registerIpc();
+    harness.api.setQuitTimeouts({ cleanup: 10 });
+
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 0); // shutdown hung, no re-issued quit
+    assert.equal(harness.calls.appExit, 0); // cap not fired yet
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(harness.calls.appExit, 1); // cap forced the exit
+    assert.equal(harness.calls.appQuit, 0); // never re-issued
   });
 
   it("does not start the install path when no update is downloaded", async (t) => {

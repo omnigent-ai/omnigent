@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import (
@@ -21,6 +22,34 @@ from tests.e2e_ui.conftest import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize(
+    ("tab_name", "tooltip", "expected_state"),
+    [
+        ("Files", "Files", "active"),
+        ("Agents", "Agents", "inactive"),
+    ],
+)
+def test_workspace_tab_hover_tooltip(
+    page: Page,
+    terminal_session: tuple[str, str],
+    tab_name: str,
+    tooltip: str,
+    expected_state: str,
+) -> None:
+    """Explain fixed workspace tabs on hover without changing selection."""
+    base_url, session_id = terminal_session
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+
+    rail = page.get_by_role("complementary", name="Workspace")
+    tab = rail.get_by_role("tab", name=re.compile(f"^{tab_name}"))
+
+    expect(tab).to_have_attribute("data-state", expected_state)
+    tab.hover()
+    expect(page.get_by_role("tooltip")).to_have_text(tooltip)
+    expect(tab).to_have_attribute("data-state", expected_state)
 
 
 def test_right_panel_terminals_and_file_viewer(

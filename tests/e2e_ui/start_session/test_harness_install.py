@@ -2,7 +2,7 @@
 
 Covers the user journey where the selected agent's harness isn't set up on the
 chosen host: the composer shows an "Install" button (instead of the "run
-omnigent setup" hint), clicking it installs the harness, and the readiness
+omni setup" hint), clicking it installs the harness, and the readiness
 warning clears once the host reports the harness ready.
 
 Uses the same route-stubbing approach as ``test_create_custom_agent.py``:
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 from collections.abc import Coroutine
 from typing import Any
@@ -150,6 +151,17 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
     async def handle_harnesses(route: Route) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_harnesses_body())
 
+    async def handle_agent_scan(route: Route) -> None:
+        # The picker ALSO scans GET /v1/sessions?kind=any for registered agents.
+        # The seeded_session fixture creates real sessions in the DB, so without
+        # this stub those leak in as agents and the picker auto-selects the
+        # built-in Claude Code (ready) instead of our unconfigured Codex —
+        # leaving no "Set up Codex" notice (the CI-only failure). Return none so
+        # only the stubbed /v1/agents Codex populates the picker.
+        await route.fulfill(
+            status=200, content_type="application/json", body=json.dumps({"data": []})
+        )
+
     async def handle_install(route: Route) -> None:
         install_requests.append(route.request.url)
         await route.fulfill(
@@ -167,6 +179,7 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/agents", handle_agents)
+    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/install", handle_install)
 
@@ -206,14 +219,20 @@ async def _drive_install(base_url: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-
-            # Commit the Codex agent (its harness is unconfigured on the host).
+            # The composer auto-selects the built-in Claude Code (ranked first),
+            # NOT our stubbed Codex agent — and Claude Code is ready on the host,
+            # so no "Set up" notice appears. Explicitly select Codex in the
+            # picker: open it, wait for the Codex row to render (it mounts only
+            # after the /v1/agents fetch resolves — can lag under CI load), then
+            # click it. Only then does the composer show the "Set up Codex"
+            # notice for its unconfigured harness.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e").click()
+            codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
+            await expect(codex_option).to_be_visible(timeout=60_000)
+            await codex_option.click()
 
-            # The composer notice offers "Set up →", which opens the setup dialog.
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
-            await expect(setup).to_be_visible(timeout=10_000)
+            await expect(setup).to_be_visible(timeout=60_000)
             await setup.click()
 
             # The dialog's checklist offers a one-click Install for this harness.

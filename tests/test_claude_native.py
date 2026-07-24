@@ -2324,6 +2324,204 @@ async def test_ensure_local_claude_resume_transcript_returns_none_when_no_record
     assert not expected.exists()
 
 
+def _resume_rebuild_handler(
+    *,
+    fail_file_fetch: bool = False,
+    malformed_meta: bool = False,
+) -> Any:
+    """Mock server for resume-rebuild tests: history with a file_id image."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/resources/files/file_img/content"):
+            if fail_file_fetch:
+                return httpx.Response(404)
+            return httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+        if path.endswith("/resources/files/file_img"):
+            if fail_file_fetch:
+                return httpx.Response(404)
+            if malformed_meta:
+                # A proxy/gateway answering 200 with an HTML error page.
+                return httpx.Response(
+                    200,
+                    content=b"<html>gateway error</html>",
+                    headers={"content-type": "text/html"},
+                )
+            return httpx.Response(
+                200,
+                json={"id": "file_img", "filename": "photo.png", "content_type": "image/png"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_image",
+                                "file_id": "file_img",
+                                "filename": "photo.png",
+                            },
+                            {"type": "input_text", "text": "look at this image"},
+                        ],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A prior-turn image survives the resume-transcript rebuild.
+
+    Items are persisted with unresolved ``file_id`` blocks and the old
+    converter kept only ``input_text`` blocks, so every relaunch silently
+    dropped the image from Claude's rebuilt transcript — the only
+    survivor was a machine-local tmp path that is dead after a
+    cross-machine resume or tmp cleanup. The rebuild must fetch the bytes
+    back, re-materialize them under the session bridge dir, and reference
+    the fresh file with a live ``[Attached: <path>]`` line.
+    """
+    from omnigent import claude_native_bridge
+
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(
+        claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+    )
+    workspace = Path("/work/some-repo")
+
+    transport = httpx.MockTransport(_resume_rebuild_handler())
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    user_content = records[0]["message"]["content"]
+    # A lone surviving block collapses to a plain string.
+    texts = (
+        [user_content]
+        if isinstance(user_content, str)
+        else [block["text"] for block in user_content]
+    )
+    attached_lines = [t for t in texts if t.startswith("[Attached: ")]
+    assert attached_lines, f"image block was silently dropped from the rebuild: {texts}"
+    attached_path = Path(attached_lines[0].removeprefix("[Attached: ").removesuffix("]"))
+    # The referenced file is live on THIS machine with the fetched bytes.
+    assert attached_path.parent == bridge_dir / "uploads"
+    assert attached_path.read_bytes() == b"png-bytes"
+    assert "look at this image" in " ".join(texts)
+    assert "file_id" not in written.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A fetch-back failure leaves a visible marker, never a silent drop.
+
+    When the file resource endpoints fail (auth/proxy/deleted file), the
+    rebuilt record must carry the could-not-load placeholder so the model
+    and the user see the attachment was lost instead of hallucinating.
+    """
+    from omnigent import claude_native_bridge
+
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(
+        claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+    )
+    workspace = Path("/work/some-repo")
+
+    transport = httpx.MockTransport(_resume_rebuild_handler(fail_file_fetch=True))
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    user_content = records[0]["message"]["content"]
+    texts = (
+        [user_content]
+        if isinstance(user_content, str)
+        else [block["text"] for block in user_content]
+    )
+    assert "[Attachment photo.png could not be loaded]" in texts
+    assert "look at this image" in " ".join(texts)
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_claude_resume_transcript_survives_malformed_file_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 200-but-unparseable metadata response must not abort the rebuild.
+
+    Metadata only supplies the media-type hint; when its body is garbage
+    (a proxy answering 200 with an HTML error page), the resolver falls
+    back to the content response's ``Content-Type`` and the attachment
+    still re-materializes — the whole transcript rebuild must not die on
+    one bad metadata body.
+    """
+    from omnigent import claude_native_bridge
+
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(
+        claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+    )
+    workspace = Path("/work/some-repo")
+
+    transport = httpx.MockTransport(_resume_rebuild_handler(malformed_meta=True))
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert written is not None
+    records = [json.loads(line) for line in written.read_text(encoding="utf-8").splitlines()]
+    user_content = records[0]["message"]["content"]
+    texts = (
+        [user_content]
+        if isinstance(user_content, str)
+        else [block["text"] for block in user_content]
+    )
+    attached_lines = [t for t in texts if t.startswith("[Attached: ")]
+    assert attached_lines, f"attachment was dropped on malformed metadata: {texts}"
+    attached_path = Path(attached_lines[0].removeprefix("[Attached: ").removesuffix("]"))
+    # Bytes came from the content response; the media type came from its
+    # Content-Type header, not the unparseable metadata body.
+    assert attached_path.read_bytes() == b"png-bytes"
+    assert "look at this image" in " ".join(texts)
+
+
 @pytest.mark.asyncio
 async def test_create_claude_session_omits_title_for_generic_seed_path() -> None:
     """
@@ -6515,6 +6713,7 @@ def test_claude_transcript_records_handles_compaction_item() -> None:
         session_id="conv_test",
         external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
         cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
     )
     types = [r.get("type") for r in records]
     # Should have compacted user + assistant + post-compaction user
@@ -6597,6 +6796,7 @@ def test_claude_transcript_tool_use_result_is_json_parseable(
         session_id="conv_test",
         external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
         cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
     )
     assert len(records) == 1
     record = records[0]
@@ -6683,6 +6883,7 @@ def test_claude_transcript_image_result_sent_as_blocks_not_text() -> None:
         session_id="conv_test",
         external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
         cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
     )
     assert len(records) == 1
     block = records[0]["message"]["content"][0]
@@ -6724,6 +6925,7 @@ def test_claude_transcript_truncated_image_result_stripped_not_leaked() -> None:
         session_id="conv_test",
         external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
         cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
     )
     assert len(records) == 1
     # No base64 anywhere in the record — not in tool_result content, not in
@@ -6770,6 +6972,7 @@ def test_tool_use_result_regression_old_flatten_would_crash_resume() -> None:
         session_id="conv_test",
         external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
         cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
     )
     assert len(records) == 1
     assert json.loads(records[0]["toolUseResult"]) == output

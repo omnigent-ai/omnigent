@@ -12,6 +12,8 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
@@ -36,6 +38,8 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -1186,6 +1190,138 @@ def test_install_harness_result_failure_round_trip() -> None:
     assert decoded.status == "failed"
     assert decoded.configured_harnesses is None
     assert decoded.error == "npm not found"
+
+
+def test_store_secret_key_frame_round_trip() -> None:
+    """A key store-secret request survives encode → decode with the secret.
+
+    The ``kind`` field rides on the wire as ``kind_`` to avoid colliding with
+    the frame-type ``kind`` discriminator; a decode that read the wrong key
+    would lose the credential kind. The secret must round-trip so the host can
+    write it.
+    """
+    original = HostStoreSecretFrame(
+        request_id="req_cred_1",
+        harness="claude",
+        kind="key",
+        secret_value="sk-ant-SECRET",
+        default_model="claude-sonnet-4-6",
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostStoreSecretFrame)
+    assert decoded.request_id == "req_cred_1"
+    assert decoded.harness == "claude"
+    assert decoded.kind == "key"
+    assert decoded.secret_value == "sk-ant-SECRET"
+    assert decoded.default_model == "claude-sonnet-4-6"
+
+
+def test_store_secret_gateway_and_adopt_round_trip() -> None:
+    """Gateway (base_url + wire_api) and adopt (env_var, no secret) round-trip."""
+    gateway = HostStoreSecretFrame(
+        request_id="req_cred_2",
+        harness="codex",
+        kind="gateway",
+        secret_value="gw-TOKEN",
+        base_url="https://openrouter.ai/api/v1",
+        wire_api="chat",
+    )
+    decoded_gw = decode_host_frame(encode_host_frame(gateway))
+    assert isinstance(decoded_gw, HostStoreSecretFrame)
+    assert decoded_gw.kind == "gateway"
+    assert decoded_gw.base_url == "https://openrouter.ai/api/v1"
+    assert decoded_gw.wire_api == "chat"
+
+    adopt = HostStoreSecretFrame(
+        request_id="req_cred_3",
+        harness="codex",
+        kind="adopt",
+        env_var="OPENAI_API_KEY",
+    )
+    decoded_adopt = decode_host_frame(encode_host_frame(adopt))
+    assert isinstance(decoded_adopt, HostStoreSecretFrame)
+    assert decoded_adopt.kind == "adopt"
+    assert decoded_adopt.env_var == "OPENAI_API_KEY"
+    assert decoded_adopt.secret_value is None
+
+
+def test_store_secret_value_is_redacted_from_telemetry() -> None:
+    """The ``secret_value`` field is masked by the telemetry redactor.
+
+    The frame body is recorded on a span when content capture is on; the field
+    is named so ``_REDACT_KEY_SUBSTRINGS`` masks it. A rename that broke this
+    would leak the credential onto a trace.
+    """
+    from omnigent.runtime import telemetry
+
+    redacted = telemetry._redact_payload(
+        {"secret_value": "sk-ant-SECRET", "harness": "claude", "kind_": "key"}
+    )
+    assert redacted["secret_value"] == "[redacted]"
+    assert redacted["harness"] == "claude"
+
+
+def test_store_secret_result_round_trip() -> None:
+    """The result frame round-trips status + refreshed readiness (never a secret)."""
+    ok = HostStoreSecretResultFrame(
+        request_id="req_cred_1",
+        status="ok",
+        configured_harnesses={"claude-native": True},
+    )
+    decoded = decode_host_frame(encode_host_frame(ok))
+    assert isinstance(decoded, HostStoreSecretResultFrame)
+    assert decoded.status == "ok"
+    assert decoded.configured_harnesses == {"claude-native": True}
+
+    failed = HostStoreSecretResultFrame(
+        request_id="req_cred_1",
+        status="failed",
+        error="a gateway requires a base_url",
+    )
+    decoded_f = decode_host_frame(encode_host_frame(failed))
+    assert isinstance(decoded_f, HostStoreSecretResultFrame)
+    assert decoded_f.status == "failed"
+    assert decoded_f.error == "a gateway requires a base_url"
+    assert decoded_f.configured_harnesses is None
+
+
+def test_detect_credentials_round_trip() -> None:
+    """The detect request + result round-trip; the result carries only descriptors."""
+    req = HostDetectCredentialsFrame(request_id="req_detect_1")
+    decoded_req = decode_host_frame(encode_host_frame(req))
+    assert isinstance(decoded_req, HostDetectCredentialsFrame)
+    assert decoded_req.request_id == "req_detect_1"
+
+    result = HostDetectCredentialsResultFrame(
+        request_id="req_detect_1",
+        credentials=[
+            {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+        ],
+    )
+    decoded = decode_host_frame(encode_host_frame(result))
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    assert decoded.credentials == [
+        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
+    ]
+
+
+def test_detect_credentials_result_drops_malformed_entries() -> None:
+    """A garbled credentials payload keeps only well-formed string entries."""
+    encoded = json.dumps(
+        {
+            "kind": "host.detect_credentials_result",
+            "request_id": "r1",
+            "credentials": [
+                {"family": "anthropic", "source": "$X", "env_var": "X"},  # kept
+                {"family": 123, "source": "$Y"},  # dropped (non-str family)
+                "not-a-dict",  # dropped
+                {"source": "$Z"},  # dropped (no family)
+            ],
+        }
+    )
+    decoded = decode_host_frame(encoded)
+    assert isinstance(decoded, HostDetectCredentialsResultFrame)
+    assert decoded.credentials == [{"family": "anthropic", "source": "$X", "env_var": "X"}]
 
 
 def test_fs_request_round_trip() -> None:

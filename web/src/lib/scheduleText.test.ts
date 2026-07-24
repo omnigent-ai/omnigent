@@ -5,6 +5,7 @@
 // yearly BYMONTH), plus the 1-hour-floor validation.
 
 import { describe, expect, it } from "vitest";
+import { RRule, rrulestr } from "rrule";
 import { describeSchedule, formatClockTime, nextRunAtMs } from "./scheduleText";
 import {
   buildRRule,
@@ -16,6 +17,15 @@ import {
 /** Convenience: a model with overrides on top of the default. */
 function model(overrides: Partial<ScheduleModel>): ScheduleModel {
   return { ...DEFAULT_SCHEDULE_MODEL, ...overrides };
+}
+
+const REFERENCE_OCCURRENCE_ANCHOR = new Date(Date.UTC(2000, 0, 1, 0, 0, 0));
+
+function referenceNextRunAtMs(rrule: string, now: Date): number | null {
+  const parsed = rrulestr(rrule);
+  if (!(parsed instanceof RRule)) return null;
+  const rule = new RRule({ ...parsed.origOptions, dtstart: REFERENCE_OCCURRENCE_ANCHOR });
+  return rule.after(now, false)?.getTime() ?? null;
 }
 
 describe("formatClockTime", () => {
@@ -318,5 +328,27 @@ describe("nextRunAtMs", () => {
 
   it("returns null for an unparseable rule", () => {
     expect(nextRunAtMs("garbage", "UTC")).toBeNull();
+  });
+
+  it.each([
+    "FREQ=HOURLY;BYMINUTE=3",
+    "FREQ=HOURLY;INTERVAL=3",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    "FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=8",
+    "FREQ=DAILY;INTERVAL=3",
+    "FREQ=MONTHLY;BYMONTHDAY=15",
+    "FREQ=YEARLY;BYMONTH=3",
+  ])("matches the deterministic 2000-anchor result for %s", (rrule) => {
+    const now = new Date("2026-07-24T05:00:00Z");
+    expect(nextRunAtMs(rrule, "UTC", now)).toBe(referenceNextRunAtMs(rrule, now));
+  });
+
+  it("computes hourly next-run values without iterating from the 2000 anchor", () => {
+    const start = performance.now();
+    const next = nextRunAtMs("FREQ=HOURLY;BYMINUTE=30", "UTC", new Date("2026-07-24T05:00:00Z"));
+    const elapsedMs = performance.now() - start;
+
+    expect(next).not.toBeNull();
+    expect(elapsedMs).toBeLessThan(30);
   });
 });
