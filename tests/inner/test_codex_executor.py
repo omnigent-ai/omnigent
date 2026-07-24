@@ -603,6 +603,70 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_new_goal_thread_replays_history_without_command(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "Finish and test"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[
+                    {"role": "user", "content": "Remember the passphrase is ORCHID."},
+                    {"role": "assistant", "content": "I will remember it."},
+                    {"role": "user", "content": "/goal Finish and test"},
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            calls = session._request.await_args_list
+            self.assertEqual(
+                calls[1].args[1],
+                {"threadId": "thread-1", "objective": "Finish and test"},
+            )
+            self.assertEqual(
+                calls[2].args[1]["input"],
+                [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Conversation so far:\n"
+                            "user: Remember the passphrase is ORCHID.\n"
+                            "assistant: I will remember it.\n"
+                            "user: Finish and test\n\n"
+                            "Respond to the latest user message, using the conversation "
+                            "above as context."
+                        ),
+                    }
+                ],
+            )
+
+        _run(_t())
+
     def test_app_server_run_turn_applies_effort_via_thread_settings_update(self):
         """Reasoning effort rides thread/settings/update, not turn/start.
 

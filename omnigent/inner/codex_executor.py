@@ -1594,6 +1594,7 @@ class _CodexAppServerSession:
         assert self.thread_id is not None
         latest_user_content = _extract_latest_user_content(messages)
         goal_objective = _goal_objective_from_content(latest_user_content)
+        prompt_messages = messages
         if goal_objective is not None:
             await self._request(
                 "thread/goal/set",
@@ -1602,7 +1603,14 @@ class _CodexAppServerSession:
                     "objective": goal_objective,
                 },
             )
-        prompt = goal_objective or _prompt_for_turn(messages, is_new_thread=is_new_thread)
+            # A reset thread still needs prior history, with the command
+            # replaced by the clean objective sent to Codex.
+            prompt_messages = [message.copy() for message in messages]
+            for message in reversed(prompt_messages):
+                if message.get("role") == "user":
+                    message["content"] = goal_objective
+                    break
+        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
