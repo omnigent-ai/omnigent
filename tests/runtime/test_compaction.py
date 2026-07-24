@@ -19,6 +19,7 @@ from omnigent.llms.types import MessageOutput, OutputText, Response
 from omnigent.runtime.compaction import (
     _BINARY_CONTENT_CLEARED,
     _TOOL_RESULT_CLEARED,
+    _clear_binary_content,
     _is_summary_auth_error,
     _pair_aware_drop_count,
     _truncate_oldest,
@@ -458,6 +459,43 @@ async def test_layer1_clears_binary_content_and_preserves_file_id(
     )
     # Text block in the same message must be untouched.
     assert text_block["text"] == "Please describe this image"
+
+
+def test_clear_binary_content_handles_resolver_shapes() -> None:
+    """Resolver-produced attachment payloads are cleared before token counting."""
+    payload = "A" * 100_000
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{payload}",
+                    "file_id": "file_image",
+                    "filename": "screenshot.png",
+                },
+                {
+                    "type": "input_file",
+                    "file_data": f"data:application/pdf;base64,{payload}",
+                    "file_id": "file_pdf",
+                    "filename": "report.pdf",
+                },
+            ],
+        }
+    ]
+
+    tokens_before = count_tokens(messages, "openai/gpt-4o")
+    _clear_binary_content(messages, protect_from=len(messages))
+    tokens_after = count_tokens(messages, "openai/gpt-4o")
+
+    image_block, file_block = messages[0]["content"]
+    assert image_block["image_url"] == _BINARY_CONTENT_CLEARED
+    assert file_block["file_data"] == _BINARY_CONTENT_CLEARED
+    assert image_block["file_id"] == "file_image"
+    assert image_block["filename"] == "screenshot.png"
+    assert file_block["file_id"] == "file_pdf"
+    assert file_block["filename"] == "report.pdf"
+    assert tokens_after < tokens_before / 10
 
 
 @pytest.mark.asyncio
