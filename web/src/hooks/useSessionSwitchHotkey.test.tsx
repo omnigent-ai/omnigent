@@ -101,6 +101,22 @@ describe("useSessionSwitchHotkey", () => {
     expect(navigate).toHaveBeenCalledWith("/c/b");
   });
 
+  it("protects unpersisted mentions carried by an empty editable", () => {
+    renderHook(() => useSessionSwitchHotkey(ids, "a"));
+    const composer = document.createElement("div");
+    composer.dataset.unpersistedMentions = "true";
+    const ta = document.createElement("textarea");
+    composer.appendChild(ta);
+    document.body.appendChild(composer);
+
+    press("ArrowDown", { metaKey: true }, ta);
+    expect(navigate).not.toHaveBeenCalled();
+
+    delete composer.dataset.unpersistedMentions;
+    press("ArrowDown", { metaKey: true }, ta);
+    expect(navigate).toHaveBeenCalledWith("/c/b");
+  });
+
   it("does not switch while a textarea contains a draft", () => {
     renderHook(() => useSessionSwitchHotkey(ids, "a"));
     const ta = document.createElement("textarea");

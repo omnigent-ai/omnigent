@@ -4755,6 +4755,9 @@ export function Composer({
           <textarea
             ref={textareaRef}
             value={value}
+            // Session drafts persist text and files, but not mention chips.
+            // Remove this marker and its hotkey guard once mentions persist.
+            data-unpersisted-mentions={mentionedItems.length > 0 ? "true" : undefined}
             onChange={(e) => {
               setValue(e.target.value);
               dirtyRef.current = true;
