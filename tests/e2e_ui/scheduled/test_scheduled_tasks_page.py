@@ -43,20 +43,33 @@ def _builtin_agent_id(base_url: str, name: str) -> str:
     return matches[0]
 
 
-def _create_task(base_url: str, agent_id: str, name: str, rrule: str) -> str:
+def _create_task(
+    base_url: str,
+    agent_id: str,
+    name: str,
+    rrule: str,
+    *,
+    host_id: str | None = None,
+    workspace: str | None = None,
+) -> str:
     """Seed one scheduled task via ``POST /v1/scheduled-tasks``.
 
     :returns: The created task id.
     """
+    body = {
+        "name": name,
+        "prompt": "Do the thing.",
+        "rrule": rrule,
+        "agent_id": agent_id,
+        "timezone": "UTC",
+    }
+    if host_id is not None:
+        body["host_id"] = host_id
+    if workspace is not None:
+        body["workspace"] = workspace
     resp = httpx.post(
         f"{base_url}/v1/scheduled-tasks",
-        json={
-            "name": name,
-            "prompt": "Do the thing.",
-            "rrule": rrule,
-            "agent_id": agent_id,
-            "timezone": "UTC",
-        },
+        json=body,
         timeout=10.0,
     )
     resp.raise_for_status()
@@ -116,3 +129,92 @@ def test_scheduled_task_rows_show_schedule_summary_without_countdown(
     # The "Next run in Xh" countdown was removed — it must not appear anywhere
     # on the page (this pins the decision so it can't silently regress).
     expect(page.get_by_text("Next run", exact=False)).to_have_count(0)
+
+
+def test_scheduled_task_create_edit_modal_and_time_picker(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Create/edit modal supports typed time input and the compact minute picker.
+
+    This stays LLM-free: creating and editing scheduled tasks only exercise
+    REST + client state, and no scheduled run fires.
+    """
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+
+    page.goto(f"{live_server}/tasks")
+
+    page.get_by_test_id("new-task-button").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("task-name-input").fill("Typed time daily")
+    page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
+        "new-chat-landing-agent-select"
+    )
+    expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
+    agent_trigger.click()
+    page.get_by_role("menuitem").filter(has_text="Claude Code").click()
+    expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Daily")
+
+    time_input = page.get_by_test_id("schedule-time")
+    time_input.fill("")
+    time_input.click()
+    page.keyboard.type("9:37")
+    assert time_input.input_value() == "9:37"
+    page.get_by_test_id("task-name-input").click()
+    expect(time_input).to_have_value("09:37 AM")
+    page.get_by_test_id("schedule-time-picker-trigger").click()
+    minute_column = page.get_by_test_id("schedule-minute-column")
+    expect(minute_column.locator('[data-testid^="schedule-minute-"]')).to_have_count(
+        60,
+        timeout=30_000,
+    )
+    expect(page.get_by_test_id("schedule-minute-37")).to_be_visible()
+    page.get_by_test_id("schedule-minute-37").click(force=True)
+    expect(time_input).to_have_value("09:37 AM")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    created_row = _row_by_name(page, "Typed time daily")
+    expect(created_row).to_be_visible(timeout=30_000)
+    expect(created_row.get_by_test_id("task-schedule-line")).to_have_text(
+        "Every day at 9:37 AM",
+        timeout=30_000,
+    )
+
+    _create_task(
+        live_server,
+        agent_id,
+        "Edit footer task",
+        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    )
+    page.set_viewport_size({"width": 900, "height": 520})
+    page.reload()
+
+    edit_row = _row_by_name(page, "Edit footer task")
+    expect(edit_row).to_be_visible(timeout=30_000)
+    edit_row.hover()
+    edit_row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+
+    dialog = page.get_by_test_id("create-scheduled-task-dialog")
+    submit = page.get_by_test_id("create-scheduled-task-submit")
+    expect(dialog).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("button", name="Cancel")).to_be_visible()
+    expect(submit).to_be_visible()
+    dialog_box = dialog.bounding_box()
+    submit_box = submit.bounding_box()
+    assert dialog_box is not None
+    assert submit_box is not None
+    assert submit_box["y"] + submit_box["height"] <= dialog_box["y"] + dialog_box["height"] + 1
+
+    time_input.fill("")
+    time_input.click()
+    page.keyboard.type("10:37")
+    page.get_by_test_id("task-name-input").click()
+    expect(time_input).to_have_value("10:37 AM")
+    submit.click()
+
+    expect(edit_row.get_by_test_id("task-schedule-line")).to_have_text(
+        "Every day at 10:37 AM",
+        timeout=30_000,
+    )
