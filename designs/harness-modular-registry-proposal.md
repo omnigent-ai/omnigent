@@ -353,6 +353,16 @@ Only starts once Phase 1 has every built-in running *through* the seam.
   2.2 → 2.3 (web); the risk center is **PR 1.5**, where the `_supervise_*_bridges`
   invariants live.
 
+### Implementation progress
+
+Append-only ledger — one line per PR as it opens, updated to `landed` on merge.
+The plan tables above stay the stable target; this tracks what has actually
+shipped. **12 PRs total** (Phase 1: 1.1–1.8, Phase 2: 2.1–2.4).
+
+| PR | Status | Link |
+|---|---|---|
+| 1.1 Provider model + resolver | in review | #3239 |
+
 ## Risks and open questions
 
 - **Runner extraction is the risk center.** The `_supervise_*_bridges` mirrors
