@@ -12,13 +12,14 @@ import {
   TabletIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useId, useMemo, useState } from "react";
+import { type ReactElement, useEffect, useId, useMemo, useState } from "react";
 import { useArtifactPreview } from "@/hooks/useArtifactPreview";
 import { useManagedArtifacts } from "@/hooks/useManagedArtifacts";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import { ArtifactIcon } from "@/components/icons/ArtifactIcon";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Select,
   SelectContent,
@@ -44,6 +45,19 @@ export interface ArtifactEntry {
   entryPath: string;
   title: string;
   modifiedAt: number | null;
+}
+
+function ArtifactToolbarTooltip({ label, children }: { label: string; children: ReactElement }) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex shrink-0">{children}</span>
+        </TooltipTrigger>
+        <TooltipContent side="top">{label}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 function titleFromSlug(slug: string): string {
@@ -330,72 +344,76 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
                 ["mobile", "Mobile viewport", SmartphoneIcon],
               ] as const
             ).map(([value, label, Icon]) => (
-              <Button
-                key={value}
-                type="button"
-                variant={viewport === value ? "secondary" : "ghost"}
-                size="icon-sm"
-                aria-label={label}
-                title={label}
-                onClick={() => setViewport(value)}
-              >
-                <Icon className="size-4" />
-              </Button>
+              <ArtifactToolbarTooltip key={value} label={label}>
+                <Button
+                  type="button"
+                  variant={viewport === value ? "secondary" : "ghost"}
+                  size="icon-sm"
+                  aria-label={label}
+                  onClick={() => setViewport(value)}
+                >
+                  <Icon className="size-4" />
+                </Button>
+              </ArtifactToolbarTooltip>
             ))}
+            <ArtifactToolbarTooltip label="Refresh preview">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Refresh artifact preview"
+                onClick={() => void refreshArtifact()}
+              >
+                <RefreshCwIcon className="size-4" />
+              </Button>
+            </ArtifactToolbarTooltip>
+          </>
+        ) : null}
+        {canSelect && selected !== null && preview.data !== undefined ? (
+          <ArtifactToolbarTooltip label="Select element for feedback">
             <Button
               type="button"
               variant="ghost"
               size="icon-sm"
-              aria-label="Refresh artifact preview"
-              title="Refresh artifact preview"
-              onClick={() => void refreshArtifact()}
+              aria-label="Select artifact element for feedback"
+              disabled={selecting}
+              onClick={() => void selectArtifactElement()}
             >
-              <RefreshCwIcon className="size-4" />
+              {selecting ? <Loader2Icon className="size-4 animate-spin" /> : <MousePointer2Icon />}
             </Button>
-          </>
-        ) : null}
-        {canSelect && selected !== null && preview.data !== undefined ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Select artifact element for feedback"
-            title="Select artifact element for feedback"
-            disabled={selecting}
-            onClick={() => void selectArtifactElement()}
-          >
-            {selecting ? <Loader2Icon className="size-4 animate-spin" /> : <MousePointer2Icon />}
-          </Button>
+          </ArtifactToolbarTooltip>
         ) : null}
         {canReview && selected !== null && preview.data !== undefined ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Review artifact"
-            title="Review artifact"
-            disabled={reviewing}
-            onClick={() => void reviewArtifact()}
-          >
-            {reviewing ? <Loader2Icon className="size-4 animate-spin" /> : <CheckCircle2Icon />}
-          </Button>
+          <ArtifactToolbarTooltip label="Review artifact">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Review artifact"
+              disabled={reviewing}
+              onClick={() => void reviewArtifact()}
+            >
+              {reviewing ? <Loader2Icon className="size-4 animate-spin" /> : <CheckCircle2Icon />}
+            </Button>
+          </ArtifactToolbarTooltip>
         ) : null}
         {canInspect && selected !== null && preview.data !== undefined ? (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            aria-label="Open artifact DevTools inspector"
-            title="Open artifact DevTools inspector"
-            disabled={inspecting}
-            onClick={() => void inspectArtifact()}
-          >
-            {inspecting ? (
-              <Loader2Icon className="size-4 animate-spin" />
-            ) : (
-              <ScanSearchIcon className="size-4" />
-            )}
-          </Button>
+          <ArtifactToolbarTooltip label="Inspect in DevTools">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Open artifact DevTools inspector"
+              disabled={inspecting}
+              onClick={() => void inspectArtifact()}
+            >
+              {inspecting ? (
+                <Loader2Icon className="size-4 animate-spin" />
+              ) : (
+                <ScanSearchIcon className="size-4" />
+              )}
+            </Button>
+          </ArtifactToolbarTooltip>
         ) : null}
       </div>
       {selected === null ? (

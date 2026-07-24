@@ -291,7 +291,7 @@ describe("artifactEntriesFromFiles", () => {
     expect(screen.getByTitle("Selected preview")).toBeDefined();
   });
 
-  it("offers the native inspect-element chooser in Electron", () => {
+  it("offers the native inspect-element chooser with a visible tooltip in Electron", async () => {
     hasNativeArtifactInspectorMock.mockReturnValue(true);
     managedArtifactsMock.mockReturnValue({
       data: [
@@ -323,7 +323,14 @@ describe("artifactEntriesFromFiles", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Open artifact DevTools inspector" }));
+    const inspectButton = screen.getByRole("button", {
+      name: "Open artifact DevTools inspector",
+    });
+    fireEvent.pointerMove(inspectButton.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Inspect in DevTools");
+    expect(tooltip.closest('[data-side="top"]')).not.toBeNull();
+    fireEvent.click(inspectButton);
     expect(inspectNativeArtifactSurfaceMock).toHaveBeenCalledWith(
       expect.stringContaining("artifact-surface-"),
     );
