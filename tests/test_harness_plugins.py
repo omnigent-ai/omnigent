@@ -252,3 +252,44 @@ def test_community_harness_can_register_background_title_generator(
 
     generator = hp.background_title_generators()["foo"]
     assert generator.generator == ("omnigent.community.harness.foo.background_titles:generate")
+
+
+def test_builtin_native_providers_cover_every_native_agent() -> None:
+    """Every native agent has exactly one provider row keyed by the same key."""
+    agent_keys = sorted(agent.key for agent in hp.native_agents())
+    provider_keys = sorted(provider.key for provider in hp.native_providers())
+    assert provider_keys == agent_keys
+    # No duplicate provider keys.
+    assert len(provider_keys) == len(set(provider_keys))
+
+
+def test_native_provider_for_key_lookup() -> None:
+    assert hp.native_provider_for_key("claude") is not None
+    assert hp.native_provider_for_key("claude").key == "claude"
+    assert hp.native_provider_for_key("does-not-exist") is None
+
+
+def test_builtin_native_providers_have_required_hooks() -> None:
+    """run_native and auto_create_terminal are mandatory on every built-in row."""
+    for provider in hp.native_providers():
+        assert provider.run_native, provider.key
+        assert provider.auto_create_terminal, provider.key
+
+
+def test_builtin_native_provider_paths_resolve() -> None:
+    """Every populated built-in provider hook resolves to a real callable.
+
+    This is the guard that keeps the provider rows honest: a typo'd import path
+    or a renamed run_<x>_native symbol fails here rather than at dispatch time.
+    """
+    from omnigent import native_dispatch
+
+    native_dispatch.reset_resolve_cache_for_tests()
+    for provider in hp.native_providers():
+        for hook in (
+            "run_native",
+            "auto_create_terminal",
+            "materialize_agent_spec",
+        ):
+            resolved = native_dispatch.resolve_hook(provider, hook)
+            assert callable(resolved), f"{provider.key}.{hook} did not resolve to a callable"
