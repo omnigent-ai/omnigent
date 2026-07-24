@@ -247,6 +247,7 @@ def load(
                 source,
                 enforce_handler_allowlist=enforce_handler_allowlist,
                 prune_invalid_sub_agents=prune_invalid_sub_agents,
+                expand_env=expand_env,
             )
         if source.suffix.lower() in {".yaml", ".yml"}:
             # The path is a YAML file but failed the omnigent check
@@ -281,13 +282,16 @@ def load(
     # The omnigent single-file path (load_omnigent_yaml) copies
     # headers / connection verbatim and never expands ``${VAR}``
     # against the process env, so it is safe regardless of
-    # *expand_env* and the flag does not apply.
+    # *expand_env* for env expansion. The flag is still forwarded so
+    # ``expand_env=False`` (untrusted upload validation) also gates the
+    # MLflow Prompt Registry fetch for an ``instructions:`` reference.
     candidate = _find_omnigent_yaml_in_dir(root)
     if candidate is not None:
         return load_omnigent_yaml(
             candidate,
             enforce_handler_allowlist=enforce_handler_allowlist,
             prune_invalid_sub_agents=prune_invalid_sub_agents,
+            expand_env=expand_env,
         )
 
     spec = parse(root, expand_env=expand_env)

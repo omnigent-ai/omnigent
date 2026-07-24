@@ -22,6 +22,7 @@ from omnigent.inner.datamodel import (
     OSEnvSpec,
     TerminalEnvSpec,
 )
+from omnigent.spec.mlflow_prompts import parse_mlflow_instructions, resolve_mlflow_prompt
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
     AgentSpec,
@@ -276,7 +277,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     raw_instructions = raw.get("instructions")
     if raw_instructions is None:
         raw_instructions = raw.get("prompt")
-    instructions = _resolve_instructions(root, raw_instructions)
+    instructions = _resolve_instructions(root, raw_instructions, expand_env=expand_env)
     skills = _discover_skills(root / "skills")
     skills_filter = _parse_skills_filter(raw.get("skills"))
     mcp_servers = _discover_mcp_servers(root / "tools" / "mcp", expand_env=expand_env)
@@ -1810,10 +1811,14 @@ def _read_contained_file(root: Path, value: str) -> str | None:
     return None
 
 
-def _resolve_instructions(root: Path, raw_value: object) -> str | None:
+def _resolve_instructions(root: Path, raw_value: object, *, expand_env: bool = True) -> str | None:
     """
     Resolve the instructions for an agent image.
 
+    - If ``instructions`` names an MLflow Prompt Registry reference
+      (``source: mlflow`` mapping or ``mlflow+prompts:/...`` string),
+      load the prompt text from the registry — but only when
+      *expand_env* is ``True``. See *expand_env* below.
     - If ``instructions`` is set in config.yaml and the value is
       a path to an existing file relative to *root*, read that
       file.
@@ -1825,12 +1830,31 @@ def _resolve_instructions(root: Path, raw_value: object) -> str | None:
     :param root: Path to the agent image directory.
     :param raw_value: The raw ``instructions`` value from
         config.yaml, or ``None`` if the key was absent. May be
-        a relative file path (e.g. ``"prompts/system.md"``) or
-        inline text.
+        a relative file path (e.g. ``"prompts/system.md"``),
+        inline text, or an MLflow Prompt Registry reference.
+    :param expand_env: Whether this is a runtime/deploy parse
+        (``True``) versus a scaffolding/validation parse
+        (``False``). It gates the MLflow registry fetch the same
+        way it gates ``${VAR}`` expansion: a tenant-supplied /
+        HTTP-uploaded bundle is parsed with ``expand_env=False``,
+        and the server must not reach out to a registry on the
+        author's behalf during validation. When ``False`` an
+        MLflow reference is left as its literal string.
     :returns: The resolved instruction text, or ``None`` if no
         instructions are available.
     """
     if raw_value is not None:
+        mlflow_ref = parse_mlflow_instructions(raw_value)
+        if mlflow_ref is not None:
+            if not expand_env:
+                return mlflow_ref.reference
+            return resolve_mlflow_prompt(
+                mlflow_ref.reference,
+                tracking_uri=mlflow_ref.tracking_uri,
+                registry_uri=mlflow_ref.registry_uri,
+                vars=mlflow_ref.vars,
+                cache_ttl=mlflow_ref.cache_ttl,
+            )
         text = str(raw_value)
         # Only attempt file lookup for short single-line values
         # that look like filenames (multiline text can't be a path).
