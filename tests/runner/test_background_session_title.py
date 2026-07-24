@@ -6,11 +6,13 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.codex_native_app_server import NativeCodexLaunch
 from omnigent.runner import create_runner_app
 from tests.runner.helpers import NullServerClient
 
@@ -154,7 +156,7 @@ async def test_background_title_maps_claude_native_to_claude_cli(
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
     resolver_calls: list[tuple[str | None, str | None]] = []
-    cli_calls: list[tuple[str, Any, str | None]] = []
+    cli_calls: list[tuple[str, str | None]] = []
 
     async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str] | None]:
         override = kwargs["harness_override"]
@@ -316,21 +318,29 @@ async def test_claude_native_title_kills_process_when_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_background_title_skips_codex_native_without_spawning(
+async def test_background_title_uses_native_codex_without_spawning_headless_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
-    calls: list[tuple[str | None, str | None]] = []
+    resolver_calls: list[tuple[str | None, str | None]] = []
+    cli_calls: list[tuple[str, Any, str | None]] = []
 
     async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str] | None]:
-        override = kwargs["harness_override"]
-        calls.append((override, kwargs["model_override"]))
+        resolver_calls.append((kwargs["harness_override"], kwargs["model_override"]))
         return "codex-native", None
+
+    async def generate_codex_title(prompt: str, *, model: str | None) -> str:
+        cli_calls.append((prompt, model))
+        return "Debug authentication timeout"
 
     monkeypatch.setattr(
         "omnigent.runner.app._resolve_harness_config",
         resolve_harness_config,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.app._generate_codex_native_background_title",
+        generate_codex_title,
     )
     app = create_runner_app(
         process_manager=process_manager,  # type: ignore[arg-type]
@@ -347,11 +357,144 @@ async def test_background_title_skips_codex_native_without_spawning(
         )
 
     assert response.status_code == 200
-    assert response.json() == {"status": "unsupported", "title": None}
-    assert calls == [(None, "gpt-5.4-mini")]
+    assert response.json() == {
+        "status": "generated",
+        "title": "Debug authentication timeout",
+    }
+    assert resolver_calls == [(None, "gpt-5.4-mini")]
+    assert cli_calls == [
+        (
+            "please investigate the authentication timeout",
+            "gpt-5.4-mini",
+        )
+    ]
     assert process_manager.get_client_calls == []
     assert process_manager.released == []
     assert harness_client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_codex_native_title_uses_ephemeral_tool_free_exec(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from omnigent.runner import app as runner_app
+
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            args = captured["args"]
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
+            captured["agents_exists"] = (codex_home / "AGENTS.md").exists()
+            output_path.write_text("Debug authentication timeout\n")
+            return b"", b"ignored warning"
+
+    async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> FakeProcess:
+        captured.update(command=command, args=list(args), kwargs=kwargs)
+        return FakeProcess()
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text("{}")
+    (source_home / "config.toml").write_text('model_provider = "openai"\n')
+    (source_home / "AGENTS.md").write_text("Do unrelated work")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.resolve_native_codex_launch",
+        lambda *, model: NativeCodexLaunch([], model, None),
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: "codex",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: source_home,
+    )
+
+    title = await runner_app._generate_codex_native_background_title(
+        "please investigate the authentication timeout",
+        model="gpt-5.4-mini",
+    )
+
+    assert title == "Debug authentication timeout"
+    assert captured["command"] == "codex"
+    args = captured["args"]
+    assert args[0] == "exec"
+    assert "--ephemeral" in args
+    assert "--ignore-rules" in args
+    assert "--skip-git-repo-check" in args
+    assert args[args.index("--model") + 1] == "gpt-5.4-mini"
+    assert "features.shell_tool=false" in args
+    assert 'web_search="disabled"' in args
+    assert "omnigent-codex-title-" in captured["kwargs"]["cwd"]
+    codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
+    assert codex_home != source_home
+    assert captured["agents_exists"] is False
+
+
+@pytest.mark.asyncio
+async def test_codex_native_title_kills_process_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    from omnigent.runner import app as runner_app
+
+    communicate_started = asyncio.Event()
+    killed: list[Any] = []
+
+    class FakeProcess:
+        returncode: int | None = None
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            communicate_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.waited = True
+            self.returncode = -9
+            return self.returncode
+
+    process = FakeProcess()
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.resolve_native_codex_launch",
+        lambda *, model: NativeCodexLaunch([], model, None),
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: "codex",
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        lambda *args, **kwargs: asyncio.sleep(0, result=process),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner._proc.kill_tree",
+        lambda candidate: killed.append(candidate),
+    )
+
+    task = asyncio.create_task(
+        runner_app._generate_codex_native_background_title(
+            "please investigate the authentication timeout",
+            model="gpt-5.4-mini",
+        )
+    )
+    await communicate_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert killed == [process]
+    assert process.waited is True
 
 
 @pytest.mark.asyncio

@@ -23,7 +23,9 @@ _logger = logging.getLogger(__name__)
 
 # Start with harnesses whose isolated title-generation paths are verified;
 # additional harnesses can be added once they have equivalent coverage.
-_SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset({"claude-sdk", "claude-native", "codex"})
+_SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset(
+    {"claude-sdk", "claude-native", "codex", "codex-native"}
+)
 
 
 def _background_session_title_harness_supported(harness: str | None) -> bool:
