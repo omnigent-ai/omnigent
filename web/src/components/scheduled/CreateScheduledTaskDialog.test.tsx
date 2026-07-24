@@ -284,7 +284,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     );
     expect(screen.getByText("Edit scheduled task")).toBeInTheDocument();
     expect(screen.getByText(/Update this recurring agent session/i)).toBeInTheDocument();
-    expect(screen.getByTestId("create-scheduled-task-submit")).toHaveTextContent("Update task");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toHaveTextContent("Save changes");
     expect((screen.getByTestId("task-name-input") as HTMLInputElement).value).toBe("Morning brief");
     expect((screen.getByTestId("task-prompt-input") as HTMLTextAreaElement).value).toBe(
       "Summarize overnight activity",
@@ -417,6 +417,15 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(timeField.tagName).toBe("INPUT");
     expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
     expect(screen.getByTestId("schedule-time-picker-trigger")).toBeInTheDocument();
+  });
+
+  it("lays out Frequency and Time in one compact row", () => {
+    renderDialog();
+    const row = screen.getByTestId("schedule-frequency-time-row");
+    expect(row).toContainElement(screen.getByText("Frequency"));
+    expect(row).toContainElement(screen.getByText("Time"));
+    expect(row).toContainElement(screen.getByTestId("schedule-preset-trigger"));
+    expect(row).toContainElement(screen.getByTestId("schedule-time"));
   });
 
   it("chooses a non-quarter-hour time from the compact picker", async () => {

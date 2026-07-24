@@ -268,7 +268,7 @@ export function CreateScheduledTaskDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className="max-h-[90vh] overflow-y-auto sm:max-w-lg"
+        className="max-h-[90vh] overflow-hidden p-0 sm:max-w-[560px]"
         data-testid="create-scheduled-task-dialog"
         // Keep a nested Select's dismiss (pick an option, OR click empty modal
         // body / trigger while it's open) from closing the whole Dialog. See
@@ -278,7 +278,7 @@ export function CreateScheduledTaskDialog({
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
       >
-        <DialogHeader>
+        <DialogHeader className="px-6 pt-6 pb-0">
           <DialogTitle>{isEdit ? "Edit scheduled task" : "New scheduled task"}</DialogTitle>
           <DialogDescription>
             {isEdit
@@ -287,13 +287,13 @@ export function CreateScheduledTaskDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col gap-4 py-1">
+        <div className="flex max-h-[calc(90vh-8.5rem)] flex-col gap-4 overflow-y-auto px-6 py-4">
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="task-name">Name</Label>
             <Input
               id="task-name"
               value={name}
-              placeholder="Nightly triage"
+              placeholder="daily-brief"
               data-testid="task-name-input"
               onChange={(e) => setName(e.target.value)}
             />
@@ -304,8 +304,8 @@ export function CreateScheduledTaskDialog({
             <Textarea
               id="task-prompt"
               value={prompt}
-              rows={4}
-              placeholder="What should the agent do each time it runs?"
+              rows={3}
+              placeholder="What should the agent do each run?"
               data-testid="task-prompt-input"
               // No native resize grip — match the clean styling of the other fields.
               className="resize-none"
@@ -468,8 +468,8 @@ export function CreateScheduledTaskDialog({
           )}
         </div>
 
-        <DialogFooter>
-          <Button variant="ghost" onClick={() => handleOpenChange(false)}>
+        <DialogFooter className="mx-0 mb-0 rounded-none border-t bg-muted/20 px-6 py-4 sm:justify-end">
+          <Button variant="outline" onClick={() => handleOpenChange(false)}>
             Cancel
           </Button>
           <Button
@@ -478,7 +478,7 @@ export function CreateScheduledTaskDialog({
             data-testid="create-scheduled-task-submit"
           >
             {mutationPending && <Loader2Icon className="mr-1 size-4 animate-spin" />}
-            {isEdit ? "Update task" : "Create task"}
+            {isEdit ? "Save changes" : "Create task"}
           </Button>
         </DialogFooter>
       </DialogContent>

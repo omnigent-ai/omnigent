@@ -155,29 +155,119 @@ export function ScheduleFields({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="schedule-preset">Frequency</Label>
-        <Select
-          value={model.preset}
-          onValueChange={(value) => onChange({ ...model, preset: value as SchedulePreset })}
-          onOpenChange={onSelectOpenChange}
-        >
-          <SelectTrigger id="schedule-preset" data-testid="schedule-preset-trigger">
-            <SelectValue />
-          </SelectTrigger>
-          {/* position="popper" opens the list anchored BELOW the trigger (auto-
-              flips up when no room) so it never overlaps the field label above,
-              unlike the default item-aligned mode. align="start" lines the
-              dropdown's left edge up with the trigger (Radix defaults to
-              center, which shifts it left). */}
-          <SelectContent position="popper" align="start">
-            {PRESET_OPTIONS.map((opt) => (
-              <SelectItem key={opt.value} value={opt.value}>
-                {opt.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+      <div className="grid gap-3 sm:grid-cols-2" data-testid="schedule-frequency-time-row">
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="schedule-preset">Frequency</Label>
+          <Select
+            value={model.preset}
+            onValueChange={(value) => onChange({ ...model, preset: value as SchedulePreset })}
+            onOpenChange={onSelectOpenChange}
+          >
+            <SelectTrigger id="schedule-preset" data-testid="schedule-preset-trigger">
+              <SelectValue />
+            </SelectTrigger>
+            {/* position="popper" opens the list anchored BELOW the trigger (auto-
+                flips up when no room) so it never overlaps the field label above,
+                unlike the default item-aligned mode. align="start" lines the
+                dropdown's left edge up with the trigger (Radix defaults to
+                center, which shifts it left). */}
+            <SelectContent position="popper" align="start">
+              {PRESET_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="schedule-time">{isHourly ? "Minute" : "Time"}</Label>
+          {isHourly ? (
+            <Input
+              ref={inputRef}
+              id="schedule-time"
+              value={timeText}
+              data-testid="schedule-minute"
+              placeholder=":15"
+              aria-invalid={error ? true : undefined}
+              onChange={(e) => handleTimeTextChange(e.target.value)}
+              onBlur={canonicalizeTimeText}
+            />
+          ) : (
+            <Popover open={timePickerOpen} onOpenChange={handleTimePickerOpenChange}>
+              <PopoverAnchor asChild>
+                <div className="relative">
+                  <Input
+                    ref={inputRef}
+                    id="schedule-time"
+                    value={timeText}
+                    data-testid="schedule-time"
+                    placeholder="5:00 PM"
+                    className="pr-8"
+                    aria-invalid={error ? true : undefined}
+                    onFocus={() => handleTimePickerOpenChange(true)}
+                    onChange={(e) => handleTimeTextChange(e.target.value)}
+                    onBlur={canonicalizeTimeText}
+                  />
+                  <button
+                    type="button"
+                    aria-label="Open time picker"
+                    data-testid="schedule-time-picker-trigger"
+                    className="absolute top-1/2 right-2 flex size-4 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
+                    onClick={() => handleTimePickerOpenChange(!timePickerOpen)}
+                  >
+                    <ClockIcon className="size-3.5" />
+                  </button>
+                </div>
+              </PopoverAnchor>
+              <PopoverContent
+                align="start"
+                className="w-44 rounded-sm p-1.5"
+                onOpenAutoFocus={(event) => event.preventDefault()}
+              >
+                <div className="grid grid-cols-3 gap-1" data-testid="schedule-time-picker">
+                  <div ref={hourColumnRef} className="max-h-64 overflow-y-auto">
+                    {HOURS_12.map((hour) => (
+                      <PickerCell
+                        key={hour}
+                        testId={`schedule-hour-${pad(hour)}`}
+                        selected={pickerParts.hour12 === hour}
+                        onClick={() => applyPickerTime({ hour12: hour })}
+                      >
+                        {pad(hour)}
+                      </PickerCell>
+                    ))}
+                  </div>
+                  <div ref={minuteColumnRef} className="max-h-64 overflow-y-auto">
+                    {MINUTES.map((minute) => (
+                      <PickerCell
+                        key={minute}
+                        testId={`schedule-minute-${pad(minute)}`}
+                        selected={pickerParts.minute === minute}
+                        onClick={() => applyPickerTime({ minute })}
+                      >
+                        {pad(minute)}
+                      </PickerCell>
+                    ))}
+                  </div>
+                  <div className="max-h-64 overflow-y-auto">
+                    {PERIODS.map((period) => (
+                      <PickerCell
+                        key={period}
+                        testId={`schedule-period-${period}`}
+                        selected={pickerParts.period === period}
+                        onClick={() => applyPickerTime({ period })}
+                      >
+                        {period}
+                      </PickerCell>
+                    ))}
+                  </div>
+                </div>
+              </PopoverContent>
+            </Popover>
+          )}
+        </div>
       </div>
 
       {showWeekdays && (
@@ -207,95 +297,6 @@ export function ScheduleFields({
           </div>
         </div>
       )}
-
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="schedule-time">{isHourly ? "Minute" : "Time"}</Label>
-        {isHourly ? (
-          <Input
-            ref={inputRef}
-            id="schedule-time"
-            value={timeText}
-            data-testid="schedule-minute"
-            placeholder=":15"
-            className="w-28"
-            aria-invalid={error ? true : undefined}
-            onChange={(e) => handleTimeTextChange(e.target.value)}
-            onBlur={canonicalizeTimeText}
-          />
-        ) : (
-          <Popover open={timePickerOpen} onOpenChange={handleTimePickerOpenChange}>
-            <PopoverAnchor asChild>
-              <div className="relative w-40">
-                <Input
-                  ref={inputRef}
-                  id="schedule-time"
-                  value={timeText}
-                  data-testid="schedule-time"
-                  placeholder="5:00 PM"
-                  className="pr-8"
-                  aria-invalid={error ? true : undefined}
-                  onFocus={() => handleTimePickerOpenChange(true)}
-                  onChange={(e) => handleTimeTextChange(e.target.value)}
-                  onBlur={canonicalizeTimeText}
-                />
-                <button
-                  type="button"
-                  aria-label="Open time picker"
-                  data-testid="schedule-time-picker-trigger"
-                  className="absolute top-1/2 right-2 flex size-4 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
-                  onClick={() => handleTimePickerOpenChange(!timePickerOpen)}
-                >
-                  <ClockIcon className="size-3.5" />
-                </button>
-              </div>
-            </PopoverAnchor>
-            <PopoverContent
-              align="start"
-              className="w-44 rounded-sm p-1.5"
-              onOpenAutoFocus={(event) => event.preventDefault()}
-            >
-              <div className="grid grid-cols-3 gap-1" data-testid="schedule-time-picker">
-                <div ref={hourColumnRef} className="max-h-64 overflow-y-auto">
-                  {HOURS_12.map((hour) => (
-                    <PickerCell
-                      key={hour}
-                      testId={`schedule-hour-${pad(hour)}`}
-                      selected={pickerParts.hour12 === hour}
-                      onClick={() => applyPickerTime({ hour12: hour })}
-                    >
-                      {pad(hour)}
-                    </PickerCell>
-                  ))}
-                </div>
-                <div ref={minuteColumnRef} className="max-h-64 overflow-y-auto">
-                  {MINUTES.map((minute) => (
-                    <PickerCell
-                      key={minute}
-                      testId={`schedule-minute-${pad(minute)}`}
-                      selected={pickerParts.minute === minute}
-                      onClick={() => applyPickerTime({ minute })}
-                    >
-                      {pad(minute)}
-                    </PickerCell>
-                  ))}
-                </div>
-                <div className="max-h-64 overflow-y-auto">
-                  {PERIODS.map((period) => (
-                    <PickerCell
-                      key={period}
-                      testId={`schedule-period-${period}`}
-                      selected={pickerParts.period === period}
-                      onClick={() => applyPickerTime({ period })}
-                    >
-                      {period}
-                    </PickerCell>
-                  ))}
-                </div>
-              </div>
-            </PopoverContent>
-          </Popover>
-        )}
-      </div>
 
       {/* describeSchedule/buildRRule stay in the lib for list rows and possible
           future previews; only the inline validation error renders here now. */}
