@@ -1,14 +1,7 @@
-import {
-  BotIcon,
-  FileCode2Icon,
-  FileIcon,
-  GlobeIcon,
-  ListTodoIcon,
-  TerminalIcon,
-  XIcon,
-} from "lucide-react";
+import { BotIcon, FileIcon, GlobeIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
+import { ArtifactIcon } from "@/components/icons/ArtifactIcon";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { FilesPanel } from "./FilesPanel";
@@ -349,7 +342,7 @@ export function WorkspacePanel({
                 value="artifacts"
                 className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
               >
-                <FileCode2Icon className="size-4" />
+                <ArtifactIcon className="size-4" />
                 Artifacts
               </TabsTrigger>
             )}

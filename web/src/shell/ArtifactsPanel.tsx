@@ -1,7 +1,6 @@
 import {
   AlertTriangleIcon,
   CheckCircle2Icon,
-  FileCode2Icon,
   Loader2Icon,
   Maximize2Icon,
   MonitorIcon,
@@ -17,6 +16,7 @@ import { useEffect, useId, useMemo, useState } from "react";
 import { useArtifactPreview } from "@/hooks/useArtifactPreview";
 import { useManagedArtifacts } from "@/hooks/useManagedArtifacts";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
+import { ArtifactIcon } from "@/components/icons/ArtifactIcon";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -287,7 +287,7 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
   if (entries.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
-        <FileCode2Icon className="size-8 text-muted-foreground/60" />
+        <ArtifactIcon className="size-8 text-muted-foreground/60" />
         <p className="text-sm font-medium">No artifacts yet</p>
         <p className="text-xs text-muted-foreground">
           Published HTML artifacts appear here for preview.
@@ -308,7 +308,7 @@ export function ArtifactsPanel({ conversationId, selectedPath, onSelect }: Artif
             aria-label="Select artifact"
             className="h-8 min-w-0 flex-1 justify-start border-0 bg-transparent px-2 shadow-none hover:bg-muted *:data-[slot=select-value]:flex-1 *:data-[slot=select-value]:text-left dark:bg-transparent dark:hover:bg-muted"
           >
-            <FileCode2Icon data-icon="inline-start" className="size-4 text-muted-foreground" />
+            <ArtifactIcon data-icon="inline-start" className="size-4 text-muted-foreground" />
             <SelectValue placeholder="Choose an artifact" />
           </SelectTrigger>
           <SelectContent position="popper" align="start">

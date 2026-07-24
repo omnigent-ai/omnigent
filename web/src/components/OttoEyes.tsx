@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { OttoIcon } from "@/components/icons/OttoIcon";
+import { OttoIcon, type OttoIconVariant } from "@/components/icons/OttoIcon";
 
 // Eye geometry in the SVG's own viewBox coordinate system (0 0 1024 1024).
 // Each of Otto's eyes is a fixed near-circular white with a concentric pupil
@@ -202,7 +202,15 @@ function caretPointFor(field: HTMLElement): ScreenPoint | null {
  * nodes, so tracking never re-renders React. Respects
  * `prefers-reduced-motion` by leaving the pupils centered.
  */
-export function OttoEyes({ className }: { className?: string }) {
+export function OttoEyes({
+  className,
+  variant = "default",
+  ariaLabel = "Omnigent",
+}: {
+  className?: string;
+  variant?: OttoIconVariant;
+  ariaLabel?: string;
+}) {
   const svgRef = useRef<SVGSVGElement>(null);
 
   useEffect(() => {
@@ -381,10 +389,11 @@ export function OttoEyes({ className }: { className?: string }) {
     <OttoIcon
       ref={svgRef}
       className={className}
+      variant={variant}
       // The hero mascot is meaningful (not decorative), so OttoIcon's
       // decorative aria-hidden default is overridden with image semantics.
       role="img"
-      aria-label="Omnigent"
+      aria-label={ariaLabel}
       aria-hidden={false}
     />
   );

@@ -153,7 +153,7 @@ import {
   parseMentionToken,
   rankMentionEntries,
 } from "@/lib/composerMentions";
-import { OttoEyes } from "@/components/OttoEyes";
+import { LandingAgentMascot, landingAgentMascotVariant } from "@/components/LandingAgentMascot";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { type CostControlMode } from "@/components/CostRoutingControl";
@@ -173,6 +173,7 @@ const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
 const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
   polly: "Multi-agent coding",
   debby: "Multi-agent debate",
+  willy: "Omnigent design",
 };
 
 // Agents whose bundled skills render as always-visible pills under the
@@ -964,6 +965,23 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
  * BEFORE selecting, so the harness-switch reseed effect in the screen reads it
  * back as the same value and doesn't clobber the choice.
  */
+type AgentHarnessPickerProps = {
+  agentEntries: AvailableAgent[];
+  harnessEntries: AvailableAgent[];
+  effectiveAgentId: string | null;
+  agentLabel: string;
+  hasAgents: boolean;
+  host: Host | undefined | null;
+  onSelectAgent: (agent: AvailableAgent) => void;
+  pendingAgent: AgentBundleInput | null;
+  pendingAgentId: string;
+  onSelectPending: () => void;
+  onCreateCustomAgent: () => void;
+  sandboxSelected: boolean;
+  trigger?: ReactNode;
+  contentAlign?: "start" | "center" | "end";
+};
+
 function AgentHarnessPicker({
   agentEntries,
   harnessEntries,
@@ -977,27 +995,15 @@ function AgentHarnessPicker({
   onSelectPending,
   onCreateCustomAgent,
   sandboxSelected,
-}: {
-  agentEntries: AvailableAgent[];
-  harnessEntries: AvailableAgent[];
-  effectiveAgentId: string | null;
-  agentLabel: string;
-  hasAgents: boolean;
-  host: Host | undefined | null;
-  onSelectAgent: (agent: AvailableAgent) => void;
-  pendingAgent: AgentBundleInput | null;
-  pendingAgentId: string;
-  onSelectPending: () => void;
-  onCreateCustomAgent: () => void;
-  sandboxSelected: boolean;
-}) {
+  trigger,
+  contentAlign = "end",
+}: AgentHarnessPickerProps) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = info !== "loading" && info.harness_install_enabled;
-  const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
   // "Custom agents") are unreachable there. On mobile we swap the dropdown's
@@ -1161,25 +1167,26 @@ function AgentHarnessPicker({
       }}
     >
       <DropdownMenuTrigger asChild>
-        <Button
-          ref={triggerRef}
-          type="button"
-          variant="ghost"
-          size="sm"
-          disabled={!hasAgents}
-          data-testid="new-chat-landing-agent-select"
-          // Drop the Button's focus-visible ring/border that otherwise shows
-          // when focus returns to the trigger after a pick.
-          className="h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
-        >
-          <span className="max-w-[12rem] truncate text-xs text-foreground">
-            {hasAgents ? agentLabel : "No agents"}
-          </span>
-          <ChevronDownIcon className="size-3.5 opacity-60" />
-        </Button>
+        {trigger ?? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={!hasAgents}
+            data-testid="new-chat-landing-agent-select"
+            // Drop the Button's focus-visible ring/border that otherwise shows
+            // when focus returns to the trigger after a pick.
+            className="h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0"
+          >
+            <span className="max-w-[12rem] truncate text-xs text-foreground">
+              {hasAgents ? agentLabel : "No agents"}
+            </span>
+            <ChevronDownIcon className="size-3.5 opacity-60" />
+          </Button>
+        )}
       </DropdownMenuTrigger>
       <DropdownMenuContent
-        align="end"
+        align={contentAlign}
         // Keep the menu inside the viewport on short mobile screens: pad the
         // collision box so the available-height cap leaves room below the
         // status bar, and let it flip/scroll rather than run off the top.
@@ -2353,6 +2360,7 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  const mascotVariant = landingAgentMascotVariant(selectedAgent?.name);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -3206,10 +3214,53 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex flex-col items-center gap-3.5 sm:flex-row">
-          <OttoEyes className="h-18 w-auto shrink-0" />
-          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
+        <div className="flex flex-col items-center gap-1.5" data-testid="new-chat-landing-hero">
+          <AgentHarnessPicker
+            agentEntries={agentEntries}
+            harnessEntries={[]}
+            effectiveAgentId={effectiveAgentId}
+            agentLabel={agentLabel}
+            hasAgents={agentList.length > 0}
+            host={harnessWarningHost}
+            onSelectAgent={handleSelectAgent}
+            pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
+            pendingAgentId={PENDING_AGENT_ID}
+            onSelectPending={handleSelectPending}
+            onCreateCustomAgent={() => setCreateAgentOpen(true)}
+            sandboxSelected={sandboxSelected}
+            contentAlign="center"
+            trigger={
+              <button
+                type="button"
+                disabled={agentList.length === 0}
+                aria-label={
+                  agentList.length > 0
+                    ? `Change agent. Current agent: ${agentLabel}`
+                    : "No agents available"
+                }
+                data-testid="new-chat-landing-mascot-agent-select"
+                className="group relative cursor-pointer rounded-[28px] transition-transform duration-150 hover:scale-[1.03] active:scale-[0.98] disabled:cursor-default disabled:hover:scale-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-4 focus-visible:ring-offset-background"
+              >
+                <LandingAgentMascot agentName={selectedAgent?.name} />
+                <span
+                  aria-hidden="true"
+                  data-testid="new-chat-landing-mascot-agent-hint"
+                  className="pointer-events-none absolute bottom-0 left-1/2 z-20 flex -translate-x-1/2 translate-y-1/2 items-center gap-0.5 whitespace-nowrap rounded-full border border-border/80 bg-popover/95 px-2 py-1 text-[11px] font-medium text-popover-foreground opacity-0 shadow-sm backdrop-blur-sm transition-[opacity,transform] duration-150 group-hover:translate-y-[45%] group-hover:opacity-100 group-focus-visible:translate-y-[45%] group-focus-visible:opacity-100 group-data-[state=open]:invisible"
+                >
+                  Change agent
+                  <ChevronDownIcon className="size-3 opacity-60" />
+                </span>
+              </button>
+            }
+          />
+          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground">
+            {mascotVariant === "willy" ? (
+              <>
+                What should we <span className="willy-design-word">design</span>?
+              </>
+            ) : (
+              "What should we do?"
+            )}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
