@@ -1521,7 +1521,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   }
 
   function scheduleCloseOnLeave(e: React.PointerEvent) {
-    if (e.pointerType !== "mouse") return;
+    if (e.pointerType !== "mouse" || !openedByHoverRef.current) return;
     scheduleClose();
   }
 
@@ -1544,12 +1544,14 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
           openedByHoverRef.current &&
           performance.now() - hoverOpenedAtRef.current < HOVER_CLICK_GRACE_MS
         ) {
+          cancelClose();
+          openedByHoverRef.current = false;
           return;
         }
         // Click / keyboard / outside-dismiss path: honor Radix immediately and
         // drop the hover flag so focus behaves normally.
         cancelClose();
-        if (!next) openedByHoverRef.current = false;
+        openedByHoverRef.current = false;
         setOpen(next);
       }}
     >

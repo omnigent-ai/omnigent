@@ -348,6 +348,18 @@ describe("AgentInfoButton hover behavior", () => {
     fireEvent.click(trigger);
     expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
   });
+
+  it("does not hover-close a popover that the same pointer gesture clicked open", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    mousePointerEnter(trigger);
+    fireEvent.click(trigger);
+    mousePointerLeave(trigger);
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
 });
 
 describe("AgentInfoButton session cost row", () => {
