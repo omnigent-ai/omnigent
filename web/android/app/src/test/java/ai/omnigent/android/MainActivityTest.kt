@@ -28,8 +28,9 @@ class MainActivityTest {
     fun `configuration change preserves SPA-applied system bar polarity`() {
         // Skip onCreate to isolate the bare config-change path from WebView dispatch.
         val activity = Robolectric.buildActivity(MainActivity::class.java).get()
-        activity.applyColorScheme(isLight = true)
-        val insetsController = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        activity.applyColorScheme(ResolvedColorScheme.LIGHT)
+        val insetsController =
+            WindowInsetsControllerCompat(activity.window, activity.window.decorView)
         val statusBarsWereLight = insetsController.isAppearanceLightStatusBars
         val navigationBarsWereLight = insetsController.isAppearanceLightNavigationBars
         assertTrue(statusBarsWereLight)
@@ -49,18 +50,34 @@ class MainActivityTest {
     }
 
     @Test
+    fun `resolved page scheme drives both system bar icon polarities`() {
+        val activity = Robolectric.buildActivity(MainActivity::class.java).get()
+        val insetsController =
+            WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+
+        activity.applyColorScheme(ResolvedColorScheme.DARK)
+        assertFalse(insetsController.isAppearanceLightStatusBars)
+        assertFalse(insetsController.isAppearanceLightNavigationBars)
+
+        activity.applyColorScheme(ResolvedColorScheme.LIGHT)
+        assertTrue(insetsController.isAppearanceLightStatusBars)
+        assertTrue(insetsController.isAppearanceLightNavigationBars)
+    }
+
+    @Test
     @Config(sdk = [35], qualifiers = "night")
     fun `top level navigation resets system bars to the OS fallback`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val webView = activity.webView()
-        val insetsController = WindowInsetsControllerCompat(activity.window, activity.window.decorView)
+        val insetsController =
+            WindowInsetsControllerCompat(activity.window, activity.window.decorView)
         assertEquals(
             Configuration.UI_MODE_NIGHT_YES,
             activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK,
         )
 
-        activity.applyColorScheme(isLight = true)
+        activity.applyColorScheme(ResolvedColorScheme.LIGHT)
         assertTrue(insetsController.isAppearanceLightStatusBars)
         assertTrue(insetsController.isAppearanceLightNavigationBars)
 
@@ -70,12 +87,12 @@ class MainActivityTest {
         assertFalse(insetsController.isAppearanceLightNavigationBars)
     }
 
-    private fun MainActivity.applyColorScheme(isLight: Boolean) {
+    private fun MainActivity.applyColorScheme(scheme: ResolvedColorScheme) {
         MainActivity::class
             .java
-            .getDeclaredMethod("applyColorScheme", Boolean::class.java)
+            .getDeclaredMethod("applyColorScheme", ResolvedColorScheme::class.java)
             .apply { isAccessible = true }
-            .invoke(this, isLight)
+            .invoke(this, scheme)
     }
 
     private fun MainActivity.webView(): WebView =

@@ -33,6 +33,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.webkit.ScriptHandler
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 
@@ -56,6 +57,8 @@ class MainActivity : ComponentActivity() {
     private var pendingNavigatePath: String? = null
     private var lastInsets: Insets? = null
     private var pageLoaded = false
+    private var bridgeTransportInstalled = false
+    private var bridgeScriptHandler: ScriptHandler? = null
     private var loginAttempts = 0 // capped browser-login retries; reset in onPageReady
     private var historyCleared = false // drop pre-auth/login-redirect history once
 
@@ -139,6 +142,9 @@ class MainActivity : ComponentActivity() {
                         // Full page loads briefly use OS-derived bar polarity until the SPA
                         // reports its resolved scheme; capable SPAs override it immediately.
                         onTopLevelNavigation = ::resetColorSchemeToSystem,
+                        shouldInjectBridgeAtPageReady = {
+                            bridgeTransportInstalled && bridgeScriptHandler == null
+                        },
                         onPageReady = ::onPageReady,
                         onLoginRequired = ::startLogin,
                     )
@@ -308,21 +314,36 @@ class MainActivity : ComponentActivity() {
             )
         } catch (_: IllegalArgumentException) {
             // Malformed origin rule — leave the bridge absent; the web layer falls back.
+            return
+        }
+        bridgeTransportInstalled = true
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            try {
+                bridgeScriptHandler =
+                    WebViewCompat.addDocumentStartJavaScript(
+                        webView,
+                        NativeBridgeScript.source,
+                        setOf(origin),
+                    )
+            } catch (_: IllegalArgumentException) {
+                // Keep the transport; onPageFinished will inject the facade instead.
+            }
         }
     }
 
-    private fun applyColorScheme(isLight: Boolean) {
+    private fun applyColorScheme(scheme: ResolvedColorScheme) {
+        val useDarkIcons = scheme == ResolvedColorScheme.LIGHT
         WindowInsetsControllerCompat(window, window.decorView).apply {
-            isAppearanceLightStatusBars = isLight
-            isAppearanceLightNavigationBars = isLight
+            isAppearanceLightStatusBars = useDarkIcons
+            isAppearanceLightNavigationBars = useDarkIcons
         }
     }
 
     private fun resetColorSchemeToSystem() {
-        val isLight =
+        val isLightMode =
             resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
-        applyColorScheme(isLight)
+        applyColorScheme(if (isLightMode) ResolvedColorScheme.LIGHT else ResolvedColorScheme.DARK)
     }
 
     /**
@@ -467,7 +488,10 @@ class MainActivity : ComponentActivity() {
         pendingMicRequest = null
         loginManager.shutdown()
         if (::blobSaver.isInitialized) blobSaver.shutdown()
-        if (::webView.isInitialized) webView.destroy() // releases the bridge chain
+        if (::webView.isInitialized) {
+            removeBridge()
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
@@ -502,6 +526,20 @@ class MainActivity : ComponentActivity() {
         serverUrl: String,
         newOrigin: String,
     ) {
+        removeBridge()
+        pinnedOrigin = newOrigin
+        pageLoaded = false
+        historyCleared = false
+        loginAttempts = 0
+        (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
+        installBridge()
+        webView.loadUrl(serverUrl)
+    }
+
+    private fun removeBridge() {
+        bridgeScriptHandler?.remove()
+        bridgeScriptHandler = null
+        bridgeTransportInstalled = false
         try {
             WebViewCompat.removeWebMessageListener(
                 webView,
@@ -510,13 +548,6 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Not registered (feature unsupported, or already removed) — no-op.
         }
-        pinnedOrigin = newOrigin
-        pageLoaded = false
-        historyCleared = false
-        loginAttempts = 0
-        (switchButton as? TextView)?.text = hostLabelOf(serverUrl)
-        installBridge()
-        webView.loadUrl(serverUrl)
     }
 
     /**
