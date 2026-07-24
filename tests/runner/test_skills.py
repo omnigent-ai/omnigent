@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import SkillSpec
@@ -436,6 +437,63 @@ async def test_session_skills_cached_per_session(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_all_source_catalog_cached_per_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The all-source catalog view (``include_other_tools=true``) is cached
+    per session, exactly like the session-default view.
+
+    This is the Skills-page browse path: it always requests
+    ``include_other_tools=true``. Before the fix this mode was keyed only
+    by ``session_id`` and effectively bypassed the cache, so every
+    catalog / detail / files / file call rebuilt the full registry — a
+    ``registry_for_spec`` filesystem walk + ``tree_digest`` of every
+    skill dir (~1.2s live with 354 skills). Keying the cache by
+    ``(session_id, include_other_tools)`` makes the second all-source
+    request a cache hit.
+
+    We count ``registry_for_spec`` invocations directly: the spec
+    *resolver* is cached upstream regardless, so the walk is the only
+    signal that distinguishes a cache hit from a rebuild. Exactly one
+    walk across two identical all-source requests proves the second hit
+    the cache; two would be the pre-fix regression.
+    """
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    bundled = [SkillSpec(name="grill-me", description="d", content="c")]
+    app = _make_app(bundle, bundled, "none")
+
+    walk_calls = 0
+    real_registry_for_spec = runner_app.registry_for_spec
+
+    def _counting_registry_for_spec(*args: Any, **kwargs: Any) -> Any:
+        nonlocal walk_calls
+        walk_calls += 1
+        return real_registry_for_spec(*args, **kwargs)
+
+    monkeypatch.setattr(runner_app, "registry_for_spec", _counting_registry_for_spec)
+
+    async for c in _client(app):
+        first = await c.get(
+            "/v1/sessions/conv_all/skills/catalog",
+            params={"include_other_tools": "true"},
+        )
+        second = await c.get(
+            "/v1/sessions/conv_all/skills/catalog",
+            params={"include_other_tools": "true"},
+        )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    # One registry walk across both all-source requests: the first
+    # populates the cache under (session, True), the second serves it.
+    # Two walks would mean the non-default mode bypassed the cache.
+    assert walk_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_session_skills_cache_ttl_expiry_rediscovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -545,6 +603,171 @@ async def test_codex_session_does_not_list_claude_plugin_skills(
 
     assert resp.status_code == 200, resp.text
     assert "superpowers:using-superpowers" not in [s["name"] for s in resp.json()["skills"]]
+
+
+@pytest.mark.asyncio
+async def test_catalog_uses_runner_session_context_and_includes_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog discovery uses runner home/workspace and the effective harness family."""
+    home = tmp_path / "runner-home"
+    claude_dir = home / ".claude" / "skills" / "claude-only"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "SKILL.md").write_text(_skill_md("claude-only", "Claude only."))
+    codex_dir = home / ".codex" / "skills" / "codex-only"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "SKILL.md").write_text(_skill_md("codex-only", "Codex only."))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    workspace = tmp_path / "runner-workspace"
+    workspace_skill_dir = workspace / ".claude" / "skills" / "workspace-claude"
+    workspace_skill_dir.mkdir(parents=True)
+    (workspace_skill_dir / "SKILL.md").write_text(
+        _skill_md("workspace-claude", "Workspace Claude.")
+    )
+    bundle = tmp_path / "runner-bundle"
+    bundle_skill_dir = bundle / "skills" / "built-in"
+    bundle_skill_dir.mkdir(parents=True)
+    (bundle_skill_dir / "SKILL.md").write_text(_skill_md("built-in", "Built in."))
+    bundled = [
+        SkillSpec(
+            name="built-in",
+            description="Built in.",
+            content="built-in body",
+            skill_dir=bundle_skill_dir,
+        )
+    ]
+    app = _make_app(
+        bundle,
+        bundled,
+        "all",
+        workspace=workspace,
+        harness="claude-native",
+    )
+
+    async for c in _client(app):
+        response = await c.get("/v1/sessions/conv_catalog/skills/catalog")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    by_name = {item["name"]: item for item in payload["data"]}
+    assert set(by_name) == {"built-in", "claude-only", "workspace-claude"}
+    assert by_name["built-in"]["origin"] == "built_in"
+    assert by_name["workspace-claude"]["origin"] == "workspace"
+    assert by_name["claude-only"]["origin"] == "personal"
+    # The catalog summary carries a concise, root-anchored `display_path` — the
+    # user-facing source of truth — so the list needs no per-skill detail fetch.
+    # A bundled skill reads as "Included with agent"; a workspace skill as a
+    # project-relative path; a home skill with a leading "~/".
+    assert by_name["built-in"]["display_path"] == "Included with agent"
+    assert by_name["workspace-claude"]["display_path"] == ".claude/skills/workspace-claude"
+    assert by_name["claude-only"]["display_path"] == "~/.claude/skills/claude-only"
+    # First-class ownership: an ordinary bundled skill is agent-owned (this stub
+    # spec has no name, so agent_name is None); host-discovered skills are local.
+    # Neither is the universal platform skill, so none is "omnigent" here.
+    assert by_name["built-in"]["ownership"] == "agent"
+    assert by_name["workspace-claude"]["ownership"] == "local"
+    assert by_name["claude-only"]["ownership"] == "local"
+    assert by_name["built-in"]["agent_name"] is None
+    assert by_name["claude-only"]["agent_name"] is None
+    assert payload["include_other_tools"] is False
+    assert payload["hidden_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_catalog_include_other_tools_list_detail_visibility_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A list override is accepted unchanged by detail for the same session context."""
+    home = tmp_path / "runner-home"
+    claude_dir = home / ".claude" / "skills" / "claude-only"
+    claude_dir.mkdir(parents=True)
+    (claude_dir / "SKILL.md").write_text(_skill_md("claude-only", "Claude only."))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    bundle = tmp_path / "runner-bundle"
+    bundle.mkdir()
+    workspace = tmp_path / "runner-workspace"
+    workspace.mkdir()
+    app = _make_app(bundle, [], "all", workspace=workspace, harness="codex-native")
+
+    async for c in _client(app):
+        listing = await c.get(
+            "/v1/sessions/conv_visibility/skills/catalog",
+            params={"include_other_tools": "true"},
+        )
+        assert listing.status_code == 200, listing.text
+        listed = next(item for item in listing.json()["data"] if item["name"] == "claude-only")
+        detail = await c.get(
+            f"/v1/sessions/conv_visibility/skills/catalog/{listed['id']}",
+            params={"include_other_tools": "true"},
+        )
+        hidden_detail = await c.get(f"/v1/sessions/conv_visibility/skills/catalog/{listed['id']}")
+
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["provenance"]["provider"] == "claude"
+    assert detail.json()["provenance"]["original_path"] == str(claude_dir.resolve())
+    assert hidden_detail.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_skill_files_lists_tree_and_reads_file_in_session_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The file endpoints browse the winner's dir in the list's session context."""
+    home = tmp_path / "runner-home"
+    skill_dir = home / ".claude" / "skills" / "with-files"
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_skill_md("with-files", "Has resources."))
+    (skill_dir / "references" / "guide.md").write_text("## guide body")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    app = _make_app(bundle, [], "all", workspace=workspace, harness="claude-native")
+
+    async for c in _client(app):
+        listing = await c.get("/v1/sessions/conv_files/skills/catalog")
+        skill_id = next(
+            item["id"] for item in listing.json()["data"] if item["name"] == "with-files"
+        )
+        tree = await c.get(f"/v1/sessions/conv_files/skills/catalog/{skill_id}/files")
+        file_ok = await c.get(
+            f"/v1/sessions/conv_files/skills/catalog/{skill_id}/file",
+            params={"path": "references/guide.md"},
+        )
+        traversal = await c.get(
+            f"/v1/sessions/conv_files/skills/catalog/{skill_id}/file",
+            params={"path": "../../../etc/passwd"},
+        )
+        missing = await c.get(
+            f"/v1/sessions/conv_files/skills/catalog/{skill_id}/file",
+            params={"path": "references/nope.md"},
+        )
+        unknown = await c.get(
+            "/v1/sessions/conv_files/skills/catalog/does-not-exist/files",
+        )
+
+    assert tree.status_code == 200, tree.text
+    tree_paths = {(n["kind"], n["path"]) for n in tree.json()["data"]}
+    assert ("file", "SKILL.md") in tree_paths
+    assert ("dir", "references") in tree_paths
+    assert ("file", "references/guide.md") in tree_paths
+
+    assert file_ok.status_code == 200, file_ok.text
+    body = file_ok.json()
+    assert body["is_text"] is True and body["too_large"] is False
+    assert body["text"] == "## guide body"
+
+    # Traversal is refused (400); a missing file is 404; an unknown skill is 404.
+    assert traversal.status_code == 400
+    assert missing.status_code == 404
+    assert unknown.status_code == 404
 
 
 @pytest.mark.asyncio

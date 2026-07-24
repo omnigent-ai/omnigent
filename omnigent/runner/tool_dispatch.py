@@ -6576,6 +6576,7 @@ def _execute_skill_tool(
         host-scope skill discovery.
     :returns: Tool output string.
     """
+    from omnigent.spec.skill_sources import registry_for_spec
     from omnigent.tools.builtins.load_skill import LoadSkillTool
     from omnigent.tools.builtins.read_skill_file import ReadSkillFileTool
 
@@ -6586,15 +6587,29 @@ def _execute_skill_tool(
     # author valid agent configs via sys_os_write without requiring the
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
+    original_skills = list(getattr(agent_spec, "skills", None) or [])
+    if agent_spec is not None and bundled_skills != original_skills:
+        from dataclasses import replace
+
+        agent_spec = replace(agent_spec, skills=bundled_skills)
+    root = (runner_workspace or Path.cwd()).resolve()
+    registry = registry_for_spec(
+        agent_spec,
+        roots=(root,),
+        home=Path.home(),
+        bundle_dir=runner_workspace,
+        harness=getattr(getattr(agent_spec, "executor", None), "harness_kind", None),
+    )
 
     if tool_name == "load_skill":
         tool = LoadSkillTool(
             bundled_skills,
             agent_root=runner_workspace,
             skills_filter=skills_filter,
+            registry=registry,
         )
     else:
-        tool = ReadSkillFileTool(bundled_skills)
+        tool = ReadSkillFileTool(registry.skills())
 
     arguments_json = json.dumps(args)
     from omnigent.tools.base import ToolContext

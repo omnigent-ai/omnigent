@@ -37,6 +37,7 @@ from omnigent.harness_capabilities import (
     IntegrationMode,
     ModelFamily,
     Resume,
+    SkillDelivery,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
 
@@ -227,6 +228,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        skill_delivery=frozenset({SkillDelivery.TOOL, SkillDelivery.NATIVE_MATERIALIZE}),
     ),
     "codex-native": _C(
         _IM.NATIVE_TUI,
@@ -238,6 +240,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        skill_delivery=frozenset({SkillDelivery.TOOL, SkillDelivery.NATIVE_MATERIALIZE}),
     ),
     # streaming is declared True unless a live bench run proves a harness does
     # NOT emit token-level deltas. Only kiro-native is so proven (0 deltas over

@@ -1,0 +1,509 @@
+// Typed client for the cross-harness Skill Registry endpoints.
+//
+// The backend (a sibling track, confirmed shipped) implements the read-only
+// catalog behind the routes below; this module is the browser-facing seam.
+// Field names are converted from the server's snake_case wire shape to
+// camelCase at the API boundary so page/hook code never depends on raw wire
+// keys — same convention as `codexGoalApi.ts`.
+//
+//   GET  /v1/skills?session_id=<id>&include_other_tools=<bool>       → { object, data[], include_other_tools, hidden_count }
+//   GET  /v1/skills/{id}?session_id=<id>&include_other_tools=<bool>  → summary + { content, provenance, selected_winner, conflict_candidates, delivery }
+//   GET  /v1/skills/trust                                            → { value, include_other_tools }
+//   PUT  /v1/skills/trust  { value }                                 → { value, include_other_tools }
+//
+// The catalog is SESSION-CONTEXTUAL: bundle/workspace/provider skills live on
+// the bound runner, so both catalog + detail require the active session id.
+// The caller resolves the current bound session (see `useActiveSkillSession`)
+// and passes it here; with no bound session the page shows an empty state and
+// never calls these routes.
+//
+// Contract semantics (from the shared plan + backend integration notes):
+//  - The primary UX is harness-neutral. `origin` is one of the three USER
+//    concepts — built_in / workspace / personal. Harness/vendor provenance
+//    (provider, path, source kind, coords, digest, conflicts, delivery) is
+//    diagnostic only and lives under a single Advanced section.
+//  - `enabled` / `available` are surfaced READ-ONLY: the backend reports both
+//    as `true` and invented no per-skill mutation, so the UI renders
+//    availability as status, never a persisted toggle.
+//  - The include-other-tools switch maps to the trust setting. The server's
+//    internal values are `current` / `all-host`; the PUT body is `{ value }`.
+//    The frontend works in the normalized boolean `includeOtherTools`.
+//
+// Every call talks to the real backend. There is no runtime fixture fallback:
+// a 404/501 (endpoint missing), a network failure, an auth rejection, or a
+// runner error propagates as an `ApiError`/`TypeError` so the page shows its
+// real error state rather than inventing skills that don't exist on the host.
+// Fixtures live only in the unit tests and the Playwright route interception.
+
+import { authenticatedFetch } from "./identity";
+import { ApiError } from "./sessionsApi";
+
+/** Internal scope kept for precedence only — NOT a user-facing category. */
+export type SkillOrigin = "built_in" | "workspace" | "personal";
+
+/**
+ * Harness-neutral OWNERSHIP category — the user-facing grouping:
+ *   - `omnigent` : universal, platform-owned skills shipped by Omnigent.
+ *   - `agent`    : bundled by a specific agent spec (carries `agentName`).
+ *   - `local`    : discovered from a local provider / generic / plugin dir.
+ * This is provenance about ownership, deliberately distinct from the vendor
+ * (claude/codex/…) and the source path.
+ */
+export type SkillOwnership = "omnigent" | "agent" | "local";
+
+/** Discovery provider — provenance only, shown under Advanced details. */
+export type SkillDiscoveryProvider = "omnigent" | "claude" | "codex" | "cursor" | string;
+
+/** Internal server trust values. The UI works in a boolean; this is the wire form. */
+export type SkillTrustValue = "current" | "all-host";
+
+// ── Wire shapes (server snake_case) ──────────────────────────────────────────
+
+interface SkillSummaryWire {
+  id: string;
+  name: string;
+  description: string;
+  origin: SkillOrigin;
+  /**
+   * First-class, harness-neutral ownership category — what the catalog groups
+   * by (Omnigent / Agent / Local). Never derived from a path in the UI.
+   */
+  ownership: SkillOwnership;
+  /** The owning agent's name — present only when `ownership === "agent"`. */
+  agent_name: string | null;
+  /** The owning agent's id — present for aggregated agent-bundle entries. */
+  agent_id?: string | null;
+  /** True when the skill is usable in the CURRENT session (browse vs execute). */
+  invokable_in_current_session?: boolean;
+  /** For a non-invokable agent skill: the agent it must be used with. */
+  required_agent_id?: string | null;
+  required_agent_name?: string | null;
+  /**
+   * Concise, root-anchored source path — the user-facing provenance
+   * (`.claude/skills/foo`, `~/.codex/skills/foo`, `Included with agent`).
+   * The backend derives it from the winner's canonical coords.
+   */
+  display_path: string;
+  enabled: boolean;
+  available: boolean;
+  has_conflict: boolean;
+  updated_at?: number | null;
+}
+
+interface SkillCatalogWire {
+  object: "list";
+  data: SkillSummaryWire[];
+  /** Effective include-other-tools setting the server resolved for this call. */
+  include_other_tools: boolean;
+  /** Count of skills hidden because include-other-tools is off. */
+  hidden_count: number;
+}
+
+interface SkillProvenanceWire {
+  provider: SkillDiscoveryProvider;
+  original_path: string;
+  source_kind: string;
+  source_coords: string;
+  digest: string;
+}
+
+interface SkillDetailWire extends SkillSummaryWire {
+  /** Raw SKILL.md instruction body (frontmatter + markdown). */
+  content: string;
+  provenance: SkillProvenanceWire;
+  /** Canonical coords of the winner Omnigent resolved by precedence. */
+  selected_winner: string;
+  /** Canonical coords of shadowed same-name candidates (diagnostics). */
+  conflict_candidates: string[];
+  delivery: { mode: string };
+}
+
+interface SkillTrustWire {
+  value: SkillTrustValue;
+  include_other_tools: boolean;
+}
+
+interface SkillFileNodeWire {
+  path: string;
+  kind: "file" | "dir";
+  size: number | null;
+}
+
+interface SkillFileTreeWire {
+  object: "list";
+  data: SkillFileNodeWire[];
+}
+
+interface SkillFileContentWire {
+  path: string;
+  size: number;
+  is_text: boolean;
+  too_large: boolean;
+  text: string | null;
+}
+
+// ── Browser-facing shapes (camelCase) ────────────────────────────────────────
+
+/** A catalog row — the shape the master list renders. */
+export interface SkillSummary {
+  id: string;
+  name: string;
+  description: string;
+  /**
+   * Internal scope, kept for winner precedence + stable ordering. NOT shown as
+   * provenance — the user-facing source is `displayPath`.
+   */
+  origin: SkillOrigin;
+  /**
+   * Harness-neutral ownership category — the section the catalog groups this
+   * skill under (Omnigent / Agent / Local). First-class from the backend.
+   */
+  ownership: SkillOwnership;
+  /** The owning agent's name — present only when `ownership === "agent"`. */
+  agentName: string | null;
+  /** The owning agent's id — present for aggregated agent-bundle entries. */
+  agentId: string | null;
+  /**
+   * Whether the skill is usable in the CURRENT session. Browse-only entries
+   * (another agent's bundle) are `false`; everything the bound session resolves
+   * is `true`. Governs the "Available in this session" vs "Use with X" label.
+   */
+  invokableInCurrentSession: boolean;
+  /** For a non-invokable agent skill: the agent it must be used with. */
+  requiredAgentName: string | null;
+  /**
+   * The user-facing source of truth: a concise, root-anchored path such as
+   * `.claude/skills/foo`, `~/.codex/skills/foo`, or the literal
+   * `Included with agent` for bundled skills.
+   */
+  displayPath: string;
+  /** Whether the skill is active in-session. Rendered read-only. */
+  enabled: boolean;
+  /** Whether the skill is available (discovered + trusted). Rendered read-only. */
+  available: boolean;
+  /** True when another source defines the same name (shown under Advanced). */
+  hasConflict: boolean;
+  updatedAt: number | null;
+}
+
+/** The catalog list plus its resolution envelope. */
+export interface SkillCatalog {
+  skills: SkillSummary[];
+  /** The include-other-tools setting the server applied for this response. */
+  includeOtherTools: boolean;
+  /** How many skills are hidden because include-other-tools is off. */
+  hiddenCount: number;
+}
+
+/** One entry in a name-conflict resolution stack (Advanced details only). */
+export interface SkillConflictCandidate {
+  /** Canonical coordinates identifying the source, e.g. `personal:codex:foo`. */
+  coords: string;
+  /** True for the winner Omnigent resolved by precedence. */
+  selected: boolean;
+}
+
+/** Diagnostic provenance — the ONLY place harness/vendor facts surface. */
+export interface SkillAdvanced {
+  discoveryProvider: SkillDiscoveryProvider;
+  sourceKind: string;
+  /** Human delivery summary, e.g. "Automatic". */
+  delivery: string;
+  originPath: string;
+  canonicalId: string;
+  digest: string;
+  /** Winner + shadowed candidates by coords; empty when there's no conflict. */
+  conflicts: SkillConflictCandidate[];
+}
+
+/** Full detail for the selected skill. */
+export interface SkillDetail extends SkillSummary {
+  /** Raw SKILL.md instruction body (frontmatter + markdown). */
+  instructions: string;
+  /**
+   * Human overview paragraph. The backend catalog doesn't carry one, so this
+   * is `null` for real responses; the page falls back to `description`.
+   */
+  overview: string | null;
+  advanced: SkillAdvanced;
+}
+
+/** One node in a skill's resource tree (file or directory). */
+export interface SkillFileNode {
+  /** POSIX path relative to the skill root, e.g. `references/x.md`. */
+  path: string;
+  kind: "file" | "dir";
+  /** Byte size for files; `null` for directories. */
+  size: number | null;
+}
+
+/** A safely-read skill resource file for preview. */
+export interface SkillFileContent {
+  path: string;
+  size: number;
+  /** True when the bytes decode as UTF-8 text (previewable). */
+  isText: boolean;
+  /** True when the file exceeds the preview cap (download-only). */
+  tooLarge: boolean;
+  /** UTF-8 text, present only when `isText && !tooLarge`. */
+  text: string | null;
+}
+
+// ── Source-path helpers (client-derived) ──────────────────────────────────────
+//
+// The master catalog is a FLAT, harness-neutral list — it is NOT grouped by
+// path, provider, or origin scope word. The concrete source path surfaces in
+// two optional places only: the detail pane's Source row, and an optional
+// source FILTER whose options are the distinct source ROOTS present in the
+// catalog. These helpers derive that root + order the filter options; `origin`
+// stays internal (precedence only) and is never shown as provenance.
+
+/** The literal `display_path` the backend emits for a bundled skill. */
+export const BUNDLED_DISPLAY_PATH = "Included with agent";
+
+/**
+ * Derive the source-ROOT of a skill from its `displayPath` — the directory a
+ * reader can locate it in. This is the value the source filter offers as an
+ * option (e.g. `.claude/skills`, `~/.codex/skills`, `Included with agent`); it
+ * is NOT used to section the list.
+ *
+ * Examples:
+ *   `.claude/skills/foo`            → `.claude/skills`
+ *   `~/.codex/skills/foo`           → `~/.codex/skills`
+ *   `omnigent/onboarding/a/skills/b`→ `omnigent/onboarding/a/skills`
+ *   `Included with agent`           → `Included with agent`
+ *   `/abs/unrooted/foo`             → `/abs/unrooted` (last-resort)
+ */
+export function sourceRootKey(skill: Pick<SkillSummary, "displayPath" | "origin">): string {
+  const path = skill.displayPath;
+  if (skill.origin === "built_in" || path === BUNDLED_DISPLAY_PATH) {
+    return BUNDLED_DISPLAY_PATH;
+  }
+  // Prefer the conventional `skills/` boundary when present, so the root is the
+  // skill collection (e.g. `.claude/skills`) rather than one dir per skill.
+  const marker = "/skills/";
+  const at = path.indexOf(marker);
+  if (at !== -1) return path.slice(0, at + marker.length - 1); // include ".../skills"
+  // Otherwise the parent directory of the leaf.
+  const slash = path.lastIndexOf("/");
+  return slash > 0 ? path.slice(0, slash) : path;
+}
+
+/**
+ * Rank a source root for the filter's option order: bundled first, then
+ * project-relative (workspace) roots, then home/absolute (personal) roots.
+ */
+export function sourceRootRank(key: string): number {
+  if (key === BUNDLED_DISPLAY_PATH) return 0;
+  if (key.startsWith("~") || key.startsWith("/")) return 2; // home / absolute → personal-ish
+  return 1; // project-relative → workspace-ish
+}
+
+/**
+ * Distinct source roots present in a catalog, ordered for the filter dropdown
+ * (bundled → workspace → home), each alphabetical within its rank. This is the
+ * dynamic option set behind the "All sources" default.
+ */
+export function catalogSourceRoots(skills: SkillSummary[]): string[] {
+  const roots = new Set<string>();
+  for (const skill of skills) roots.add(sourceRootKey(skill));
+  return [...roots].sort((a, b) => sourceRootRank(a) - sourceRootRank(b) || a.localeCompare(b));
+}
+
+// ── Ownership category helpers (the top-level grouping) ───────────────────────
+
+/** The fixed display order of the ownership sections. */
+export const OWNERSHIP_ORDER: readonly SkillOwnership[] = ["omnigent", "agent", "local"];
+
+/** Section heading for an ownership category (the Agent heading adds the name). */
+export function ownershipLabel(ownership: SkillOwnership, agentName?: string | null): string {
+  switch (ownership) {
+    case "omnigent":
+      return "Omnigent";
+    case "agent":
+      return agentName ? `Agent · ${agentName}` : "Agent";
+    case "local":
+      return "Local";
+  }
+}
+
+// ── Wire → browser projection ────────────────────────────────────────────────
+
+function toSummary(w: SkillSummaryWire): SkillSummary {
+  return {
+    id: w.id,
+    name: w.name,
+    description: w.description,
+    origin: w.origin,
+    ownership: w.ownership,
+    agentName: w.agent_name ?? null,
+    agentId: w.agent_id ?? null,
+    // Browse entries default to invokable unless the server marks them
+    // browse-only (another agent's bundle).
+    invokableInCurrentSession: w.invokable_in_current_session ?? true,
+    requiredAgentName: w.required_agent_name ?? null,
+    displayPath: w.display_path,
+    enabled: w.enabled,
+    available: w.available,
+    hasConflict: w.has_conflict,
+    updatedAt: w.updated_at ?? null,
+  };
+}
+
+function toDetail(w: SkillDetailWire): SkillDetail {
+  const conflicts: SkillConflictCandidate[] = w.conflict_candidates.length
+    ? [
+        { coords: w.selected_winner, selected: true },
+        ...w.conflict_candidates.map((coords) => ({ coords, selected: false })),
+      ]
+    : [];
+  return {
+    ...toSummary(w),
+    instructions: w.content,
+    overview: null,
+    advanced: {
+      discoveryProvider: w.provenance.provider,
+      sourceKind: w.provenance.source_kind,
+      // Backend reports a structured `{ mode: "automatic" }`; render a friendly
+      // sentence so the Advanced row reads as prose.
+      delivery: w.delivery?.mode === "automatic" ? "Automatic" : (w.delivery?.mode ?? "Automatic"),
+      originPath: w.provenance.original_path,
+      canonicalId: w.provenance.source_coords,
+      digest: w.provenance.digest,
+      conflicts,
+    },
+  };
+}
+
+async function readJsonOrThrow<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    // Reuse the AP error-body convention: prefer `error.message`/`error.code`.
+    let message = `${res.status} ${res.statusText}`;
+    let code: string | null = null;
+    try {
+      const body = (await res.json()) as { error?: { code?: string; message?: string } };
+      if (body.error?.message) message = body.error.message;
+      if (body.error?.code) code = body.error.code;
+    } catch {
+      // Non-JSON / empty body — keep the status-line fallback.
+    }
+    throw new ApiError(message, res.status, code);
+  }
+  return (await res.json()) as T;
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Fetch the harness-neutral skill catalog for a bound session. The catalog is
+ * session-contextual (bundle/workspace/provider skills resolve on that
+ * session's runner), so `sessionId` is required. `includeOtherTools` maps to
+ * the `include_other_tools` query flag (the trust widening). Any request
+ * failure — endpoint missing, network, auth, runner — propagates to the caller.
+ */
+export async function getSkillCatalog(
+  sessionId: string,
+  includeOtherTools: boolean,
+): Promise<SkillCatalog> {
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    include_other_tools: includeOtherTools ? "true" : "false",
+  });
+  const res = await authenticatedFetch(`/v1/skills?${params.toString()}`);
+  const wire = await readJsonOrThrow<SkillCatalogWire>(res);
+  return {
+    skills: wire.data.map(toSummary),
+    includeOtherTools: wire.include_other_tools,
+    hiddenCount: wire.hidden_count,
+  };
+}
+
+/**
+ * Fetch one skill's full detail (instructions + provenance) in the same
+ * session + trust context as the list it was selected from — the backend
+ * resolves the same winner only when `session_id` + `include_other_tools`
+ * match the catalog call. Any request failure propagates to the caller.
+ */
+export async function getSkillDetail(
+  id: string,
+  sessionId: string,
+  includeOtherTools: boolean,
+): Promise<SkillDetail> {
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    include_other_tools: includeOtherTools ? "true" : "false",
+  });
+  const res = await authenticatedFetch(`/v1/skills/${encodeURIComponent(id)}?${params.toString()}`);
+  const wire = await readJsonOrThrow<SkillDetailWire>(res);
+  return toDetail(wire);
+}
+
+/**
+ * List a skill's on-disk resource tree (files + directories) in the same
+ * session + trust context as the catalog. Used to lazily populate the detail
+ * pane's Files browser. Any request failure propagates to the caller.
+ */
+export async function getSkillFileTree(
+  id: string,
+  sessionId: string,
+  includeOtherTools: boolean,
+): Promise<SkillFileNode[]> {
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    include_other_tools: includeOtherTools ? "true" : "false",
+  });
+  const res = await authenticatedFetch(
+    `/v1/skills/${encodeURIComponent(id)}/files?${params.toString()}`,
+  );
+  const wire = await readJsonOrThrow<SkillFileTreeWire>(res);
+  return wire.data.map((n) => ({ path: n.path, kind: n.kind, size: n.size }));
+}
+
+/**
+ * Read one resource file from a skill's directory (safely, server-side). The
+ * backend caps size and reports binary/oversized files as metadata only, so
+ * `text` may be `null` even on success. Same session + trust context as the
+ * tree. A 400 (bad/traversal path) or 404 (missing) propagates as an ApiError.
+ */
+export async function getSkillFile(
+  id: string,
+  filePath: string,
+  sessionId: string,
+  includeOtherTools: boolean,
+): Promise<SkillFileContent> {
+  const params = new URLSearchParams({
+    session_id: sessionId,
+    include_other_tools: includeOtherTools ? "true" : "false",
+    path: filePath,
+  });
+  const res = await authenticatedFetch(
+    `/v1/skills/${encodeURIComponent(id)}/file?${params.toString()}`,
+  );
+  const wire = await readJsonOrThrow<SkillFileContentWire>(res);
+  return {
+    path: wire.path,
+    size: wire.size,
+    isText: wire.is_text,
+    tooLarge: wire.too_large,
+    text: wire.text,
+  };
+}
+
+/** Read the persisted include-other-tools trust setting. */
+export async function getSkillTrust(): Promise<boolean> {
+  const res = await authenticatedFetch(`/v1/skills/trust`);
+  const wire = await readJsonOrThrow<SkillTrustWire>(res);
+  return wire.include_other_tools;
+}
+
+/** Persist the include-other-tools trust setting; returns the applied value. */
+export async function setSkillTrust(includeOtherTools: boolean): Promise<boolean> {
+  const value: SkillTrustValue = includeOtherTools ? "all-host" : "current";
+  const res = await authenticatedFetch(`/v1/skills/trust`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value }),
+  });
+  const wire = await readJsonOrThrow<SkillTrustWire>(res);
+  return wire.include_other_tools;
+}

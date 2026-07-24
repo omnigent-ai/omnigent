@@ -1531,6 +1531,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     # filter — agents that want to suppress bundled skills do so by
     # not shipping them, not by setting this filter to ``"none"``.
     skills_filter: str | list[str] = "all"
+    skill_trust: Literal["current", "all-host"] = "current"
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     local_tools: list[LocalToolInfo] = field(default_factory=list)
     sub_agents: list[AgentSpec] = field(default_factory=list)

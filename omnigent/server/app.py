@@ -86,6 +86,7 @@ from omnigent.server.routes.sessions import (
     set_server_runner_router,
 )
 from omnigent.server.routes.sharing import create_sharing_router
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
@@ -2413,6 +2414,18 @@ def create_app(
         ),
         prefix="/v1",
         tags=["sharing"],
+    )
+    app.include_router(
+        create_skills_router(
+            conversation_store,
+            runner_router=runner_router,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        ),
+        prefix="/v1",
+        tags=["skills"],
     )
 
     # First-class projects (owner-private session containers). Mounted only

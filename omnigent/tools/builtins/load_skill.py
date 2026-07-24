@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from omnigent.spec.skill_registry import SkillRegistry
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -33,6 +34,7 @@ class LoadSkillTool(Tool):
         skills: list[SkillSpec],
         agent_root: Path | None = None,
         skills_filter: str | list[str] = "all",
+        registry: SkillRegistry | None = None,
     ) -> None:
         """
         Initialize with bundled + host-scope skills.
@@ -43,6 +45,11 @@ class LoadSkillTool(Tool):
         :param skills_filter: Host-scope skill filter from
             the agent spec.
         """
+        if registry is not None:
+            all_skills = registry.skills()
+            self._skills = all_skills
+            self._skills_by_name = {s.name: s for s in all_skills}
+            return
         all_skills = list(skills)
         # Discover host-scope skills. Use agent_root when provided,
         # but fall back to cwd — in production the server process

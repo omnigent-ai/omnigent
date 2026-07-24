@@ -43,6 +43,7 @@ import {
   PlusIcon,
   SearchIcon,
   SettingsIcon,
+  SparklesIcon,
   ShareIcon,
   SquareIcon,
   SquareCheckIcon,
@@ -244,15 +245,18 @@ function useActiveNavItem(): {
   isNewChatPage: boolean;
   isInboxPage: boolean;
   isTasksPage: boolean;
+  isSkillsPage: boolean;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
   const leaf = useLocation().pathname.split("/").filter(Boolean).at(-1);
   const isInboxPage = leaf === "inbox";
   const isTasksPage = leaf === "tasks";
-  // Exclude inbox/tasks: they also have no `:conversationId`, so they would
-  // otherwise light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage && !isTasksPage;
-  return { isNewChatPage, isInboxPage, isTasksPage };
+  const isSkillsPage = leaf === "skills";
+  // Exclude inbox/tasks/skills: they also have no `:conversationId`, so they
+  // would otherwise light up the "New session" button.
+  const isNewChatPage =
+    activeConversationId == null && !isInboxPage && !isTasksPage && !isSkillsPage;
+  return { isNewChatPage, isInboxPage, isTasksPage, isSkillsPage };
 }
 
 /**
@@ -400,7 +404,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage, isSkillsPage } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -628,6 +632,27 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               <Link to="/tasks" onClick={onNavClick}>
                 <ClockIcon className="size-3.5 text-muted-foreground" />
                 Scheduled
+              </Link>
+            </Button>
+            {/* Customize — first-class entry to the cross-harness Skill
+            Registry catalog. Shares the same nav-row construct as New session /
+            Scheduled / Inbox so the active-pill, hover, insets, icon column,
+            and text weight all match. Route/testid stay `skills` for the
+            underlying Skill Registry; only the user-facing label is
+            "Customize" (matching the product prototype). */}
+            <Button
+              asChild
+              variant="ghost"
+              className={cn(
+                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                SIDEBAR_HOVER_HIGHLIGHT,
+                isSkillsPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              )}
+              data-testid="skills-button"
+            >
+              <Link to="/skills" onClick={onNavClick} aria-current={isSkillsPage ? "page" : undefined}>
+                <SparklesIcon className="size-3.5 text-muted-foreground" />
+                Customize
               </Link>
             </Button>
             {selectionMode ? (
