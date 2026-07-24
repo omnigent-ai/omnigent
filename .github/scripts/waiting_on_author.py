@@ -119,6 +119,18 @@ class GitHubAPI:
     def list_timeline(self, issue_number: int) -> list[dict[str, Any]]:
         return self.paginated(f"/repos/{self.repo}/issues/{issue_number}/timeline?per_page=100")
 
+    def list_issue_comments(self, issue_number: int) -> list[dict[str, Any]]:
+        return self.paginated(f"/repos/{self.repo}/issues/{issue_number}/comments?per_page=100")
+
+    def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+        return self.paginated(f"/repos/{self.repo}/pulls/{pull_number}/comments?per_page=100")
+
+    def list_reviews(self, pull_number: int) -> list[dict[str, Any]]:
+        return self.paginated(f"/repos/{self.repo}/pulls/{pull_number}/reviews?per_page=100")
+
+    def list_commits(self, pull_number: int) -> list[dict[str, Any]]:
+        return self.paginated(f"/repos/{self.repo}/pulls/{pull_number}/commits?per_page=100")
+
     def close_pull(self, pull_number: int) -> None:
         self.request("PATCH", f"/repos/{self.repo}/pulls/{pull_number}", {"state": "closed"})
 
@@ -144,6 +156,46 @@ def remove_waiting_label(api: GitHubAPI, issue_number: int, reason: str) -> bool
     else:
         print(f"#{issue_number} no longer has {LABEL}; nothing to remove.")
     return removed
+
+
+def user_login(item: dict[str, Any]) -> str | None:
+    login = item.get("user", {}).get("login")
+    return login.lower() if login else None
+
+
+def is_after(timestamp: str | None, since: str) -> bool:
+    return bool(timestamp and parse_time(timestamp) > parse_time(since))
+
+
+def authored_after(items: list[dict[str, Any]], author: str, since: str, key: str) -> bool:
+    return any(user_login(item) == author and is_after(item.get(key), since) for item in items)
+
+
+def commit_after(commits: list[dict[str, Any]], since: str) -> bool:
+    for commit in commits:
+        authored_at = commit.get("commit", {}).get("author", {}).get("date")
+        committed_at = commit.get("commit", {}).get("committer", {}).get("date")
+        if is_after(authored_at, since) or is_after(committed_at, since):
+            return True
+    return False
+
+
+def author_activity_since_label(api: GitHubAPI, pull: dict[str, Any], since: str) -> str | None:
+    author = pull.get("user", {}).get("login")
+    if not author:
+        return None
+    author = author.lower()
+    pull_number = pull["number"]
+
+    if authored_after(api.list_issue_comments(pull_number), author, since, "created_at"):
+        return "the author commented"
+    if authored_after(api.list_review_comments(pull_number), author, since, "created_at"):
+        return "the author replied to a review comment"
+    if authored_after(api.list_reviews(pull_number), author, since, "submitted_at"):
+        return "the author submitted a review response"
+    if commit_after(api.list_commits(pull_number), since):
+        return "new commits were pushed"
+    return None
 
 
 def clear_on_author_activity(event_name: str, payload: dict[str, Any], api: GitHubAPI) -> bool:
@@ -205,6 +257,13 @@ def close_stale_waiting_prs(api: GitHubAPI, now: datetime | None = None) -> int:
                     "in the timeline; skipping."
                 )
                 continue
+
+            pull = api.get_pull(issue["number"])
+            reason = author_activity_since_label(api, pull, label_applied_at)
+            if reason:
+                remove_waiting_label(api, issue["number"], reason)
+                continue
+
             if days_between(label_applied_at, now) < WAITING_DAYS:
                 continue
 
