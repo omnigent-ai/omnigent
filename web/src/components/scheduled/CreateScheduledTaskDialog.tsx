@@ -295,6 +295,7 @@ export function CreateScheduledTaskDialog({
               value={name}
               placeholder="daily-brief"
               data-testid="task-name-input"
+              className="text-sm"
               onChange={(e) => setName(e.target.value)}
             />
           </div>
@@ -308,7 +309,7 @@ export function CreateScheduledTaskDialog({
               placeholder="What should the agent do each run?"
               data-testid="task-prompt-input"
               // No native resize grip — match the clean styling of the other fields.
-              className="resize-none"
+              className="resize-none text-sm"
               onChange={(e) => setPrompt(e.target.value)}
             />
           </div>

@@ -46,7 +46,7 @@ const PRESET_OPTIONS: { value: SchedulePreset; label: string }[] = [
 ];
 
 const HOURS_12 = Array.from({ length: 12 }, (_, i) => i + 1);
-const QUARTER_HOUR_MINUTES = [0, 15, 30, 45] as const;
+const MINUTES = Array.from({ length: 60 }, (_, i) => i);
 const PERIODS = ["AM", "PM"] as const;
 type Period = (typeof PERIODS)[number];
 
@@ -90,7 +90,6 @@ export function ScheduleFields({
   }, [isHourly, model.hour, model.minute]);
 
   const pickerParts = toPickerParts(getPickerTime());
-  const pickerMinuteOptions = minuteOptionsFor(pickerParts.minute);
 
   useEffect(() => {
     if (!timePickerOpen || isHourly) return;
@@ -283,7 +282,7 @@ export function ScheduleFields({
                     className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
                     data-testid="schedule-minute-column"
                   >
-                    {pickerMinuteOptions.map((minute) => (
+                    {MINUTES.map((minute) => (
                       <PickerCell
                         key={minute}
                         testId={`schedule-minute-${pad(minute)}`}
@@ -369,10 +368,6 @@ function formatInputValue(model: ScheduleModel, isHourly: boolean): string {
 function formatMinuteInput(minute: number): string {
   if (!Number.isInteger(minute) || minute < 0 || minute > 59) return "";
   return `:${pad(minute)}`;
-}
-
-function minuteOptionsFor(currentMinute: number): number[] {
-  return [...new Set([...QUARTER_HOUR_MINUTES, currentMinute])].sort((a, b) => a - b);
 }
 
 function formatTimeInput(hour: number, minute: number): string {
