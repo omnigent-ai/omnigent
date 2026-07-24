@@ -54,6 +54,7 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
+import type { ConversationItem } from "@/lib/conversationItems";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -65,7 +66,9 @@ import {
   getSessionSlim,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
+  initialWindowComplete,
   interrupt as interruptSession,
+  MAX_INITIAL_PAGES,
   openSessionStream,
   postEvent,
   type SessionItemsPage,
@@ -398,6 +401,14 @@ export interface ChatState {
   hasMoreHistory: boolean;
   /** True while a `loadMoreHistory` fetch is in flight. */
   loadingMoreHistory: boolean;
+  /**
+   * True while the post-render initial-window backfill is paging older
+   * items to satisfy the "last two user prompts" boundary. Bind renders
+   * the first page immediately, then fills the rest in the background;
+   * this drives the top-of-history spinner so the user sees more is
+   * coming rather than a truncated transcript. See `backfillInitialWindow`.
+   */
+  loadingInitialWindow: boolean;
   /**
    * The item id at the start of the current `blocks` history window —
    * used as the `before` cursor for the next `loadMoreHistory` page
@@ -929,6 +940,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   codexPlanMode: false,
   hasMoreHistory: false,
   loadingMoreHistory: false,
+  loadingInitialWindow: false,
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
@@ -1614,6 +1626,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         conversationLoadError: null,
         hasMoreHistory: false,
         loadingMoreHistory: false,
+        loadingInitialWindow: false,
         oldestItemId: null,
         llmModel: null,
         sessionHarness: null,
@@ -2349,6 +2362,12 @@ async function bindStream(
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   try {
+    // Fetch only the FIRST page here so the transcript renders as soon as
+    // the newest items arrive. The rest of the initial window (paging back
+    // to the previous user prompt) fills in via `backfillInitialWindow`
+    // after this bind commits — a top-of-history spinner covers the gap.
+    // Previously this awaited the whole multi-page window, blocking first
+    // paint on up to `MAX_INITIAL_PAGES` serial round-trips.
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
@@ -2356,7 +2375,7 @@ async function bindStream(
         staleTime: 0,
         retry: false,
       }),
-      fetchInitialHistoryWindow(id),
+      fetchSessionItemsPage(id),
     ]);
     if (get().conversationId !== id) return;
     const items = page.items;
@@ -2434,6 +2453,9 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
+    // Page the rest of the initial window in the background only when the
+    // first page didn't already reach the boundary and older items exist.
+    const needsBackfill = page.hasMore && !initialWindowComplete(items);
     set((state) => {
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
@@ -2595,6 +2617,10 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
+        // Arm the top-of-history spinner when the first page didn't already
+        // reach the previous-prompt boundary; `backfillInitialWindow` (fired
+        // below) pages the rest and clears this.
+        loadingInitialWindow: needsBackfill,
         sessionStatus: session.status,
         // Re-show "N background tasks still running" after a reload/navigate-back: the
         // live SSE edge that set this is long gone, so the count rides in on
@@ -2621,12 +2647,85 @@ async function bindStream(
       };
     });
     racedNativeModelOptions.delete(id);
+    // Fill the rest of the initial window after first paint (not awaited):
+    // page older items until the previous-prompt boundary is reached, with
+    // the top spinner lit. Pinned to this bind's generation so a navigate-
+    // away/back or reconnect that resets the window cancels it.
+    if (needsBackfill) {
+      void backfillInitialWindow(id, page.items, get().historyGeneration, set, get);
+    }
   } catch (err) {
     if (get().conversationId !== id) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
+  }
+}
+
+/**
+ * Page older history after the initial bind until the initial-window
+ * boundary (`initialWindowComplete`) is reached or history runs out —
+ * the deferred remainder of what `fetchInitialHistoryWindow` used to
+ * fetch synchronously before first paint. Continues the same paging loop
+ * across the render boundary: `windowItems` seeds it with the first page
+ * (already rendered) so the boundary is evaluated on the same accumulated
+ * item view the old synchronous helper used.
+ *
+ * Runs in the background with `loadingInitialWindow` lit (top-of-history
+ * spinner) and holds the `loadingMoreHistory` lock so scroll-up / rail
+ * loaders don't fetch the same pages concurrently. Bounded by
+ * `MAX_INITIAL_PAGES` (the first page counts as one); if the cap is hit
+ * mid-turn, `hasMoreHistory` stays true so the rest is reachable via
+ * scroll-up. Drops its result if the window was reset while a page was in
+ * flight (generation guard), mirroring `loadMoreHistory`.
+ */
+async function backfillInitialWindow(
+  id: string,
+  firstPageItems: ConversationItem[],
+  generation: number,
+  set: Setter,
+  get: Getter,
+): Promise<void> {
+  const stale = (): boolean =>
+    get().conversationId !== id || get().historyGeneration !== generation;
+  // Accumulate items exactly as fetchInitialHistoryWindow did, seeded with
+  // the already-rendered first page, so `initialWindowComplete` sees the
+  // full window (not just the latest page) when deciding to stop.
+  let windowItems = firstPageItems;
+  set({ loadingMoreHistory: true });
+  try {
+    // The first page counts as page 0; cap the extra pages so the total
+    // matches the old synchronous window's bound.
+    for (let pages = 1; pages < MAX_INITIAL_PAGES; pages++) {
+      const cursor = windowItems[0]?.id;
+      if (!cursor) break; // no cursor to page further; avoid a spin
+      const { items, hasMore } = await fetchSessionItemsPage(id, { olderThan: cursor });
+      if (stale()) return;
+      windowItems = [...items, ...windowItems]; // prepend the older page
+      const newBlocks = itemsToBlocks(items);
+      set((state) => {
+        // Dedupe against the current window: a live-pump item or an
+        // overlapping page could already be present.
+        const seen = new Set(
+          state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        );
+        const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
+        return {
+          blocks: [...unique, ...state.blocks],
+          hasMoreHistory: hasMore,
+          oldestItemId: items[0]?.id ?? state.oldestItemId,
+        };
+      });
+      if (!hasMore || initialWindowComplete(windowItems)) break;
+    }
+  } catch {
+    // Match loadMoreHistory: a persistent failure must not leave the
+    // scroll-up / rail loaders re-arming against a broken endpoint.
+    if (stale()) return;
+    set({ hasMoreHistory: false });
+  } finally {
+    if (!stale()) set({ loadingMoreHistory: false, loadingInitialWindow: false });
   }
 }
 

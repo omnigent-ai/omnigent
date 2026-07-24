@@ -1470,6 +1470,11 @@ function MainAgentSurface({
   // staring at a fresh session during a slow MCP boot sees the startup band
   // instead of a bare "What should we work on?" empty state.
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
+  // True while the post-render initial-window backfill is still paging older
+  // items toward the previous-prompt boundary. Drives the top-of-history
+  // spinner so opening a conversation shows the newest turn immediately with
+  // a "loading earlier messages" cue rather than blocking on the full window.
+  const loadingInitialWindow = useChatStore((s) => s.loadingInitialWindow);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
   // including stopped/resumable sessions, and the connection indicator
@@ -1749,6 +1754,17 @@ function MainAgentSurface({
               )
             ) : (
               <>
+                {/* Top-of-history spinner while the initial-window backfill
+                    pages older items in the background (see
+                    `backfillInitialWindow`). Sits above the oldest loaded
+                    bubble so the newest turn renders immediately and the user
+                    sees earlier messages are still arriving. */}
+                {loadingInitialWindow && (
+                  <div className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm">
+                    <Loader2Icon className="size-4 animate-spin" aria-hidden />
+                    Loading earlier messages…
+                  </div>
+                )}
                 {streamBubbles.map((bubble) => (
                   <BubbleView key={bubbleKey(bubble)} bubble={bubble} canApprove={canApprove} />
                 ))}

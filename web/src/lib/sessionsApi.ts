@@ -828,11 +828,22 @@ export async function fetchSessionItemsPage(
  * cap is hit we stop with `hasMore: true`, so the rest stays reachable
  * via scroll-up `loadMoreHistory` — not a silent truncation.
  */
-const MAX_INITIAL_PAGES = 8;
+export const MAX_INITIAL_PAGES = 8;
 
 /** A real (non-meta) user prompt — the boundary the initial window snaps to. */
 function isUserPrompt(item: ConversationItem): boolean {
   return isMessageItem(item) && item.role === "user" && !item.is_meta;
+}
+
+/**
+ * True once the loaded items form a complete initial window: at least one
+ * page of items AND the last two real user prompts (so the newest exchange
+ * and its preceding prompt are both on screen). The boundary
+ * `fetchInitialHistoryWindow` pages toward and the store's post-render
+ * backfill stops at — shared so both agree on "done".
+ */
+export function initialWindowComplete(items: ConversationItem[]): boolean {
+  return items.length >= SESSION_HISTORY_PAGE_SIZE && items.filter(isUserPrompt).length >= 2;
 }
 
 /**
@@ -867,8 +878,7 @@ export async function fetchInitialHistoryWindow(sessionId: string): Promise<Sess
     items = [...page.items, ...items]; // prepend the older page
     hasMore = page.hasMore;
     if (!hasMore) break; // reached the start of the conversation
-    const userCount = items.filter(isUserPrompt).length;
-    if (items.length >= SESSION_HISTORY_PAGE_SIZE && userCount >= 2) break;
+    if (initialWindowComplete(items)) break;
     if (!items[0]?.id) break; // no cursor to page further; avoid a spin
   }
   /* oxlint-enable no-await-in-loop */

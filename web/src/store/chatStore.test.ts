@@ -404,6 +404,15 @@ afterEach(() => {
 /** Yield to the microtask queue so background pump kicks off. */
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
+/**
+ * Drain the non-awaited `backfillInitialWindow` fired by bind: pump ticks
+ * until the top-of-history spinner clears (or a bounded cap, so a bug that
+ * never settles fails fast instead of hanging).
+ */
+async function settleInitialWindow(): Promise<void> {
+  for (let i = 0; i < 40 && useChatStore.getState().loadingInitialWindow; i++) await tick();
+}
+
 /** Seed the session snapshot returned by GET /v1/sessions/{id}. */
 function seedSession(id: string, items: ConversationItem[] = []): void {
   sessionSnapshots.set(id, items);
@@ -1197,6 +1206,62 @@ describe("chatStore — switchTo", () => {
     );
     expect(itemFetches).toHaveLength(1);
     expect(String(itemFetches[0]![0])).toContain("order=desc");
+  });
+
+  it("renders the first page immediately, then backfills to the previous-prompt boundary", async () => {
+    // A long newest turn: its prompt sits in page 1, but the whole first
+    // page holds only ONE real user prompt, so the boundary (two prompts)
+    // isn't met until an older page loads. Bind must render page 1 without
+    // blocking on that older page, then fill it in via the backfill.
+    const older = [userMessage("resp_prev", "previous prompt"), assistantMessage("resp_prev", "a")];
+    const turnFillers = Array.from({ length: SESSION_HISTORY_PAGE_SIZE - 1 }, (_, i) =>
+      assistantMessage(`resp_last_${i}`, `tool ${i}`),
+    );
+    const fullItems = [...older, userMessage("resp_last", "latest prompt"), ...turnFillers];
+    seedSessionSnapshot("conv_bf", fullItems.slice(-SESSION_HISTORY_PAGE_SIZE));
+    seedSessionItems("conv_bf", fullItems);
+
+    await useChatStore.getState().switchTo("conv_bf");
+
+    // Bind committed exactly the first (newest) page — first paint doesn't
+    // wait on the backfill — and armed the spinner because that page holds
+    // only one prompt with older history remaining.
+    const afterBind = useChatStore.getState();
+    expect(afterBind.blocks).toHaveLength(SESSION_HISTORY_PAGE_SIZE);
+    expect(afterBind.loadingInitialWindow).toBe(true);
+
+    // The backfill then pages older until the previous prompt is on screen.
+    await settleInitialWindow();
+    const settled = useChatStore.getState();
+    expect(settled.loadingInitialWindow).toBe(false);
+    expect(settled.loadingMoreHistory).toBe(false);
+    expect(settled.blocks.filter((b) => b.type === "user_message")).toHaveLength(2);
+    expect(settled.blocks[0]).toMatchObject({
+      type: "user_message",
+      ctx: { itemId: "msg_resp_prev_user" },
+    });
+    // Both real prompts are now loaded and nothing older remains.
+    expect(settled.hasMoreHistory).toBe(false);
+  });
+
+  it("does not backfill when the first page already meets the boundary", async () => {
+    // The newest page already holds two real user prompts, so the initial
+    // window is complete on the first fetch — no spinner, no extra request.
+    const fullItems = Array.from({ length: SESSION_HISTORY_PAGE_SIZE }, (_, idx) =>
+      userMessage(`resp_${idx.toString().padStart(4, "0")}`, `message ${idx}`),
+    );
+    seedSession("conv_nobf", fullItems);
+
+    await useChatStore.getState().switchTo("conv_nobf");
+    await settleInitialWindow();
+
+    const state = useChatStore.getState();
+    expect(state.loadingInitialWindow).toBe(false);
+    // Exactly one items request on bind — the backfill never fired.
+    const itemFetches = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_nobf/items"),
+    );
+    expect(itemFetches).toHaveLength(1);
   });
 
   it("loadMoreHistory prepends the page of items immediately older than the window", async () => {
