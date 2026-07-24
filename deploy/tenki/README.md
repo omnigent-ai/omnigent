@@ -153,14 +153,15 @@ variables are copied from your environment into the sandbox at provision time.
 > with servers that don't require in-sandbox App auth, or authenticate via
 > injected credentials (below).
 
-> [!IMPORTANT]
-> **CLI-bootstrap wheel-shipping needs `/tmp` inside the image's workdir.** Tenki's
-> file API is *workdir-scoped* — it rejects paths outside the session workdir with
-> `path outside workdir`. The bootstrap ships the wheel tarball to
-> `/tmp/oa-wheels.tgz`, so your prepared host image must use a workdir that
-> contains `/tmp` (e.g. `WORKDIR /`) for `omnigent sandbox create` to overlay your
-> local wheels. If it doesn't, use **server-managed** hosts instead — they boot
-> the baked image and ship no wheels, so the workdir scope never applies.
+> [!NOTE]
+> **Wheel-shipping works regardless of the image's workdir.** Tenki's file API is
+> *workdir-scoped* — it rejects paths outside the session workdir with `path
+> outside workdir` — but the bootstrap ships the wheel tarball to an absolute path
+> (`/tmp/oa-wheels.tgz`). The launcher bridges the two by uploading into the
+> workdir under a temporary name and then shell-moving the file to its
+> destination (command execution is not workdir-scoped), so no special `WORKDIR`
+> is required in your prepared image. The only assumption is that the destination
+> is writable by the session user, which `/tmp` is on the default `sandbox` base.
 
 ## Server-managed sandboxes
 

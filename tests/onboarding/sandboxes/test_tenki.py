@@ -73,6 +73,7 @@ class _State:
     exec_calls: list[dict] = field(default_factory=list)
     start_calls: list[dict] = field(default_factory=list)
     uploaded: list[tuple[str, str]] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
     closed: list[str] = field(default_factory=list)
     extends: list[object] = field(default_factory=list)
     # Behavior toggles.
@@ -130,6 +131,9 @@ class _FakeFs:
         if self._state.upload_raises:
             raise _SandboxError("upload failed")
         self._state.uploaded.append((local_path, remote_path))
+
+    def remove(self, path: str, *, recursive: bool = True) -> None:
+        self._state.removed.append(path)
 
 
 class _FakeSandbox:
@@ -408,19 +412,51 @@ def test_terminate_missing_sdk_raises_install_hint(monkeypatch: pytest.MonkeyPat
 # ── put ─────────────────────────────────────────────────────
 
 
-def test_put_uploads_file(sdk: _State, tmp_path: Path) -> None:
+def test_put_stages_in_workdir_then_moves_to_destination(sdk: _State, tmp_path: Path) -> None:
+    """
+    Tenki's fs API rejects paths outside the session workdir, so put()
+    must never hand it the caller's absolute destination — it stages a
+    workdir-relative name and shell-moves that into place. An upload
+    aimed straight at /tmp/... would fail on a live session even though
+    the fake accepts it, so the staging path shape is the assertion.
+    """
     local = tmp_path / "wheels.tgz"
     local.write_bytes(b"binary\x00data")
     _launcher().put("sb-tenki-1", local, "/tmp/wheels.tgz")
-    assert sdk.uploaded == [(str(local), "/tmp/wheels.tgz")]
+
+    assert len(sdk.uploaded) == 1
+    uploaded_local, staging = sdk.uploaded[0]
+    assert uploaded_local == str(local)
+    # Workdir-relative (the only place the fs API may write), unique-ish.
+    assert not staging.startswith("/")
+    assert staging.startswith(".oa-put-")
+    # The move runs through the exec path and targets the real destination.
+    (move_call,) = sdk.exec_calls
+    move_command = move_call["argv"][-1]
+    assert f"mv -f {staging} /tmp/wheels.tgz" in move_command
+    assert 'mkdir -p "$(dirname /tmp/wheels.tgz)"' in move_command
 
 
-def test_put_failure_surfaces(sdk: _State, tmp_path: Path) -> None:
+def test_put_upload_failure_surfaces(sdk: _State, tmp_path: Path) -> None:
     sdk.upload_raises = True
     local = tmp_path / "wheels.tgz"
     local.write_bytes(b"x")
     with pytest.raises(click.ClickException, match="File upload"):
         _launcher().put("sb-tenki-1", local, "/tmp/wheels.tgz")
+    # Nothing was staged, so nothing to move or clean up.
+    assert sdk.exec_calls == []
+    assert sdk.removed == []
+
+
+def test_put_move_failure_cleans_staged_file(sdk: _State, tmp_path: Path) -> None:
+    """A failed move must not leave the staged upload behind in the workdir."""
+    sdk.exec_result = _FakeCommandResult(exit_code=1)
+    local = tmp_path / "wheels.tgz"
+    local.write_bytes(b"x")
+    with pytest.raises(click.ClickException, match="Remote command failed"):
+        _launcher().put("sb-tenki-1", local, "/tmp/wheels.tgz")
+    (_, staging) = sdk.uploaded[0]
+    assert sdk.removed == [staging]
 
 
 # ── attach ──────────────────────────────────────────────────

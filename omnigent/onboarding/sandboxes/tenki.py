@@ -40,6 +40,8 @@ from __future__ import annotations
 import contextlib
 import os
 import queue
+import secrets
+import shlex
 import threading
 from typing import TYPE_CHECKING, ClassVar
 
@@ -274,9 +276,11 @@ class TenkiSandboxLauncher(SandboxLauncher):
 
     All transport rides the SDK: ``Client.create`` / ``Client.get`` /
     ``Sandbox.close`` for lifecycle, ``sandbox.exec`` for commands (a
-    ``bash -lc`` wrap applies login PATH), ``sandbox.fs.upload`` for file
-    shipping, and ``sandbox.start`` for the foreground attach. Handles are
-    cached per sandbox id to avoid a server round-trip on every primitive.
+    ``bash -lc`` wrap applies login PATH), ``sandbox.fs.upload`` plus a
+    shell move for file shipping (the fs API is workdir-scoped; see
+    :meth:`put`), and ``sandbox.start`` for the foreground attach. Handles
+    are cached per sandbox id to avoid a server round-trip on every
+    primitive.
     """
 
     provider: ClassVar[str] = "tenki"
@@ -592,11 +596,18 @@ class TenkiSandboxLauncher(SandboxLauncher):
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
         """
-        Copy a local file into the sandbox via the SDK's filesystem API.
+        Copy a local file into the sandbox.
+
+        Tenki's filesystem API only writes inside the session workdir —
+        an absolute destination like the bootstrap's
+        ``"/tmp/oa-wheels.tgz"`` is rejected as outside it. Command
+        execution has no such scoping, so the file is staged in the
+        workdir under a unique name and then shell-moved into place,
+        keeping the launcher contract for any destination path.
 
         :param sandbox_id: Target sandbox.
         :param local_path: Local file to read.
-        :param remote_path: Absolute destination path on the sandbox,
+        :param remote_path: Destination path on the sandbox,
             e.g. ``"/tmp/oa-wheels.tgz"``.
         :raises click.ClickException: If the transfer fails.
         """
@@ -604,12 +615,27 @@ class TenkiSandboxLauncher(SandboxLauncher):
         from tenki_sandbox.errors import SandboxError
 
         sandbox = self._resolve(sandbox_id)
+        staging = f".oa-put-{secrets.token_hex(8)}"
         try:
-            sandbox.fs.upload(str(local_path), remote_path)
+            sandbox.fs.upload(str(local_path), staging)
         except SandboxError as exc:
             raise click.ClickException(
                 f"File upload to sandbox '{sandbox_id}' failed: {exc}"
             ) from exc
+        # The exec shell starts in the session workdir, where the staged
+        # file just landed.
+        destination = shlex.quote(remote_path)
+        try:
+            self.run(
+                sandbox_id,
+                f'mkdir -p "$(dirname {destination})" && '
+                f"mv -f {shlex.quote(staging)} {destination}",
+            )
+        except click.ClickException:
+            # Don't leave the staged file behind on a failed move.
+            with contextlib.suppress(Exception):
+                sandbox.fs.remove(staging)
+            raise
 
     def stream_exec(self, sandbox_id: str, command: str, *, pty: bool = False) -> RemoteProcess:
         """
