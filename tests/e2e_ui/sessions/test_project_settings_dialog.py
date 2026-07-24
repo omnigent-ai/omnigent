@@ -11,9 +11,11 @@ tests mock out: open the dialog → flip the "Random worktree" toggle ON → Sav
 (``PATCH``) → reopen and confirm the fetched config seeds the toggle back ON.
 Worktrees are opt-in, so a toggle-ON stores ``use_worktree: true``.
 
-The working-directory / host prefill can't be exercised here — the e2e_ui
-runner registers no host to browse — so this test stays on the host-free path
-(the worktree toggle is a plain Switch, no host needed).
+The project is created directly via ``POST /v1/projects`` (an empty first-class
+project needs no member session, and this sidesteps the flaky row-kebab
+move-to-project dance). The working-directory / host prefill can't be exercised
+here — the e2e_ui runner registers no host to browse — so this test stays on the
+host-free path (the worktree toggle is a plain Switch, no host needed).
 """
 
 from __future__ import annotations
@@ -21,24 +23,22 @@ from __future__ import annotations
 import uuid
 
 import httpx
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Page, expect
 
 
-def _row(page: Page, session_id: str) -> Locator:
-    """Locate the sidebar row (``<li>``) for *session_id* by its href."""
-    return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
+def _create_project(base_url: str, name: str) -> str:
+    """Create an empty first-class project via the API; return its id."""
+    resp = httpx.post(f"{base_url}/v1/projects", json={"name": name}, timeout=10.0)
+    resp.raise_for_status()
+    return resp.json()["id"]
 
 
-def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
-    """Drive the row kebab → "Add to project" → "Create new project" flow so a
-    first-class project row exists (its ``config`` can then be edited)."""
-    row.hover()
-    row.get_by_test_id("conversation-actions").click()
-    page.get_by_test_id("move-to-project").click()
-    page.get_by_role("menuitem", name="Create new project").click()
-    new_input = page.get_by_placeholder("Project name…")
-    new_input.fill(name)
-    new_input.press("Enter")
+def _set_project_config(base_url: str, project_id: str, config: dict) -> None:
+    """Write a project's stored config via ``PATCH /v1/projects/{id}``."""
+    resp = httpx.patch(
+        f"{base_url}/v1/projects/{project_id}", json={"config": config}, timeout=10.0
+    )
+    resp.raise_for_status()
 
 
 def _open_project_settings(page: Page, project: str) -> None:
@@ -59,17 +59,16 @@ def test_project_settings_worktree_toggle_persists(
 ) -> None:
     """Turning "Random worktree" ON persists and re-seeds on reopen.
 
-    Creates a first-class project, opens its settings, flips the opt-in worktree
-    toggle ON, and Saves (``PATCH /v1/projects/{id}`` with ``use_worktree:true``).
-    Reopening the dialog fetches the stored config and seeds the toggle back ON —
-    proving the write reached the server and the read seeds from it.
+    Opens an empty project's settings, flips the opt-in worktree toggle ON, and
+    Saves (``PATCH /v1/projects/{id}`` with ``use_worktree:true``). Reopening the
+    dialog fetches the stored config and seeds the toggle back ON — proving the
+    write reached the server and the read seeds from it.
     """
     base_url, session_id = seeded_session
     project = f"Project {uuid.uuid4().hex[:6]}"
+    _create_project(base_url, project)
 
     page.goto(f"{base_url}/c/{session_id}")
-    _move_to_new_project(page, _row(page, session_id), project)
-    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
 
     # Open settings; the worktree toggle defaults OFF (opt-in).
     _open_project_settings(page, project)
@@ -97,26 +96,16 @@ def test_project_settings_clears_worktree_toggle(
 ) -> None:
     """Turning the toggle back OFF clears the stored default.
 
-    Starts from a project whose ``config`` has ``use_worktree: true`` (set via
-    the API), opens settings (toggle seeds ON), flips it OFF, and Saves. An
-    all-default dialog clears to ``{}``, so reopening seeds the toggle OFF.
+    Starts from a project whose ``config`` has ``use_worktree: true``, opens
+    settings (toggle seeds ON), flips it OFF, and Saves. An all-default dialog
+    clears to ``{}``, so reopening seeds the toggle OFF.
     """
     base_url, session_id = seeded_session
     project = f"Project {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, project)
+    _set_project_config(base_url, project_id, {"use_worktree": True})
 
     page.goto(f"{base_url}/c/{session_id}")
-    _move_to_new_project(page, _row(page, session_id), project)
-    expect(page.get_by_role("button", name=project, exact=True)).to_be_visible()
-
-    # Resolve the freshly-created project's id and pre-seed use_worktree:true so
-    # the dialog opens with the toggle already ON.
-    projects = httpx.get(f"{base_url}/v1/projects", timeout=10.0).json()
-    project_id = next(p["id"] for p in projects["data"] if p["name"] == project)
-    httpx.patch(
-        f"{base_url}/v1/projects/{project_id}",
-        json={"config": {"use_worktree": True}},
-        timeout=10.0,
-    ).raise_for_status()
 
     _open_project_settings(page, project)
     toggle = page.get_by_test_id("project-settings-worktree")
