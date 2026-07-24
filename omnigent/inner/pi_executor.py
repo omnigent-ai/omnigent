@@ -854,12 +854,15 @@ def _pi_model_is_reasoning(model: str) -> bool:
 def _pi_needs_responses_api(model: str) -> bool:
     """Return True when a GPT model requires the Responses API for tools.
 
-    gpt-5-5, gpt-5-6-*, and gpt-5-3-codex reject function tool calls via
-    ``/chat/completions`` with 400; they work via ``/responses`` at the AI
-    Gateway. Matches pi_native_credentials._needs_responses_api.
+    Uses the same allowlist logic as pi_native_credentials._needs_responses_api:
+    GPT models known to work with /chat/completions + tools are allowlisted;
+    everything else (newer models) defaults to the Responses API.
     """
-    lower = model.lower()
-    return any(token in lower for token in ("gpt-5-5", "gpt-5-6", "gpt-5-3-codex"))
+    from omnigent.pi_native_credentials import (
+        _needs_responses_api,
+    )
+
+    return _needs_responses_api(model.lower())
 
 
 def _pi_provider_for_model(model: str) -> str:

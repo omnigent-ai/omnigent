@@ -335,20 +335,42 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         return None
 
 
+# GPT model versions known to work fine with /chat/completions + function tools.
+# Any GPT model NOT in this set defaults to the Responses API (safer default for
+# newer models we haven't explicitly tested with completions).
+# These token fragments identify GPT models that work fine with
+# /chat/completions + function tools. Any GPT model whose id does NOT contain
+# one of these tokens defaults to the Responses API (safer for new models).
+# Use specific enough tokens so "gpt-5" doesn't match "gpt-5-5".
+_GPT_COMPLETIONS_COMPATIBLE: frozenset[str] = frozenset(
+    {
+        "gpt-5-4",  # gpt-5-4, gpt-5-4-mini, gpt-5-4-nano
+        "gpt-5-2",
+        "gpt-5-1",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-oss",  # excluded entirely via _unsupported_in_pi
+    }
+)
+
+
 def _needs_responses_api(model_id_lower: str) -> bool:
-    """Return True when a Databricks model requires the Responses API for tools.
+    """Return True when a GPT model requires the Responses API for tools.
 
-    Newer GPT models (gpt-5.5, gpt-5.6-*, gpt-5.3-codex) reject function tool
-    calls via ``/chat/completions`` with 400; they work via the Responses API at
-    the AI Gateway (``/ai-gateway/codex/v1/responses``). Detected by name: these
-    models have ``gpt-5.5``, ``gpt-5.6``, or ``gpt-5.3-codex`` in their id.
-    Non-GPT models (Kimi, Llama, GLM) and older GPT (5.4, 5.2, …) work fine
-    with ``/chat/completions`` + tools.
+    Some GPT models reject function tool calls via ``/chat/completions`` with
+    400; they work via the AI Gateway Responses API instead. Rather than
+    maintaining a denylist of newer versions, we maintain an allowlist of models
+    known to work with completions. Any GPT model not in the allowlist defaults
+    to the Responses API — safer for new models we haven't tested.
 
-    Expects a pre-lowercased model id (the caller typically has ``name_lower``
-    already computed).
+    Non-GPT models are handled separately (Kimi/inkling via reasoning:true,
+    Gemini/Qwen3/gpt-oss excluded via _unsupported_in_pi).
+
+    Expects a pre-lowercased model id.
     """
-    return any(token in model_id_lower for token in ("gpt-5-5", "gpt-5-6", "gpt-5-3-codex"))
+    if "gpt" not in model_id_lower:
+        return False
+    return not any(token in model_id_lower for token in _GPT_COMPLETIONS_COMPATIBLE)
 
 
 def _unsupported_in_pi(model_id_lower: str) -> bool:
