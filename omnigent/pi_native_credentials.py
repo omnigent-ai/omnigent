@@ -363,14 +363,16 @@ def _unsupported_in_pi(model_id_lower: str) -> bool:
     Exclude these models from both providers so the picker can show them but
     Pi doesn't try to call them with tools.
 
-    Also includes gpt-oss models (gpt-oss-120b, gpt-oss-20b) which return
-    content as a typed array ``[{type:'reasoning',...},{type:'text',...}]``.
+    Also includes gpt-oss and qwen3 models which return content as a typed
+    array ``[{type:'reasoning',...},{type:'text',...}]`` when tools are present.
     Pi's openai-completions streaming handler does ``block.text += content``
     where content is an array, producing ``[object Object],[object Object]``.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
+    return (
+        "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower or "qwen3" in model_id_lower
+    )
 
 
 def _fetch_pi_model_lists(
