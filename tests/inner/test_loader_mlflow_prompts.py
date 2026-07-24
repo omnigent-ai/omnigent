@@ -11,12 +11,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import mlflow
 import pytest
 import yaml
-from mlflow.genai import register_prompt, set_prompt_alias
 
-from omnigent.inner.loader import load_agent_def
+# mlflow is an optional extra; CI groups that don't install omnigent[mlflow]
+# must skip this module cleanly rather than error at collection.
+mlflow = pytest.importorskip("mlflow")
+from mlflow.genai import register_prompt, set_prompt_alias  # noqa: E402
+
+from omnigent.inner.loader import load_agent_def  # noqa: E402
 
 
 @pytest.fixture()

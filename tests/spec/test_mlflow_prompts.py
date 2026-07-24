@@ -5,17 +5,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import mlflow
 import pytest
 import yaml
-from mlflow.genai import register_prompt, set_prompt_alias
 
-from omnigent.errors import OmnigentError
-from omnigent.spec.mlflow_prompts import (
+# mlflow is an optional extra; CI groups that don't install omnigent[mlflow]
+# must skip this module cleanly rather than error at collection.
+mlflow = pytest.importorskip("mlflow")
+from mlflow.genai import register_prompt, set_prompt_alias  # noqa: E402
+
+from omnigent.errors import OmnigentError  # noqa: E402
+from omnigent.spec.mlflow_prompts import (  # noqa: E402
     parse_mlflow_instructions,
     resolve_mlflow_prompt,
 )
-from omnigent.spec.parser import parse
+from omnigent.spec.parser import parse  # noqa: E402
 
 
 @pytest.fixture()
