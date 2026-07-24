@@ -97,7 +97,7 @@ export function ScheduledTaskRow({
     >
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-sm font-semibold">{task.name}</span>
+          <span className="truncate text-base font-bold">{task.name}</span>
           {paused && (
             <span
               data-testid="task-paused-pill"
