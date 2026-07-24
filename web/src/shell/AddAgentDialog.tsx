@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { AgentCard } from "@/components/AgentCard";
-import { useAvailableAgents } from "@/hooks/useAvailableAgents";
+import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { createSession } from "@/lib/sessionsApi";
 
@@ -52,22 +52,30 @@ export function AddAgentDialog({
   const agentList = agents ?? [];
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [name, setName] = useState("");
-  // Pre-filled from the selected agent's declared ``llm.model`` and
-  // forwarded as ``model_override`` on session create. Empty (or an
-  // agent with no declared model) → harness default (no override sent).
-  const [model, setModel] = useState("");
+  // null means "untouched" — the input shows the selected agent's declared
+  // model. Once the user types (including clearing it to ""), their value
+  // wins. Forwarded as ``model_override``; empty → harness default.
+  const [model, setModel] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedAgent = agentList.find((a) => a.id === selectedAgentId) ?? null;
+  const modelValue = model ?? selectedAgent?.model ?? "";
+
+  // Session-discovered rows reach the catalog with only scan data; their
+  // declared model arrives via this enrichment. Without it the picker's
+  // model input stays empty for exactly the agents this dialog surfaces.
+  useEffect(() => {
+    if (!open) return;
+    for (const agent of agentList) {
+      void prefetchAvailableAgentDetails(agent, queryClient);
+    }
+  }, [open, agentList, queryClient]);
 
   function selectAgent(agentId: string): void {
-    const agent = agentList.find((a) => a.id === agentId) ?? null;
     setSelectedAgentId(agentId);
-    // Pre-fill the model input with the agent's declared default so the
-    // user can accept it as-is or edit it; agents without a declared
-    // model start empty (harness default).
-    setModel(agent?.model ?? "");
+    // Back to following the newly picked agent's declared model.
+    setModel(null);
     setError(null);
   }
 
@@ -75,7 +83,7 @@ export function AddAgentDialog({
     if (!next) {
       setSelectedAgentId(null);
       setName("");
-      setModel("");
+      setModel(null);
       setError(null);
       setSubmitting(false);
     }
@@ -89,7 +97,7 @@ export function AddAgentDialog({
       setError("Enter a name for the agent.");
       return;
     }
-    const trimmedModel = model.trim();
+    const trimmedModel = modelValue.trim();
     const title = `${UI_ADDED_TITLE_PREFIX}:${selectedAgent.name}:${trimmed}`;
     setSubmitting(true);
     setError(null);
@@ -186,7 +194,7 @@ export function AddAgentDialog({
                   id="add-agent-model"
                   data-testid="add-agent-model-input"
                   type="text"
-                  value={model}
+                  value={modelValue}
                   onChange={(e) => setModel(e.target.value)}
                   placeholder="Harness default"
                   className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
