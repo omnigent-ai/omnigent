@@ -120,7 +120,7 @@ export function ScheduledTaskRow({
           )}
         </span>
         <span
-          className="truncate text-[13px] text-muted-foreground"
+          className="truncate text-[13px] text-muted-foreground/80"
           data-testid="task-schedule-line"
         >
           {scheduleSummary}
