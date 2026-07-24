@@ -14,6 +14,9 @@ import pytest
 
 from omnigent.codex_native_app_server import NativeCodexLaunch
 from omnigent.runner import create_runner_app
+from omnigent.runner.background_titles import BackgroundTitleContext
+from omnigent.runner.background_titles import claude_native as claude_native_titles
+from omnigent.runner.background_titles import codex_native as codex_native_titles
 from tests.runner.helpers import NullServerClient
 
 
@@ -165,8 +168,8 @@ async def test_background_title_maps_claude_native_to_claude_cli(
             return "claude-sdk", {"HARNESS_CLAUDE_SDK_MODEL": "claude-sonnet-4-6"}
         return "claude-native", None
 
-    async def generate_claude_title(prompt: str, *, cwd: Any, model: str | None) -> str:
-        cli_calls.append((prompt, cwd, model))
+    async def generate_claude_title(context: BackgroundTitleContext) -> str:
+        cli_calls.append((context.prompt, context.cwd, context.model))
         return "Debug authentication timeout"
 
     monkeypatch.setattr(
@@ -174,7 +177,7 @@ async def test_background_title_maps_claude_native_to_claude_cli(
         resolve_harness_config,
     )
     monkeypatch.setattr(
-        "omnigent.runner.app._generate_claude_native_background_title",
+        "omnigent.runner.background_titles.claude_native.generate_background_title",
         generate_claude_title,
     )
     app = create_runner_app(
@@ -216,8 +219,6 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from omnigent.runner import app as runner_app
-
     captured: dict[str, Any] = {}
 
     class FakeProcess:
@@ -240,10 +241,15 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
 
-    title = await runner_app._generate_claude_native_background_title(
-        "please investigate the authentication timeout",
-        cwd=tmp_path,
-        model="claude-sonnet-4-6",
+    title = await claude_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="claude-native",
+            spawn_env={},
+            process_manager=None,
+            cwd=tmp_path,
+            model="claude-sonnet-4-6",
+        )
     )
 
     assert title == "Debug authentication timeout"
@@ -263,8 +269,6 @@ async def test_claude_native_title_kills_process_when_cancelled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from omnigent.runner import app as runner_app
-
     communicate_started = asyncio.Event()
 
     class FakeProcess:
@@ -302,10 +306,15 @@ async def test_claude_native_title_kills_process_when_cancelled(
     )
 
     task = asyncio.create_task(
-        runner_app._generate_claude_native_background_title(
-            "please investigate the authentication timeout",
-            cwd=tmp_path,
-            model="claude-sonnet-4-6",
+        claude_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="claude-native",
+                spawn_env={},
+                process_manager=None,
+                cwd=tmp_path,
+                model="claude-sonnet-4-6",
+            )
         )
     )
     await communicate_started.wait()
@@ -330,8 +339,8 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
         resolver_calls.append((kwargs["harness_override"], kwargs["model_override"]))
         return "codex-native", None
 
-    async def generate_codex_title(prompt: str, *, model: str | None) -> str:
-        cli_calls.append((prompt, model))
+    async def generate_codex_title(context: BackgroundTitleContext) -> str:
+        cli_calls.append((context.prompt, context.model))
         return "Debug authentication timeout"
 
     monkeypatch.setattr(
@@ -339,7 +348,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
         resolve_harness_config,
     )
     monkeypatch.setattr(
-        "omnigent.runner.app._generate_codex_native_background_title",
+        "omnigent.runner.background_titles.codex_native.generate_background_title",
         generate_codex_title,
     )
     app = create_runner_app(
@@ -378,8 +387,6 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from omnigent.runner import app as runner_app
-
     captured: dict[str, Any] = {}
 
     class FakeProcess:
@@ -436,9 +443,14 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
         lambda: source_home,
     )
 
-    title = await runner_app._generate_codex_native_background_title(
-        "please investigate the authentication timeout",
-        model="gpt-5.4-mini",
+    title = await codex_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="codex-native",
+            spawn_env={},
+            process_manager=None,
+            model="gpt-5.4-mini",
+        )
     )
 
     assert title == "Debug authentication timeout"
@@ -470,8 +482,6 @@ async def test_codex_native_title_kills_process_when_cancelled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from omnigent.runner import app as runner_app
-
     communicate_started = asyncio.Event()
     killed: list[Any] = []
 
@@ -510,9 +520,14 @@ async def test_codex_native_title_kills_process_when_cancelled(
     )
 
     task = asyncio.create_task(
-        runner_app._generate_codex_native_background_title(
-            "please investigate the authentication timeout",
-            model="gpt-5.4-mini",
+        codex_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="codex-native",
+                spawn_env={},
+                process_manager=None,
+                model="gpt-5.4-mini",
+            )
         )
     )
     await communicate_started.wait()
@@ -649,7 +664,7 @@ async def test_background_title_timeout_releases_process(
         resolve_harness_config,
     )
     monkeypatch.setattr(
-        "omnigent.runner.app._BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
+        "omnigent.runner.background_titles.sdk.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
         0.01,
     )
     app = create_runner_app(
