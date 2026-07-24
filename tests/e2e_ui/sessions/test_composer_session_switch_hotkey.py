@@ -26,8 +26,11 @@ sidebar's "Sessions" group, so both are in the hotkey's ordered list.
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 import httpx
 from playwright.sync_api import Page, expect
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 _COMPOSER = "Ask the agent anything…"
 
@@ -40,6 +43,29 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
         timeout=10.0,
     )
     resp.raise_for_status()
+
+
+def _press_down_and_expect_session_change(page: Page) -> None:
+    """Press the traversal chord and require a different session URL."""
+    previous_url = page.url
+    previous_path = urlsplit(previous_url).path
+    assert previous_path.startswith("/c/") and previous_path.count("/") == 2
+
+    page.keyboard.press("ControlOrMeta+ArrowDown")
+    try:
+        page.wait_for_function(
+            """previousPath => {
+                const current = new URL(window.location.href);
+                return current.pathname !== previousPath
+                    && /^\\/c\\/[^/]+$/.test(current.pathname);
+            }""",
+            arg=previous_path,
+            timeout=10_000,
+        )
+    except PlaywrightTimeoutError:
+        raise AssertionError(
+            f"expected a different /c/<id> after session traversal from {previous_url}"
+        ) from None
 
 
 def test_ctrl_arrow_does_not_switch_session_from_focused_composer(
@@ -100,11 +126,9 @@ def test_empty_focused_composer_does_not_block_session_switching(
     expect(composer).to_have_value("")
     composer.focus()
 
-    page.keyboard.press("ControlOrMeta+ArrowDown")
-    expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=10_000)
-
-    page.keyboard.press("ControlOrMeta+ArrowDown")
-    expect(page).to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
-
-    page.keyboard.press("ControlOrMeta+ArrowDown")
-    expect(page).to_have_url(f"{base_url}/c/{session_b}", timeout=10_000)
+    # Assert only the traversal invariant. Other sessions may exist in the
+    # sidebar, so seeded sessions are not guaranteed to be adjacent.
+    for _ in range(3):
+        expect(composer).to_have_value("")
+        _press_down_and_expect_session_change(page)
+        expect(composer).to_have_value("")
