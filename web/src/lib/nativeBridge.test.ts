@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -39,6 +41,19 @@ const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
 const androidSetColorScheme = vi.fn();
+
+const androidBridgeScriptSource = readFileSync(
+  resolve("android/app/src/main/java/ai/omnigent/android/NativeBridgeScript.kt"),
+  "utf8",
+);
+
+function androidColorSchemeSyncSource(): string {
+  const match = androidBridgeScriptSource.match(
+    /          const resolvePageColorScheme = \(\) => \{[\s\S]*?          syncPageColorScheme\(\);/,
+  );
+  if (!match) throw new Error("Android color-scheme sync script not found");
+  return match[0].replace(/^ {10}/gm, "");
+}
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -235,6 +250,36 @@ describe("reportColorScheme", () => {
 
     expect(androidSetColorScheme).toHaveBeenCalledOnce();
     expect(androidSetColorScheme).toHaveBeenCalledWith("light");
+  });
+});
+
+describe("Android injected color scheme sync", () => {
+  it("re-pushes concrete schemes after live root theme changes", async () => {
+    document.documentElement.className = "light";
+    const post = vi.fn();
+    const disconnect = new Function(
+      "post",
+      `${androidColorSchemeSyncSource()}\nreturn () => colorSchemeObserver?.disconnect();`,
+    )(post) as () => void;
+
+    try {
+      expect(post).toHaveBeenLastCalledWith({ method: "setColorScheme", scheme: "light" });
+      post.mockClear();
+
+      document.documentElement.className = "dark";
+      await vi.waitFor(() => {
+        expect(post).toHaveBeenLastCalledWith({ method: "setColorScheme", scheme: "dark" });
+      });
+
+      post.mockClear();
+      document.documentElement.className = "light";
+      await vi.waitFor(() => {
+        expect(post).toHaveBeenLastCalledWith({ method: "setColorScheme", scheme: "light" });
+      });
+    } finally {
+      disconnect();
+      document.documentElement.className = "";
+    }
   });
 });
 
