@@ -785,6 +785,81 @@ def test_oversized_server_error_message_is_capped(
     assert len(out) < 5_000, f"error string not bounded: {len(out)} chars"
 
 
+@respx.mock
+def test_oversized_status_from_result_body_is_bounded(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """A hostile run status in the result body can't inflate the error string.
+
+    The status is read from the response body (not a URL), so nothing else
+    bounds it; only a known terminal status is trusted.
+    """
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(
+        return_value=httpx.Response(
+            422,
+            json={"run": {"status": "s" * 200_000}, "error": {"message": "boom"}},
+        )
+    )
+    out = _invoke(_config(), tool_ctx)
+    assert out == f"Nimble research run {_RUN_ID} failed: boom"
+    assert len(out) < 5_000, f"error string not bounded: {len(out)} chars"
+
+
+@respx.mock
+def test_oversized_run_id_is_rejected(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
+    """An implausibly long run id is a protocol error, not a value we echo or route on."""
+    respx.post(_RUNS_URL).mock(
+        return_value=httpx.Response(202, json=_run("completed", id="task_run_" + "z" * 50_000))
+    )
+    out = _invoke(_config(), tool_ctx)
+    assert out.startswith("Nimble research error: expected a 'task_run_...' run id")
+    assert len(out) < 5_000, f"error string not bounded: {len(out)} chars"
+
+
+@respx.mock
+def test_trust_section_bounded_at_max_cardinality(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """Per-field caps multiply across cardinality, so the section is bounded as a whole."""
+    big = "y" * 5_000
+    trust = {
+        "confidence": "high",
+        "reasoning": big,
+        "sources": [{"url": big, "type": big, "title": big} for _ in range(10)],
+        "claims": [
+            {
+                "path": big,
+                "confidence": big,
+                "citations": [{"url": big, "title": big} for _ in range(3)],
+            }
+            for _ in range(10)
+        ],
+    }
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result(trust=trust)))
+    raw = _invoke(_config(), tool_ctx)
+    envelope = json.loads(raw)
+    assert envelope["trust"]["trust_truncated"] is True
+    assert len(raw) < 60_000, f"envelope not bounded at max cardinality: {len(raw)} chars"
+
+
+@respx.mock
+def test_non_string_citation_url_is_dropped(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
+    """Parity with sources: a non-string citation url is dropped, not passed through."""
+    trust = {
+        "confidence": "high",
+        "reasoning": "r",
+        "sources": [],
+        "claims": [{"path": "$.a", "citations": [{"url": {"nested": "x" * 50_000}}]}],
+    }
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result(trust=trust)))
+    raw = _invoke(_config(), tool_ctx)
+    assert json.loads(raw)["trust"]["claims"][0]["citations"][0]["url"] is None
+    assert len(raw) < 10_000
+
+
 # ---------------------------------------------------------------------------
 # Secret hygiene
 # ---------------------------------------------------------------------------

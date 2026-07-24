@@ -94,9 +94,15 @@ _MAX_CONTENT_CHARS = 50_000
 _MAX_TRUST_SOURCES = 10
 _MAX_TRUST_CLAIMS = 10
 _MAX_CITATIONS_PER_CLAIM = 3
-# Per-string cap for trust fields (reasoning / url / title / type) so a single
-# oversized API-supplied value can't inflate the envelope past its bound.
+# Per-string cap for any API-supplied value reflected into the envelope or an
+# error message, so a single oversized field can't inflate either past its bound.
 _MAX_FIELD_CHARS = 2_000
+# Per-field caps still multiply across sources x claims x citations, so the
+# trust section is bounded as a whole too.
+_MAX_TRUST_CHARS = 20_000
+# A run id is "task_run_" + a uuid (~45 chars); anything far longer is a
+# protocol violation, not a value to echo back or build a URL from.
+_MAX_RUN_ID_CHARS = 200
 
 # Test seams: unit tests monkeypatch these module attributes with a fake clock
 # instead of patching the process-global ``time`` module.
@@ -236,8 +242,12 @@ def _run_error_message(run_id: str, status: str, error: object) -> str:
         if isinstance(raw, str):
             message = raw.strip()
     if message:
-        return f"Nimble research run {run_id} {status}: {_cap_field(message)}"
-    return f"Nimble research run {run_id} {status} without an error message."
+        return (
+            f"Nimble research run {_cap_field(run_id)} {_cap_field(status)}: {_cap_field(message)}"
+        )
+    return (
+        f"Nimble research run {_cap_field(run_id)} {_cap_field(status)} without an error message."
+    )
 
 
 def _start_run(
@@ -294,7 +304,11 @@ def _start_run(
     if run is None:
         return None, "Nimble research error: run creation returned a non-JSON response."
     run_id = run.get("id")
-    if not isinstance(run_id, str) or not run_id.startswith(_RUN_ID_PREFIX):
+    if (
+        not isinstance(run_id, str)
+        or not run_id.startswith(_RUN_ID_PREFIX)
+        or len(run_id) > _MAX_RUN_ID_CHARS
+    ):
         return None, (
             f"Nimble research error: expected a '{_RUN_ID_PREFIX}...' run id, "
             f"got {_cap_field(repr(run_id))}."
@@ -446,7 +460,7 @@ def _fetch_result(
             failed = _parse_json_dict(resp) or {}
             run = failed.get("run")
             status = "failed"
-            if isinstance(run, dict) and isinstance(run.get("status"), str):
+            if isinstance(run, dict) and run.get("status") in _TERMINAL_STATUSES:
                 status = str(run["status"])
             return None, _run_error_message(run_id, status, failed.get("error"))
         if resp.status_code >= 400:
@@ -466,7 +480,7 @@ def _fetch_result(
             # Defensive: the API schema allows a failed-result body on HTTP 200.
             run = data.get("run")
             status = "failed"
-            if isinstance(run, dict) and isinstance(run.get("status"), str):
+            if isinstance(run, dict) and run.get("status") in _TERMINAL_STATUSES:
                 status = str(run["status"])
             return None, _run_error_message(run_id, status, error)
         return None, f"Nimble research run {run_id} result had an unexpected shape."
@@ -549,6 +563,16 @@ def _map_trust(trust: object) -> dict[str, Any]:
     mapped["claims"] = kept_claims
     if len(claims) > _MAX_TRUST_CLAIMS:
         mapped["claims_omitted"] = len(claims) - _MAX_TRUST_CLAIMS
+
+    # Per-field caps multiply across sources x claims x citations, so bound the
+    # section as a whole. Claims carry the most text, so they go first; the
+    # omitted counts stay so the reader knows data was withheld.
+    for section, raw in (("claims", claims), ("sources", sources)):
+        if len(json.dumps(mapped, ensure_ascii=False)) <= _MAX_TRUST_CHARS:
+            break
+        mapped[section] = []
+        mapped[f"{section}_omitted"] = len(raw)
+        mapped["trust_truncated"] = True
     return mapped
 
 
