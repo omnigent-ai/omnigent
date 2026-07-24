@@ -47,6 +47,7 @@ import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
   consumePendingInitialPrompt,
+  __clearTranscriptCacheForTests,
   handleSessionEvent,
   initChatStore,
   pumpStreamEvents,
@@ -387,6 +388,10 @@ beforeEach(() => {
     // Restore the real send action; a prior test may have stubbed it.
     send: realSend,
   });
+  // Clear the module-level transcript switch-back cache (#2849) between
+  // cases: conversation ids are reused across tests, so a cached transcript
+  // would otherwise leak into the next test's cold load.
+  __clearTranscriptCacheForTests();
   fetchMock.mockReset();
   fetchMock.mockImplementation(defaultFetchHandler);
   vi.stubGlobal("fetch", fetchMock);
@@ -9174,5 +9179,96 @@ describe("chatStore — background cross-session flush", () => {
     await tick();
     await tick();
     expect(delivered).toEqual(["foreground", "background"]);
+  });
+});
+
+describe("chatStore — transcript switch-back cache (#2849)", () => {
+  it("restores older history on switch-back without re-running the eager backfill", async () => {
+    // Three pages: the bind window is only the newest page, older pages exist.
+    const total = SESSION_HISTORY_PAGE_SIZE * 3;
+    const items = Array.from({ length: total }, (_, i) =>
+      userMessage(`a_${i.toString().padStart(4, "0")}`, `a ${i}`),
+    );
+    seedSession("conv_a", items);
+    seedSession("conv_b", []);
+
+    // Open A and page one older window in, so state holds two pages.
+    await useChatStore.getState().switchTo("conv_a");
+    await useChatStore.getState().loadMoreHistory();
+    const loaded = useChatStore.getState();
+    const idsBefore = loaded.blocks.map((b) => b.ctx.itemId);
+    expect(idsBefore).toHaveLength(SESSION_HISTORY_PAGE_SIZE * 2);
+    const oldestBefore = loaded.oldestItemId;
+    expect(loaded.hasMoreHistory).toBe(true); // one page still older
+
+    // Leave A (stashes its transcript), then come back — counting only the
+    // item fetches the switch-back itself triggers.
+    await useChatStore.getState().switchTo("conv_b");
+    fetchMock.mockClear();
+    await useChatStore.getState().switchTo("conv_a");
+
+    const restored = useChatStore.getState();
+    // The full two-page transcript is back, in order — not just the newest
+    // page a cold bind would show.
+    expect(restored.blocks.map((b) => b.ctx.itemId)).toEqual(idsBefore);
+    expect(restored.oldestItemId).toBe(oldestBefore);
+    expect(restored.hasMoreHistory).toBe(true);
+
+    // And it cost exactly ONE item request (the bind window); the older page
+    // came from the cache, not a re-fetch. A regression to re-paging on
+    // switch-back would add an `after=` cursor fetch here.
+    const itemFetches = fetchMock.mock.calls.filter(([u]) =>
+      String(u).startsWith("/v1/sessions/conv_a/items"),
+    );
+    expect(itemFetches).toHaveLength(1);
+    expect(itemFetches.every(([u]) => !String(u).includes("after="))).toBe(true);
+
+    // Scroll-up still works off the restored cursor: the remaining older page
+    // pages in correctly, proving the restored state is internally consistent.
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+      items.map((it) => it.id),
+    );
+  });
+
+  it("falls back to a fresh reload when items arrived while away, dropping nothing", async () => {
+    const firstBatch = SESSION_HISTORY_PAGE_SIZE * 2;
+    const items = Array.from({ length: firstBatch }, (_, i) =>
+      userMessage(`a_${i.toString().padStart(4, "0")}`, `a ${i}`),
+    );
+    seedSession("conv_a", items);
+    seedSession("conv_b", []);
+
+    // Cache two pages for A.
+    await useChatStore.getState().switchTo("conv_a");
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().blocks).toHaveLength(SESSION_HISTORY_PAGE_SIZE * 2);
+
+    await useChatStore.getState().switchTo("conv_b");
+
+    // While away, many new items commit to A — enough that its fresh newest
+    // page shares NO id with the cached transcript. That is the gap the cache
+    // must refuse to bridge (else the missing middle items vanish).
+    const added = Array.from({ length: SESSION_HISTORY_PAGE_SIZE * 2 }, (_, i) =>
+      userMessage(`a_new_${i.toString().padStart(4, "0")}`, `a new ${i}`),
+    );
+    const grown = [...items, ...added];
+    seedSession("conv_a", grown);
+
+    await useChatStore.getState().switchTo("conv_a");
+
+    const state = useChatStore.getState();
+    // Exactly the fresh newest page (the new items) — the stale cache was NOT
+    // prepended, so nothing is scrambled and no gap is papered over.
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(
+      grown.slice(-SESSION_HISTORY_PAGE_SIZE).map((it) => it.id),
+    );
+    expect(state.hasMoreHistory).toBe(true);
+    // Paging up walks the real, contiguous history — including the middle
+    // items the cache never had — with no duplicates.
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+      grown.slice(-SESSION_HISTORY_PAGE_SIZE * 2).map((it) => it.id),
+    );
   });
 });

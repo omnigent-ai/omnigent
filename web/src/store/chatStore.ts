@@ -682,6 +682,51 @@ let queryClient: QueryClient | null = null;
 const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
 let pendingSeq = 0;
 let queueSeq = 0;
+
+/**
+ * Per-conversation transcript cache for fast session switch-back (#2849).
+ *
+ * `switchTo` resets `blocks` to `[]` and the rail then re-runs the eager
+ * backfill (up to 10 serial `/items` pages), so returning to a session just
+ * viewed pays that multi-round-trip cost again. This is a pure performance
+ * cache — deliberately module-level, NOT reactive store state, so it never
+ * triggers renders or bloats snapshots. `switchTo` stashes the loaded
+ * transcript on leave; `bindStream` restores the older history on return
+ * WITHOUT re-paging, but only when the freshly-fetched snapshot window shares
+ * an item id with the cache (proof the two are contiguous), so an item
+ * committed while the user was away can never fall into a gap. A small LRU cap
+ * bounds memory.
+ */
+interface CachedTranscript {
+  blocks: AnyBlock[];
+  oldestItemId: string | null;
+  hasMoreHistory: boolean;
+}
+const MAX_CACHED_TRANSCRIPTS = 8;
+const transcriptCache = new Map<string, CachedTranscript>();
+
+/**
+ * Stash a conversation's loaded transcript for a later switch-back.
+ *
+ * Skips a transcript with no server item id (purely optimistic/live bubbles):
+ * it can never satisfy the overlap guard and so would only waste memory.
+ * Re-inserts to mark most-recently-used and evicts the oldest past the cap.
+ */
+function stashTranscript(conversationId: string, entry: CachedTranscript): void {
+  if (!entry.blocks.some((b) => b.ctx.itemId != null)) return;
+  transcriptCache.delete(conversationId);
+  transcriptCache.set(conversationId, entry);
+  while (transcriptCache.size > MAX_CACHED_TRANSCRIPTS) {
+    const oldest = transcriptCache.keys().next().value;
+    if (oldest === undefined) break;
+    transcriptCache.delete(oldest);
+  }
+}
+
+/** Test-only: clear the module-level transcript cache between cases. */
+export function __clearTranscriptCacheForTests(): void {
+  transcriptCache.clear();
+}
 // Tail of the send chain. Each `send` waits on the previous send's network
 // work before issuing its own POST, so rapid-fire messages reach the server
 // in submission order. Concurrent `fetch` POSTs have no ordering guarantee,
@@ -1544,6 +1589,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // bindStream's pump unwinds via AbortError and stops applying
     // events to state.blocks.
     get().abortController?.abort();
+
+    // #2849: stash the outgoing transcript so switching back restores its
+    // older history without re-running the eager backfill. Read before the
+    // reset below wipes `blocks`. `bindStream` gates the restore on an
+    // overlap check, so a stale cache can never drop messages.
+    const outgoing = get();
+    if (outgoing.conversationId !== null) {
+      stashTranscript(outgoing.conversationId, {
+        blocks: outgoing.blocks,
+        oldestItemId: outgoing.oldestItemId,
+        hasMoreHistory: outgoing.hasMoreHistory,
+      });
+    }
 
     set((s) => {
       // Stash the OUTGOING conversation's still-in-flight optimistic
@@ -2612,6 +2670,43 @@ async function bindStream(
         }>,
       };
     });
+    // #2849: on a cold load, restore the older transcript from the
+    // switch-away cache instead of re-running the eager backfill — but only
+    // when the fresh snapshot window shares an item id with the cache. A
+    // shared id proves the cache is contiguous with the window, so items
+    // committed while the user was away cannot fall into a gap. No shared id
+    // (a long-idle switch-back, or heavy activity while away) leaves the
+    // normal backfill to run. Runs synchronously right after the bind set()
+    // — no `await` between them — so the rail's eager-load effect sees the
+    // restored history and skips its serial paging.
+    if (hydratePending && get().conversationId === id) {
+      const cached = transcriptCache.get(id);
+      if (cached !== undefined) {
+        set((state) => {
+          const windowIds = new Set(
+            state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+          );
+          const overlaps = cached.blocks.some(
+            (b) => b.ctx.itemId != null && windowIds.has(b.ctx.itemId),
+          );
+          if (!overlaps) return {};
+          // Prepend only the strictly-older committed cached blocks (those the
+          // fresh window doesn't already hold), preserving their order, and
+          // restore the paging cursor so scroll-up and the rail see the full
+          // loaded range. Optimistic/live bubbles (no item id) are never
+          // carried over — the pending logic above owns those.
+          const olderFromCache = cached.blocks.filter(
+            (b) => b.ctx.itemId != null && !windowIds.has(b.ctx.itemId),
+          );
+          if (olderFromCache.length === 0) return {};
+          return {
+            blocks: [...olderFromCache, ...state.blocks],
+            oldestItemId: cached.oldestItemId ?? state.oldestItemId,
+            hasMoreHistory: cached.hasMoreHistory,
+          };
+        });
+      }
+    }
     racedNativeModelOptions.delete(id);
   } catch (err) {
     if (get().conversationId !== id) return;
