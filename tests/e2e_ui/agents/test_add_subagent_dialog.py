@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
@@ -44,27 +44,47 @@ _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 _HELLO_WORLD_MODEL = "gpt-4o-mini"
 
 
-def _picker_hello_world_id(base_url: str, session_id: str) -> str:
-    """Return the ``hello_world`` agent id the Add-agent picker surfaces.
+def _picker_hello_world_ids(base_url: str, session_id: str) -> list[str]:
+    """Return every agent id the picker may render for ``hello_world``.
 
-    The picker keys each card on the agent id (``agent-card-<id>``). Its hook
-    (``useAvailableAgents``) lets a newer same-named session upload supersede the
-    ``--agent`` template — and this session is already bound to a session-scoped
-    ``hello_world`` (created after the template), so the picker surfaces THAT
-    copy, not the template. Resolve it from the session's bound agent so the card
-    selector matches what the picker renders (rather than guessing the display
-    name, which the SPA prettifies).
+    The picker keys each card on the agent id (``agent-card-<id>``), and two
+    rows compete for the name: the ``--agent`` template in the ``GET
+    /v1/agents`` catalog, and the session-scoped copy this session is bound
+    to. ``useAvailableAgents`` collapses them newest-wins, and which one
+    survives depends on the catalog fetch and the sessions scan resolving in
+    a particular order — so pinning either id alone makes the card selector
+    miss intermittently. Return both and let the caller match whichever
+    rendered, rather than guessing the display name (the SPA prettifies it).
 
     :param base_url: Spawned server base URL.
-    :param session_id: The session whose page hosts the dialog; its bound
-        ``hello_world`` is what the picker shows.
-    :returns: The ``hello_world`` agent id the picker renders.
+    :param session_id: The session whose page hosts the dialog.
+    :returns: Candidate ``hello_world`` agent ids, session-bound copy first.
     """
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/agent", timeout=10.0)
     resp.raise_for_status()
     agent = resp.json()
     assert agent.get("name") == "hello_world", f"session not bound to hello_world: {agent}"
-    return str(agent["id"])
+    ids = [str(agent["id"])]
+    catalog = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
+    catalog.raise_for_status()
+    ids += [
+        str(row["id"])
+        for row in catalog.json().get("data", [])
+        if row.get("name") == "hello_world" and str(row["id"]) not in ids
+    ]
+    return ids
+
+
+def _hello_world_card(dialog: Locator, base_url: str, session_id: str) -> Locator:
+    """Locate the ``hello_world`` card the picker actually rendered.
+
+    :param dialog: The open Add-agent dialog.
+    :param base_url: Spawned server base URL.
+    :param session_id: The session whose page hosts the dialog.
+    :returns: Locator for the rendered ``hello_world`` card.
+    """
+    ids = _picker_hello_world_ids(base_url, session_id)
+    return dialog.locator(", ".join(f'[data-testid="agent-card-{i}"]' for i in ids)).first
 
 
 def _child_sessions(base_url: str, session_id: str) -> list[dict]:
@@ -98,7 +118,6 @@ def test_add_subagent_from_dialog(
 ) -> None:
     """Add-agent dialog → pick agent → name → submit → child session is created."""
     base_url, session_id = seeded_session
-    agent_id = _picker_hello_world_id(base_url, session_id)
     page.goto(f"{base_url}/c/{session_id}")
 
     # The Add-agent button lives in the Agents rail panel, so open the rail and
@@ -118,7 +137,7 @@ def test_add_subagent_from_dialog(
     expect(dialog).to_be_visible(timeout=15_000)
 
     # Pick the hello_world agent and give the child a unique, assertable name.
-    dialog.locator(f'[data-testid="agent-card-{agent_id}"]').click()
+    _hello_world_card(dialog, base_url, session_id).click()
     child_name = "rail-spawned-sub"
     name_input = dialog.locator(_ADD_AGENT_NAME_INPUT)
     expect(name_input).to_be_visible()
@@ -164,7 +183,6 @@ def test_add_subagent_dialog_prefills_and_overrides_model(
     LLM turn is involved (the dialog is pure catalog + REST plumbing).
     """
     base_url, session_id = seeded_session
-    agent_id = _picker_hello_world_id(base_url, session_id)
     page.goto(f"{base_url}/c/{session_id}")
 
     open_right_rail(page)
@@ -178,8 +196,10 @@ def test_add_subagent_dialog_prefills_and_overrides_model(
     dialog = page.locator(_ADD_AGENT_DIALOG)
     expect(dialog).to_be_visible(timeout=15_000)
 
-    # Pick hello_world — its declared model is gpt-4o-mini.
-    dialog.locator(f'[data-testid="agent-card-{agent_id}"]').click()
+    # Pick hello_world — its declared model is gpt-4o-mini. Both the catalog
+    # row and the session-scoped copy carry it, so the pre-fill assertion
+    # below holds whichever one the picker collapsed to.
+    _hello_world_card(dialog, base_url, session_id).click()
 
     # The Model input is pre-filled with the agent's declared model, not
     # empty — a regression to an empty default would mean the agent's
