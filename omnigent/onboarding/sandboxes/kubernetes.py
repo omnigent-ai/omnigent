@@ -54,7 +54,7 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import click
@@ -475,6 +475,7 @@ def build_pod_manifest(
     repo_branch: str | None = None,
     host_config: dict[str, object] | None = None,
     resources: dict[str, object] | None = None,
+    pvc_mounts: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Pod manifest as a plain dict.
@@ -502,6 +503,9 @@ def build_pod_manifest(
       root filesystem stays writable (the host writes ``/tmp`` + ``~/.omnigent``).
     - ``kubernetes.io/arch: amd64`` is the default; a *node_selector* entry for
       that key overrides it (e.g. ``arm64`` — the host image is multi-arch).
+    - Operator *pvc_mounts* become ``persistentVolumeClaim`` volumes mounted on
+      the **host container only** (read-only unless opted out); the init
+      container sees only HOME, so nothing external is exposed at clone time.
 
     :param pod_name: DNS-label-safe Pod name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Pod is created in.
@@ -530,6 +534,9 @@ def build_pod_manifest(
         the sandbox against the ``envFrom`` harness Secret), so embedding the
         content in the init container's command is as safe as the clone URL.
     :param resources: Configured resources block, or ``None`` for the defaults.
+    :param pvc_mounts: Normalized PVC mounts (``{claim_name, mount_path,
+        read_only}``) added as ``persistentVolumeClaim`` volumes on the host
+        container only, or ``None``.
     :returns: The Pod manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -538,6 +545,23 @@ def build_pod_manifest(
         "capabilities": {"drop": ["ALL"]},
     }
     home_mount = [{"name": "home", "mountPath": _HOME_DIR}]
+    pvc_volumes: list[dict[str, object]] = []
+    pvc_volume_mounts: list[dict[str, object]] = []
+    for i, mount in enumerate(pvc_mounts or ()):
+        # Index-based names sidestep DNS-label collisions between similar claim
+        # names and with the reserved "home" volume.
+        claim_source: dict[str, object] = {"claimName": mount["claim_name"]}
+        volume_mount: dict[str, object] = {
+            "name": f"pvc-{i}",
+            "mountPath": mount["mount_path"],
+        }
+        if mount["read_only"]:
+            # readOnly on the volume source too, so even a future second mount
+            # of the same volume cannot write through it.
+            claim_source["readOnly"] = True
+            volume_mount["readOnly"] = True
+        pvc_volumes.append({"name": f"pvc-{i}", "persistentVolumeClaim": claim_source})
+        pvc_volume_mounts.append(volume_mount)
 
     init_env = [{"name": "HOME", "value": _HOME_DIR}]
     config_home = env_literals.get("OMNIGENT_CONFIG_HOME")
@@ -603,7 +627,7 @@ def build_pod_manifest(
         "env": host_env,
         "resources": pod_resources,
         "securityContext": container_security,
-        "volumeMounts": home_mount,
+        "volumeMounts": [*home_mount, *pvc_volume_mounts],
     }
     if harness_secret:
         host_container["envFrom"] = [{"secretRef": {"name": harness_secret}}]
@@ -624,7 +648,7 @@ def build_pod_manifest(
             "fsGroupChangePolicy": "OnRootMismatch",
             "seccompProfile": {"type": "RuntimeDefault"},
         },
-        "volumes": [{"name": "home", "emptyDir": {}}],
+        "volumes": [{"name": "home", "emptyDir": {}}, *pvc_volumes],
         "initContainers": [init_container],
         "containers": [host_container],
     }
@@ -814,6 +838,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         kubeconfig: str | None = None,
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
+        pvc_mounts: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -838,6 +863,8 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             ``False`` kubeconfig only, ``None`` to try in-cluster then fall back.
         :param resources: ``sandbox.kubernetes.resources`` block, or ``None``
             for the built-in defaults.
+        :param pvc_mounts: Normalized ``sandbox.kubernetes.pvc_mounts`` entries
+            (validated at parse time), or ``None`` for none.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -848,6 +875,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._kubeconfig = kubeconfig
         self._in_cluster = in_cluster
         self._resources = resources
+        self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1143,6 +1171,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     repo_branch=repo_branch,
                     host_config=host_config,
                     resources=self._resources,
+                    pvc_mounts=self._pvc_mounts,
                 )
                 # Secret before Pod so the Pod's secretKeyRef resolves
                 # immediately — a Pod referencing a missing Secret would sit in

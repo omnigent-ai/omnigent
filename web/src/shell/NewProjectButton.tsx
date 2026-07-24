@@ -42,7 +42,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
           <Button
             type="button"
             variant="ghost"
-            size="icon-sm"
+            size="icon-xs"
             aria-label="New project"
             data-testid="new-project"
             onClick={(e) => {

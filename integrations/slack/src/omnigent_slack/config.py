@@ -4,8 +4,18 @@ import os
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ConfigError(Exception):
+    """A configuration problem stated in operator-friendly terms.
+
+    Raised by :func:`load_settings` instead of surfacing a raw pydantic
+    ``ValidationError`` (internal field names + a traceback). The message is
+    safe and useful to print straight to a terminal.
+    """
+
 
 # Auth posture the bot assumes for its Omnigent server. ``auto`` probes the
 # server (the historical behaviour — device grant / OIDC ticket). ``databricks``
@@ -85,9 +95,13 @@ def _local_data_dir() -> Path:
 
 
 class Settings(BaseSettings):
+    # Config is read from real environment variables only — no ``env_file``.
+    # This mirrors ``omni server`` / the core CLI, which load no ``.env``:
+    # whatever populates the environment (shell, ``uv run``, the Docker /
+    # Databricks deploy) is the single source of truth. For local dev, export
+    # the vars or run under a tool that injects them (e.g. ``uv run`` reading a
+    # ``.env``). See integrations/slack/README.
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
     )
@@ -319,5 +333,68 @@ class Settings(BaseSettings):
         return self
 
 
+# Required env vars → a short human label, so a missing-config error can name
+# exactly what to set. Only the fields with no default are truly required.
+_REQUIRED_ENV_VARS: dict[str, str] = {
+    "OMNIGENT_SLACK_BOT_TOKEN": "Slack bot token (xoxb-…)",
+    "OMNIGENT_SLACK_APP_TOKEN": "Slack app-level token (xapp-…)",
+    "OMNIGENT_SERVER_URL": "Omnigent server URL (https://…)",
+}
+
+
 def load_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    """Load settings from the environment, with an operator-friendly error.
+
+    A missing/invalid config raises :class:`ConfigError` carrying a message
+    fit to print directly — naming the missing environment variables and how
+    to set them — instead of a raw pydantic ``ValidationError`` traceback.
+    Config is read from real environment variables only (no ``.env`` loading);
+    see the module docstring / integrations/slack/README.
+    """
+    try:
+        return Settings()  # type: ignore[call-arg]
+    except ValidationError as exc:
+        # Separate the two failure kinds so the message is precise: a required
+        # var not set at all (pydantic "missing") vs. a value that failed a
+        # validator (bad URL, bad auth mode, …).
+        missing: list[str] = []
+        invalid: list[str] = []
+        for err in exc.errors():
+            # The field's env alias is the useful name to show; fall back to
+            # the field name when a loc isn't a known field.
+            field = str(err["loc"][0]) if err["loc"] else ""
+            env_name = _env_alias_for(field)
+            if err["type"] == "missing":
+                missing.append(env_name)
+            else:
+                invalid.append(f"{env_name}: {err['msg']}")
+
+        lines: list[str] = []
+        if missing:
+            lines.append("Missing required configuration. Set these environment variables:")
+            for name in missing:
+                label = _REQUIRED_ENV_VARS.get(name, "")
+                lines.append(f"  • {name}" + (f"  — {label}" if label else ""))
+        if invalid:
+            if lines:
+                lines.append("")
+            lines.append("Invalid configuration:")
+            lines.extend(f"  • {item}" for item in invalid)
+        lines.append(
+            "\nThe bot reads config from the environment (it does NOT load a .env "
+            "file itself). Export the variables, or launch under a tool that "
+            "injects them — e.g. `uv run --env-file .env omni integration slack`. "
+            "See integrations/slack/.env.example for the full set."
+        )
+        raise ConfigError("\n".join(lines)) from exc
+
+
+def _env_alias_for(field_name: str) -> str:
+    """Return the env-var alias for a Settings field (fallback: the field name).
+
+    The friendly error names the environment variable the operator sets (e.g.
+    ``OMNIGENT_SERVER_URL``), not the internal snake_case field (``server_url``).
+    """
+    info = Settings.model_fields.get(field_name)
+    alias = getattr(info, "validation_alias", None) if info is not None else None
+    return alias if isinstance(alias, str) else field_name.upper()

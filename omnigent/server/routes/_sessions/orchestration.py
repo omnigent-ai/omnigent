@@ -3483,14 +3483,27 @@ async def _forward_event_to_runner(
     # harness + model are determined here on the first message where user
     # text is available.  After resolution the sentinel is replaced with
     # the concrete harness so subsequent turns behave normally.
+    # Tracks whether this block ran the router this turn, so the per-turn
+    # routing block below doesn't re-route the same message (which would
+    # double the judge call, emit two cards, and risk a mismatched pick).
+    _auto_resolved_this_turn = False
+    # Auto-harness verdict captured for card emission AFTER the runner forward
+    # and input.consumed (so the live SSE stream delivers the user bubble
+    # before the routing card, matching the per-turn routing path).
+    _auto_card_model: str | None = None
+    _auto_card_verdict: dict[str, Any] | None = None
     if conv.harness_override == "auto" and body.type == "message":
         from omnigent.server.smart_routing import route_session_harness
 
         _auto_text = _extract_user_text_for_routing(body)
         if _auto_text:
-            _auto_harness, _auto_model, _auto_verdict = await route_session_harness(
+            _auto_resolved_this_turn = True
+            # For a forced-auto child, route against the parent's catalog (full
+            # spawnable-worker map) rather than the child's leaf "self" catalog.
+            _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
                 _auto_text,
                 session_id=session_id,
+                catalog_session_id=conv.parent_conversation_id,
                 runner_client=runner_client,
             )
             try:
@@ -3518,13 +3531,14 @@ async def _forward_event_to_runner(
                     session_id,
                     exc_info=True,
                 )
+            # Defer card emission until after input.consumed (see below).
             if _auto_model is not None and _auto_verdict is not None:
-                await _emit_server_routing_decision(
-                    session_id,
-                    conversation_store,
-                    _auto_model,
-                    _auto_verdict,
-                )
+                _auto_card_model = _auto_model
+                _auto_card_verdict = _auto_verdict
+            elif _auto_error is not None:
+                # Routing failed — surface why auto-harness fell back to defaults.
+                _auto_card_model = "unavailable"
+                _auto_card_verdict = {"rationale": _auto_error, "applied": False}
     # ── Server-side intelligent routing ──────────────────────────────
     # When the session toggle is ON and no model has been chosen yet,
     # call the judge LLM on the FIRST message to pick the model for
@@ -3545,6 +3559,7 @@ async def _forward_event_to_runner(
         conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
     ) or _parent_routing_on
     _routed_model: str | None = None
+    _routed_harness: str | None = None
     _verdict: dict[str, Any] | None = None
     # For child sessions, route even when the orchestrator specified a model via
     # sys_session_send (effective_runner_override is already set). Smart routing
@@ -3552,44 +3567,88 @@ async def _forward_event_to_runner(
     _should_route = (
         _routing_enabled
         and body.type == "message"
+        # The auto-harness block above already routed this turn (harness +
+        # model) — don't re-run the router for the same message.
+        and not _auto_resolved_this_turn
         and (effective_runner_override is None or conv.parent_conversation_id is not None)
     )
     if _should_route:
-        from omnigent.server.smart_routing import route_turn
-
-        _harness = _resolve_harness(conv)
         _user_text = _extract_user_text_for_routing(body)
         if _user_text:
-            _routed_model, _verdict = await route_turn(
-                _harness,
-                _user_text,
-                session_id=session_id,
-                runner_client=runner_client,
-            )
-            if _routed_model is not None:
-                effective_runner_override = _routed_model
-                # Persist as the session's model_override so all
-                # subsequent turns use this model automatically.
+            if _parent_routing_on:
+                # Child sessions: use route_session_harness to pick both harness
+                # and model, overriding whatever the orchestrator specified in
+                # sys_session_send.
+                from omnigent.server.smart_routing import route_session_harness
+
+                # Route against the PARENT's catalog: it enumerates the
+                # spawnable workers (claude_code/codex/pi) with full model
+                # lists, whereas this child's own leaf catalog is "self"-only
+                # and would force the static fallback (a smaller/different set).
+                _routed_harness, _routed_model, _verdict, _route_err = await route_session_harness(
+                    _user_text,
+                    session_id=session_id,
+                    catalog_session_id=conv.parent_conversation_id,
+                    runner_client=runner_client,
+                )
+                if _routed_model is not None:
+                    effective_runner_override = _routed_model
                 try:
-                    await asyncio.to_thread(
-                        conversation_store.update_conversation,
-                        session_id,
-                        model_override=_routed_model,
-                    )
+                    _child_updates: dict[str, Any] = {}
+                    if _routed_model is not None:
+                        _child_updates["model_override"] = _routed_model
+                    if _routed_harness is not None:
+                        _child_updates["harness_override"] = _routed_harness
+                    if _child_updates:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            **_child_updates,
+                        )
                 except (OSError, ValueError):
                     _logger.warning(
-                        "smart_routing: failed to persist model_override "
-                        "for session=%s; turn still uses routed model",
+                        "smart_routing: failed to persist harness/model for child session=%s",
                         session_id,
                         exc_info=True,
                     )
+            else:
+                # Top-level sessions: model-only routing (harness already fixed by spec).
+                from omnigent.server.smart_routing import route_turn
+
+                _harness = _resolve_harness(conv)
+                _routed_model, _verdict = await route_turn(
+                    _harness,
+                    _user_text,
+                    session_id=session_id,
+                    runner_client=runner_client,
+                )
+                if _routed_model is not None:
+                    effective_runner_override = _routed_model
+                    # Persist as the session's model_override so all
+                    # subsequent turns use this model automatically.
+                    try:
+                        await asyncio.to_thread(
+                            conversation_store.update_conversation,
+                            session_id,
+                            model_override=_routed_model,
+                        )
+                    except (OSError, ValueError):
+                        _logger.warning(
+                            "smart_routing: failed to persist model_override "
+                            "for session=%s; turn still uses routed model",
+                            session_id,
+                            exc_info=True,
+                        )
     # ────────────────────────────────────────────────────────────────
     if effective_runner_override is not None:
         runner_body["model_override"] = effective_runner_override
     # Per-session brain-harness override — create-time only, so no
     # per-event value exists; the persisted column is the source.
-    if conv.harness_override is not None and conv.harness_override != "auto":
-        runner_body["harness_override"] = conv.harness_override
+    # _routed_harness is non-None when the child routing path resolved one
+    # this turn (conv is not refreshed, so we use the in-flight value).
+    _effective_harness = _routed_harness or conv.harness_override
+    if _effective_harness is not None and _effective_harness != "auto":
+        runner_body["harness_override"] = _effective_harness
 
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
@@ -3606,6 +3665,23 @@ async def _forward_event_to_runner(
         # Emit the routing_decision chip AFTER input.consumed so the
         # live SSE stream delivers the user bubble before the chip —
         # matching the store order (user message was persisted first).
+        # Auto-harness card (success or failure) emitted here for the same
+        # ordering reason; it was resolved earlier in the turn.
+        if _auto_card_model is not None and _auto_card_verdict is not None:
+            await _emit_server_routing_decision(
+                session_id,
+                conversation_store,
+                _auto_card_model,
+                _auto_card_verdict,
+            )
+            if conv.parent_conversation_id is not None:
+                await _emit_server_routing_decision(
+                    conv.parent_conversation_id,
+                    conversation_store,
+                    _auto_card_model,
+                    _auto_card_verdict,
+                    agent=agent_name or "",
+                )
         if _routed_model is not None and _verdict is not None:
             await _emit_server_routing_decision(
                 session_id,
@@ -5084,14 +5160,39 @@ async def _create_session_from_existing_agent(
         body.cost_control_mode_override
     )
 
+    # When the parent session has smart routing on, a sub-agent created via
+    # sys_session_send is routed regardless of the harness/model the
+    # orchestrator chose: force the "auto" sentinel so the first-message
+    # routing path picks both harness and model, ignoring the tool's
+    # ``agent``/``model`` args. Only applied to omnigent-executor agents
+    # (auto requires a swappable brain harness).
+    _force_auto_for_child = False
+    if body.parent_session_id is not None:
+        _parent_for_routing = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
+        if (
+            _parent_for_routing is not None
+            and _parent_for_routing.cost_control_mode_override == "on"
+        ):
+            try:
+                await asyncio.to_thread(_validated_harness_override_executor_type, agent)
+                _force_auto_for_child = True
+            except OmnigentError:
+                # Non-omnigent agent (e.g. a native wrapper) — can't route
+                # harness; leave the orchestrator's choice untouched.
+                _force_auto_for_child = False
+
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's
     # --harness fail-loud rules.
     # "auto" defers harness + model selection to the first-message routing
     # path; validate executor type now but store the sentinel unchanged.
-    if body.harness_override == "auto":
+    if _force_auto_for_child or body.harness_override == "auto":
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
+        # Ignore any orchestrator-supplied model; routing picks it.
+        model_override = None
     else:
         harness_override = await asyncio.to_thread(
             _validated_harness_override, body.harness_override, agent
@@ -5293,11 +5394,15 @@ async def _create_session_from_existing_agent(
     elif (
         body.sub_agent_name
         and sub_spec is not None
+        and not _force_auto_for_child
         and (_sa_labels := _native_subagent_wrapper_labels_from_spec(sub_spec))
     ):
         # A native-harness sub-agent (claude-native / codex-native) must
         # render terminal-first with the Chat/Terminal pill, same as a
         # top-level wrapper session. Merge over any caller-supplied labels.
+        # Skipped when forcing auto: the harness is not decided until the
+        # first-message router runs, so native terminal labels would be
+        # premature (routing may pick a non-native SDK harness).
         _merged = dict(body.labels) if body.labels else {}
         _merged.update(_sa_labels)
         await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)

@@ -138,24 +138,18 @@ def _build_external_routing_client(
     from omnigent.server.smart_routing import _bearer_auth
 
     # Auth precedence mirrors the ``llm:`` block: an explicit (provider-
-    # agnostic) api_key wins, else the Databricks ``profile`` convenience,
-    # else unauthenticated.
+    # agnostic) api_key wins (static bearer), else the Databricks ``profile``
+    # is passed through so the client mints a fresh bearer per call (OAuth
+    # refresh — a token captured once here would 401 after ~1h), else
+    # unauthenticated.
     auth = None
+    databricks_profile: str | None = None
     if api_key:
         from omnigent.spec import expand_env_vars
 
         auth = _bearer_auth(expand_env_vars({"api_key": api_key})["api_key"])
     elif profile:
-        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
-        try:
-            creds = resolve_databricks_workspace(profile)
-            auth = _bearer_auth(creds.token)
-        except OSError:
-            click.echo(
-                f"routing.profile={profile} could not be resolved; calling router unauthenticated",
-                err=True,
-            )
+        databricks_profile = profile
 
     from omnigent.server.smart_routing import ExternalRoutingClient
 
@@ -163,6 +157,7 @@ def _build_external_routing_client(
         base_url=base_url,
         router_name=router_name,
         auth=auth,
+        databricks_profile=databricks_profile,
         model_prefixes=model_prefixes,
     )
 
@@ -1483,6 +1478,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "uninstall",
         "update",
         "upgrade",
+        "usage",
         "version",
     }
 )
@@ -4972,6 +4968,163 @@ def import_session_command(
             raise click.ClickException(f"{failed_count} session(s) failed to import")
 
 
+def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[explicit-any]
+    """
+    Print the usage report: a daily-rollup cost summary plus per-session detail.
+
+    Styling routes through :mod:`omnigent.inner.ui` — the CLI palette SOT —
+    so headers/borders use the brand semantic tokens (``omni.accent`` /
+    ``omni.muted``) and adapt to light / dark terminals (no hard-coded colors).
+
+    The per-session block mirrors the web session sidebar: an authoritative
+    session total, then each model's recorded cost indented beneath. The
+    per-model costs are shown faithfully and may not sum to the session total
+    (native harnesses report one cumulative figure attributed to the active
+    model — see :class:`omnigent.server.schemas.SessionUsage`).
+
+    :param report: The decoded ``GET /v1/usage`` JSON body.
+    :param limit: Maximum number of sessions to show.
+    """
+    from rich.markup import escape
+    from rich.style import Style
+    from rich.text import Text
+
+    from omnigent.inner import ui
+
+    # rich resolves a theme token combined with an attribute only via a Style
+    # object or inline single-token markup, not a "bold omni.accent" style
+    # string — so build the accent header style explicitly.
+    accent_bold = ui.console.get_style("omni.accent") + Style(bold=True)
+
+    def money(value: float) -> str:
+        return f"${value:,.2f}"
+
+    ui.console.print()
+    ui.console.print(
+        "[omni.muted]Costs are best-effort estimates; consult your provider for "
+        "actual billing.[/omni.muted]"
+    )
+    ui.console.print()
+    ui.console.print(Text("Summary", style=accent_bold))
+    ui.kv("  Today", money(report.get("cost_today", 0.0)), label_width=15)
+    ui.kv("  Last 7 days", money(report.get("cost_last_7d", 0.0)), label_width=15)
+    ui.kv("  Last 30 days", money(report.get("cost_last_30d", 0.0)), label_width=15)
+    ui.kv("  All time", money(report.get("total_cost_usd", 0.0)), label_width=15)
+    ui.console.print()
+
+    all_sessions = report.get("sessions", [])
+    shown = all_sessions[:limit]
+    # Empty base Text so the muted count hint doesn't inherit the accent.
+    header = Text()
+    header.append("Per session", style=accent_bold)
+    header.append(f" (last {len(shown)})", style="omni.muted")
+    ui.console.print(header)
+    if not all_sessions:
+        ui.console.print("  [omni.muted]No usage recorded yet.[/omni.muted]")
+        return
+
+    # Three columns: Session ID · Model · Cost. A single-model session fits on
+    # one line; a multi-model session leaves the Model column blank on the
+    # session line (id + bold authoritative total) and lists each model on its
+    # own row beneath, cost muted to mark it as breakdown detail. The border
+    # uses the shared muted token so it adapts to light / dark.
+    tbl = Table(
+        box=box.SIMPLE_HEAVY,
+        show_edge=False,
+        header_style="bold",
+        border_style="omni.muted",
+    )
+    tbl.add_column("Session ID", style="omni.muted", no_wrap=True)
+    tbl.add_column("Model", no_wrap=True)
+    tbl.add_column("Cost", justify="right", no_wrap=True)
+    for s in shown:
+        sid = escape(str(s.get("id", "")))
+        total = f"[bold]{money(s.get('cost_usd', 0.0))}[/bold]"
+        # Dominant model first, so the biggest spend leads (cost desc).
+        models = sorted((s.get("models") or {}).items(), key=lambda kv: kv[1], reverse=True)
+        if len(models) <= 1:
+            model_cell = escape(str(models[0][0])) if models else "[omni.muted]—[/omni.muted]"
+            tbl.add_row(sid, model_cell, total)
+        else:
+            tbl.add_row(sid, "", total)
+            for name, cost in models:
+                tbl.add_row(
+                    "",
+                    escape(str(name)),
+                    f"[omni.muted]{money(float(cost))}[/omni.muted]",
+                )
+    ui.console.print(tbl)
+
+
+@cli.command("usage")
+@click.option(
+    "--limit",
+    default=10,
+    show_default=True,
+    help="Number of most-recent sessions to show in the per-session table.",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the raw usage report as JSON instead of the table.",
+)
+def usage(limit: int, server: str | None, as_json: bool) -> None:
+    """Show your Omnigent LLM cost for today / the last 7 / 30 days.
+
+    The summary is sourced from the per-user daily cost rollup, which
+    attributes spend to the UTC calendar day it occurred on — so the
+    windows reflect when spend actually happened, not just a session's
+    last-activity time. Below it, the most-recent sessions are listed with
+    each session's total and its per-model cost breakdown.
+
+    \b
+    Per-model costs are shown as recorded and may not sum to the session
+    total: native harnesses report one cumulative session figure attributed
+    to the active model, so a session that switched models mid-run shows a
+    snapshot per model rather than each model's own spend (the same
+    convention as the web session sidebar).
+
+    \b
+    Examples:
+      omnigent usage
+      omnigent usage --limit 25
+      omnigent usage --json
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        startup = ensure_local_omnigent_server()
+        base_url = startup.url
+    base_url = base_url.rstrip("/")
+
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=60.0
+    ) as client:
+        resp = client.get("/v1/usage")
+        resp.raise_for_status()
+        report = resp.json()
+
+    if as_json:
+        click.echo(json.dumps(report, indent=2))
+        return
+
+    _render_usage(report, limit)
+
+
 @cli.group("session", invoke_without_command=True)
 @click.pass_context
 def session(ctx: click.Context) -> None:
@@ -5076,6 +5229,227 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 after = page.get("last_id")
 
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
+
+
+# Fields on an exported item that belong to the store/envelope, not the typed
+# ``data`` payload — dropped before rebuilding the item for re-append.
+_IMPORT_ITEM_ENVELOPE_FIELDS = frozenset(
+    {"record_type", "id", "type", "status", "response_id", "created_by"}
+)
+
+
+def _import_agent_aliased_types() -> frozenset[str]:
+    """
+    Return the item types whose ``agent`` field serializes as ``model``.
+
+    ``to_api_dict`` renders items with ``by_alias=True``, so a data model with
+    ``agent: ... = Field(serialization_alias="model")`` exports ``agent`` as
+    ``model``. On import that must be reversed — but ONLY for those types.
+    Other types (``compaction``, ``routing_decision``) carry a genuine ``model``
+    field that must be left alone; ``routing_decision`` even has both ``model``
+    and ``agent``. Derive the set from the field definitions so it can't drift
+    if aliases are added or removed.
+
+    :returns: Item-type strings whose ``model`` export must map back to
+        ``agent`` on import, e.g. ``{"message", "function_call", ...}``.
+    """
+    from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
+
+    aliased: set[str] = set()
+    for item_type, cls in ITEM_TYPE_TO_DATA_CLS.items():
+        field = cls.model_fields.get("agent")
+        if field is not None and field.serialization_alias == "model":
+            aliased.add(item_type)
+    return frozenset(aliased)
+
+
+def _import_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+    """
+    Rebuild one exported item into a ``{"type", "data"}`` create payload.
+
+    Strips envelope fields the server reassigns, reverses the ``agent``→
+    ``model`` serialization alias (only for the types that carry it), and
+    validates the result with :func:`parse_item_data` so a malformed item
+    fails loud client-side before the create request.
+
+    :param item: One ``record_type == "item"`` object from an export JSONL.
+    :returns: A ``SessionEventInput``-shaped dict for ``initial_items``.
+    :raises click.ClickException: If the item has no ``type`` or its payload
+        does not validate for that type.
+    """
+    from omnigent.entities.conversation import parse_item_data
+
+    item_type = item.get("type")
+    if not isinstance(item_type, str) or not item_type:
+        raise click.ClickException(f"Export item is missing a 'type': {item!r}")
+    raw = {key: value for key, value in item.items() if key not in _IMPORT_ITEM_ENVELOPE_FIELDS}
+    # Reverse the agent→model alias only for types that actually use it, so a
+    # genuine ``model`` field on other types (compaction, routing_decision) is
+    # preserved rather than corrupted.
+    if item_type in _import_agent_aliased_types() and "model" in raw:
+        raw["agent"] = raw.pop("model")
+    try:
+        parse_item_data(item_type, raw)
+    except (TypeError, ValueError) as exc:
+        raise click.ClickException(
+            f"Export contains an invalid {item_type!r} item: {exc}"
+        ) from exc
+    return {"type": item_type, "data": raw}
+
+
+@session.command("import")
+@click.option(
+    "--input",
+    "-i",
+    "input_path",
+    required=True,
+    metavar="FILE",
+    help="Path to a JSONL file produced by 'omnigent session export'.",
+)
+@click.option(
+    "--title",
+    default=None,
+    help="Override the imported session title (defaults to the exported title).",
+)
+@click.option(
+    "--server",
+    default=None,
+    help=(
+        "Omnigent server URL. "
+        "Defaults to the configured server, or a local server already running."
+    ),
+)
+def session_import(input_path: str, title: str | None, server: str | None) -> None:
+    """Import a session transcript from a portable JSONL file.
+
+    The inverse of ``omnigent session export``: reads the ``session_meta`` +
+    ``item`` lines and recreates the conversation on the target server as a new
+    session (a fresh conversation id each time). Distinct from ``omnigent
+    import``, which reads native harness history rather than an export file.
+
+    The session is created as history-only (no runner is launched); open it in
+    the UI or resume it to continue. Note: per-turn ``response_id`` grouping is
+    not preserved — replayed items are seeded under a single response id — and
+    item authorship is re-attributed to the importing user (original
+    ``created_by`` is not carried over).
+
+    \b
+    Examples:
+      omnigent session import -i my_session.jsonl
+      omnigent session import -i my_session.jsonl --title "Repro of ES-2065116"
+      omnigent session import -i my_session.jsonl --server https://myserver.com
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.native_coding_agents import native_coding_agent_for_harness
+
+    src_path = Path(input_path)
+    if not src_path.is_file():
+        raise click.ClickException(f"Import file not found: {input_path}")
+
+    meta: dict[str, Any] | None = None
+    items: list[dict[str, Any]] = []
+    with src_path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError as exc:
+                raise click.ClickException(
+                    f"{input_path}:{line_no}: not valid JSON ({exc})."
+                ) from exc
+            kind = record.get("record_type")
+            if kind == "session_meta":
+                meta = record
+            elif kind == "item":
+                items.append(record)
+            # Unknown record_type lines are ignored for forward compatibility.
+
+    if meta is None:
+        raise click.ClickException(
+            f"{input_path}: no 'session_meta' line found — is this a session export?"
+        )
+    if not items:
+        raise click.ClickException(f"{input_path}: no 'item' lines to import.")
+
+    initial_items = [_import_item_payload(item) for item in items]
+
+    # Agent binding: reuse the exported agent_id when it exists on the target
+    # server; otherwise fall back to the built-in native agent for the export's
+    # harness (mirrors the /v1/imports fallback).
+    exported_agent_id = meta.get("agent_id")
+    harness = meta.get("harness") or meta.get("harness_override")
+    fallback_agent_id: str | None = None
+    native_agent = native_coding_agent_for_harness(harness)
+    if native_agent is not None:
+        fallback_agent_id = builtin_agent_id(native_agent.agent_name)
+
+    cfg = _load_effective_config()
+    base_url = _resolve_attach_server(server, cfg.get("server"))
+    if base_url is None:
+        base_url = ensure_local_omnigent_server().url
+    base_url = base_url.rstrip("/")
+
+    resolved_title = title if title is not None else meta.get("title")
+
+    def _create(agent_id: str, client: httpx.Client) -> httpx.Response:
+        body: dict[str, Any] = {
+            "agent_id": agent_id,
+            "initial_items": initial_items,
+            # Explicitly external with no host_id so the server seeds
+            # initial_items as history-only and launches no runner.
+            "host_type": "external",
+        }
+        if resolved_title:
+            body["title"] = resolved_title
+        for key in (
+            "workspace",
+            "harness_override",
+            "model_override",
+            "reasoning_effort",
+            "cost_control_mode_override",
+            "terminal_launch_args",
+        ):
+            value = meta.get(key)
+            if value is not None:
+                body[key] = value
+        return client.post("/v1/sessions", json=body)
+
+    with httpx.Client(
+        base_url=base_url, headers=_remote_headers(server_url=base_url), timeout=120.0
+    ) as client:
+        candidates = [a for a in (exported_agent_id, fallback_agent_id) if a]
+        if not candidates:
+            raise click.ClickException(
+                "Could not resolve an agent to bind: the export has no agent_id "
+                f"and harness {harness!r} has no built-in native agent. "
+                "Register the agent on the target server, then retry."
+            )
+        resp: httpx.Response | None = None
+        for idx, agent_id in enumerate(candidates):
+            resp = _create(agent_id, client)
+            if resp.status_code == 404 and idx + 1 < len(candidates):
+                # Exported agent absent on this server — try the native fallback.
+                continue
+            break
+        assert resp is not None
+        if resp.status_code == 404:
+            raise click.ClickException(
+                f"Agent not found on server for import (tried {candidates}). "
+                "Register the agent on the target server, then retry."
+            )
+        if resp.status_code >= 400:
+            raise click.ClickException(
+                f"Failed to import session ({resp.status_code}): {resp.text[:500]}"
+            )
+        created = resp.json()
+
+    new_id = created.get("id") or created.get("session_id")
+    click.echo(f"Imported {len(initial_items)} item(s) into {new_id}")
 
 
 # Shared option help for ``run`` and the harness commands. These are the same
@@ -7682,29 +8056,6 @@ def _slack_argv() -> list[str]:
     return [sys.executable, "-m", _SLACK_PACKAGE]
 
 
-def _slack_cwd() -> Path | None:
-    """Directory to run the Slack bot from, so its ``.env`` resolves.
-
-    The bot's ``Settings`` loads a CWD-relative ``.env``; a background daemon
-    otherwise inherits whatever directory ``omni`` was launched from and
-    silently misses config. For a source/editable install the package lives at
-    ``<integration>/src/omnigent_slack``, so the integration dir (holding the
-    ``.env``) is three parents up. Returns that dir only when it actually holds
-    a ``.env``; otherwise ``None`` (a wheel install has no such dir — config
-    then comes from real environment variables).
-    """
-    import importlib.util
-
-    spec = importlib.util.find_spec(_SLACK_PACKAGE)
-    if spec is None or not spec.origin:
-        return None
-    origin = Path(spec.origin)
-    if len(origin.parents) < 3:
-        return None
-    integration_dir = origin.parents[2]
-    return integration_dir if (integration_dir / ".env").is_file() else None
-
-
 def _integration_state_dir() -> Path:
     """Runtime dir for integration daemon records (honors OMNIGENT_DATA_DIR)."""
     from omnigent.host.local_server import _local_data_dir
@@ -7726,33 +8077,59 @@ def integration(ctx: click.Context) -> None:
       slack   The @omnigent Slack socket-mode bot.
 
     Run ``omni integration slack`` to start the Slack bot in the foreground,
-    or ``omni integration slack start`` to run it in the background.
+    or ``omni integration slack --background`` to run it in the background.
     """
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
 
 @integration.group("slack", invoke_without_command=True)
+@click.option(
+    "--background",
+    "background",
+    is_flag=True,
+    default=False,
+    help=(
+        "Spawn the Slack bot as a detached background daemon (returning "
+        "immediately) instead of running it in the foreground. Reuses a "
+        "healthy background daemon if one is already up."
+    ),
+)
 @click.pass_context
-def slack(ctx: click.Context) -> None:
-    """Run the @omnigent Slack socket-mode bot (foreground).
+def slack(ctx: click.Context, background: bool) -> None:
+    """Run the @omnigent Slack socket-mode bot.
 
     \b
     Bare invocation runs in the FOREGROUND (Ctrl-C to stop):
       omni integration slack
-    Manage a BACKGROUND daemon with the subcommands:
-      omni integration slack start    # spawn detached, return immediately
+    Pass --background to spawn it as a detached daemon instead:
+      omni integration slack --background   # spawn detached, return immediately
+    Manage that background daemon with the subcommands:
       omni integration slack status   # is it running?
       omni integration slack stop     # terminate the daemon
       omni integration slack logs     # where the daemon logs (-f to tail)
 
-    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from the environment
-    and the integration's .env file — see integrations/slack/.env.example.
+    Config (Slack tokens, OMNIGENT_SERVER_URL, …) comes from environment
+    variables — the bot does not read a .env file itself (matching
+    ``omni server``). Export them, or launch under a tool that injects a .env
+    (e.g. ``uv run --env-file .env``). See integrations/slack/.env.example for
+    the full set; a missing required var prints a friendly error and exits.
+
+    :param background: When True, spawn the detached background daemon (the
+        former ``slack start`` behavior) instead of running in the foreground.
     """
     if ctx.invoked_subcommand is not None:
+        # A subcommand (stop/status/logs) handles this invocation.
         return
     if not _slack_installed():
         raise click.ClickException(_SLACK_INSTALL_HINT)
+
+    if background:
+        # `omni integration slack --background` replaces the removed `start`
+        # subcommand: spawn (or reuse) the detached daemon and return.
+        _start_slack_background()
+        return
+
     # A background daemon already holds the Slack socket; a second foreground
     # bot would contend on the same connection. Refuse rather than double-run.
     existing = _slack_daemon().running_record()
@@ -7762,24 +8139,28 @@ def slack(ctx: click.Context) -> None:
             "Stop it first with `omni integration slack stop`, or view it with "
             "`omni integration slack status`."
         )
-    # Foreground: inherit stdio, block until the bot exits (Ctrl-C).
+    # Foreground: inherit stdio, block until the bot exits (Ctrl-C). Config
+    # comes from the inherited environment only (no .env loading — matches
+    # `omni server`), so the child inherits our cwd; nothing to special-case.
     click.echo("Starting the Omnigent Slack bot (foreground). Press Ctrl-C to stop.")
-    result = subprocess.run(_slack_argv(), env=os.environ.copy(), cwd=_slack_cwd(), check=False)
+    result = subprocess.run(_slack_argv(), env=os.environ.copy(), check=False)
     raise SystemExit(result.returncode)
 
 
-@slack.command("start")
-def slack_start() -> None:
-    """Start the Slack bot as a background daemon."""
-    if not _slack_installed():
-        raise click.ClickException(_SLACK_INSTALL_HINT)
+def _start_slack_background() -> None:
+    """Spawn (or reuse) the detached background Slack daemon and report it.
+
+    The background counterpart to the foreground bare ``omni integration
+    slack``, invoked by the ``--background`` flag (the former ``start``
+    subcommand).
+    """
     daemon = _slack_daemon()
     existing = daemon.running_record()
     if existing is not None:
         click.echo(f"Slack bot already running (pid {existing.pid}).")
         click.echo(f"Logs: {_display_path(Path(existing.log_path))}")
         return
-    record = daemon.start(_slack_argv(), os.environ.copy(), cwd=_slack_cwd())
+    record = daemon.start(_slack_argv(), os.environ.copy())
     # A detached daemon that dies on startup (missing tokens, bad server URL)
     # leaves nothing on the terminal — confirm it survives a short grace and
     # surface the log tail if it didn't, instead of falsely reporting success.
@@ -8619,6 +9000,89 @@ def _workspace_api_server_url(server: str) -> str:
     return server
 
 
+def _canonical_azure_databricks_url(server: str) -> str | None:
+    """Build the canonical ``adb-`` host for an Azure custom-URL workspace.
+
+    Azure workspaces can front a custom (vanity) URL such as
+    ``https://mydomain.azuredatabricks.net``, but that edge 303-redirects an
+    unauthenticated request to ``/login`` instead of answering the probe, so the
+    login/host flow can't detect the Databricks posture. The canonical
+    host does answer, and the ``?o=<workspace_id>`` selector already carries the
+    id needed to build it.
+
+    The ``{workspace_id % 20}`` shard is an observed regularity, not a documented
+    contract: Microsoft calls the segment a random number and treats
+    ``properties.workspaceUrl`` from the ARM API as authoritative. It held on
+    every real workspace we could measure (170 live hosts, and probing all 20
+    shards on 6 of them answers only at the mod-20 value), but callers must probe
+    the result before adopting it rather than trust the arithmetic.
+
+    :param server: A scheme-bearing server URL, e.g.
+        ``"https://mydomain.azuredatabricks.net/?o=123"``.
+    :returns: The URL with the canonical Azure host, or ``None`` when *server* is
+        not a vanity Azure workspace URL carrying a numeric selector (AWS/GCP
+        hosts, already-canonical URLs, a missing or malformed selector).
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(server)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname.endswith(".azuredatabricks.net") or hostname.startswith("adb-"):
+        return None
+    org_id = _org_id_from_url(server)
+    # ASCII-only: str.isdecimal() also accepts non-ASCII digits (e.g. Arabic-Indic
+    # "٣") that int() parses too, which would synthesize a nonsensical host.
+    if org_id is None or not (org_id.isascii() and org_id.isdecimal()):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None  # malformed port: leave the URL for the probe to reject
+    canonical_host = f"adb-{org_id}.{int(org_id) % 20}.azuredatabricks.net"
+    netloc = f"{canonical_host}:{port}" if port else canonical_host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _probe_root(server: str) -> str:
+    """Reduce a URL to the root ``_workspace_api_server_url`` actually probes.
+
+    That function drops the query/fragment before probing (a query-bearing base
+    would push the appended path into the query, ``…/?o=123/v1/me``), so anything
+    comparing against its result — or probing alongside it — has to reduce the
+    same way.
+
+    :param server: A scheme-bearing server URL.
+    :returns: *server* without its query or fragment and without a trailing slash.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(server.rstrip("/"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")).rstrip("/")
+
+
+def _databricks_root_is_usable(server: str) -> bool:
+    """Report whether *server* answers a probe we know how to talk to.
+
+    Mirrors the two acceptance conditions ``_workspace_api_server_url`` applies to
+    its own root probe, so the two agree on what "this URL works" means.
+
+    :param server: A scheme-bearing server URL; its query/fragment is dropped
+        before probing, as ``_workspace_api_server_url`` does.
+    :returns: True when the host answers as an omnigent server or a recognized
+        Databricks login target.
+    """
+    import httpx as _httpx
+
+    root = _probe_root(server)
+    try:
+        probe = _httpx.get(f"{root}/v1/me", timeout=10.0)
+    except _httpx.HTTPError:
+        return False
+    if probe.status_code == 200:
+        return True
+    return _databricks_workspace_login_target(root, probe) is not None
+
+
 def _resolve_server_url(server: str) -> str:
     """
     Normalize a user-supplied ``--server`` value to the Omnigent API base.
@@ -8630,12 +9094,38 @@ def _resolve_server_url(server: str) -> str:
     web-UI URL the internal user guide hands out — to the
     ``/api/2.0/omnigent`` mount.
 
+    The URL is always tried as the user gave it first. Only when that fails
+    to resolve, and only for an Azure custom (vanity) workspace URL, is the
+    canonical ``adb-`` host synthesized — and it is probed before
+    being adopted, so a wrong guess falls back to the user's URL instead of
+    stranding them on a host they never typed.
+
     :param server: A non-empty ``--server`` value, e.g.
         ``"example.cloud.databricks.com/omnigent"``.
     :returns: The normalized API base URL without a trailing slash, e.g.
         ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
     """
-    return _workspace_api_server_url(_with_default_scheme(server.rstrip("/")))
+    from omnigent.conversation_browser import display_server_url
+
+    normalized = _with_default_scheme(server.rstrip("/"))
+    expanded = _workspace_api_server_url(normalized)
+    candidate = _canonical_azure_databricks_url(normalized)
+    if candidate is None:
+        return expanded  # not a vanity Azure workspace URL
+    # A URL "resolved" if the expansion adopted a mount for it, or if the root
+    # answers on its own. Compare against the root the expansion probed, not the
+    # raw input: it drops the ?o= selector first, and that selector is what makes
+    # a URL a candidate here, so comparing raw would always look like an adoption.
+    if expanded != _probe_root(normalized) or _databricks_root_is_usable(normalized):
+        return expanded
+    canonical = _workspace_api_server_url(candidate)
+    if canonical == _probe_root(candidate) and not _databricks_root_is_usable(candidate):
+        return expanded  # the canonical host is no better; keep what the user typed
+    click.echo(
+        f"Note: {display_server_url(normalized)} did not answer as a workspace; "
+        f"using its canonical host {display_server_url(canonical)}."
+    )
+    return canonical
 
 
 def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> str | None:

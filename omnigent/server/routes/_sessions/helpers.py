@@ -5384,9 +5384,10 @@ async def _emit_server_routing_decision(
     import uuid
 
     rationale = verdict.get("rationale", "")
+    applied = verdict.get("applied", True)
     item_data: dict[str, Any] = {
         "model": model,
-        "applied": True,
+        "applied": bool(applied),
         "rationale": rationale if isinstance(rationale, str) else "",
     }
     if agent is not None:

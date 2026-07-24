@@ -852,8 +852,12 @@ def login_waiting_modal(server_url: str, verification_url: str, user_code: str) 
     # the link and approves in their browser; the modal then advances itself
     # to the agent/host picker via views_update — no DM, no re-running the
     # command. No submit button: this screen just waits.
-    # Device-grant flows show a short user_code to match on the consent page;
-    # the OIDC ticket flow has none (the IdP page needs no code).
+    #
+    # The link is one-click (code prefilled). Device-grant flows still show the
+    # short user_code so the user can confirm it matches the consent page; the
+    # anti-phishing guarantee is the consent page's forced password re-auth
+    # (see designs/DEVICE_AUTH.md), not code entry. The OIDC ticket flow has no
+    # code (the IdP page needs none).
     code_hint = f" (code `{user_code}`)" if user_code else ""
     return {
         "type": "modal",

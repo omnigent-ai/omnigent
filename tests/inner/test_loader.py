@@ -69,6 +69,43 @@ class TestLoadFromDict(unittest.TestCase):
         a = load_agent_def({"name": "t", "executor": {"model": "claude-sonnet-4"}})
         self.assertEqual(a.executor.model, "claude-sonnet-4")
 
+    def test_executor_bundle_nesting_rejected(self):
+        # The bundle config.yaml shape inside a single-file agent used to be
+        # silently dropped, replacing the declared harness with one inferred
+        # from the model prefix.
+        with self.assertRaisesRegex(ValueError, r"config, type.*spells the executor flat"):
+            load_agent_def(
+                {
+                    "name": "t",
+                    "executor": {
+                        "type": "omnigent",
+                        "config": {"harness": "codex-native"},
+                        "model": "databricks-gpt-5-4-mini",
+                    },
+                }
+            )
+
+    def test_executor_extra_keys_tolerated(self):
+        # The compat loader reads raw executor keys this parser doesn't
+        # model (use_responses, extra, …); they must not fail the load.
+        a = load_agent_def({"name": "t", "executor": {"model": "gpt-5", "use_responses": False}})
+        self.assertEqual(a.executor.model, "gpt-5")
+
+    def test_tools_agent_executor_bundle_nesting_rejected(self):
+        with self.assertRaisesRegex(ValueError, r"key\(s\) config belong to the bundle"):
+            load_agent_def(
+                {
+                    "name": "t",
+                    "tools": {
+                        "h": {
+                            "type": "agent",
+                            "prompt": "Help.",
+                            "executor": {"config": {"harness": "codex-native"}},
+                        }
+                    },
+                }
+            )
+
     def test_tools_function(self):
         a = load_agent_def(
             {"name": "t", "tools": {"f": {"type": "function", "catalog_path": "a.b.c"}}}

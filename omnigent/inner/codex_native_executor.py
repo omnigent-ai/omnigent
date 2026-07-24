@@ -31,7 +31,11 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment, parse_data_uri
+from omnigent.inner.native_attachments import (
+    materialize_attachment,
+    parse_data_uri,
+    unresolved_attachment_marker,
+)
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 
 _logger = logging.getLogger(__name__)
@@ -428,6 +432,8 @@ def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, An
                 path = materialize_attachment(block, bridge_dir)
                 if path is not None:
                     items.append({"type": "localImage", "path": str(path)})
+                else:
+                    items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
@@ -452,8 +458,9 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Bridge directory for materializing the file.
-    :returns: A Codex ``text`` input item, or ``None`` when the file
-        could not be decoded or materialized.
+    :returns: A Codex ``text`` input item; a visible could-not-load
+        marker item when the file failed to materialize; or ``None``
+        for an empty text file.
     """
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
@@ -471,4 +478,4 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         # matching _ATTACHMENT_MARKER_RE in
         # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
-    return None
+    return {"type": "text", "text": unresolved_attachment_marker(block)}
