@@ -6986,6 +6986,41 @@
       }
     },
     "/v1/hosts/{host_id}": {
+      "delete": {
+        "description": "Deregister (delete) a host the caller owns.\n\nRemoves a retired self-registered host so it stops appearing in\nsession-creation pickers forever. Any sessions still bound to it\nare unbound by the store (their `host_id` is nulled) and the\nrow is deleted, which also revokes the host's launch token.\n\nRefuses a host that is currently online (409): retire it after it\ngoes offline so an active machine is not pulled out from under\nrunning work. Server-managed sandbox hosts are likewise refused\n(409) \u2014 their lifecycle belongs to the server that created them,\nand deleting only the row would orphan the live sandbox.\n\n**Returns:** 204 No Content on success.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist, 403 if the caller is not the owner, 409 if the host is online or server-managed.",
+        "operationId": "delete_host_v1_hosts__host_id__delete",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Host",
+        "tags": [
+          "hosts"
+        ]
+      },
       "get": {
         "description": "Get details for a single host.\n\n**Returns:** Host details dict.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
