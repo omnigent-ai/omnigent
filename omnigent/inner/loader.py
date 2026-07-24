@@ -76,6 +76,7 @@ def load_agent_def(
     path_or_dict: str | Path | YamlData,
     *,
     enforce_handler_allowlist: bool = False,
+    expand_env: bool = True,
 ) -> AgentDef:
     """Load an AgentDef from a YAML file path or a raw dict.
 
@@ -102,6 +103,12 @@ def load_agent_def(
         ``omnigent run``, operator specs, the CLI) keep working with
         custom handlers — the operator already has code execution, so
         the restriction would add no security there.
+    :param expand_env: Whether this is a runtime/deploy load (``True``,
+        the default) versus a scaffolding/validation load (``False``).
+        Forwarded to :func:`_resolve_instructions` to gate the MLflow
+        Prompt Registry fetch: untrusted / HTTP-uploaded bundles are
+        validated with ``expand_env=False`` and must not trigger a
+        registry network fetch during validation.
     """
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
@@ -113,7 +120,7 @@ def load_agent_def(
         instructions_root = None
     if enforce_handler_allowlist:
         _reject_unregistered_policy_handlers(data)
-    return _parse_agent_def(data, instructions_root=instructions_root)
+    return _parse_agent_def(data, instructions_root=instructions_root, expand_env=expand_env)
 
 
 def _reject_unregistered_policy_handlers(data: YamlData) -> None:
@@ -186,6 +193,8 @@ def _read_contained_file(root: Path, value: str) -> str | None:
 def _resolve_instructions(
     raw_value: object,
     instructions_root: Path | None,
+    *,
+    expand_env: bool = True,
 ) -> str | None:
     """
     Resolve the ``instructions:`` field to a system-prompt string.
@@ -194,6 +203,9 @@ def _resolve_instructions(
     so omnigent-flavored YAMLs and native Omnigent YAMLs treat the
     field identically:
 
+    - MLflow Prompt Registry reference (``source: mlflow`` mapping or
+      ``mlflow+prompts:/...`` string): the prompt text is loaded from
+      the registry, but only when *expand_env* is ``True`` (see below).
     - Single-line value that names an existing file relative to
       *instructions_root*: the file's contents are read.
     - Multi-line value (contains ``\\n``): treated as inline text.
@@ -201,7 +213,8 @@ def _resolve_instructions(
       treated as inline text. Matches native Omnigent behavior so users
       who type ``instructions: AGENTS.md`` and forget the file
       get the literal string back rather than a misleading error.
-    - ``None`` / non-string raw values return ``None``.
+    - ``None`` / non-string raw values (other than an MLflow mapping)
+      return ``None``.
 
     :param raw_value: The raw YAML value at the ``instructions:``
         key, or ``None`` if the key was absent.
@@ -209,9 +222,37 @@ def _resolve_instructions(
         lookups. ``None`` skips the file-read attempt and treats
         every value as inline text — used when the loader has no
         on-disk anchor (raw-dict input path).
+    :param expand_env: Whether this is a runtime/deploy parse
+        (``True``) versus a scaffolding/validation parse (``False``).
+        It gates the MLflow registry fetch the same way
+        :func:`omnigent.spec.parser._resolve_instructions` does: an
+        untrusted / HTTP-uploaded bundle is validated with
+        ``expand_env=False`` and must not trigger a network fetch on
+        the author's behalf, so an MLflow reference is left as its
+        literal string.
     :returns: The resolved instruction text, or ``None`` if no
         ``instructions:`` was supplied.
     """
+    # Reuse the single canonical MLflow helper from the spec layer
+    # (imported lazily to avoid an import-time cycle: the spec package
+    # imports this loader module) so the two parser copies can never
+    # drift on registry-resolution rules.
+    from omnigent.spec.mlflow_prompts import (
+        parse_mlflow_instructions,
+        resolve_mlflow_prompt,
+    )
+
+    mlflow_ref = parse_mlflow_instructions(raw_value)
+    if mlflow_ref is not None:
+        if not expand_env:
+            return mlflow_ref.reference
+        return resolve_mlflow_prompt(
+            mlflow_ref.reference,
+            tracking_uri=mlflow_ref.tracking_uri,
+            registry_uri=mlflow_ref.registry_uri,
+            vars=mlflow_ref.vars,
+            cache_ttl=mlflow_ref.cache_ttl,
+        )
     if raw_value is None:
         return None
     if not isinstance(raw_value, str):
@@ -229,6 +270,7 @@ def _parse_agent_def(
     data: YamlData,
     *,
     instructions_root: Path | None = None,
+    expand_env: bool = True,
 ) -> AgentDef:
     agent = AgentDef()
     # ``AgentDef.name`` and ``AgentDef.prompt`` are both ``str | None``;
@@ -236,11 +278,14 @@ def _parse_agent_def(
     agent.name = data.get("name")
     agent.prompt = data.get("prompt")
     # ``instructions:`` is resolved into the agent's system-prompt
-    # text right here (file path → contents, or inline string).
-    # Translator code downstream only sees the resolved string
-    # in ``agent.instructions`` and the raw user-supplied
-    # ``agent.prompt`` — it doesn't have to re-walk the path.
-    agent.instructions = _resolve_instructions(data.get("instructions"), instructions_root)
+    # text right here (file path → contents, inline string, or MLflow
+    # Prompt Registry text). Translator code downstream only sees the
+    # resolved string in ``agent.instructions`` and the raw
+    # user-supplied ``agent.prompt`` — it doesn't have to re-walk the
+    # path.
+    agent.instructions = _resolve_instructions(
+        data.get("instructions"), instructions_root, expand_env=expand_env
+    )
     agent.input_type = data.get("input_type")
     agent.output_type = data.get("output_type")
     if "async_enabled" in data:

@@ -310,6 +310,7 @@ def load_omnigent_yaml(
     *,
     enforce_handler_allowlist: bool = False,
     prune_invalid_sub_agents: bool = False,
+    expand_env: bool = True,
 ) -> AgentSpec:
     """
     Load an omnigent YAML and translate it to an
@@ -334,6 +335,13 @@ def load_omnigent_yaml(
         WARNING logged per drop. The root agent must still validate.
         See :func:`omnigent.spec.load` for the full rationale — this
         is the execution-path backwards-compatibility guard.
+    :param expand_env: Forwarded to
+        :func:`omnigent.inner.loader.load_agent_def` to gate the MLflow
+        Prompt Registry fetch. ``False`` (untrusted / HTTP-uploaded
+        bundle validation) leaves an MLflow ``instructions:`` reference
+        as its literal string instead of contacting the registry. Does
+        not affect ``${VAR}`` handling on this path — the omnigent
+        loader never expands env vars.
     :returns: A validated :class:`AgentSpec` with
         ``executor.type == OMNIGENT_EXECUTOR_TYPE``.
     :raises OmnigentError: If the synthesized spec fails
@@ -365,7 +373,11 @@ def load_omnigent_yaml(
     from omnigent.spec.omnigent import agent_def_to_agent_spec
     from omnigent.spec.validator import validate
 
-    agent_def = load_agent_def(path, enforce_handler_allowlist=enforce_handler_allowlist)
+    agent_def = load_agent_def(
+        path,
+        enforce_handler_allowlist=enforce_handler_allowlist,
+        expand_env=expand_env,
+    )
     # Read the raw YAML alongside so the translator can preserve
     # policy-level YAML fields that the omnigent loader drops
     # (label policies in particular compile to synthetic

@@ -168,6 +168,15 @@ kubernetes = ["kubernetes>=36,<37"]
 # are in the default install). `omnigent[tracing]` still works — it just
 # no longer pulls in the heavy mlflow dependency.
 tracing = []
+# MLflow 3 Prompt Registry resolution for agent `instructions:` references
+# (`source: mlflow` / `mlflow+prompts:/...`). Optional: the resolver
+# (omnigent/spec/mlflow_prompts.py) imports mlflow lazily on first use, so only
+# agents that reference a registry prompt need this extra. Floored at MLflow
+# 3.8, where `MlflowClient.load_prompt` gained the `cache_ttl_seconds` kwarg the
+# resolver passes (added in 3.8.0 via mlflow#18963; absent in 3.7.x), and capped
+# below 4. The same SDK serves both the OSS and Databricks-managed (UC)
+# registries.
+mlflow = ["mlflow>=3.8,<4"]
 agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
@@ -246,6 +255,11 @@ dev = [
     # hindsight-client is opt-in (the `hindsight` extra), but the Hindsight
     # memory tool tests import + mock it, so keep it in the dev set.
     "hindsight-client>=0.4.0",
+    # mlflow is opt-in (the `mlflow` extra), but the Prompt Registry
+    # resolution tests register + load prompts against a local sqlite-backed
+    # MLflow, so keep it in the dev set. Floor matches the `mlflow` extra
+    # (3.8 for `MlflowClient.load_prompt(cache_ttl_seconds=...)`).
+    "mlflow>=3.8,<4",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
@@ -322,6 +336,14 @@ dev = [
 # `omni` ship, internal and OSS alike.)
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
+
+# Floor a transitive dependency to clear known CVEs. mlflow-skinny (pulled
+# in by the optional `mlflow` extra) depends on gitpython, and 3.1.50 carries
+# GHSA-2f96-g7mh-g2hx / GHSA-v396-v7q4-x2qj / GHSA-956x-8gvw-wg5v, all fixed in
+# 3.1.51. Constrain the resolution rather than adding a direct dependency so
+# gitpython only appears when a gitpython-using extra is installed.
+[tool.uv]
+constraint-dependencies = ["gitpython>=3.1.51,<4"]
 
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
@@ -595,6 +617,13 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "databricks_mcp.*"
+ignore_missing_imports = true
+
+# mlflow is an optional dep (the ``mlflow`` extra); the Prompt Registry
+# resolver (omnigent/spec/mlflow_prompts.py) imports it lazily so the base
+# install never needs it.
+[[tool.mypy.overrides]]
+module = "mlflow.*"
 ignore_missing_imports = true
 
 # psycopg is an optional dep (only declared in the ``databricks``
