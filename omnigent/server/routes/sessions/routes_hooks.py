@@ -559,7 +559,9 @@ def register_hooks_routes(
                 media_type="application/json",
             )
 
-        loaded = get_agent_cache().load(
+        from omnigent.server.routes import sessions as _sessions_facade
+
+        loaded = _sessions_facade.get_agent_cache().load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
 

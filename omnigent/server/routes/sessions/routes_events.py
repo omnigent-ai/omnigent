@@ -607,7 +607,9 @@ def register_events_routes(
                 params=elicit_params,
             )
             _mcp_elicit_payload = event.model_dump()
-            session_stream.publish(session_id, _mcp_elicit_payload)
+            from omnigent.server.routes import sessions as _sessions_facade
+
+            _sessions_facade.session_stream.publish(session_id, _mcp_elicit_payload)
             # Mirror the prompt into ancestor streams so a sub-agent MCP
             # elicitation surfaces in the parent (polly) chat with a
             # ``target_session_id`` pointing back at this child. The

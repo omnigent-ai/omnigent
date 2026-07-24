@@ -127,7 +127,9 @@ def register_browser_routes(
                 action=action,
                 args=args,
             )
-            session_stream.publish(session_id, event.model_dump())
+            from omnigent.server.routes import sessions as _sessions_facade
+
+            _sessions_facade.session_stream.publish(session_id, event.model_dump())
             done, _pending = await asyncio.wait(
                 {future},
                 timeout=_BROWSER_ACTION_AWAIT_S,
