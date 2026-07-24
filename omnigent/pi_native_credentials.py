@@ -450,6 +450,12 @@ def _fetch_pi_model_lists(
         if isinstance(ready, str) and ready and ready.upper() != "READY":
             continue
         entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
+        # Kimi (and GLM/DeepSeek) stream output on reasoning_content channel.
+        # Pi's openai-completions parser requires reasoning:true on the model
+        # entry to consume that channel; without it the turn ends with
+        # "Stream ended without finish_reason".
+        if any(frag in name_lower for frag in ("kimi", "glm", "deepseek")):
+            entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
         elif _needs_responses_api(name_lower):
