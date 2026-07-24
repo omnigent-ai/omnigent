@@ -1,5 +1,7 @@
 "use strict";
 
+const { randomUUID } = require("node:crypto");
+
 const ARTIFACT_INSPECTOR_SCRIPT = `(() => {
   window.__omnigentCancelArtifactInspector?.();
   return new Promise((resolve) => {
@@ -276,9 +278,16 @@ function normalizeArtifactBounds(bounds, contentBounds) {
   };
 }
 
+function denyPermissions(ses) {
+  if (!ses) return;
+  ses.setPermissionCheckHandler?.(() => false);
+  ses.setPermissionRequestHandler?.((_webContents, _permission, callback) => callback(false));
+}
+
 class ArtifactSurfaceManager {
-  constructor({ createView }) {
+  constructor({ createView, configureSession = denyPermissions }) {
     this.createView = createView;
+    this.configureSession = configureSession;
     this.surfaces = new WeakMap();
   }
 
@@ -307,11 +316,21 @@ class ArtifactSurfaceManager {
           nodeIntegration: false,
           sandbox: true,
           webSecurity: true,
+          partition: `omnigent-artifact-preview-${win.id}-${randomUUID()}`,
         },
       });
       const consoleMessages = [];
       const loadErrors = [];
-      surface = { id: params.id, view, policy, url: null, consoleMessages, loadErrors };
+      surface = {
+        id: params.id,
+        view,
+        policy,
+        url: null,
+        deviceEmulation: null,
+        consoleMessages,
+        loadErrors,
+      };
+      this.configureSession(view.webContents.session);
       view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       const blockUnsafeNavigation = (event, url) => {
         if (!navigationAllowed(url, surface.policy)) event.preventDefault();
@@ -354,16 +373,22 @@ class ArtifactSurfaceManager {
       const width = Math.round(viewportWidth);
       const scale = Math.min(1, bounds.width / width);
       const height = Math.max(1, Math.round(bounds.height / scale));
-      surface.view.webContents.enableDeviceEmulation({
+      const deviceEmulation = {
         screenPosition: "desktop",
         screenSize: { width, height },
         viewPosition: { x: 0, y: 0 },
         deviceScaleFactor: 1,
         viewSize: { width, height },
         scale,
-      });
-    } else {
+      };
+      const signature = JSON.stringify(deviceEmulation);
+      if (surface.deviceEmulation !== signature) {
+        surface.view.webContents.enableDeviceEmulation(deviceEmulation);
+        surface.deviceEmulation = signature;
+      }
+    } else if (surface.deviceEmulation !== null) {
       surface.view.webContents.disableDeviceEmulation();
+      surface.deviceEmulation = null;
     }
     surface.view.setVisible(Boolean(params.visible && bounds.width > 0 && bounds.height > 0));
     if (surface.url !== policy.url.href) {
@@ -434,6 +459,7 @@ module.exports = {
   ARTIFACT_INSPECTOR_SCRIPT,
   ARTIFACT_SELECTION_SCRIPT,
   ARTIFACT_REVIEW_SCRIPT,
+  denyPermissions,
   navigationAllowed,
   normalizeArtifactBounds,
   parseArtifactPreviewUrl,

@@ -49,9 +49,12 @@ function fakeViewFactory(created) {
         webContents.reloads = (webContents.reloads ?? 0) + 1;
       },
       enableDeviceEmulation: (parameters) => {
+        webContents.enableDeviceEmulationCalls = (webContents.enableDeviceEmulationCalls ?? 0) + 1;
         webContents.deviceEmulation = parameters;
       },
       disableDeviceEmulation: () => {
+        webContents.disableDeviceEmulationCalls =
+          (webContents.disableDeviceEmulationCalls ?? 0) + 1;
         webContents.deviceEmulation = null;
       },
       close: () => {
@@ -123,10 +126,14 @@ describe("artifact bounds", () => {
 });
 
 describe("ArtifactSurfaceManager", () => {
-  it("creates a sandboxed surface and blocks navigation outside its grant", async () => {
+  it("creates an isolated surface and blocks navigation outside its grant", async () => {
     const win = fakeWindow();
     const created = [];
-    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    const deniedPermissions = [];
+    const manager = new ArtifactSurfaceManager({
+      createView: fakeViewFactory(created),
+      configureSession: (ses) => deniedPermissions.push(ses),
+    });
 
     await manager.sync(win, {
       id: "artifact-1",
@@ -141,7 +148,12 @@ describe("ArtifactSurfaceManager", () => {
     assert.equal(view.webContents.options.webPreferences.contextIsolation, true);
     assert.equal(view.webContents.options.webPreferences.nodeIntegration, false);
     assert.equal(view.webContents.options.webPreferences.sandbox, true);
-    assert.equal(view.webContents.options.webPreferences.partition, undefined);
+    assert.match(
+      view.webContents.options.webPreferences.partition,
+      /^omnigent-artifact-preview-7-/,
+    );
+    assert.equal(deniedPermissions.length, 1);
+    assert.equal(view.webContents.disableDeviceEmulationCalls, undefined);
     assert.deepEqual(view.webContents.windowOpenHandler(), { action: "deny" });
 
     const event = {
@@ -225,6 +237,16 @@ describe("ArtifactSurfaceManager", () => {
       viewSize: { width: 768, height: 960 },
       scale: 0.625,
     });
+    assert.equal(created[0].webContents.enableDeviceEmulationCalls, 1);
+
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 480, height: 600 },
+      viewportWidth: 768,
+    });
+    assert.equal(created[0].webContents.enableDeviceEmulationCalls, 1);
 
     await manager.sync(win, {
       id: "current",
@@ -233,6 +255,7 @@ describe("ArtifactSurfaceManager", () => {
       bounds: { x: 0, y: 0, width: 480, height: 600 },
     });
     assert.equal(created[0].webContents.deviceEmulation, null);
+    assert.equal(created[0].webContents.disableDeviceEmulationCalls, 1);
   });
 
   it("destroys the surface during window cleanup", async () => {
