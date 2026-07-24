@@ -131,8 +131,15 @@ def store_harness_credential(
         return StoreCredentialResult(False, None, f"unsupported family {family!r}")
     if not secret or not secret.strip():
         return StoreCredentialResult(False, None, "no credential provided")
-    if kind == "gateway" and not (base_url and base_url.strip()):
-        return StoreCredentialResult(False, None, "a gateway requires a base_url")
+    if kind == "gateway":
+        if not (base_url and base_url.strip()):
+            return StoreCredentialResult(False, None, "a gateway requires a base_url")
+        # Reject a non-http(s) base_url here rather than writing a malformed
+        # provider entry that fails opaquely at the harness's first turn.
+        if not base_url.strip().lower().startswith(("http://", "https://")):
+            return StoreCredentialResult(
+                False, None, "a gateway base_url must start with http:// or https://"
+            )
 
     from omnigent.onboarding import secrets as secret_store
 
@@ -268,9 +275,13 @@ def adopt_env_credential(*, family: str, env_var: str) -> StoreCredentialResult:
     if not env_var:
         return StoreCredentialResult(False, None, "no environment variable named")
     # Only adopt a var that's actually set on this host — otherwise the entry
-    # would reference an empty credential and fail at the first turn. (This runs
-    # on the runner, so os.environ is the host's environment.)
-    if not os.environ.get(env_var):
+    # would reference an empty credential and fail at the first turn. Test
+    # PRESENCE ONLY (``in os.environ``, never reading the value) so the "never
+    # reads the value" contract stays literally true; the caller (the daemon's
+    # adopt handler) already restricts this to vars ambient detection surfaced,
+    # which are meaningfully set. (This runs on the runner, so os.environ is the
+    # host's environment.)
+    if env_var not in os.environ:
         return StoreCredentialResult(False, None, f"{env_var} is not set on this host")
 
     name = family

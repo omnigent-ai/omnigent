@@ -121,6 +121,15 @@ def test_store_gateway_requires_base_url() -> None:
     assert result.reason is not None and "base_url" in result.reason
 
 
+def test_store_gateway_rejects_non_http_base_url() -> None:
+    """A gateway base_url that isn't http(s):// is refused (no malformed entry)."""
+    result = ha.store_harness_credential(
+        family="openai", kind="gateway", secret="tok", base_url="ftp://gw.example/v1"
+    )
+    assert result.stored is False
+    assert result.reason is not None and "http" in result.reason
+
+
 def test_store_flips_readiness_to_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     """After a successful write, the provider resolves for the harness family."""
     assert default_provider_for_harness(load_config(), "claude-native") is None

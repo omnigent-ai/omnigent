@@ -70,6 +70,11 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.onboarding.harness_auth import (
+    adopt_env_credential,
+    detect_adoptable_credentials,
+    store_harness_credential,
+)
 from omnigent.onboarding.harness_install import (
     harness_cli_installed,
     harness_setup_hint,
@@ -80,6 +85,7 @@ from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
@@ -1651,13 +1657,6 @@ class HostProcess:
         :returns: Result with ``status`` ``"ok"``/``"failed"``, refreshed
             readiness on success, and a non-secret reason on failure.
         """
-        from omnigent.onboarding.harness_auth import (
-            adopt_env_credential,
-            detect_adoptable_credentials,
-            store_harness_credential,
-        )
-        from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
-
         # Resolve the harness to a provider family, re-checking the allowlist.
         # claude→anthropic, codex→openai; pi consumes both and prefers anthropic
         # (its first fallback family), so a typed pi key lands on anthropic.
@@ -1681,17 +1680,26 @@ class HostProcess:
                     status="failed",
                     error="adopt requires an env_var",
                 )
-            # Adopt an env var by its OWN family, not the harness-derived one.
-            # pi consumes both anthropic + openai, so it can offer e.g.
-            # $OPENAI_API_KEY — writing that under anthropic (the harness default)
-            # would mis-route it to anthropic's endpoint. Look the env var up in
-            # the host's detected credentials and use its detected family; fall
-            # back to the harness family if it isn't detected (shouldn't happen,
-            # since the UI only offers detected vars).
+            # Adopt ONLY a credential the host actually detected, and under its
+            # OWN family. Requiring a match in detect_adoptable_credentials()
+            # enforces the adopt boundary server-side (the raw API is owner-authz'd
+            # but otherwise unvalidated): without it a caller could name any set
+            # env var — a DB password, an unrelated secret — and have it persisted
+            # as a provider credential and sent to the vendor endpoint as auth.
+            # Using the detected family (not the harness default) also keeps a
+            # cross-family pick correct: pi consumes both anthropic + openai, so a
+            # detected $OPENAI_API_KEY adopted for pi lands on openai, not
+            # anthropic's endpoint.
             detected_family = next(
                 (d.family for d in detect_adoptable_credentials() if d.env_var == frame.env_var),
-                family,
+                None,
             )
+            if detected_family is None:
+                return HostStoreSecretResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=f"{frame.env_var} is not an adoptable credential on this host",
+                )
             result = adopt_env_credential(family=detected_family, env_var=frame.env_var)
         elif frame.kind in ("key", "gateway"):
             result = store_harness_credential(
@@ -1741,8 +1749,6 @@ class HostProcess:
         :param frame: The detect request (carries only a request id).
         :returns: Result frame with the non-secret credential descriptors.
         """
-        from omnigent.onboarding.harness_auth import detect_adoptable_credentials
-
         detected = detect_adoptable_credentials()
         return HostDetectCredentialsResultFrame(
             request_id=frame.request_id,

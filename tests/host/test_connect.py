@@ -2282,7 +2282,7 @@ def test_handle_store_secret_key_writes_and_returns_readiness(
         calls.append(kwargs)
         return StoreCredentialResult(True, "anthropic", None)
 
-    monkeypatch.setattr("omnigent.onboarding.harness_auth.store_harness_credential", _store)
+    monkeypatch.setattr(connect, "store_harness_credential", _store)
     monkeypatch.setattr(connect, "configured_harness_map", lambda: {"claude-native": True})
 
     host = _make_host_process()
@@ -2324,7 +2324,7 @@ def test_handle_store_secret_pi_maps_to_anthropic_family(
         seen.update(kwargs)
         return StoreCredentialResult(True, "anthropic", None)
 
-    monkeypatch.setattr("omnigent.onboarding.harness_auth.store_harness_credential", _store)
+    monkeypatch.setattr(connect, "store_harness_credential", _store)
     monkeypatch.setattr(connect, "configured_harness_map", lambda: {"pi": True})
 
     host = _make_host_process()
@@ -2348,9 +2348,10 @@ def test_handle_store_secret_adopt_calls_adopt_core(
         seen.update(kwargs)
         return StoreCredentialResult(True, "openai", None)
 
-    monkeypatch.setattr("omnigent.onboarding.harness_auth.adopt_env_credential", _adopt)
+    monkeypatch.setattr(connect, "adopt_env_credential", _adopt)
     monkeypatch.setattr(
-        "omnigent.onboarding.harness_auth.detect_adoptable_credentials",
+        connect,
+        "detect_adoptable_credentials",
         lambda: [
             DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
         ],
@@ -2387,9 +2388,10 @@ def test_handle_store_secret_pi_adopt_uses_detected_family_not_harness(
         seen.update(kwargs)
         return StoreCredentialResult(True, "openai", None)
 
-    monkeypatch.setattr("omnigent.onboarding.harness_auth.adopt_env_credential", _adopt)
+    monkeypatch.setattr(connect, "adopt_env_credential", _adopt)
     monkeypatch.setattr(
-        "omnigent.onboarding.harness_auth.detect_adoptable_credentials",
+        connect,
+        "detect_adoptable_credentials",
         lambda: [
             DetectedCredential(family="openai", source="$OPENAI_API_KEY", env_var="OPENAI_API_KEY")
         ],
@@ -2405,15 +2407,54 @@ def test_handle_store_secret_pi_adopt_uses_detected_family_not_harness(
     assert seen == {"family": "openai", "env_var": "OPENAI_API_KEY"}
 
 
+def test_handle_store_secret_adopt_refuses_undetected_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopt refuses an env var the host didn't detect, without writing.
+
+    The server is owner-authz'd but doesn't otherwise validate env_var, so the
+    handler must enforce the adopt boundary: only a var present in
+    detect_adoptable_credentials() may be adopted. Otherwise a caller could name
+    an arbitrary set env var (a DB password, an unrelated secret) and have it
+    persisted as a provider credential and sent to the vendor endpoint as auth.
+    """
+    import omnigent.host.connect as connect
+    from omnigent.onboarding.harness_auth import DetectedCredential
+
+    def _must_not_write(**kwargs: object) -> object:
+        raise AssertionError("adopt core reached for an undetected env var")
+
+    monkeypatch.setattr(connect, "adopt_env_credential", _must_not_write)
+    # Detect surfaces only ANTHROPIC_API_KEY; the request names a different var.
+    monkeypatch.setattr(
+        connect,
+        "detect_adoptable_credentials",
+        lambda: [
+            DetectedCredential(
+                family="anthropic", source="$ANTHROPIC_API_KEY", env_var="ANTHROPIC_API_KEY"
+            )
+        ],
+    )
+
+    host = _make_host_process()
+    result = host._handle_store_secret(
+        HostStoreSecretFrame(
+            request_id="c6", harness="pi", kind="adopt", env_var="DATABASE_PASSWORD"
+        )
+    )
+    assert result.status == "failed"
+    assert result.error is not None and "DATABASE_PASSWORD" in result.error
+    assert result.configured_harnesses is None
+
+
 def test_handle_store_secret_rejects_non_ui_harness(monkeypatch: pytest.MonkeyPatch) -> None:
     """A harness outside the UI-auth families is refused without a write."""
+    import omnigent.host.connect as connect
 
     def _must_not_write(**kwargs: object) -> object:
         raise AssertionError("credential core reached for a non-UI-auth harness")
 
-    monkeypatch.setattr(
-        "omnigent.onboarding.harness_auth.store_harness_credential", _must_not_write
-    )
+    monkeypatch.setattr(connect, "store_harness_credential", _must_not_write)
     host = _make_host_process()
     result = host._handle_store_secret(
         HostStoreSecretFrame(request_id="c4", harness="cursor", kind="key", secret_value="x")
@@ -2424,10 +2465,12 @@ def test_handle_store_secret_rejects_non_ui_harness(monkeypatch: pytest.MonkeyPa
 
 def test_handle_store_secret_surfaces_core_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """A core write failure surfaces its non-secret reason as ``failed``."""
+    import omnigent.host.connect as connect
     from omnigent.onboarding.harness_auth import StoreCredentialResult
 
     monkeypatch.setattr(
-        "omnigent.onboarding.harness_auth.store_harness_credential",
+        connect,
+        "store_harness_credential",
         lambda **k: StoreCredentialResult(False, None, "a gateway requires a base_url"),
     )
     host = _make_host_process()
@@ -2443,10 +2486,12 @@ def test_handle_detect_credentials_returns_non_secret_descriptors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The detect handler returns the core's descriptors as plain dicts."""
+    import omnigent.host.connect as connect
     from omnigent.onboarding.harness_auth import DetectedCredential
 
     monkeypatch.setattr(
-        "omnigent.onboarding.harness_auth.detect_adoptable_credentials",
+        connect,
+        "detect_adoptable_credentials",
         lambda: [DetectedCredential("anthropic", "$ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY")],
     )
     host = _make_host_process()
