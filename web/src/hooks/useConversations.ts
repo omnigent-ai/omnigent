@@ -1392,7 +1392,24 @@ export function useUpdateProjectConfig() {
       const projectId = id ?? (await apiCreateProject(name)).id;
       return apiUpdateProjectConfig(projectId, config);
     },
-    onSuccess: () => {
+    onSuccess: (project) => {
+      // Seed the fresh config into the cache (not just invalidate) so the
+      // composer's prefill reads the just-saved defaults on the very next visit
+      // — the prefill settles once and would otherwise latch onto the stale
+      // cached value during the 30s staleTime window while a refetch is still
+      // in flight.
+      queryClient.setQueryData<ProjectConfig>(["project-config", project.id], project.config ?? {});
+      // Upsert the projects list too, so a just-promoted label-only folder
+      // resolves to its NEW first-class id immediately (name → id is how the
+      // composer keys the config lookup); a stale `id: null` would resolve the
+      // config to `{}` and drop the saved defaults on that first visit.
+      queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
+        if (!prev) return prev;
+        const summary = { id: project.id, name: project.name };
+        return prev.some((p) => p.name === project.name)
+          ? prev.map((p) => (p.name === project.name ? summary : p))
+          : [...prev, summary];
+      });
       void queryClient.invalidateQueries({ queryKey: ["project-config"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },

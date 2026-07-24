@@ -196,4 +196,21 @@ describe("ProjectSettingsDialog", () => {
       expect(updateMock).toHaveBeenCalledWith("p_1", { host_id: "h1", workspace: "/picked/dir" }),
     );
   });
+
+  it("blocks Save (does not clear defaults) when the config load fails", async () => {
+    // A transient GET failure must NOT be read as "no config" — otherwise
+    // saving the blank draft would send `{}` and wipe the stored defaults.
+    getProjectMock.mockRejectedValue(new Error("500 Server Error"));
+    renderDialog();
+
+    // The load-error notice shows and Save stays disabled.
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-load-error")).toBeInTheDocument(),
+    );
+    expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(true);
+
+    // Even if a submit is forced, onSubmit bails — no clearing PATCH is sent.
+    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
 });

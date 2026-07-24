@@ -92,7 +92,13 @@ export function ProjectSettingsDialog({
 }) {
   // A label-only folder has no row to read; its config starts empty and the
   // save promotes it. Fetch only runs for a first-class project.
-  const { data: stored, isLoading } = useProjectConfig(open ? projectId : null);
+  const { data: stored, isLoading, isError } = useProjectConfig(open ? projectId : null);
+  // A failed config GET for a first-class project must NOT be treated as "no
+  // config" — saving the resulting blank draft would send `{}` and wipe the
+  // project's stored defaults. Block Save (and surface the error) until the
+  // fetch succeeds. A label-only folder (no id) has nothing to load, so it's
+  // never in this state.
+  const loadFailed = projectId !== null && isError;
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
   const { data: agents } = useAvailableAgents();
@@ -148,16 +154,22 @@ export function ProjectSettingsDialog({
 
   useEffect(() => {
     if (!open) return;
+    // Don't seed a blank draft from a failed load — Save is blocked anyway, and
+    // clobbering the fields would risk sending `{}` if the guard ever regressed.
+    if (loadFailed) return;
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
     setUseWorktree(c.use_worktree ?? false);
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
-  }, [open, stored]);
+  }, [open, stored, loadFailed]);
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
+    // Guard against submitting a blank draft seeded from a failed load, which
+    // the server would read as "clear the stored defaults".
+    if (loadFailed) return;
     // Build the config from set fields only — an unset slot is an absent key,
     // so the whole object is `{}` when nothing is configured (the server treats
     // that as "clear the stored defaults").
@@ -401,6 +413,16 @@ export function ProjectSettingsDialog({
             </div>
           </Field>
 
+          {loadFailed && (
+            <p
+              className="text-destructive text-sm"
+              role="alert"
+              data-testid="project-settings-load-error"
+            >
+              Couldn't load this project's settings. Close and reopen to try again — saving is
+              disabled so your existing defaults aren't overwritten.
+            </p>
+          )}
           {updateConfig.isError && (
             <p className="text-destructive text-sm" role="alert">
               {(updateConfig.error as Error).message}
@@ -419,7 +441,7 @@ export function ProjectSettingsDialog({
             <Button
               type="submit"
               data-testid="project-settings-save"
-              disabled={updateConfig.isPending || isLoading}
+              disabled={updateConfig.isPending || isLoading || loadFailed}
             >
               {updateConfig.isPending ? "Saving…" : "Save"}
             </Button>

@@ -19,7 +19,9 @@ import {
   useConversations,
   useDeleteProject,
   useProjects,
+  useProjectConfig,
   useProjectSessions,
+  useUpdateProjectConfig,
   useMoveToProject,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -1142,6 +1144,57 @@ describe("useProjects", () => {
       createElement(QueryClientProvider, { client: queryClient }, children);
     const { result } = renderHook(() => useProjects(), { wrapper });
 
+    await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+});
+
+describe("useUpdateProjectConfig cache seeding", () => {
+  it("seeds the fresh config + upserts the projects list on success (no stale read)", async () => {
+    // The composer prefill settles once from the cache, so a save must write
+    // the fresh value in — not merely invalidate — or the next visit within the
+    // staleTime window reads the old config and drops the just-saved defaults.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Pre-seed both caches with a STALE snapshot: a label-only folder (id=null)
+    // and its (empty) config.
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Work" }]);
+    queryClient.setQueryData(["project-config", "p_new"], {});
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    // The PATCH (label-only folder → promoted, so a create precedes it) returns
+    // the fresh first-class project with its stored config.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work" })) // apiCreateProject
+      .mockResolvedValueOnce(
+        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x" } }),
+      );
+
+    const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+    result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x" } });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The config cache holds the fresh value keyed by the NEW id.
+    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
+    // The projects list now resolves "Work" → the promoted first-class id.
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
+  });
+});
+
+describe("useProjectConfig", () => {
+  it("does not fetch for a label-only folder (null id)", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useProjectConfig(null), { wrapper });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("surfaces isError on a failed GET (so the dialog can block a clearing save)", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useProjectConfig("p_1"), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true));
   });
 });
