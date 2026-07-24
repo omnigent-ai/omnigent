@@ -634,10 +634,12 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 Scheduled
               </Link>
             </Button>
-            {/* Skills — first-class entry to the cross-harness Skill Registry
-            catalog. Shares the same nav-row construct as New session /
+            {/* Customize — first-class entry to the cross-harness Skill
+            Registry catalog. Shares the same nav-row construct as New session /
             Scheduled / Inbox so the active-pill, hover, insets, icon column,
-            and text weight all match. */}
+            and text weight all match. Route/testid stay `skills` for the
+            underlying Skill Registry; only the user-facing label is
+            "Customize" (matching the product prototype). */}
             <Button
               asChild
               variant="ghost"
@@ -650,7 +652,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             >
               <Link to="/skills" onClick={onNavClick} aria-current={isSkillsPage ? "page" : undefined}>
                 <SparklesIcon className="size-3.5 text-muted-foreground" />
-                Skills
+                Customize
               </Link>
             </Button>
             {selectionMode ? (
