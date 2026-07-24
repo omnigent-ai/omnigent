@@ -1,10 +1,11 @@
 """Databricks Apps entry point for the Omnigent Slack bot.
 
 Runs the Socket-Mode bot and, in Databricks web-auth mode, the enrollment web
-server that binds ``DATABRICKS_APP_PORT``. The package source (``omnigent_slack``)
-is copied next to this file by ``deploy.py``; its runtime deps come from the
-generated ``requirements.txt``. Startup failures are logged and the process is
-held open briefly so the platform captures them in ``/logz``.
+server. The ``omnigent_slack`` package is installed from the wheel ``deploy.py``
+copies next to this file; the app's ``uv run`` command resolves it (and the
+inlined runtime deps) from the generated ``pyproject.toml`` in-container at boot.
+Startup failures are logged and the process is held open briefly so the platform
+captures them in ``/logz``.
 """
 
 from __future__ import annotations
