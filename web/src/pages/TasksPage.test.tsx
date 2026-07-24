@@ -244,7 +244,7 @@ describe("sort order", () => {
       renderPage();
       const names = screen
         .getAllByTestId("scheduled-task-row")
-        .map((r) => r.querySelector(".font-bold")?.textContent);
+        .map((r) => r.querySelector(".font-semibold")?.textContent);
       expect(names).toEqual(["Active soon", "Active late", "Paused early"]);
     } finally {
       vi.useRealTimers();
