@@ -158,12 +158,20 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          gh pr comment "${{ github.event.pull_request.number }}" \
-            --edit-last \
-            --body-file comment_body.md || \
-          gh pr comment "${{ github.event.pull_request.number }}" \
-            --body-file comment_body.md
+          COMMENT_MARKER="<!-- benchmark-pr-comment -->"
+          COMMENT_ID=$(gh api --paginate \
+            "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | startswith(\"$COMMENT_MARKER\")) | .id" \
+            | head -1)
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="$(cat comment_body.md)"
+          else
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file comment_body.md
+          fi
 
       - name: Upload candidate results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
