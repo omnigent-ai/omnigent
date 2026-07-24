@@ -206,17 +206,18 @@ async def _drive_install(base_url: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-
-            # The single seeded agent (Codex) is auto-selected once the
-            # /v1/agents fetch resolves, and because its harness is unconfigured
-            # on the host the composer surfaces a "Set up Codex" notice. Wait for
-            # that notice directly and click it to open the setup dialog. (We
-            # deliberately do NOT drive the agent picker here: the agent is
-            # already selected, and opening/clicking the dropdown only added a
-            # menu-open-vs-async-render race that flaked under CI load. A long
-            # timeout absorbs a slow agents fetch on a loaded runner.)
+            # The "Set up Codex" notice only renders once BOTH async fetches have
+            # landed and re-rendered the composer: /v1/agents (auto-selects the
+            # single Codex agent) and /v1/hosts (marks its harness unconfigured).
+            # On a loaded CI runner that chain can lag, so wait for the network to
+            # go idle and the host chip (readiness data present) before asserting
+            # the notice — otherwise the assertion races the still-loading state.
+            await page.wait_for_load_state("networkidle")
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_be_visible(
+                timeout=30_000
+            )
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
-            await expect(setup).to_be_visible(timeout=60_000)
+            await expect(setup).to_be_visible(timeout=30_000)
             await setup.click()
 
             # The dialog's checklist offers a one-click Install for this harness.
