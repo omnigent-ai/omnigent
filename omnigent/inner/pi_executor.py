@@ -738,6 +738,7 @@ def _build_models_json(
     """
     h = host.rstrip("/")
     serving_endpoints_url = f"{h}/serving-endpoints"
+    codex_gateway_url = f"{h}/ai-gateway/codex/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     # ucode's ``openai`` gateway is the Codex Responses gateway
     # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
@@ -749,25 +750,41 @@ def _build_models_json(
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
+    _openai_responses_compat: dict[str, Any] = {  # type: ignore[explicit-any]
+        "supportsDeveloperRole": False,
+        "supportsStore": False,
+        "supportsStrictMode": False,
+        "supportsReasoningEffort": False,
+    }
     config: dict[str, Any] = {  # type: ignore[explicit-any]  # Pi-owned schema, see note above
         "providers": {
-            # GPT models → OpenAI Chat Completions API.
-            # We use completions (not responses) because the Databricks
-            # Responses API rejects tool-result chaining on subsequent turns.
-            # The ``compat`` settings ensure Pi uses ``system`` role (not
-            # ``developer``) and avoids other OpenAI-specific features that
-            # Databricks doesn't support.
+            # Newer GPT models (gpt-5-5, gpt-5-6-*, gpt-5-3-codex) → OpenAI
+            # Responses API at the AI Gateway. These models reject function
+            # tools via /chat/completions but work via /responses. The Responses
+            # API now supports tool-result chaining on subsequent turns.
+            "databricks-openai": {
+                "baseUrl": codex_gateway_url,
+                "apiKey": token,
+                "api": "openai-responses",
+                "authHeader": True,
+                "compat": _openai_responses_compat,
+                "models": [
+                    m
+                    for m in _DATABRICKS_RESPONSES_MODELS
+                    if isinstance(m.get("id"), str) and _pi_needs_responses_api(m["id"])
+                ],
+            },
+            # Older GPT models → OpenAI Chat Completions at serving-endpoints.
             "databricks": {
                 "baseUrl": openai_base_url,
                 "apiKey": token,
                 "api": "openai-completions",
-                "compat": {
-                    "supportsDeveloperRole": False,
-                    "supportsStore": False,
-                    "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
-                },
-                "models": _DATABRICKS_RESPONSES_MODELS,
+                "compat": _openai_responses_compat,
+                "models": [
+                    m
+                    for m in _DATABRICKS_RESPONSES_MODELS
+                    if not (isinstance(m.get("id"), str) and _pi_needs_responses_api(m["id"]))
+                ],
             },
             # Claude models → Anthropic Messages API.
             # ``authHeader`` sends ``Authorization: Bearer <token>`` instead
@@ -834,13 +851,24 @@ def _pi_model_is_reasoning(model: str) -> bool:
     return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
 
 
+def _pi_needs_responses_api(model: str) -> bool:
+    """Return True when a GPT model requires the Responses API for tools.
+
+    gpt-5-5, gpt-5-6-*, and gpt-5-3-codex reject function tool calls via
+    ``/chat/completions`` with 400; they work via ``/responses`` at the AI
+    Gateway. Matches pi_native_credentials._needs_responses_api.
+    """
+    lower = model.lower()
+    return any(token in lower for token in ("gpt-5-5", "gpt-5-6", "gpt-5-3-codex"))
+
+
 def _pi_provider_for_model(model: str) -> str:
     """Return the Pi provider name to use for a given Databricks model."""
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
     if "gpt" in lower:
-        return "databricks"
+        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
     return "databricks-completions"
 
 

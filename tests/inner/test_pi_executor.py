@@ -2971,10 +2971,15 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-claude-sonnet-4-6",
         "databricks-claude-sonnet-4-5",
     ]
-    openai_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_ids == [
+    # Older GPT models (no tool-rejection via /chat/completions) → completions.
+    openai_completions_ids = [m["id"] for m in providers["databricks"]["models"]]
+    assert openai_completions_ids == [
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
+    ]
+    # Newer GPT models (reject tools via /chat/completions) → responses API.
+    openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
+    assert openai_responses_ids == [
         "databricks-gpt-5-5",
         "databricks-gpt-5-5-pro",
     ]
@@ -2986,7 +2991,7 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
 def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
     """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
     models = _build_models_json("https://host.example.com", "tok")
-    by_id = {m["id"]: m for m in models["providers"]["databricks"]["models"]}
+    by_id = {m["id"]: m for m in models["providers"]["databricks-openai"]["models"]}
     for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
         assert by_id[model_id]["contextWindow"] == 400000
         assert by_id[model_id]["maxTokens"] == 128000
