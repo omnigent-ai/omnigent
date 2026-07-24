@@ -3027,7 +3027,8 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
     # _pi_provider_for_model routes it to, advertising image input so Pi
     # doesn't strip attached images (#515).
     entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
-    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
+    # kimi models use reasoning_content channel → need reasoning:true flag
+    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"], "reasoning": True}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.
     assert completions["baseUrl"] == "https://openrouter.ai/api/v1"
