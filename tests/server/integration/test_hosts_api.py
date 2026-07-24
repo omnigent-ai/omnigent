@@ -453,6 +453,111 @@ async def test_get_host_404(
     assert resp.status_code == 404
 
 
+async def test_delete_host_removes_offline_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE /v1/hosts/{id} removes a retired (offline) host so it stops
+    polluting the pickers, and the row is gone from the store.
+
+    Regression for #2038: there was no API to deregister a
+    self-registered host, so a decommissioned machine lingered in every
+    host picker forever.
+    """
+    app, _reg, host_store, _cs = host_api_app
+    host_store.upsert_on_connect(_HOST_ID, "retired-vm", "local")
+    host_store.set_offline(_HOST_ID)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+        listing = await client.get("/v1/hosts")
+
+    assert resp.status_code == 204, f"expected 204, got {resp.status_code}: {resp.text}"
+    # Row is actually gone: neither the store nor the picker sees it.
+    assert host_store.get_host(_HOST_ID) is None
+    assert listing.json()["hosts"] == []
+
+
+async def test_delete_host_404_unknown(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """DELETE returns 404 for a host_id that does not exist."""
+    app, _reg, _hs, _cs = host_api_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete("/v1/hosts/aababcc3941edb738172734a9ab7bb8c")
+    assert resp.status_code == 404
+
+
+async def test_delete_host_409_when_online(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE refuses an online host with 409 and leaves it in place, so an
+    active machine is not pulled out from under running work.
+    """
+    app, registry, host_store, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+
+    assert resp.status_code == 409, f"expected 409 for an online host, got {resp.status_code}"
+    # Untouched: the live host is still registered.
+    assert host_store.get_host(_HOST_ID) is not None
+
+
+async def test_delete_host_409_managed_sandbox(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE refuses a server-managed sandbox host with 409: its lifecycle
+    belongs to the server that created it, and deleting only the row
+    would orphan the live sandbox.
+    """
+    app, _reg, host_store, _cs = host_api_app
+    managed_id = "b8a8862c405a01143b4373e2b155b02a"
+    host_store.register_managed_host(
+        host_id=managed_id,
+        name="sandbox-host",
+        user_id="local",
+        token="launch-token-secret",
+        provider="modal",
+        sandbox_id="sb-12345",
+        token_expires_at=int(time.time()) + 3600,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{managed_id}")
+
+    assert resp.status_code == 409, f"expected 409 for a managed host, got {resp.status_code}"
+    assert host_store.get_host(managed_id) is not None
+
+
+async def test_delete_host_unbinds_bound_sessions(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Deleting a host unbinds any session still pointing at it: the
+    session's ``host_id`` is nulled rather than left dangling at a row
+    that no longer exists.
+    """
+    app, _reg, host_store, conv_store = host_api_app
+    host_store.upsert_on_connect(_HOST_ID, "retired-vm", "local")
+    host_store.set_offline(_HOST_ID)
+    conv = conv_store.create_conversation(agent_id=None)
+    # workspace is required alongside host_id by the row check constraint.
+    conv_store.set_host_id(conv.id, _HOST_ID, workspace="/tmp/ws")
+    assert conv_store.get_conversation(conv.id).host_id == _HOST_ID
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+
+    assert resp.status_code == 204
+    unbound = conv_store.get_conversation(conv.id)
+    assert unbound is not None
+    assert unbound.host_id is None, "a deleted host must not leave sessions bound to a dead row"
+
+
 async def test_list_and_get_host_report_online_from_other_replica(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     db_uri: str,
@@ -896,6 +1001,35 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+async def test_delete_host_403_wrong_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    DELETE /v1/hosts/{id} returns 403 when the caller doesn't own the
+    host, and the host is left in place.
+
+    If it returned 204, one user could deregister another user's host
+    out of their picker (and revoke its launch token).
+    """
+    _app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect(
+        "294391bc835cde1130ef2a02dcd2b7b3", "alice-laptop", "alice@test.com"
+    )
+    host_store.set_offline("294391bc835cde1130ef2a02dcd2b7b3")
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        resp = await client.delete(
+            "/v1/hosts/294391bc835cde1130ef2a02dcd2b7b3",
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403, (
+        f"Expected 403 for wrong owner on delete, got {resp.status_code}. "
+        "Owner check on DELETE /v1/hosts/{{id}} is missing."
+    )
+    # Alice's host survives Bob's attempt.
+    assert host_store.get_host("294391bc835cde1130ef2a02dcd2b7b3") is not None
 
 
 async def test_launch_runner_403_wrong_owner(
