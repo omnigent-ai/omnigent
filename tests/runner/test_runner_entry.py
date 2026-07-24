@@ -1386,11 +1386,16 @@ async def test_resolve_agent_spec_from_server_memoizes_parse_across_sessions(
         b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
         b"params:\n  shared_key: original\n"
     )
+    child_bytes = b"spec_version: 1\nname: child\nexecutor:\n  config:\n    harness: claude-sdk\n"
     bundle_buf = io.BytesIO()
     with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config_bytes)
-        tf.addfile(info, io.BytesIO(config_bytes))
+        for member_name, member_bytes in (
+            ("config.yaml", config_bytes),
+            ("agents/child/config.yaml", child_bytes),
+        ):
+            info = tarfile.TarInfo(name=member_name)
+            info.size = len(member_bytes)
+            tf.addfile(info, io.BytesIO(member_bytes))
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """Return the same bundle for every request.
@@ -1439,6 +1444,58 @@ async def test_resolve_agent_spec_from_server_memoizes_parse_across_sessions(
     assert first.spec.params is not second.spec.params
     first.spec.params["injected"] = "session-a"
     assert "injected" not in second.spec.params
+    # The real hazard: a builtin appends to sub_agents per conversation
+    # (WebFetchTool adds __web_researcher), so the list must not be shared
+    # and the cached master must never grow.
+    assert first.spec.sub_agents is not second.spec.sub_agents
+    first.spec.sub_agents.append(first.spec.sub_agents[0])
+    assert len(second.spec.sub_agents) == 1
+    assert len(cache[("ag_cached", "7", False)].sub_agents) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_spec_from_server_evicts_prior_version(tmp_path: Path) -> None:
+    """A new agent version evicts the memo entry for that agent's prior version.
+
+    A PUT bumps the version with the agent id unchanged, so without eviction the
+    memo strands the prior version's fully parsed spec for the runner's lifetime.
+
+    :param tmp_path: Temporary spec cache root.
+    :returns: None.
+    """
+    config_bytes = (
+        b"spec_version: 1\nname: cached-agent\nexecutor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle_buf = io.BytesIO()
+    with tarfile.open(fileobj=bundle_buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name="config.yaml")
+        info.size = len(config_bytes)
+        tf.addfile(info, io.BytesIO(config_bytes))
+
+    versions = iter(["7", "8"])
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Serve the same bundle, bumping the version header each call.
+
+        :param request: Incoming mocked HTTP request.
+        :returns: A mocked successful bundle response.
+        """
+        return httpx.Response(
+            200, content=bundle_buf.getvalue(), headers={"X-Agent-Version": next(versions)}
+        )
+
+    cache: dict[tuple[str, str, bool], Any] = {}
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://server.test"
+    ) as client:
+        await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_x", session_id="conv_a", spec_parse_cache=cache
+        )
+        assert list(cache) == [("ag_x", "7", False)]
+        await _resolve_agent_spec_from_server(
+            client, tmp_path, "ag_x", session_id="conv_a", spec_parse_cache=cache
+        )
+    assert list(cache) == [("ag_x", "8", False)]
 
 
 @pytest.mark.asyncio

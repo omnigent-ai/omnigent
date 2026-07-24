@@ -865,6 +865,9 @@ async def _resolve_agent_spec_from_server(
         master = spec_parse_cache.get(cache_key)
         if master is None:
             master = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+            # A version bump retires every prior version of this agent.
+            for stale in [k for k in spec_parse_cache if k[0] == agent_id]:
+                del spec_parse_cache[stale]
             spec_parse_cache[cache_key] = master
         spec = copy.deepcopy(master)
     return ResolvedSpec(spec=spec, workdir=dest)
@@ -969,8 +972,9 @@ def create_app(
     import tempfile
 
     _spec_cache_root = Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-"))
-    # Parsed-spec memo, same runner lifetime as _spec_cache_root. Keyed by
-    # (agent_id, version, expand_env); each resolve gets a deepcopy.
+    # Parsed-spec memo, torn down with the runner like _spec_cache_root. Keyed by
+    # (agent_id, version, expand_env); each resolve gets a deepcopy, and a new
+    # version for an agent evicts that agent's older entries.
     _spec_parse_cache: dict[tuple[str, str, bool], AgentSpec] = {}
 
     async def spec_resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec | None:
