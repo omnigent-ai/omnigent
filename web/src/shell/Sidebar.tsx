@@ -316,9 +316,11 @@ function showArchivedToast() {
  * legacy key so this runs at most once.
  *
  * Waits for the server pinned set to load (`pinnedLoaded`) so an id the server
- * already has isn't needlessly re-PATCHed. Runs the writes directly (not via
- * the mutation hook's cache patching) since the pinned query is invalidated by
- * each toggle anyway and this fires before any user interaction.
+ * already has isn't needlessly re-PATCHed. Runs the writes directly rather than
+ * through the mutation hook: this fires once before any user interaction, and it
+ * patches the pinned-list cache itself with the confirmed rows (below) — the
+ * same cache-patch (not invalidate) strategy `useTogglePinnedConversation` uses,
+ * since the `?pinned=true` index lags these writes.
  *
  * @param serverPinnedIds - Ids the server already reports as pinned.
  * @param pinnedLoaded - Whether the server pinned query has settled.
