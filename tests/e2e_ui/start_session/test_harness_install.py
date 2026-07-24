@@ -21,8 +21,10 @@ from typing import Any
 from playwright.async_api import Route, async_playwright, expect
 
 _HOST_ID = "host_e2e"
-# The stub host reports codex's harness as not installed; the install POST
-# flips it to ready so the warning clears.
+# The stub host reports Claude ready and Codex missing. Claude remains the
+# selected inline default, so Codex exercises the picker's More submenu before
+# the install POST flips it to ready.
+_READY_HARNESS = "claude-native"
 _HARNESS = "codex-native"
 
 
@@ -44,10 +46,18 @@ def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
 
 
 def _agents_body() -> str:
-    """A single Codex agent whose harness the stub host lacks."""
+    """A ready default agent plus the missing Codex harness under test."""
     return json.dumps(
         {
             "data": [
+                {
+                    "id": "ag_claude_e2e",
+                    "name": "claude-native-ui",
+                    "display_name": "Claude Code",
+                    "description": "Anthropic's coding agent",
+                    "harness": _READY_HARNESS,
+                    "skills": [],
+                },
                 {
                     "id": "ag_codex_e2e",
                     "name": "codex-native-ui",
@@ -55,7 +65,7 @@ def _agents_body() -> str:
                     "description": "OpenAI's coding agent",
                     "harness": _HARNESS,
                     "skills": [],
-                }
+                },
             ]
         }
     )
@@ -71,7 +81,10 @@ def _hosts_body(*, ready: bool) -> str:
                     "name": "e2e-host",
                     "owner": "e2e",
                     "status": "online",
-                    "configured_harnesses": {_HARNESS: ready},
+                    "configured_harnesses": {
+                        _READY_HARNESS: True,
+                        _HARNESS: ready,
+                    },
                 }
             ]
         }
