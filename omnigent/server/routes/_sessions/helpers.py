@@ -116,7 +116,7 @@ from omnigent.server.routes._sessions.common import *
 # imported from common as facade-delegating proxies (kept out of common's
 # ``__all__`` so the star import above never overwrites them). Resolving them
 # here means a facade-level monkeypatch is honoured in this module too.
-from omnigent.server.routes._sessions.common import (
+from omnigent.server.routes._sessions.common import (  # noqa: F401
     _ELICITATION_MODE,
     build_policy_engine,
     get_agent_cache,
@@ -3768,7 +3768,7 @@ async def _query_host_runner_status(
         )
     except asyncio.TimeoutError:
         return None
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Defensive: this query only ever *speeds up* the connect grace, so
         # any unexpected failure (e.g. the future resolved with an error)
         # must degrade to "no verdict" and fall back to the wait rather than
@@ -6025,7 +6025,7 @@ def _agent_provider_family(agent: Agent) -> str | None:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     return provider_family_for_harness(spec.executor.harness_kind)
 
@@ -6081,7 +6081,7 @@ def _agent_is_native_impl(agent: Agent) -> bool:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return is_native_harness(spec.executor.harness_kind)
 
@@ -6117,7 +6117,7 @@ def _agent_carries_native_fork_history_impl(agent: Agent) -> bool:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return canonicalize_harness(spec.executor.harness_kind) in _FORK_HISTORY_NATIVE_HARNESSES
 
@@ -6143,7 +6143,7 @@ def _agent_carries_cursor_fork_history(agent: Agent) -> bool:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return canonicalize_harness(spec.executor.harness_kind) in _CURSOR_FORK_HISTORY_HARNESSES
 
@@ -6161,7 +6161,7 @@ def _native_coding_agent_for_agent(agent: Agent) -> NativeCodingAgent | None:
             .load(agent.id, agent.bundle_location, expand_env=agent.session_id is None)
             .spec
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     return native_coding_agent_for_harness(spec.executor.harness_kind)
 
@@ -7145,7 +7145,7 @@ def _resolve_subagent_spec(
         parent_spec = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         ).spec
-    except Exception:
+    except Exception:  # noqa: BLE001
         # A bundle that fails to load here must not break session
         # creation; the session still works, just without the
         # derived labels / launch args.
@@ -7504,7 +7504,7 @@ def _delete_stored_session_bundle_after_failure(
     """
     try:
         artifact_store.delete(agent_bundle_location)
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.warning(
             "Failed to delete uploaded session bundle %s after rollback",
             agent_bundle_location,
@@ -7897,7 +7897,7 @@ async def _handle_advise_models_mcp(
                     )
                     .spec
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 _logger.debug(
                     "_handle_advise_models_mcp: failed to load spec for agent=%s", conv.agent_id
                 )
@@ -8152,7 +8152,7 @@ async def _handle_mcp_tools_list(
         )
         resp.raise_for_status()
         data = resp.json()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
         return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
 

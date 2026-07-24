@@ -99,40 +99,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.helpers import (
-    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _get_runner_client_impl as _get_runner_client,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _poll_request_disconnect_impl as _poll_request_disconnect,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _publish_sandbox_status_impl as _publish_sandbox_status,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _resolve_harness_impl as _resolve_harness,
-)
-from omnigent.server.routes._sessions.helpers import (
-    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,
-)
 from omnigent.server.routes._sessions.orchestration import *
-from omnigent.server.routes._sessions.orchestration import (
-    _ensure_runner_relay_ready_impl as _ensure_runner_relay_ready,
-)
-from omnigent.server.routes._sessions.orchestration import (
-    _kick_managed_wake_impl as _kick_managed_wake,
-)
-from omnigent.server.routes._sessions.orchestration import (
-    _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
-)
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -1179,7 +1146,9 @@ def register_core_routes(
                     await _send({"type": "changed", "items": changed})
                 if removed:
                     await _send({"type": "removed", "ids": removed})
-            if time.monotonic() - last_send_monotonic >= _SESSION_UPDATES_HEARTBEAT_INTERVAL_S:
+            from omnigent.server.routes import sessions as _sf
+
+            if time.monotonic() - last_send_monotonic >= _sf._SESSION_UPDATES_HEARTBEAT_INTERVAL_S:
                 await _send({"type": "heartbeat"})
 
         async def _reader() -> None:
@@ -1207,7 +1176,9 @@ def register_core_routes(
                     if isinstance(cid, str) and cid not in unique:
                         unique.add(cid)
                         deduped.append(cid)
-                if len(deduped) > _SESSION_UPDATES_MAX_WATCHED:
+                from omnigent.server.routes import sessions as _sf
+
+                if len(deduped) > _sf._SESSION_UPDATES_MAX_WATCHED:
                     # Ids past the cap get no push updates and are never reported
                     # "removed" (they aren't watched). The client's low-rate list
                     # reconciliation still covers them, but log the silent drop so
@@ -1215,11 +1186,11 @@ def register_core_routes(
                     _logger.warning(
                         "session-updates watch-set truncated to %d of %d distinct ids "
                         "for user %r; ids beyond the cap rely on list-poll reconciliation",
-                        _SESSION_UPDATES_MAX_WATCHED,
+                        _sf._SESSION_UPDATES_MAX_WATCHED,
                         len(deduped),
                         user_id,
                     )
-                    deduped = deduped[:_SESSION_UPDATES_MAX_WATCHED]
+                    deduped = deduped[: _sf._SESSION_UPDATES_MAX_WATCHED]
                 # The watched set after capping — used to prune baselines for ids
                 # the client no longer watches (including any just truncated).
                 watched_set = set(deduped)
@@ -1241,7 +1212,9 @@ def register_core_routes(
         async def _ticker() -> None:
             """Emit deltas / heartbeats on a fixed interval."""
             while True:
-                await asyncio.sleep(_SESSION_UPDATES_RESCAN_INTERVAL_S)
+                from omnigent.server.routes import sessions as _sf
+
+                await asyncio.sleep(_sf._SESSION_UPDATES_RESCAN_INTERVAL_S)
                 async with emit_lock:
                     try:
                         await _emit_deltas()
