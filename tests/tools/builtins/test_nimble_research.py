@@ -697,6 +697,94 @@ def test_oversized_trust_reasoning_is_capped(
     assert reasoning.endswith("…")
 
 
+@respx.mock
+def test_control_char_run_id_from_poll_hop_returns_error(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """A control char in the API-supplied run id fails cleanly on the poll hop."""
+    bad = "task_run_\n0000"
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued", id=bad)))
+    out = _invoke(_config(), tool_ctx)
+    assert out.startswith("Nimble research run "), out
+    assert "polling failed" in out
+
+
+@respx.mock
+def test_control_char_run_id_from_result_hop_returns_error(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """A control char in the API-supplied run id fails cleanly on the result hop."""
+    bad = "task_run_\n0000"
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed", id=bad)))
+    out = _invoke(_config(), tool_ctx)
+    assert out.startswith("Nimble research run "), out
+    assert "result fetch failed" in out
+
+
+@respx.mock
+def test_all_trust_string_fields_are_capped(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
+    """Every API-supplied trust string is bounded; the envelope stays small."""
+    big = "z" * 100_000
+    trust = {
+        "confidence": big,
+        "reasoning": big,
+        "sources": [{"url": big, "type": big, "title": big}],
+        "claims": [
+            {
+                "callout": 1,
+                "path": big,
+                "confidence": big,
+                "citations": [{"url": big, "title": big}],
+            }
+        ],
+    }
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result(trust=trust)))
+    raw = _invoke(_config(), tool_ctx)
+    envelope = json.loads(raw)
+    t = envelope["trust"]
+    for value in (t["confidence"], t["reasoning"]):
+        assert len(value) <= 2_010, "trust scalar not capped"
+    src = t["sources"][0]
+    for key in ("url", "type", "title"):
+        assert len(src[key]) <= 2_010, f"source.{key} not capped"
+    claim = t["claims"][0]
+    for key in ("path", "confidence"):
+        assert len(claim[key]) <= 2_010, f"claim.{key} not capped"
+    assert len(claim["citations"][0]["url"]) <= 2_010
+    assert len(claim["citations"][0]["title"]) <= 2_010
+    assert len(raw) < 50_000, f"envelope not bounded: {len(raw)} chars"
+
+
+@respx.mock
+def test_non_string_source_url_is_dropped(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
+    """A non-string url is dropped rather than passed through unbounded."""
+    trust = {
+        "confidence": "high",
+        "reasoning": "r",
+        "sources": [{"url": {"nested": "x" * 50_000}}],
+        "claims": [],
+    }
+    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result(trust=trust)))
+    raw = _invoke(_config(), tool_ctx)
+    assert json.loads(raw)["trust"]["sources"][0]["url"] is None
+    assert len(raw) < 10_000
+
+
+@respx.mock
+def test_oversized_server_error_message_is_capped(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """A hostile multi-KB server error message is bounded in the error string."""
+    respx.post(_RUNS_URL).mock(
+        return_value=httpx.Response(500, json={"message": "q" * 100_000, "task_id": "t"})
+    )
+    out = _invoke(_config(), tool_ctx)
+    assert out.startswith("Nimble research error: HTTP 500")
+    assert len(out) < 5_000, f"error string not bounded: {len(out)} chars"
+
+
 # ---------------------------------------------------------------------------
 # Secret hygiene
 # ---------------------------------------------------------------------------

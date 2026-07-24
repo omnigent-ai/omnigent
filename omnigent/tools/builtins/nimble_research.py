@@ -213,10 +213,10 @@ def _http_error_detail(resp: httpx.Response) -> str:
     message = body.get("message") or body.get("msg")
     if not isinstance(message, str) or not message.strip():
         return ""
-    detail = f": {message.strip()}"
+    detail = f": {_cap_field(message.strip())}"
     task_id = body.get("task_id")
     if isinstance(task_id, str) and task_id:
-        detail += f" (task: {task_id})"
+        detail += f" (task: {_cap_field(task_id)})"
     return detail
 
 
@@ -236,7 +236,7 @@ def _run_error_message(run_id: str, status: str, error: object) -> str:
         if isinstance(raw, str):
             message = raw.strip()
     if message:
-        return f"Nimble research run {run_id} {status}: {message}"
+        return f"Nimble research run {run_id} {status}: {_cap_field(message)}"
     return f"Nimble research run {run_id} {status} without an error message."
 
 
@@ -296,7 +296,8 @@ def _start_run(
     run_id = run.get("id")
     if not isinstance(run_id, str) or not run_id.startswith(_RUN_ID_PREFIX):
         return None, (
-            f"Nimble research error: expected a '{_RUN_ID_PREFIX}...' run id, got {run_id!r}."
+            f"Nimble research error: expected a '{_RUN_ID_PREFIX}...' run id, "
+            f"got {_cap_field(repr(run_id))}."
         )
     return run, None
 
@@ -334,7 +335,8 @@ def _poll_until_terminal(
             _NONTERMINAL_STATUSES | _TERMINAL_STATUSES
         ):
             return None, (
-                f"Nimble research run {run_id} returned unknown status {status!r} "
+                f"Nimble research run {run_id} returned unknown status "
+                f"{_cap_field(repr(status))} "
                 f"(agent {agent_id}); treating this as a protocol error."
             )
         if status in _TERMINAL_STATUSES:
@@ -357,6 +359,8 @@ def _poll_until_terminal(
                 headers=headers,
                 timeout=_HTTP_TIMEOUT_S,
             )
+        except httpx.InvalidURL as exc:
+            return None, f"Nimble research run {run_id} polling failed: {exc}"
         except httpx.RequestError as exc:
             transient_failures += 1
             if transient_failures > _MAX_TRANSIENT_RETRIES:
@@ -424,7 +428,7 @@ def _fetch_result(
                 headers=headers,
                 timeout=_HTTP_TIMEOUT_S,
             )
-        except httpx.RequestError as exc:
+        except (httpx.RequestError, httpx.InvalidURL) as exc:
             return None, f"Nimble research run {run_id} result fetch failed: {exc}"
         if resp.status_code == 409:
             # The run was observed completed, so a 409 here is a brief
@@ -494,7 +498,7 @@ def _map_trust(trust: object) -> dict[str, Any]:
     mapped: dict[str, Any] = {}
     confidence = trust.get("confidence")
     if isinstance(confidence, str):
-        mapped["confidence"] = confidence
+        mapped["confidence"] = _cap_field(confidence)
     reasoning = trust.get("reasoning")
     if isinstance(reasoning, str):
         mapped["reasoning"] = _cap_field(reasoning)
@@ -506,7 +510,7 @@ def _map_trust(trust: object) -> dict[str, Any]:
         if not isinstance(source, dict):
             continue
         url = source.get("url")
-        entry: dict[str, Any] = {"url": _cap_field(url) if isinstance(url, str) else url}
+        entry: dict[str, Any] = {"url": _cap_field(url) if isinstance(url, str) else None}
         if isinstance(source.get("type"), str):
             entry["type"] = _cap_field(source["type"])
         if isinstance(source.get("title"), str):
@@ -526,9 +530,9 @@ def _map_trust(trust: object) -> dict[str, Any]:
         if isinstance(claim.get("callout"), int):
             entry["callout"] = claim["callout"]
         if isinstance(claim.get("path"), str):
-            entry["path"] = claim["path"]
+            entry["path"] = _cap_field(claim["path"])
         if isinstance(claim.get("confidence"), str):
-            entry["confidence"] = claim["confidence"]
+            entry["confidence"] = _cap_field(claim["confidence"])
         raw_citations = claim.get("citations")
         citations = raw_citations if isinstance(raw_citations, list) else []
         kept_citations: list[dict[str, Any]] = []
@@ -536,7 +540,7 @@ def _map_trust(trust: object) -> dict[str, Any]:
             if not isinstance(citation, dict):
                 continue
             curl = citation.get("url")
-            cite: dict[str, Any] = {"url": _cap_field(curl) if isinstance(curl, str) else curl}
+            cite: dict[str, Any] = {"url": _cap_field(curl) if isinstance(curl, str) else None}
             if isinstance(citation.get("title"), str):
                 cite["title"] = _cap_field(citation["title"])
             kept_citations.append(cite)
