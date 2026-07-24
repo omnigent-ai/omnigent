@@ -479,8 +479,8 @@ describe("mobile in-place project picker", () => {
   // Desktop opens the "Add to project" item as a side-flyout submenu, but a
   // side flyout has no room on mobile. There the item instead swaps the kebab
   // body in place: the main actions are replaced by the project picker (search
-  // + list + Create new project) plus a Back control that returns to the main
-  // menu — no submenu, no close/reopen. Desktop keeps the flyout untouched.
+  // + list) plus a Back control that returns to the main menu — no submenu, no
+  // close/reopen. Desktop keeps the flyout untouched.
 
   it("swaps the kebab body to the project picker in place, and Back returns", () => {
     mocks.isMobile = true;
@@ -499,12 +499,11 @@ describe("mobile in-place project picker", () => {
     expect(moveItem).not.toHaveAttribute("aria-haspopup", "menu");
 
     // Tapping it swaps the body in place to the project picker — the main
-    // actions are gone, and the picker (search + project + Create new project)
-    // plus a Back control are shown.
+    // actions are gone, and the picker (search + project list) plus a Back
+    // control are shown.
     fireEvent.click(moveItem);
     expect(screen.getByPlaceholderText("Search projects")).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /Sprint 42/ })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: /Create new project/ })).toBeInTheDocument();
     expect(screen.getByTestId("project-picker-back")).toBeInTheDocument();
     // The main actions are no longer rendered — the body was replaced, not
     // stacked beside a flyout.

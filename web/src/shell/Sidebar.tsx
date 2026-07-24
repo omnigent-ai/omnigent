@@ -40,7 +40,6 @@ import {
   PencilIcon,
   PinIcon,
   PinOffIcon,
-  PlusIcon,
   SearchIcon,
   SettingsIcon,
   ShareIcon,
@@ -3518,26 +3517,10 @@ function ProjectPickerMenu({
 }) {
   const { data: projects = [] } = useProjects();
   const [search, setSearch] = useState("");
-  const [creatingNew, setCreatingNew] = useState(false);
-  const [newProjectName, setNewProjectName] = useState("");
-  const newInputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (creatingNew) {
-      newInputRef.current?.focus();
-    }
-  }, [creatingNew]);
 
   const filtered = search
     ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
     : projects;
-
-  function handleNewProjectCommit() {
-    const name = newProjectName.trim();
-    setCreatingNew(false);
-    setNewProjectName("");
-    if (name) onSelect(name);
-  }
 
   // Keep keystrokes inside the inputs from reaching the menu's typeahead /
   // navigation handlers (which would otherwise steal letters and arrows).
@@ -3566,54 +3549,20 @@ function ProjectPickerMenu({
             )}
           </C.Item>
         ))}
-        {filtered.length === 0 && !creatingNew && (
+        {filtered.length === 0 && (
           <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
         )}
       </div>
-      <div className="border-t pt-1">
-        {creatingNew ? (
-          <div className="flex items-center gap-1 px-2 py-1">
-            <input
-              ref={newInputRef}
-              className="flex-1 bg-transparent text-xs outline-none"
-              placeholder="Project name…"
-              value={newProjectName}
-              onChange={(e) => setNewProjectName(e.target.value)}
-              onKeyDown={(e) => {
-                e.stopPropagation();
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleNewProjectCommit();
-                }
-                if (e.key === "Escape") {
-                  setCreatingNew(false);
-                  setNewProjectName("");
-                }
-              }}
-            />
-          </div>
-        ) : (
-          <C.Item
-            className="px-2 py-1"
-            // Keep the menu open so the inline input can take over in place.
-            onSelect={(e) => {
-              e.preventDefault();
-              setCreatingNew(true);
-            }}
-          >
-            <PlusIcon className="size-3.5 shrink-0" />
-            Create new project
-          </C.Item>
-        )}
-        {currentProject && (
+      {currentProject && (
+        <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect("")}>
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}
             </span>
           </C.Item>
-        )}
-      </div>
+        </div>
+      )}
     </>
   );
 }
