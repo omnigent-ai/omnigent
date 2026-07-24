@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-HarnessAvailability = bool | str
+from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 
 # Structured error code carried in ``HostLaunchRunnerResultFrame.error_code``
 # when the host refuses a launch because the session's harness is not
@@ -38,6 +38,7 @@ class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
     HELLO = "host.hello"
+    HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
     STOP_RUNNER = "host.stop_runner"
@@ -57,8 +58,12 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    INSTALL_HARNESS = "host.install_harness"
+    INSTALL_HARNESS_RESULT = "host.install_harness_result"
     FS_REQUEST = "host.fs_request"
     FS_RESULT = "host.fs_result"
+    MODEL_OPTIONS = "host.model_options"
+    MODEL_OPTIONS_RESULT = "host.model_options_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -81,8 +86,9 @@ class HostHelloFrame:
         (see ``omnigent.onboarding.harness_readiness``). Keys
         cover every accepted harness spelling. ``None`` means
         unknown (an older host that doesn't report it) — never
-        treat ``None`` as "nothing is configured". Recomputed on
-        each (re)connect; the launch-time check is authoritative.
+        treat ``None`` as "nothing is configured". Changes arrive in
+        :class:`HostHarnessReadinessFrame`; launch-time checks remain
+        authoritative.
     """
 
     version: str
@@ -92,6 +98,17 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+
+
+@dataclass
+class HostHarnessReadinessFrame:
+    """Host's refreshed per-harness readiness while the tunnel stays open.
+
+    :param configured_harnesses: Current launch readiness keyed by every
+        accepted harness spelling. Sent only when the map changes.
+    """
+
+    configured_harnesses: dict[str, HarnessAvailability]
 
 
 @dataclass
@@ -567,6 +584,55 @@ class HostCreateDirResultFrame:
 
 
 @dataclass
+class HostInstallHarnessFrame:
+    """Server → host: install a harness CLI on the host.
+
+    Backs ``POST /v1/hosts/{id}/harnesses/{harness}/install``, used by
+    the Web UI's New Chat dialog so a user can install a missing,
+    npm-installable harness onto a connected host without dropping to a
+    terminal. The host runs the same :func:`install_harness_cli` the
+    ``omnigent setup`` wizard uses. Only allowlisted, npm-installable
+    harnesses reach this frame — the server rejects curl/brew and
+    interactive-auth harnesses before sending it.
+
+    :param request_id: Correlates the result, e.g. ``"req_install_1"``.
+    :param harness: Harness identifier to install, e.g. ``"claude"`` or
+        ``"codex"``. The host maps it to its install-spec key.
+    """
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostInstallHarnessResultFrame:
+    """Host → server: outcome of an install request.
+
+    Carries the freshly-recomputed readiness map so the server can
+    update its view and the UI can flip the harness badge without
+    waiting for a reconnect (the ``host.hello`` handshake is the only
+    other readiness carrier, sent once per connect).
+
+    :param request_id: Correlates to the
+        :class:`HostInstallHarnessFrame`, e.g. ``"req_install_1"``.
+    :param status: ``"ok"`` when the installer ran and the binary landed
+        on ``PATH``, ``"failed"`` otherwise. A ``"failed"`` status pairs
+        with a human-readable ``error`` (e.g. ``"npm not found"``).
+    :param configured_harnesses: The host's readiness map recomputed
+        after the install attempt, e.g. ``{"claude-native": True,
+        "codex-native": "needs-auth"}``. ``None`` when the install could
+        not run (the server keeps its prior readiness view).
+    :param error: Why the install failed, e.g. ``"npm not found"`` or
+        ``"install timed out"``. ``None`` on success.
+    """
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostFsRequestFrame:
     """Server → host: read-only workspace filesystem request.
 
@@ -619,8 +685,27 @@ class HostFsResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostModelOptionsFrame:
+    """Server → host: resolve pre-launch model choices for a harness."""
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostModelOptionsResultFrame:
+    """Host → server: pre-launch model choices resolved on that machine."""
+
+    request_id: str
+    status: str
+    models: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
+    | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
     | HostStopRunnerFrame
@@ -642,6 +727,8 @@ HostFrame = (
     | HostCreateDirResultFrame
     | HostFsRequestFrame
     | HostFsResultFrame
+    | HostModelOptionsFrame
+    | HostModelOptionsResultFrame
 )
 
 
@@ -690,6 +777,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "configured_harnesses": frame.configured_harnesses,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+            }
+        )
+    if isinstance(frame, HostHarnessReadinessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_READINESS.value,
+                "configured_harnesses": frame.configured_harnesses,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -882,6 +976,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostInstallHarnessFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSTALL_HARNESS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostInstallHarnessResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.INSTALL_HARNESS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostFsRequestFrame):
         return _encode_payload(
             {
@@ -902,6 +1014,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "payload": frame.payload,
                 "error_status": frame.error_status,
                 "error_code": frame.error_code,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostModelOptionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MODEL_OPTIONS.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostModelOptionsResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.MODEL_OPTIONS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "models": frame.models,
                 "error": frame.error,
             }
         )
@@ -967,6 +1097,8 @@ def _decode_known_host_frame(
     match kind:
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
+        case HostFrameKind.HARNESS_READINESS:
+            return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:
@@ -1005,10 +1137,18 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.INSTALL_HARNESS:
+            return _decode_install_harness(msg)
+        case HostFrameKind.INSTALL_HARNESS_RESULT:
+            return _decode_install_harness_result(msg)
         case HostFrameKind.FS_REQUEST:
             return _decode_fs_request(msg)
         case HostFrameKind.FS_RESULT:
             return _decode_fs_result(msg)
+        case HostFrameKind.MODEL_OPTIONS:
+            return _decode_model_options(msg)
+        case HostFrameKind.MODEL_OPTIONS_RESULT:
+            return _decode_model_options_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1027,6 +1167,19 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
+
+
+def _decode_harness_readiness(msg: dict[str, Any]) -> HostHarnessReadinessFrame:
+    """Decode a live harness-readiness refresh frame."""
+    configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
+    if configured_harnesses is None:
+        raise ValueError("harness readiness frame requires a configured_harnesses object")
+    raw = msg["configured_harnesses"]
+    if len(configured_harnesses) != len(raw):
+        raise ValueError("harness readiness frame contains an unsupported availability state")
+    if not configured_harnesses:
+        raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
+    return HostHarnessReadinessFrame(configured_harnesses=configured_harnesses)
 
 
 def _decode_launch_runner(msg: dict[str, Any]) -> HostLaunchRunnerFrame:
@@ -1345,6 +1498,32 @@ def _decode_create_dir_result(msg: dict[str, Any]) -> HostCreateDirResultFrame:
     )
 
 
+def _decode_install_harness(msg: dict[str, Any]) -> HostInstallHarnessFrame:
+    """Decode a host.install_harness request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.install_harness frame.
+    """
+    return HostInstallHarnessFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+    )
+
+
+def _decode_install_harness_result(msg: dict[str, Any]) -> HostInstallHarnessResultFrame:
+    """Decode a host.install_harness_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.install_harness_result frame.
+    """
+    return HostInstallHarnessResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
 def _decode_fs_request(msg: dict[str, Any]) -> HostFsRequestFrame:
     """Decode a host.fs_request request frame.
 
@@ -1383,6 +1562,27 @@ def _decode_fs_result(msg: dict[str, Any]) -> HostFsResultFrame:
         payload=payload,
         error_status=error_status,
         error_code=_optional_nullable_str(msg, "error_code"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
+    """Decode a host.model_options request frame."""
+    return HostModelOptionsFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+    )
+
+
+def _decode_model_options_result(msg: dict[str, Any]) -> HostModelOptionsResultFrame:
+    """Decode a host.model_options_result frame."""
+    models = msg.get("models", [])
+    if not isinstance(models, list) or not all(isinstance(model, dict) for model in models):
+        raise ValueError("frame field must be a list of JSON objects: 'models'")
+    return HostModelOptionsResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        models=models,
         error=_optional_nullable_str(msg, "error"),
     )
 
@@ -1454,7 +1654,7 @@ def _optional_str_availability_map(
     Tolerant by design: absent, null, or non-mapping values all decode
     to ``None`` ("unknown") rather than raising, so an older or newer
     peer's hello never breaks the tunnel handshake. Entries with a
-    non-string key or non-bool/string value are dropped for the same reason.
+    non-string key or unsupported readiness value are dropped for the same reason.
 
     :param msg: Decoded frame object.
     :param key: Field name, e.g. ``"configured_harnesses"``.
@@ -1464,7 +1664,7 @@ def _optional_str_availability_map(
     val = msg.get(key)
     if not isinstance(val, dict):
         return None
-    return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, (bool, str))}
+    return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
 
 
 def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:

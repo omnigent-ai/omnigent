@@ -152,6 +152,18 @@ async def _register_routes(
         else:
             await route.continue_()
 
+    async def handle_agent_scan(route: Route) -> None:
+        # Neutralize agent discovery so only the stubbed Claude agent feeds the
+        # picker. On the shared e2e_ui server, sessions other tests left behind
+        # would otherwise leak in as discovered custom agents — flipping the
+        # picker's "Custom agents" group on and folding "Create custom agent"
+        # into a submenu, so the top-level create row this test clicks is absent.
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"data": []}),
+        )
+
     if managed:
 
         async def handle_info(route: Route) -> None:
@@ -165,6 +177,9 @@ async def _register_routes(
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
+    # Registered after the broad sessions glob so it wins the kind=any discovery
+    # scan; the bare conversation-list GET still falls through to handle_sessions.
+    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
 
 async def _seed_workspace(page) -> None:
@@ -175,6 +190,17 @@ async def _seed_workspace(page) -> None:
             JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
         );"""
     )
+
+
+async def _open_create_agent(page) -> None:
+    """Open the agent picker and click "Create custom agent".
+
+    With no custom agents registered, the create action is a top-level row in
+    the picker (it only folds into a "Custom agents" submenu once custom agents
+    exist), so open the dropdown and click the create item directly.
+    """
+    await page.get_by_test_id("new-chat-landing-agent-select").click()
+    await page.get_by_test_id("new-chat-landing-create-agent").click()
 
 
 # ── Tests ──────────────────────────────────────────────────────────
@@ -204,7 +230,8 @@ async def _drive_dialog_opens(base_url: str, session_id: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Open the agent dropdown.
+            # Open the agent dropdown. With no custom agents yet, "Create custom
+            # agent" is a top-level row (not behind a "Custom agents" submenu).
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
             # "Create custom agent" item should be visible.
@@ -251,8 +278,7 @@ async def _drive_create_and_submit(base_url: str, session_id: str) -> None:
             )
 
             # Open dropdown → Create custom agent.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
 
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
@@ -314,8 +340,7 @@ async def _drive_mcp_server(base_url: str, session_id: str) -> None:
             )
 
             # Open dropdown → Create custom agent.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
 
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
@@ -378,8 +403,7 @@ async def _drive_cancel(base_url: str, session_id: str) -> None:
             )
 
             # Open dropdown → Create custom agent.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
 
             dialog = page.get_by_test_id("create-agent-dialog")
             await expect(dialog).to_be_visible(timeout=5_000)
@@ -440,11 +464,14 @@ async def _drive_hidden_on_sandbox(base_url: str, session_id: str) -> None:
                 "Databricks Sandbox"
             )
 
-            # On the sandbox, the create item is omitted from the picker.
+            # On the sandbox, "Create custom agent" is not offered (a managed
+            # sandbox has no create path for an uploaded bundle), so it's never
+            # in the DOM.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             await expect(page.get_by_test_id("new-chat-landing-create-agent")).to_have_count(0)
 
-            # Switch to the connected host: the item reappears and opens.
+            # Switch to the connected host: with no custom agents yet, create is
+            # a top-level row (not behind a "Custom agents" submenu) and opens.
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
@@ -495,8 +522,7 @@ async def _drive_pending_dropped_on_sandbox(base_url: str, session_id: str) -> N
             # Switch to the connected host, then create + submit a pending agent.
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{_HOST_ID}").click()
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            await page.get_by_test_id("new-chat-landing-create-agent").click()
+            await _open_create_agent(page)
             await expect(page.get_by_test_id("create-agent-dialog")).to_be_visible(timeout=5_000)
             await page.get_by_test_id("create-agent-name").fill("pending-agent")
             await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")

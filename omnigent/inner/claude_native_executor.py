@@ -91,10 +91,6 @@ class ClaudeNativeExecutor(Executor):
                     inject_user_message,
                     self._bridge_dir,
                     content=text,
-                    # Mid-turn steering: a queued prompt may not fire
-                    # UserPromptSubmit promptly, so keep the legacy
-                    # pane-only verification here (see #2061).
-                    verify_delivery=False,
                 )
         except RuntimeError:
             return False

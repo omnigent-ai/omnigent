@@ -5,7 +5,7 @@
 // omitted. ConversationRow highlights the row whose id matches the active
 // route param. When the user clicks a sub-agent the URL becomes
 // `/c/<childId>`, which matches no sidebar row, so the parent row lost its
-// `bg-muted` highlight. The fix resolves the active conversation's
+// neutral sidebar-active highlight. The fix resolves the active conversation's
 // top-level root (via useActiveRootSessionId, walking parentSessionId) and
 // highlights against that, so the parent stays selected while viewing any
 // descendant.
@@ -37,6 +37,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useProjectSessions: () => ({ data: undefined, isLoading: false, isError: false, error: null }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -132,6 +134,26 @@ function rowFor(id: string): HTMLElement {
 }
 
 describe("sidebar highlight while viewing a sub-agent", () => {
+  it("renders the official Omnigent wordmark instead of styled text", () => {
+    mockConversations([]);
+    renderAt("/");
+
+    const wordmark = screen.getByTestId("sidebar-wordmark");
+    expect(wordmark).toHaveAttribute("alt", "Omnigent");
+    expect(wordmark).toHaveClass("h-[15px]", "dark:invert");
+    expect(wordmark.getAttribute("src")).toContain("omnigent-wordmark");
+  });
+
+  it("uses the same Otto structural-container radius as the workspace rail", () => {
+    mockConversations([]);
+    renderAt("/");
+
+    expect(screen.getByRole("complementary", { name: "Conversations" })).toHaveClass(
+      "md:rounded-[var(--radius-otto-md)]",
+      "md:m-2",
+    );
+  });
+
   it("highlights the top-level parent row when the active session is its child", async () => {
     mockConversations([topLevelConv("conv_root"), topLevelConv("conv_other")]);
     // conv_child is a sub-agent of conv_root and is NOT in the sidebar list.
@@ -145,8 +167,8 @@ describe("sidebar highlight while viewing a sub-agent", () => {
     renderAt("/c/conv_child");
 
     // Once the parent walk resolves, the root's row carries the highlight.
-    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-muted"));
-    expect(rowFor("conv_other")).not.toHaveClass("bg-muted");
+    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"));
+    expect(rowFor("conv_other")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("still highlights a top-level session viewed directly", async () => {
@@ -157,7 +179,7 @@ describe("sidebar highlight while viewing a sub-agent", () => {
 
     // A top-level session resolves to itself; highlight lands immediately and
     // doesn't bleed onto siblings.
-    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-muted"));
-    expect(rowFor("conv_other")).not.toHaveClass("bg-muted");
+    await waitFor(() => expect(rowFor("conv_root")).toHaveClass("bg-[var(--sidebar-active)]"));
+    expect(rowFor("conv_other")).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 });

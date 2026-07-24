@@ -86,7 +86,7 @@ Three transports, easy to confuse:
 
 ```bash
 cd /path/to/omnigent
-.venv/bin/omni server start          # detached managed server on a free loopback port
+.venv/bin/omni server --background          # detached managed server on a free loopback port
 .venv/bin/omni server status         # prints the URL, e.g. http://127.0.0.1:6767
 SERVER=http://127.0.0.1:6767         # use the printed URL below
 curl -s "$SERVER/health"             # {"status":"ok"}

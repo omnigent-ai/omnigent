@@ -2508,6 +2508,75 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert session_inbox.empty()
 
 
+@pytest.mark.parametrize(
+    ("arguments", "expected_error"),
+    [
+        ("{", "malformed JSON arguments"),
+        ("", "malformed JSON arguments"),
+        ("   ", "malformed JSON arguments"),
+        ("[]", "arguments must be a JSON object"),
+        ("42", "arguments must be a JSON object"),
+        ("null", "arguments must be a JSON object"),
+        ('"scalar"', "arguments must be a JSON object"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_tool_rejects_non_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: str,
+    expected_error: str,
+) -> None:
+    """
+    Malformed or non-object argument payloads fail before tool dispatch.
+
+    A silent ``{}`` substitution would run a default/no-argument system
+    tool after bad input; the shared parser must reject these shapes and
+    the underlying OS-env handler must never be entered.
+    """
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[object] = []
+
+    async def _spy_os_env_tool(*args: object, **kwargs: object) -> str:
+        calls.append((args, kwargs))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments=arguments)
+
+    assert json.loads(output) == {"error": expected_error}
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_accepts_empty_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid ``{}`` still reaches the tool with an empty argument dict."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[dict[str, Any]] = []
+
+    async def _spy_os_env_tool(
+        tool_name: str,
+        args: dict[str, Any],
+        **_kwargs: object,
+    ) -> str:
+        del tool_name
+        calls.append(args)
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments="{}")
+
+    assert json.loads(output) == {"ok": True}
+    assert calls == [{}]
+
+
 # ── End-to-end with real harness subprocess + real LLM ──
 
 
@@ -7118,6 +7187,59 @@ async def test_approval_event_without_content_flattened() -> None:
     assert resp.status_code == 204
     assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
     ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_spawn_handle_round_trips_to_sys_cancel_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawned handle can be passed directly to ``sys_cancel_async``."""
+    from omnigent.runner import tool_dispatch
+
+    async def _slow(**_kw: Any) -> str:
+        await asyncio.sleep(30)
+        return "late"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _slow)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    spawn_kw: dict[str, Any] = {
+        "server_client": None,
+        "terminal_registry": None,
+        "resource_registry": None,
+        "agent_spec": None,
+        "conversation_id": "conv_roundtrip",
+        "task_id": None,
+        "agent_id": None,
+        "agent_name": None,
+        "runner_workspace": None,
+        "mcp_manager": None,
+        "filesystem_registry": None,
+    }
+    handle_raw = tool_dispatch._spawn_async_tool(
+        {"tool": "slow", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    handle = json.loads(handle_raw)
+    assert handle["task_id"] == handle["handle_id"]
+    assert handle["status"] == "in_progress"
+    assert "sys_cancel_async" in handle["message"]
+    assert f"handle_id={handle['handle_id']!r}" in handle["message"]
+
+    bg_task, _evt = tasks[handle["handle_id"]]
+    cancel_raw = tool_dispatch._cancel_async_tool(
+        {"handle_id": handle["handle_id"]},
+        session_async_tasks=tasks,
+    )
+    assert json.loads(cancel_raw) == {
+        "cancelled": True,
+        "handle_id": handle["handle_id"],
+    }
+
+    await bg_task
+    assert inbox.get_nowait()["status"] == "cancelled"
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,15 @@
 # omnidev
 
-Dev tooling for Omnigent, in one binary with two independent capabilities:
+Dev tooling for Omnigent, in one binary with three surfaces:
 
 1. A per-repo dev **pod supervisor** (bare `omnidev`) — the default.
-2. **Install management** (`omnidev install`/`update`/`check`) — install and
-   keep a git-based omnigent up to date. See
+2. **Install management** (`omnidev install`/`update`/`check`) — install
+   and keep a git-based omnigent up to date. See
    [Managing your omnigent install](#managing-your-omnigent-install). These
-   subcommands need no checkout and run anywhere.
+   need no checkout and run anywhere.
+3. **An omnigent passthrough** (`omnidev omnigent …`) — run any omnigent command
+   against the current checkout's pod, with the pod's isolated env applied.
+   See [Running omnigent commands](#running-omnigent-commands).
 
 ## Pod supervisor
 
@@ -138,6 +141,34 @@ feel familiar.
 | `c` | Clear the focused pane |
 | `q` / `Ctrl-C` | Quit and tear down all processes |
 
+## Running omnigent commands
+
+`omnidev omnigent …` runs any omnigent command against the current checkout's
+pod, via `uv run omnigent …`, with the pod's isolated env applied
+(`OMNIGENT_DATA_DIR`, `OMNIGENT_DATABASE_URI`, `OMNIGENT_CONFIG_HOME`,
+`OMNIGENT_URL`). It resolves the same repo root and pod dir the supervisor
+uses, so a command talks to the pod's database and config — and `OMNIGENT_URL`
+points at a running supervisor's server when one is up.
+
+```bash
+omnidev omnigent agent run "fix the flaky test"
+omnidev omnigent config show
+omnidev --pod-dir /tmp/x omnigent agent list   # target a specific pod
+```
+
+Everything after the subcommand is forwarded verbatim to omnigent. It runs in
+the foreground (inheriting your stdio) and exits with omnigent's status code.
+It acquires **no** lock, so it coexists with a running supervisor — the common
+case: the server is up and you issue a command against it. Use `--` to pass
+flags that look like omnidev's own:
+
+```bash
+omnidev omnigent -- --verbose agent run …
+```
+
+Supervisor-only flags (`--server-port`, `--clean`, `--no-vite`, …) don't apply
+to the passthrough; only `--pod-dir` is shared.
+
 ## Managing your omnigent install
 
 For people who *run* omnigent (installed from git via `uv tool install`) rather
@@ -145,8 +176,8 @@ than develop it. This wraps the fiddly PEP 508 install syntax and adds a daily
 update check — filling a gap, since omnigent's own update notice only works for
 PyPI-wheel installs and skips git installs.
 
-These subcommands manage the global tool and work from **any directory** (no
-checkout needed).
+These subcommands manage the global tool and work from **any directory**
+(no checkout needed).
 
 ```
 omnidev install     # uv tool install omnigent from git (databricks extra, main)
@@ -185,6 +216,6 @@ result (`${XDG_CACHE_HOME:-~/.cache}/omnidev/omnigent-check.json`) and, when
 stale (>24h), refreshes it in a detached background process — so shell startup
 never blocks on the network. When a newer commit is available it prints a notice
 and, on a terminal, prompts `Update omnigent now? [y/N]`; on yes it runs
-`omnidev update` in the foreground. Declining suppresses that same commit until a
-newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
+`omnidev update` in the foreground. Declining suppresses that same commit until
+a newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
 to silence omnigent's own separate notice.

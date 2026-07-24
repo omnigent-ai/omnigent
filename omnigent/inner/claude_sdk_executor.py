@@ -802,7 +802,11 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
     if not tool_names:
         return system_prompt
 
-    examples = [name for name in ("sys_session_send", "sys_session_create") if name in tool_names]
+    examples = [
+        name
+        for name in ("sys_session_rename", "sys_session_send", "sys_session_create")
+        if name in tool_names
+    ]
     if examples:
         example_text = "; ".join(
             f"use `mcp__omnigent__{name}` when instructions say `{name}`" for name in examples

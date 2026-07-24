@@ -163,24 +163,41 @@ prompt: |
     ("powerful", "seamless", "effortless", "game-changing"), no hype. Prefer a
     real example over an abstraction.
 
-  Do not add a hero image — leave any `heroArt` frontmatter blank for a human.
+  Leave `heroArt: ""` in the frontmatter. The workflow generates the hero image
+  from your `IMAGE_PROMPT` (below) and fills `heroArt` in; do not set it yourself.
   Ground every fact in the material; if unsure, omit it and note it under
   "Manual review needed".
 
   ## Output contract (your final assistant text)
-  On the line IMMEDIATELY BEFORE `<!-- BLOG_DRAFT_SUMMARY -->`, emit a single
-  `BLOG_PR_TITLE:` line — a concise, imperative summary grounded in the feature
-  (e.g. `BLOG_PR_TITLE: add feature blog for side-by-side harness sessions`).
-  Keep it under 60 characters, no trailing period, and do NOT prefix it with
-  `blog:` (the workflow adds that). This becomes the blog PR title.
+  Emit these two single-line fields (each on its own line), then the summary
+  block. Extraction is by prefix, so order between the two does not matter, but
+  `BLOG_PR_TITLE:` MUST be the line immediately before `<!-- BLOG_DRAFT_SUMMARY -->`.
+
+  - `IMAGE_PROMPT:` — one sentence describing a concrete visual SCENE that
+    depicts THIS feature's content, for an illustrated hero image. Describe the
+    subject only (what is happening, the objects/actors and their relationship),
+    grounded in what the feature actually does. Examples: for a queue/steer
+    feature, "a person lining up a stack of chat message cards that feed one at a
+    time into a working AI agent, with a hand redirecting one mid-flight"; for a
+    multi-harness feature, "several distinct robot agents plugging into a single
+    central hub that routes their work". Rules: NO text, words, letters, logos,
+    UI screenshots, charts, or watermarks in the scene; do NOT mention colors,
+    art style, aspect ratio, or "flat vector / navy / starfish" — the workflow
+    appends the fixed brand style. Just the subject.
+  - `BLOG_PR_TITLE:` — a concise, imperative summary grounded in the feature
+    (e.g. `BLOG_PR_TITLE: add feature blog for side-by-side harness sessions`).
+    Keep it under 60 characters, no trailing period, and do NOT prefix it with
+    `blog:` (the workflow adds that). This becomes the blog PR title.
 
   Then, after a line containing exactly `<!-- BLOG_DRAFT_SUMMARY -->`, emit:
   - `## Post drafted` — the path of the single post file you created
     (`app/blog/<SLUG>/page.mdx`). You should not have edited any other file.
   - `## Manual review needed` — a checklist: `- [ ] <item> — <why>`. Always
-    include the mandatory demo line (the `{/* DEMO REQUIRED */}` marker you left)
-    and the hero art + author byline as items a human must complete before merge.
-    Add any fact you had to omit for lack of grounding.
+    include the mandatory demo line (the `{/* DEMO REQUIRED */}` marker you left).
+    Note that the hero image is auto-generated from your `IMAGE_PROMPT` and the
+    author byline defaults to `omnigent`; list each as "review / optionally
+    replace" rather than a blocking task. Add any fact you had to omit for lack
+    of grounding.
   Then STOP. Do NOT `git commit`, push, or open a PR — the workflow does that.
   Leave your edits in SITE_REPO's working tree and print the summary.
 

@@ -185,8 +185,9 @@ async def _drive(base_url: str) -> None:
                 );"""
             )
 
-            # 1. Default (toggle off): both harnesses listed. Goose is badged
-            #    "needs setup" but still selectable.
+            # 1. Default (toggle off): Claude lists inline; Goose is unconfigured
+            #    on the host, so it folds into the "More" submenu (badged "needs
+            #    setup") but is still reachable/selectable.
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
@@ -195,6 +196,11 @@ async def _drive(base_url: str) -> None:
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_CLAUDE_AGENT_ID}")
             ).to_be_visible(timeout=30_000)
+            # Goose isn't inline — drill into "More" to reveal it.
+            await expect(
+                page.get_by_test_id(f"new-chat-landing-agent-{_GOOSE_AGENT_ID}")
+            ).to_have_count(0)
+            await page.get_by_test_id("new-chat-landing-harness-more").click()
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_GOOSE_AGENT_ID}")
             ).to_be_visible()

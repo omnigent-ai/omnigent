@@ -19,6 +19,7 @@
 import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
+  CalendarClockIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -133,6 +134,13 @@ export function CommandPalette({
         icon: InboxIcon,
         keywords: ["notifications", "comments", "needs response"],
         run: () => navigate("/inbox"),
+      },
+      {
+        id: "go-tasks",
+        label: "Go to Scheduled tasks",
+        icon: CalendarClockIcon,
+        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
+        run: () => navigate("/tasks"),
       },
       {
         id: "go-settings",

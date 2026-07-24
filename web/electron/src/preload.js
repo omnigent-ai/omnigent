@@ -16,6 +16,23 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
+// Collapse the update states the in-page UpdateBanner renders on
+// (available / downloaded / error-security) to `idle` so the server page can
+// never show a banner — that UI is shell-owned (the corner overlay). Kept here
+// (not main) so it applies uniformly to getStatus + every onStatus push, and
+// so error-security still reaches Settings as idle+lastError (which it shows).
+function bannerSafe(status) {
+  if (
+    status &&
+    (status.state === "available" ||
+      status.state === "downloaded" ||
+      status.state === "error-security")
+  ) {
+    return status.lastError ? { state: "idle", lastError: status.lastError } : { state: "idle" };
+  }
+  return status;
+}
+
 // Native integrations for the SPA: a dock/taskbar badge and OS notifications.
 // Numbers/strings only so the values survive contextBridge's structured-clone
 // boundary.
@@ -123,26 +140,36 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * setup page, so a connected server can't repoint the CLI at an arbitrary one.
    */
   resetCliPath: () => ipcRenderer.invoke("omnigent:cli-reset-path"),
+  // Update bridge for the server page — CONFIG ONLY, by design. Desktop update
+  // NOTIFICATIONS are owned by the shell now (a native corner overlay with its
+  // own preload + the Server menu). This bridge stays so Settings can still
+  // read/write update preferences (mode, auto-install) and trigger a check, but
+  // it is BANNER-SAFE: `bannerSafe()` collapses the states the in-page
+  // UpdateBanner renders on (available / downloaded / error-security) down to
+  // `idle` before the page sees them. That means NO web bundle — including
+  // older shipped ones that still mount the in-page banner — can show a
+  // (duplicate) banner, while Settings still gets check progress and errors
+  // (error-security is forwarded as idle+lastError, which Settings surfaces).
   updates: {
     getConfig: () => ipcRenderer.invoke("omnigent:get-update-config"),
-    getStatus: () => ipcRenderer.invoke("omnigent:get-update-status"),
+    getStatus: () => ipcRenderer.invoke("omnigent:get-update-status").then(bannerSafe),
     check: () => ipcRenderer.invoke("omnigent:update-check"),
     download: () => ipcRenderer.invoke("omnigent:update-download"),
     installNow: () => ipcRenderer.invoke("omnigent:update-install"),
     setConfig: (patch) => ipcRenderer.invoke("omnigent:set-update-config", patch),
-    /**
-     * Subscribe to update status changes. The renderer should read getStatus()
-     * first to replay any startup event that fired before subscription.
-     * Returns an unsubscribe function.
-     * @param {(status: unknown) => void} callback
-     * @returns {() => void}
-     */
     onStatus: (callback) => {
-      const listener = (_event, status) => callback(status);
+      const listener = (_event, status) => callback(bannerSafe(status));
       ipcRenderer.on("omnigent:update-status", listener);
       return () => ipcRenderer.removeListener("omnigent:update-status", listener);
     },
   },
+  /**
+   * Report the web app's resolved color scheme so the shell can mirror it via
+   * `nativeTheme.themeSource` — keeping the update overlay, native dialogs, and
+   * menus in sync with the in-app theme switcher (not just the OS setting).
+   * @param {"light" | "dark" | "system"} scheme
+   */
+  setColorScheme: (scheme) => ipcRenderer.send("omnigent:set-color-scheme", scheme),
 
   // ── Embedded browser pane ──────────────────────────────────────────────
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native

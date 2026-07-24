@@ -24,8 +24,6 @@ from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _NATIVE_TERMINAL_DISPATCH_SPECS,
-    _adopt_ambient_credentials,
-    _announce_auto_configured_credentials,
     _bundle,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
@@ -37,26 +35,31 @@ from omnigent.cli import (
     _is_removed_ad_hoc_invocation,
     _is_run_shorthand,
     _load_global_config,
-    _manage_goose_harness,
-    _manage_hermes_harness,
-    _manage_kimi_harness,
-    _manage_qwen_harness,
     _materialize_harness_launcher_file,
-    _node_dependency_problem,
-    _node_version,
     _pick_first_run_harness,
     _preregister_agent,
-    _qwen_auth_configured,
     _resolve_auto_open_conversation_from_config,
     _resolve_auto_open_conversation_setting,
     _resolve_bundle_env_vars,
     _resolve_default_agent_target,
     _resolve_first_run_plan,
     _save_global_config,
+    _save_local_config,
     _server_uvicorn_log_config,
     _start_cli_runner_process,
-    _warn_missing_harness_dependencies,
     cli,
+)
+from omnigent.cli_config import (
+    _adopt_ambient_credentials,
+    _announce_auto_configured_credentials,
+    _manage_goose_harness,
+    _manage_hermes_harness,
+    _manage_kimi_harness,
+    _manage_qwen_harness,
+    _node_dependency_problem,
+    _node_version,
+    _qwen_auth_configured,
+    _warn_missing_harness_dependencies,
 )
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.ambient import DetectedProvider
@@ -605,6 +608,25 @@ def test_claude_command_use_native_config_bypasses_databricks_auth(
     assert captured["use_claude_config"] is True
 
 
+def test_claude_command_flag_is_deprecated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent claude --command`` emits a DeprecationWarning pointing to env/config."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.claude_native.run_claude_native",
+        _fake_run_claude_native_capture({}),
+    )
+
+    result = CliRunner().invoke(cli, ["claude", "--command", "/custom/claude"])
+
+    assert result.exit_code == 0, result.output
+    # The deprecated flag still works (forwards the command) but warns.
+    assert "deprecated" in result.output.lower()
+    assert "OMNIGENT_CLAUDE_PATH" in result.output
+
+
 def test_codex_command_resume_binds_session_and_passes_unknown_args(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -708,6 +730,219 @@ def test_codex_command_session_and_resume_mutually_exclusive(
     assert "mutually exclusive" in result.output
 
 
+def test_codex_command_env_var_passes_command_to_run_codex_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_CODEX_PATH`` forwards ``command`` to the runner."""
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/x/y")
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.codex_native.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["codex"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["command"] == "/x/y"
+
+
+def test_codex_command_honors_config_command_when_env_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``harness.codex-native.command`` config is used when no env var is set."""
+    captured: dict[str, object] = {}
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"codex-native": {"command": "/from/config"}}},
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.codex_native.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["codex"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["command"] == "/from/config"
+
+
+def test_codex_command_env_var_overrides_config_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_CODEX_PATH`` env var beats ``harness.codex-native.command`` config."""
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/from/env")
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"codex-native": {"command": "/from/config"}}},
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.codex_native.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["codex"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["command"] == "/from/env"
+
+
+def test_antigravity_command_env_var_passes_command_to_run_antigravity_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_ANTIGRAVITY_PATH`` forwards ``command`` to the runner."""
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("OMNIGENT_ANTIGRAVITY_PATH", "/x/y")
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.antigravity_native.run_antigravity_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(cli, ["antigravity"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["command"] == "/x/y"
+
+
+def test_antigravity_command_honors_config_command_when_env_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``harness.antigravity-native.command`` config is used when no env var is set."""
+    captured: dict[str, object] = {}
+    monkeypatch.delenv("OMNIGENT_ANTIGRAVITY_PATH", raising=False)
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"antigravity-native": {"command": "/from/config"}}},
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.antigravity_native.run_antigravity_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(cli, ["antigravity"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["command"] == "/from/config"
+
+
+def test_antigravity_command_empty_resolved_falls_back_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no override, ``command`` is ``None`` so agy's binary discovery runs."""
+    captured: dict[str, object] = {}
+    monkeypatch.delenv("OMNIGENT_ANTIGRAVITY_PATH", raising=False)
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.antigravity_native.run_antigravity_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(cli, ["antigravity"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["command"] is None
+
+
+# ---------------------------------------------------------------------------
+# Native harness config args → terminal_launch_args (CLI args appended after)
+# ---------------------------------------------------------------------------
+
+
+def test_codex_config_args_form_base_cli_args_append(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config ``harness.codex-native.args`` is the base; CLI pass-through appends."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"codex-native": {"args": ["--config", "k=v"]}}},
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.codex_native.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["codex", "--dangerously-skip-permissions"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["codex_args"] == (
+        "--config",
+        "k=v",
+        "--dangerously-skip-permissions",
+    )
+
+
+def test_codex_config_args_only_when_no_cli_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no CLI pass-through, config args are the whole arg list."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"codex-native": {"args": ["--verbose"]}}},
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.codex_native.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["codex"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["codex_args"] == ("--verbose",)
+
+
+def test_codex_args_no_config_is_cli_args_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no config args, the result is just the CLI pass-through."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.codex_native.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["codex", "--flag"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["codex_args"] == ("--flag",)
+
+
+def test_pi_config_args_form_base_cli_args_append(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config ``harness.pi-native.args`` is the base; CLI pass-through appends."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"pi-native": {"args": ["--base"]}}},
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.pi_native.run_pi_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = CliRunner().invoke(cli, ["pi", "--cli-flag"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["pi_args"] == ("--base", "--cli-flag")
+
+
 def test_kiro_command_is_registered_in_click_help() -> None:
     """``omnigent kiro`` is a true top-level Click command."""
     result = CliRunner().invoke(cli, ["--help"])
@@ -809,6 +1044,94 @@ def test_kiro_command_rejects_kiro_resume_passthrough_flags(
 
     assert result.exit_code != 0
     assert "Kiro resume flags are reserved" in result.output
+
+
+def test_pi_config_command_threads_to_harness_path_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``harness.pi-native.command`` config sets ``OMNIGENT_PI_PATH`` before launch.
+
+    The env-resolver harnesses (pi, cursor, kiro, goose, qwen, kimi, hermes)
+    resolve their executable RUNNER-SIDE from ``OMNIGENT_<NAME>_PATH`` (the
+    canonical name; ``HARNESS_<NAME>_PATH`` is a deprecated read-only fallback).
+    The CLI threads ``harness.<name>-native.command`` config into that env var
+    before ``_ensure_backend`` so a locally-spawned daemon (and its runner)
+    inherits it.
+    """
+    monkeypatch.setenv("OMNIGENT_PI_PATH", "")  # ensure teardown restores (CLI overwrites it)
+    monkeypatch.setattr(
+        "omnigent.cli._load_effective_config",
+        lambda: {"harness": {"pi-native": {"command": "/custom/pi"}}},
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda s: s or "http://localhost:1")
+    monkeypatch.setattr("omnigent.pi_native.run_pi_native", lambda **kw: None)
+
+    result = CliRunner().invoke(cli, ["pi"])
+
+    assert result.exit_code == 0, result.output
+    assert os.environ["OMNIGENT_PI_PATH"] == "/custom/pi"
+
+
+# ── legacy HARNESS_*_PATH deprecation notice ───────────────────────────
+
+
+def test_cli_warns_deprecated_harness_path_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    """A set ``HARNESS_*_PATH`` produces a terminal-visible deprecation notice."""
+    from omnigent.cli import _warn_deprecated_harness_path_env_vars
+
+    monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
+    monkeypatch.setenv("HARNESS_PI_PATH", "/custom/pi")
+    monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    # The notice is stderr + isatty gated; force tty on so the helper emits.
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+
+    _warn_deprecated_harness_path_env_vars()
+
+    out = capsys.readouterr().err
+    assert "HARNESS_CODEX_PATH is deprecated" in out
+    assert "set OMNIGENT_CODEX_PATH instead" in out
+    assert "HARNESS_PI_PATH is deprecated" in out
+    assert "set OMNIGENT_PI_PATH instead" in out
+    assert "v0.8.0" in out
+
+
+def test_cli_no_deprecation_notice_when_no_legacy_var_set(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    """No legacy ``HARNESS_*_PATH`` set → no notice."""
+    from omnigent.cli import _warn_deprecated_harness_path_env_vars
+
+    for v in (
+        "HARNESS_CODEX_PATH",
+        "HARNESS_PI_PATH",
+        "HARNESS_KIMI_PATH",
+        "HARNESS_GOOSE_PATH",
+        "HARNESS_QWEN_PATH",
+        "HARNESS_HERMES_PATH",
+    ):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr("sys.stderr.isatty", lambda: True)
+
+    _warn_deprecated_harness_path_env_vars()
+
+    assert capsys.readouterr().err == ""
+
+
+def test_cli_no_deprecation_notice_in_non_tty(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    """The notice is suppressed when stderr is not a tty (pipes/CI)."""
+    from omnigent.cli import _warn_deprecated_harness_path_env_vars
+
+    monkeypatch.setenv("HARNESS_CODEX_PATH", "/usr/local/bin/codex")
+    monkeypatch.setattr("sys.stderr.isatty", lambda: False)
+
+    _warn_deprecated_harness_path_env_vars()
+
+    assert capsys.readouterr().err == ""
 
 
 # ── bundled-agent shorthands (omnigent polly / omnigent debby) ──────────
@@ -2634,8 +2957,8 @@ def test_run_without_agent_drops_into_configure_when_unconfigured(
     # first-run plan resolves to "nothing configured".
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured
@@ -3697,6 +4020,136 @@ def test_config_list_dedups_when_cwd_is_config_home(
     assert len(source_comments) == 1, f"expected one config source, got {source_comments}"
 
 
+# ---------------------------------------------------------------------------
+# `harness:` polymorphic key — auto-migration, config set, config list
+# ---------------------------------------------------------------------------
+
+
+def test_save_global_migrates_scalar_harness_to_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A scalar ``harness:`` is rewritten to ``{default: <str>}`` on save, with a notice."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    # Seed a legacy scalar harness via a raw write (bypass the save-side migration).
+    config_path.write_text("harness: claude-sdk\n", encoding="utf-8")
+
+    _save_global_config({"model": "x"})
+
+    cfg = _load_global_config()
+    assert cfg["harness"] == {"default": "claude-sdk"}
+    assert cfg["model"] == "x"
+
+
+def test_save_global_scalar_migration_notice_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The migration fires a single stderr notice and is idempotent."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    config_path.write_text("harness: claude-sdk\n", encoding="utf-8")
+
+    # First write migrates the scalar and emits the notice.
+    _save_global_config({"model": "x"})
+    # Second write: already a mapping, no second notice, no double migration.
+    _save_global_config({"server": "https://example.com"})
+    cfg = _load_global_config()
+    assert cfg["harness"] == {"default": "claude-sdk"}
+
+
+def test_save_local_config_migrates_scalar_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``_save_local_config`` also migrates a scalar harness to the mapping form."""
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir(parents=True)
+    local_path.write_text("harness: codex\n", encoding="utf-8")
+
+    _save_local_config({"model": "x"})
+
+    from omnigent.cli import _load_local_config
+
+    cfg = _load_local_config()
+    assert cfg["harness"] == {"default": "codex"}
+    assert cfg["model"] == "x"
+
+
+def test_config_set_harness_deep_merges_preserving_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``config set --global harness=pi`` preserves existing per-harness overrides."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    # Existing mapping with a per-harness override.
+    _save_global_config({"harness": {"default": "claude-sdk", "codex": {"command": "/bin/codex"}}})
+
+    result = CliRunner().invoke(cli, ["config", "set", "--global", "harness=pi"])
+
+    assert result.exit_code == 0, result.output
+    cfg = _load_global_config()
+    assert cfg["harness"]["default"] == "pi"
+    # The pre-existing override must survive the default change.
+    assert cfg["harness"]["codex"] == {"command": "/bin/codex"}
+
+
+def test_config_set_harness_migrates_scalar_to_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``config set --global harness=x`` on a legacy scalar writes a mapping."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    config_path.write_text("harness: claude-sdk\n", encoding="utf-8")
+
+    result = CliRunner().invoke(cli, ["config", "set", "--global", "harness=pi"])
+
+    assert result.exit_code == 0, result.output
+    cfg = _load_global_config()
+    assert cfg["harness"] == {"default": "pi"}
+
+
+def test_config_list_shows_harness_default_and_override_note(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``config list`` renders ``harness=<default>`` plus a per-harness-override note."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+    _save_global_config({"harness": {"default": "claude-sdk", "codex": {"command": "/bin/codex"}}})
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "harness=claude-sdk" in result.output
+    assert "per-harness overrides" in result.output
+    assert "codex" in result.output
+
+
+def test_config_list_shows_scalar_harness_without_note(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A legacy scalar harness renders as ``harness=<value>`` with no override note."""
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
+    monkeypatch.setattr("omnigent.cli._load_local_config", dict)
+    config_path.write_text("harness: claude-sdk\n", encoding="utf-8")
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "harness=claude-sdk" in result.output
+    assert "per-harness overrides" not in result.output
+
+
 def test_config_unset_removes_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4632,8 +5085,8 @@ def test_resolve_first_run_plan_does_not_persist_derived_default(
     Claude→polly yet no global ``harness`` / ``default_agent`` was written.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for("claude-sdk"),
@@ -4663,8 +5116,8 @@ def test_resolve_first_run_plan_re_derives_when_creds_change(
     pick would pin the user to codex and fail the second half.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
 
     # 1) Only Codex configured → codex REPL, no example agent.
     monkeypatch.setattr(
@@ -4694,8 +5147,8 @@ def test_resolve_first_run_plan_drops_into_configure_when_empty(
     return of None signals the caller to exit cleanly rather than error.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=[]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", Mock(return_value=[]))
     monkeypatch.setattr(
         "omnigent.onboarding.provider_config.default_provider_for_harness",
         _fake_provider_for(),  # nothing configured, before and after configure
@@ -4776,8 +5229,10 @@ def test_adopt_ambient_credentials_announces_only_what_was_adopted(
     A regression that stopped calling the callout (or announced credentials
     that were not actually adopted) fails here.
     """
-    monkeypatch.setattr("omnigent.cli._promote_global_auth_to_provider", Mock())
-    monkeypatch.setattr("omnigent.cli._adopt_detected_providers", Mock(return_value=["anthropic"]))
+    monkeypatch.setattr("omnigent.cli_config._promote_global_auth_to_provider", Mock())
+    monkeypatch.setattr(
+        "omnigent.cli_config._adopt_detected_providers", Mock(return_value=["anthropic"])
+    )
     monkeypatch.setattr(
         "omnigent.onboarding.ambient.detect_providers",
         lambda: [
@@ -5293,7 +5748,7 @@ def test_manage_qwen_harness_declines_install_returns(
     install = Mock()
     monkeypatch.setattr(hi, "install_harness_cli", install)
     launch = Mock()
-    monkeypatch.setattr("omnigent.cli._launch_qwen_auth", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_qwen_auth", launch)
     # The install prompt offers [install, no, show-command]; pick "No".
     monkeypatch.setattr(it, "select", lambda *a, **k: 1)
 
@@ -5315,10 +5770,10 @@ def test_manage_qwen_harness_back_does_not_launch(
     import omnigent.onboarding.interactive as it
 
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: True)
-    monkeypatch.setattr("omnigent.cli._qwen_auth_configured", lambda: False)
+    monkeypatch.setattr("omnigent.cli_config._qwen_auth_configured", lambda: False)
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock(return_value="x")
-    monkeypatch.setattr("omnigent.cli._launch_qwen_auth", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_qwen_auth", launch)
     # rows = [Open Qwen to run /auth, Show auth options, ← Back]; pick Back (2).
     monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
@@ -5384,7 +5839,7 @@ def test_manage_goose_harness_missing_cli_shows_hint_returns(
     monkeypatch.setattr(hi, "harness_cli_installed", lambda key: False)
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock()
-    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_goose_configure", launch)
     # Should never reach the select() menu when the CLI is absent.
     monkeypatch.setattr(it, "select", Mock(side_effect=AssertionError("select called")))
 
@@ -5409,7 +5864,7 @@ def test_manage_goose_harness_back_does_not_launch(
     )
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock(return_value="x")
-    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_goose_configure", launch)
     # rows = [Run goose configure, Show configuration options, ← Back]; pick Back (2).
     monkeypatch.setattr(it, "select", lambda *a, **k: 2)
 
@@ -5434,7 +5889,7 @@ def test_manage_goose_harness_configure_launches(
     )
     monkeypatch.setattr(it, "console", Mock())
     launch = Mock(return_value="✓ provider configured: anthropic")
-    monkeypatch.setattr("omnigent.cli._launch_goose_configure", launch)
+    monkeypatch.setattr("omnigent.cli_config._launch_goose_configure", launch)
     # First iteration: pick "Run goose configure" (0); second: "← Back" (2).
     choices = iter([0, 2])
     monkeypatch.setattr(it, "select", lambda *a, **k: next(choices))

@@ -254,6 +254,40 @@ async def test_subscriber_slot_cleaned_up_on_exit() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A subscriber that falls behind is disconnected instead of growing forever.
+
+    The ready event suspends the consumer while keeping its slot registered,
+    reproducing a backpressured SSE response. Once more events arrive than the
+    configured queue bound, the stale backlog is replaced by one overflow
+    signal. Consuming that signal raises and unregisters the slot so the route
+    can close the transport and let the client reconnect from its snapshot.
+    """
+    monkeypatch.setattr(session_stream, "_SUBSCRIBER_QUEUE_MAX_EVENTS", 2)
+    conv_id = "conv_slow"
+    gen = session_stream.subscribe(conv_id, ready_event={"type": "test.ready"})
+
+    ready = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+    assert ready == {"type": "test.ready"}
+
+    session_stream.publish(conv_id, {"type": "test.event", "i": 1})
+    session_stream.publish(conv_id, {"type": "test.event", "i": 2})
+    session_stream.publish(conv_id, {"type": "test.event", "i": 3})
+    await asyncio.sleep(0)
+
+    ((queue, _loop),) = session_stream._subscribers[conv_id]
+    assert queue.maxsize == 2
+    assert queue.qsize() == 1, "overflow must replace the stale backlog with one signal"
+
+    with pytest.raises(session_stream.SubscriberOverflowError, match=conv_id):
+        await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+    assert conv_id not in session_stream._subscribers
+
+
 # ── Side-channel: pending-elicitations index ─────────────────────────
 
 
