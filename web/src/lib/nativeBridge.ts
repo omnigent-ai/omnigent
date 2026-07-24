@@ -374,20 +374,15 @@ export function supportsBrowser(): boolean {
   return typeof electronApi()?.browserOpenOrNavigate === "function";
 }
 
-/** macOS Electron 42 crashes while creating the artifact WebContentsView. */
-function artifactSurfaceApi(): ElectronDesktopApi | undefined {
-  return isMacElectronShell() ? undefined : electronApi();
-}
-
 /** True when the Electron shell can host isolated artifact child surfaces. */
 export function hasNativeArtifactSurface(): boolean {
-  const api = artifactSurfaceApi();
+  const api = electronApi();
   return typeof api?.syncArtifactSurface === "function";
 }
 
 /** Synchronize the native artifact surface, returning false on old/broken shells. */
 export async function syncNativeArtifactSurface(params: ArtifactSurfaceSync): Promise<boolean> {
-  const sync = artifactSurfaceApi()?.syncArtifactSurface;
+  const sync = electronApi()?.syncArtifactSurface;
   if (!sync) return false;
   try {
     return await sync(params);
@@ -399,7 +394,7 @@ export async function syncNativeArtifactSurface(params: ArtifactSurfaceSync): Pr
 /** Best-effort teardown for the native artifact surface. */
 export async function destroyNativeArtifactSurface(id: string): Promise<void> {
   try {
-    await artifactSurfaceApi()?.destroyArtifactSurface?.(id);
+    await electronApi()?.destroyArtifactSurface?.(id);
   } catch {
     // A stale or closing desktop shell must not break renderer cleanup.
   }
@@ -407,12 +402,12 @@ export async function destroyNativeArtifactSurface(id: string): Promise<void> {
 
 /** True when the Electron shell exposes the artifact element picker. */
 export function hasNativeArtifactInspector(): boolean {
-  return typeof artifactSurfaceApi()?.inspectArtifactSurface === "function";
+  return typeof electronApi()?.inspectArtifactSurface === "function";
 }
 
 /** Start the native picker; false means unavailable, cancelled, or failed. */
 export async function inspectNativeArtifactSurface(id: string): Promise<boolean> {
-  const inspect = artifactSurfaceApi()?.inspectArtifactSurface;
+  const inspect = electronApi()?.inspectArtifactSurface;
   if (!inspect) return false;
   try {
     return await inspect(id);
@@ -425,7 +420,7 @@ export async function inspectNativeArtifactSurface(id: string): Promise<boolean>
 export async function selectNativeArtifactElement(
   id: string,
 ): Promise<ArtifactElementContext | null> {
-  const select = artifactSurfaceApi()?.selectArtifactElement;
+  const select = electronApi()?.selectArtifactElement;
   if (!select) return null;
   try {
     return await select(id);
@@ -436,7 +431,7 @@ export async function selectNativeArtifactElement(
 
 /** Reload the native artifact surface. */
 export async function reloadNativeArtifactSurface(id: string): Promise<boolean> {
-  const reload = artifactSurfaceApi()?.reloadArtifactSurface;
+  const reload = electronApi()?.reloadArtifactSurface;
   if (!reload) return false;
   try {
     return await reload(id);
@@ -447,14 +442,14 @@ export async function reloadNativeArtifactSurface(id: string): Promise<boolean> 
 
 /** True when the desktop shell exposes artifact diagnostics. */
 export function hasNativeArtifactReview(): boolean {
-  return typeof artifactSurfaceApi()?.reviewArtifactSurface === "function";
+  return typeof electronApi()?.reviewArtifactSurface === "function";
 }
 
 /** Collect native artifact diagnostics. */
 export async function reviewNativeArtifactSurface(
   id: string,
 ): Promise<ArtifactSurfaceDiagnostics | null> {
-  const review = artifactSurfaceApi()?.reviewArtifactSurface;
+  const review = electronApi()?.reviewArtifactSurface;
   if (!review) return null;
   try {
     return await review(id);

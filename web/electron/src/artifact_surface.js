@@ -1,7 +1,5 @@
 "use strict";
 
-const { randomUUID } = require("node:crypto");
-
 const ARTIFACT_INSPECTOR_SCRIPT = `(() => {
   window.__omnigentCancelArtifactInspector?.();
   return new Promise((resolve) => {
@@ -278,16 +276,9 @@ function normalizeArtifactBounds(bounds, contentBounds) {
   };
 }
 
-function denyPermissions(ses) {
-  if (!ses) return;
-  ses.setPermissionCheckHandler?.(() => false);
-  ses.setPermissionRequestHandler?.((_webContents, _permission, callback) => callback(false));
-}
-
 class ArtifactSurfaceManager {
-  constructor({ createView, configureSession = denyPermissions }) {
+  constructor({ createView }) {
     this.createView = createView;
-    this.configureSession = configureSession;
     this.surfaces = new WeakMap();
   }
 
@@ -316,13 +307,11 @@ class ArtifactSurfaceManager {
           nodeIntegration: false,
           sandbox: true,
           webSecurity: true,
-          partition: `omnigent-artifact-preview-${win.id}-${randomUUID()}`,
         },
       });
       const consoleMessages = [];
       const loadErrors = [];
       surface = { id: params.id, view, policy, url: null, consoleMessages, loadErrors };
-      this.configureSession(view.webContents.session);
       view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       const blockUnsafeNavigation = (event, url) => {
         if (!navigationAllowed(url, surface.policy)) event.preventDefault();
@@ -445,7 +434,6 @@ module.exports = {
   ARTIFACT_INSPECTOR_SCRIPT,
   ARTIFACT_SELECTION_SCRIPT,
   ARTIFACT_REVIEW_SCRIPT,
-  denyPermissions,
   navigationAllowed,
   normalizeArtifactBounds,
   parseArtifactPreviewUrl,

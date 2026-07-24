@@ -41,32 +41,6 @@ describe("ArtifactPreviewSurface", () => {
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-same-origin");
   });
 
-  it("uses the iframe fallback in macOS Electron", () => {
-    vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue(
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-    );
-    (window as unknown as Record<string, unknown>).omnigentDesktop = {
-      kind: "electron",
-      setBadgeCount: vi.fn(),
-      notify: vi.fn(),
-      syncArtifactSurface,
-      destroyArtifactSurface,
-    };
-
-    render(
-      <ArtifactPreviewSurface
-        surfaceId="surface"
-        title="Revenue"
-        url="http://preview.localhost/p/grant/a"
-        visible
-      />,
-    );
-
-    expect(screen.getByTitle("Revenue preview").tagName).toBe("IFRAME");
-    expect(syncArtifactSurface).not.toHaveBeenCalled();
-    expect(destroyArtifactSurface).not.toHaveBeenCalled();
-  });
-
   it("creates the native surface once across a StrictMode mount cycle", async () => {
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",

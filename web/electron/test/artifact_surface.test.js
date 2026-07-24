@@ -123,14 +123,10 @@ describe("artifact bounds", () => {
 });
 
 describe("ArtifactSurfaceManager", () => {
-  it("creates an isolated surface and blocks navigation outside its grant", async () => {
+  it("creates a sandboxed surface and blocks navigation outside its grant", async () => {
     const win = fakeWindow();
     const created = [];
-    const deniedPermissions = [];
-    const manager = new ArtifactSurfaceManager({
-      createView: fakeViewFactory(created),
-      configureSession: (ses) => deniedPermissions.push(ses),
-    });
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
 
     await manager.sync(win, {
       id: "artifact-1",
@@ -145,11 +141,7 @@ describe("ArtifactSurfaceManager", () => {
     assert.equal(view.webContents.options.webPreferences.contextIsolation, true);
     assert.equal(view.webContents.options.webPreferences.nodeIntegration, false);
     assert.equal(view.webContents.options.webPreferences.sandbox, true);
-    assert.match(
-      view.webContents.options.webPreferences.partition,
-      /^omnigent-artifact-preview-7-/,
-    );
-    assert.equal(deniedPermissions.length, 1);
+    assert.equal(view.webContents.options.webPreferences.partition, undefined);
     assert.deepEqual(view.webContents.windowOpenHandler(), { action: "deny" });
 
     const event = {
