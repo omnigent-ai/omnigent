@@ -12,9 +12,11 @@
 // (scheduleBuilder.ts, scheduleText.ts) so they stay robust; they are not
 // reachable from this form today.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { ClockIcon } from "lucide-react";
 import { Label } from "@/components/scheduled/Label";
 import { Input } from "@/components/ui/input";
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -24,6 +26,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import {
+  DEFAULT_SCHEDULE_MODEL,
   WEEKDAY_CODES,
   parseMinuteOfHourInput,
   parseTimeOfDayInput,
@@ -32,7 +35,6 @@ import {
   type SchedulePreset,
   type WeekdayCode,
 } from "@/lib/scheduleBuilder";
-import { formatClockTime } from "@/lib/scheduleText";
 
 // Presets only: "custom" is deferred (see file header) and is
 // deliberately absent from this list, so it's unreachable from the dropdown.
@@ -42,6 +44,11 @@ const PRESET_OPTIONS: { value: SchedulePreset; label: string }[] = [
   { value: "weekdays", label: "Weekdays" },
   { value: "weekly", label: "Weekly" },
 ];
+
+const HOURS_12 = Array.from({ length: 12 }, (_, i) => i + 1);
+const MINUTES = Array.from({ length: 60 }, (_, i) => i);
+const PERIODS = ["AM", "PM"] as const;
+type Period = (typeof PERIODS)[number];
 
 const WEEKDAY_LABELS: Record<WeekdayCode, string> = {
   MO: "Mon",
@@ -71,12 +78,23 @@ export function ScheduleFields({
 
   const error = validateSchedule(model);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const hourColumnRef = useRef<HTMLDivElement | null>(null);
+  const minuteColumnRef = useRef<HTMLDivElement | null>(null);
   const [timeText, setTimeText] = useState(() => formatInputValue(model, isHourly));
+  const [timePickerOpen, setTimePickerOpen] = useState(false);
 
   useEffect(() => {
     if (document.activeElement === inputRef.current) return;
     setTimeText(formatInputValue(model, isHourly));
   }, [isHourly, model.hour, model.minute]);
+
+  const pickerParts = toPickerParts(getPickerTime());
+
+  useEffect(() => {
+    if (!timePickerOpen || isHourly) return;
+    scrollSelectedIntoView(hourColumnRef.current);
+    scrollSelectedIntoView(minuteColumnRef.current);
+  }, [isHourly, pickerParts.hour12, pickerParts.minute, timePickerOpen]);
 
   function toggleWeekday(code: WeekdayCode) {
     const has = model.weekdays.includes(code);
@@ -108,7 +126,31 @@ export function ScheduleFields({
     }
 
     const parsed = parseTimeOfDayInput(timeText);
-    if (parsed !== null) setTimeText(formatClockTime(parsed.hour, parsed.minute));
+    if (parsed !== null) setTimeText(formatTimeInput(parsed.hour, parsed.minute));
+  }
+
+  function handleTimePickerOpenChange(next: boolean) {
+    setTimePickerOpen(next);
+    onSelectOpenChange?.(next);
+  }
+
+  function getPickerTime(): { hour: number; minute: number } {
+    const parsed = parseTimeOfDayInput(timeText);
+    if (parsed !== null) return parsed;
+    if (Number.isInteger(model.hour) && Number.isInteger(model.minute)) {
+      return { hour: model.hour, minute: model.minute };
+    }
+    return { hour: DEFAULT_SCHEDULE_MODEL.hour, minute: DEFAULT_SCHEDULE_MODEL.minute };
+  }
+
+  function applyPickerTime(next: Partial<{ hour12: number; minute: number; period: Period }>) {
+    const current = toPickerParts(getPickerTime());
+    const hour12 = next.hour12 ?? current.hour12;
+    const minute = next.minute ?? current.minute;
+    const period = next.period ?? current.period;
+    const hour = to24Hour(hour12, period);
+    setTimeText(formatTimeInput(hour, minute));
+    onChange({ ...model, hour, minute });
   }
 
   return (
@@ -168,17 +210,91 @@ export function ScheduleFields({
 
       <div className="flex flex-col gap-1.5">
         <Label htmlFor="schedule-time">{isHourly ? "Minute" : "Time"}</Label>
-        <Input
-          ref={inputRef}
-          id="schedule-time"
-          value={timeText}
-          data-testid={isHourly ? "schedule-minute" : "schedule-time"}
-          placeholder={isHourly ? ":15" : "5:00 PM"}
-          className={isHourly ? "w-28" : "w-40"}
-          aria-invalid={error ? true : undefined}
-          onChange={(e) => handleTimeTextChange(e.target.value)}
-          onBlur={canonicalizeTimeText}
-        />
+        {isHourly ? (
+          <Input
+            ref={inputRef}
+            id="schedule-time"
+            value={timeText}
+            data-testid="schedule-minute"
+            placeholder=":15"
+            className="w-28"
+            aria-invalid={error ? true : undefined}
+            onChange={(e) => handleTimeTextChange(e.target.value)}
+            onBlur={canonicalizeTimeText}
+          />
+        ) : (
+          <Popover open={timePickerOpen} onOpenChange={handleTimePickerOpenChange}>
+            <PopoverAnchor asChild>
+              <div className="relative w-40">
+                <Input
+                  ref={inputRef}
+                  id="schedule-time"
+                  value={timeText}
+                  data-testid="schedule-time"
+                  placeholder="5:00 PM"
+                  className="pr-8"
+                  aria-invalid={error ? true : undefined}
+                  onFocus={() => handleTimePickerOpenChange(true)}
+                  onChange={(e) => handleTimeTextChange(e.target.value)}
+                  onBlur={canonicalizeTimeText}
+                />
+                <button
+                  type="button"
+                  aria-label="Open time picker"
+                  data-testid="schedule-time-picker-trigger"
+                  className="absolute top-1/2 right-2 flex size-4 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
+                  onClick={() => handleTimePickerOpenChange(!timePickerOpen)}
+                >
+                  <ClockIcon className="size-3.5" />
+                </button>
+              </div>
+            </PopoverAnchor>
+            <PopoverContent
+              align="start"
+              className="w-44 rounded-sm p-1.5"
+              onOpenAutoFocus={(event) => event.preventDefault()}
+            >
+              <div className="grid grid-cols-3 gap-1" data-testid="schedule-time-picker">
+                <div ref={hourColumnRef} className="max-h-64 overflow-y-auto">
+                  {HOURS_12.map((hour) => (
+                    <PickerCell
+                      key={hour}
+                      testId={`schedule-hour-${pad(hour)}`}
+                      selected={pickerParts.hour12 === hour}
+                      onClick={() => applyPickerTime({ hour12: hour })}
+                    >
+                      {pad(hour)}
+                    </PickerCell>
+                  ))}
+                </div>
+                <div ref={minuteColumnRef} className="max-h-64 overflow-y-auto">
+                  {MINUTES.map((minute) => (
+                    <PickerCell
+                      key={minute}
+                      testId={`schedule-minute-${pad(minute)}`}
+                      selected={pickerParts.minute === minute}
+                      onClick={() => applyPickerTime({ minute })}
+                    >
+                      {pad(minute)}
+                    </PickerCell>
+                  ))}
+                </div>
+                <div className="max-h-64 overflow-y-auto">
+                  {PERIODS.map((period) => (
+                    <PickerCell
+                      key={period}
+                      testId={`schedule-period-${period}`}
+                      selected={pickerParts.period === period}
+                      onClick={() => applyPickerTime({ period })}
+                    >
+                      {period}
+                    </PickerCell>
+                  ))}
+                </div>
+              </div>
+            </PopoverContent>
+          </Popover>
+        )}
       </div>
 
       {/* describeSchedule/buildRRule stay in the lib for list rows and possible
@@ -199,10 +315,67 @@ function pad(n: number): string {
 function formatInputValue(model: ScheduleModel, isHourly: boolean): string {
   if (isHourly) return formatMinuteInput(model.minute);
   if (!Number.isInteger(model.hour) || !Number.isInteger(model.minute)) return "";
-  return formatClockTime(model.hour, model.minute);
+  return formatTimeInput(model.hour, model.minute);
 }
 
 function formatMinuteInput(minute: number): string {
   if (!Number.isInteger(minute) || minute < 0 || minute > 59) return "";
   return `:${pad(minute)}`;
+}
+
+function formatTimeInput(hour: number, minute: number): string {
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return "";
+  const parts = toPickerParts({ hour, minute });
+  return `${pad(parts.hour12)}:${pad(parts.minute)} ${parts.period}`;
+}
+
+function toPickerParts(time: { hour: number; minute: number }): {
+  hour12: number;
+  minute: number;
+  period: Period;
+} {
+  const hour = Math.min(23, Math.max(0, time.hour));
+  return {
+    hour12: hour % 12 === 0 ? 12 : hour % 12,
+    minute: Math.min(59, Math.max(0, time.minute)),
+    period: hour >= 12 ? "PM" : "AM",
+  };
+}
+
+function to24Hour(hour12: number, period: Period): number {
+  return (hour12 % 12) + (period === "PM" ? 12 : 0);
+}
+
+function scrollSelectedIntoView(column: HTMLDivElement | null) {
+  column
+    ?.querySelector<HTMLElement>('[data-selected="true"]')
+    ?.scrollIntoView?.({ block: "center" });
+}
+
+function PickerCell({
+  children,
+  onClick,
+  selected,
+  testId,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  selected: boolean;
+  testId: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      data-selected={selected ? "true" : undefined}
+      data-testid={testId}
+      className={cn(
+        "flex h-8 w-full items-center justify-center rounded-sm text-sm transition-colors",
+        selected ? "bg-primary text-primary-foreground" : "text-foreground hover:bg-muted",
+      )}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
 }

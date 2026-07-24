@@ -291,7 +291,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     );
     expect(screen.getByTestId("task-agent-readonly")).toHaveTextContent("Polly");
     expect(screen.queryByTestId("agent-picker-stub")).not.toBeInTheDocument();
-    expect(screen.getByTestId("schedule-time")).toHaveValue("8:30 AM");
+    expect(screen.getByTestId("schedule-time")).toHaveValue("08:30 AM");
   });
 
   it("round-trips non-quarter-hour edit times through the update payload", async () => {
@@ -302,7 +302,11 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=17;BYMINUTE=7" })}
       />,
     );
-    expect(screen.getByTestId("schedule-time")).toHaveValue("5:07 PM");
+    expect(screen.getByTestId("schedule-time")).toHaveValue("05:07 PM");
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    expect(screen.getByTestId("schedule-hour-05")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("schedule-minute-07")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("schedule-period-PM")).toHaveAttribute("aria-pressed", "true");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
@@ -407,11 +411,27 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.queryByTestId("task-timezone-trigger")).toBeNull();
   });
 
-  it("renders the Time field as a text input", () => {
+  it("renders the Time field as an input with a compact picker trigger", () => {
     renderDialog();
     const timeField = screen.getByTestId("schedule-time");
     expect(timeField.tagName).toBe("INPUT");
     expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
+    expect(screen.getByTestId("schedule-time-picker-trigger")).toBeInTheDocument();
+  });
+
+  it("chooses a non-quarter-hour time from the compact picker", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    fireEvent.click(await screen.findByTestId("schedule-hour-05"));
+    fireEvent.click(screen.getByTestId("schedule-minute-07"));
+    fireEvent.click(screen.getByTestId("schedule-period-PM"));
+    expect(screen.getByTestId("schedule-time")).toHaveValue("05:07 PM");
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
   });
 
   it("typing a non-quarter-hour time flows into the submitted RRULE", async () => {
@@ -426,6 +446,14 @@ describe("CreateScheduledTaskDialog submit", () => {
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     // Default preset is Daily -> 17:07.
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
+  });
+
+  it("canonicalizes typed time on blur", () => {
+    renderDialog();
+    const timeField = screen.getByTestId("schedule-time");
+    fireEvent.change(timeField, { target: { value: "17:07" } });
+    fireEvent.blur(timeField);
+    expect(timeField).toHaveValue("05:07 PM");
   });
 
   it("blocks submit while the typed time is invalid", async () => {
@@ -443,6 +471,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
     const minuteField = screen.getByTestId("schedule-minute");
     expect(minuteField.tagName).toBe("INPUT");
+    expect(screen.queryByTestId("schedule-time-picker-trigger")).toBeNull();
     fireEvent.change(minuteField, { target: { value: ":07" } });
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
