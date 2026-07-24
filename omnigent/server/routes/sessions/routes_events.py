@@ -30,9 +30,9 @@ from omnigent.runtime import (
     session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.policies.approval import _ELICITATION_MODE  # noqa: F401
+from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import presence
-from omnigent.server._elicitation_registry import (  # noqa: F401
+from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -68,16 +68,16 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import *
-from omnigent.server.routes._sessions.common import (  # noqa: F401
+from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.helpers import (
-    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,  # noqa: F401
+    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,  # noqa: F401
+    _compact_lock_impl as _compact_lock,
 )
 from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
@@ -92,13 +92,13 @@ from omnigent.server.routes._sessions.helpers import (
     _launch_runner_on_host_impl as _launch_runner_on_host,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _poll_request_disconnect_impl as _poll_request_disconnect,  # noqa: F401
+    _poll_request_disconnect_impl as _poll_request_disconnect,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _resolve_harness_impl as _resolve_harness,  # noqa: F401
+    _resolve_harness_impl as _resolve_harness,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,  # noqa: E501,F401
+    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,
 )
 from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner_impl as _stop_session_via_runner,
@@ -114,7 +114,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _ensure_runner_relay_ready_impl as _ensure_runner_relay_ready,
 )
 from omnigent.server.routes._sessions.orchestration import (
-    _kick_managed_wake_impl as _kick_managed_wake,  # noqa: F401
+    _kick_managed_wake_impl as _kick_managed_wake,
 )
 from omnigent.server.schemas import (
     ConversationDeleted,
@@ -155,6 +155,7 @@ def register_events_routes(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
+
     @router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -351,7 +352,7 @@ def register_events_routes(
                     runner_router,
                     actor=_actor,
                 )
-            except Exception as _policy_exc:  # noqa: BLE001 — fail-safe for misconfigured policies
+            except Exception as _policy_exc:
                 # Policy evaluation crashed (e.g. factory misconfigured).
                 # Log and treat as DENY so the session doesn't hang on
                 # "working" forever. The full cause is logged for admins;
@@ -567,7 +568,7 @@ def register_events_routes(
                         anon_user_id=_anon,
                     )
                 )
-            except Exception:  # noqa: BLE001 — telemetry is best-effort
+            except Exception:
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
@@ -1249,7 +1250,7 @@ def register_events_routes(
                     _agent.bundle_location,
                 )
                 _has_mcp_servers = bool(_loaded_agent.spec.mcp_servers)
-            except Exception:  # noqa: BLE001 — spec load failure must not break event forwarding
+            except Exception:
                 _logger.warning(
                     "Failed to load agent spec for MCP hint for session=%s",
                     session_id,
@@ -1429,7 +1430,7 @@ def register_events_routes(
                             "child": summary.model_dump(mode="json"),
                         }
                     )
-            except Exception:  # noqa: BLE001 -- best-effort snapshot; never block live tail
+            except Exception:
                 _logger.debug("snapshot: child sessions failed for %s", session_id, exc_info=True)
             if runner_client is not None:
                 try:
@@ -1450,7 +1451,7 @@ def register_events_routes(
                     if resp.status_code == 200:
                         for item in resp.json().get("data", []):
                             events.append({"type": "session.resource.created", "resource": item})
-                except Exception:  # noqa: BLE001 -- best-effort snapshot; never block live tail
+                except Exception:
                     _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
             # Tell the client to (re)fetch the changed-files list rather
             # than fetching it here (avoids a second runner round-trip).
@@ -1684,6 +1685,6 @@ def register_events_routes(
                     total_cost_usd=_usage.get("total_cost_usd"),
                 )
             )
-        except Exception:  # noqa: BLE001 — telemetry is best-effort
+        except Exception:
             pass
         return ConversationDeleted(id=session_id)

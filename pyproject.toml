@@ -564,7 +564,8 @@ known-first-party = ["omnigent"]
 # orchestration). Star re-export is the point of the facade, so F403 (star
 # import) and F405 (name may be from star import) are expected here and can't
 # be resolved without enumerating hundreds of re-exports by hand.
-"omnigent/server/routes/sessions.py" = ["F403", "F405"]
+"omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401", "F403", "F405"]
+"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401", "F403", "F405"]
 "omnigent/server/routes/_sessions/*.py" = ["F403", "F405"]
 
 [tool.mypy]

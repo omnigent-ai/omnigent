@@ -15,8 +15,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import (
     session_stream,
 )
-from omnigent.runtime.policies.approval import _ELICITATION_MODE  # noqa: F401
-from omnigent.server._elicitation_registry import (  # noqa: F401
+from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -35,29 +35,29 @@ from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._sessions.common import *
-from omnigent.server.routes._sessions.common import (  # noqa: F401
+from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.helpers import (
-    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,  # noqa: F401
+    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,  # noqa: F401
+    _compact_lock_impl as _compact_lock,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _poll_request_disconnect_impl as _poll_request_disconnect,  # noqa: F401
+    _poll_request_disconnect_impl as _poll_request_disconnect,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _resolve_harness_impl as _resolve_harness,  # noqa: F401
+    _resolve_harness_impl as _resolve_harness,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,  # noqa: E501,F401
+    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,
 )
 from omnigent.server.routes._sessions.orchestration import *
 from omnigent.server.routes._sessions.orchestration import (
-    _kick_managed_wake_impl as _kick_managed_wake,  # noqa: F401
+    _kick_managed_wake_impl as _kick_managed_wake,
 )
 from omnigent.server.schemas import (
     BrowserActionRequestEvent,
@@ -74,6 +74,7 @@ def register_browser_routes(
     permission_store: PermissionStore | None = None,
 ) -> None:
     """Register the browser routes on router."""
+
     @router.post(
         "/sessions/{session_id}/browser/action_request",
         # Internal embedded-browser flow — hidden from the public API reference.

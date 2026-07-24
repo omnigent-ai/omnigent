@@ -119,7 +119,7 @@ from omnigent.server.routes._sessions.common import *
 # imported from common as facade-delegating proxies (kept out of common's
 # ``__all__`` so the star import above never overwrites them). Resolving them
 # here means a facade-level monkeypatch is honoured in this module too.
-from omnigent.server.routes._sessions.common import (  # noqa: F401
+from omnigent.server.routes._sessions.common import (
     get_caps,
     get_server_runner_router,
     session_stream,
@@ -417,7 +417,7 @@ async def _best_effort_stop(
     try:
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
         status = _session_status_with_child_rollup(session_id, descendant_ids)
-    except Exception:  # noqa: BLE001 (best-effort; must not block archive/delete)
+    except Exception:
         _logger.debug(
             "Best-effort stop failed for %s; proceeding anyway",
             session_id,
@@ -431,7 +431,7 @@ async def _best_effort_stop(
     async def _stop(target_id: str) -> None:
         try:
             await _stop_session_via_runner(target_id, runner_router)
-        except Exception:  # noqa: BLE001 (best-effort; must not block archive/delete)
+        except Exception:
             _logger.debug(
                 "Best-effort stop failed for %s; proceeding anyway",
                 target_id,
@@ -5464,7 +5464,7 @@ async def _create_session_from_existing_agent(
                     is_sub_agent=body.sub_agent_name is not None,
                 )
             )
-    except Exception:  # noqa: BLE001 — telemetry must not disrupt session creation
+    except Exception:
         pass
 
     if body.initial_items:
@@ -5741,7 +5741,7 @@ async def _handle_mcp_tools_call(
         # Verify the opaque requestState.
         try:
             state = json.loads(request_state_str)  # type: ignore[arg-type]
-        except Exception:  # noqa: BLE001
+        except Exception:
             return _mcp_error_response(rpc_id, -32000, "Invalid requestState: not valid JSON")
         if state.get("session_id") != session_id:
             # Reject cross-session replay.
@@ -5939,7 +5939,7 @@ async def _handle_mcp_tools_call(
         )
         exec_resp.raise_for_status()
         exec_data = exec_resp.json()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.warning("Runner MCP execute failed: %s", exc, exc_info=True)
         return _mcp_error_response(rpc_id, -32000, "Runner MCP execute failed.")
 
@@ -6004,7 +6004,7 @@ async def _handle_mcp_tools_call(
             )
             retry_resp.raise_for_status()
             exec_data = retry_resp.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             _logger.warning("Runner MCP retry failed: %s", exc, exc_info=True)
             return _mcp_error_response(rpc_id, -32000, "Runner MCP retry failed.")
         if "error" in exec_data:
@@ -6378,7 +6378,7 @@ async def _get_session_snapshot(
                         llm_model,
                         model_override=conv.model_override,
                     )
-        except Exception:  # noqa: BLE001 — best-effort; missing agent must not break session fetch
+        except Exception:
             pass
     # Skills are runner-owned: the bound runner discovers them against its
     # own filesystem (bundled skills + host skills under the session's

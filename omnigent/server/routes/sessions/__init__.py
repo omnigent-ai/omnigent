@@ -99,7 +99,7 @@ from omnigent.runtime import (
     user_session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.policies.approval import _ELICITATION_MODE  # noqa: F401
+from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.runtime.policies.builder import (
     any_policies_apply,
     build_policy_engine,
@@ -110,7 +110,7 @@ from omnigent.server import presence
 # Elicitation-registry state and dataclasses. Tests reach these through this
 # facade module (``sessions._ParkedHarnessElicitation`` etc.); re-export them so
 # the module namespace matches the pre-split file.
-from omnigent.server._elicitation_registry import (  # noqa: F401
+from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -170,7 +170,7 @@ from omnigent.server.routes._origin import require_trusted_origin
 # leaf module; import them here so this module and its re-exporters see the same
 # objects. The mutable caches are shared by reference across the package.
 from omnigent.server.routes._sessions.common import *
-from omnigent.server.routes._sessions.common import (  # noqa: F401
+from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -186,16 +186,16 @@ from omnigent.server.routes._sessions.helpers import *
 # Bind the real bodies here (overriding the star-imported proxies) so the facade
 # attribute is the implementation tests replace.
 from omnigent.server.routes._sessions.helpers import (
-    _agent_carries_native_fork_history_impl as _agent_carries_native_fork_history,  # noqa: F401
+    _agent_carries_native_fork_history_impl as _agent_carries_native_fork_history,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _agent_is_native_impl as _agent_is_native,  # noqa: F401
+    _agent_is_native_impl as _agent_is_native,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,  # noqa: F401
+    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,  # noqa: F401
+    _compact_lock_impl as _compact_lock,
 )
 from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
@@ -213,25 +213,25 @@ from omnigent.server.routes._sessions.helpers import (
     _load_agent_spec_for_session_impl as _load_agent_spec_for_session,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _poll_request_disconnect_impl as _poll_request_disconnect,  # noqa: F401
+    _poll_request_disconnect_impl as _poll_request_disconnect,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _presentation_labels_for_agent_impl as _presentation_labels_for_agent,  # noqa: F401
+    _presentation_labels_for_agent_impl as _presentation_labels_for_agent,
 )
 from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status_impl as _publish_sandbox_status,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch,  # noqa: F401
+    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _resolve_harness_impl as _resolve_harness,  # noqa: F401
+    _resolve_harness_impl as _resolve_harness,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _same_provider_family_impl as _same_provider_family,  # noqa: F401
+    _same_provider_family_impl as _same_provider_family,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,  # noqa: E501,F401
+    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,
 )
 from omnigent.server.routes._sessions.helpers import (
     _stop_session_via_runner_impl as _stop_session_via_runner,
@@ -253,7 +253,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate_impl as _hold_native_ask_gate,
 )
 from omnigent.server.routes._sessions.orchestration import (
-    _kick_managed_wake_impl as _kick_managed_wake,  # noqa: F401
+    _kick_managed_wake_impl as _kick_managed_wake,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
@@ -339,7 +339,7 @@ def create_sessions_router(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     agent_cache: AgentCache | None = None,
-    mcp_pool: ServerMcpPool | None = None,  # noqa: ARG001 — retained for API compat
+    mcp_pool: ServerMcpPool | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
     comment_store: CommentStore | None = None,
     runner_tunnel_tokens: frozenset[str] | None = None,

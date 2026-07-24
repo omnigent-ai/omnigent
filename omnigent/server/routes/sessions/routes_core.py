@@ -53,8 +53,8 @@ from omnigent.runtime import (
     user_session_stream,
 )
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.policies.approval import _ELICITATION_MODE  # noqa: F401
-from omnigent.server._elicitation_registry import (  # noqa: F401
+from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -94,16 +94,16 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import *
-from omnigent.server.routes._sessions.common import (  # noqa: F401
+from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.helpers import (
-    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,  # noqa: F401
+    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,  # noqa: F401
+    _compact_lock_impl as _compact_lock,
 )
 from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner_impl as _forward_session_change_to_runner,
@@ -112,23 +112,23 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client_impl as _get_runner_client,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _poll_request_disconnect_impl as _poll_request_disconnect,  # noqa: F401
+    _poll_request_disconnect_impl as _poll_request_disconnect,
 )
 from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status_impl as _publish_sandbox_status,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _resolve_harness_impl as _resolve_harness,  # noqa: F401
+    _resolve_harness_impl as _resolve_harness,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,  # noqa: E501,F401
+    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,
 )
 from omnigent.server.routes._sessions.orchestration import *
 from omnigent.server.routes._sessions.orchestration import (
     _ensure_runner_relay_ready_impl as _ensure_runner_relay_ready,
 )
 from omnigent.server.routes._sessions.orchestration import (
-    _kick_managed_wake_impl as _kick_managed_wake,  # noqa: F401
+    _kick_managed_wake_impl as _kick_managed_wake,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
@@ -185,6 +185,7 @@ def register_core_routes(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> None:
     """Register the core session routes on router."""
+
     @router.post(
         "/sessions",
         status_code=201,
@@ -1249,7 +1250,7 @@ def register_core_routes(
                         # condition. Propagate so the stream tears down and the
                         # reader/ticker pair is cancelled.
                         raise
-                    except Exception:  # noqa: BLE001 — a transient tick failure must not tear down a live stream
+                    except Exception:
                         # A transient store/DB read failure must not kill a live
                         # stream and force every watcher to reconnect +
                         # re-snapshot. Log it and try again next interval; the
@@ -1294,7 +1295,7 @@ def register_core_routes(
                         except WebSocketDisconnect:
                             # Client gone mid-send — propagate to tear the stream down.
                             raise
-                        except Exception:  # noqa: BLE001 — a failed discovery push must not kill a live stream
+                        except Exception:
                             # A transient read/send failure for one announcement
                             # must not drop the whole stream; the session is still
                             # discoverable on the client's next list reconcile.
@@ -1310,7 +1311,7 @@ def register_core_routes(
                             await _send({"type": "hosts_changed"})
                         except WebSocketDisconnect:
                             raise
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             _logger.warning(
                                 "hosts-changed push failed; client will rely on fallback poll",
                                 exc_info=True,

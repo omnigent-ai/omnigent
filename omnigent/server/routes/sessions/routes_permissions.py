@@ -16,8 +16,8 @@ from omnigent.entities import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.runtime.policies.approval import _ELICITATION_MODE  # noqa: F401
-from omnigent.server._elicitation_registry import (  # noqa: F401
+from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -44,29 +44,29 @@ from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
 from omnigent.server.routes._sessions.common import *
-from omnigent.server.routes._sessions.common import (  # noqa: F401
+from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.helpers import (
-    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,  # noqa: F401
+    _build_policy_engine_from_spec_impl as _build_policy_engine_from_spec,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _compact_lock_impl as _compact_lock,  # noqa: F401
+    _compact_lock_impl as _compact_lock,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _poll_request_disconnect_impl as _poll_request_disconnect,  # noqa: F401
+    _poll_request_disconnect_impl as _poll_request_disconnect,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _resolve_harness_impl as _resolve_harness,  # noqa: F401
+    _resolve_harness_impl as _resolve_harness,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,  # noqa: E501,F401
+    _signal_terminal_resolved_harness_elicitation_impl as _signal_terminal_resolved_harness_elicitation,
 )
 from omnigent.server.routes._sessions.orchestration import *
 from omnigent.server.routes._sessions.orchestration import (
-    _kick_managed_wake_impl as _kick_managed_wake,  # noqa: F401
+    _kick_managed_wake_impl as _kick_managed_wake,
 )
 from omnigent.server.schemas import (
     AgentObject,
@@ -94,6 +94,7 @@ def register_permissions_routes(
     agent_cache: AgentCache | None = None,
 ) -> None:
     """Register the permissions routes on router."""
+
     @router.put(
         "/sessions/{session_id}/permissions",
         response_model=None,
@@ -314,121 +315,120 @@ def register_permissions_routes(
             "next_cursor": next_cursor,
         }
 
-    # ── Agent sub-resource ────────────────────────────────────────
-    # These endpoints expose the session's bound agent metadata
-    # and bundle through the session namespace, removing the need
-    # for a standalone ``/api/agents`` router.
+    return router
 
-    def _policy_type(spec: PolicySpec) -> str:
-        """Return ``"function"`` for all policies."""
-        if isinstance(spec, FunctionPolicySpec):
-            return "function"
-        return "unknown"
 
-    def _policy_description(spec: PolicySpec) -> str | None:
-        """Return a short description for a policy spec.
+def _policy_type(spec: PolicySpec) -> str:
+    """Return ``"function"`` for all policies."""
+    if isinstance(spec, FunctionPolicySpec):
+        return "function"
+    return "unknown"
 
-        Looks up the policy registry for a human-readable
-        description; falls back to the callable path.
-        """
-        if isinstance(spec, FunctionPolicySpec) and spec.function:
-            from omnigent.policies.registry import get_entry
 
-            entry = get_entry(spec.function.path)
-            return entry.description if entry else spec.function.path
-        return None
+def _policy_description(spec: PolicySpec) -> str | None:
+    """Return a short description for a policy spec.
 
-    def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
-        """
-        Convert a runtime :class:`Agent` entity to an API-layer
-        :class:`AgentObject`.
+    Looks up the policy registry for a human-readable
+    description; falls back to the callable path.
+    """
+    if isinstance(spec, FunctionPolicySpec) and spec.function:
+        from omnigent.policies.registry import get_entry
 
-        Loads the agent spec from *cache* to populate ``mcp_servers``,
-        ``policies``, ``skills``, and (when the stored row has none) the
-        ``description``. If the cache is ``None``, the spec is not
-        cached, or the load fails, those fall back to empty lists / the
-        stored value rather than raising — the endpoint must not fail
-        because one spec can't be read.
+        entry = get_entry(spec.function.path)
+        return entry.description if entry else spec.function.path
+    return None
 
-        :param agent: The runtime agent entity.
-        :param cache: Agent cache, or ``None`` in test setups.
-        :returns: An :class:`AgentObject` for the API response.
-        """
-        mcp_servers: list[MCPServerSummary] = []
-        policies: list[PolicySummary] = []
-        skills: list[SkillSummary] = []
-        terminals: list[str] = []
-        # Harness/kind for the UI; None until the spec loads (mirrors the
-        # GET /v1/agents catalog so both endpoints report it consistently).
-        harness: str | None = None
-        # Prefer the stored entity's description; fall back to the spec's
-        # top-level description when the stored value is unset (single-file
-        # YAML agents don't persist it at registration today). Lets the
-        # new-session picker show a hover description without a migration.
-        description: str | None = agent.description
-        if cache is not None:
-            try:
-                loaded = cache.load(
-                    agent.id, agent.bundle_location, expand_env=agent.session_id is None
+
+def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
+    """
+    Convert a runtime :class:`Agent` entity to an API-layer
+    :class:`AgentObject`.
+
+    Loads the agent spec from *cache* to populate ``mcp_servers``,
+    ``policies``, ``skills``, and (when the stored row has none) the
+    ``description``. If the cache is ``None``, the spec is not
+    cached, or the load fails, those fall back to empty lists / the
+    stored value rather than raising — the endpoint must not fail
+    because one spec can't be read.
+
+    :param agent: The runtime agent entity.
+    :param cache: Agent cache, or ``None`` in test setups.
+    :returns: An :class:`AgentObject` for the API response.
+    """
+    mcp_servers: list[MCPServerSummary] = []
+    policies: list[PolicySummary] = []
+    skills: list[SkillSummary] = []
+    terminals: list[str] = []
+    # Harness/kind for the UI; None until the spec loads (mirrors the
+    # GET /v1/agents catalog so both endpoints report it consistently).
+    harness: str | None = None
+    # Prefer the stored entity's description; fall back to the spec's
+    # top-level description when the stored value is unset (single-file
+    # YAML agents don't persist it at registration today). Lets the
+    # new-session picker show a hover description without a migration.
+    description: str | None = agent.description
+    if cache is not None:
+        try:
+            loaded = cache.load(
+                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            )
+            harness = loaded.spec.executor.harness_kind
+            if description is None:
+                description = loaded.spec.description
+            # Declared terminal names, in spec order — the Web UI
+            # gates its "new terminal" affordance on this list.
+            terminals = list(loaded.spec.terminals or {})
+            # Bundled skills only (mirrors GET /v1/agents); the merged
+            # bundled + host-discovered set lives on the session snapshot.
+            skills = [
+                SkillSummary(name=s.name, description=s.description) for s in loaded.spec.skills
+            ]
+            mcp_servers = [
+                MCPServerSummary(
+                    name=srv.name,
+                    transport=srv.transport,
+                    description=srv.description,
+                    url=srv.url,
+                    headers=dict.fromkeys(srv.headers, "[REDACTED]") if srv.headers else {},
+                    command=srv.command,
+                    args=srv.args,
                 )
-                harness = loaded.spec.executor.harness_kind
-                if description is None:
-                    description = loaded.spec.description
-                # Declared terminal names, in spec order — the Web UI
-                # gates its "new terminal" affordance on this list.
-                terminals = list(loaded.spec.terminals or {})
-                # Bundled skills only (mirrors GET /v1/agents); the merged
-                # bundled + host-discovered set lives on the session snapshot.
-                skills = [
-                    SkillSummary(name=s.name, description=s.description)
-                    for s in loaded.spec.skills
-                ]
-                mcp_servers = [
-                    MCPServerSummary(
-                        name=srv.name,
-                        transport=srv.transport,
-                        description=srv.description,
-                        url=srv.url,
-                        headers=dict.fromkeys(srv.headers, "[REDACTED]") if srv.headers else {},
-                        command=srv.command,
-                        args=srv.args,
+                for srv in loaded.spec.mcp_servers
+            ]
+            if loaded.spec.guardrails and loaded.spec.guardrails.policies:
+                policies = [
+                    PolicySummary(
+                        name=ps.name,
+                        type=_policy_type(ps),
+                        on=[
+                            f"{sel.phase.value}:{sel.tool_name}"
+                            if sel.tool_name
+                            else sel.phase.value
+                            for sel in (ps.on or [])
+                        ],
+                        description=_policy_description(ps),
                     )
-                    for srv in loaded.spec.mcp_servers
+                    for ps in loaded.spec.guardrails.policies
                 ]
-                if loaded.spec.guardrails and loaded.spec.guardrails.policies:
-                    policies = [
-                        PolicySummary(
-                            name=ps.name,
-                            type=_policy_type(ps),
-                            on=[
-                                f"{sel.phase.value}:{sel.tool_name}"
-                                if sel.tool_name
-                                else sel.phase.value
-                                for sel in (ps.on or [])
-                            ],
-                            description=_policy_description(ps),
-                        )
-                        for ps in loaded.spec.guardrails.policies
-                    ]
-            except Exception:  # noqa: BLE001 — spec load failure must not break agent fetch
-                _logger.debug(
-                    "Failed to load spec for agent %s; mcp_servers/policies will be empty",
-                    agent.id,
-                    exc_info=True,
-                )
-        return AgentObject(
-            id=agent.id,
-            name=agent.name,
-            version=agent.version,
-            description=description,
-            created_at=agent.created_at,
-            updated_at=agent.updated_at,
-            harness=harness,
-            mcp_servers=mcp_servers,
-            mcp_servers_editable=(
-                agent.session_id is not None and not (harness or "").endswith("-native")
-            ),
-            policies=policies,
-            skills=skills,
-            terminals=terminals,
-        )
+        except Exception:
+            _logger.debug(
+                "Failed to load spec for agent %s; mcp_servers/policies will be empty",
+                agent.id,
+                exc_info=True,
+            )
+    return AgentObject(
+        id=agent.id,
+        name=agent.name,
+        version=agent.version,
+        description=description,
+        created_at=agent.created_at,
+        updated_at=agent.updated_at,
+        harness=harness,
+        mcp_servers=mcp_servers,
+        mcp_servers_editable=(
+            agent.session_id is not None and not (harness or "").endswith("-native")
+        ),
+        policies=policies,
+        skills=skills,
+        terminals=terminals,
+    )
