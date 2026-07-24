@@ -440,7 +440,14 @@ export function useRenameConversation() {
     // failed PATCH can roll back to whatever the caches held before. The
     // sidebar reads from the ["conversations"] lists, so prefer that row's
     // title and fall back to the snapshot / backfill caches.
-    onMutate: ({ id, title }) => {
+    onMutate: async ({ id, title }) => {
+      // Cancel any in-flight list refetch (the reconcile poll or a WS-triggered
+      // fetch) so it can't resolve after this overlay and clobber the new title
+      // with the stale search-indexed name.
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["conversations"] }),
+        queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+      ]);
       // Find the row's current title in whichever list cache holds it — the
       // flat sidebar list or a project folder — so a failed PATCH can revert.
       let listTitle: string | null | undefined;

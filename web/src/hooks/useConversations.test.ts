@@ -609,6 +609,20 @@ describe("useRenameConversation cache patching", () => {
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
   });
 
+  it("cancels in-flight list queries so a stale reconcile can't clobber the new title", async () => {
+    const { queryClient, rendered } = seedAndRename();
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // onMutate must cancel both list-cache families before overlaying, or an
+    // in-flight reconcile poll / WS-triggered fetch could resolve afterward
+    // and overwrite the optimistic title with the stale search-indexed name.
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+  });
+
   it("paints the new title optimistically before the PATCH resolves", async () => {
     // Hold the PATCH open so we can observe the cache between mutate() and
     // the server response — the window where the sidebar used to show the
