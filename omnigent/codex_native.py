@@ -88,6 +88,9 @@ from omnigent.native_terminal import (
     bind_session_runner as _bind_session_runner,
 )
 from omnigent.native_terminal import (
+    normalize_extra_args as _normalize_extra_args,
+)
+from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 
@@ -348,7 +351,8 @@ def run_codex_native(
     *,
     server: str | None,
     session_id: str | None,
-    codex_args: tuple[str, ...],
+    extra_args: tuple[str, ...] | None = None,
+    codex_args: tuple[str, ...] | None = None,
     resume_picker: bool = False,
     command: str = _DEFAULT_CODEX_COMMAND,
     model: str | None = None,
@@ -372,6 +376,9 @@ def run_codex_native(
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup fails.
     """
+    codex_args = _normalize_extra_args(
+        extra_args=extra_args, legacy_args=codex_args, legacy_param="codex_args"
+    )
     resolved_command = command.strip()
     if not resolved_command:
         raise click.ClickException("Codex command must not be empty.")

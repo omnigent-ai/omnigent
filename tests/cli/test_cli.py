@@ -432,7 +432,7 @@ def test_claude_command_resume_binds_session_and_passes_unknown_args(
     # there).
     assert captured["server"] == "https://example.com"
     assert captured["session_id"] == "conv_abc"
-    assert captured["claude_args"] == ("--resume", "claude-session", "-p", "say hi")
+    assert captured["extra_args"] == ("--resume", "claude-session", "-p", "say hi")
     # No picker requested when ``--resume`` carries a value.
     assert captured["resume_picker"] is False
     # Default: Databricks auth is active (``--use-native-config`` not set) —
@@ -465,7 +465,7 @@ def test_claude_command_short_r_binds_omnigent_session(
     assert result.exit_code == 0, result.output
     assert captured["session_id"] == "conv_abc"
     # ``-r <conv_id>`` consumes both tokens; no leftover claude args.
-    assert captured["claude_args"] == ()
+    assert captured["extra_args"] == ()
     assert captured["resume_picker"] is False
 
 
@@ -662,7 +662,7 @@ def test_codex_command_resume_binds_session_and_passes_unknown_args(
     assert result.exit_code == 0, result.output
     assert captured["server"] == "https://example.com"
     assert captured["session_id"] == "conv_abc"
-    assert captured["codex_args"] == ("-c", "approval_policy=on-request")
+    assert captured["extra_args"] == ("-c", "approval_policy=on-request")
     assert captured["model"] == "gpt-test"
     assert captured["prompt"] == "say hi"
     assert captured["resume_picker"] is False
@@ -876,7 +876,7 @@ def test_codex_config_args_form_base_cli_args_append(
     result = CliRunner().invoke(cli, ["codex", "--dangerously-skip-permissions"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == (
+    assert captured["extra_args"] == (
         "--config",
         "k=v",
         "--dangerously-skip-permissions",
@@ -901,7 +901,7 @@ def test_codex_config_args_only_when_no_cli_args(
     result = CliRunner().invoke(cli, ["codex"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == ("--verbose",)
+    assert captured["extra_args"] == ("--verbose",)
 
 
 def test_codex_args_no_config_is_cli_args_only(
@@ -919,7 +919,7 @@ def test_codex_args_no_config_is_cli_args_only(
     result = CliRunner().invoke(cli, ["codex", "--flag"])
 
     assert result.exit_code == 0, result.output
-    assert captured["codex_args"] == ("--flag",)
+    assert captured["extra_args"] == ("--flag",)
 
 
 def test_pi_config_args_form_base_cli_args_append(
@@ -940,7 +940,7 @@ def test_pi_config_args_form_base_cli_args_append(
     result = CliRunner().invoke(cli, ["pi", "--cli-flag"])
 
     assert result.exit_code == 0, result.output
-    assert captured["pi_args"] == ("--base", "--cli-flag")
+    assert captured["extra_args"] == ("--base", "--cli-flag")
 
 
 def test_kiro_command_is_registered_in_click_help() -> None:
@@ -988,7 +988,7 @@ def test_kiro_command_parses_native_options_and_prompt(
     assert captured["resume_picker"] is False
     assert captured["model"] == "auto"
     assert captured["prompt"] == "hi"
-    assert captured["kiro_args"] == (
+    assert captured["extra_args"] == (
         "--effort",
         "high",
         "--agent",

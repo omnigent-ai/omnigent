@@ -97,7 +97,7 @@ def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPa
     assert captured == {
         "server": "https://example.com",
         "session_id": "conv_kiro",
-        "kiro_args": (),
+        "extra_args": (),
         "auto_open_conversation": True,
     }
 
@@ -3814,7 +3814,7 @@ def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) 
     assert captured == {
         "server": "https://example.com",
         "session_id": "conv_abc123",
-        "cursor_args": (),
+        "extra_args": (),
         "auto_open_conversation": True,
     }
 

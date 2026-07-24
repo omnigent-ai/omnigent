@@ -121,7 +121,7 @@ def test_dispatch_by_runtime_claude_native_remote_routes_to_wrapper(
     # Trailing slash stripped — the wrapper expects a bare base URL.
     assert captured["server"] == "https://example.com"
     # No leaking claude args; the wrapper builds its own.
-    assert captured["claude_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_codex_native_remote_routes_to_wrapper(
@@ -158,7 +158,7 @@ def test_dispatch_by_runtime_codex_native_remote_routes_to_wrapper(
 
     assert captured["session_id"] == "4e92b5a0c0ee6db3f874f9c4a3f855a5"
     assert captured["server"] == "https://example.com"
-    assert captured["codex_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
@@ -195,7 +195,7 @@ def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
 
     assert captured["session_id"] == "415c9954e2fe4b9276083a4d2c66f689"
     assert captured["server"] is None
-    assert captured["codex_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
@@ -221,7 +221,7 @@ def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
 
     assert captured["session_id"] == "823dbd1aab969b5a813fac59bb977a77"
     assert captured["server"] == "https://example.com"
-    assert captured["kiro_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
@@ -262,7 +262,7 @@ def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
 
     assert captured["session_id"] == "a8bcbee631c58ddb98fb5e3f54a1592a"
     assert captured["server"] == "https://example.com"
-    assert captured["antigravity_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_antigravity_native_local_routes_to_wrapper(
@@ -299,7 +299,7 @@ def test_dispatch_by_runtime_antigravity_native_local_routes_to_wrapper(
 
     assert captured["session_id"] == "e85224ee39457def1d20bcce5b74ed8c"
     assert captured["server"] is None
-    assert captured["antigravity_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
@@ -336,7 +336,7 @@ def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
 
     assert captured["session_id"] == "64a784c3aa907d1774f44313546947c6"
     assert captured["server"] is None
-    assert captured["claude_args"] == ()
+    assert captured["extra_args"] == ()
 
 
 @pytest.mark.parametrize(

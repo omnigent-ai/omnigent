@@ -1162,7 +1162,7 @@ def _run_claude_native_resume_redirect(
     run_claude_native(
         server=base_url,
         session_id=conversation_id,
-        claude_args=(),
+        extra_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -1196,7 +1196,7 @@ def _run_codex_native_resume_redirect(
     run_codex_native(
         server=base_url,
         session_id=conversation_id,
-        codex_args=(),
+        extra_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -1228,7 +1228,7 @@ def _run_pi_native_resume_redirect(
     run_pi_native(
         server=base_url,
         session_id=conversation_id,
-        pi_args=(),
+        extra_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -1252,7 +1252,7 @@ def _run_kiro_native_resume_redirect(
     run_kiro_native(
         server=base_url,
         session_id=conversation_id,
-        kiro_args=(),
+        extra_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -1292,7 +1292,7 @@ def _run_cursor_native_resume_redirect(
     run_cursor_native(
         server=base_url,
         session_id=conversation_id,
-        cursor_args=(),
+        extra_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
@@ -1330,7 +1330,7 @@ def _run_kimi_native_resume_redirect(
     run_kimi_native(
         server=base_url,
         session_id=conversation_id,
-        kimi_args=(),
+        extra_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 
