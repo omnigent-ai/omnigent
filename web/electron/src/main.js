@@ -45,8 +45,13 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const { ArtifactSurfaceManager } = require("./artifact_surface");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+
+const artifactSurfaceManager = new ArtifactSurfaceManager({
+  createView: (options) => new WebContentsView(options),
+});
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -1158,6 +1163,9 @@ function createWindow(targetUrl, opts = {}) {
   // The desktop never auto-connects this machine as a runner — on launch or on
   // connect. Connecting is an explicit action from the host menu.
 
+  win.on("close", () => {
+    artifactSurfaceManager.destroyWindow(win);
+  });
   win.on("closed", () => {
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
@@ -2034,6 +2042,44 @@ function browserRegistryForSender(event) {
 }
 
 function registerIpc() {
+  ipcMain.handle("omnigent:artifact-surface-sync", async (event, params) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("artifact surfaces are only available to a connected server page");
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.sync(win, params);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-destroy", (event, id) => {
+    if (!isPinnedOriginSender(event)) return;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    artifactSurfaceManager.destroy(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-inspect", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.inspect(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-select", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.select(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-reload", (event, id) => {
+    if (!isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.reload(win, id);
+  });
+
+  ipcMain.handle("omnigent:artifact-surface-review", async (event, id) => {
+    if (!isPinnedOriginSender(event)) return null;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return artifactSurfaceManager.review(win, id);
+  });
+
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.

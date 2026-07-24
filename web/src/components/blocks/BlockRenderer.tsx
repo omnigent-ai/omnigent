@@ -32,6 +32,7 @@ import {
 } from "@/shell/FileViewerContext";
 import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
 import { ElicitationCard } from "./ApprovalCard";
+import { DesignArtifactCard, parseDesignArtifactResult } from "./DesignArtifactCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
@@ -450,11 +451,25 @@ function renderToolRunFragment(
 
 const _ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
 const _SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
+const PUBLISH_DESIGN_ARTIFACT_NAME = "publish_design_artifact";
+
+function designArtifactData(item: RenderItem) {
+  if (
+    item.kind !== "tool" ||
+    item.execution.name !== PUBLISH_DESIGN_ARTIFACT_NAME ||
+    item.state !== "output-available"
+  ) {
+    return null;
+  }
+  return parseDesignArtifactResult(item.execution.arguments, item.output);
+}
 
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (_ADVISE_MODELS_NAMES.has(item.execution.name) || _SESSION_SEND_NAMES.has(item.execution.name))
+    (_ADVISE_MODELS_NAMES.has(item.execution.name) ||
+      _SESSION_SEND_NAMES.has(item.execution.name) ||
+      designArtifactData(item) !== null)
   );
 }
 
@@ -514,6 +529,12 @@ function renderItem(
         />
       );
     case "tool":
+      {
+        const artifact = designArtifactData(item);
+        if (artifact !== null) {
+          return <DesignArtifactCard key={key} data={artifact} />;
+        }
+      }
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic name(json) row + raw-JSON expansion.
       if (_ADVISE_MODELS_NAMES.has(item.execution.name)) {

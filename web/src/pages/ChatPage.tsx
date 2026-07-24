@@ -3878,6 +3878,8 @@ export function Composer({
   // "Attach to agent" button). Drained into ``mentionedItems`` below, then
   // cleared from the store so they aren't re-applied.
   const pendingComposerAttachments = useChatStore((s) => s.pendingComposerAttachments);
+  const pendingComposerInserts = useChatStore((s) => s.pendingComposerInserts);
+  const activeComposerConversationId = useChatStore((s) => s.conversationId);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -4200,6 +4202,28 @@ export function Composer({
     return () => useChatStore.getState().clearPendingComposerAttachments();
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
   }, [pendingComposerAttachments, setMentionedItems]);
+
+  useEffect(() => {
+    if (!activeComposerConversationId) return;
+    const matching = pendingComposerInserts.filter(
+      (insert) => insert.conversationId === activeComposerConversationId,
+    );
+    if (matching.length === 0) return;
+    const insertedText = matching
+      .map((insert) => insert.text.trim())
+      .filter(Boolean)
+      .join("\n\n");
+    if (insertedText) {
+      setValue((current) =>
+        current.trim() ? `${current.trimEnd()}\n\n${insertedText}` : insertedText,
+      );
+    }
+    const insertedFiles = matching.flatMap((insert) => insert.files);
+    if (insertedFiles.length > 0) setFiles((current) => [...current, ...insertedFiles]);
+    dirtyRef.current = true;
+    useChatStore.getState().clearPendingComposerInserts(activeComposerConversationId);
+    textareaRef.current?.focus();
+  }, [activeComposerConversationId, pendingComposerInserts]);
 
   /**
    * Execute a slash command by name + optional argument string.

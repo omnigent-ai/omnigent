@@ -755,6 +755,48 @@ describe("NewChatLandingScreen", () => {
     // the placeholder, the composer input would be absent and this fails.
     expect(screen.getByText("What should we do?")).toBeTruthy();
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-hero").className).toContain("flex-col");
+    expect(screen.getByTestId("new-chat-landing-hero").className).toContain("items-center");
+    expect(screen.getByRole("heading", { name: "What should we do?" }).className).not.toContain(
+      "sm:text-left",
+    );
+  });
+
+  it("updates the landing mascot when Willy is selected", () => {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "claude-sdk": true },
+      } as Host,
+    ]);
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_willy",
+        name: "willy",
+        display_name: "Willy",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-mascot").dataset.variant).toBe("otto");
+
+    selectAgent("a_willy");
+
+    expect(screen.getByTestId("new-chat-landing-mascot").dataset.variant).toBe("willy");
+    expect(screen.getByTestId("willy-paintbrush")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "What should we design?" })).toBeTruthy();
+    expect(screen.getByText("design").classList.contains("willy-design-word")).toBe(true);
   });
 
   it("preserves the typed message and attachments when the landing screen unmounts and remounts", () => {
@@ -2458,6 +2500,47 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     // Clicking a2 (Codex) commits the pick — the trigger reflects it.
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-a2"));
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Codex");
+  });
+
+  it("opens an agents-only picker from the landing mascot", () => {
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a_willy",
+        name: "willy",
+        display_name: "Willy",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    const mascotTrigger = screen.getByTestId("new-chat-landing-mascot-agent-select");
+    expect(mascotTrigger.getAttribute("aria-label")).toContain("Claude Code");
+    expect(mascotTrigger.getAttribute("title")).toBeNull();
+    expect(mascotTrigger.className).toContain("cursor-pointer");
+    const mascotHint = screen.getByTestId("new-chat-landing-mascot-agent-hint");
+    expect(mascotHint.textContent).toContain("Change agent");
+    expect(mascotHint.className).toContain("group-data-[state=open]:invisible");
+
+    fireEvent.pointerDown(mascotTrigger, { button: 0 });
+    expect(mascotTrigger.getAttribute("data-state")).toBe("open");
+    expect(screen.queryByTestId("new-chat-landing-agent-a1")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-a_willy").textContent).toContain(
+      "Omnigent design",
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-a_willy"));
+
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Willy");
+    expect(mascotTrigger.getAttribute("aria-label")).toContain("Willy");
   });
 
   it("opens the selected agent's config modal from the gear icon", () => {

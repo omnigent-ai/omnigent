@@ -182,6 +182,7 @@ class ProxyMcpManager:
         # Values are Any because MCP tool arguments are JSON objects with
         # heterogeneous value types (str, int, bool, nested dicts, etc.).
         arguments: dict[str, Any],  # type: ignore[explicit-any]
+        session_id: str | None = None,
     ) -> str:
         """Dispatch a tool call via the Omnigent server MCP proxy (``tools/call``).
 
@@ -200,12 +201,14 @@ class ProxyMcpManager:
         :param tool_name: Tool name as seen by the LLM, e.g.
             ``"github__search"`` or ``"sys_os_read"``.
         :param arguments: Decoded tool arguments dict.
+        :param session_id: Accepted for interface parity; this proxy is already
+            bound to a session-specific server endpoint.
         :returns: Tool output string.  On denial the Omnigent server returns an
             MCP error response which is converted here to a JSON error string
             so the harness can feed it to the LLM as a tool result.
         :raises RuntimeError: On network failure or unexpected protocol errors.
         """
-        del spec  # Omnigent server resolves spec from session context
+        del spec, session_id  # The proxy endpoint already carries session context.
 
         payload: dict[str, Any] = {
             "jsonrpc": "2.0",

@@ -118,6 +118,10 @@ from omnigent.server._elicitation_registry import (  # noqa: F401
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.artifact_previews import (
+    ArtifactPreviewService,
+    ArtifactPreviewUnavailable,
+)
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -332,6 +336,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    artifact_preview_service: ArtifactPreviewService | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -3792,6 +3797,44 @@ def create_sessions_router(
         if conv is None:
             raise _session_not_found()
         return conv
+
+    @router.post(
+        "/sessions/{session_id}/artifact-previews",
+        status_code=201,
+    )
+    async def create_artifact_preview(
+        session_id: str,
+        request: Request,
+    ) -> dict[str, str | float]:
+        """Create a short-lived capability URL for a design artifact."""
+        await _validate_session(session_id, request, LEVEL_READ)
+        if artifact_preview_service is None:
+            raise HTTPException(status_code=503, detail="artifact previews unavailable")
+        try:
+            body = await request.json()
+            entry_path = body.get("entry_path") if isinstance(body, dict) else None
+            if not isinstance(entry_path, str):
+                raise ValueError
+            grant = await artifact_preview_service.create_grant(session_id, entry_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid artifact entry path") from exc
+        except ArtifactPreviewUnavailable as exc:
+            raise HTTPException(
+                status_code=503, detail="artifact preview runner unavailable"
+            ) from exc
+        return {"url": grant.url, "expires_at": grant.expires_at}
+
+    @router.get("/sessions/{session_id}/artifacts", response_model=None)
+    async def list_managed_artifacts(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """List canonical HTML entries from the runner-managed artifact root."""
+        await _validate_session(session_id, request, LEVEL_READ)
+        return await _proxy_get_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/artifacts",
+        )
 
     async def _proxy_get_to_runner(
         session_id: str,
