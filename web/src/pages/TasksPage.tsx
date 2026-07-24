@@ -81,6 +81,11 @@ export function TasksPage() {
       if (q && !t.name.toLowerCase().includes(q)) return false;
       return true;
     });
+    const nextRunByTaskId = new Map(
+      matches
+        .filter((t) => t.state === "active")
+        .map((t) => [t.id, nextRunAtMs(t.rrule, t.timezone)]),
+    );
     // Sort: ACTIVE first (soonest next-run at the top), PAUSED last. The
     // least-actionable (paused) rows sink to the bottom rather than leading the
     // list. Active rows with no computable next-run sort after those that have
@@ -90,8 +95,8 @@ export function TasksPage() {
       const bPaused = b.state === "paused";
       if (aPaused !== bPaused) return aPaused ? 1 : -1;
       if (aPaused && bPaused) return a.name.localeCompare(b.name);
-      const aNext = nextRunAtMs(a.rrule, a.timezone);
-      const bNext = nextRunAtMs(b.rrule, b.timezone);
+      const aNext = nextRunByTaskId.get(a.id) ?? null;
+      const bNext = nextRunByTaskId.get(b.id) ?? null;
       if (aNext == null && bNext == null) return a.name.localeCompare(b.name);
       if (aNext == null) return 1;
       if (bNext == null) return -1;
