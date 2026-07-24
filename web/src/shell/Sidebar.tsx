@@ -721,12 +721,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
 
           <nav
             ref={scrollContainerRef}
-            // `stable both-edges` reserves the scrollbar gutter symmetrically
-            // (left + right) so rows stay centered and content never reflows
-            // when the scrollbar appears/disappears — on classic-scrollbar
-            // platforms as well as overlay ones. Plain `stable` (right-only)
-            // left rows visually off-center against the left `px-2` inset.
-            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-gutter:stable_both-edges]"
+            // Keep wheel/touch scrolling without letting classic-scrollbar
+            // platforms reserve a wide, permanently visible Sidebar gutter.
+            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -2422,7 +2419,7 @@ function SessionTooltipContent({
       sideOffset={8}
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
-      // then a muted, small-icon metadata line.
+      // then muted, small-icon metadata lines.
       className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-md ring-1 ring-foreground/10"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
@@ -2439,6 +2436,15 @@ function SessionTooltipContent({
         <LaptopIcon aria-hidden className="size-3.5 shrink-0" />
         <span className="truncate">{locationLabel}</span>
       </p>
+      {conversation.git_branch && (
+        <p
+          data-testid="session-tooltip-branch"
+          className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+        >
+          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{conversation.git_branch}</span>
+        </p>
+      )}
     </TooltipContent>
   );
 }
@@ -2776,12 +2782,19 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "sidebar-compact-text relative flex min-h-7 flex-col gap-0.5 rounded-[var(--radius-otto-sm)] px-2 py-0.5 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
+        "sidebar-compact-text relative flex h-7 flex-col justify-center rounded-[var(--radius-otto-sm)] py-0.5 pl-2 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
         "w-full",
-        !selectionMode && (sessionState?.kind === "awaiting" ? "pr-48 md:pr-29" : "pr-28 md:pr-14"),
+        !selectionMode &&
+          (sessionState?.kind === "awaiting"
+            ? "pr-48 md:pr-29"
+            : sessionState !== null
+              ? "pr-28 md:pr-8"
+              : "pr-28 md:pr-2"),
+        !selectionMode && "md:group-hover:pr-14 md:group-focus-within:pr-14",
+        !selectionMode && menuOpen && "md:pr-14",
         selectionMode && "pr-10",
         isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -2818,16 +2831,6 @@ function ConversationRow({
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
-      {/* Row 2: git branch subtitle, spanning the full row below. */}
-      {gitBranch !== null && (
-        <span
-          className="flex items-center gap-1 font-normal text-xs text-muted-foreground"
-          title={gitBranch}
-        >
-          <GitBranchIcon className="size-3 shrink-0" />
-          <span className="truncate">{gitBranch}</span>
-        </span>
-      )}
     </Link>
   );
 
@@ -2855,6 +2858,7 @@ function ConversationRow({
             <PinnedProjectFlyoutContent
               title={conversation.title ?? conversation.id}
               projectName={projectFlyoutName}
+              gitBranch={gitBranch}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -2882,6 +2886,7 @@ function ConversationRow({
           <PinnedProjectFlyoutContent
             title={conversation.title ?? conversation.id}
             projectName={projectFlyoutName}
+            gitBranch={gitBranch}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -3135,16 +3140,18 @@ function ConversationRow({
  *
  * Pinning lifts a session out of its project folder into the flat "Pinned"
  * section, dropping the visual project cue the folder provided. Hovering the
- * row surfaces it again: the session title, then a folder icon + project name.
+ * row surfaces it again: the session title, project name, and optional branch.
  * Mirrors {@link AgentHoverCard}'s Cursor-style placement (right / top-aligned)
  * and the muted, small-icon foreground used elsewhere in the sidebar.
  */
 function PinnedProjectFlyoutContent({
   title,
   projectName,
+  gitBranch,
 }: {
   title: string;
   projectName: string;
+  gitBranch: string | null;
 }) {
   return (
     <HoverCardContent
@@ -3162,6 +3169,15 @@ function PinnedProjectFlyoutContent({
         <FolderIcon className="size-3.5 shrink-0" />
         <span className="truncate">{projectName}</span>
       </p>
+      {gitBranch && (
+        <p
+          data-testid="pinned-project-flyout-branch"
+          className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground"
+        >
+          <GitBranchIcon aria-hidden className="size-3.5 shrink-0" />
+          <span className="truncate">{gitBranch}</span>
+        </p>
+      )}
     </HoverCardContent>
   );
 }
