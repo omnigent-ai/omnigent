@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import sys
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -1647,9 +1646,10 @@ async def test_session_stream_receives_events() -> None:
 @pytest.mark.asyncio
 async def test_session_stream_emits_heartbeat_on_idle() -> None:
     """The session stream emits an immediate and idle ``session.heartbeat``."""
-    runner_app_module = sys.modules[create_runner_app.__module__]
-    original = runner_app_module._SESSION_STREAM_HEARTBEAT_S
-    runner_app_module._SESSION_STREAM_HEARTBEAT_S = 0.05
+    import omnigent.runner.app as _runner_app_module
+
+    original = _runner_app_module._SESSION_STREAM_HEARTBEAT_S
+    _runner_app_module._SESSION_STREAM_HEARTBEAT_S = 0.05
     try:
         app, _pm, _hc = _build_lifecycle_app()
         async with _runner_client(app) as client:
@@ -1685,7 +1685,7 @@ async def test_session_stream_emits_heartbeat_on_idle() -> None:
             "for this before forwarding fast no-replay user input."
         )
     finally:
-        runner_app_module._SESSION_STREAM_HEARTBEAT_S = original
+        _runner_app_module._SESSION_STREAM_HEARTBEAT_S = original
 
 
 @pytest.mark.asyncio

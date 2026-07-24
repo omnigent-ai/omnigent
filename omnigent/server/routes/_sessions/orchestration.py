@@ -5451,6 +5451,10 @@ async def _create_session_from_existing_agent(
                     expand_env=agent.session_id is None,
                 )
                 _tel_harness = _spec_harness(_tel_loaded.spec)
+            # Only log agent name for known built-in orchestrators to avoid
+            # leaking user-defined agent names.
+            _NAMED_AGENTS = {"polly", "debby"}
+            _tel_agent_name = agent.name if agent.name in _NAMED_AGENTS else None
             _tel_emit(
                 _TelSessionCreatedEvent(
                     session_id=conv.id,
@@ -5462,6 +5466,7 @@ async def _create_session_from_existing_agent(
                     host_installation_id=_host_install_id,
                     is_fork=body.parent_session_id is not None,
                     is_sub_agent=body.sub_agent_name is not None,
+                    agent_name=_tel_agent_name,
                 )
             )
     except Exception:  # noqa: BLE001 — telemetry must not disrupt session creation

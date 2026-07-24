@@ -275,6 +275,28 @@ describe("AgentInfoButton hover behavior", () => {
     expect(screen.queryByTestId("agent-info-panel")).toBeNull();
   });
 
+  it("keeps the MCP restart warning after the popover closes and reopens", () => {
+    renderButtonWithSession(AGENT_WITH_BOTH, "conv_mcp_dirty");
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: "github" } });
+    fireEvent.change(within(dialog).getByLabelText("URL"), {
+      target: { value: "https://example.com/sse" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Save/ }));
+    expect(within(dialog).getByText("Restart the session to apply your changes.")).toBeVisible();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    fireEvent.click(trigger);
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+
+    fireEvent.click(trigger);
+    expect(screen.getByText("Restart to apply changes")).toBeVisible();
+  });
+
   it("ignores a touch pointer so a tap falls through to click-to-open", () => {
     // A touch tap synthesizes pointerenter+click. If hover-open fired on touch,
     // it would open on pointerenter only for the synthetic click to toggle it
@@ -324,6 +346,18 @@ describe("AgentInfoButton hover behavior", () => {
 
     // No timers advanced: the click lands inside HOVER_CLICK_GRACE_MS.
     fireEvent.click(trigger);
+    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+  });
+
+  it("does not hover-close a popover that the same pointer gesture clicked open", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+
+    mousePointerEnter(trigger);
+    fireEvent.click(trigger);
+    mousePointerLeave(trigger);
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+
     expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
   });
 });

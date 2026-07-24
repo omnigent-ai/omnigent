@@ -363,59 +363,135 @@ export async function deleteConversation(id: string, deleteBranch = false): Prom
 /**
  * Rename a conversation via `PATCH /v1/sessions/{id}`.
  *
- * Patches the new title into every cached list/snapshot query in
- * place instead of invalidating. `GET /v1/sessions` may serve titles
- * from a search index that catches up to the rename asynchronously
- * (the Databricks deployment lists via search-midtier over WHS), so
- * an immediate refetch races the reindex and loses — the sidebar
- * would keep the old name until the next reconciliation. The PATCH
- * response is server-confirmed truth; overlaying it is always safe.
- * List membership and ordering converge later via the
+ * Optimistic: the new title is overlaid into every cached list/snapshot
+ * query in `onMutate`, so the sidebar row repaints on the next frame
+ * rather than after the PATCH round-trips (which showed the old name
+ * for the request's duration). `onSuccess` re-overlays the
+ * server-confirmed row to pick up the authoritative `updated_at`;
+ * `onError` restores the pre-rename title.
+ *
+ * Overlaying in place instead of invalidating is deliberate:
+ * `GET /v1/sessions` may serve titles from a search index that catches
+ * up to the rename asynchronously (the Databricks deployment lists via
+ * search-midtier over WHS), so an immediate refetch races the reindex
+ * and loses — the sidebar would keep the old name until the next
+ * reconciliation. List membership and ordering converge later via the
  * `WS /v1/sessions/updates` stream and the low-rate reconciliation
  * polls. Callers (the sidebar row) trigger this on blur / Enter in
  * the inline-edit input.
  */
+// Project folders (["project-sessions", name]) are non-archived, unsearched
+// lists — the same filters the push-delta merge uses to overlay them.
+const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+
 export function useRenameConversation() {
   const queryClient = useQueryClient();
+
+  // Overlay a title into every cache that holds a row for this session.
+  // Only the fields the rename changes are written — the full PATCH
+  // snapshot carries nulls for absent fields that would clobber
+  // list-shaped rows (see `nullsToUndefined` in sessionListCache).
+  const overlayTitle = (id: string, title: string | null, updatedAt?: number) => {
+    const wire: SessionListWireItem = {
+      id,
+      title,
+      ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
+    };
+    const itemsById = new Map([[id, wire]]);
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["conversations"],
+    })) {
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        itemsById,
+        filtersFromConversationQueryKey(key),
+        // activeId only gates `needsRefetch`, which is unused here —
+        // we deliberately skip the refetch (see hook docstring).
+        undefined,
+      );
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+    // A filed session renders from its own ["project-sessions", name] list,
+    // not the flat ["conversations"] cache, so patch those (non-archived,
+    // unsearched — PROJECT_FOLDER_FILTERS) too or the folder row stays stale.
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["project-sessions"],
+    })) {
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        itemsById,
+        PROJECT_FOLDER_FILTERS,
+        undefined,
+      );
+      if (next !== data) queryClient.setQueryData(key, next);
+    }
+    // The pinned-row backfill cache (staleTime 60s) and the per-session
+    // snapshot (staleTime Infinity) are not covered by the list patch and
+    // would serve the old title long after.
+    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+      old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
+    );
+    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
+  };
+
   return useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) => renameConversation(id, title),
+    // Paint the new name immediately; snapshot the current title so a
+    // failed PATCH can roll back to whatever the caches held before. The
+    // sidebar reads from the ["conversations"] lists, so prefer that row's
+    // title and fall back to the snapshot / backfill caches.
+    onMutate: async ({ id, title }) => {
+      // Cancel any in-flight list refetch (the reconcile poll or a WS-triggered
+      // fetch) so it can't resolve after this overlay and clobber the new title
+      // with the stale search-indexed name.
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey: ["conversations"] }),
+        queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+      ]);
+      // Find the row's current title in whichever list cache holds it — the
+      // flat sidebar list or a project folder — so a failed PATCH can revert.
+      let listTitle: string | null | undefined;
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const row = data?.pages.flatMap((page) => page.data).find((conv) => conv.id === id);
+          if (row) {
+            listTitle = row.title;
+            break;
+          }
+        }
+        if (listTitle !== undefined) break;
+      }
+      const previous = {
+        list: listTitle,
+        session: queryClient.getQueryData<Session>(["session", id])?.title,
+        backfill: queryClient.getQueryData<Conversation | null>(["conversation-backfill", id])
+          ?.title,
+      };
+      overlayTitle(id, title);
+      return previous;
+    },
+    onError: (_err, { id }, previous) => {
+      // Restore the first title we managed to snapshot. A snapshotted null
+      // (previously-untitled row) is a real value to restore; only skip
+      // when we never captured a title at all (all sources undefined).
+      const restored =
+        previous?.list !== undefined
+          ? previous.list
+          : previous?.session !== undefined
+            ? previous.session
+            : previous?.backfill;
+      if (restored !== undefined) overlayTitle(id, restored);
+    },
     onSuccess: (updated) => {
       // The PATCH bumps server `updated_at`, which the unseen tracker
       // would otherwise read as new messages even though the user
       // initiated this themselves. Anchor the seen-baseline to the
       // server's new updated_at so the next refetch reports not unseen.
       markConversationSeen(updated.id, updated.updated_at);
-      // Overlay only the fields the rename changes — the full PATCH
-      // snapshot carries nulls for absent fields that would clobber
-      // list-shaped rows (see `nullsToUndefined` in sessionListCache).
-      const wire: SessionListWireItem = {
-        id: updated.id,
-        title: updated.title,
-        updated_at: updated.updated_at,
-      };
-      const itemsById = new Map([[updated.id, wire]]);
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["conversations"],
-      })) {
-        const { data: next } = mergeItemsIntoPages(
-          data,
-          itemsById,
-          filtersFromConversationQueryKey(key),
-          // activeId only gates `needsRefetch`, which is unused here —
-          // we deliberately skip the refetch (see hook docstring).
-          undefined,
-        );
-        if (next !== data) queryClient.setQueryData(key, next);
-      }
-      // The pinned-row backfill cache (staleTime 60s) and the
-      // per-session snapshot (staleTime Infinity) are not covered by
-      // the list patch and would serve the old title long after.
-      queryClient.setQueryData<Conversation | null>(["conversation-backfill", updated.id], (old) =>
-        old ? { ...old, title: updated.title, updated_at: updated.updated_at } : old,
-      );
-      queryClient.setQueryData<Session>(["session", updated.id], (old) =>
-        old ? { ...old, title: updated.title } : old,
-      );
+      // Reconcile with the server-confirmed title + authoritative updated_at.
+      overlayTitle(updated.id, updated.title, updated.updated_at);
     },
   });
 }
