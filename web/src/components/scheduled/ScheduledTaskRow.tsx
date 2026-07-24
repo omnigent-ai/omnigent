@@ -1,16 +1,27 @@
 // One row in the Tasks list, rendered as a FLAT list row (no card chrome — no
 // border/background/shadow box, no per-row divider). Layout: bold task title on
-// line 1 (+ a small "Paused" pill when paused), a single muted subline on line 2
-// with the human-readable schedule summary ("Weekdays at 8:00 AM"). We show ONLY
-// the schedule — no "Next run in Xh" countdown — because a client-computed
-// next-run can't be guaranteed to match the server's anchor for INTERVAL>1
-// rules; the schedule summary is always correct. Paused rows are NOT dimmed —
-// the title stays fully legible and the pill is the sole paused signal. A
-// hover-revealed ellipsis (⋯) action menu (Pause/Resume + Delete) sits on the
-// right. No leading or trailing status circles — the ⋯ menu is the only affordance.
+// line 1 (+ a small "Paused" pill when paused, + a completion-status pill for
+// the last run), a single muted subline on line 2 with the human-readable
+// schedule summary ("Weekdays at 8:00 AM") followed by the SERVER's next-run
+// time ("· Next: Tomorrow 9:00 AM") when armed.
+//
+// The next-run time is the scheduler's authoritative `nextRunAt` (an ISO string
+// the server computes) — we only FORMAT it, never recompute it on the client,
+// because a client-computed next-run can't match the server anchor for
+// INTERVAL>1 rules (the original reason a client countdown was removed). Paused
+// rows are NOT dimmed — the title stays fully legible and the pill is the sole
+// paused signal. A hover-revealed ellipsis (⋯) action menu (Run now / Pause /
+// Resume / Edit / Delete) sits on the right.
 
 import { useMemo, useState } from "react";
-import { MoreHorizontalIcon, PauseIcon, PencilIcon, PlayIcon, Trash2Icon } from "lucide-react";
+import {
+  MoreHorizontalIcon,
+  PauseIcon,
+  PencilIcon,
+  PlayIcon,
+  Trash2Icon,
+  ZapIcon,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -19,28 +30,52 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { describeSchedule } from "@/lib/scheduleText";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
+import type { ScheduledTask, ScheduledTaskRunStatus } from "@/lib/scheduledTasksApi";
+
+/**
+ * Display config for each last-run status pill. `succeeded` deliberately renders
+ * NOTHING (a green "Succeeded" pill on every healthy row is visual noise — the
+ * signal is failure/skip/in-flight); the others are distinct: destructive for
+ * `failed`, muted for `skipped`, accent for the in-flight `running`/`scheduled`.
+ * `incomplete` (a stale run force-failed by the server) reads as a failure.
+ */
+const RUN_STATUS_PILL: Partial<
+  Record<ScheduledTaskRunStatus, { label: string; className: string }>
+> = {
+  failed: { label: "Failed", className: "bg-destructive/10 text-destructive" },
+  incomplete: { label: "Failed", className: "bg-destructive/10 text-destructive" },
+  skipped: { label: "Skipped", className: "bg-muted text-muted-foreground" },
+  running: { label: "Running", className: "bg-primary/10 text-primary" },
+  scheduled: { label: "Queued", className: "bg-primary/10 text-primary" },
+};
 
 export function ScheduledTaskRow({
   task,
   onEdit,
   onPauseToggle,
+  onRunNow,
   onDelete,
   busy,
 }: {
   task: ScheduledTask;
   onEdit: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
+  onRunNow: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
   busy: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const paused = task.state === "paused";
-  // The subtitle is just the schedule summary for both active and paused rows
-  // (no next-run countdown). The paused signal is the pill next to the title,
-  // NOT a "· Paused" suffix and NOT row-wide dimming.
-  const secondaryLine = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
+  const statusPill = task.lastRunStatus ? RUN_STATUS_PILL[task.lastRunStatus] : undefined;
+  // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
+  // (active tasks only — a paused task has null nextRunAt). We only format the
+  // server value; we never recompute next-run on the client.
+  const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
+  const nextRun = useMemo(
+    () => formatNextRunAt(task.nextRunAt, task.timezone),
+    [task.nextRunAt, task.timezone],
+  );
 
   return (
     <div
@@ -71,9 +106,27 @@ export function ScheduledTaskRow({
               Paused
             </span>
           )}
+          {statusPill && (
+            <span
+              data-testid="task-run-status-pill"
+              data-status={task.lastRunStatus}
+              className={cn(
+                "shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium",
+                statusPill.className,
+              )}
+            >
+              {statusPill.label}
+            </span>
+          )}
         </span>
         <span className="truncate text-xs text-muted-foreground" data-testid="task-schedule-line">
-          {secondaryLine}
+          {scheduleSummary}
+          {nextRun && (
+            <>
+              {" · "}
+              <span data-testid="task-next-run">Next: {nextRun}</span>
+            </>
+          )}
         </span>
       </div>
 
@@ -100,6 +153,10 @@ export function ScheduledTaskRow({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => onRunNow(task)} data-testid="task-run-now">
+            <ZapIcon className="size-4" />
+            Run now
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => onEdit(task)} data-testid="task-edit">
             <PencilIcon className="size-4" />
             Edit

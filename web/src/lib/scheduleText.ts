@@ -57,6 +57,102 @@ export function formatClockTime(hour: number, minute: number): string {
   return `${h12}:${mm} ${period}`;
 }
 
+/**
+ * Format the SERVER's authoritative next-run instant (an ISO-8601 string from
+ * the live scheduler) as a short human label in the task's timezone, e.g.
+ * `Today 9:00 AM`, `Tomorrow 8:30 AM`, `Mon 6:00 AM`, `Mar 3, 9:00 AM`.
+ *
+ * This formats a value the SERVER computed — it does NOT recompute next-run on
+ * the client (which can't match the server anchor for INTERVAL>1 rules). Pass
+ * the task's `nextRunAt` straight through. Returns `null` for a null/unparseable
+ * input so the caller renders nothing.
+ *
+ * "Today" / "Tomorrow" are decided by calendar-day difference in `timezone`
+ * (not a 24h delta), so an 11pm-now / 1am-tomorrow fire still reads "Tomorrow".
+ *
+ * @param iso The server's `next_run_at` ISO string, or `null`.
+ * @param timezone IANA timezone the label is rendered in (the task timezone).
+ * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
+ */
+export function formatNextRunAt(
+  iso: string | null | undefined,
+  timezone: string,
+  now: Date = new Date(),
+): string | null {
+  if (!iso) return null;
+  const instant = new Date(iso);
+  if (Number.isNaN(instant.getTime())) return null;
+
+  const dayDelta = calendarDayDeltaInTz(now, instant, timezone);
+  const time = formatInstantClock(instant, timezone);
+  if (dayDelta === 0) return `Today ${time}`;
+  if (dayDelta === 1) return `Tomorrow ${time}`;
+  // Within the coming week, name the weekday ("Mon"); otherwise a short date.
+  if (dayDelta > 1 && dayDelta < 7) {
+    return `${formatInstantPart(instant, timezone, { weekday: "short" })} ${time}`;
+  }
+  const date = formatInstantPart(instant, timezone, { month: "short", day: "numeric" });
+  return `${date}, ${time}`;
+}
+
+/** 12-hour clock (`9:00 AM`) for an absolute instant, rendered in `timezone`. */
+function formatInstantClock(instant: Date, timezone: string): string {
+  return formatInstantPart(instant, timezone, {
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  });
+}
+
+/** Render an absolute instant in `timezone` with the given Intl options. */
+function formatInstantPart(
+  instant: Date,
+  timezone: string,
+  options: Intl.DateTimeFormatOptions,
+): string {
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: timezone, ...options }).format(instant);
+  } catch {
+    // Unknown timezone → fall back to the viewer's local zone rather than throw.
+    return new Intl.DateTimeFormat("en-US", options).format(instant);
+  }
+}
+
+/**
+ * Whole-calendar-day difference (`b` − `a`) as counted in `timezone`, so
+ * "today"/"tomorrow" reflect the wall-clock date boundary rather than a 24h
+ * span. Returns e.g. 0 (same day), 1 (next day), or a negative number for a
+ * past instant.
+ */
+function calendarDayDeltaInTz(a: Date, b: Date, timezone: string): number {
+  const dayA = civilDayNumber(a, timezone);
+  const dayB = civilDayNumber(b, timezone);
+  if (dayA == null || dayB == null) return Math.round((b.getTime() - a.getTime()) / 86_400_000);
+  return dayB - dayA;
+}
+
+/** The instant's civil date in `timezone` as a day count (days since epoch). */
+function civilDayNumber(instant: Date, timezone: string): number | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(instant);
+    const map: Record<string, number> = {};
+    for (const p of parts) {
+      if (p.type !== "literal") map[p.type] = Number(p.value);
+    }
+    if (map.year == null || map.month == null || map.day == null) return null;
+    // Days since the Unix epoch for that civil date (UTC math on the tz-local
+    // Y/M/D — a pure day index, so DST never shifts the count).
+    return Math.floor(Date.UTC(map.year, map.month - 1, map.day) / 86_400_000);
+  } catch {
+    return null;
+  }
+}
+
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */
 function tryParse(rrule: string): RRule | null {
   try {
