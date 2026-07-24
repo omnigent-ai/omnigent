@@ -209,15 +209,16 @@ async def _drive_install(base_url: str) -> None:
             # The "Set up Codex" notice only renders once BOTH async fetches have
             # landed and re-rendered the composer: /v1/agents (auto-selects the
             # single Codex agent) and /v1/hosts (marks its harness unconfigured).
-            # On a loaded CI runner that chain can lag, so wait for the network to
-            # go idle and the host chip (readiness data present) before asserting
-            # the notice — otherwise the assertion races the still-loading state.
-            await page.wait_for_load_state("networkidle")
+            # On a loaded CI runner that chain can lag, so step through the
+            # readiness signals with generous element waits: the host chip
+            # (host + readiness present) first, then the notice. (NOT
+            # wait_for_load_state("networkidle") — the app holds a long-lived
+            # sessions/updates WebSocket, so the network never goes idle.)
             await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_be_visible(
-                timeout=30_000
+                timeout=60_000
             )
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
-            await expect(setup).to_be_visible(timeout=30_000)
+            await expect(setup).to_be_visible(timeout=60_000)
             await setup.click()
 
             # The dialog's checklist offers a one-click Install for this harness.
