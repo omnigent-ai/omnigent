@@ -46,19 +46,12 @@
 
 The Slack integration (`integrations/slack/`) is a standalone Socket-Mode
 process that calls each user's Omnigent server over HTTP + SSE
-(`OmnigentClient` / `OmnigentClientPool`). Today it sends **every request
-unauthenticated**: the pool is *"one unauthenticated client per server URL"*
-(`omnigent.py:337`), and any server with auth enabled returns 401, which the
-bot converts into a dead-end *"authentication … isn't supported yet"* setup
-error (`omnigent.py:23`, `setup.py:144`).
-
-So the bot only works against auth-disabled servers, and when it does work the
-server sees a single shared anonymous identity — it cannot tell one Slack user
-from another, cannot scope permissions, and cannot audit who did what.
-
-We want each Slack user's turns to reach the Omnigent server **as that user's
-own authenticated identity**, without the Slack process ever handling the
-user's Omnigent credentials.
+(`OmnigentClient` / `OmnigentClientPool`). Each Slack user's turns must reach
+the Omnigent server **as that user's own authenticated identity** — so the
+server can scope permissions and audit who did what — **without the Slack
+process ever handling the user's Omnigent credentials**. An unauthenticated
+client can only reach auth-disabled servers, and would present one shared
+anonymous identity the server can't distinguish per user.
 
 ## Topology and trust
 
@@ -85,28 +78,25 @@ Role mapping:
 | Resource Owner           | The Slack user, authenticating in their browser |
 | Out-of-band channel      | Slack (delivers the verification link only)     |
 
-## What already exists (reused, not rebuilt)
+## Shared substrate (reused, not rebuilt)
 
-RFC 8628 primitives are absent (no `device_code` / `user_code` /
-`verification_uri` anywhere), but the substrate is all present:
+The device grant builds on existing server primitives:
 
-- **Poll-endpoint shape** — `POST /auth/cli-login` + `GET /auth/cli-poll` with
-  202-pending / 200-done / 410-expired semantics (`routes/auth.py:484`).
 - **Atomic single-use token redemption** — `SqlAlchemyAccountStore.redeem_token`
   uses `UPDATE … WHERE redeemed_at IS NULL` + rowcount so at most one caller
-  wins under concurrency (`accounts_store.py:329`). The new grant store copies
-  this pattern.
+  wins under concurrency (`accounts_store.py`). The grant store follows the
+  same pattern.
 - **Session JWT minting** — `mint_session_token(user_id, secret, ttl, provider)`
-  (`oidc.py:53`), HS256 with `sub`/`iat`/`exp`/`provider`.
-- **Bearer validation** — `UnifiedAuthProvider._check_cookie` already accepts
+  (`oidc.py`), HS256 with `sub`/`iat`/`exp`/`provider`.
+- **Bearer validation** — `UnifiedAuthProvider._check_cookie` accepts
   `Authorization: Bearer <jwt>` and validates the same claim shape
-  (`auth.py:477`). Delegated access tokens validate through this path unchanged.
-- **Browser consent under accounts mode** — the `accounts` provider already
+  (`auth.py`). Delegated access tokens validate through this path unchanged.
+- **Browser consent under accounts mode** — the `accounts` provider
   establishes the browser identity via its session cookie; the consent page
   runs behind it. (This is why the grant mounts in accounts mode only — see
   the mount restriction below.)
-- **Open-redirect hardening** — `_sanitize_return_to` (`routes/auth.py:150`) is
-  reused for the post-login bounce back to the consent page.
+- **Open-redirect hardening** — `_sanitize_return_to` (`routes/auth.py`) guards
+  the post-login bounce back to the consent page.
 
 ## Design decisions (agreed)
 
@@ -120,14 +110,10 @@ RFC 8628 primitives are absent (no `device_code` / `user_code` /
    only an authorized client can drive the flow. The **browser** endpoints
    (consent GET / approve / deny) are never gated by it — the user's browser
    doesn't hold the secret; their trust is the session cookie + Origin check.
-   Unset ⇒ endpoints stay public (backward compatible).
-
-   *History:* the secret was implemented, removed, then reintroduced as
-   opt-in. It was removed when the Slack client accepted a **user-supplied**
-   server URL — shipping a shared secret to an arbitrary user-typed host was a
-   secret-exfiltration/SSRF path. That objection is now gone: the Slack socket
-   server's target is a **fixed operator config** (`OMNIGENT_SERVER_URL`), not
-   a user-supplied URL, so the secret only ever travels to the trusted server.
+   Unset ⇒ endpoints stay public (backward compatible). Shipping the secret to
+   the Slack client is safe because its target is a **fixed operator config**
+   (`OMNIGENT_SERVER_URL`), not a user-supplied URL, so the secret only ever
+   travels to the trusted server.
 2. **Refresh tokens** — short-lived access tokens (≤ 1 h) plus a rotating,
    revocable refresh token, with a 30-day absolute grant lifetime. The Slack
    server refreshes silently; a stolen access token expires quickly and a grant
@@ -149,15 +135,21 @@ RFC 8628 primitives are absent (no `device_code` / `user_code` /
          verification_uri_complete,   # verification_uri?user_code=XYZ
          expires_in: 600, interval: 5 }
 
- 3. Slack server shows the verification link in the setup modal (initiator
-       only). The device_code is NOT included — it never leaves the server
-       pair; only the user_code (in verification_uri_complete) does.
+ 3. Slack server shows the verification link (verification_uri_complete,
+       code prefilled for one-click) in the setup modal (initiator only),
+       plus the user_code so the user can confirm the match. The
+       device_code is NOT included — it never leaves the server pair.
 
  4. User clicks → Omnigent consent page (verification_uri).
-       Browser authenticates via the server's accounts provider.
-       Page shows: "<client_id> is requesting permission to act as YOU
-       (alice@example.com) on this Omnigent server.  [Approve] [Deny]"
-       plus a warning to approve only a login the user personally started.
+       The page REQUIRES a login started for THIS flow: if the browser's
+       session predates the grant (session iat < grant.created_at), it
+       bounces through the login page with ?reauth=1 — which forces a fresh
+       password entry even for an already-signed-in user — and returns here.
+       Once re-authenticated, the page shows: "<client_id> is requesting
+       permission to act as YOU (alice@example.com) on this Omnigent server.
+       [Approve] [Deny]" plus a warning to approve only a self-started login.
+       The forced re-auth means a grant can't be approved by one reflexive
+       click on a link the user didn't personally start (see threat #2).
 
  5. User approves → the grant is bound to the authenticated identity
        (alice@…). client_id is recorded for display/audit only, never as
@@ -197,9 +189,8 @@ cli-ticket flow and never mounts these routes; header mode has no
 server-mintable identity — see `create_device_auth_router`, which raises if
 constructed for any other source). The `device_grants` table is created
 unconditionally by the migration regardless of the flag; only the router
-mount is gated. This router also **owns** `mint_delegated_token` and
-`DELEGATED_SCOPE` (moved here from `oidc.py`, which retains only
-`mint_session_token` / `mint_session_cookie`).
+mount is gated. This router **owns** `mint_delegated_token` and
+`DELEGATED_SCOPE`.
 
 - `POST /oauth/device/authorize` — **public** (rate-limited). Generates a
   high-entropy `device_code` (`secrets.token_urlsafe`, stored **hashed**), a
@@ -275,9 +266,8 @@ HS256 shape (so `_check_cookie` accepts them) plus four delegated-only claims:
 
 ## Slack-side changes
 
-- **`oauth.py` (new)** — device-authorize → post ephemeral link → poll token
-  endpoint (respecting `interval` / `slow_down`) → store tokens. Replaces the
-  `AuthRequiredError` dead-end.
+- **`oauth.py`** — device-authorize → post ephemeral link → poll token
+  endpoint (respecting `interval` / `slow_down`) → store tokens.
 - **`omnigent.py`** — attach `Authorization: Bearer` per
   `(server_url, slack_user_id)`; on 401, refresh once and retry; on refresh
   failure, surface a re-login prompt. `OmnigentClientPool` keys clients by
@@ -285,8 +275,8 @@ HS256 shape (so `_check_cookie` accepts them) plus four delegated-only claims:
 - **`store.py`** — new `oauth_tokens` table `(team_id, user_id, server_url)` →
   access/refresh **encrypted at rest** (key from env / secret manager, never in
   the DB). `/omnigent logout` → `POST /oauth/revoke` + local delete.
-- **`setup.py`** — validation uses the user's token; auth-enabled servers become
-  supported rather than rejected.
+- **`setup.py`** — validation uses the user's token, so auth-enabled servers
+  are supported.
 - **`config.py`** — holds the local encryption key for token storage.
 
 ## Security analysis
@@ -294,7 +284,7 @@ HS256 shape (so `_check_cookie` accepts them) plus four delegated-only claims:
 | # | Threat | Mitigation |
 |---|--------|-----------|
 | 1 | `device_code` leak → token theft | Never transits Slack or the user — only `verification_uri_complete` (a `user_code`) does. Stored hashed; single-use. |
-| 2 | Link misdelivery / phishing another user | Link shown to the initiator only (in their own setup modal). Consent page names the exact Omnigent identity the grant will act as and the requesting `client_id`, and warns to approve only a self-initiated login. |
+| 2 | Link misdelivery / phishing another user | Link shown to the initiator only (in their own setup modal). **Consent requires a login started FOR this flow: the consent page rejects a session whose `iat` predates the grant and bounces through the login page with `reauth=1`, forcing a fresh password entry even for an already-signed-in user.** So an attacker-initiated flow can't be approved by a single reflexive click — the victim must deliberately re-enter their password against a screen naming the exact Omnigent identity and requesting `client_id`. The gate is enforced on both the consent GET and the approve POST. |
 | 3 | Anyone can initiate/poll (public client) | Cheap `pending` state grants nothing until an authenticated user approves. `POST /oauth/device/authorize` is rate-limited per client IP (10/60s → 429 `slow_down`); short (10 min) `device_code` expiry; `slow_down` enforced server-side on aggressive polling; expired grants purged opportunistically. |
 | 4 | Slack SQLite exfiltration → mass impersonation | Tokens **encrypted at rest**; access tokens short-lived (≤ 1 h); refresh tokens revocable. Bounded, centrally killable window. |
 | 5 | Compromised Slack server acts as all users (inherent to delegation) | Reduced scope (no admin), short TTL + refresh rotation, per-grant revocation, **absolute grant lifetime (30 d) enforced on refresh** so even an un-revoked grant dies, and an `act`-claim audit trail. |
@@ -315,6 +305,17 @@ token.
 When no client secret is configured the endpoints are **public**, so
 initiation is open — the defense is layered, not a gate:
 
+- **Forced re-authentication at consent.** Consent requires a login started for
+  THIS flow: the consent page (and the approve POST) reject a session whose
+  `iat` predates the grant's `created_at` and bounce through the login page with
+  `reauth=1`, which forces a fresh password entry even for an already-signed-in
+  user. This defeats the reflex-approve variant of the attack — a victim handed a
+  one-click link (even one with the code prefilled) still can't bind the grant
+  without deliberately re-entering their password against a screen naming the
+  exact identity and client. (`device_auth.py` `_session_iat` + the
+  `reauth=1` bounce; `LoginPage.tsx` suppresses its already-signed-in
+  auto-return under `reauth=1`.) The prefilled one-click link is therefore
+  retained for convenience — the re-auth step, not code handling, is the gate.
 - The consent page prominently **warns** the user to approve only a login they
   personally started and to match the code shown by the application.
 - The delegated scope excludes admin / user-management endpoints.
@@ -322,6 +323,11 @@ initiation is open — the defense is layered, not a gate:
   grant self-expires even if never revoked.
 - Initiation is rate-limited per IP; nothing is granted until a real user
   authenticates and approves in their own browser.
+- **Startup warning.** When the grant is mounted on a multi-user (accounts)
+  server with `OMNIGENT_DEVICE_CLIENT_SECRET` unset, the server logs a loud
+  warning at startup that the authorize endpoint is public — nudging the
+  operator to opt into the secret rather than leaving initiation open unknowingly
+  (`app.py`, at the device-router mount).
 
 Setting `OMNIGENT_DEVICE_CLIENT_SECRET` closes initiation entirely to
 unauthorized callers: without the matching `X-Omnigent-Client-Secret` header,

@@ -82,6 +82,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
     ConversationAlreadyExistsError,
@@ -89,6 +90,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     SessionConnectivity,
+    pinned_label_key,
 )
 
 _logger = logging.getLogger(__name__)
@@ -598,15 +600,20 @@ def _fetch_search_snippets(
     return out
 
 
-def _to_item(row: SqlConversationItem) -> ConversationItem:
+def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
     """
     Convert a :class:`SqlConversationItem` ORM row to a
     :class:`ConversationItem` entity.
 
-    Deserializes the JSON ``data`` column and parses it into
-    the appropriate typed data model.
+    Parses *data_json* into the appropriate typed data model.
 
     :param row: The SQLAlchemy ORM row to convert.
+    :param data_json: The row's already-decoded ``data`` JSON. Callers decode a
+        page of rows up front via
+        :meth:`SqlAlchemyConversationStore._decode_item_data_batch` (identity by
+        default), so this builds the entity from plaintext and never reads
+        ``row.data`` directly — letting a subclass decode a whole page in one
+        pass (e.g. a single batched decrypt) rather than once per row.
     :returns: A :class:`ConversationItem` Pydantic model.
     """
     item_type = decode_item_type(row.type)
@@ -616,7 +623,7 @@ def _to_item(row: SqlConversationItem) -> ConversationItem:
         status=decode_item_status(row.status),
         response_id=row.response_id,
         created_at=row.created_at,
-        data=parse_item_data(item_type, json.loads(row.data)),
+        data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
     )
 
@@ -1490,6 +1497,24 @@ class SqlAlchemyConversationStore(ConversationStore):
             row = session.get(SqlUserDailyCost, (current_workspace_id(), user_id, day_utc))
             return float(row.cost_usd) if row is not None else 0.0
 
+    def sum_daily_cost(self, user_id: str, since_day_utc: str) -> float:
+        """
+        Sum a user's LLM spend over all UTC days ``>= since_day_utc``.
+
+        See :meth:`ConversationStore.sum_daily_cost`. Day strings compare
+        lexicographically (zero-padded ``"YYYY-MM-DD"``), so the range is
+        a plain ``>=`` on the string column; ``SUM`` returns ``NULL`` for
+        an empty range, coalesced to ``0.0``.
+        """
+        with self._session() as session:
+            total = session.execute(
+                select(func.coalesce(func.sum(SqlUserDailyCost.cost_usd), 0.0))
+                .where(SqlUserDailyCost.workspace_id == current_workspace_id())
+                .where(SqlUserDailyCost.user_id == user_id)
+                .where(SqlUserDailyCost.day_utc >= since_day_utc)
+            ).scalar_one()
+            return float(total or 0.0)
+
     def get_daily_cost_state(self, user_id: str, day_utc: str) -> dict[str, float]:
         """
         Return a user's daily cost rollup state for one UTC day.
@@ -1708,7 +1733,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             # Preserve FTS rank order
             order = {iid: i for i, iid in enumerate(item_ids)}
-            return [_to_item(r) for r in sorted(rows, key=lambda r: order[r.id])]
+            ordered = sorted(rows, key=lambda r: order[r.id])
+            decoded = self._decode_item_data_batch([r.data for r in ordered])
+            return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
     def list_items(
         self,
@@ -1782,7 +1809,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
-            items = [_to_item(r) for r in rows]
+            decoded = self._decode_item_data_batch([r.data for r in rows])
+            items = [_to_item(r, d) for r, d in zip(rows, decoded, strict=True)]
             return PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
@@ -1823,9 +1851,48 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(ranked.c.row_num <= per_conversation_limit)
                 .order_by(ranked.c.conversation_id, ranked.c.position.desc())
             ).all()
-            for row in rows:
-                result[row.conversation_id].append(_to_item(row))  # type: ignore[arg-type]
+            decoded = self._decode_item_data_batch([row.data for row in rows])
+            for row, data_json in zip(rows, decoded, strict=True):
+                result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
         return result
+
+    def _encode_item_data(self, data_json: str) -> str:
+        """
+        Transform an item's serialized ``data`` JSON on its way into the
+        ``conversation_items.data`` column. Inverse of
+        :meth:`_decode_item_data_batch`.
+
+        The default is identity — the column stays plaintext ``Text`` and the
+        JSON is returned unchanged. A subclass may override to compress or
+        encrypt the payload, provided it applies the matching inverse in
+        :meth:`_decode_item_data_batch` (and maps the column to a binary type if
+        the transform yields non-text bytes).
+        """
+        return data_json
+
+    def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+        """
+        Inverse of :meth:`_encode_item_data` for a whole page of rows, applied
+        when reading. Returns one decoded ``data`` JSON per input, in order.
+
+        The default returns the values unchanged (the column is plaintext). A
+        subclass that encoded the column on write reverses it here; overriding
+        the *batch* — rather than a per-row hook — lets it decode the page in a
+        single pass (e.g. one bulk decrypt call) instead of once per row.
+        """
+        return stored
+
+    def _item_search_text(self, item: NewConversationItem) -> str | None:
+        """
+        Plain-text extraction of *item* persisted in ``search_text`` and indexed
+        for full-text search by :meth:`append`.
+
+        The default extracts the searchable text as before. A subclass whose
+        schema omits ``search_text`` (e.g. because ``data`` is stored opaquely
+        and cannot be searched in SQL) returns ``None`` to skip persisting the
+        column and its FTS row entirely.
+        """
+        return strip_nul_bytes(extract_search_text(item))
 
     def append(
         self,
@@ -1895,8 +1962,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # column, which rejects them outright. Tool output can
                 # embed NUL (e.g. reading a binary file); without this
                 # the whole INSERT aborts and the item never persists.
-                data = strip_nul_bytes(json.dumps(data_dict))
-                search = strip_nul_bytes(extract_search_text(item))
+                data = self._encode_item_data(strip_nul_bytes(json.dumps(data_dict)))
+                search = self._item_search_text(item)
                 item_id = generate_item_id(item.type)
                 row = SqlConversationItem(
                     id=item_id,
@@ -1907,11 +1974,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                     position=position,
                     type=encode_item_type(item.type),
                     data=data,
-                    search_text=search,
                     created_by=item.created_by,
                 )
+                # A backend may omit search_text (see _item_search_text); leaving
+                # the attribute unset drops it from the INSERT so a schema without
+                # the column still works, and skips its FTS row.
+                if search is not None:
+                    row.search_text = search
+                    fts_rows.append((item_id, conversation_id, search))
                 session.add(row)
-                fts_rows.append((item_id, conversation_id, search))
                 persisted.append(
                     ConversationItem(
                         id=row.id,
@@ -2060,6 +2131,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        pinned: bool = False,
+        pinned_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -2113,6 +2186,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` disables the filter. The name→id resolution is scoped to
             ``owned_by`` (projects are owner-private), so pass ``owned_by``
             alongside a specific name for the first-class half to resolve.
+        :param pinned: When ``True``, restrict to sessions ``pinned_owner`` has
+            pinned (their per-user ``omnigent.pinned.<user>`` label — the
+            sidebar's Pinned section). ``False`` (default) disables the filter.
+            Lets the client enumerate its pinned sessions independent of the
+            loaded pagination window.
+        :param pinned_owner: The user whose pins ``pinned=True`` filters to.
+            ``None`` → the single-user ``local`` sentinel.
         :param owned_by: When set, restrict to sessions the user owns
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
@@ -2315,6 +2395,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                             ),
                         )
                     )
+            if pinned:
+                # Restrict to sessions the caller has pinned. Pins are per-user,
+                # so match the caller's own key (``omnigent.pinned.<user>``), not
+                # a shared key — otherwise one user's pin would surface for every
+                # user with access. The row exists only while pinned (unpin
+                # deletes it), so key presence alone is the filter; the value is
+                # the pin timestamp, not a flag. Colocated on the AP DB, so an
+                # inline IN-subquery is enough (no cross-DB prefetch).
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlConversationLabel.conversation_id).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.key == pinned_label_key(pinned_owner),
+                        )
+                    )
+                )
             if after:
                 stmt = self._apply_cursor(
                     stmt,
@@ -3443,10 +3539,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             # message instead of dropping it. Forks of chat-only sources
             # (no workspace) get no such label and resume in-process like
             # a brand-new chat session.
+            # Per-user pin keys (``omnigent.pinned.<user>``) are dynamic-suffix,
+            # so they're never in the exact-match drop sets — drop them by prefix
+            # instead. A fork is a NEW conversation; inheriting the source's pins
+            # would show the clone as pinned for the forker AND carry every other
+            # user's pin key along as dead data.
             fork_labels = {
                 key: value
                 for key, value in _fetch_labels(session, source_conversation_id).items()
                 if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
+                and not key.startswith(f"{PINNED_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None

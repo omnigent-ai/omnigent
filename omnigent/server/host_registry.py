@@ -232,6 +232,16 @@ class HostConnection:
         npm's non-race-safe global writes never run twice at once. Keyed by
         the resolved install key (not ``request_id``) and cleared when the
         install completes.
+    :param pending_secret_writes: Per-``request_id`` futures for in-flight
+        ``host.store_secret`` requests (a UI-driven harness credential write).
+        Resolved when the host sends ``host.store_secret_result``. Values carry
+        the result fields (``status``, ``configured_harnesses``, ``error``) —
+        never the secret. Same ``Any`` typing rationale as ``pending_stats``.
+    :param credential_write_lock: Serializes credential writes to this host so
+        two overlapping requests (a double-click, or key + gateway in quick
+        succession) can't interleave the daemon's non-atomic
+        load→merge→save of ``config.yaml`` and clobber a sibling ``providers:``
+        entry. Held around the whole store-secret round-trip.
     :param pending_fs_requests: Per-``request_id`` futures for
         in-flight ``host.fs_request`` reads (the workspace file
         panel served from the host while the runner is offline).
@@ -283,6 +293,13 @@ class HostConnection:
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_secret_writes: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_credential_detects: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )

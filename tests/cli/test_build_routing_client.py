@@ -55,22 +55,28 @@ def test_external_threads_model_prefix_list() -> None:
     assert client._model_prefixes == ["databricks-", "system.ai."]
 
 
-def test_external_resolves_profile_auth() -> None:
+def test_external_defers_profile_auth_to_per_call() -> None:
+    """A ``profile`` is threaded through for lazy per-call token minting.
+
+    The client mints a fresh bearer per request (OAuth refresh) rather
+    than resolving a token at build time — a token captured once here
+    would 401 after ~1h. So the builder neither resolves the profile
+    eagerly nor sets a static ``_auth``; it stores the profile instead.
+    """
     cfg = {
         "provider": "external",
         "base_url": "https://host/v1",
         "router_name": "task_v0",
         "profile": "staging",
     }
-    creds = MagicMock(token="dapi-XYZ", host="https://host")
     with patch(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
-        return_value=creds,
     ) as resolve:
         client = _build_external_routing_client(cfg)
-    resolve.assert_called_once_with("staging")
+    resolve.assert_not_called()  # deferred to per-call, not resolved at build
     assert isinstance(client, ExternalRoutingClient)
-    assert client._auth is not None  # bearer auth built from the profile token
+    assert client._auth is None  # static auth unused; token minted per call
+    assert client._databricks_profile == "staging"
 
 
 def test_external_api_key_expands_env(monkeypatch: Any) -> None:

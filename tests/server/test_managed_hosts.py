@@ -556,6 +556,7 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.secret_name is None
     assert fake.in_cluster is None
     assert fake.resources is None
+    assert fake.pvc_mounts is None
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -686,6 +687,9 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
         ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
         ({"in_cluster": "yes"}, "must be a boolean"),
+        # A misspelled section key would silently no-op (e.g. no PVCs mounted)
+        # without the allowlist check.
+        ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
     ],
 )
 def test_parse_kubernetes_invalid_block_fails_loud(
@@ -700,6 +704,216 @@ def test_parse_kubernetes_invalid_block_fails_loud(
                 "kubernetes": kubernetes_block,
             }
         )
+
+
+def test_parse_kubernetes_pvc_mounts_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pvc_mounts parse into normalized entries (read_only defaults True) on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets"},
+                    {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts == [
+        {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True},
+        {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+    ]
+
+
+def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) pvc_mounts reach the launcher as None — no volumes added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"pvc_mounts": []},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts is None
+
+
+@pytest.mark.parametrize(
+    ("pvc_mounts", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("nfs-share", "must be a list"),
+        ([["claim"]], "must be a mapping"),
+        # Unknown / missing keys.
+        ([{"claim_name": "c", "mount_path": "/mnt/x", "sub_path": "y"}], "unknown key"),
+        ([{"mount_path": "/mnt/x"}], "claim_name"),
+        ([{"claim_name": "c"}], "mount_path"),
+        # Bad claim names (PVC names are DNS-1123 subdomains).
+        ([{"claim_name": "Bad_Claim", "mount_path": "/mnt/x"}], "claim_name"),
+        # Bad mount paths: relative, unnormalized, root, reserved.
+        ([{"claim_name": "c", "mount_path": "mnt/x"}], "absolute"),
+        ([{"claim_name": "c", "mount_path": "/mnt/../etc"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/mnt/x/"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/home//omnigent"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/home/./omnigent"}], "normalized"),
+        # Exactly two leading slashes survive posixpath.normpath (POSIX) but
+        # the kernel collapses them, so '//home/omnigent' would shadow HOME.
+        ([{"claim_name": "c", "mount_path": "//home/omnigent"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "//mnt/x"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/home/omnigent/data"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run/secrets/x"}], "reserved"),
+        # Ancestors of reserved paths: a PVC at /home would mount over the
+        # HOME emptyDir's /home/omnigent mountpoint (likewise /var, /var/run
+        # over the Secret projections).
+        ([{"claim_name": "c", "mount_path": "/home"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run"}], "reserved"),
+        # /var/run -> /run and /var/lock -> /run/lock on the Debian-based
+        # host image: every spelling of any path under them must be
+        # rejected, not just the secrets subtree.
+        ([{"claim_name": "c", "mount_path": "/run"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/run/secrets"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/run/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/lock"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/lock/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/tmp"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/etc"}], "reserved"),
+        # /opt hosts the image's omnigent venv (/opt/venv).
+        ([{"claim_name": "c", "mount_path": "/opt"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/opt/venv"}], "reserved"),
+        # read_only must be a boolean, not a truthy string.
+        ([{"claim_name": "c", "mount_path": "/mnt/x", "read_only": "yes"}], "boolean"),
+        # Duplicates / nesting between entries.
+        (
+            [
+                {"claim_name": "a", "mount_path": "/mnt/x"},
+                {"claim_name": "b", "mount_path": "/mnt/x"},
+            ],
+            "duplicate",
+        ),
+        (
+            [
+                {"claim_name": "a", "mount_path": "/mnt/x"},
+                {"claim_name": "b", "mount_path": "/mnt/x/sub"},
+            ],
+            "nested",
+        ),
+    ],
+)
+def test_parse_kubernetes_pvc_mounts_invalid_fails_loud(
+    pvc_mounts: object, expected_fragment: str
+) -> None:
+    """An operator typo in pvc_mounts fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"pvc_mounts": pvc_mounts},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "mount_path", ["/home/other", "/home/omnigent-data", "/var/lib", "/runway"]
+)
+def test_parse_kubernetes_pvc_mounts_reserved_check_is_segment_aware(mount_path: str) -> None:
+    """Siblings sharing a string prefix with a reserved path (or its parent) are allowed."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"pvc_mounts": [{"claim_name": "c", "mount_path": mount_path}]},
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_pvc_mounts_sibling_prefix_is_not_nested() -> None:
+    """/mnt/data vs /mnt/database share a string prefix but are distinct mounts."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "a", "mount_path": "/mnt/data"},
+                    {"claim_name": "b", "mount_path": "/mnt/database"},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_pvc_mounts_nesting_is_rejected_regardless_of_order() -> None:
+    """The pairwise collision check catches nesting anywhere in a 3-entry list."""
+    with pytest.raises(ValueError, match="nested"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [
+                        {"claim_name": "a", "mount_path": "/mnt/x/sub"},
+                        {"claim_name": "b", "mount_path": "/mnt/y"},
+                        {"claim_name": "c", "mount_path": "/mnt/x"},
+                    ]
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_pvc_mounts_rejects_explicit_null_read_only() -> None:
+    """An explicit YAML `read_only: null` is rejected, not silently defaulted."""
+    with pytest.raises(ValueError, match="boolean"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [{"claim_name": "c", "mount_path": "/mnt/x", "read_only": None}]
+                },
+            }
+        )
+
+
+def test_reserved_mount_prefixes_pin_the_launcher_home_dir() -> None:
+    """The mirrored HOME prefix must track the launcher's _HOME_DIR — a rename
+    there without updating the reserved list would let a mount shadow HOME."""
+    from omnigent.onboarding.sandboxes.kubernetes import _HOME_DIR
+    from omnigent.server.managed_hosts import _KUBERNETES_RESERVED_MOUNT_PREFIXES
+
+    assert _HOME_DIR in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+
+
+def test_parse_kubernetes_pvc_mounts_allows_same_claim_at_two_paths() -> None:
+    """One claim may be mounted at two paths (e.g. RO datasets + RW scratch subtrees)."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "shared", "mount_path": "/mnt/a"},
+                    {"claim_name": "shared", "mount_path": "/mnt/b", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
 
 
 @pytest.mark.parametrize(

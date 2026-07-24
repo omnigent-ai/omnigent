@@ -52,28 +52,40 @@ def _row(page: Page, session_id: str) -> Locator:
     return page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
 
 
+def _create_project(page: Page, name: str) -> None:
+    """Create an empty project via the "Projects" group header's "New project"
+    (+) button, typing *name* into the dialog and confirming."""
+    page.get_by_test_id("new-project").click()
+    dialog_input = page.get_by_placeholder("Project name…")
+    dialog_input.fill(name)
+    page.get_by_test_id("new-project-confirm").click()
+
+
 def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
-    """Drive the row kebab → "Add to project" → "Create new project" flow,
-    typing *name* and committing with Enter."""
+    """File *row*'s session into a fresh project *name*.
+
+    Projects are created from the "Projects" group header's + button (the
+    picker no longer offers an inline "Create new project"), so this first
+    creates the empty project, then drives the row kebab → "Add to project" →
+    picking that project from the list."""
+    _create_project(page, name)
     row.hover()
     row.get_by_test_id("conversation-actions").click()
-    # Open the submenu flyout, then start the inline new-project input.
+    # Open the submenu flyout, then pick the just-created project by name.
     page.get_by_test_id("move-to-project").click()
-    page.get_by_role("menuitem", name="Create new project").click()
-    new_input = page.get_by_placeholder("Project name…")
-    new_input.fill(name)
-    new_input.press("Enter")
+    page.get_by_role("menuitem", name=name, exact=True).click()
 
 
 def test_move_session_into_new_project(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Creating a project from the kebab moves the row into it.
+    """Filing a session into a freshly-created project moves the row into it.
 
-    The session starts under "Sessions"; after "Add to project → Create new
-    project", a project folder with that name appears under the "Projects" group and the
-    row lives under it (once expanded) and no longer under "Sessions".
+    The session starts under "Sessions"; after creating the project (+ button)
+    and picking it from "Add to project", a project folder with that name
+    appears under the "Projects" group and the row lives under it (once
+    expanded) and no longer under "Sessions".
     """
     base_url, session_id = seeded_session
     title = f"e2e-proj-{uuid.uuid4().hex[:8]}"

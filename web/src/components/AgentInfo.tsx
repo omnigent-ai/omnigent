@@ -1049,11 +1049,15 @@ function McpServersSection({
   servers,
   editable,
   onManagerOpenChange,
+  dirty: controlledDirty,
+  onDirtyChange,
 }: {
   sessionId?: string | null;
   servers: McpServerSummary[];
   editable: boolean;
   onManagerOpenChange?: (open: boolean) => void;
+  dirty?: boolean;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [managerOpen, setManagerOpen] = useState(false);
 
@@ -1061,16 +1065,24 @@ function McpServersSection({
     setManagerOpen(open);
     onManagerOpenChange?.(open);
   }
-  const [mcpDirty, setMcpDirty] = useState(false);
+  const [localDirty, setLocalDirty] = useState(false);
+  const dirtyControlled = controlledDirty !== undefined;
+  const mcpDirty = controlledDirty ?? localDirty;
+
+  function setMcpDirty(dirty: boolean) {
+    if (!dirtyControlled) setLocalDirty(dirty);
+    onDirtyChange?.(dirty);
+  }
+
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   // Clear the dirty flag when the session restarts (launching picks up
   // the updated MCP config) or when the user navigates to another session.
   useEffect(() => {
-    if (sessionStatus === "launching") setMcpDirty(false);
-  }, [sessionStatus]);
+    if (!dirtyControlled && sessionStatus === "launching") setLocalDirty(false);
+  }, [dirtyControlled, sessionStatus]);
   useEffect(() => {
-    setMcpDirty(false);
-  }, [sessionId]);
+    if (!dirtyControlled) setLocalDirty(false);
+  }, [dirtyControlled, sessionId]);
   const canEdit = !!(sessionId && editable);
   const deleteServer = useDeleteMcpServer(canEdit ? sessionId : "");
   const showSection = servers.length > 0 || canEdit;
@@ -1234,6 +1246,10 @@ interface AgentInfoProps {
    * while a nested dialog is open.
    */
   onSubdialogOpenChange?: (open: boolean) => void;
+  /** Controlled MCP restart-warning state for parents that outlive the content mount. */
+  mcpDirty?: boolean;
+  /** Update the controlled MCP restart-warning state. */
+  onMcpDirtyChange?: (dirty: boolean) => void;
 }
 
 /**
@@ -1250,7 +1266,13 @@ export function agentHasInfo(agent: Agent | undefined, sessionId?: string | null
  * Shared by the desktop header popover ({@link AgentInfoButton}) and the
  * mobile header menu's agent-info dialog.
  */
-export function AgentInfoContent({ agent, sessionId, onSubdialogOpenChange }: AgentInfoProps) {
+export function AgentInfoContent({
+  agent,
+  sessionId,
+  onSubdialogOpenChange,
+  mcpDirty,
+  onMcpDirtyChange,
+}: AgentInfoProps) {
   const servers = agent?.mcp_servers ?? [];
   const mcpEditable = agent?.mcp_servers_editable === true;
   const displayName = agent ? agentDisplayLabel(agent.name) : null;
@@ -1389,6 +1411,8 @@ export function AgentInfoContent({ agent, sessionId, onSubdialogOpenChange }: Ag
         servers={servers}
         editable={mcpEditable}
         onManagerOpenChange={onSubdialogOpenChange}
+        dirty={mcpDirty}
+        onDirtyChange={onMcpDirtyChange}
       />
       {sessionId && <SessionPoliciesSection sessionId={sessionId} />}
       {versionFooter && (
@@ -1440,6 +1464,8 @@ export const HOVER_CLICK_GRACE_MS = 30;
  */
 export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   const [open, setOpen] = useState(false);
+  const [mcpDirty, setMcpDirty] = useState(false);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
   const subdialogOpenRef = useRef(false);
   // Tracks whether the current open came from hover, so we can suppress Radix's
   // focus move into the panel on hover-open (which would steal focus and could
@@ -1456,6 +1482,12 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
       if (closeTimeoutRef.current !== null) window.clearTimeout(closeTimeoutRef.current);
     };
   }, []);
+  useEffect(() => {
+    if (sessionStatus === "launching") setMcpDirty(false);
+  }, [sessionStatus]);
+  useEffect(() => {
+    setMcpDirty(false);
+  }, [sessionId]);
 
   if (!agentHasInfo(agent, sessionId)) return null;
 
@@ -1489,7 +1521,7 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
   }
 
   function scheduleCloseOnLeave(e: React.PointerEvent) {
-    if (e.pointerType !== "mouse") return;
+    if (e.pointerType !== "mouse" || !openedByHoverRef.current) return;
     scheduleClose();
   }
 
@@ -1512,12 +1544,14 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
           openedByHoverRef.current &&
           performance.now() - hoverOpenedAtRef.current < HOVER_CLICK_GRACE_MS
         ) {
+          cancelClose();
+          openedByHoverRef.current = false;
           return;
         }
         // Click / keyboard / outside-dismiss path: honor Radix immediately and
         // drop the hover flag so focus behaves normally.
         cancelClose();
-        if (!next) openedByHoverRef.current = false;
+        openedByHoverRef.current = false;
         setOpen(next);
       }}
     >
@@ -1564,6 +1598,8 @@ export function AgentInfoButton({ agent, sessionId }: AgentInfoProps) {
         <AgentInfoContent
           agent={agent}
           sessionId={sessionId}
+          mcpDirty={mcpDirty}
+          onMcpDirtyChange={setMcpDirty}
           onSubdialogOpenChange={(open) => {
             subdialogOpenRef.current = open;
           }}

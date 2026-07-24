@@ -5612,6 +5612,59 @@
         "title": "SessionTodosEvent",
         "type": "object"
       },
+      "SessionUsage": {
+        "description": "One session's rolled-up LLM spend for the `GET /v1/usage` report.\n\n`cost_usd` is the subtree total \u2014 the session plus every sub-agent it\nspawned \u2014 read from `session_usage` via\n`omnigent.runtime.policies.builder.load_session_usage`. It is the\nauthoritative session figure (the same value the web session sidebar\nshows as \"Session cost\" and the daily rollup records).\n\n`models` is the per-model cost breakdown, mirroring the web session\nsidebar's per-model list. Deliberately **not guaranteed to sum to\n`cost_usd`**: native harnesses report a single cumulative session\ntotal and the server attributes it to the currently-active model, so on\na session that switched models mid-run each model's bucket is a snapshot\nof the running total rather than that model's own spend. The header\n`cost_usd` stays authoritative; the per-model values are shown\nfaithfully as recorded (same convention as the web UI).",
+        "properties": {
+          "cost_usd": {
+            "default": 0.0,
+            "description": "Authoritative cumulative USD spend for this session's subtree.",
+            "title": "Cost Usd",
+            "type": "number"
+          },
+          "created_at": {
+            "description": "Unix epoch seconds of creation.",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "models": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "Per-model recorded cost, keyed by the raw harness model id (e.g. `{\"claude-opus-4-8\": 14.03}`). Empty when no per-model cost was recorded. May not sum to `cost_usd` (see above).",
+            "title": "Models",
+            "type": "object"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional human-readable title.",
+            "title": "Title"
+          },
+          "updated_at": {
+            "description": "Unix epoch seconds of last activity.",
+            "title": "Updated At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "SessionUsage",
+        "type": "object"
+      },
       "SessionUsageEvent": {
         "description": "Token-usage update from a terminal-backed integration.\n\nEmitted after an `external_session_usage` POST from an\nout-of-AP runtime (e.g. the `omnigent claude` transcript\nforwarder). Either field may be absent; clients should leave\ncached values untouched for missing fields.",
         "properties": {
@@ -5844,6 +5897,81 @@
           "arguments"
         ],
         "title": "SlashCommandData",
+        "type": "object"
+      },
+      "StoreHarnessCredentialRequest": {
+        "description": "Request body for `POST /v1/hosts/{id}/harnesses/{harness}/credential`.\n\nCarries the credential in the body (never the URL). The secret field is\noptional so the `adopt` kind \u2014 which references an existing host env var\nby name rather than sending a value \u2014 can omit it.",
+        "properties": {
+          "base_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The gateway base URL, required for `kind=\"gateway\"`.",
+            "title": "Base Url"
+          },
+          "default_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional family default model id to pin.",
+            "title": "Default Model"
+          },
+          "env_var": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For `kind=\"adopt\"`, the host env var to reference.",
+            "title": "Env Var"
+          },
+          "kind": {
+            "description": "`\"key\"` (a vendor API key), `\"gateway\"` (a compatible proxy at `base_url`), or `\"adopt\"` (reference host env `env_var`).",
+            "title": "Kind",
+            "type": "string"
+          },
+          "secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The API key / gateway token for `key` / `gateway`; `None` for `adopt`.",
+            "title": "Secret"
+          },
+          "wire_api": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional OpenAI wire protocol (`\"chat\"` / `\"responses\"`).",
+            "title": "Wire Api"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "StoreHarnessCredentialRequest",
         "type": "object"
       },
       "TerminalCommandData": {
@@ -6582,6 +6710,51 @@
         "title": "UsageDetails",
         "type": "object"
       },
+      "UsageReport": {
+        "description": "Aggregated LLM usage for the calling user, powering `omni usage`.\n\nThe cost summary is sourced from the per-user daily-cost rollup\n(`user_daily_cost`), which attributes spend to the UTC calendar day it\noccurred on. Windows are therefore calendar-day buckets summed back from\ntoday \u2014 `cost_today` / `cost_last_7d` / `cost_last_30d` \u2014 not\nrolling wall-clock hours, so a weeks-old session touched today is not\ncounted wholly in \"today\".\n\nThe `sessions` list is a separate detail view built from each session's\ncumulative `session_usage` (newest activity first), so the summary and\nthe per-session list come from different sources and are not guaranteed\nto tie out to the cent (the summary counts every priced turn ever\nrecorded for the user; the list only covers the user's currently-listed\ntop-level sessions).",
+        "properties": {
+          "cost_last_30d": {
+            "default": 0.0,
+            "description": "Total spend over the last 30 UTC days (incl. today).",
+            "title": "Cost Last 30D",
+            "type": "number"
+          },
+          "cost_last_7d": {
+            "default": 0.0,
+            "description": "Total spend over the last 7 UTC days (incl. today).",
+            "title": "Cost Last 7D",
+            "type": "number"
+          },
+          "cost_today": {
+            "default": 0.0,
+            "description": "Total spend on the current UTC day.",
+            "title": "Cost Today",
+            "type": "number"
+          },
+          "object": {
+            "const": "usage_report",
+            "default": "usage_report",
+            "title": "Object",
+            "type": "string"
+          },
+          "sessions": {
+            "description": "Per-session detail, newest activity first.",
+            "items": {
+              "$ref": "#/components/schemas/SessionUsage"
+            },
+            "title": "Sessions",
+            "type": "array"
+          },
+          "total_cost_usd": {
+            "default": 0.0,
+            "description": "All-time total spend from the daily rollup.",
+            "title": "Total Cost Usd",
+            "type": "number"
+          }
+        },
+        "title": "UsageReport",
+        "type": "object"
+      },
       "ValidationError": {
         "properties": {
           "ctx": {
@@ -6933,6 +7106,52 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/credentials/detected": {
+      "get": {
+        "description": "List adoptable credentials already present on a connected host.\n\nBacks the setup dialog's \"adopt an existing credential\" affordance: the\nhost reports which UI-auth-family credentials it already has as\nNON-secret descriptors (family + source label + env var name), so the UI\ncan offer a one-click \"Use it\". Owner-scoped and flag-gated like the\ncredential-write route (404 when disabled). Never returns a secret value.\n\n**Returns:** `{\"object\": \"detected_credentials\", \"credentials\": [...]}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 403 when not the owner, 409 when offline, 502/504 on host failure/timeout.",
+        "operationId": "detect_host_credentials_v1_hosts__host_id__credentials_detected_get",
+        "parameters": [
+          {
+            "description": "Host identifier.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Detect Host Credentials V1 Hosts  Host Id  Credentials Detected Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Detect Host Credentials",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/directories": {
       "post": {
         "description": "Create a new directory on a host.\n\nBacks the Web UI workspace picker's \"New folder\" action so a\nuser can make a fresh directory to start a session in without\ndropping to a terminal. Owner-scoped exactly like the\nfilesystem browse endpoints (`GET /v1/hosts/{id}/filesystem`):\nonly the host owner can create directories, and \u2014 like browse \u2014\nthis is NOT scoped to a session. The workspace-boundary check\nstill runs at session-create time, so creating a directory here\ndoes not by itself grant an agent access to it.\n\n**Parameters**\n\n- `body` \u2014 Request body carrying the absolute (or tilde-prefixed) `path` to create.\n\n**Returns:** `{\"object\": \"directory\", \"path\": \"<created abs path>\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline or the directory could not be created (already exists / permission denied), 400 on path validation, 504 on host timeout, 502 on host I/O failure.",
@@ -7180,6 +7399,72 @@
           }
         },
         "summary": "List Host Filesystem",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/credential": {
+      "post": {
+        "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`OMNIGENT_HARNESS_INSTALL_ENABLED` exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline, 502 on host-side failure, 504 on timeout.",
+        "operationId": "store_host_harness_credential_v1_hosts__host_id__harnesses__harness__credential_post",
+        "parameters": [
+          {
+            "description": "Host identifier.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Harness being configured, e.g. `\"claude\"`.",
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreHarnessCredentialRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Store Host Harness Credential V1 Hosts  Host Id  Harnesses  Harness  Credential Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Store Host Harness Credential",
         "tags": [
           "hosts"
         ]
@@ -8265,6 +8550,17 @@
                 }
               ],
               "title": "Project"
+            }
+          },
+          {
+            "description": "When `True`, return only sessions the user has pinned (the `omnigent.pinned` label). Lets the sidebar enumerate pinned sessions that fall outside the loaded pagination window. `False` (default) disables it.",
+            "in": "query",
+            "name": "pinned",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Pinned",
+              "type": "boolean"
             }
           }
         ],
@@ -11868,6 +12164,28 @@
         "summary": "Set Sharing",
         "tags": [
           "sharing"
+        ]
+      }
+    },
+    "/v1/usage": {
+      "get": {
+        "description": "Aggregate the calling user's LLM spend across their sessions.\n\nrequire_user, not get_user_id: the aggregation scopes to the caller,\nso a request slipping through as `None` in multi-user mode would\nread another scope. Fail closed with 401 instead (`user_id` is\n`None` only when auth is disabled \u2014 the single-user / local case).",
+        "operationId": "get_usage_v1_usage_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageReport"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Usage",
+        "tags": [
+          "usage"
         ]
       }
     }

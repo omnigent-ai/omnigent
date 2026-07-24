@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -25,11 +24,6 @@ _logger = logging.getLogger(__name__)
 # Start with harnesses whose isolated title-generation paths are verified;
 # additional harnesses can be added once they have equivalent coverage.
 _SUPPORTED_BACKGROUND_TITLE_HARNESSES = frozenset({"claude-sdk", "claude-native", "codex"})
-
-
-def background_session_titles_enabled() -> bool:
-    """Return whether automatic background titles are explicitly enabled."""
-    return os.environ.get("OMNIGENT_SESSION_RENAME") == "1"
 
 
 def _background_session_title_harness_supported(harness: str | None) -> bool:
@@ -286,7 +280,6 @@ def prepare_background_session_title(
     """Prepare a guarded first-turn title attempt for a top-level session."""
     if (
         coordinator is None
-        or not background_session_titles_enabled()
         or conversation.title is not None
         or conversation.parent_conversation_id is not None
         or not _background_session_title_harness_supported(conversation.harness_override)

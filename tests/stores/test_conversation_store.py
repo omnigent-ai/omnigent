@@ -49,6 +49,31 @@ def test_fork_drops_import_provenance_labels(
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_per_user_pin_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork is a NEW conversation, so it must not inherit the source's pins:
+    neither the forker's nor any other user's per-user pin key rides along
+    (those keys have a dynamic suffix, so a prefix drop is required)."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {
+            pinned_label_key("alice"): "1721760000000",
+            pinned_label_key("bob"): "1700000000000",
+            "kept": "yes",
+        },
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert pinned_label_key("alice") not in fork.labels
+    assert pinned_label_key("bob") not in fork.labels
+
+
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     assert len(conv.id) == 32
@@ -4863,6 +4888,56 @@ def test_list_conversations_filters_by_project_name_dual_read(
     assert labelled.id not in unfiled_ids
 
 
+def test_list_conversations_filters_by_pinned_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``list_conversations(pinned=True, pinned_owner=<user>)`` returns only the
+    sessions THAT user has pinned — matched by their per-user
+    ``omnigent.pinned.<user>`` label, not a shared key (see ``pinned_label_key``).
+    Key-presence based (the value is the epoch-ms pin time). Another user's pin
+    on the same session does not match; clearing the label drops it."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    pinned = conversation_store.create_conversation(title="pinned")
+    other = conversation_store.create_conversation(title="other")
+    also_pinned_by_bob = conversation_store.create_conversation(title="bob's pin")
+    # Alice pins one; Bob pins a different one — each under their own key.
+    conversation_store.set_labels(pinned.id, {pinned_label_key("alice"): "1721760000000"})
+    conversation_store.set_labels(
+        also_pinned_by_bob.id, {pinned_label_key("bob"): "1721760000000"}
+    )
+
+    alice_page = conversation_store.list_conversations(pinned=True, pinned_owner="alice")
+    alice_ids = {c.id for c in alice_page.data}
+    assert alice_ids == {pinned.id}
+    # Bob's pin and the never-pinned row must not surface for Alice.
+    assert also_pinned_by_bob.id not in alice_ids
+    assert other.id not in alice_ids
+
+    # Unpin (Alice's key deleted) removes it from her pinned filter.
+    conversation_store.delete_label(pinned.id, pinned_label_key("alice"))
+    assert conversation_store.list_conversations(pinned=True, pinned_owner="alice").data == []
+
+
+def test_pinned_label_key_fits_column_for_long_user_ids() -> None:
+    """The per-user pin key must never overflow the ``String(128)`` label-key
+    column. Short ids stay verbatim (DB-readable); an over-long id (e.g. a long
+    SSO subject) falls back to a fixed-width hash suffix, deterministic in the
+    id so writes and the pinned filter still agree."""
+    from omnigent.stores.conversation_store import PINNED_LABEL_KEY, pinned_label_key
+
+    # A normal email is used verbatim.
+    assert pinned_label_key("alice@example.com") == f"{PINNED_LABEL_KEY}.alice@example.com"
+
+    # A 200-char id can't fit raw; the key must still be ≤ 128 and deterministic.
+    long_id = "u" * 200
+    key = pinned_label_key(long_id)
+    assert len(key) <= 128
+    assert key == pinned_label_key(long_id)  # deterministic
+    # Distinct long ids don't collide.
+    assert pinned_label_key("u" * 200) != pinned_label_key("v" * 200)
+
+
 def test_list_projects_owned_by_excludes_shared_only_projects(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
@@ -5053,3 +5128,139 @@ def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
             assert updated.pending_elicitation_count == 3
     finally:
         session_live_state.configure(None)
+
+
+# ── Item-data serialization seam ─────────────────────
+
+
+def _stored_item_data(store: SqlAlchemyConversationStore, conversation_id: str) -> list[object]:
+    """Raw, undecoded ``data`` column values for a conversation, in position
+    order — what actually sits in the row before :func:`_to_item` decodes it."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    with store._conv_session() as session:
+        return list(
+            session.execute(
+                select(SqlConversationItem.data)
+                .where(SqlConversationItem.conversation_id == conversation_id)
+                .order_by(SqlConversationItem.position)
+            ).scalars()
+        )
+
+
+def test_item_data_seam_default_stores_plaintext_json(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The default ``_encode_item_data`` is identity: the column holds plaintext
+    JSON and reads round-trip unchanged (the seam is a no-op out of the box)."""
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_seam",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "plaintext-marker"}]
+                ),
+            )
+        ],
+    )
+
+    [stored] = _stored_item_data(conversation_store, conv.id)
+    assert isinstance(stored, str)
+    assert "plaintext-marker" in stored  # not encoded/encrypted
+
+    [item] = conversation_store.list_items(conv.id).data
+    assert item.data.content[0]["text"] == "plaintext-marker"
+
+
+def test_item_data_seam_subclass_encodes_and_decodes(db_uri: str) -> None:
+    """A subclass overriding the seam transforms ``data`` on write and reverses
+    it on read: the row holds an opaque (base64) blob, yet reads round-trip.
+
+    base64 is deliberately not valid item JSON, so a read that skipped
+    ``_decode_item_data_batch`` would fail in ``json.loads`` — a clean round-trip
+    proves both hooks are wired onto the write and read paths.
+
+    The transform stays a ``str``: OSS maps ``data`` to a text column, and raw
+    ``bytes`` round-trip there only under SQLite's dynamic typing — Postgres and
+    MySQL stringify the bytes object (its ``repr``) and corrupt it. A subclass
+    needing true bytes maps the column to a binary type and covers it in that
+    store's own tests.
+    """
+    import base64
+
+    class _Base64ItemDataStore(SqlAlchemyConversationStore):
+        def _encode_item_data(self, data_json: str) -> str:
+            return base64.b64encode(data_json.encode("utf-8")).decode("ascii")
+
+        def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+            return [base64.b64decode(s).decode("utf-8") for s in stored]
+
+    store = _Base64ItemDataStore(db_uri)
+    conv = store.create_conversation()
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_enc",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "secret-payload"}]
+                ),
+            )
+        ],
+    )
+
+    # Stored form is the opaque transform, not the plaintext JSON.
+    [stored] = _stored_item_data(store, conv.id)
+    assert "secret-payload" not in str(stored)
+    assert "secret-payload" in base64.b64decode(stored).decode("utf-8")
+
+    # Reads reverse the transform and recover the entity.
+    [item] = store.list_items(conv.id).data
+    assert item.data.content[0]["text"] == "secret-payload"
+
+
+def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
+    """The ``_item_search_text`` hook controls what lands in ``search_text``.
+
+    (Returning ``None`` from the hook — to skip the column on a schema that
+    omits it — is exercised by such a backend; the OSS SQLite schema keeps
+    ``search_text`` NOT NULL, so this asserts the string-returning path.)
+    """
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationItem
+
+    class _CustomSearchTextStore(SqlAlchemyConversationStore):
+        def _item_search_text(self, item: NewConversationItem) -> str:
+            return "custom-search-text"
+
+    store = _CustomSearchTextStore(db_uri)
+    conv = store.create_conversation()
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_st",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "body text"}]
+                ),
+            )
+        ],
+    )
+
+    with store._conv_session() as session:
+        stored = list(
+            session.execute(
+                select(SqlConversationItem.search_text).where(
+                    SqlConversationItem.conversation_id == conv.id
+                )
+            ).scalars()
+        )
+    assert stored == ["custom-search-text"]

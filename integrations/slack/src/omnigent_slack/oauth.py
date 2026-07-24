@@ -244,6 +244,10 @@ async def _start_device_login(
         device_code = str(data["device_code"])
         interval = max(int(data.get("interval", 5)), 1)
         expires_in = int(data.get("expires_in", 600))
+        # The complete URI (code prefilled) — a one-click link for the user.
+        # The anti-phishing checkpoint is NOT here but on the consent page: it
+        # forces a fresh password re-auth before a grant can be approved (see
+        # designs/DEVICE_AUTH.md), so prefilling the code is safe.
         verification_url = str(data["verification_uri_complete"])
         user_code = str(data.get("user_code", ""))
     except (ValueError, KeyError, TypeError) as exc:
