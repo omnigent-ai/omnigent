@@ -25,7 +25,10 @@ class ThemeTest {
             (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or nightMode
         val themedContext = context.createConfigurationContext(configuration)
         themedContext.setTheme(R.style.Theme_Omnigent)
-        val attributes = themedContext.obtainStyledAttributes(intArrayOf(android.R.attr.isLightTheme))
+        val attributes =
+            themedContext.obtainStyledAttributes(
+                intArrayOf(android.R.attr.isLightTheme),
+            )
         return try {
             attributes.getBoolean(0, false)
         } finally {
