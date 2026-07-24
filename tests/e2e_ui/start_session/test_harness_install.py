@@ -207,8 +207,10 @@ async def _drive_install(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Commit the Codex agent (its harness is unconfigured on the host).
+            # Commit the Codex agent. Unconfigured harnesses intentionally fold
+            # into the More submenu once host readiness has loaded.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-harness-more").click()
             await page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e").click()
 
             # The composer notice offers "Set up →", which opens the setup dialog.

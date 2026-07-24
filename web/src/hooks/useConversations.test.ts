@@ -2,7 +2,7 @@
 // query-invalidation contract of the stop mutation hook.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
@@ -607,6 +607,235 @@ describe("useRenameConversation cache patching", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
+  });
+
+  it("cancels in-flight list queries so a stale reconcile can't clobber the new title", async () => {
+    const { queryClient, rendered } = seedAndRename();
+    const cancelSpy = vi.spyOn(queryClient, "cancelQueries");
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // onMutate must cancel both list-cache families before overlaying, or an
+    // in-flight reconcile poll / WS-triggered fetch could resolve afterward
+    // and overwrite the optimistic title with the stale search-indexed name.
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    expect(cancelSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
+  });
+
+  it("paints the new title optimistically before the PATCH resolves", async () => {
+    // Hold the PATCH open so we can observe the cache between mutate() and
+    // the server response — the window where the sidebar used to show the
+    // stale name.
+    let resolvePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useRenameConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+
+    // Before the PATCH resolves, the cached row already shows the new title.
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("New name");
+    });
+
+    resolvePatch(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "New name",
+        created_at: 0,
+        updated_at: 200,
+        labels: {},
+      }),
+    );
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+  });
+
+  it("rolls back to the old title when the PATCH fails", async () => {
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+    queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useRenameConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", title: "New name" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // A failed rename must not leave the optimistic title stranded in the
+    // cache — the row reverts to what it showed before.
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("Old name");
+    const backfill = queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"]);
+    expect(backfill!.title).toBe("Old name");
+  });
+
+  it("re-renders a subscribed list component with the new title before the PATCH resolves", async () => {
+    // The cache-level assertions above prove onMutate writes the cache, but
+    // not that a component reading it through useConversations actually
+    // re-paints. This renders the real subscription + the real rename hook
+    // together so a regression to server-first (or a stale subscription)
+    // fails here — this is the path the user sees in the sidebar.
+    let resolvePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    // useConversations does an initial fetch on mount, then the PATCH.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        data: [
+          {
+            id: "conv_x",
+            object: "conversation",
+            title: "Old name",
+            created_at: 0,
+            updated_at: 100,
+            labels: {},
+          },
+        ],
+        first_id: "conv_x",
+        last_id: "conv_x",
+        has_more: false,
+      }),
+    );
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+
+    function Harness() {
+      const { data } = useConversations();
+      const rename = useRenameConversation();
+      const title = data?.pages.flatMap((p) => p.data).find((c) => c.id === "conv_x")?.title;
+      return createElement(
+        "div",
+        null,
+        createElement("span", { "data-testid": "title" }, title ?? ""),
+        createElement(
+          "button",
+          { onClick: () => rename.mutate({ id: "conv_x", title: "New name" }) },
+          "rename",
+        ),
+      );
+    }
+
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    render(createElement(Harness), { wrapper });
+
+    // The list loads the old title.
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("Old name"));
+
+    // Fire the rename; the subscribed span must flip to the new title while
+    // the PATCH is still in flight (optimistic), not after it resolves.
+    screen.getByRole("button").click();
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+
+    resolvePatch(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "New name",
+        created_at: 0,
+        updated_at: 200,
+        labels: {},
+      }),
+    );
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+  });
+
+  it("re-renders a project-folder row (['project-sessions']) with the new title optimistically", async () => {
+    // A session filed in a project renders from its own
+    // ["project-sessions", name] cache, NOT the flat ["conversations"] list.
+    // Renaming it must overlay that cache too, or the folder row keeps the
+    // stale title until the WS reconcile — the reported bug.
+    let resolvePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        resolvePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({
+      // staleTime Infinity so the seeded folder cache doesn't background-refetch
+      // on mount and consume the PATCH mock below.
+      defaultOptions: {
+        queries: { retry: false, staleTime: Infinity },
+        mutations: { retry: false },
+      },
+    });
+    // Seed only the project-folder cache; the flat list is empty (the folder
+    // is the sole place this row appears).
+    queryClient.setQueryData(
+      ["project-sessions", "Sprint 42"],
+      infinitePage([conversation({ id: "conv_x" })]),
+    );
+
+    function Harness() {
+      const { data } = useProjectSessions("Sprint 42", true);
+      const rename = useRenameConversation();
+      const title = data?.pages.flatMap((p) => p.data).find((c) => c.id === "conv_x")?.title;
+      return createElement(
+        "div",
+        null,
+        createElement("span", { "data-testid": "title" }, title ?? ""),
+        createElement(
+          "button",
+          { onClick: () => rename.mutate({ id: "conv_x", title: "New name" }) },
+          "rename",
+        ),
+      );
+    }
+
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    render(createElement(Harness), { wrapper });
+
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("Old name"));
+
+    screen.getByRole("button").click();
+    // The folder row flips to the new title while the PATCH is still in flight.
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+
+    resolvePatch(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "New name",
+        created_at: 0,
+        updated_at: 200,
+        labels: {},
+      }),
+    );
+    await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
   });
 });
 

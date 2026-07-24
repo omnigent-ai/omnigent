@@ -7,6 +7,7 @@ import type {
   CompactionBlock,
   ErrorBlock,
   NativeToolBlock,
+  ReasoningBlock,
   SlashCommandBlock,
   TextDone,
   ToolGroup,
@@ -174,6 +175,27 @@ describe("itemsToBlocks — flat shape", () => {
     const blocks = itemsToBlocks(items);
     const td = blocks.find((b): b is TextDone => b.type === "text_done");
     expect(td?.hasCodeBlocks).toBe(true);
+  });
+
+  it("reasoning items survive history hydration", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "rs_1",
+        response_id: "resp_1",
+        type: "reasoning",
+        status: "completed",
+        model: "Pi",
+        summary: [],
+        content: [{ type: "reasoning_text", text: "Inspect the shared path first." }],
+      },
+      assistantMessage("resp_1", "Done."),
+    ];
+    const blocks = itemsToBlocks(items);
+    const reasoning = blocks[0] as ReasoningBlock;
+    expect(reasoning.type).toBe("reasoning_block");
+    expect(reasoning.ctx.itemId).toBe("rs_1");
+    expect(reasoning.ctx.responseId).toBe("resp_1");
+    expect(reasoning.reasoningText).toBe("Inspect the shared path first.");
   });
 
   it("assistant interrupted marker is preserved on TextDone", () => {

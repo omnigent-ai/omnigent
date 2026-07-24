@@ -92,6 +92,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
@@ -2361,6 +2362,16 @@ def create_app(
     )
     if artifact_preview_service is not None:
         app.include_router(create_artifact_preview_public_router(artifact_preview_service))
+    # Per-user LLM cost report (omni usage). User-scoped, not session-scoped,
+    # so it gets its own router rather than living under /sessions.
+    app.include_router(
+        create_usage_router(
+            conversation_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["usage"],
+    )
     # Read-only built-in agent discovery (designs/BUILTIN_AGENTS.md).
     # Successor to the removed GET /api/agents list; lists only
     # built-in (session_id IS NULL) agents for the new-session picker.
@@ -2844,6 +2855,21 @@ def create_app(
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
+            # Multi-user server with a PUBLIC device-authorize endpoint: without
+            # the shared client secret, anyone who can reach the server can
+            # initiate a device flow, so the only phishing defense is the
+            # consent-page warning + short TTL. Warn loudly so an operator opts
+            # into OMNIGENT_DEVICE_CLIENT_SECRET (which closes initiation to
+            # unauthorized callers) rather than leaving it off unknowingly. See
+            # designs/DEVICE_AUTH.md § "Device-code phishing".
+            if not os.environ.get("OMNIGENT_DEVICE_CLIENT_SECRET", "").strip():
+                _logger.warning(
+                    "device-grant: OMNIGENT_DEVICE_CLIENT_SECRET is not set — the "
+                    "/oauth/device/authorize endpoint is PUBLIC (any caller may "
+                    "initiate a login flow). Set OMNIGENT_DEVICE_CLIENT_SECRET on "
+                    "the server and its trusted client(s) to restrict initiation "
+                    "to authorized clients. See designs/DEVICE_AUTH.md.",
+                )
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite

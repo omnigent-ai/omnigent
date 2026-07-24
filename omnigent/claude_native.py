@@ -1640,8 +1640,11 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
-        _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
     }
+    # Don't disable betas when gateway-aware mode (CLAUDE_CODE_USE_GATEWAY=1)
+    # is selected: that mode keeps tool search on so MCP schemas load on demand.
+    if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1":
+        env[_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV] = "1"
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
@@ -1746,13 +1749,13 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
     return ClaudeNativeUcodeConfig(
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
-            # Disable Claude Code's experimental anthropic-beta flags. Gateways
-            # (Databricks serving-endpoints and the like) reject beta flags they
-            # don't implement with a 400 "invalid beta flag", which kills every
-            # turn. The ucode/databricks path already sets this; mirror it here
-            # so the generic key/gateway/local provider path is equally
-            # gateway-safe.
-            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+            # Disable beta flags gateways reject (400 "invalid beta flag");
+            # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
+            **(
+                {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
+                if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                else {}
+            ),
         },
         api_key_helper=api_key_helper,
         model=family.default_model,
@@ -3612,16 +3615,23 @@ async def _ensure_local_claude_resume_transcript(
     """
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return None
+    from omnigent.claude_native_bridge import bridge_dir_for_conversation_id
+
     current = workspace
     target_dir = _claude_project_dir_for_cwd(current)
     target = target_dir / f"{external_session_id}.jsonl"
 
     items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+    # Items are persisted with unresolved file_id attachment blocks;
+    # fetch the bytes back so the rebuilt transcript can reference a
+    # live local file instead of silently dropping the attachment.
+    items = await _resolve_session_item_file_references(client, session_id=session_id, items=items)
     records = _claude_transcript_records_from_session_items(
         items,
         session_id=session_id,
         external_session_id=external_session_id,
         cwd=current,
+        bridge_dir=bridge_dir_for_conversation_id(session_id),
     )
     # Empty transcript → ``claude --resume`` exits fatally ("No conversation
     # found"), killing the terminal-as-agent. Return None so the caller
@@ -3699,12 +3709,50 @@ async def _fetch_all_session_items_for_claude_resume(
         after = last_id
 
 
+async def _resolve_session_item_file_references(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Inline ``file_id`` attachment blocks as base64 data URIs.
+
+    Message items come back from the server in pre-resolution form (the
+    upload's raw ``file_id``). The transcript rebuild runs where no
+    file/artifact stores exist, so bytes are fetched back through the
+    session-scoped file resource endpoints — the same fetch the runner's
+    current-message fallback performs. A failed fetch is non-fatal: the
+    block stays unresolved and the converter surfaces a visible marker.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param items: Flat API item dicts from ``GET /v1/sessions/{id}/items``.
+    :returns: The same items with resolvable attachment blocks rewritten
+        to carry ``image_url`` / ``file_data`` data URIs.
+    """
+    from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
+
+    for item in items:
+        content = item.get("content")
+        if item.get("type") != "message" or not isinstance(content, list):
+            continue
+        item["content"] = [
+            (await resolve_file_id_block(block, session_id=session_id, client=client) or block)
+            if isinstance(block, dict) and has_unresolved_file_id(block)
+            else block
+            for block in content
+        ]
+    return items
+
+
 def _claude_transcript_records_from_session_items(
     items: list[dict[str, Any]],
     *,
     session_id: str,
     external_session_id: str,
     cwd: Path,
+    bridge_dir: Path,
 ) -> list[dict[str, Any]]:
     """
     Convert Omnigent session items into Claude Code transcript records.
@@ -3718,6 +3766,8 @@ def _claude_transcript_records_from_session_items(
         ``"02857840-6362-408f-b41f-309e396ed7c6"``.
     :param cwd: Working directory to write into each transcript
         record, e.g. ``Path("/home/me/repo")``.
+    :param bridge_dir: Session bridge directory; resolved attachment
+        blocks are re-materialized under its ``uploads/`` subdirectory.
     :returns: Claude JSONL record dictionaries.
     """
     records: list[dict[str, Any]] = []
@@ -3776,6 +3826,7 @@ def _claude_transcript_records_from_session_items(
                         record_uuid=cm_uuid,
                         parent_uuid=parent_uuid,
                         cwd=cwd,
+                        bridge_dir=bridge_dir,
                     )
                     if cm_record is not None:
                         records.append(cm_record)
@@ -3793,6 +3844,7 @@ def _claude_transcript_records_from_session_items(
             record_uuid=record_uuid,
             parent_uuid=tool_parent_by_call_id.get(str(item.get("call_id"))) or parent_uuid,
             cwd=cwd,
+            bridge_dir=bridge_dir,
         )
         if record is None:
             continue
@@ -3812,6 +3864,7 @@ def _claude_transcript_record_from_session_item(
     record_uuid: str,
     parent_uuid: str | None,
     cwd: Path,
+    bridge_dir: Path,
 ) -> dict[str, Any] | None:
     """
     Convert one Omnigent item into one Claude transcript record.
@@ -3826,6 +3879,8 @@ def _claude_transcript_record_from_session_item(
         for the first line.
     :param cwd: Current working directory to record, e.g.
         ``Path("/home/me/repo")``.
+    :param bridge_dir: Session bridge directory for re-materializing
+        attachment blocks.
     :returns: Claude transcript record, or ``None`` for unsupported or
         empty Omnigent items.
     """
@@ -3836,7 +3891,7 @@ def _claude_transcript_record_from_session_item(
     if item_type == "message":
         role = item.get("role")
         if role == "user":
-            content = _claude_user_content_from_api_blocks(item.get("content"))
+            content = _claude_user_content_from_api_blocks(item.get("content"), bridge_dir)
             if content is None:
                 return None
             record_type = "user"
@@ -3881,6 +3936,15 @@ def _claude_transcript_record_from_session_item(
         output = item.get("output")
         if not isinstance(output, str):
             output = "" if output is None else json.dumps(output, separators=(",", ":"))
+        # An intact base64 image rehydrates into a real image block below (cheap
+        # for the model, so it is kept as-is). But a payload clipped at the
+        # conversation-store byte cap holds corrupt/partial base64 that no
+        # longer parses — rehydration fails and the raw ~250K-char string would
+        # be sent as text on ``--resume``, re-overflowing the context and
+        # wedging compaction. Collapse only that truncated case to a
+        # placeholder, so both the tool_result content and the toolUseResult
+        # metadata stay small while intact images still resume as images.
+        output = _strip_unparseable_image_output(output)
         record_type = "user"
         # Image (and other structured) tool results are persisted as a
         # stringified content-block array. Rehydrate them into real blocks
@@ -3946,21 +4010,62 @@ def _synthetic_claude_transcript_uuid(
     )
 
 
-def _claude_user_content_from_api_blocks(content: object) -> str | list[dict[str, Any]] | None:
+def _claude_user_content_from_api_blocks(
+    content: object,
+    bridge_dir: Path,
+) -> str | list[dict[str, Any]] | None:
     """
     Convert Omnigent user message blocks into Claude message content.
 
+    Attachment blocks (``input_image`` / ``input_file``) cannot ride the
+    transcript as bytes; resolved ones are re-materialized under the
+    bridge dir and referenced by an ``[Attached: <path>]`` line, and
+    unresolved ones surface as a visible could-not-load marker — never a
+    silent drop.
+
     :param content: Omnigent ``content`` value, e.g.
         ``[{"type": "input_text", "text": "hello"}]``.
+    :param bridge_dir: Session bridge directory for re-materializing
+        attachment blocks.
     :returns: A string for simple text prompts, a Claude content block
         list for multi-block prompts, or ``None`` when no text exists.
     """
-    blocks = _claude_text_blocks_from_api_content(content, api_type="input_text")
+    blocks = _claude_attachment_text_blocks_from_api_content(content, bridge_dir)
+    blocks += _claude_text_blocks_from_api_content(content, api_type="input_text")
     if not blocks:
         return None
     if len(blocks) == 1:
         return str(blocks[0]["text"])
     return blocks
+
+
+def _claude_attachment_text_blocks_from_api_content(
+    content: object,
+    bridge_dir: Path,
+) -> list[dict[str, Any]]:
+    """
+    Re-materialize attachment blocks as transcript text references.
+
+    Mirrors the native executors' turn-time behavior: a resolved data-URI
+    block is decoded to ``<bridge_dir>/uploads/`` and referenced with the
+    ``[Attached: <path>]`` marker so Claude can Read it after a resume; a
+    block whose bytes never arrived yields the could-not-load placeholder
+    instead of vanishing from the rebuilt transcript.
+
+    :param content: Omnigent content array, e.g.
+        ``[{"type": "input_image", "image_url": "data:image/png;..."}]``.
+    :param bridge_dir: Session bridge directory to write files under.
+    :returns: Claude ``{"type": "text", "text": ...}`` blocks.
+    """
+    from omnigent.inner.native_attachments import attachment_reference_line
+
+    if not isinstance(content, list):
+        return []
+    return [
+        {"type": "text", "text": attachment_reference_line(block, bridge_dir)}
+        for block in content
+        if isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+    ]
 
 
 def _claude_assistant_content_from_api_blocks(content: object) -> list[dict[str, Any]] | None:
@@ -4047,6 +4152,32 @@ def _json_safe_tool_use_result(output: str) -> str:
         json.loads(output)
     except (json.JSONDecodeError, ValueError):
         return json.dumps(output)
+    return output
+
+
+def _strip_unparseable_image_output(output: str) -> str:
+    """Collapse a truncated/corrupt base64 image tool result to a placeholder.
+
+    Intact image outputs (valid JSON) are returned unchanged so the caller can
+    rehydrate them into real image blocks for ``--resume``. Only a payload that
+    *looks* like an image but no longer parses as JSON — the shape produced when
+    the conversation store clipped it at its byte cap — is replaced with a short
+    placeholder, so the corrupt ~250K-char base64 is never sent as prompt text.
+
+    :param output: The persisted tool-result string.
+    :returns: The original string, or a placeholder JSON array when the output
+        is an unparseable image payload.
+    """
+    stripped = output.lstrip()
+    if stripped[:1] not in ("[", "{") or '"image"' not in output or '"base64"' not in output:
+        return output
+    try:
+        json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        from omnigent.runtime.prompt import _image_omitted_placeholder
+
+        placeholder = {"type": "text", "text": _image_omitted_placeholder(None)}
+        return json.dumps([placeholder], separators=(",", ":"))
     return output
 
 

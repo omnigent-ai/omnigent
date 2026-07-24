@@ -142,6 +142,76 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.sandbox.type == "none"
 
 
+def test_executor_factory_cwd_falls_back_to_runner_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Locks the harness half of the contract asserted by
+    ``tests/runtime/test_spawn_env_cwd.py::test_builder_omits_cwd_when_none``:
+    when the builder omits ``HARNESS_CODEX_CWD``, the harness falls back
+    to ``OMNIGENT_RUNNER_WORKSPACE``. Mirrors the claude-sdk / kimi / pi /
+    hermes harnesses.
+    """
+    monkeypatch.delenv("HARNESS_CODEX_CWD", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, cwd: str | None, **_kwargs: Any) -> None:
+        captured["cwd"] = cwd
+
+    with patch(
+        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        _fake_init,
+    ):
+        codex_harness._build_codex_executor()
+
+    assert captured["cwd"] == "/home/bobby/code/agents"
+
+
+def test_executor_factory_explicit_cwd_wins_over_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``HARNESS_CODEX_CWD`` takes precedence over the
+    ``OMNIGENT_RUNNER_WORKSPACE`` fallback."""
+    monkeypatch.setenv("HARNESS_CODEX_CWD", "/tmp/explicit")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, cwd: str | None, **_kwargs: Any) -> None:
+        captured["cwd"] = cwd
+
+    with patch(
+        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        _fake_init,
+    ):
+        codex_harness._build_codex_executor()
+
+    assert captured["cwd"] == "/tmp/explicit"
+
+
+def test_executor_factory_blank_cwd_env_vars_pass_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty cwd env vars normalize to ``None`` rather than an empty
+    string, so the executor reaches its own inherited-cwd fallback."""
+    monkeypatch.setenv("HARNESS_CODEX_CWD", "")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, cwd: str | None, **_kwargs: Any) -> None:
+        captured["cwd"] = cwd
+
+    with patch(
+        "omnigent.inner.codex_harness.CodexExecutor.__init__",
+        _fake_init,
+    ):
+        codex_harness._build_codex_executor()
+
+    assert captured["cwd"] is None
+
+
 def test_executor_factory_decodes_os_env_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

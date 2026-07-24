@@ -20,11 +20,12 @@ Omnigent identity against it.
 3. Add a slash command `/omnigent` (Features → Slash Commands). In Socket Mode
   the request URL is ignored, so any placeholder works.
 4. Install the app into the workspace.
-5. Copy `.env.example` to `.env` and fill in the two Slack tokens
-  (`OMNIGENT_SLACK_BOT_TOKEN`, `OMNIGENT_SLACK_APP_TOKEN`) and your Omnigent
-   server URL (`OMNIGENT_SERVER_URL`). If your server sets
+5. Set the two Slack tokens (`OMNIGENT_SLACK_BOT_TOKEN`,
+   `OMNIGENT_SLACK_APP_TOKEN`) and your Omnigent server URL
+   (`OMNIGENT_SERVER_URL`) as **environment variables**. If your server sets
    `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same value here so the bot is
-   accepted as an authorized device-grant client.
+   accepted as an authorized device-grant client. See **Configuration** below
+   for how the bot reads config.
 6. Run the bot — see **Running the bot** below.
 
 ## Required scopes
@@ -80,21 +81,28 @@ Under **Event Subscriptions → Subscribe to bot events**, add:
 With the `omni` CLI installed, the Slack bot is managed as a background daemon:
 
 ```bash
-omni integration slack           # run in the foreground (Ctrl-C to stop)
-omni integration slack start     # run in the background (detached)
-omni integration slack status    # is the background bot running?
-omni integration slack stop      # stop the background bot
-omni integration slack logs      # print the background bot's log path
-omni integration slack logs -f   # follow the log (like tail -f)
+omni integration slack              # run in the foreground (Ctrl-C to stop)
+omni integration slack --background # run in the background (detached)
+omni integration slack status       # is the background bot running?
+omni integration slack stop         # stop the background bot
+omni integration slack logs         # print the background bot's log path
+omni integration slack logs -f      # follow the log (like tail -f)
 ```
 
-`omni integration slack start` spawns a detached daemon and returns
-immediately; `status`/`stop`/`logs` manage it. Running `start` again while it's
-already up is a no-op that reports the existing process.
+`omni integration slack --background` spawns a detached daemon and returns
+immediately; `status`/`stop`/`logs` manage it. Running `--background` again
+while it's already up is a no-op that reports the existing process.
+
+### Configuration
 
 All configuration (the two Slack tokens, `OMNIGENT_SERVER_URL`, and the
 optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`)
-comes from the environment and the `.env` file — the CLI only launches the bot.
+comes from **real environment variables** — the bot does **not** read a `.env`
+file itself. For local dev, either export the vars, or launch under a tool that
+injects a `.env` — e.g. `uv run --env-file .env omni integration slack`, or
+`export $(grep -v '^#' .env | xargs)` before running. In production the
+Docker / Databricks deploy sets them directly. `.env.example` documents the
+full set of variables to copy from.
 
 The bot lives in the separate `omnigent-slack` package, which must be installed
 **in the same environment as** `omni` for the `omni integration slack` commands
@@ -104,7 +112,7 @@ to find it. Install it as the `slack` extra of omnigent:
 uv tool install "omnigent[slack]"     # or, from a source checkout: uv sync --extra slack
 ```
 
-Set `LOG_LEVEL=DEBUG` in `.env` when diagnosing why Slack events are not producing replies.
+Set `LOG_LEVEL=DEBUG` in the environment when diagnosing why Slack events are not producing replies.
 
 ## Per-user setup flow
 
@@ -140,8 +148,12 @@ command.
 The bot **auto-detects the server's auth mode** (an unauthenticated `GET /v1/me`, exactly as the `omnigent login` CLI does) and picks the matching flow:
 
 - `accounts` **mode** → **OAuth 2.0 Device Authorization Grant** (RFC 8628).
-The modal shows a verification link + code; the user approves a consent page
-in their browser. The server issues a short-lived, session-scoped delegated
+The modal shows a one-click login link (code prefilled) and the short code to
+confirm; the user opens the link and approves a consent page in their browser.
+(The consent page **forces a fresh password entry** before it will approve —
+even if the user is already signed in — so a link the user didn't personally
+start can't be approved by reflex.) The server issues a short-lived,
+session-scoped delegated
 token plus a rotating refresh token, so the bot silently refreshes and the
 token can't reach admin endpoints. **The Omnigent server must have the device
 grant enabled** (`OMNIGENT_DEVICE_GRANT_ENABLED=1` — it is default-off);

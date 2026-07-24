@@ -464,7 +464,7 @@ def _parse_sandbox_config(
 
         sandbox:
           container_image: python:3.12-slim
-          container_runtime: podman  # optional, defaults to docker
+          container_runtime: podman  # optional, defaults to OMNIGENT_CONTAINER_RUNTIME or docker
 
     :param raw: The raw ``sandbox`` value from the ``tools``
         block. ``None`` means not specified (use defaults).
@@ -472,16 +472,17 @@ def _parse_sandbox_config(
     """
     if raw is None or not isinstance(raw, dict):
         return SandboxConfig()
-    runtime = raw.get("container_runtime", "docker")
-    if runtime not in ("docker", "podman"):
-        raise ValueError(
-            f"Unsupported container_runtime {runtime!r}; expected 'docker' or 'podman'."
-        )
     image = raw.get("container_image") or raw.get("docker_image")
-    return SandboxConfig(
-        container_image=image,
-        container_runtime=runtime,
-    )
+    kwargs: dict[str, Any] = {"container_image": image}
+    if "container_runtime" in raw:
+        runtime = raw["container_runtime"]
+        if runtime not in SandboxConfig.ALLOWED_RUNTIMES:
+            raise ValueError(
+                f"Unsupported container_runtime {runtime!r}; "
+                f"expected one of {sorted(SandboxConfig.ALLOWED_RUNTIMES)}."
+            )
+        kwargs["container_runtime"] = runtime
+    return SandboxConfig(**kwargs)
 
 
 def _parse_builtin_tools(
