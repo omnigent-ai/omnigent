@@ -334,6 +334,14 @@ dev = [
 omnigent = "omnigent.cli:main"
 omni = "omnigent.cli:main"
 
+# Floor a transitive dependency to clear known CVEs. mlflow-skinny (pulled
+# in by the optional `mlflow` extra) depends on gitpython, and 3.1.50 carries
+# GHSA-2f96-g7mh-g2hx / GHSA-v396-v7q4-x2qj / GHSA-956x-8gvw-wg5v, all fixed in
+# 3.1.51. Constrain the resolution rather than adding a direct dependency so
+# gitpython only appears when a gitpython-using extra is installed.
+[tool.uv]
+constraint-dependencies = ["gitpython>=3.1.51,<4"]
+
 # uv path-deps for the sibling SDK packages (renamed in Stage 3).
 [tool.uv.sources]
 omnigent-client = { path = "sdks/python-client", editable = true }
