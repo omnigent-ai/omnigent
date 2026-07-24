@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import sys
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -182,6 +183,212 @@ async def test_sessions_native_resolves_file_id_before_harness() -> None:
         "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
     }
     assert "file_id" not in image_block
+
+
+class _MalformedMetaFileServerClient(_FakeFileServerClient):
+    """File metadata GETs answer 200 with a non-JSON body (a proxy error page)."""
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        response = await super().get(url, **kwargs)
+        if "/resources/files/" in url and not url.endswith("/content"):
+
+            def _raise_not_json() -> dict[str, Any]:
+                raise ValueError("body is not JSON")
+
+            response.content = b"<html>gateway error</html>"
+            response.json = _raise_not_json
+        return response
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_malformed_file_metadata_is_nonfatal() -> None:
+    """A 200-but-unparseable metadata body must not break attachment resolution.
+
+    The metadata fetch only supplies the media-type hint; when a proxy
+    answers 200 with an HTML error page, the resolver falls back to the
+    content response's Content-Type and the attachment still inlines.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _MalformedMetaFileServerClient()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/e54fa4d331772eeb0314b74c56161415/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "file_id": "07b38328508bae2010c8b9933a310846",
+                        "filename": "photo.png",
+                    },
+                    {"type": "input_text", "text": "what is this?"},
+                ],
+            },
+        )
+
+    assert resp.status_code == 202
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    image_block = harness_client.posted_bodies[0]["content"][0]["content"][0]
+    # Bytes came from the content response; the media type came from its
+    # Content-Type header, not the unparseable metadata body.
+    assert image_block == {
+        "type": "input_image",
+        "filename": "photo.png",
+        "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+    }
+    assert "file_id" not in image_block
+
+
+class _HistoryFileServerClient(_FakeFileServerClient):
+    """Server client whose stored history carries an unresolved ``file_id``."""
+
+    def __init__(self, *, fail_file_fetch: bool = False) -> None:
+        super().__init__()
+        self._fail_file_fetch = fail_file_fetch
+        # Prior turn persisted in pre-resolution form: the image block
+        # still references the server-side file store by file_id.
+        self._items_payload: dict[str, Any] = {
+            "data": [
+                {
+                    "id": "item_prior_user",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "file_id": "file_img",
+                            "filename": "photo.png",
+                        },
+                        {"type": "input_text", "text": "look at this image"},
+                    ],
+                },
+                {
+                    "id": "item_prior_assistant",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "A photo."}],
+                },
+            ],
+            "has_more": False,
+        }
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if self._fail_file_fetch and not url.endswith("/items"):
+            self.get_calls.append(url)
+            raise httpx.ConnectError("file resource endpoint unreachable")
+        response = await super().get(url, **kwargs)
+        if url.endswith("/items"):
+            response.json = lambda: self._items_payload
+        return response
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_resolves_history_file_id_on_cold_reload() -> None:
+    """Cold-cache history reload resolves prior-turn ``file_id`` blocks.
+
+    Remote runners have no file/artifact stores, so history reloaded from
+    the server still carries raw ``file_id`` blocks. Without runner-side
+    resolution the harness receives them unresolved and the attachment is
+    silently dropped downstream — the model then hallucinates the image.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _HistoryFileServerClient()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_hist/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_abc",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "what did I show you before?"}],
+            },
+        )
+
+    assert resp.status_code == 202
+    # The cold-cache reload must fetch the prior image's bytes back from
+    # the server, same as the current-turn fallback path does.
+    assert "/v1/sessions/conv_hist/resources/files/file_img" in server_client.get_calls
+    assert "/v1/sessions/conv_hist/resources/files/file_img/content" in server_client.get_calls
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    posted = harness_client.posted_bodies[0]
+    # content = [prior user message, prior assistant message, new message]
+    prior_image_block = posted["content"][0]["content"][0]
+    assert prior_image_block == {
+        "type": "input_image",
+        "filename": "photo.png",
+        "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+    }
+    assert "file_id" not in prior_image_block
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed history file fetch keeps the block and logs, not crashes.
+
+    The turn must still run with the rest of the history; the unresolved
+    block passes through so downstream executors can surface a visible
+    could-not-load marker instead of dropping the attachment silently.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _HistoryFileServerClient(fail_file_fetch=True)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            resp = await client.post(
+                "/v1/sessions/conv_hist_fail/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_abc",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": "what was that image?"}],
+                },
+            )
+
+    assert resp.status_code == 202
+    assert "failed to resolve file_id" in caplog.text
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    posted = harness_client.posted_bodies[0]
+    prior_image_block = posted["content"][0]["content"][0]
+    assert prior_image_block["file_id"] == "file_img"
 
 
 @pytest.mark.asyncio
@@ -1501,3 +1708,122 @@ async def test_create_session() -> None:
     assert "created_at" in body
     assert body["items"] == []
     assert pm.has_session("8e32600337d08f59ad381caf96a90659")
+
+
+class _NativeSeedServerClient(NullServerClient):
+    """Server client with one stored item; records item listings and event posts."""
+
+    def __init__(self) -> None:
+        self.items_params: list[Any] = []
+        self.file_calls: list[str] = []
+        self.posted_events: list[dict[str, Any]] = []
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if url.endswith("/items"):
+            self.items_params.append(kwargs.get("params"))
+
+            class _ItemsResponse(NullServerClient._Response):
+                def json(self) -> dict[str, Any]:
+                    return {"data": [{"id": "item_latest"}], "has_more": False}
+
+            return _ItemsResponse()
+        if "/resources/files/" in url:
+            self.file_calls.append(url)
+        return await super().get(url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        body = kwargs.get("json")
+        if isinstance(body, dict):
+            self.posted_events.append(body)
+        return await super().post(url, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_native_session_create_seeds_harness_compaction_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Native session assignment must seed the harness-compaction anchor.
+
+    Native harnesses skip the history load entirely (their transcripts are
+    mirrored from the underlying runtime, and reloading would re-download
+    attachments), but harness compaction persistence still anchors on the
+    latest server item ID. Session create must fetch just that ID —
+    newest-first, single item, no attachment downloads — so a later
+    ``response.compaction.completed`` persists instead of silently bailing
+    on the missing anchor.
+    """
+    import omnigent.runner.app as runner_app_mod
+
+    async def _noop_terminal(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(runner_app_mod, "_auto_create_claude_terminal", _noop_terminal)
+    # No bridge dir exists in this test; keep the lazy comment-relay start
+    # from parking on the cold-bridge tools/list_changed wait.
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge.post_tools_changed",
+        lambda *args, **kwargs: None,
+    )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse(
+                {
+                    "type": "response.compaction.completed",
+                    "summary": "squashed prior turns",
+                    "total_tokens": 5,
+                }
+            ),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _NativeSeedServerClient()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert resp.status_code == 201, resp.text
+        # The seed fetches only the newest item ID — no history conversion,
+        # no attachment fetch-backs.
+        assert {"limit": "1", "order": "desc"} in server_client.items_params
+        assert server_client.file_calls == []
+
+        turn = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "claude-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+        assert turn.status_code == 202
+        compactions: list[dict[str, Any]] = []
+        for _ in range(100):
+            compactions = [b for b in server_client.posted_events if b.get("type") == "compaction"]
+            if compactions:
+                break
+            await asyncio.sleep(0.05)
+
+    assert compactions, "harness compaction was never persisted to the server"
+    assert compactions[0]["data"]["last_item_id"] == "item_latest"

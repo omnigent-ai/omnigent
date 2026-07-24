@@ -9000,6 +9000,89 @@ def _workspace_api_server_url(server: str) -> str:
     return server
 
 
+def _canonical_azure_databricks_url(server: str) -> str | None:
+    """Build the canonical ``adb-`` host for an Azure custom-URL workspace.
+
+    Azure workspaces can front a custom (vanity) URL such as
+    ``https://mydomain.azuredatabricks.net``, but that edge 303-redirects an
+    unauthenticated request to ``/login`` instead of answering the probe, so the
+    login/host flow can't detect the Databricks posture. The canonical
+    host does answer, and the ``?o=<workspace_id>`` selector already carries the
+    id needed to build it.
+
+    The ``{workspace_id % 20}`` shard is an observed regularity, not a documented
+    contract: Microsoft calls the segment a random number and treats
+    ``properties.workspaceUrl`` from the ARM API as authoritative. It held on
+    every real workspace we could measure (170 live hosts, and probing all 20
+    shards on 6 of them answers only at the mod-20 value), but callers must probe
+    the result before adopting it rather than trust the arithmetic.
+
+    :param server: A scheme-bearing server URL, e.g.
+        ``"https://mydomain.azuredatabricks.net/?o=123"``.
+    :returns: The URL with the canonical Azure host, or ``None`` when *server* is
+        not a vanity Azure workspace URL carrying a numeric selector (AWS/GCP
+        hosts, already-canonical URLs, a missing or malformed selector).
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(server)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname.endswith(".azuredatabricks.net") or hostname.startswith("adb-"):
+        return None
+    org_id = _org_id_from_url(server)
+    # ASCII-only: str.isdecimal() also accepts non-ASCII digits (e.g. Arabic-Indic
+    # "٣") that int() parses too, which would synthesize a nonsensical host.
+    if org_id is None or not (org_id.isascii() and org_id.isdecimal()):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None  # malformed port: leave the URL for the probe to reject
+    canonical_host = f"adb-{org_id}.{int(org_id) % 20}.azuredatabricks.net"
+    netloc = f"{canonical_host}:{port}" if port else canonical_host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def _probe_root(server: str) -> str:
+    """Reduce a URL to the root ``_workspace_api_server_url`` actually probes.
+
+    That function drops the query/fragment before probing (a query-bearing base
+    would push the appended path into the query, ``…/?o=123/v1/me``), so anything
+    comparing against its result — or probing alongside it — has to reduce the
+    same way.
+
+    :param server: A scheme-bearing server URL.
+    :returns: *server* without its query or fragment and without a trailing slash.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parsed = urlsplit(server.rstrip("/"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")).rstrip("/")
+
+
+def _databricks_root_is_usable(server: str) -> bool:
+    """Report whether *server* answers a probe we know how to talk to.
+
+    Mirrors the two acceptance conditions ``_workspace_api_server_url`` applies to
+    its own root probe, so the two agree on what "this URL works" means.
+
+    :param server: A scheme-bearing server URL; its query/fragment is dropped
+        before probing, as ``_workspace_api_server_url`` does.
+    :returns: True when the host answers as an omnigent server or a recognized
+        Databricks login target.
+    """
+    import httpx as _httpx
+
+    root = _probe_root(server)
+    try:
+        probe = _httpx.get(f"{root}/v1/me", timeout=10.0)
+    except _httpx.HTTPError:
+        return False
+    if probe.status_code == 200:
+        return True
+    return _databricks_workspace_login_target(root, probe) is not None
+
+
 def _resolve_server_url(server: str) -> str:
     """
     Normalize a user-supplied ``--server`` value to the Omnigent API base.
@@ -9011,12 +9094,38 @@ def _resolve_server_url(server: str) -> str:
     web-UI URL the internal user guide hands out — to the
     ``/api/2.0/omnigent`` mount.
 
+    The URL is always tried as the user gave it first. Only when that fails
+    to resolve, and only for an Azure custom (vanity) workspace URL, is the
+    canonical ``adb-`` host synthesized — and it is probed before
+    being adopted, so a wrong guess falls back to the user's URL instead of
+    stranding them on a host they never typed.
+
     :param server: A non-empty ``--server`` value, e.g.
         ``"example.cloud.databricks.com/omnigent"``.
     :returns: The normalized API base URL without a trailing slash, e.g.
         ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
     """
-    return _workspace_api_server_url(_with_default_scheme(server.rstrip("/")))
+    from omnigent.conversation_browser import display_server_url
+
+    normalized = _with_default_scheme(server.rstrip("/"))
+    expanded = _workspace_api_server_url(normalized)
+    candidate = _canonical_azure_databricks_url(normalized)
+    if candidate is None:
+        return expanded  # not a vanity Azure workspace URL
+    # A URL "resolved" if the expansion adopted a mount for it, or if the root
+    # answers on its own. Compare against the root the expansion probed, not the
+    # raw input: it drops the ?o= selector first, and that selector is what makes
+    # a URL a candidate here, so comparing raw would always look like an adoption.
+    if expanded != _probe_root(normalized) or _databricks_root_is_usable(normalized):
+        return expanded
+    canonical = _workspace_api_server_url(candidate)
+    if canonical == _probe_root(candidate) and not _databricks_root_is_usable(candidate):
+        return expanded  # the canonical host is no better; keep what the user typed
+    click.echo(
+        f"Note: {display_server_url(normalized)} did not answer as a workspace; "
+        f"using its canonical host {display_server_url(canonical)}."
+    )
+    return canonical
 
 
 def _databricks_workspace_login_target(server: str, probe: httpx.Response) -> str | None:

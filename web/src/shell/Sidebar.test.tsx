@@ -292,8 +292,46 @@ describe("Sidebar session list", () => {
     expect(within(primaryNav).getByTestId("toggle-selection-mode")).toBeInTheDocument();
   });
 
-  it("does NOT close the sidebar when the header Settings is tapped", () => {
-    // No onNavClick on the header Settings link: on mobile the overlay stays
+  it("renders the 'Scheduled' nav row directly under 'New session' and routes to /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const scheduled = screen.getByTestId("scheduled-tasks-nav");
+    // Full-width nav ROW (a link), labeled just "Scheduled", pointing at /tasks —
+    // not the old top-right icon button.
+    expect(scheduled).toHaveAttribute("href", "/tasks");
+    expect(scheduled).toHaveTextContent("Scheduled");
+    // The removed icon-button version must be gone.
+    expect(screen.queryByTestId("scheduled-tasks-button")).toBeNull();
+
+    // It sits in the primary nav group right after "New session" and before
+    // the "Inbox" row. Compare document order. (The search box now renders
+    // above this nav group upstream, so we anchor to New session + Inbox — the
+    // two items actually adjacent to Scheduled — rather than the search box.)
+    const newSession = screen.getByTestId("new-chat-button");
+    const inbox = screen.getByTestId("inbox-button");
+    expect(newSession.compareDocumentPosition(scheduled) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(scheduled.compareDocumentPosition(inbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("marks the 'Scheduled' nav row active when on /tasks", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/tasks");
+
+    // Active/selected state uses the SAME shared active-highlight as the sibling
+    // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
+    // ad-hoc bg-muted.
+    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
+      "bg-[var(--sidebar-active)]",
+    );
+  });
+
+  it("does NOT close the sidebar when the footer Settings is tapped", () => {
+    // No onNavClick on the footer Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto
     // the default section's content.
     mockConversations(THREE_TYPE_CONVERSATIONS);

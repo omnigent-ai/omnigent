@@ -123,7 +123,9 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import posixpath
 import re
 import secrets
 import time
@@ -768,9 +770,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "boxlite":
         section = _boxlite_section(raw)
-        _reject_unknown_boxlite_keys(
-            section, {"image", "env", "local", "cloud"}, "sandbox.boxlite"
-        )
+        _reject_unknown_keys(section, {"image", "env", "local", "cloud"}, "sandbox.boxlite")
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
             endpoint,
@@ -821,6 +821,24 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider == "kubernetes":
+        kubernetes_section = _parse_provider_section(raw, "kubernetes")
+        if kubernetes_section is not None:
+            _reject_unknown_keys(
+                kubernetes_section,
+                {
+                    "image",
+                    "env",
+                    "namespace",
+                    "secret_name",
+                    "service_account",
+                    "node_selector",
+                    "kubeconfig",
+                    "in_cluster",
+                    "resources",
+                    "pvc_mounts",
+                },
+                "sandbox.kubernetes",
+            )
         launcher_factory = _kubernetes_launcher_factory(
             image=_parse_provider_image(raw, "kubernetes"),
             env=_parse_provider_env(raw, "kubernetes"),
@@ -831,6 +849,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             kubeconfig=_parse_provider_string(raw, "kubernetes", "kubeconfig"),
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
+            pvc_mounts=_parse_kubernetes_pvc_mounts(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -1076,7 +1095,7 @@ def _boxlite_section(raw: dict[str, object]) -> dict[str, object]:
     return section
 
 
-def _reject_unknown_boxlite_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
+def _reject_unknown_keys(mapping: dict[str, object], allowed: set[str], path: str) -> None:
     """
     Fail loud on any key outside *allowed* — catches typos and misplaced keys
     (e.g. ``endpoint`` at the section level instead of under ``cloud:``, or a
@@ -1127,7 +1146,7 @@ def _parse_boxlite_mode(
     if cloud_present:
         if not isinstance(cloud_block, dict):
             raise ValueError("server config 'sandbox.boxlite.cloud' must be a mapping")
-        _reject_unknown_boxlite_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
+        _reject_unknown_keys(cloud_block, {"endpoint"}, "sandbox.boxlite.cloud")
         endpoint = cloud_block.get("endpoint")
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
@@ -1140,7 +1159,7 @@ def _parse_boxlite_mode(
         return None, None, None
     if not isinstance(local_block, dict):
         raise ValueError("server config 'sandbox.boxlite.local' must be a mapping")
-    _reject_unknown_boxlite_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
+    _reject_unknown_keys(local_block, {"home_dir", "registry"}, "sandbox.boxlite.local")
     return None, _parse_boxlite_home_dir(local_block), _parse_boxlite_registry(local_block)
 
 
@@ -1221,7 +1240,7 @@ def _parse_boxlite_registry(local: dict[str, object]) -> dict[str, object] | Non
         return None
     if not isinstance(registry, dict):
         raise ValueError("server config 'sandbox.boxlite.local.registry' must be a mapping")
-    _reject_unknown_boxlite_keys(
+    _reject_unknown_keys(
         registry,
         {"host", "transport", "skip_verify", "username_env", "password_env", "token_env"},
         "sandbox.boxlite.local.registry",
@@ -1785,6 +1804,116 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     return normalized
 
 
+# Path prefixes a pvc_mounts mount_path may not overlap — neither sitting at
+# or under one, nor mounting over one from an ancestor (a PVC at /home would
+# shadow the /home/omnigent mountpoint): the runner's writable-HOME emptyDir
+# (mirrors the launcher's _HOME_DIR — pinned by test), Kubernetes Secret
+# projections, the image's OS / scratch directories, and /opt (the host
+# image's omnigent venv lives at /opt/venv).
+_KUBERNETES_RESERVED_MOUNT_PREFIXES: tuple[str, ...] = (
+    "/home/omnigent",
+    # Secret projections live under /var/run/secrets; the Debian-based host
+    # image symlinks /var/run -> /run and /var/lock -> /run/lock, so every
+    # spelling is reserved in full to keep the lexical check consistent
+    # across the aliases.
+    "/var/run",
+    "/var/lock",
+    "/run",
+    "/tmp",
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/proc",
+    "/sys",
+    "/dev",
+)
+
+
+def _parse_kubernetes_pvc_mounts(raw: dict[str, object]) -> list[dict[str, object]] | None:
+    """
+    Extract and validate the optional ``sandbox.kubernetes.pvc_mounts`` list.
+
+    Each entry references a PersistentVolumeClaim the operator pre-created in
+    the runner namespace: ``{claim_name, mount_path, read_only?}`` with
+    ``read_only`` defaulting to ``True``. Validated at parse time so an
+    operator typo fails server startup instead of the first managed launch.
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: Normalized entries, or ``None`` when omitted or empty.
+    :raises ValueError: When the list or any entry has the wrong shape, a name
+        or path is malformed, a path is reserved, or paths collide.
+    """
+    section = _parse_provider_section(raw, "kubernetes")
+    if section is None:
+        return None
+    value = section.get("pvc_mounts")
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            "server config 'sandbox.kubernetes.pvc_mounts' must be a list of "
+            "{claim_name, mount_path, read_only?} entries"
+        )
+    normalized: list[dict[str, object]] = []
+    for i, entry in enumerate(value):
+        path_prefix = f"sandbox.kubernetes.pvc_mounts[{i}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"server config '{path_prefix}' must be a mapping")
+        _reject_unknown_keys(entry, {"claim_name", "mount_path", "read_only"}, path_prefix)
+        claim = entry.get("claim_name")
+        if not isinstance(claim, str) or not claim.strip():
+            raise ValueError(
+                f"server config '{path_prefix}.claim_name' must name a "
+                "PersistentVolumeClaim pre-created in the runner namespace"
+            )
+        claim = claim.strip()
+        _validate_dns1123_subdomain(claim, f"pvc_mounts[{i}].claim_name")
+        mount = entry.get("mount_path")
+        if not isinstance(mount, str) or not mount.startswith("/"):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be an absolute "
+                "in-Pod path, e.g. '/mnt/datasets'"
+            )
+        # normpath preserves exactly two leading slashes (POSIX), but the
+        # kernel collapses them at mount time — reject them explicitly so
+        # '//home/omnigent' cannot slip past the reserved-prefix check.
+        if mount.startswith("//") or mount != posixpath.normpath(mount):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' must be a normalized "
+                f"path (no '..', '.', doubled or trailing slashes): {mount!r}"
+            )
+        if mount == "/" or any(
+            mount == p or mount.startswith(p + "/") or p.startswith(mount + "/")
+            for p in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+        ):
+            raise ValueError(
+                f"server config '{path_prefix}.mount_path' overlaps a reserved "
+                f"path: {mount!r} (the runner's HOME, Secret projections, and OS "
+                "directories cannot be shadowed or mounted over)"
+            )
+        read_only = entry.get("read_only", True)
+        if not isinstance(read_only, bool):
+            raise ValueError(f"server config '{path_prefix}.read_only' must be a boolean")
+        normalized.append({"claim_name": claim, "mount_path": mount, "read_only": read_only})
+    for a, b in itertools.combinations(normalized, 2):
+        pa, pb = str(a["mount_path"]), str(b["mount_path"])
+        if pa == pb:
+            raise ValueError(
+                f"server config 'sandbox.kubernetes.pvc_mounts' has a duplicate mount_path: {pa!r}"
+            )
+        low, high = sorted((pa, pb), key=len)
+        if high.startswith(low + "/"):
+            raise ValueError(
+                "server config 'sandbox.kubernetes.pvc_mounts' has nested "
+                f"mount_paths: {low!r} contains {high!r}"
+            )
+    return normalized or None
+
+
 def _kubernetes_launcher_factory(
     *,
     image: str | None,
@@ -1796,6 +1925,7 @@ def _kubernetes_launcher_factory(
     kubeconfig: str | None,
     in_cluster: bool | None,
     resources: dict[str, object] | None,
+    pvc_mounts: list[dict[str, object]] | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -1817,6 +1947,8 @@ def _kubernetes_launcher_factory(
     :param in_cluster: Force the cluster-config source, or ``None`` to try
         in-cluster then fall back to kubeconfig.
     :param resources: Validated ``resources`` block, or ``None`` for defaults.
+    :param pvc_mounts: Normalized PVC mount entries added to every runner Pod,
+        or ``None``.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -1836,6 +1968,7 @@ def _kubernetes_launcher_factory(
             kubeconfig=kubeconfig,
             in_cluster=in_cluster,
             resources=resources,
+            pvc_mounts=pvc_mounts,
         )
 
     return _build
