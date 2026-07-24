@@ -1536,6 +1536,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env["HOME"] == "/home/alice"
     assert env["LANG"] == "en_US.UTF-8"
     assert env["LC_CTYPE"] == "UTF-8"
+    # Forced so lifecycle glyphs cannot crash runners on cp1252.
+    assert env["PYTHONUTF8"] == "1"
     # Databricks config selectors are allowlisted ambient passthrough —
     # the ambient value reaches the runner unmodified (no flag override).
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"

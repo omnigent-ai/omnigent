@@ -35,6 +35,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     resolve_terminal_entry_by_resource_id,
@@ -3349,8 +3350,12 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        # The convenience REPL terminal is tmux/PTY-backed, which Windows has
+        # no implementation for — attempting it there only logs a traceback and
+        # flickers the UI's terminal-pending state on and back off.
         if (
             spec is not None
+            and not IS_WINDOWS
             and not is_native_harness(harness_name)
             and not _sa_name
             and resource_registry.terminal_registry is not None

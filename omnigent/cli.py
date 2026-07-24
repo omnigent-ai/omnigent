@@ -2650,6 +2650,10 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST or key.startswith(daemon_env_prefixes)
         }
+    # Force UTF-8 mode so daemon stdout never raises UnicodeEncodeError on a
+    # legacy Windows code page. Harmless on POSIX; ``setdefault`` preserves an
+    # explicit PYTHONUTF8=0 opt-out.
+    env.setdefault("PYTHONUTF8", "1")
     return env
 
 

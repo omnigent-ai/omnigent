@@ -29,6 +29,7 @@ import logging
 import secrets
 from typing import Any
 
+from omnigent._platform import is_absolute_path
 from omnigent.host.frames import HostStatFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
@@ -214,11 +215,13 @@ async def validate_workspace(
         The exception message is suitable for surfacing to the
         API caller verbatim.
     """
-    if not workspace.startswith("/"):
+    if not is_absolute_path(workspace):
         # Belt-and-suspenders. The Pydantic schema layer also
         # rejects this; pin it here so direct callers (tests,
-        # other server-internal paths) can't bypass.
-        raise WorkspaceValidationError("workspace must be an absolute path starting with /")
+        # other server-internal paths) can't bypass. Accepts POSIX
+        # and Windows (``D:\\...``, UNC) forms so a Linux server can
+        # validate a Windows host's workspace.
+        raise WorkspaceValidationError("workspace must be an absolute path")
 
     display_host = host_name_for_errors or host_id
 

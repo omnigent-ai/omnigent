@@ -606,3 +606,31 @@ async def test_tilde_boundary_passed_through_to_host(
         spec_cwd="~/universe",
     )
     assert canonical == "/Users/corey/universe/src/foo"
+
+
+async def test_windows_drive_workspace_accepted(
+    host_setup: tuple[HostRegistry, _FakeWebSocket, asyncio.Task[None]],
+) -> None:
+    """
+    A Windows drive-letter workspace must pass the absolute-path guard.
+
+    The validator may run on a Linux server while the host is Windows.
+    ``os.path.isabs(r"D:\\proj")`` is False on Linux, so the old
+    ``startswith("/")`` check (and a naive ``os.path.isabs`` swap) both
+    reject valid Windows workspaces with HTTP 400.
+    """
+    registry, _, _ = host_setup
+    win_workspace = r"D:\Users\alice\proj"
+    _set_stat(
+        registry,
+        win_workspace,
+        canonical=win_workspace,
+    )
+
+    canonical = await validate_workspace(
+        host_registry=registry,
+        host_id=_HOST_ID,
+        workspace=win_workspace,
+        spec_cwd=".",
+    )
+    assert canonical == win_workspace

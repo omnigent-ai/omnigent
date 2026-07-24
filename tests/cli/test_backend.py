@@ -272,6 +272,37 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
 
 
+def test_build_host_daemon_env_forces_pythonutf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon env always sets PYTHONUTF8 so cp1252 consoles cannot crash.
+
+    Without this, a user-exported PYTHONUTF8=1 is stripped by the allowlist
+    and lifecycle glyphs (✓ / ↑) raise UnicodeEncodeError inside the tunnel
+    handler, tearing down the connection after a successful handshake.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+
+    local_env = _build_host_daemon_env(server_url=None)
+    remote_env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert local_env["PYTHONUTF8"] == "1"
+    assert remote_env["PYTHONUTF8"] == "1"
+
+
+def test_build_host_daemon_env_preserves_explicit_pythonutf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit PYTHONUTF8 from the parent shell survives setdefault."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("PYTHONUTF8", "0")
+
+    env = _build_host_daemon_env(server_url=None)
+
+    assert env["PYTHONUTF8"] == "0"
+
+
 def test_ensure_host_daemon_reuses_same_target(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

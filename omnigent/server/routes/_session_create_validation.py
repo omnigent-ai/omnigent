@@ -12,6 +12,7 @@ import asyncio
 import logging
 from typing import Any
 
+from omnigent._platform import is_absolute_path
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
 from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
@@ -114,9 +115,9 @@ async def validate_existing_host_workspace(
             "workspace required when host_id is set",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not workspace.startswith("/"):
+    if not is_absolute_path(workspace):
         raise OmnigentError(
-            "workspace must be an absolute path starting with /",
+            "workspace must be an absolute path",
             code=ErrorCode.INVALID_INPUT,
         )
     if agent_cache is None:

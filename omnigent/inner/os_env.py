@@ -123,6 +123,7 @@ _DEFAULT_ENV_PASSTHROUGH: tuple[str, ...] = (
     # Python interpreter knobs that don't change security posture.
     "PYTHONHASHSEED",
     "PYTHONIOENCODING",
+    "PYTHONUTF8",
     "PYTHONUNBUFFERED",
     "PYTHONDONTWRITEBYTECODE",
     "PYTHONFAULTHANDLER",
@@ -495,7 +496,12 @@ class _HelperProcessClient:
         # paths/booleans — but we still keep the file private and ephemeral.
         r_fd: int | None = None
         if IS_WINDOWS:
-            assert self._tmpdir is not None
+            # The config-file fallback needs a private dir even when the
+            # sandbox is inactive — Job Object containment creates no scratch
+            # tmpdir the way bwrap/seatbelt do, so make one lazily here.
+            if self._tmpdir is None:
+                self._tmpdir = create_private_tmpdir()
+                set_temp_env(env, self._tmpdir)
             config_file = self._tmpdir / "helper-config.json"
             config_file.write_bytes(config_bytes)
             config_arg = ["--config-file", str(config_file)]

@@ -41,7 +41,7 @@ def _stub_host_workspace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
             from omnigent.errors import ErrorCode, OmnigentError
 
             raise OmnigentError(
-                "workspace must be an absolute path starting with /",
+                "workspace must be an absolute path",
                 code=ErrorCode.INVALID_INPUT,
             )
         return workspace

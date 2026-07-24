@@ -453,3 +453,39 @@ def test_cli_fallback_dirs_no_nvm_dir_is_safe(monkeypatch, tmp_path):
     monkeypatch.setattr(_platform.Path, "home", staticmethod(lambda: tmp_path))
     dirs = _platform._cli_fallback_dirs()
     assert tmp_path / ".local" / "bin" in dirs
+
+
+def test_is_absolute_path_accepts_posix_and_windows_forms() -> None:
+    """Cross-OS absolute check accepts drive-letter paths on a POSIX server.
+
+    ``os.path.isabs(r"D:\\proj")`` is False on Linux, which is how a Linux
+    server used to reject every Windows workspace. Either pure-path flavour
+    treating it as absolute is enough for a path to pass.
+    """
+    assert _platform.is_absolute_path("/Users/alice/proj") is True
+    assert _platform.is_absolute_path(r"D:\Users\alice\proj") is True
+    assert _platform.is_absolute_path(r"D:/Users/alice/proj") is True
+    assert _platform.is_absolute_path(r"\\server\share\proj") is True
+    assert _platform.is_absolute_path("some/relative") is False
+    assert _platform.is_absolute_path("~/projects") is False
+    assert _platform.is_absolute_path("") is False
+
+
+def test_safe_console_print_survives_legacy_code_page() -> None:
+    """Lifecycle glyphs must not raise on a cp1252 stream."""
+    import io
+
+    class _Cp1252Stream(io.TextIOWrapper):
+        def write(self, s: str) -> int:
+            encoded = s.encode("cp1252")  # raises on ✓ / ↑
+            return self.buffer.write(encoded)
+
+    buf = io.BytesIO()
+    stream = _Cp1252Stream(buf, encoding="cp1252", errors="strict")
+    # Must not raise — replacement characters land instead of the glyphs.
+    _platform.safe_console_print("✓ Connected as 'host'", file=stream, flush=True)
+    _platform.safe_console_print("  ↑ Runner started", file=stream, flush=True)
+    out = buf.getvalue()
+    assert out  # something was written
+    # Round-trip through cp1252 must succeed (no undecodable leftovers).
+    out.decode("cp1252")

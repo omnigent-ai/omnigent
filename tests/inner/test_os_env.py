@@ -401,3 +401,69 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+def test_windows_inactive_sandbox_creates_tmpdir_for_config_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Windows config-file delivery must create a tmpdir when sandbox is inactive.
+
+    On Windows the helper config cannot ride an inherited pipe fd, so
+    ``_start_locked`` writes ``helper-config.json`` into ``self._tmpdir``.
+    That tmpdir used to be created only when ``sandbox.active`` — but
+    Windows Job Object containment never activates a filesystem sandbox,
+    so the assert fired and every OS tool returned an empty error.
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    import omnigent.inner.os_env as os_env_mod
+    from omnigent.inner.os_env import _HelperProcessClient
+
+    monkeypatch.setattr(os_env_mod, "IS_WINDOWS", True)
+    created: list[Path] = []
+
+    def _fake_tmpdir() -> Path:
+        d = tmp_path / f"osenv-{len(created)}"
+        d.mkdir()
+        created.append(d)
+        return d
+
+    monkeypatch.setattr(os_env_mod, "create_private_tmpdir", _fake_tmpdir)
+
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None
+    fake_proc.stdin = MagicMock()
+    fake_proc.stdout = MagicMock()
+    fake_proc.stderr = MagicMock()
+    captured: dict[str, object] = {}
+
+    def _fake_popen(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return fake_proc
+
+    monkeypatch.setattr(os_env_mod.subprocess, "Popen", _fake_popen)
+
+    client = _HelperProcessClient(
+        cwd=tmp_path,
+        shell_path="cmd.exe",
+        sandbox=_inactive_policy(),
+    )
+    try:
+        client._start_locked()
+    finally:
+        client._tmpdir = None  # avoid rmtree of our tmp_path child in close
+        client._proc = None
+        client.close()
+
+    assert created, "Windows inactive sandbox must create a private tmpdir"
+    assert "--config-file" in captured["argv"]
+    config_path = Path(captured["argv"][captured["argv"].index("--config-file") + 1])
+    assert config_path.parent == created[0]
+    assert config_path.is_file()
+    payload = json.loads(config_path.read_bytes())
+    assert payload["cwd"] == str(tmp_path)
+    # Temp env vars point at the private dir so helper scratch stays contained.
+    assert captured["env"]["TMP"] == str(created[0])

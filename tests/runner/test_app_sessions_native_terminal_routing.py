@@ -836,22 +836,26 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
 
 
 @pytest.mark.parametrize(
-    ("harness", "sub_agent_name", "expect_created"),
+    ("harness", "sub_agent_name", "is_windows", "expect_created"),
     [
         # SDK harness, top-level → REPL terminal auto-creates.
-        ("openai-agents", None, True),
+        ("openai-agents", None, False, True),
         # Sub-agent sessions surface through the parent transcript — no
         # REPL pane of their own.
-        ("openai-agents", "worker", False),
+        ("openai-agents", "worker", False, False),
         # Native harnesses own a dedicated terminal (the vendor TUI); the
         # REPL pane must not double up next to it.
-        ("codex-native", None, False),
+        ("codex-native", None, False, False),
+        # The REPL pane is tmux/PTY-backed, which Windows cannot launch —
+        # skip it there instead of logging a traceback every session.
+        ("openai-agents", None, True, False),
     ],
 )
 @pytest.mark.asyncio
 async def test_create_session_repl_terminal_dispatch(
     harness: str,
     sub_agent_name: str | None,
+    is_windows: bool,
     expect_created: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -860,20 +864,23 @@ async def test_create_session_repl_terminal_dispatch(
     ``POST /v1/sessions`` auto-creates the REPL terminal for SDK sessions only.
 
     Exercises the route-level dispatch condition: non-native harness AND
-    top-level session AND a terminal registry present. If the condition
-    regresses, either SDK sessions lose their embedded web TUI (no
-    create) or native / sub-agent sessions grow a spurious second
-    terminal (over-create).
+    top-level session AND a terminal registry present AND not Windows. If
+    the condition regresses, either SDK sessions lose their embedded web
+    TUI (no create) or native / sub-agent / Windows sessions grow a
+    spurious second terminal (over-create).
 
     :param harness: Harness id resolved from the agent spec,
         e.g. ``"openai-agents"``.
     :param sub_agent_name: ``sub_agent_name`` in the POST body, or
         ``None`` for a top-level session.
+    :param is_windows: Platform the dispatch gate sees. Pinned so the
+        matrix behaves identically on every host OS.
     :param expect_created: Whether the REPL auto-create must fire.
     :param tmp_path: Temporary directory isolating bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    monkeypatch.setattr("omnigent.runner.app.IS_WINDOWS", is_windows)
     # Keep the codex-native branch's bridge writes inside tmp_path.
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
 

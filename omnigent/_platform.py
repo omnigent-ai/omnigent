@@ -21,7 +21,8 @@ import os
 import shutil
 import sys
 from contextlib import suppress
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TextIO
 
 _logger = logging.getLogger(__name__)
 
@@ -265,6 +266,55 @@ def stable_user_id() -> str:
     except (OSError, KeyError, ModuleNotFoundError):
         name = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
     return hashlib.sha256(name.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+
+
+def is_absolute_path(path: str) -> bool:
+    """
+    Return whether *path* is absolute on POSIX **or** Windows.
+
+    Server-side validators may run on Linux while the session host is
+    Windows (or vice versa). ``os.path.isabs`` only understands the
+    *current* OS, so a Linux server would reject ``D:\\project``. Check
+    both :class:`~pathlib.PurePosixPath` and
+    :class:`~pathlib.PureWindowsPath` so drive-letter, UNC, and
+    ``/``-rooted paths are all accepted regardless of where the server
+    process runs.
+
+    :param path: A filesystem path string, e.g. ``"/Users/a/p"`` or
+        ``"D:\\\\Users\\\\a\\\\p"``.
+    :returns: ``True`` when either pure-path flavour treats it as absolute.
+    """
+    return PurePosixPath(path).is_absolute() or PureWindowsPath(path).is_absolute()
+
+
+def safe_console_print(
+    message: str,
+    *,
+    file: TextIO | None = None,
+    flush: bool = False,
+) -> None:
+    """
+    Print *message* without letting :exc:`UnicodeEncodeError` escape.
+
+    Lifecycle lines in the host tunnel (``✓ Connected``, ``↑ Runner
+    started``) used to call :func:`print` directly. On a legacy Windows
+    code page (cp1252 / cp936) those glyphs raise inside the tunnel
+    handler and tear down the WebSocket — the success message itself
+    crashes the connection. Catch the encode failure and retry with
+    replacement characters so the tunnel stays up; UTF-8 consoles still
+    get the original glyphs.
+
+    :param message: Text to write (may contain non-ASCII glyphs).
+    :param file: Destination stream; defaults to ``sys.stdout``.
+    :param flush: Forwarded to :func:`print`.
+    """
+    stream = sys.stdout if file is None else file
+    try:
+        print(message, file=stream, flush=flush)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "ascii"
+        fallback = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(fallback, file=stream, flush=flush)
 
 
 def resolve_repo_symlink(path: Path) -> Path:
