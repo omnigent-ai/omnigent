@@ -22,7 +22,7 @@ import os
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
@@ -517,6 +517,50 @@ def create_hosts_router(
             "configured_harnesses": host.configured_harnesses,
             "runners": [],
         }
+
+    @router.delete("/hosts/{host_id}", status_code=204)
+    async def delete_host(request: Request, host_id: str) -> Response:
+        """Deregister (delete) a host the caller owns.
+
+        Removes a retired self-registered host so it stops appearing in
+        session-creation pickers forever. Any sessions still bound to it
+        are unbound by the store (their ``host_id`` is nulled) and the
+        row is deleted, which also revokes the host's launch token.
+
+        Refuses a host that is currently online (409): retire it after it
+        goes offline so an active machine is not pulled out from under
+        running work. Server-managed sandbox hosts are likewise refused
+        (409) — their lifecycle belongs to the server that created them,
+        and deleting only the row would orphan the live sandbox.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :returns: 204 No Content on success.
+        :raises HTTPException: 404 if the host does not exist, 403 if the
+            caller is not the owner, 409 if the host is online or
+            server-managed.
+        """
+        # Same auth shape as get_host: require_user 401s unauthenticated
+        # callers when auth is configured; a None user_id means auth is
+        # disabled entirely (single-user server, reserved "local" owner).
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+        if host.sandbox_provider is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="server-managed host cannot be deregistered manually",
+            )
+        if host_is_live(host):
+            raise HTTPException(
+                status_code=409,
+                detail="host is online; retire it after it goes offline",
+            )
+        await asyncio.to_thread(host_store.delete_host, host_id)
+        return Response(status_code=204)
 
     @router.get("/hosts/{host_id}/harnesses/{harness}/model-options")
     async def get_host_model_options(
