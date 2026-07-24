@@ -256,6 +256,64 @@ async def test_background_title_resolves_synthetic_claude_policy_gate(
     ]
 
 
+@pytest.mark.parametrize("evaluation_id", [None, ""])
+@pytest.mark.asyncio
+async def test_background_title_rejects_policy_gate_without_evaluation_id(
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation_id: str | None,
+) -> None:
+    class InvalidPolicyClient(_FakeHarnessClient):
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float | None,
+        ) -> _FakeHarnessStream:
+            assert method == "POST"
+            assert timeout is None
+            self.requests.append((url, json))
+            return _FakeHarnessStream(
+                [
+                    {
+                        "type": "policy_evaluation.requested",
+                        "evaluation_id": evaluation_id,
+                        "phase": "PHASE_LLM_REQUEST",
+                    }
+                ]
+            )
+
+    harness_client = InvalidPolicyClient()
+    process_manager = _FakeProcessManager(harness_client)
+
+    async def resolve_harness_config(**_kwargs: Any) -> tuple[str, None]:
+        return "claude-sdk", None
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._resolve_harness_config",
+        resolve_harness_config,
+    )
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/background-title",
+            json={"prompt": "please investigate the authentication timeout"},
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": "title_harness_failed",
+        "detail": "Harness requested policy evaluation without an id.",
+    }
+    [process_key] = process_manager.released
+    assert uuid.UUID(process_key).hex == process_key
+
+
 @pytest.mark.asyncio
 async def test_background_title_maps_claude_native_to_claude_cli(
     monkeypatch: pytest.MonkeyPatch,
