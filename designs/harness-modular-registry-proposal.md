@@ -56,25 +56,32 @@ Every blocker is **imperative per-harness dispatch** that branches on
 `harness_name == "<x>-native"` or `native_agent.key == "<x>"` and does an inline
 `import omnigent.<x>_native`. Grouped by hub:
 
-### 1. The runner — `omnigent/runner/app.py` (~19.7k lines) — the epicenter
+### 1. The runner — `omnigent/runner/app.py` (~10.1k lines) + `omnigent/runner/native/orchestration.py` (~6.5k) — the epicenter
 
-Five separate 11-branch chains plus their handlers:
+Phase 0 (#3148) moved the native *builders and mirrors* out of `app.py` into
+`omnigent/runner/native/orchestration.py` (re-exported through
+`omnigent/runner/native/__init__.py`), shrinking `app.py` from ~20.1k to
+~10.1k lines. The imperative per-harness *dispatch* still lives in `app.py`;
+it now calls the imported builders instead of locally-defined ones. The
+coupling left to untangle:
 
-- **Spawn-env dispatch** (`~:8887`, again `~:14124`): `if harness_name ==
-  "<x>-native": from omnigent.<x>_native_bridge import build_<x>_native_spawn_env`.
-- **Launch dispatch** (`~:9015`): 11 branches → `_auto_create_<x>_terminal(...)`.
-- **`_auto_create_<x>_terminal`** functions (11 of them) — each imports its own
-  `<x>_native_bridge` / `<x>_native_forwarder` / `<x>_native_permissions` and
-  wires the transcript forwarder + permission/usage/compaction mirrors. This is
-  the dominant blocker: e.g. `_supervise_cursor_native_bridges`,
+- **Spawn-env dispatch** (`app.py`, 11 arms): `if harness_name ==
+  "<x>-native" and spawn_env is None: ... build_<x>_native_spawn_env`.
+- **Launch dispatch** (`app.py`, 11 arms) → `_auto_create_<x>_terminal(...)`.
+- **`_auto_create_<x>_terminal`** functions (11 of them) — now in
+  `runner/native/orchestration.py`; each imports its own `<x>_native_bridge` /
+  `<x>_native_forwarder` / `<x>_native_permissions` and wires the transcript
+  forwarder + permission/usage/compaction mirrors, alongside the
+  `_supervise_*_bridges` mirrors (`_supervise_cursor_native_bridges`,
   `_supervise_goose_native_bridges`, `_supervise_hermes_native_bridges`,
-  `_supervise_qwen_native_bridges`.
-- **Interrupt dispatch** (`~:15169`) → `_handle_<x>_native_interrupt`.
-- **Stop dispatch** (`~:15262`) → `_handle_<x>_native_stop`.
-- **Terminal-route dispatch** (`~:15840`): `terminal_name == "<x>"` →
+  `_supervise_qwen_native_bridges`). Still the dominant blocker — the split
+  gave it a home but the `if key ==` dispatch that reaches it is unchanged.
+- **Interrupt / stop dispatch** (`app.py`) → `_handle_<x>_native_interrupt` /
+  `_handle_<x>_native_stop` closures (kept in `app.py`, not extracted).
+- **Terminal-route dispatch** (`app.py`): `terminal_name == "<x>"` →
   `_auto_create_<x>_terminal`.
-- Plus the 11 `*_NATIVE_TERMINAL_ROLE` imports (`~:60`) and the cost-popup
-  bridge-dir dispatch (`~:12779`).
+- Plus the 11 `*_NATIVE_TERMINAL_ROLE` imports and the cost-popup bridge-dir
+  dispatch (both in `app.py`).
 
 ### 2. Native launch — `omnigent/cli.py` (~14.5k lines)
 
@@ -244,18 +251,23 @@ Done:
   (`sessions.py`, now 7.8k) that star-imports an impl package
   (`omnigent/server/routes/_sessions/`: `common.py`, `helpers.py`,
   `orchestration.py`). `create_sessions_router` stays in the facade.
-
-Remaining (the two files still over 10k — can proceed in parallel):
-
-- **`runner/app.py`** (~20.1k lines — the epicenter) → extract native
-  orchestration into `omnigent/runner/native/` (e.g. `terminals.py` for the
-  `_auto_create_*` builders, `supervise.py` for the `_supervise_*_bridges`
-  mirrors, `interrupt.py` for interrupt/stop handlers). `app.py` keeps the
-  (soon-to-be registry-driven) dispatch entry points and imports from the new
-  package.
-- **`tests/runner/test_app_sessions_native.py`** (~19.0k lines) → split the
-  native-dispatch test suite along the same seams as the `runner/native/`
-  extraction so each module's tests sit beside it.
+- **`runner/app.py`** ✅ (#3148) — the native builders and bridge mirrors
+  (`_auto_create_*_terminal`, `_supervise_*_bridges`, the transcript-forwarder
+  task registry, cost-popup repop tasks) moved into
+  `omnigent/runner/native/orchestration.py` (~6.5k lines), re-exported through
+  `omnigent/runner/native/__init__.py`; `app.py` imports them. `app.py` dropped
+  from ~20.1k to ~10.1k lines. Landed as a single `orchestration.py` rather than
+  the proposed `terminals.py` / `supervise.py` / `interrupt.py` three-way split —
+  a further sub-split can happen when the seam lands if the module stays hot.
+  The `if key ==` / `if harness_name ==` dispatch arms and the interrupt/stop
+  handler closures stayed in `app.py` (they are the entry points Phase 1
+  rewrites), so `app.py` is still marginally over the 10k target.
+- **`tests/runner/test_app_sessions_native.py`** ✅ (#3149) — the ~19.0k-line
+  monolith was split into nine concern-scoped modules
+  (`test_app_sessions_native_{events_lifecycle,events_options,supervision,
+  terminal_routing,terminals_autocreate,terminals_runtime,wake_forwarders,
+  workflow_init,workflow_messages}.py`) plus a shared `tests/runner/conftest.py`
+  (~0.7k) holding the scaffolding. Each new file is under 3k lines.
 
 Deferred (under the 10k target already; fold into Phase 1 when the seam lands):
 
@@ -295,8 +307,11 @@ Deferred (under the 10k target already; fold into Phase 1 when the seam lands):
 
 - **Runner extraction is the risk center.** The `_supervise_*_bridges` mirrors
   hold subtle forward-cursor / restart / double-post invariants (see the
-  transcript-forwarder registry at `runner/app.py:302`). Phase 0 must preserve
-  these exactly; lean on the existing native e2e skills
+  `_AUTO_FORWARDER_TASKS` transcript-forwarder registry, now in
+  `runner/native/orchestration.py`). Phase 0's move (#3148) preserved these
+  behaviorally — verified by the split native test suite (#3149) — so the
+  remaining risk shifts to Phase 1, where the dispatch that reaches these
+  mirrors gets rewritten. Lean on the existing native e2e skills
   (`claude-native-ui:build-omnigent`, `pi-native-e2e-dev`, etc.).
 - **Signature uniformity.** Not every native launcher is trivially uniform
   (opencode has a cold-boot app-server path, codex has WS JSON-RPC). The
