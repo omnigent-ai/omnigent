@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from omnigent.codex_native_app_server import NativeCodexLaunch
+from omnigent.harness_plugins import BackgroundTitleGeneratorSpec
 from omnigent.runner import create_runner_app
 from omnigent.runner.background_titles import BackgroundTitleContext
 from omnigent.runner.background_titles import claude_native as claude_native_titles
@@ -169,7 +170,7 @@ async def test_background_title_maps_claude_native_to_claude_cli(
         return "claude-native", None
 
     async def generate_claude_title(context: BackgroundTitleContext) -> str:
-        cli_calls.append((context.prompt, context.cwd, context.model))
+        cli_calls.append((context.prompt, context.cwd, context.model_override))
         return "Debug authentication timeout"
 
     monkeypatch.setattr(
@@ -248,7 +249,7 @@ async def test_claude_native_title_uses_tool_free_print_mode(
             spawn_env={},
             process_manager=None,
             cwd=tmp_path,
-            model="claude-sonnet-4-6",
+            model_override="claude-sonnet-4-6",
         )
     )
 
@@ -313,7 +314,7 @@ async def test_claude_native_title_kills_process_when_cancelled(
                 spawn_env={},
                 process_manager=None,
                 cwd=tmp_path,
-                model="claude-sonnet-4-6",
+                model_override="claude-sonnet-4-6",
             )
         )
     )
@@ -340,7 +341,7 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
         return "codex-native", None
 
     async def generate_codex_title(context: BackgroundTitleContext) -> str:
-        cli_calls.append((context.prompt, context.model))
+        cli_calls.append((context.prompt, context.model_override))
         return "Debug authentication timeout"
 
     monkeypatch.setattr(
@@ -449,7 +450,7 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
             harness="codex-native",
             spawn_env={},
             process_manager=None,
-            model="gpt-5.4-mini",
+            model_override="gpt-5.4-mini",
         )
     )
 
@@ -526,7 +527,7 @@ async def test_codex_native_title_kills_process_when_cancelled(
                 harness="codex-native",
                 spawn_env={},
                 process_manager=None,
-                model="gpt-5.4-mini",
+                model_override="gpt-5.4-mini",
             )
         )
     )
@@ -537,6 +538,64 @@ async def test_codex_native_title_kills_process_when_cancelled(
 
     assert killed == [process]
     assert process.waited is True
+
+
+@pytest.mark.asyncio
+async def test_background_title_dispatches_any_registered_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness_client = _FakeHarnessClient()
+    process_manager = _FakeProcessManager(harness_client)
+    captured: list[BackgroundTitleContext] = []
+
+    async def resolve_harness_config(**_kwargs: Any) -> tuple[str, dict[str, str]]:
+        return "community-example", {"EXAMPLE_MODEL": "example-model"}
+
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        captured.append(context)
+        return "Review generic dispatch"
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._resolve_harness_config",
+        resolve_harness_config,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.service.background_title_generators",
+        lambda: {
+            "community-example": BackgroundTitleGeneratorSpec(
+                "omnigent.community.harness.example.background_titles:generate"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.service.load_object",
+        lambda _path: generate_title,
+    )
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/background-title",
+            json={
+                "prompt": "please review the generic dispatch path",
+                "model_override": "example-model",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "generated",
+        "title": "Review generic dispatch",
+    }
+    [context] = captured
+    assert context.harness == "community-example"
+    assert context.spawn_env == {"EXAMPLE_MODEL": "example-model"}
+    assert context.model_override == "example-model"
+    assert process_manager.get_client_calls == []
+    assert process_manager.released == []
 
 
 @pytest.mark.asyncio

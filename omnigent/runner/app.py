@@ -2404,32 +2404,24 @@ def create_runner_app(
                 },
             )
 
-        spawn_env = dict(spawn_env or {})
-        model = body.model_override
-        if effective_harness == "claude-native":
-            model = spawn_env.get("HARNESS_CLAUDE_SDK_MODEL") or model
-        elif effective_harness == "codex-native":
-            model = model or _codex_native_model_from_spec(
-                _session_spec_cache.get(conversation_id)
-            )
         context = BackgroundTitleContext(
             prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
             harness=effective_harness,
-            spawn_env=spawn_env,
+            spawn_env=dict(spawn_env or {}),
             process_manager=process_manager,
             cwd=resolver_kwargs["cwd"],
-            model=model,
+            model_override=body.model_override,
+            session_spec=_session_spec_cache.get(conversation_id),
         )
         try:
             title = await run_background_title(context)
         except TimeoutError:
-            detail = {
-                "claude-native": "Claude Code title generation timed out.",
-                "codex-native": "Codex title generation timed out.",
-            }.get(effective_harness, "Harness title generation timed out.")
             return JSONResponse(
                 status_code=504,
-                content={"error": "title_harness_timeout", "detail": detail},
+                content={
+                    "error": "title_harness_timeout",
+                    "detail": "Harness title generation timed out.",
+                },
             )
         except BackgroundTitleHarnessError as exc:
             return JSONResponse(
@@ -2437,26 +2429,21 @@ def create_runner_app(
                 content={"error": "title_harness_failed", "detail": str(exc)},
             )
         except (ImportError, OSError, RuntimeError) as exc:
-            error_context = {
-                "claude-native": "Claude Code title",
-                "codex-native": "Codex title",
-            }.get(effective_harness, "title harness")
             return JSONResponse(
                 status_code=502,
                 content={
                     "error": "title_harness_failed",
-                    "detail": _client_safe_error_detail(exc, context=error_context),
+                    "detail": _client_safe_error_detail(exc, context="title harness"),
                 },
             )
 
         if title is None:
-            detail = {
-                "claude-native": "Claude Code title generation failed.",
-                "codex-native": "Codex title generation failed.",
-            }.get(effective_harness, "Harness title generation returned no text.")
             return JSONResponse(
                 status_code=502,
-                content={"error": "title_harness_failed", "detail": detail},
+                content={
+                    "error": "title_harness_failed",
+                    "detail": "Harness title generation returned no text.",
+                },
             )
         return BackgroundSessionTitleResponse(
             status="generated",

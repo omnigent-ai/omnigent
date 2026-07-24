@@ -35,7 +35,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             exc_info=True,
         )
         claude_config = None
-    effective_model = context.model or (claude_config.model if claude_config is not None else None)
+    effective_model = (
+        context.spawn_env.get("HARNESS_CLAUDE_SDK_MODEL")
+        or context.model_override
+        or (claude_config.model if claude_config is not None else None)
+    )
     args = [
         "--safe-mode",
         "--system-prompt",

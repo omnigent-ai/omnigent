@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from omnigent.harness_plugins import (
     BackgroundTitleGeneratorSpec,
     background_title_generators,
     load_object,
 )
+
+if TYPE_CHECKING:
+    from omnigent.spec.types import AgentSpec
 
 BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
 BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32
@@ -45,7 +48,8 @@ class BackgroundTitleContext:
     spawn_env: dict[str, str]
     process_manager: BackgroundTitleProcessManager
     cwd: Path | None = None
-    model: str | None = None
+    model_override: str | None = None
+    session_spec: AgentSpec | None = None
 
 
 class BackgroundTitleGenerator(Protocol):

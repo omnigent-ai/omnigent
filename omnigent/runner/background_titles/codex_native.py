@@ -28,8 +28,10 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
     )
+    from omnigent.runner.native.orchestration import _codex_native_model_from_spec
 
-    launch = resolve_native_codex_launch(model=context.model)
+    model = context.model_override or _codex_native_model_from_spec(context.session_spec)
+    launch = resolve_native_codex_launch(model=model)
     with tempfile.TemporaryDirectory(prefix="omnigent-codex-title-") as temp_dir:
         temp_root = Path(temp_dir)
         codex_home = temp_root / "codex-home"
