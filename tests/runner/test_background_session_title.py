@@ -153,6 +153,109 @@ async def test_background_title_uses_isolated_codex_process(
     assert "please investigate the authentication timeout" in body["content"]
 
 
+@pytest.mark.parametrize(
+    ("phase", "expected_action"),
+    [
+        ("PHASE_LLM_REQUEST", "POLICY_ACTION_ALLOW"),
+        ("PHASE_TOOL_CALL", "POLICY_ACTION_DENY"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_background_title_resolves_synthetic_claude_policy_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    expected_action: str,
+) -> None:
+    verdict_received = asyncio.Event()
+
+    class PolicyStream(_FakeHarnessStream):
+        async def aiter_lines(self):
+            yield "data: " + json.dumps(
+                {
+                    "type": "policy_evaluation.requested",
+                    "evaluation_id": "poleval_title",
+                    "phase": phase,
+                    "data": {},
+                }
+            )
+            yield ""
+            await verdict_received.wait()
+            yield "data: " + json.dumps(
+                {
+                    "type": "response.output_text.delta",
+                    "delta": "Debug authentication timeout",
+                }
+            )
+            yield ""
+            yield "data: " + json.dumps({"type": "response.completed"})
+            yield ""
+
+    class PolicyClient(_FakeHarnessClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.verdicts: list[tuple[str, dict[str, Any]]] = []
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float | None,
+        ) -> _FakeHarnessStream:
+            assert method == "POST"
+            assert timeout is None
+            self.requests.append((url, json))
+            return PolicyStream([])
+
+        async def post(self, url: str, *, json: dict[str, Any]) -> None:
+            self.verdicts.append((url, json))
+            verdict_received.set()
+
+    harness_client = PolicyClient()
+    process_manager = _FakeProcessManager(harness_client)
+
+    async def resolve_harness_config(**_kwargs: Any) -> tuple[str, None]:
+        return "claude-sdk", None
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._resolve_harness_config",
+        resolve_harness_config,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.sdk.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/background-title",
+            json={"prompt": "please investigate the authentication timeout"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "generated",
+        "title": "Debug authentication timeout",
+    }
+    [(process_key, harness, _env)] = process_manager.get_client_calls
+    assert harness == "claude-sdk"
+    assert harness_client.verdicts == [
+        (
+            f"/v1/sessions/{process_key}/events",
+            {
+                "type": "policy_verdict",
+                "evaluation_id": "poleval_title",
+                "action": expected_action,
+            },
+        )
+    ]
+
+
 @pytest.mark.asyncio
 async def test_background_title_maps_claude_native_to_claude_cli(
     monkeypatch: pytest.MonkeyPatch,

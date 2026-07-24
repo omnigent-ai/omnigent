@@ -74,7 +74,27 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
                         continue
                     event = json.loads(payload)
                     event_type = event.get("type")
-                    if event_type == "response.output_text.delta":
+                    if event_type == "policy_evaluation.requested":
+                        evaluation_id = event.get("evaluation_id")
+                        phase = event.get("phase")
+                        if not isinstance(evaluation_id, str) or not evaluation_id:
+                            raise BackgroundTitleHarnessError(
+                                "Harness requested policy evaluation without an id."
+                            )
+                        action = (
+                            "POLICY_ACTION_DENY"
+                            if phase == "PHASE_TOOL_CALL"
+                            else "POLICY_ACTION_ALLOW"
+                        )
+                        await client.post(
+                            f"/v1/sessions/{process_key}/events",
+                            json={
+                                "type": "policy_verdict",
+                                "evaluation_id": evaluation_id,
+                                "action": action,
+                            },
+                        )
+                    elif event_type == "response.output_text.delta":
                         delta = event.get("delta")
                         if isinstance(delta, str):
                             text_parts.append(delta)
