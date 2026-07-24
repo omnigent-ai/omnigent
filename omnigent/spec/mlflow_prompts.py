@@ -33,7 +33,9 @@ contents are not.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from omnigent.errors import ErrorCode, OmnigentError
 
@@ -45,6 +47,14 @@ _SHORTHAND_PREFIX = "mlflow+"
 # or ``prompts:/name/version``). ``load_prompt`` resolves by version or alias
 # only, never by tag, so no tag syntax is accepted here.
 _PROMPT_URI_SCHEME = "prompts:/"
+# The identifier after ``prompts:/`` must be exactly ``<name>@<alias>`` or
+# ``<name>/<version>``. Names/aliases forbid ``@ / ? # `` and whitespace so a
+# query string or fragment (``?tag=...``, ``#frag``) can never smuggle a tag
+# selector past validation — MLflow would silently ignore it and resolve a
+# different prompt than the reference reads as.
+_IDENT = r"[^@/?#\s]+"
+_ALIAS_REF = re.compile(rf"^{_IDENT}@{_IDENT}$")
+_VERSION_REF = re.compile(rf"^{_IDENT}/[0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -128,33 +138,38 @@ def resolve_mlflow_prompt(
     Load a prompt from the MLflow Prompt Registry and return its text.
 
     The prompt is resolved by version (``prompts:/name/1``) or alias
-    (``prompts:/name@production``). Pinned versions are immutable so MLflow
-    caches them indefinitely; aliases are mutable so MLflow applies its own
-    TTL (default 60s, or *cache_ttl* / the ``MLFLOW_*_PROMPT_CACHE_TTL_SECONDS``
-    env vars) — the cache is owned entirely by MLflow, never wrapped here, so an
-    alias re-point is picked up within the TTL rather than pinned forever.
+    (``prompts:/name@production``) against a per-call
+    :class:`~mlflow.tracking.MlflowClient`, so resolution never mutates
+    process-global MLflow state. MLflow's own prompt cache is process-global and
+    keyed by URI only (not by registry), so by default it is disabled here to
+    avoid one registry's entry being served for the same URI against another;
+    pass *cache_ttl* to opt back in when a single registry is in play.
 
     :param reference: A ``prompts:/`` URI.
-    :param tracking_uri: Optional MLflow tracking URI (OSS backend). Applied
-        via ``mlflow.set_tracking_uri`` before the load.
+    :param tracking_uri: Optional MLflow tracking URI (OSS backend). Passed
+        per-call to :class:`~mlflow.tracking.MlflowClient`; process-global
+        MLflow state is never mutated.
     :param registry_uri: Optional MLflow registry URI. Set to
         ``"databricks-uc"`` (with a 3-part UC name in *reference*) for the
-        Databricks-managed registry; applied via ``mlflow.set_registry_uri``.
-    :param vars: Template variables. When provided, the template is rendered
-        with ``PromptVersion.format(**vars)`` (which honors ``{{var}}`` and
-        ``{{{{escaped}}}}`` double-brace semantics); when omitted, the raw
-        template text is returned.
+        Databricks-managed registry; passed per-call to the client.
+    :param vars: Template variables. When present (even an empty mapping), the
+        template is rendered with ``PromptVersion.format(**vars)`` (which honors
+        ``{{var}}`` and ``{{{{escaped}}}}`` double-brace semantics); when
+        ``None``, the raw template text is returned.
     :param cache_ttl: Per-call cache TTL in seconds forwarded to MLflow's
-        ``cache_ttl_seconds`` (0 disables the cache).
+        ``cache_ttl_seconds``. When omitted the cache is disabled (``0``): the
+        MLflow prompt cache is process-global and keyed by URI only, so a cache
+        entry from one registry would otherwise be served for the same
+        ``prompts:/name/version`` URI resolved against a different registry.
     :returns: The resolved prompt text.
-    :raises OmnigentError: If ``mlflow`` is not installed, the reference points
-        at a chat-style (message-list) prompt, or the registry load fails
+    :raises OmnigentError: If ``mlflow`` is not installed, a URI embeds
+        credentials, the reference points at a chat-style (message-list) prompt
+        or a partial (non-string) render, or the registry load fails
         (unreachable registry, missing prompt/alias, auth error).
     """
     try:
-        import mlflow
         from mlflow.exceptions import MlflowException
-        from mlflow.genai import load_prompt
+        from mlflow.tracking import MlflowClient
     except ImportError as exc:
         raise OmnigentError(
             "instructions reference an MLflow Prompt Registry entry "
@@ -164,19 +179,23 @@ def resolve_mlflow_prompt(
             code=ErrorCode.INVALID_INPUT,
         ) from exc
 
-    if tracking_uri is not None:
-        mlflow.set_tracking_uri(tracking_uri)
-    if registry_uri is not None:
-        mlflow.set_registry_uri(registry_uri)
+    _reject_credentials(tracking_uri, "tracking_uri")
+    _reject_credentials(registry_uri, "registry_uri")
+
+    # Per-call client: resolving against a specific registry must not mutate
+    # ``mlflow.set_tracking_uri`` / ``set_registry_uri`` process globals, which
+    # would leak across unrelated loads (e.g. a Databricks-UC load contaminating
+    # a later OSS load) and race under concurrent resolution.
+    client = MlflowClient(tracking_uri=tracking_uri, registry_uri=registry_uri)
+
+    # The prompt cache is process-global and keyed by URI only, not by registry
+    # identity, so default to disabling it (0) unless the caller opts in with an
+    # explicit TTL. This prevents one registry's cached prompt from being
+    # returned for the same URI against a different registry.
+    ttl = 0.0 if cache_ttl is None else cache_ttl
 
     try:
-        # link_to_model=False: bundle load has no active model/run to bind to;
-        # binding would fail or create a spurious link.
-        prompt = load_prompt(
-            reference,
-            cache_ttl_seconds=cache_ttl,
-            link_to_model=False,
-        )
+        prompt = client.load_prompt(reference, cache_ttl_seconds=ttl)
     except MlflowException as exc:
         raise OmnigentError(
             f"failed to load MLflow prompt {reference!r}: {exc}. Verify the "
@@ -196,9 +215,23 @@ def resolve_mlflow_prompt(
 
     _log.info("resolved MLflow prompt %r version %s", prompt.name, prompt.version)
 
-    if vars:
-        return str(prompt.format(**vars))
-    return template
+    if vars is None:
+        return template
+
+    rendered = prompt.format(**vars)
+    # ``format`` returns a ``PromptVersion`` when the template is only partially
+    # filled and a message list for chat templates; only a fully-rendered text
+    # prompt yields a ``str``. ``str(rendered)`` on the other shapes would stuff
+    # a Python repr into the agent's instructions, so reject them loudly.
+    if not isinstance(rendered, str):
+        raise OmnigentError(
+            f"MLflow prompt {reference!r} did not render to text with the "
+            "supplied vars (missing variables leave a partial template). "
+            "Provide every template variable so the prompt renders to a "
+            "single string.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return rendered
 
 
 def _require_prompt_uri(reference: str) -> None:
@@ -206,6 +239,28 @@ def _require_prompt_uri(reference: str) -> None:
         raise OmnigentError(
             f"MLflow instructions reference must be a '{_PROMPT_URI_SCHEME}' "
             f"URI (e.g. 'prompts:/greeting@production'); got {reference!r}.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    identifier = reference[len(_PROMPT_URI_SCHEME) :]
+    if not (_ALIAS_REF.match(identifier) or _VERSION_REF.match(identifier)):
+        raise OmnigentError(
+            f"MLflow instructions reference {reference!r} must resolve by alias "
+            "('prompts:/name@alias') or version ('prompts:/name/1') only. Tags, "
+            "query strings, and fragments are not supported — MLflow resolves by "
+            "version or alias and would silently ignore them.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+def _reject_credentials(uri: str | None, key: str) -> None:
+    """Reject a URI that embeds ``user:pass@`` credentials (secrets in YAML)."""
+    if uri is None:
+        return
+    if urlsplit(uri).username or urlsplit(uri).password:
+        raise OmnigentError(
+            f"instructions.{key} must not embed credentials (a 'user:pass@' "
+            "component). Supply auth via the environment or MLflow's unified "
+            "auth instead of putting secrets in agent YAML.",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -219,4 +274,5 @@ def _optional_str(mapping: dict[str, object], key: str) -> str | None:
             f"instructions.{key} must be a string; got {type(value).__name__}.",
             code=ErrorCode.INVALID_INPUT,
         )
+    _reject_credentials(value, key)
     return value

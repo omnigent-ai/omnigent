@@ -171,10 +171,12 @@ tracing = []
 # MLflow 3 Prompt Registry resolution for agent `instructions:` references
 # (`source: mlflow` / `mlflow+prompts:/...`). Optional: the resolver
 # (omnigent/spec/mlflow_prompts.py) imports mlflow lazily on first use, so only
-# agents that reference a registry prompt need this extra. Floored at MLflow 3
-# (the `mlflow.genai.load_prompt` API landed there) and capped below 4. The
-# same SDK serves both the OSS and Databricks-managed (UC) registries.
-mlflow = ["mlflow>=3,<4"]
+# agents that reference a registry prompt need this extra. Floored at MLflow
+# 3.8, where `MlflowClient.load_prompt` gained the `cache_ttl_seconds` kwarg the
+# resolver passes (added in 3.8.0 via mlflow#18963; absent in 3.7.x), and capped
+# below 4. The same SDK serves both the OSS and Databricks-managed (UC)
+# registries.
+mlflow = ["mlflow>=3.8,<4"]
 agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
@@ -255,8 +257,9 @@ dev = [
     "hindsight-client>=0.4.0",
     # mlflow is opt-in (the `mlflow` extra), but the Prompt Registry
     # resolution tests register + load prompts against a local sqlite-backed
-    # MLflow, so keep it in the dev set.
-    "mlflow>=3,<4",
+    # MLflow, so keep it in the dev set. Floor matches the `mlflow` extra
+    # (3.8 for `MlflowClient.load_prompt(cache_ttl_seconds=...)`).
+    "mlflow>=3.8,<4",
     "pytest-asyncio>=0.21",
     "pytest-xdist>=3.6",
     # Line coverage during the unit-test matrix. Each CI shard writes its
