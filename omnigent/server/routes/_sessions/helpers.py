@@ -178,6 +178,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -7342,12 +7343,29 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     :param labels: The client-supplied label mapping, or ``None``.
     :raises OmnigentError: 400 when any reserved key is present.
     """
-    if not labels or _TURN_ACTOR_LABEL not in labels:
+    if not labels:
         return
-    raise OmnigentError(
-        f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
-        code=ErrorCode.INVALID_INPUT,
+    if _TURN_ACTOR_LABEL in labels:
+        raise OmnigentError(
+            f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Pins are per-user: the client may only write the bare canonical
+    # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
+    # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting
+    # one from a client would let a caller pin/unpin a shared session for
+    # another user, or forge arbitrary per-user pin rows, defeating the per-user
+    # isolation. Reject any suffixed form; only the bare key is client-writable.
+    suffixed_pin = next(
+        (k for k in labels if k.startswith(f"{PINNED_LABEL_KEY}.")),
+        None,
     )
+    if suffixed_pin is not None:
+        raise OmnigentError(
+            f"label {suffixed_pin!r} is server-derived; set the bare "
+            f"{PINNED_LABEL_KEY!r} key to pin for yourself",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _require_cost_control_label_authority(

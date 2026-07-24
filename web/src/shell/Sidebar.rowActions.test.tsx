@@ -6,6 +6,7 @@
 //      `onDoubleClick`), gated on edit permission.
 // See ConversationRow / ConversationEditRow in Sidebar.tsx.
 
+import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -19,14 +20,40 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 // `useIsMobileViewport` so a test can render the row on a mobile viewport (the
 // project flyout is disabled there). Declared via vi.hoisted so the vi.mock
 // factories (hoisted above imports) can reference them.
-const mocks = vi.hoisted(() => ({
-  rename: { mutate: vi.fn() },
-  isMobile: false,
-  // Projects surfaced by the picker + the move-to-project mutation, so the
-  // mobile in-place project view test can assert both the list and the pick.
-  projects: [] as string[],
-  moveToProject: { mutate: vi.fn() },
-}));
+const mocks = vi.hoisted(() => {
+  // Tiny reactive store for the server-authoritative pinned set, so a quick-pin
+  // click re-renders the sidebar (mirrors the real query's refetch). Holds ids;
+  // the mocked hook maps them onto the loaded conversations.
+  const pinnedListeners = new Set<() => void>();
+  const pinnedStore = {
+    ids: [] as string[],
+    subscribe(cb: () => void) {
+      pinnedListeners.add(cb);
+      return () => pinnedListeners.delete(cb);
+    },
+    set(ids: string[]) {
+      pinnedStore.ids = ids;
+      pinnedListeners.forEach((cb) => cb());
+    },
+    toggle(id: string, pinned: boolean) {
+      pinnedStore.set(
+        pinned
+          ? [id, ...pinnedStore.ids.filter((x) => x !== id)]
+          : pinnedStore.ids.filter((x) => x !== id),
+      );
+    },
+  };
+  return {
+    rename: { mutate: vi.fn() },
+    isMobile: false,
+    // Projects surfaced by the picker + the move-to-project mutation, so the
+    // mobile in-place project view test can assert both the list and the pick.
+    projects: [] as string[],
+    moveToProject: { mutate: vi.fn() },
+    conversations: [] as unknown[],
+    pinnedStore,
+  };
+});
 
 // Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
 // drive it explicitly. Defaults to desktop (false); the mobile flyout test
@@ -45,7 +72,22 @@ vi.mock("@/hooks/useConversations", () => ({
     isError: false,
     variables: undefined,
   }),
-  usePinnedConversationBackfill: () => [],
+  // Reactive server pinned set: subscribes to the hoisted store so a toggle
+  // re-renders, mapping pinned ids onto the loaded conversations.
+  usePinnedConversations: () => {
+    const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
+    const idSet = new Set(ids);
+    return {
+      data: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+      isSuccess: true,
+    };
+  },
+  useTogglePinnedConversation: () => ({
+    mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
+      mocks.pinnedStore.toggle(id, pinned),
+  }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
@@ -122,6 +164,8 @@ function mockConversations(conversations: Conversation[]) {
     isFetchingNextPage: false,
   } as unknown as ReturnType<typeof useConversations>;
   useConvMock.mockImplementation(() => dataResult);
+  // The pinned mock maps its ids onto these loaded conversations.
+  mocks.conversations = conversations;
 }
 
 /** Full ServerInfo with permissive defaults; override per test. */
@@ -179,9 +223,9 @@ beforeEach(() => {
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
   useConvMock.mockReset();
-  // Pins persist to localStorage; clear it so a seeded pin doesn't leak into
-  // the next test's row state.
   localStorage.clear();
+  // Reset the server pinned set between tests.
+  mocks.pinnedStore.set([]);
   // The read-state mirror is module-level (in-memory), so reset it between
   // tests to avoid a mark-unread leaking into later rows.
   __resetReadStateForTests();
@@ -267,9 +311,9 @@ describe("quick pin/unpin hover button", () => {
       "Unpin conversation",
     );
 
-    // Persisted to localStorage so the pin survives a reload (same contract
-    // as the kebab's Pin item).
-    expect(localStorage.getItem("omnigent:pinned-conversation-ids")).toContain("conv_1");
+    // Persisted server-side (the `omnigent.pinned` label) so the pin follows the
+    // user across devices — same contract as the kebab's Pin item.
+    expect(mocks.pinnedStore.ids).toContain("conv_1");
 
     // Clicking again unpins: the Pinned section disappears.
     fireEvent.click(screen.getByTestId("quick-pin-conversation"));
@@ -294,7 +338,7 @@ describe("quick pin/unpin hover button", () => {
     const pinnedHeader = screen.getByText("Pinned");
     const pinnedSection = pinnedHeader.closest("section")!;
     expect(within(pinnedSection).getByText("My Session")).toBeInTheDocument();
-    expect(localStorage.getItem("omnigent:pinned-conversation-ids")).toContain("conv_1");
+    expect(mocks.pinnedStore.ids).toContain("conv_1");
   });
 
   it("splits the two pin affordances by viewport via Tailwind responsive classes", () => {
@@ -421,7 +465,7 @@ describe("pinned row project flyout", () => {
   it("shows the project name in the flyout for a pinned, project-owned row", async () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
     // (a project-owned row otherwise sits inside a collapsed project folder).
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mocks.pinnedStore.set(["conv_1"]);
     mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
@@ -443,7 +487,7 @@ describe("pinned row project flyout", () => {
   it("renders no project flyout for a pinned row with no project", () => {
     // No project label → nothing to surface, so the row keeps its plain native
     // title tooltip and never mounts a hover-card trigger.
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mocks.pinnedStore.set(["conv_1"]);
     mockConversations([{ ...CONV, labels: {} }]);
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
@@ -460,7 +504,7 @@ describe("pinned row project flyout", () => {
     // row falls back to the plain link path — no hover-card trigger, native
     // title restored — even though it IS pinned + project-owned.
     mocks.isMobile = true;
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_1"]));
+    mocks.pinnedStore.set(["conv_1"]);
     mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();

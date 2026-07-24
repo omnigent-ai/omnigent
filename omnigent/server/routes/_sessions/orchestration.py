@@ -157,7 +157,9 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    PINNED_LABEL_KEY,
     ConversationNotFoundError,
+    pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
@@ -449,6 +451,36 @@ async def _best_effort_stop(
             await _stop(descendant_id)
 
 
+def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
+    """
+    Collapse per-user pin keys to the canonical pin label for one viewer.
+
+    Pins are stored per-user as ``omnigent.pinned.<user>`` (see
+    :func:`pinned_label_key`). On the wire we present a single canonical
+    ``omnigent.pinned`` key — set iff THIS viewer pinned the session — and drop
+    every ``omnigent.pinned.*`` key. That keeps the per-user dimension server-
+    side (a viewer never sees who else pinned a shared session, and the client
+    reads the same bare key it writes) and stops other users' pin keys from
+    bloating the payload.
+
+    :param labels: The stored conversation labels.
+    :param user_id: The requesting viewer, or ``None`` in single-user mode.
+    :returns: A copy with all ``omnigent.pinned.*`` keys removed and the
+        canonical ``omnigent.pinned`` key added when the viewer's own pin
+        is present.
+    """
+    my_key = pinned_label_key(user_id)
+    my_pin = labels.get(my_key)
+    cleaned = {
+        k: v
+        for k, v in labels.items()
+        if k != PINNED_LABEL_KEY and not k.startswith(f"{PINNED_LABEL_KEY}.")
+    }
+    if my_pin is not None:
+        cleaned[PINNED_LABEL_KEY] = my_pin
+    return cleaned
+
+
 def _build_session_list_item(
     conv: Conversation,
     *,
@@ -520,7 +552,9 @@ def _build_session_list_item(
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         title=title_without_closed_marker(conv.title),
-        labels=labels_with_closed_status(conv.labels, conv.title),
+        # Collapse per-user pin keys to the canonical bare key for this viewer
+        # (never leak another user's pin key), then add the closed marker.
+        labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
         runner_id=conv.runner_id,
         host_id=conv.host_id,
         reasoning_effort=conv.reasoning_effort,
@@ -623,6 +657,7 @@ def _build_session_response(
     pending_elicitation_events: list[dict[str, Any]] | None = None,
     subtree_usage: dict[str, Any] | None = None,
     model_options: list[dict[str, Any]] | None = None,
+    viewer_id: str | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -708,7 +743,9 @@ def _build_session_response(
     # agent identity, so derive it here from ``agent_name`` rather than relying
     # solely on the stored label — the pill then stays correct even if the
     # stored value is missing or stale. Idempotent: a no-op when already present.
-    labels = labels_with_closed_status(conv.labels, conv.title)
+    # Collapse per-user pin keys to the canonical bare key for this viewer, so
+    # the snapshot never carries another user's pin key (see _labels_for_viewer).
+    labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
     if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     return SessionResponse(
@@ -6194,6 +6231,7 @@ async def _get_session_snapshot(
     refresh_state: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxConfig | None = None,
+    viewer_id: str | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -6456,6 +6494,7 @@ async def _get_session_snapshot(
             conv,
         ),
         subtree_usage=subtree_usage,
+        viewer_id=viewer_id,
     )
 
 
@@ -6489,6 +6528,7 @@ __all__ = [
     "_is_native_terminal_session",
     "_kick_managed_relaunch",
     "_kick_managed_wake",
+    "_labels_for_viewer",
     "_maybe_relaunch_managed_sandbox",
     "_maybe_wake_stale_resumable_managed_sandbox",
     "_native_subagent_wrapper_labels",

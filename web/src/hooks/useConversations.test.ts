@@ -25,8 +25,11 @@ import {
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
+  useTogglePinnedConversation,
+  PINNED_CONVERSATIONS_KEY,
   type Conversation,
 } from "./useConversations";
+import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -836,6 +839,86 @@ describe("useRenameConversation cache patching", () => {
       }),
     );
     await waitFor(() => expect(screen.getByTestId("title").textContent).toBe("New name"));
+  });
+});
+
+describe("useTogglePinnedConversation cache patching", () => {
+  // The PATCH returns a SessionResponse snapshot: it has `labels` but NO
+  // `updated_at` (only the list endpoint's SessionListItem carries it). The
+  // hook must therefore build the pinned row from the existing cached row so
+  // it keeps a real timestamp — never from the raw PATCH response.
+  function seed(pinned: boolean) {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "Session X",
+        created_at: 0,
+        // Deliberately NO updated_at — mirrors the real PATCH snapshot.
+        labels: pinned ? { [PINNED_LABEL_KEY]: "1721760000000" } : {},
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x", updated_at: 150 })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useTogglePinnedConversation(), { wrapper });
+    return { queryClient, rendered };
+  }
+
+  it("adds a pinned row that keeps its updated_at (not the timestamp-less PATCH body)", async () => {
+    const { queryClient, rendered } = seed(true);
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const pinned = queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY);
+    const row = pinned!.find((c) => c.id === "conv_x")!;
+    // The row is present immediately AND has a real timestamp — the bug was a
+    // blank time field until the pinned query refetched.
+    expect(row.updated_at).toBe(150);
+    expect(row.labels?.[PINNED_LABEL_KEY]).toBe("1721760000000");
+  });
+
+  it("removes the row from the pinned cache on unpin", async () => {
+    const { queryClient, rendered } = seed(false);
+    queryClient.setQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY, [
+      conversation({ id: "conv_x", updated_at: 150 }),
+    ]);
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: false });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY)).toEqual([]);
+  });
+
+  it("does not blank an existing list row's updated_at (labels-only overlay)", async () => {
+    const { queryClient, rendered } = seed(true);
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const list = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    const row = list!.pages[0].data.find((c) => c.id === "conv_x")!;
+    expect(row.updated_at).toBe(150);
+    expect(row.labels?.[PINNED_LABEL_KEY]).toBe("1721760000000");
+  });
+
+  it("does not invalidate the pinned query (the label index lags the write)", async () => {
+    const { queryClient, rendered } = seed(true);
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // A refetch of ?pinned=true here races the async label reindex and would
+    // momentarily revert the toggle — only the PATCH itself may hit the network.
+    expect(invalidateSpy).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
   });
 });
 

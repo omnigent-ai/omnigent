@@ -1,5 +1,6 @@
 """Conversation store — manages conversations and their items."""
 
+import hashlib
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -83,6 +84,61 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+
+# Reserved label-key PREFIX that records whether a session is "pinned" in the
+# sidebar. Pins are PER-USER: the stored key is ``omnigent.pinned.<user_id>``
+# (see :func:`pinned_label_key`), so pinning a session shared with others does
+# not pin it for them, and either party can pin/unpin independently — matching
+# the prior per-user localStorage behaviour. The value is the epoch-ms pin time
+# (any non-empty value means pinned; the row is deleted on unpin), which lets
+# the sidebar order the Pinned section by pin recency (stable under a new
+# message bumping ``updated_at``) and keeps the Cmd+1..0 hotkey slots consistent
+# across a user's devices. Server-side persistence lets a pin follow the user
+# across devices.
+#
+# The bare ``omnigent.pinned`` (no user suffix) is the CANONICAL key the web
+# client reads/writes; the server rewrites it to the caller's per-user key on
+# write and collapses the caller's per-user key back to it on read (see
+# ``_build_session_list_item``), so the per-user dimension never crosses the
+# API boundary — a viewer never sees another user's pin key. The web client
+# mirrors the canonical key as ``PINNED_LABEL_KEY``.
+PINNED_LABEL_KEY = "omnigent.pinned"
+
+# Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
+# reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
+_PINNED_LABEL_LOCAL_USER = "local"
+
+# ``conversation_labels.key`` is ``String(128)``. The prefix ``omnigent.pinned.``
+# is 16 chars, so a raw ``user_id`` suffix must stay ≤ 112 chars to fit. User ids
+# are ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
+# could overflow the key column — Postgres errors, MySQL silently truncates (and
+# two long ids could then collide on the truncated key). To stay safe while
+# keeping the common case (emails) human-readable in the DB, ids that don't fit
+# are replaced with a fixed-width hash suffix.
+_PINNED_LABEL_MAX_SUFFIX_LEN = 128 - len(PINNED_LABEL_KEY) - 1  # minus the "." joiner
+
+
+def pinned_label_key(user_id: str | None) -> str:
+    """
+    The per-user pinned-label key for ``user_id``.
+
+    Deterministic in ``user_id`` (the write path and the ``pinned=True`` filter
+    derive the key the same way, so they always match). Normal ids are used
+    verbatim for DB readability; an id too long to fit the ``String(128)`` key
+    column is replaced with a fixed-width ``sha256`` suffix so it can never
+    overflow or collide via silent truncation.
+
+    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
+        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
+    :returns: ``"omnigent.pinned.<suffix>"`` (suffix = the id, or its hash when
+        the id is too long).
+    """
+    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
+    if len(suffix) > _PINNED_LABEL_MAX_SUFFIX_LEN:
+        # 64 hex chars — well within the budget and collision-safe.
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return f"{PINNED_LABEL_KEY}.{suffix}"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -554,6 +610,8 @@ class ConversationStore(ABC):
         owned_by: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        pinned: bool = False,
+        pinned_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -654,6 +712,12 @@ class ConversationStore(ABC):
             the filter. The name→id resolution is owner-scoped (projects are
             owner-private), so pass ``owned_by`` alongside a specific name.
             See ``designs/PROJECTS_PRD.md``.
+        :param pinned: When ``True``, only return sessions ``pinned_owner`` has
+            pinned (their per-user ``omnigent.pinned.<user>`` label — the
+            sidebar's Pinned section). ``False`` (default) disables the filter.
+        :param pinned_owner: The user whose pins ``pinned=True`` filters to
+            (their per-user key). ``None`` → the single-user ``local`` sentinel.
+            Ignored unless ``pinned`` is ``True``.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in

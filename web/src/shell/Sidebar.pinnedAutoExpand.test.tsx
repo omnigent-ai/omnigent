@@ -10,10 +10,10 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
-import {
-  EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
-  PINNED_CONVERSATION_IDS_STORAGE_KEY,
-} from "@/shell/sidebarNav";
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
+
+// Server-authoritative pinned set for the mock; tests push the pinned conv here.
+const { pinnedRef } = vi.hoisted(() => ({ pinnedRef: { current: [] as unknown[] } }));
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -23,7 +23,10 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversations: () => ({ data: pinnedRef.current, isSuccess: true }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   useProjects: () => ({ data: [{ id: "p_repro", name: "Repro 2506" }] }),
@@ -107,6 +110,7 @@ beforeEach(() => {
     hasNextPage: false,
     isFetchingNextPage: false,
   } as unknown as ReturnType<typeof useProjectSessions>);
+  pinnedRef.current = [];
   localStorage.clear();
 });
 
@@ -117,7 +121,7 @@ describe("sidebar auto-expand vs. pinned sessions (#2506)", () => {
     // Pinned session `pinned_a` + a project sibling `sibling_b`, both filed
     // under "Repro 2506". Project starts collapsed (empty
     // EXPANDED_PROJECT_SECTIONS_STORAGE_KEY), pinned id already stored.
-    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["pinned_a"]));
+    pinnedRef.current = [conv("pinned_a", "Repro 2506")];
     localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([]));
     mockConversations([conv("pinned_a", "Repro 2506"), conv("sibling_b", "Repro 2506")]);
 
@@ -137,7 +141,7 @@ describe("sidebar auto-expand vs. pinned sessions (#2506)", () => {
     // Same shape, but the active route is the NON-pinned sibling. This is the
     // intended auto-expand path: without opening the folder, the row is
     // invisible and the user would land on a "hidden" session.
-    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["pinned_a"]));
+    pinnedRef.current = [conv("pinned_a", "Repro 2506")];
     localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([]));
     mockConversations([conv("pinned_a", "Repro 2506"), conv("sibling_b", "Repro 2506")]);
 

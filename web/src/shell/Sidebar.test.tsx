@@ -24,6 +24,7 @@ const {
   createProjectSpy,
   fetchProjectSessionIdsMock,
   conversationsRef,
+  pinnedIdsRef,
   projectSessionsMock,
   useHostsMock,
 } = vi.hoisted(() => ({
@@ -41,6 +42,10 @@ const {
   // ?project= filter — so tests that seed project sessions via the global list
   // keep working without a separate per-project fixture.
   conversationsRef: { current: [] as { id: string; labels?: Record<string, string> }[] },
+  // Server-authoritative pinned ids. Kept in a ref (not the legacy localStorage
+  // key, which the one-time migration clears on mount) so a seeded pin survives
+  // the first render. `seedPins` sets it; the toggle mock mutates it.
+  pinnedIdsRef: { current: [] as string[] },
   // Per-project override: when a test sets projectSessionsMock[name], the folder
   // serves exactly those rows instead of deriving from the global list — used to
   // prove a folder fetches its members independently of the global window.
@@ -62,7 +67,25 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversationBackfill: () => [],
+  // Pins are server-authoritative now. Derive the pinned set from the seeded
+  // ref intersected with the loaded conversations, so tests that seed via
+  // `seedPins` exercise the Pinned section without a separate fixture.
+  usePinnedConversations: () => {
+    const idSet = new Set(pinnedIdsRef.current);
+    return { data: conversationsRef.current.filter((c) => idSet.has(c.id)), isSuccess: true };
+  },
+  // Reflect the toggle into the seeded ref so a test that clicks quick-pin then
+  // re-renders sees the updated Pinned set.
+  useTogglePinnedConversation: () => ({
+    mutate: ({ id, pinned }: { id: string; pinned: boolean }) => {
+      const ids = pinnedIdsRef.current;
+      pinnedIdsRef.current = pinned
+        ? [id, ...ids.filter((x) => x !== id)]
+        : ids.filter((x) => x !== id);
+    },
+  }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
   // Project feature: the sidebar reads the project list to build project
@@ -206,9 +229,15 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockReset();
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
+  pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
 });
+
+/** Seed the server-authoritative pinned set (replaces the old localStorage seed). */
+function seedPins(ids: string[]) {
+  pinnedIdsRef.current = ids;
+}
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
@@ -616,7 +645,7 @@ describe("Sidebar tabs", () => {
       conv("conv_mine", "Claude Code"),
       conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_shared"]));
+    seedPins(["conv_shared"]);
     renderSidebar();
 
     // My sessions tab: owned session is unpinned (no Pinned section), and the
@@ -949,7 +978,7 @@ describe("Sidebar project sections", () => {
       conv("conv_pinned", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     // Pin one of the filed sessions via localStorage (client-side pins).
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    seedPins(["conv_pinned"]);
     renderSidebar();
 
     // Pinned takes precedence over Project: the pinned session leaves the
@@ -1170,7 +1199,7 @@ describe("Sidebar collapsed project marker", () => {
 // persists across reloads.
 describe("Sidebar default section collapse", () => {
   it("expands Pinned and Sessions by default when there is no stored preference", () => {
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
+    seedPins(["conv_pin"]);
     mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
     renderSidebar();
 
@@ -1203,9 +1232,22 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     localStorage.setItem("omnigent:collapsed-sidebar-sections", JSON.stringify(["Pinned"]));
     // Start with one already-pinned session (so the Pinned section renders) and
     // one unpinned session to pin.
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pinned"]));
+    seedPins(["conv_pinned"]);
     mockConversations([conv("conv_pinned", "Claude Code"), conv("conv_plain", "Claude Code")]);
-    renderSidebar();
+    // A stable tree so the rerender keeps the same Sidebar instance — the
+    // auto-expand effect compares against the PREVIOUS pinned set, which only
+    // works if the component (and its ref) survive the pinned-set change.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree());
 
     // Collapsed to start: the header reports collapsed and the pinned row hides.
     expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute(
@@ -1213,9 +1255,11 @@ describe("Sidebar auto-expand Pinned on pin", () => {
       "false",
     );
 
-    // Pin the plain row via its quick-pin control.
-    const plainRow = screen.getByRole("link", { name: /conv_plain/ }).closest("li")!;
-    fireEvent.click(within(plainRow).getByTestId("quick-pin-conversation"));
+    // A new session becomes pinned server-side (as if the toggle landed and the
+    // pinned query refetched); re-render the same tree so the effect sees the
+    // transition and auto-expands.
+    seedPins(["conv_pinned", "conv_plain"]);
+    rerender(tree());
 
     // The Pinned section auto-expands so the freshly-pinned session is visible,
     // and the expansion is persisted (dropped from the collapsed list).
@@ -1233,7 +1277,7 @@ describe("Sidebar auto-expand Pinned on pin", () => {
 describe("Sidebar pin marker visibility", () => {
   it("hover-reveals an unpin control on a pinned row (no persistent marker)", () => {
     mockConversations([conv("conv_pin", "Claude Code")]);
-    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
+    seedPins(["conv_pin"]);
     renderSidebar();
 
     const pinned = screen.getByText("Pinned").closest("section")!;

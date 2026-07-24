@@ -124,8 +124,10 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
+    pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
@@ -690,6 +692,7 @@ def register_core_routes(
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
+            viewer_id=user_id,
         )
 
     @router.get(
@@ -728,7 +731,9 @@ def register_core_routes(
             raise _session_not_found()
         return SessionLabelsResponse(
             id=conv.id,
-            labels=labels_with_closed_status(conv.labels, conv.title),
+            # Collapse per-user pin keys for this caller (never leak another
+            # user's pin key to a native harness bridge).
+            labels=labels_with_closed_status(_labels_for_viewer(conv.labels, user_id), conv.title),
         )
 
     # ── GET /sessions ───────────────────────────────────────────
@@ -751,6 +756,7 @@ def register_core_routes(
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
+        pinned: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -794,6 +800,10 @@ def register_core_routes(
             this lets the new-session agent picker discover agents
             that are only bound to sub-agent sessions (e.g. ones
             uploaded via ``sys_session_create``).
+        :param pinned: When ``True``, return only sessions the user
+            has pinned (the ``omnigent.pinned`` label). Lets the
+            sidebar enumerate pinned sessions that fall outside the
+            loaded pagination window. ``False`` (default) disables it.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -837,6 +847,9 @@ def register_core_routes(
             search_query=normalized_query,
             include_archived=include_archived,
             project=project,
+            pinned=pinned,
+            # Pins are per-user: filter to the caller's own pin key.
+            pinned_owner=user_id,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
@@ -1415,19 +1428,35 @@ def register_core_routes(
             registered; 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
-        # Filing into a project is owner-only: projects are owner-private, so a
-        # session's membership is the owner organizing their own sessions — an
-        # editor must not move it. Presence is the signal (``""`` unfiles), so
-        # gate on model_fields_set, not a non-None value.
+        # This PATCH gates at the least level the request actually needs, in
+        # three tiers matching the if/elif/else below:
+        #
+        # * READ — a pin-only PATCH. Pinning is a personal, per-viewer
+        #   preference (stored as the caller's own ``omnigent.pinned.<user>``
+        #   label), not an edit to the session, so anyone who can SEE the
+        #   session may pin it — including a read-only collaborator on a session
+        #   shared with them. Only when the pinned label is the request's ONLY
+        #   mutation.
+        # * OWNER — archiving/unarchiving or filing into a project. Both are
+        #   owner-only: projects are owner-private (an editor must not move a
+        #   session between them), and archive pairs with a client-driven,
+        #   owner-gated stop (an editor must not hide/stop a session they can't
+        #   issue that stop for). Presence is the signal for project (``""``
+        #   unfiles), so gate on model_fields_set, not a non-None value.
+        # * EDIT — every other field.
+        #
+        # Owner implies edit, so a single check at the resolved level gates all
+        # three with no redundant second permission-store read.
         set_project = "project_id" in body.model_fields_set
-        # Archiving/unarchiving is an owner-only lifecycle action: it pairs
-        # with a client-driven, owner-gated stop, so an editor must not be
-        # able to archive a session (hiding it, and via the client stopping
-        # it) when they couldn't issue that stop. Every other field on this
-        # endpoint needs only edit. Owner implies edit, so a single check at
-        # the level the request actually requires gates both — no redundant
-        # second permission-store read for archive/unarchive.
-        required_level = LEVEL_OWNER if (body.archived is not None or set_project) else LEVEL_EDIT
+        pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
+            PINNED_LABEL_KEY
+        }
+        if pin_only:
+            required_level = LEVEL_READ
+        elif body.archived is not None or set_project:
+            required_level = LEVEL_OWNER
+        else:
+            required_level = LEVEL_EDIT
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
@@ -1492,6 +1521,12 @@ def register_core_routes(
                 )
             requested_codex_collaboration_mode = body.collaboration_mode
         labels_to_set = dict(body.labels or {})
+        # Pins are per-user. The client writes the canonical ``omnigent.pinned``
+        # key; rewrite it to the caller's per-user key so one user's pin doesn't
+        # pin the session for everyone with access. Empty value (unpin) carries
+        # through to the delete-clear loop below under the per-user key.
+        if PINNED_LABEL_KEY in labels_to_set:
+            labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
                 requested_codex_collaboration_mode
@@ -1719,12 +1754,17 @@ def register_core_routes(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        # The project label is special: an empty-string value means "remove
-        # from project" (delete the label row) rather than upsert an empty value.
-        # Split it out before the bulk upsert so other labels are unaffected.
-        if labels_to_set and labels_to_set.get(PROJECT_LABEL_KEY) == "":
-            labels_to_set = {k: v for k, v in labels_to_set.items() if k != PROJECT_LABEL_KEY}
-            await asyncio.to_thread(conversation_store.delete_label, session_id, PROJECT_LABEL_KEY)
+        # Some labels are cleared by DELETE, not by upserting an empty value:
+        # the project membership (empty = "remove from project") and the pinned
+        # flag (empty = "unpin"). Split any empty-valued clear keys out before
+        # the bulk upsert so other labels are unaffected. Labels are upsert-only,
+        # so without this an empty string would linger as a stored value.
+        # The pinned key was rewritten to the caller's per-user key above, so
+        # clear that one (not the canonical bare key) on an empty value.
+        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+            if labels_to_set.get(_clear_key) == "":
+                labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
+                await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
         if labels_to_set:
             await asyncio.to_thread(conversation_store.set_labels, session_id, labels_to_set)
         if requested_codex_collaboration_mode is not None:
@@ -1801,6 +1841,7 @@ def register_core_routes(
             agent_cache,
             liveness_lookup=liveness_lookup,
             runner_exit_reports=runner_exit_reports,
+            viewer_id=user_id,
         )
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
