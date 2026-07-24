@@ -395,7 +395,7 @@ export function CreateScheduledTaskDialog({
 
           {/* Optional host + workspace pin. Left unset, the server resolves the
               owner's connected host and its home directory at fire time. */}
-          <div className="flex flex-col gap-1.5">
+          <div className="flex flex-col gap-1.5 sm:w-64" data-testid="task-host-field">
             <Label htmlFor="task-host">Host (optional)</Label>
             <Select
               value={hostId === "" ? UNSET_HOST : hostId}
@@ -408,7 +408,7 @@ export function CreateScheduledTaskDialog({
               }}
               onOpenChange={handleSelectOpenChange}
             >
-              <SelectTrigger id="task-host" data-testid="task-host-trigger">
+              <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent position="popper" align="start">

@@ -46,7 +46,7 @@ const PRESET_OPTIONS: { value: SchedulePreset; label: string }[] = [
 ];
 
 const HOURS_12 = Array.from({ length: 12 }, (_, i) => i + 1);
-const MINUTES = Array.from({ length: 60 }, (_, i) => i);
+const QUARTER_HOUR_MINUTES = [0, 15, 30, 45] as const;
 const PERIODS = ["AM", "PM"] as const;
 type Period = (typeof PERIODS)[number];
 
@@ -80,6 +80,7 @@ export function ScheduleFields({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const hourColumnRef = useRef<HTMLDivElement | null>(null);
   const minuteColumnRef = useRef<HTMLDivElement | null>(null);
+  const periodColumnRef = useRef<HTMLDivElement | null>(null);
   const [timeText, setTimeText] = useState(() => formatInputValue(model, isHourly));
   const [timePickerOpen, setTimePickerOpen] = useState(false);
 
@@ -89,12 +90,38 @@ export function ScheduleFields({
   }, [isHourly, model.hour, model.minute]);
 
   const pickerParts = toPickerParts(getPickerTime());
+  const pickerMinuteOptions = minuteOptionsFor(pickerParts.minute);
 
   useEffect(() => {
     if (!timePickerOpen || isHourly) return;
     scrollSelectedIntoView(hourColumnRef.current);
     scrollSelectedIntoView(minuteColumnRef.current);
   }, [isHourly, pickerParts.hour12, pickerParts.minute, timePickerOpen]);
+
+  useEffect(() => {
+    if (isHourly) return;
+    const handleWheel = (event: WheelEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      const columns = [
+        hourColumnRef.current ?? document.querySelector('[data-testid="schedule-hour-column"]'),
+        minuteColumnRef.current ?? document.querySelector('[data-testid="schedule-minute-column"]'),
+        periodColumnRef.current ?? document.querySelector('[data-testid="schedule-period-column"]'),
+      ];
+      const column = columns.find((col) => col?.contains(target));
+      if (!column) return;
+      if (column.scrollHeight > column.clientHeight) {
+        column.scrollTop += event.deltaY;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+    };
+    window.addEventListener("wheel", handleWheel, { capture: true, passive: false });
+    return () => {
+      window.removeEventListener("wheel", handleWheel, true);
+    };
+  }, [isHourly]);
 
   function toggleWeekday(code: WeekdayCode) {
     const has = model.weekdays.includes(code);
@@ -155,15 +182,22 @@ export function ScheduleFields({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="grid gap-3 sm:grid-cols-2" data-testid="schedule-frequency-time-row">
-        <div className="flex flex-col gap-1.5">
+      <div className="grid gap-3 sm:grid-cols-2 sm:gap-6" data-testid="schedule-frequency-time-row">
+        <div
+          className="flex w-full min-w-0 flex-col gap-1.5"
+          data-testid="schedule-frequency-control"
+        >
           <Label htmlFor="schedule-preset">Frequency</Label>
           <Select
             value={model.preset}
             onValueChange={(value) => onChange({ ...model, preset: value as SchedulePreset })}
             onOpenChange={onSelectOpenChange}
           >
-            <SelectTrigger id="schedule-preset" data-testid="schedule-preset-trigger">
+            <SelectTrigger
+              id="schedule-preset"
+              data-testid="schedule-preset-trigger"
+              className="w-full"
+            >
               <SelectValue />
             </SelectTrigger>
             {/* position="popper" opens the list anchored BELOW the trigger (auto-
@@ -181,7 +215,7 @@ export function ScheduleFields({
           </Select>
         </div>
 
-        <div className="flex flex-col gap-1.5">
+        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="schedule-time-control">
           <Label htmlFor="schedule-time">{isHourly ? "Minute" : "Time"}</Label>
           {isHourly ? (
             <Input
@@ -190,6 +224,7 @@ export function ScheduleFields({
               value={timeText}
               data-testid="schedule-minute"
               placeholder=":15"
+              className="text-sm"
               aria-invalid={error ? true : undefined}
               onChange={(e) => handleTimeTextChange(e.target.value)}
               onBlur={canonicalizeTimeText}
@@ -204,7 +239,7 @@ export function ScheduleFields({
                     value={timeText}
                     data-testid="schedule-time"
                     placeholder="5:00 PM"
-                    className="pr-8"
+                    className="pr-8 text-sm"
                     aria-invalid={error ? true : undefined}
                     onFocus={() => handleTimePickerOpenChange(true)}
                     onChange={(e) => handleTimeTextChange(e.target.value)}
@@ -223,11 +258,15 @@ export function ScheduleFields({
               </PopoverAnchor>
               <PopoverContent
                 align="start"
-                className="w-44 rounded-sm p-1.5"
+                className="w-64 rounded-sm p-1.5"
                 onOpenAutoFocus={(event) => event.preventDefault()}
               >
                 <div className="grid grid-cols-3 gap-1" data-testid="schedule-time-picker">
-                  <div ref={hourColumnRef} className="max-h-64 overflow-y-auto">
+                  <div
+                    ref={hourColumnRef}
+                    className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+                    data-testid="schedule-hour-column"
+                  >
                     {HOURS_12.map((hour) => (
                       <PickerCell
                         key={hour}
@@ -239,8 +278,12 @@ export function ScheduleFields({
                       </PickerCell>
                     ))}
                   </div>
-                  <div ref={minuteColumnRef} className="max-h-64 overflow-y-auto">
-                    {MINUTES.map((minute) => (
+                  <div
+                    ref={minuteColumnRef}
+                    className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+                    data-testid="schedule-minute-column"
+                  >
+                    {pickerMinuteOptions.map((minute) => (
                       <PickerCell
                         key={minute}
                         testId={`schedule-minute-${pad(minute)}`}
@@ -251,7 +294,11 @@ export function ScheduleFields({
                       </PickerCell>
                     ))}
                   </div>
-                  <div className="max-h-64 overflow-y-auto">
+                  <div
+                    ref={periodColumnRef}
+                    className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+                    data-testid="schedule-period-column"
+                  >
                     {PERIODS.map((period) => (
                       <PickerCell
                         key={period}
@@ -322,6 +369,10 @@ function formatInputValue(model: ScheduleModel, isHourly: boolean): string {
 function formatMinuteInput(minute: number): string {
   if (!Number.isInteger(minute) || minute < 0 || minute > 59) return "";
   return `:${pad(minute)}`;
+}
+
+function minuteOptionsFor(currentMinute: number): number[] {
+  return [...new Set([...QUARTER_HOUR_MINUTES, currentMinute])].sort((a, b) => a - b);
 }
 
 function formatTimeInput(hour: number, minute: number): string {

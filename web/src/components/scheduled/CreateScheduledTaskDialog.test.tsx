@@ -416,6 +416,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     const timeField = screen.getByTestId("schedule-time");
     expect(timeField.tagName).toBe("INPUT");
     expect(timeField).toHaveAttribute("placeholder", "5:00 PM");
+    expect(timeField).toHaveClass("text-sm");
     expect(screen.getByTestId("schedule-time-picker-trigger")).toBeInTheDocument();
   });
 
@@ -426,6 +427,19 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(row).toContainElement(screen.getByText("Time"));
     expect(row).toContainElement(screen.getByTestId("schedule-preset-trigger"));
     expect(row).toContainElement(screen.getByTestId("schedule-time"));
+    expect(row).toHaveClass("sm:grid-cols-2", "sm:gap-6");
+    expect(screen.getByTestId("schedule-frequency-control")).toHaveClass("w-full");
+    expect(screen.getByTestId("schedule-time-control")).toHaveClass("w-full");
+    expect(screen.getByTestId("schedule-preset-trigger")).toHaveClass("w-full");
+  });
+
+  it("keeps Host compact instead of stretching it full-width", () => {
+    renderDialog();
+    const hostField = screen.getByTestId("task-host-field");
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    expect(hostField).toHaveClass("sm:w-64");
+    expect(hostField).toContainElement(hostTrigger);
+    expect(hostTrigger).toHaveClass("w-full");
   });
 
   it("chooses a non-quarter-hour time from the compact picker", async () => {
@@ -434,13 +448,53 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
     fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
     fireEvent.click(await screen.findByTestId("schedule-hour-05"));
-    fireEvent.click(screen.getByTestId("schedule-minute-07"));
+    expect(screen.queryByTestId("schedule-minute-07")).toBeNull();
+    fireEvent.click(screen.getByTestId("schedule-minute-15"));
     fireEvent.click(screen.getByTestId("schedule-period-PM"));
-    expect(screen.getByTestId("schedule-time")).toHaveValue("05:07 PM");
+    expect(screen.getByTestId("schedule-time")).toHaveValue("05:15 PM");
 
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=7");
+    expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=DAILY;BYHOUR=17;BYMINUTE=15");
+  });
+
+  it("shows quarter-hour minute choices in the compact picker", async () => {
+    renderDialog();
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    expect(await screen.findByTestId("schedule-minute-00")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-15")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-30")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-45")).toBeInTheDocument();
+    expect(screen.queryByTestId("schedule-minute-01")).toBeNull();
+    expect(screen.queryByTestId("schedule-minute-59")).toBeNull();
+  });
+
+  it("makes overflowing picker columns scrollable without closing the picker", async () => {
+    renderDialog();
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    const hourColumn = await screen.findByTestId("schedule-hour-column");
+    expect(hourColumn).toHaveClass("overflow-y-auto", "overscroll-contain");
+    expect(screen.getByTestId("schedule-minute-column")).toHaveClass("overflow-y-auto");
+
+    fireEvent.wheel(hourColumn, { deltaY: 120 });
+    expect(screen.getByTestId("schedule-time-picker")).toBeInTheDocument();
+  });
+
+  it("includes the current off-grid minute as the selected picker value", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=7" })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("schedule-time-picker-trigger"));
+    expect(screen.getByTestId("schedule-minute-00")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-07")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("schedule-minute-15")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-30")).toBeInTheDocument();
+    expect(screen.getByTestId("schedule-minute-45")).toBeInTheDocument();
+    expect(screen.queryByTestId("schedule-minute-08")).toBeNull();
   });
 
   it("typing a non-quarter-hour time flows into the submitted RRULE", async () => {
@@ -480,6 +534,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
     const minuteField = screen.getByTestId("schedule-minute");
     expect(minuteField.tagName).toBe("INPUT");
+    expect(minuteField).toHaveClass("text-sm");
     expect(screen.queryByTestId("schedule-time-picker-trigger")).toBeNull();
     fireEvent.change(minuteField, { target: { value: ":07" } });
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
