@@ -184,6 +184,35 @@ describe("ArtifactSurfaceManager", () => {
     assert.equal(win.children.length, 0);
   });
 
+  it("reuses the native view across surface and capability changes", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "session-a",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 100, height: 100 },
+    });
+    await manager.sync(win, {
+      id: "session-b",
+      url: "http://preview.localhost:6767/p/grant-b/artifacts/b/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 120, height: 120 },
+    });
+
+    assert.equal(created.length, 1);
+    assert.equal(created[0].webContents.closed, false);
+    assert.deepEqual(created[0].webContents.loaded, [
+      "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      "http://preview.localhost:6767/p/grant-b/artifacts/b/index.html",
+    ]);
+    manager.destroy(win, "session-a");
+    assert.equal(created[0].webContents.closed, false);
+    manager.destroy(win, "session-b");
+    assert.equal(created[0].webContents.closed, true);
+  });
+
   it("fits a fixed viewport inside the native artifact pane", async () => {
     const win = fakeWindow();
     const created = [];

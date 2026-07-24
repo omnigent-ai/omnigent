@@ -297,13 +297,16 @@ class ArtifactSurfaceManager {
     }
     const policy = parseArtifactPreviewUrl(params.url);
     let surface = this.surfaces.get(win);
-    const policyChanged =
-      surface &&
-      (surface.policy.origin !== policy.origin ||
-        surface.policy.capabilityPrefix !== policy.capabilityPrefix);
-    if (surface && (surface.id !== params.id || policyChanged)) {
-      this.destroy(win, surface.id);
-      surface = undefined;
+    if (surface) {
+      const policyChanged =
+        surface.policy.origin !== policy.origin ||
+        surface.policy.capabilityPrefix !== policy.capabilityPrefix;
+      surface.id = params.id;
+      surface.policy = policy;
+      if (policyChanged) {
+        surface.consoleMessages.length = 0;
+        surface.loadErrors.length = 0;
+      }
     }
 
     if (!surface) {
@@ -316,15 +319,16 @@ class ArtifactSurfaceManager {
           partition: `omnigent-artifact-preview-${win.id}-${randomUUID()}`,
         },
       });
+      const consoleMessages = [];
+      const loadErrors = [];
+      surface = { id: params.id, view, policy, url: null, consoleMessages, loadErrors };
       this.configureSession(view.webContents.session);
       view.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       const blockUnsafeNavigation = (event, url) => {
-        if (!navigationAllowed(url, policy)) event.preventDefault();
+        if (!navigationAllowed(url, surface.policy)) event.preventDefault();
       };
       view.webContents.on("will-navigate", blockUnsafeNavigation);
       view.webContents.on("will-redirect", blockUnsafeNavigation);
-      const consoleMessages = [];
-      const loadErrors = [];
       view.webContents.on("console-message", (_event, levelOrDetails, message, line, source) => {
         const details =
           levelOrDetails && typeof levelOrDetails === "object"
@@ -346,7 +350,6 @@ class ArtifactSurfaceManager {
         });
       });
       win.contentView.addChildView(view);
-      surface = { id: params.id, view, policy, url: null, consoleMessages, loadErrors };
       this.surfaces.set(win, surface);
     }
 

@@ -1,4 +1,5 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ArtifactPreviewSurface } from "./ArtifactPreviewSurface";
 
@@ -38,6 +39,44 @@ describe("ArtifactPreviewSurface", () => {
     const frame = screen.getByTitle("Revenue preview");
     expect(frame.tagName).toBe("IFRAME");
     expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-same-origin");
+  });
+
+  it("creates the native surface once across a StrictMode mount cycle", async () => {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      syncArtifactSurface,
+      destroyArtifactSurface,
+    };
+    vi.stubGlobal("ResizeObserver", ResizeObserverMock);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 12,
+      y: 34,
+      width: 500,
+      height: 360,
+      top: 34,
+      right: 512,
+      bottom: 394,
+      left: 12,
+      toJSON: () => ({}),
+    });
+
+    const { unmount } = render(
+      <StrictMode>
+        <ArtifactPreviewSurface
+          surfaceId="surface"
+          title="Revenue"
+          url="http://preview.localhost/p/grant/a"
+          visible
+        />
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(syncArtifactSurface).toHaveBeenCalledTimes(2));
+    expect(destroyArtifactSurface).toHaveBeenCalledTimes(1);
+    act(() => unmount());
+    expect(destroyArtifactSurface).toHaveBeenCalledTimes(2);
   });
 
   it("syncs a native surface instead of rendering an iframe in Electron", async () => {

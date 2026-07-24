@@ -35,7 +35,10 @@ export function ArtifactPreviewSurface({
     const element = elementRef.current;
     if (!element) return;
 
+    let cancelled = false;
+    let observer: ResizeObserver | null = null;
     const sync = () => {
+      if (cancelled) return;
       const previewState = previewStateRef.current;
       const rect = element.getBoundingClientRect();
       const intersectsViewport =
@@ -56,15 +59,19 @@ export function ArtifactPreviewSurface({
         },
       });
     };
-    syncRef.current = sync;
-
-    const observer = new ResizeObserver(sync);
-    observer.observe(element);
-    window.addEventListener("resize", sync);
-    window.addEventListener("scroll", sync, true);
-    sync();
+    queueMicrotask(() => {
+      if (cancelled) return;
+      syncRef.current = sync;
+      observer = new ResizeObserver(sync);
+      observer.observe(element);
+      window.addEventListener("resize", sync);
+      window.addEventListener("scroll", sync, true);
+      sync();
+    });
     return () => {
-      observer.disconnect();
+      cancelled = true;
+      syncRef.current = () => undefined;
+      observer?.disconnect();
       window.removeEventListener("resize", sync);
       window.removeEventListener("scroll", sync, true);
     };
