@@ -129,13 +129,17 @@ export function ScheduleFields({
   }
 
   function handleTimeTextChange(value: string) {
-    setTimeText(value);
     if (isHourly) {
-      const minute = parseMinuteOfHourInput(value);
-      onChange({ ...model, minute: minute ?? Number.NaN });
+      const digits = value.replace(/\D/g, "").slice(0, 2);
+      let minute = digits === "" ? Number.NaN : Number(digits);
+      if (Number.isInteger(minute) && minute > 59) minute = 59;
+      const text = Number.isInteger(minute) ? String(minute) : "";
+      setTimeText(text);
+      onChange({ ...model, minute: Number.isInteger(minute) ? minute : Number.NaN });
       return;
     }
 
+    setTimeText(value);
     const parsed = parseTimeOfDayInput(value);
     onChange({
       ...model,
@@ -222,7 +226,7 @@ export function ScheduleFields({
               id="schedule-time"
               value={timeText}
               data-testid="schedule-minute"
-              placeholder=":15"
+              placeholder="0"
               className="text-sm"
               aria-invalid={error ? true : undefined}
               onChange={(e) => handleTimeTextChange(e.target.value)}
@@ -366,8 +370,8 @@ function formatInputValue(model: ScheduleModel, isHourly: boolean): string {
 }
 
 function formatMinuteInput(minute: number): string {
-  if (!Number.isInteger(minute) || minute < 0 || minute > 59) return "";
-  return `:${pad(minute)}`;
+  if (!Number.isInteger(minute)) return "";
+  return String(Math.min(59, Math.max(0, minute)));
 }
 
 function formatTimeInput(hour: number, minute: number): string {

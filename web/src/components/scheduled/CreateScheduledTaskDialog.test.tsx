@@ -592,13 +592,32 @@ describe("CreateScheduledTaskDialog submit", () => {
     const minuteField = screen.getByTestId("schedule-minute");
     expect(minuteField.tagName).toBe("INPUT");
     expect(minuteField).toHaveClass("text-sm");
+    expect(minuteField).toHaveAttribute("placeholder", "0");
     expect(screen.queryByTestId("schedule-time-picker-trigger")).toBeNull();
-    fireEvent.change(minuteField, { target: { value: ":07" } });
+    fireEvent.change(minuteField, { target: { value: "7" } });
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "T" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=HOURLY;BYMINUTE=7");
+  });
+
+  it("Hourly preset strips non-digits, caps to two digits, and clamps above 59", async () => {
+    renderDialog();
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Hourly" }));
+    const minuteField = screen.getByTestId("schedule-minute");
+
+    fireEvent.change(minuteField, { target: { value: "a:-" } });
+    expect(minuteField).toHaveValue("");
+    fireEvent.change(minuteField, { target: { value: "3a" } });
+    expect(minuteField).toHaveValue("3");
+    fireEvent.blur(minuteField);
+    expect(minuteField).toHaveValue("3");
+    fireEvent.change(minuteField, { target: { value: "75" } });
+    expect(minuteField).toHaveValue("59");
+    fireEvent.change(minuteField, { target: { value: "123" } });
+    expect(minuteField).toHaveValue("12");
   });
 
   it("offers exactly the four frequency presets with no Custom entry point", async () => {
