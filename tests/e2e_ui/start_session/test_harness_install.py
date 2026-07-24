@@ -207,25 +207,16 @@ async def _drive_install(base_url: str) -> None:
                 state="visible", timeout=30_000
             )
 
-            # Commit the Codex agent (its harness is unconfigured on the host).
-            # The picker trigger only settles once the /v1/agents fetch resolves;
-            # opening it before that (under CI load) races the menu-open against
-            # a re-render, and re-clicking the trigger while its dropdown overlay
-            # is up gets the click intercepted by the overlay. So first wait for
-            # the composer to reflect the loaded agent (the "Set up Codex" notice
-            # only renders once the Codex agent + its unconfigured host state are
-            # in), THEN open the picker once and click the Codex row.
-            await expect(page.get_by_test_id("new-chat-landing-harness-setup")).to_be_visible(
-                timeout=30_000
-            )
-            picker = page.get_by_test_id("new-chat-landing-agent-select")
-            codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
-            await picker.click()
-            await codex_option.click(timeout=30_000)
-
-            # The composer notice offers "Set up →", which opens the setup dialog.
+            # The single seeded agent (Codex) is auto-selected once the
+            # /v1/agents fetch resolves, and because its harness is unconfigured
+            # on the host the composer surfaces a "Set up Codex" notice. Wait for
+            # that notice directly and click it to open the setup dialog. (We
+            # deliberately do NOT drive the agent picker here: the agent is
+            # already selected, and opening/clicking the dropdown only added a
+            # menu-open-vs-async-render race that flaked under CI load. A long
+            # timeout absorbs a slow agents fetch on a loaded runner.)
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
-            await expect(setup).to_be_visible(timeout=10_000)
+            await expect(setup).to_be_visible(timeout=60_000)
             await setup.click()
 
             # The dialog's checklist offers a one-click Install for this harness.
