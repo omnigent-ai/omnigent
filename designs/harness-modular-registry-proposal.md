@@ -275,33 +275,83 @@ Deferred (under the 10k target already; fold into Phase 1 when the seam lands):
   `resume_dispatch.py` (they duplicate its dispatch anyway) as the first step of
   collapsing the two resume paths into one.
 
+### Current state (verified 2026-07-24, at `main` `59e6b70e`)
+
+Grounding the plan in the actual tree, not just the coupling inventory above:
+
+- **Data model is ready.** `NativeCodingAgent` (`harness_plugins.py:49`) is 11
+  frozen rows; `HarnessContribution` (`:70`) has `native_harnesses` /
+  `native_agents` but **no** `native_providers` field yet;
+  `native_coding_agents.py` already indexes rows by agent_name / harness /
+  wrapper_label / terminal_name. `HarnessCapabilities`
+  (`harness_capabilities.py:79`) exists with an optional-field extension
+  pattern (`steering`, `live_queue`, `images`, `compaction`) but **no**
+  `fork_history` axis.
+- **`run_<x>_native` is already near-uniform.** All 11 are `(*, server,
+  session_id, <x>_args, resume_picker=..., ...)`. The divergence is only the
+  pass-through arg *name* plus four harnesses carrying extra kwargs: claude
+  (`command`, `use_claude_config`), codex (`command`, `model`, `prompt`),
+  antigravity (`command`, `model`, `permission_mode`), opencode (`model`). So
+  signature normalization is a keyword-rename with a threaded `**extra`, not a
+  rewrite — lower risk than "Signature uniformity" under Risks suggested.
+- **Coverage is uneven across hubs** (a correctness smell the seam fixes):
+  `resume_dispatch._dispatch_wrapper` covers 10, `chat.py`
+  `_redirect_native_resume_if_needed` only 6 (missing opencode/goose/hermes/
+  antigravity/qwen), runner interrupt handlers 9, stop handlers 7. Routing
+  everything through one resolver *normalizes* coverage.
+- **The dead `_HARNESS_MODULES` literal still exists** (`runtime/harnesses/
+  __init__.py:36`, overwritten at `:152`) — not yet deleted.
+- **`harness_catalog()` (`harness_plugins.py:899`) does not emit native-agent
+  rows** — only `{id, label, capabilities?, setup_steps?}` per harness, no
+  `agent_name` / `wrapper_label` / icon. The web is still 100% literals.
+
+Roughly **60+ hardcoded duplication points across ~12 Python + 6 TS files**
+plus the five dispatch hubs remain.
+
 ### Phase 1 — Internal provider seam (core-only)
 
-1. Add `NativeHarnessProvider`, `native_providers` field, accessors, and
-   `omnigent/native_dispatch.py` resolver.
-2. Populate the built-in contribution with one provider per native agent,
-   pointing at the existing `omnigent.<x>_native` functions.
-3. Normalize `run_<x>_native` to the uniform keyword signature (with aliases).
-4. Rewrite each hub (table above) to resolve through the registry. Delete the
-   `if key ==` chains and the dead `_HARNESS_MODULES` literal.
-5. Derive the §5 enumerations from `native_agents()` / capabilities.
-6. Keep the validator rejecting community native metadata — nothing external
-   yet. All existing native harnesses now run *through* the seam. This is the
-   correctness-critical phase; the test bar is "every native harness behaves
-   identically before/after."
+Built-ins keep living in core but route through the generic seam. The test bar
+for every PR here is **"every native harness behaves identically before/after"**
+— lean on the split native test suite (#3149) and the native e2e skills. The
+validator keeps rejecting community native metadata throughout Phase 1.
+
+| PR | Scope | Key files | Depends on | Risk | Est. |
+|---|---|---|---|---|---|
+| **1.1 Provider model + resolver** | Add `NativeHarnessProvider` (import-path strings), the `native_providers` field + accessors, and `omnigent/native_dispatch.py` (lazy `importlib` resolver, cached per path). Populate 11 built-in providers pointing at existing `omnigent.<x>_native` functions. Purely additive — no hub rewired yet. | `harness_plugins.py`, new `native_dispatch.py` | — | Low | 1–2d |
+| **1.2 Signature normalization** | Give `run_<x>_native` a uniform `extra_args` spelling with a back-compat `<x>_args` alias (one-release deprecation per CLAUDE.md — name the target release). Decide the `**extra` protocol for the four special-kwarg harnesses (claude/codex/antigravity/opencode). | 11 `omnigent/<x>_native.py`, `native_dispatch.py` | 1.1 | Low–Med (mechanical ×11) | 2–3d |
+| **1.3 Resume hubs** | Collapse `resume_dispatch._dispatch_wrapper` (10 arms) and the 6 `chat.py` `_run_<x>_native_resume_redirect` helpers into one `resolve(provider.run_native)(...)` path. Deletes the redirect helpers and normalizes the 10-vs-6 coverage gap. | `resume_dispatch.py`, `chat.py` | 1.1, 1.2 | Med | 2d |
+| **1.4 CLI subcommands** | Replace the 11 hand-written `@cli.command` funcs in `cli_native.py` with a loop over `native_agents()`, registering one Click command each; make `_reject_native_on_windows` a registry-driven guard. Wrinkle: per-command options (`--model`, `--command`) must come off provider/row metadata. | `cli_native.py`, `cli.py` | 1.1, 1.2 | Med | 2–3d |
+| **1.5 Runner launch + terminal-route** | The epicenter. Replace spawn-env (22 arms), launch (11 + 3 elif), and terminal-route (11) dispatch in `app.py` with `resolve(provider.auto_create_terminal / spawn_env_builder)(...)`. **Preserve the `_supervise_*_bridges` forward-cursor / restart / double-post invariants exactly.** Likely splits into 1.5a spawn-env and 1.5b launch+route. | `runner/app.py`, `runner/native/orchestration.py` | 1.1, 1.2 | **High** | 4–6d |
+| **1.6 Runner interrupt/stop** | Route interrupt/stop through `resolve(provider.interrupt_handler / stop_handler)`; fill the 9/7 coverage gaps so every native has both paths. | `runner/app.py` | 1.1 | Med | 2d |
+| **1.7 Seeding loop** | Replace the 26 `_ensure_default_<x>_agent` / `_build_<x>_native_bundle` touchpoints in `server/app.py` with a loop materializing via `provider.materialize_agent_spec`. **`builtin_agent_id` output must stay byte-identical** so redeploy doesn't orphan seeded agents — pin this with a test. | `server/app.py`, `db/utils.py` | 1.1 | Med | 2–3d |
+| **1.8 Derive enumerations** | Add a `fork_history: Literal["none","rebuild","preamble"]` axis to `HarnessCapabilities`; derive the §5 frozensets/dicts from `native_agents()` / capabilities (8 files, ~35 sets); delete the dead `_HARNESS_MODULES` literal. | `harness_capabilities.py`, `_omnigent_compat.py`, `harness_readiness.py`, `harness_install.py`, `model_override.py`, `model_catalog.py`, `_sessions/common.py`, `resource_registry.py`, `runtime/harnesses/__init__.py`, `tests/test_harness_capabilities.py` | 1.1 | Med | 2–3d |
+
+After 1.1 + 1.2 land, PRs 1.3–1.8 touch mostly disjoint hubs and can proceed in
+parallel. **Phase 1 subtotal: ~17–25 engineer-days.**
 
 ### Phase 2 — Open to community packages
 
-1. Flip `_validate_community_contribution` to positive validation.
-2. Extend `GET /v1/harnesses` (`harness_catalog()`) to emit native-agent rows +
-   capabilities.
-3. Drive the web off `/v1/harnesses`: delete the `nativeCodingAgents.ts`
-   literals, `forkHarness.ts`, and the `AgentCard` icon switch in favor of
-   server-supplied metadata (icon can be a capability/label field).
-4. Document the native checklist in `designs/harness-plugin-interface.md`
-   (extend § "Native TUI Harnesses").
-5. Ship an example native plugin (`examples/` or a sibling `omnigent-foo-native`)
-   to prove the contract end to end.
+Only starts once Phase 1 has every built-in running *through* the seam.
+
+| PR | Scope | Key files | Depends on | Risk | Est. |
+|---|---|---|---|---|---|
+| **2.1 Validator flip** | Replace the hard reject in `_validate_community_contribution` with positive validation: every `native_agent.key` has a matching `native_provider.key`; provider import paths start with `COMMUNITY_MODULE_PREFIX`; identity values don't collide (`_native_agent_identity_values` already checks this); `run_native` + `auto_create_terminal` are non-empty. | `harness_plugins.py` | 1.1 | Low–Med | 1d |
+| **2.2 `/v1/harnesses` native rows** | Extend `harness_catalog()` to emit native-agent rows + capabilities (`agent_name`, `wrapper_label`, `fork_history`, icon/label field), so the web has a server source of truth. | `harness_plugins.py`, `server/routes/harnesses.py` | 1.8 | Low | 2d |
+| **2.3 Web off the endpoint** | Delete the `nativeCodingAgents.ts` literals + `HARNESS_ALIASES`, the `forkHarness.ts` sets (`NATIVE_REBUILD_HARNESSES` / `PREAMBLE_FORK_HARNESSES` now come from `fork_history`), the `AgentCard` icon switch, and the wrapper-label literals in `sessionStop.ts` / `sessionCapabilities.ts` / `codexPlanMode.ts` — all driven by `/v1/harnesses`. Needs a **demo (screenshots/recording)** per CLAUDE.md; likely splits into 2.3a fork/capabilities data-plumb and 2.3b icon/label rendering. | `web/src/lib/*`, `web/src/components/AgentCard.tsx` | 2.2 | Med–High (largest FE) | 4–6d |
+| **2.4 Docs + example plugin** | Extend `designs/harness-plugin-interface.md` § "Native TUI Harnesses" with the native checklist, and ship an example native plugin (`examples/` or a sibling `omnigent-foo-native`) proving the contract end to end. | `designs/harness-plugin-interface.md`, `examples/` | 2.1, 2.2 | Low–Med | 2–3d |
+
+**Phase 2 subtotal: ~9–12 engineer-days.**
+
+### Effort summary
+
+- **Phase 1** (internal seam): ~17–25 engineer-days.
+- **Phase 2** (community + web): ~9–12 engineer-days.
+- **Total: ~26–37 engineer-days** of focused work across ~12 PRs (splittable to
+  ~14 with 1.5 and 2.3 breaking in two). Folding in review cycles, CI, and
+  runner e2e validation, that is realistically **~2–3 calendar months** done
+  alongside other work. The critical path is 1.1 → 1.2 → 1.5 (runner) →
+  2.2 → 2.3 (web); the risk center is **PR 1.5**, where the `_supervise_*_bridges`
+  invariants live.
 
 ## Risks and open questions
 
@@ -330,8 +380,11 @@ Deferred (under the 10k target already; fold into Phase 1 when the seam lands):
 
 ## Bottom line
 
-The data model is ready; the work is untangling native orchestration from five
-`runner/app.py` chains and four other hubs into a `NativeHarnessProvider`
-behavior seam, then flipping the validator. Do the file split (Phase 0) first so
-the seam lands in small, reviewable modules, then the core-only seam (Phase 1),
-then community enablement (Phase 2).
+The data model is ready and Phase 0 (the file splits) has landed. The remaining
+work is untangling native orchestration from five `runner/app.py` chains and
+four other hubs into a `NativeHarnessProvider` behavior seam, then flipping the
+validator — sequenced as ~12 PRs (Phase 1: 1.1–1.8 core-only; Phase 2: 2.1–2.4
+community + web), ~26–37 engineer-days total. Start with the additive foundation
+(1.1 provider model + resolver), which unblocks everything; the risk center is
+1.5 (runner launch/terminal-route), where the `_supervise_*_bridges` invariants
+live.
