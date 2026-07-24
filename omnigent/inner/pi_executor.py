@@ -789,6 +789,9 @@ def _build_models_json(
                     "supportsStore": False,
                     "supportsStrictMode": False,
                     "supportsReasoningEffort": False,
+                    # Gemini/Qwen/Llama/inkling models reject stream_options
+                    # (which carries include_usage) with 400 "unknown field".
+                    "supportsUsageInStreaming": False,
                 },
                 "models": _DATABRICKS_COMPLETIONS_MODELS,
             },
