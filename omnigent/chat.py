@@ -58,6 +58,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
@@ -1054,55 +1055,27 @@ def _redirect_native_resume_if_needed(
     native_agent = native_coding_agent_for_wrapper_label(wrapper_label)
     if native_agent is None:
         return False
-    if native_agent.key == "claude":
-        _run_claude_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "codex":
-        _run_codex_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "pi":
-        _run_pi_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "kiro":
-        _run_kiro_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "cursor":
-        _run_cursor_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    if native_agent.key == "kimi":
-        _run_kimi_native_resume_redirect(
-            base_url=base_url,
-            conversation_id=conversation_id,
-            auto_open_conversation=auto_open_conversation,
-            progress=progress,
-        )
-        return True
-    return False
+    run_native = resolve_hook_for_key(native_agent.key, "run_native")
+    if run_native is None:
+        return False
+    # The native TUI owns the turns; resuming through the Omnigent REPL would run
+    # an Omnigent turn per message *and* let the transcript forwarder mirror the
+    # same message from the native store, double-posting each user turn. Redirect
+    # to `omnigent <key> --resume`'s direct tmux attach instead — the wrapper
+    # label is `<key>-native` and the CLI command is `<key>`.
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name=native_agent.harness,
+        native_command=native_agent.key,
+    )
+    run_native(
+        server=base_url,
+        session_id=conversation_id,
+        extra_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+    return True
 
 
 def _finish_native_redirect_progress(
@@ -1130,208 +1103,6 @@ def _finish_native_redirect_progress(
             f"session — redirecting to `omnigent {native_command} --resume`.\n"
         ),
         err=True,
-    )
-
-
-def _run_claude_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a claude-native conversation back to ``omnigent claude``.
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricksapps.com"``.
-    :param conversation_id: Omnigent conversation id, e.g.
-        ``"conv_abc123"``.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="claude-native",
-        native_command="claude",
-    )
-    from omnigent.claude_native import run_claude_native
-
-    run_claude_native(
-        server=base_url,
-        session_id=conversation_id,
-        extra_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_codex_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a codex-native conversation back to ``omnigent codex``.
-
-    :param base_url: Omnigent server base URL, e.g.
-        ``"https://example.databricksapps.com"``.
-    :param conversation_id: Omnigent conversation id, e.g.
-        ``"conv_abc123"``.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="codex-native",
-        native_command="codex",
-    )
-    from omnigent.codex_native import run_codex_native
-
-    run_codex_native(
-        server=base_url,
-        session_id=conversation_id,
-        extra_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_pi_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a pi-native conversation back to ``omnigent pi``.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="pi-native",
-        native_command="pi",
-    )
-    from omnigent.pi_native import run_pi_native
-
-    run_pi_native(
-        server=base_url,
-        session_id=conversation_id,
-        extra_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_kiro_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """Hand a kiro-native conversation back to ``omnigent kiro``."""
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="kiro-native",
-        native_command="kiro",
-    )
-    from omnigent.kiro_native import run_kiro_native
-
-    run_kiro_native(
-        server=base_url,
-        session_id=conversation_id,
-        extra_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_cursor_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a cursor-native conversation back to ``omnigent cursor``.
-
-    The cursor-native session is driven by the ``cursor-agent`` TUI in a
-    runner-owned tmux pane, and the forwarder mirrors that transcript back
-    into the conversation. Resuming through the Omnigent REPL would instead
-    run an Omnigent turn per message (which persists its own user item) *and*
-    leave the forwarder mirroring the same message from the cursor store —
-    recording each user message twice. Redirecting to ``omnigent cursor``'s
-    direct tmux attach keeps the TUI the single source of turns.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="cursor-native",
-        native_command="cursor",
-    )
-    from omnigent.cursor_native import run_cursor_native
-
-    run_cursor_native(
-        server=base_url,
-        session_id=conversation_id,
-        extra_args=(),
-        auto_open_conversation=auto_open_conversation,
-    )
-
-
-def _run_kimi_native_resume_redirect(
-    *,
-    base_url: str,
-    conversation_id: str,
-    auto_open_conversation: bool,
-    progress: RunnerStartupProgress | None,
-) -> None:
-    """
-    Hand a kimi-native conversation back to ``omnigent kimi``.
-
-    The kimi-native session is driven by the ``kimi`` TUI in a runner-owned
-    tmux pane. Resuming through the Omnigent REPL would run an Omnigent turn
-    per message instead of attaching to the live TUI; redirecting to
-    ``omnigent kimi``'s direct tmux attach keeps the TUI the single source of
-    turns. Mirrors :func:`_run_cursor_native_resume_redirect`.
-
-    :param base_url: Omnigent server base URL.
-    :param conversation_id: Omnigent conversation id.
-    :param auto_open_conversation: Browser-open preference for the wrapper.
-    :param progress: Optional Omnigent startup spinner to finish before redirect.
-    :returns: None.
-    """
-    _finish_native_redirect_progress(
-        progress=progress,
-        conversation_id=conversation_id,
-        wrapper_name="kimi-native",
-        native_command="kimi",
-    )
-    from omnigent.kimi_native import run_kimi_native
-
-    run_kimi_native(
-        server=base_url,
-        session_id=conversation_id,
-        extra_args=(),
-        auto_open_conversation=auto_open_conversation,
     )
 
 

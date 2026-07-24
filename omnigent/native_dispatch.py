@@ -21,19 +21,18 @@ from omnigent.harness_plugins import (
     native_provider_for_key,
 )
 
-_RESOLVE_CACHE: dict[str, Any] = {}
-
 
 def resolve(import_path: str) -> Any:
-    """Resolve a ``module:attr`` / ``module.attr`` path to its object, cached.
+    """Resolve a ``module:attr`` / ``module.attr`` path to its object.
 
-    Thin caching wrapper over :func:`omnigent.harness_plugins.load_object`.
+    Thin wrapper over :func:`omnigent.harness_plugins.load_object`. Deliberately
+    *not* cached: native dispatch happens at most once per resume/launch/seed —
+    never in a hot loop — and the underlying ``importlib.import_module`` already
+    caches the module in ``sys.modules``, so the only repeated cost is a cheap
+    ``getattr``. Resolving fresh keeps ``monkeypatch.setattr("...:run_x", ...)``
+    working, which caching would silently defeat by pinning the pre-patch object.
     """
-    cached = _RESOLVE_CACHE.get(import_path)
-    if cached is None:
-        cached = load_object(import_path)
-        _RESOLVE_CACHE[import_path] = cached
-    return cached
+    return load_object(import_path)
 
 
 def resolve_hook(provider: NativeHarnessProvider, hook: str) -> Any | None:
@@ -56,8 +55,3 @@ def resolve_hook_for_key(key: str, hook: str) -> Any | None:
     if provider is None:
         return None
     return resolve_hook(provider, hook)
-
-
-def reset_resolve_cache_for_tests() -> None:
-    """Clear the per-path resolution cache."""
-    _RESOLVE_CACHE.clear()

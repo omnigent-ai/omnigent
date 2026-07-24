@@ -284,7 +284,6 @@ def test_builtin_native_provider_paths_resolve() -> None:
     """
     from omnigent import native_dispatch
 
-    native_dispatch.reset_resolve_cache_for_tests()
     for provider in hp.native_providers():
         for hook in (
             "run_native",

@@ -3819,6 +3819,63 @@ def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) 
     }
 
 
+def test_redirect_native_resume_covers_every_native_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every native wrapper redirects — the seam closed the old 6-of-11 gap.
+
+    The hand-written dispatch only covered claude/codex/pi/kiro/cursor/kimi, so a
+    goose/hermes/antigravity/qwen/opencode resume fell through to the Omnigent
+    REPL and double-posted. Routing through the provider seam covers all of them;
+    goose stands in for the formerly-uncovered set here.
+    """
+    from omnigent._wrapper_labels import GOOSE_NATIVE_WRAPPER_VALUE
+
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: GOOSE_NATIVE_WRAPPER_VALUE,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "omnigent.goose_native.run_goose_native",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    handled = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_goose",
+        auto_open_conversation=False,
+    )
+
+    assert handled is True
+    assert captured == {
+        "server": "https://example.com",
+        "session_id": "conv_goose",
+        "extra_args": (),
+        "auto_open_conversation": False,
+    }
+
+
+def test_redirect_native_resume_ignores_non_native_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-native (or absent) wrapper label leaves the resume to the REPL."""
+    monkeypatch.setattr(
+        chat_module,
+        "_wrapper_label_for_conversation",
+        lambda **_kw: None,
+    )
+
+    handled = chat_module._redirect_native_resume_if_needed(
+        base_url="https://example.com",
+        conversation_id="conv_plain",
+        auto_open_conversation=False,
+    )
+
+    assert handled is False
+
+
 def test_cursor_native_resume_never_drives_an_omnigent_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
