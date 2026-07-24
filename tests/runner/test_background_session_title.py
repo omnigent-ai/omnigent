@@ -389,6 +389,8 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
             args = captured["args"]
             output_path = Path(args[args.index("--output-last-message") + 1])
             codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
+            captured["auth_text"] = (codex_home / "auth.json").read_text()
+            captured["config_text"] = (codex_home / "config.toml").read_text()
             captured["agents_exists"] = (codex_home / "AGENTS.md").exists()
             output_path.write_text("Debug authentication timeout\n")
             return b"", b"ignored warning"
@@ -399,8 +401,25 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
 
     source_home = tmp_path / "source-codex-home"
     source_home.mkdir()
-    (source_home / "auth.json").write_text("{}")
-    (source_home / "config.toml").write_text('model_provider = "openai"\n')
+    (source_home / "auth.json").write_text('{"auth_mode": "oauth"}')
+    (source_home / "config.toml").write_text(
+        'model_provider = "custom"\n'
+        'unrelated_top_level = "drop"\n'
+        "\n"
+        "[model_providers.custom]\n"
+        'name = "Custom Provider"\n'
+        'base_url = "https://example.test/v1"\n'
+        "\n"
+        "[profiles.team]\n"
+        'model_provider = "custom"\n'
+        'model = "gpt-5.4-mini"\n'
+        "\n"
+        "[mcp_servers.unrelated]\n"
+        'command = "echo"\n'
+        "\n"
+        "[features]\n"
+        "multi_agent = true\n"
+    )
     (source_home / "AGENTS.md").write_text("Do unrelated work")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
@@ -435,6 +454,14 @@ async def test_codex_native_title_uses_ephemeral_tool_free_exec(
     assert "omnigent-codex-title-" in captured["kwargs"]["cwd"]
     codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
     assert codex_home != source_home
+    assert captured["auth_text"] == '{"auth_mode": "oauth"}'
+    config_text = captured["config_text"]
+    assert 'model_provider = "custom"' in config_text
+    assert "[model_providers.custom]" in config_text
+    assert "[profiles.team]" in config_text
+    assert "unrelated_top_level" not in config_text
+    assert "mcp_servers" not in config_text
+    assert "[features]" not in config_text
     assert captured["agents_exists"] is False
 
 
