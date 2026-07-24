@@ -21,6 +21,7 @@ import {
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  ClockIcon,
   CircleStopIcon,
   FolderIcon,
   FolderInputIcon,
@@ -239,13 +240,19 @@ interface SidebarProps {
  * which is `inbox` in both standalone and embedded modes. Conversation ids are
  * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
  */
-function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
+function useActiveNavItem(): {
+  isNewChatPage: boolean;
+  isInboxPage: boolean;
+  isTasksPage: boolean;
+} {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
-  const isInboxPage = useLocation().pathname.split("/").filter(Boolean).at(-1) === "inbox";
-  // Exclude inbox: it also has no `:conversationId`, so it would otherwise
-  // light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage;
-  return { isNewChatPage, isInboxPage };
+  const leaf = useLocation().pathname.split("/").filter(Boolean).at(-1);
+  const isInboxPage = leaf === "inbox";
+  const isTasksPage = leaf === "tasks";
+  // Exclude inbox/tasks: they also have no `:conversationId`, so they would
+  // otherwise light up the "New session" button.
+  const isNewChatPage = activeConversationId == null && !isInboxPage && !isTasksPage;
+  return { isNewChatPage, isInboxPage, isTasksPage };
 }
 
 /**
@@ -393,7 +400,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, isTasksPage } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -602,6 +609,25 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               >
                 <SquarePenIcon className="size-3.5 text-muted-foreground" />
                 New session
+              </Link>
+            </Button>
+            {/* Keep Scheduled in the primary nav group with the same row treatment as New session. */}
+            <Button
+              asChild
+              className={cn(
+                // Same shared nav-row construct as "New session" / "Inbox" /
+                // "Select sessions" so the active-pill, hover, insets, icon
+                // column, and text weight all match post-refactor.
+                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] px-2 font-normal",
+                SIDEBAR_HOVER_HIGHLIGHT,
+                isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+              )}
+              variant="ghost"
+              data-testid="scheduled-tasks-nav"
+            >
+              <Link to="/tasks" onClick={onNavClick}>
+                <ClockIcon className="size-3.5 text-muted-foreground" />
+                Scheduled
               </Link>
             </Button>
             {selectionMode ? (

@@ -133,8 +133,7 @@ prompt: You are a friendly assistant. Say hello and answer questions.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 # Required for PUT /filesystem/{path} seeding in UI tests (e.g. markdown
 # editor comments) — the runner returns 404 when os_env is absent.
@@ -200,8 +199,7 @@ prompt: You are a terse assistant with no filesystem.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 """
 _FILES_PROBE_ENV_AGENT_YAML = f"""\
 name: {_FILES_PROBE_ENV_AGENT_NAME}
@@ -209,8 +207,7 @@ prompt: You are a terse assistant with a filesystem.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 os_env:
   type: caller_process
@@ -1330,8 +1327,7 @@ prompt: |
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 os_env:
   type: caller_process

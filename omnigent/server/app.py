@@ -2790,6 +2790,21 @@ def create_app(
                 tags=["oauth"],
             )
             _logger.info("device-grant: /oauth/* routes enabled")
+            # Multi-user server with a PUBLIC device-authorize endpoint: without
+            # the shared client secret, anyone who can reach the server can
+            # initiate a device flow, so the only phishing defense is the
+            # consent-page warning + short TTL. Warn loudly so an operator opts
+            # into OMNIGENT_DEVICE_CLIENT_SECRET (which closes initiation to
+            # unauthorized callers) rather than leaving it off unknowingly. See
+            # designs/DEVICE_AUTH.md § "Device-code phishing".
+            if not os.environ.get("OMNIGENT_DEVICE_CLIENT_SECRET", "").strip():
+                _logger.warning(
+                    "device-grant: OMNIGENT_DEVICE_CLIENT_SECRET is not set — the "
+                    "/oauth/device/authorize endpoint is PUBLIC (any caller may "
+                    "initiate a login flow). Set OMNIGENT_DEVICE_CLIENT_SECRET on "
+                    "the server and its trusted client(s) to restrict initiation "
+                    "to authorized clients. See designs/DEVICE_AUTH.md.",
+                )
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite

@@ -8,16 +8,22 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-# Attachment path markers the native executors prepend to prompt text
+from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+
+# Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
-# "[Attached file: /tmp/...]" from codex-native's _file_block_to_input_item).
+# "[Attached file: /tmp/...]" from codex-native's _file_block_to_input_item,
+# "[Attachment <name> could not be loaded]" from native_attachments'
+# unresolved_attachment_marker).
 # Those markers round-trip through the vendor transcript as user-message
 # text, so without filtering them a session started with an image is
 # titled by a temp-file path instead of what the user typed. Matched per
-# line by synthesize_conversation_title; keep in sync with
-# omnigent/inner/claude_native_executor.py and
-# omnigent/inner/codex_native_executor.py.
-_ATTACHMENT_MARKER_RE = re.compile(r"^\[Attached(?: file)?: .+\]$")
+# line by synthesize_conversation_title; keep the Attached variants in
+# sync with attachment_reference_line in omnigent/inner/native_attachments.py
+# and omnigent/inner/codex_native_executor.py.
+_ATTACHMENT_MARKER_RE = re.compile(
+    rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
+)
 
 # ── Conversation ──────────────────────────────────────
 

@@ -86,6 +86,15 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
 /**
+ * Quit-safety timeouts (see the before-quit handler near the end of this
+ * file). `let` (not const) so tests can shrink them via __test.setQuitTimeouts
+ * to exercise the force-exit safety nets without waiting seconds in real
+ * time. Production code never writes them.
+ */
+let quitCleanupTimeoutMs = 10000;
+let quitInstallFallbackMs = 3000;
+
+/**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
  * button drives the Web Speech API and a `getUserMedia` audio stream (for the
  * mic level meter); both go through Chromium's permission layer, which in
@@ -2877,6 +2886,20 @@ if (!gotLock) {
   // stop a local server it owns. The desktop owns its host connections (the
   // confirmed lifecycle), so quitting disconnects this machine. We defer the
   // quit until cleanup finishes, then re-issue it.
+  //
+  // Hard safety cap: the only thing that ever lets the quit proceed is the
+  // re-issued app.quit() in .finally — and re-issuing app.quit() after
+  // before-quit's preventDefault() is a known intermittently-unreliable
+  // Electron behavior (electron/electron#4994, #33643, #39094). If that re-issue
+  // is a no-op, or shutdown hangs (a stuck `omnigent server stop`), the app
+  // would otherwise stay up with its window still open — looking exactly like
+  // "refuses to quit". So if graceful cleanup + the re-issued quit haven't
+  // terminated the process within quitCleanupTimeoutMs, force-exit. Host
+  // children are SIGKILL'd at 4s and a normal `omnigent server stop` is sub-
+  // second, so a normal quit completes well under the cap; the cap only trips
+  // when something is genuinely stuck, and force-exiting then is strictly
+  // better than a hung app. A cut-off server stop only leaves a daemon with a
+  // pidfile that the next launch reuses or `omnigent server stop` reclaims.
   let quitCleanupDone = false;
   let quitCleanupStarted = false;
   app.on("before-quit", (event) => {
@@ -2887,14 +2910,45 @@ if (!gotLock) {
     event.preventDefault();
     if (quitCleanupStarted) return;
     quitCleanupStarted = true;
-    serverManager
-      .shutdown(resolvedCliPath())
+
+    // unref'd so the cap itself can't hold the event loop open; app.exit()
+    // bypasses before-quit/will-quit, so it's the guaranteed way out when
+    // app.quit() proves unreliable.
+    const cap = setTimeout(() => {
+      if (quitCleanupDone) return;
+      quitCleanupDone = true;
+      app.exit(0);
+    }, quitCleanupTimeoutMs);
+    if (typeof cap.unref === "function") cap.unref();
+
+    // resolvedCliPath() is evaluated inside the async IIFE so a throw (a future
+    // change to settings/CLI resolution) becomes a rejection caught below,
+    // never stranding the quit. shutdown() always settles: host children are
+    // SIGKILL'd within 4s and `omnigent server stop` has its own exec timeout.
+    (async () => {
+      const cliPath = resolvedCliPath();
+      await serverManager.shutdown(cliPath);
+    })()
       .catch(() => {})
       .finally(() => {
+        if (quitCleanupDone) return; // the hard cap already forced the exit
         quitCleanupDone = true;
+        clearTimeout(cap);
         // Hand off to a user-approved install if one is pending; otherwise
-        // complete the deferred quit.
-        if (!updater.quitAndInstallIfPending()) app.quit();
+        // complete the deferred quit. quitAndInstall() re-issues app.quit()
+        // (via setImmediate) only when it can actually install — so if the
+        // staged update is gone and install() returns false, fall back to a
+        // plain quit and then a forced exit after a short grace, rather than
+        // leave the app up waiting for an update that won't install. The
+        // installer is spawned synchronously inside quitAndInstall(), so by
+        // the time the fallback fires the update is already underway (or was
+        // never going to install) — force-exiting only ensures we quit.
+        if (updater.quitAndInstallIfPending()) {
+          const fallback = setTimeout(() => app.exit(0), quitInstallFallbackMs);
+          if (typeof fallback.unref === "function") fallback.unref();
+        } else {
+          app.quit();
+        }
       });
   });
 }

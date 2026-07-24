@@ -58,6 +58,14 @@ export function LoginPage() {
   // paths — never a fully-qualified URL — to prevent open-redirect.
   const returnTo = sanitizeReturnTo(params.get("return_to"));
   const magicError = params.get("magic"); // "expired" | "missing" | null
+  // Forced re-authentication: the device-grant consent page bounces here with
+  // ?reauth=1 to require a FRESH password submit before approving a delegated
+  // login, even for an already-signed-in user. When set, suppress the
+  // "already authenticated → bounce back" shortcut below — otherwise the
+  // stale session would auto-return to consent, which would just bounce here
+  // again (a loop). The user must re-enter their password; a successful submit
+  // mints a new session whose iat clears the consent page's freshness check.
+  const forceReauth = params.get("reauth") === "1";
 
   const [username, setUsername] = useState(readLastUsername);
   const [password, setPassword] = useState("");
@@ -74,7 +82,12 @@ export function LoginPage() {
   // user — bounce them to where they were headed (or home). Covers
   // someone hitting /login directly, a bookmarked /login, or a
   // back-button after auth. Hard-navigate so identity.ts re-runs.
+  //
+  // EXCEPT under forced re-auth (?reauth=1, from device-grant consent): there
+  // the whole point is to re-prove the password, so an existing session must
+  // NOT short-circuit — show the form and require a fresh submit.
   useEffect(() => {
+    if (forceReauth) return;
     void (async () => {
       const account = await getMe();
       if (account !== null) {

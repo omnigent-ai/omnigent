@@ -143,9 +143,18 @@ def test_auth_aware_native_harness_reports_binary_missing(
 def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Installed but not signed in → ``needs-auth`` (the second step)."""
+    """Installed but not signed in AND no provider → ``needs-auth``.
+
+    Claude is ready via a configured provider OR a CLI login; this pins the
+    both-absent case. The autouse fixture points config home at an empty tmp
+    dir, so no provider is configured — but stub it explicitly so the verdict
+    can't depend on ambient config.
+    """
     _all_clis_installed(monkeypatch)
-    # claude: `claude auth status` reports not-logged-in.
+    # claude: no provider configured AND `claude auth status` not-logged-in.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
+    )
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key: False)
     # opencode: no stored/env provider.
     import omnigent.onboarding.opencode_auth as oc
@@ -158,6 +167,64 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
     result = configured_harness_map()
     assert result["claude-native"] == "needs-auth"
     assert result["opencode-native"] == "needs-auth"
+
+
+def test_claude_ready_via_configured_provider_without_cli_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude with an omnigent provider (API key) but NO CLI login reads ready.
+
+    A user who set an ANTHROPIC API key (a ``key``-kind provider) must go green
+    even though ``claude auth status`` — the subscription login — reports
+    not-logged-in. Checking the provider first also avoids the status subprocess
+    on this common path.
+    """
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
+    )
+
+    def _must_not_probe(_key: str) -> bool:
+        raise AssertionError("CLI login probed despite a configured provider")
+
+    monkeypatch.setattr(hi, "harness_cli_logged_in", _must_not_probe)
+    assert configured_harness_map()["claude-native"] is True
+
+
+def test_family_provider_configured_excludes_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``subscription``-kind default is NOT counted as a provider credential.
+
+    Subscription auth lives in the harness CLI's own login (judged by
+    ``harness_cli_logged_in``); counting it here would double-count that path
+    and mask a genuine "installed but no key" state. Only non-subscription kinds
+    (key/gateway/…) satisfy the provider check.
+    """
+    import omnigent.onboarding.harness_readiness as hrmod
+    from omnigent.onboarding.provider_config import KEY_KIND, SUBSCRIPTION_KIND
+
+    class _Provider:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
+        lambda _cfg, _h: _Provider(SUBSCRIPTION_KIND),
+    )
+    assert hrmod._family_provider_configured("claude-native") is False
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
+        lambda _cfg, _h: _Provider(KEY_KIND),
+    )
+    assert hrmod._family_provider_configured("claude-native") is True
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
+        lambda _cfg, _h: None,
+    )
+    assert hrmod._family_provider_configured("claude-native") is False
 
 
 def test_auth_aware_native_harness_launch_gate_stays_binary_only(
@@ -284,7 +351,6 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # antigravity-native is also gated (it wraps the ``agy`` CLI); with no
     # binary it reads False before its credential check is even reached.
     for cli in (
-        "pi",
         "kimi",
         "cursor-native",
         "native-cursor",
@@ -298,9 +364,10 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "hermes",
     ):
         assert result[cli] is False, f"{cli} should be gated on its CLI binary"
-    # Auth-aware native harnesses (codex, claude, opencode) carry a two-step
-    # signal in the picker map, so a missing binary is the structured
-    # ``"binary-missing"`` (step 1 to-do), not a bare ``False``.
+    # Auth-aware harnesses (codex, claude, opencode, pi) carry a two-step signal
+    # in the picker map, so a missing binary is the structured ``"binary-missing"``
+    # (step 1 to-do), not a bare ``False``. Pi joined this group — it now reports
+    # the credential axis (no CLI login; its credential is a provider).
     for missing in (
         "codex",
         "codex-native",
@@ -308,6 +375,8 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "claude-native",
         "native-claude",
         "opencode-native",
+        "pi",
+        "pi-native",
     ):
         assert result[missing] == "binary-missing", f"{missing} should name the missing CLI binary"
 
@@ -335,6 +404,11 @@ def test_configured_harness_map_all_true_with_clis(
     # antigravity-native also needs a credential (not just the ``agy`` binary).
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: True)
     monkeypatch.setenv("GH_TOKEN", "gho_ready")
+    # claude / pi are auth-aware on the credential axis now: satisfy the provider
+    # check deterministically (don't depend on the dev machine's real config).
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
+    )
     # The generic ACP harness is config-gated (≥1 registered agent), not
     # CLI-gated — satisfy it so it isn't the lone unconfigured entry here.
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
