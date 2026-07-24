@@ -174,10 +174,10 @@ def test_claude_ready_via_configured_provider_without_cli_login(
 ) -> None:
     """Claude with an omnigent provider (API key) but NO CLI login reads ready.
 
-    The key change for M2: a user who set an ANTHROPIC API key from the UI (a
-    ``key``-kind provider) must go green even though ``claude auth status`` — the
-    subscription login — reports not-logged-in. Checking the provider first also
-    avoids the status subprocess on this common path.
+    A user who set an ANTHROPIC API key (a ``key``-kind provider) must go green
+    even though ``claude auth status`` — the subscription login — reports
+    not-logged-in. Checking the provider first also avoids the status subprocess
+    on this common path.
     """
     _all_clis_installed(monkeypatch)
     monkeypatch.setattr(
@@ -209,19 +209,19 @@ def test_family_provider_configured_excludes_subscription(
             self.kind = kind
 
     monkeypatch.setattr(
-        "omnigent.onboarding.provider_config.default_provider_for_harness",
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
         lambda _cfg, _h: _Provider(SUBSCRIPTION_KIND),
     )
     assert hrmod._family_provider_configured("claude-native") is False
 
     monkeypatch.setattr(
-        "omnigent.onboarding.provider_config.default_provider_for_harness",
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
         lambda _cfg, _h: _Provider(KEY_KIND),
     )
     assert hrmod._family_provider_configured("claude-native") is True
 
     monkeypatch.setattr(
-        "omnigent.onboarding.provider_config.default_provider_for_harness",
+        "omnigent.onboarding.harness_readiness.default_provider_for_harness",
         lambda _cfg, _h: None,
     )
     assert hrmod._family_provider_configured("claude-native") is False

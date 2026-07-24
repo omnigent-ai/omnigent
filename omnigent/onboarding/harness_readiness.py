@@ -55,6 +55,9 @@ from omnigent.onboarding.provider_config import (
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
+    SUBSCRIPTION_KIND,
+    default_provider_for_harness,
+    load_config,
 )
 
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
@@ -339,12 +342,6 @@ def _family_provider_configured(harness: str) -> bool:
         for the harness's family, else ``False``.
     """
     try:
-        from omnigent.onboarding.provider_config import (
-            SUBSCRIPTION_KIND,
-            default_provider_for_harness,
-            load_config,
-        )
-
         provider = default_provider_for_harness(load_config(), harness)
     except Exception:
         # Readiness must never raise; a broken/unreadable config fails to
