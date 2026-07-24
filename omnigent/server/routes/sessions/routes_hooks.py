@@ -133,6 +133,8 @@ def register_hooks_routes(
             400 if the body fails JSON parse or is missing
             ``tool_name``.
         """
+        from omnigent.server.routes import sessions as _sf
+
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
@@ -263,7 +265,7 @@ def register_hooks_routes(
             request,
             session_id=session_id,
             params=params,
-            timeout_s=_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            timeout_s=_sf._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
             # Client-minted stable id so a retry re-parks the same elicitation.
             elicitation_id=elicitation_id,
@@ -459,7 +461,9 @@ def register_hooks_routes(
         :raises OmnigentError: 404 if the session doesn't exist,
             400 if the body is malformed.
         """
-        user_id = _get_user_id(request, auth_provider)
+        from omnigent.server.routes import sessions as _sf
+
+        user_id = _sf._get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
@@ -536,13 +540,11 @@ def register_hooks_routes(
                 media_type="application/json",
             )
 
-        from omnigent.server.routes import sessions as _sessions_facade
-
-        loaded = _sessions_facade.get_agent_cache().load(
+        loaded = _sf.get_agent_cache().load(
             agent.id, agent.bundle_location, expand_env=agent.session_id is None
         )
 
-        _caps = _sessions_facade.get_caps()
+        _caps = _sf.get_caps()
 
         # Fast path: if no policies would fire (no agent guardrails, no
         # session policies, no server-wide defaults), skip the engine build
@@ -774,11 +776,13 @@ def register_hooks_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         codex_request = parse_codex_elicitation_request(payload)
+        from omnigent.server.routes import sessions as _sf
+
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
             params=codex_request.params,
-            timeout_s=_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
+            timeout_s=_sf._CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
             elicitation_id=codex_elicitation_id(
                 session_id,
@@ -882,11 +886,13 @@ def register_hooks_routes(
                 f"Invalid 'params' in antigravity elicitation hook body: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        from omnigent.server.routes import sessions as _sf
+
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
             params=params,
-            timeout_s=_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
+            timeout_s=_sf._ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
         )
@@ -996,11 +1002,13 @@ def register_hooks_routes(
             content_preview=content_preview,
             **extras,
         )
+        from omnigent.server.routes import sessions as _sf
+
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
             params=params,
-            timeout_s=_CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            timeout_s=_sf._CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
             tool_name=f"Cursor({operation_type})",
@@ -1104,11 +1112,13 @@ def register_hooks_routes(
             policy_name=policy_name,
             content_preview=content_preview,
         )
+        from omnigent.server.routes import sessions as _sf
+
         result = await _publish_and_wait_for_harness_elicitation(
             request,
             session_id=session_id,
             params=params,
-            timeout_s=_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+            timeout_s=_sf._NATIVE_PERMISSION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
             elicitation_id=elicitation_id,
             tool_name=f"{agent}({operation_type})",
