@@ -1,9 +1,8 @@
 // One row in the Tasks list, rendered as a FLAT list row (no card chrome — no
 // border/background/shadow box, no per-row divider). Layout: bold task title on
-// line 1 (+ a small "Paused" pill when paused, + a completion-status pill for
-// the last run), a single muted subline on line 2 with the human-readable
-// schedule summary ("Weekdays at 8:00 AM") followed by the SERVER's next-run
-// time ("· Next: Tomorrow 9:00 AM") when armed.
+// line 1 (+ a small "Paused" pill when paused), a single muted subline on line 2
+// with the human-readable schedule summary ("Weekdays at 8:00 AM") followed by
+// the SERVER's next-run time ("· Next: Tomorrow 9:00 AM") when armed.
 //
 // The next-run time is the scheduler's authoritative `nextRunAt` (an ISO string
 // the server computes) — we only FORMAT it, never recompute it on the client,
@@ -31,24 +30,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
-import type { ScheduledTask, ScheduledTaskRunStatus } from "@/lib/scheduledTasksApi";
-
-/**
- * Display config for each last-run status pill. `succeeded` deliberately renders
- * NOTHING (a green "Succeeded" pill on every healthy row is visual noise — the
- * signal is failure/skip/in-flight); the others are distinct: destructive for
- * `failed`, muted for `skipped`, accent for the in-flight `running`/`scheduled`.
- * `incomplete` (a stale run force-failed by the server) reads as a failure.
- */
-const RUN_STATUS_PILL: Partial<
-  Record<ScheduledTaskRunStatus, { label: string; className: string }>
-> = {
-  failed: { label: "Failed", className: "bg-destructive/10 text-destructive" },
-  incomplete: { label: "Failed", className: "bg-destructive/10 text-destructive" },
-  skipped: { label: "Skipped", className: "bg-muted text-muted-foreground" },
-  running: { label: "Running", className: "bg-primary/10 text-primary" },
-  scheduled: { label: "Queued", className: "bg-primary/10 text-primary" },
-};
+import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
   task,
@@ -67,7 +49,6 @@ export function ScheduledTaskRow({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const paused = task.state === "paused";
-  const statusPill = task.lastRunStatus ? RUN_STATUS_PILL[task.lastRunStatus] : undefined;
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
   // server value; we never recompute next-run on the client.
@@ -92,7 +73,7 @@ export function ScheduledTaskRow({
         // two edges are symmetric within the highlight; `pr-10` keeps the text
         // clear of the inset button. Paused rows are NOT dimmed — the title must
         // stay legible (AA); the "Paused" pill is the sole signal.
-        "group relative -mx-2 flex items-center gap-3 rounded-lg py-3 pr-10 pl-2 transition-colors hover:bg-muted/50",
+        "group relative -mx-2 flex items-center gap-3 rounded-lg py-[11px] pr-10 pl-2 transition-colors hover:bg-muted/50",
       )}
     >
       <div className="flex min-w-0 flex-1 flex-col">
@@ -104,18 +85,6 @@ export function ScheduledTaskRow({
               className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
             >
               Paused
-            </span>
-          )}
-          {statusPill && (
-            <span
-              data-testid="task-run-status-pill"
-              data-status={task.lastRunStatus}
-              className={cn(
-                "shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium",
-                statusPill.className,
-              )}
-            >
-              {statusPill.label}
             </span>
           )}
         </span>

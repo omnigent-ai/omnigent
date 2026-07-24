@@ -1,5 +1,4 @@
-// Tests for ScheduledTaskRow: the last-run completion pill (one per status,
-// plus the no-pill cases), the server-sourced next-run text, and the ⋯ menu
+// Tests for ScheduledTaskRow: the server-sourced next-run text and the ⋯ menu
 // actions (Run now / Pause-Resume / Edit / Delete) dispatching their callbacks.
 //
 // The row is fully props-driven, so these render it directly with a built task
@@ -9,7 +8,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScheduledTaskRow } from "./ScheduledTaskRow";
-import type { ScheduledTask, ScheduledTaskRunStatus } from "@/lib/scheduledTasksApi";
+import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
@@ -53,58 +52,6 @@ function renderRow(
 }
 
 afterEach(cleanup);
-
-describe("last-run status pill", () => {
-  it.each<[ScheduledTaskRunStatus, string]>([
-    ["failed", "Failed"],
-    ["incomplete", "Failed"],
-    ["skipped", "Skipped"],
-    ["running", "Running"],
-    ["scheduled", "Queued"],
-  ])("renders the %s status as a '%s' pill", (status, label) => {
-    renderRow(task({ lastRunStatus: status }));
-    const pill = screen.getByTestId("task-run-status-pill");
-    expect(pill).toHaveTextContent(label);
-    expect(pill).toHaveAttribute("data-status", status);
-  });
-
-  it("renders NO status pill when the task has never run (null status)", () => {
-    renderRow(task({ lastRunStatus: null }));
-    expect(screen.queryByTestId("task-run-status-pill")).toBeNull();
-  });
-
-  it("renders NO status pill for a succeeded run (success is not noise)", () => {
-    renderRow(task({ lastRunStatus: "succeeded" }));
-    expect(screen.queryByTestId("task-run-status-pill")).toBeNull();
-  });
-
-  it("marks failed distinctly from skipped (destructive vs muted)", () => {
-    const { rerender } = render(
-      <ScheduledTaskRow
-        task={task({ lastRunStatus: "failed" })}
-        onEdit={vi.fn()}
-        onPauseToggle={vi.fn()}
-        onRunNow={vi.fn()}
-        onDelete={vi.fn()}
-        busy={false}
-      />,
-    );
-    expect(screen.getByTestId("task-run-status-pill").className).toContain("text-destructive");
-    rerender(
-      <ScheduledTaskRow
-        task={task({ lastRunStatus: "skipped" })}
-        onEdit={vi.fn()}
-        onPauseToggle={vi.fn()}
-        onRunNow={vi.fn()}
-        onDelete={vi.fn()}
-        busy={false}
-      />,
-    );
-    const skipped = screen.getByTestId("task-run-status-pill");
-    expect(skipped.className).toContain("text-muted-foreground");
-    expect(skipped.className).not.toContain("text-destructive");
-  });
-});
 
 describe("next-run text (server-sourced)", () => {
   it("renders the formatted next-run when nextRunAt is set", () => {
