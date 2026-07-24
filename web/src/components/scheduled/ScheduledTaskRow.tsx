@@ -10,7 +10,7 @@
 // right. No leading or trailing status circles — the ⋯ menu is the only affordance.
 
 import { useMemo, useState } from "react";
-import { MoreHorizontalIcon, PauseIcon, PlayIcon, Trash2Icon } from "lucide-react";
+import { MoreHorizontalIcon, PauseIcon, PencilIcon, PlayIcon, Trash2Icon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -24,11 +24,13 @@ import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
   task,
+  onEdit,
   onPauseToggle,
   onDelete,
   busy,
 }: {
   task: ScheduledTask;
+  onEdit: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onDelete: (task: ScheduledTask) => void;
   busy: boolean;
@@ -98,6 +100,10 @@ export function ScheduledTaskRow({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          <DropdownMenuItem onSelect={() => onEdit(task)} data-testid="task-edit">
+            <PencilIcon className="size-4" />
+            Edit
+          </DropdownMenuItem>
           <DropdownMenuItem onSelect={() => onPauseToggle(task)} data-testid="task-pause-toggle">
             {paused ? (
               <>

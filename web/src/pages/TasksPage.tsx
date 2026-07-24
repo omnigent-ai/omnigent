@@ -46,6 +46,7 @@ export function TasksPage() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
   const [manualOpen, setManualOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
   // Prefill for the manual create dialog when opened from a "Suggestions" chip.
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
   // stale prefill never leaks into a subsequent plain "New task" open.
@@ -53,17 +54,22 @@ export function TasksPage() {
 
   function openManual() {
     setPrefill(null);
+    setEditingTask(null);
     setManualOpen(true);
   }
 
   function openFromSuggestion(s: ScheduledTaskSuggestion) {
     setPrefill(s.prefill);
+    setEditingTask(null);
     setManualOpen(true);
   }
 
   function handleManualOpenChange(next: boolean) {
     setManualOpen(next);
-    if (!next) setPrefill(null);
+    if (!next) {
+      setPrefill(null);
+      setEditingTask(null);
+    }
   }
 
   const filtered = useMemo(() => {
@@ -75,6 +81,11 @@ export function TasksPage() {
       if (q && !t.name.toLowerCase().includes(q)) return false;
       return true;
     });
+    const nextRunByTaskId = new Map(
+      matches
+        .filter((t) => t.state === "active")
+        .map((t) => [t.id, nextRunAtMs(t.rrule, t.timezone)]),
+    );
     // Sort: ACTIVE first (soonest next-run at the top), PAUSED last. The
     // least-actionable (paused) rows sink to the bottom rather than leading the
     // list. Active rows with no computable next-run sort after those that have
@@ -84,8 +95,8 @@ export function TasksPage() {
       const bPaused = b.state === "paused";
       if (aPaused !== bPaused) return aPaused ? 1 : -1;
       if (aPaused && bPaused) return a.name.localeCompare(b.name);
-      const aNext = nextRunAtMs(a.rrule, a.timezone);
-      const bNext = nextRunAtMs(b.rrule, b.timezone);
+      const aNext = nextRunByTaskId.get(a.id) ?? null;
+      const bNext = nextRunByTaskId.get(b.id) ?? null;
       if (aNext == null && bNext == null) return a.name.localeCompare(b.name);
       if (aNext == null) return 1;
       if (bNext == null) return -1;
@@ -110,6 +121,12 @@ export function TasksPage() {
 
   function handleDelete(task: ScheduledTask) {
     deleteMutation.mutate(task.id);
+  }
+
+  function handleEdit(task: ScheduledTask) {
+    setPrefill(null);
+    setEditingTask(task);
+    setManualOpen(true);
   }
 
   const hasAnyTasks = (tasks ?? []).length > 0;
@@ -198,6 +215,7 @@ export function TasksPage() {
               key={task.id}
               task={task}
               busy={busyId === task.id}
+              onEdit={handleEdit}
               onPauseToggle={handlePauseToggle}
               onDelete={handleDelete}
             />
@@ -218,6 +236,7 @@ export function TasksPage() {
         onOpenChange={handleManualOpenChange}
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
+        editingTask={editingTask}
       />
     </PageScroll>
   );

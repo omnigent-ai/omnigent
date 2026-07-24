@@ -26,6 +26,20 @@ describe("CommandGoalDialog", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("describes the selected goal backend", () => {
+    render(
+      <CommandGoalDialog
+        open
+        onOpenChange={vi.fn()}
+        readOnly={false}
+        onStartGoal={vi.fn()}
+        backendLabel="Codex"
+      />,
+    );
+
+    expect(screen.getByText(/Codex keeps working until this condition is met/)).toBeInTheDocument();
+  });
+
   it("rejects an empty condition", () => {
     const onStartGoal = vi.fn();
     render(

@@ -126,6 +126,30 @@ describe("Composer Claude goal control", () => {
   });
 });
 
+describe("Composer Codex goal control", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("sends the completion condition as a Codex /goal command", () => {
+    const onSend = vi.fn();
+    useChatStore.setState({ conversationId: "conv_polly" });
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend, showPollyCodexGoalControl: true })} />,
+    );
+
+    fireEvent.click(screen.getByTestId("goal-toggle"));
+    expect(screen.getByText(/Codex keeps working until this condition is met/)).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("goal-condition"), {
+      target: { value: "  Finish the implementation and pass tests  " },
+    });
+    fireEvent.click(screen.getByTestId("goal-start"));
+
+    expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
+
 describe("Composer slash-command menu", () => {
   beforeEach(() => {
     // Two skills so the menu has skill rows distinct from the built-ins.

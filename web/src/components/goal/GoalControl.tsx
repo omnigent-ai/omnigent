@@ -75,6 +75,7 @@ export function GoalControl(props: GoalControlProps) {
           onOpenChange={setOpen}
           readOnly={readOnly}
           onStartGoal={props.onStartGoal}
+          backendLabel={backendLabel}
         />
       ) : (
         <GoalDialog

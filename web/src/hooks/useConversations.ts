@@ -17,18 +17,12 @@
 // chat's row is held in place via an in-memory override (sidebarNav
 // `ActiveChatOverride`) so sends don't reorder it.
 
-import { useMemo } from "react";
-import {
-  useInfiniteQuery,
-  useMutation,
-  useQueries,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
+  PINNED_LABEL_KEY,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
   type ConversationsInfiniteData,
@@ -768,49 +762,188 @@ export function useBulkStopSessions() {
   });
 }
 
+// ── Pinned hooks ──────────────────────────────────────────────────────────────
+
+// The reserved `conversation_labels` pinned key lives in the leaf cache module
+// (see sessionListCache) so membership checks can read it without a value
+// import cycle; re-exported here for the existing consumers.
+export { PINNED_LABEL_KEY };
+
+// TanStack Query key for the server-authoritative pinned-session list.
+// Deliberately NOT under the ["conversations"] prefix: the list mutations do
+// prefix-matched `getQueriesData(["conversations"])` sweeps (and
+// `filtersFromConversationQueryKey`, which throws on a non-list key) plus
+// `invalidateQueries(["conversations"])`. A pinned key nested under that prefix
+// would be swept into those loops — the throw aborted the toggle's cache patch,
+// so a pinned row didn't move until a refetch. A sibling key keeps it isolated.
+export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
+
 /**
- * Fetch pinned sessions that aren't present in the loaded paginated
- * data. Returns the backfilled conversations so the caller can merge
- * them into the list before grouping.
- *
- * Each missing pinned ID fires an individual ``GET /v1/sessions/{id}``
- * via ``fetchConversationById``. Results are cached with a long stale
- * time — the low-rate list reconciliation will eventually include the
- * session once it scrolls into the loaded window, at which point the
- * individual query is no longer consulted.
- *
- * @param pinnedIds - User's pinned session IDs from localStorage.
- * @param loadedIds - Set of session IDs present in the paginated data.
+ * Fetch every pinned session (the `omnigent.pinned` label) via
+ * `GET /v1/sessions?pinned=true`, independent of the sidebar's paginated
+ * window. Pins now live on the server (a session label) so they follow the
+ * user across devices; this query is the source of truth for which sessions
+ * are pinned and supplies the rows for any pin that sits outside the loaded
+ * list. A generous single page (100) covers realistic pin counts.
  */
-export function usePinnedConversationBackfill(
-  pinnedIds: readonly string[],
-  loadedIds: Set<string>,
-): Conversation[] {
-  const missingIds = pinnedIds.filter((id) => !loadedIds.has(id));
-  const results = useQueries({
-    queries: missingIds.map((id) => ({
-      queryKey: ["conversation-backfill", id],
-      queryFn: () => fetchConversationById(id),
-      staleTime: 60_000,
-      retry: false,
-    })),
+export async function fetchPinnedConversations(): Promise<Conversation[]> {
+  const params = new URLSearchParams({
+    order: "desc",
+    sort_by: "updated_at",
+    limit: "100",
+    pinned: "true",
   });
-  // Stabilize the returned array: only produce a new reference when
-  // the set of resolved IDs actually changes. Without this, useQueries
-  // returns a new array object on every render → downstream memos and
-  // effects re-fire → infinite re-render loop.
-  const resolvedIds = results
-    .filter((r) => r.data != null)
-    .map((r) => r.data!.id)
-    .join(",");
-  return useMemo(() => {
-    const backfilled: Conversation[] = [];
-    for (const result of results) {
-      if (result.data) backfilled.push(result.data);
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return ((await res.json()) as ConversationsPage).data;
+}
+
+/** Server-authoritative list of the viewer's pinned sessions. */
+export function usePinnedConversations() {
+  return useQuery<Conversation[]>({
+    queryKey: PINNED_CONVERSATIONS_KEY,
+    queryFn: fetchPinnedConversations,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * PATCH the pinned label on a session. Pinning stores the epoch-ms pin time as
+ * the value (so the Pinned section can order by pin recency); an empty string
+ * signals unpin — the server deletes the label row rather than persisting an
+ * empty value (labels are upsert-only). An optional `pinnedAt` lets the
+ * localStorage migration preserve each legacy pin's relative order.
+ */
+export async function setConversationPinned(
+  id: string,
+  pinned: boolean,
+  pinnedAt: number = Date.now(),
+): Promise<Conversation> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      labels: { [PINNED_LABEL_KEY]: pinned ? String(pinnedAt) : "" },
+    }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
+/**
+ * Pin / unpin a session via `PATCH /v1/sessions/{id}` (the `omnigent.pinned`
+ * label). Overlays only the `labels` field onto cached rows and patches the
+ * pinned-list query directly (adding the row on pin, removing it on unpin)
+ * rather than invalidating it. `GET /v1/sessions?pinned=true` is served from a
+ * label index that catches up to the write asynchronously (same reindex lag the
+ * rename / delete hooks document), so an immediate refetch races it and would
+ * return the pre-toggle set — the Pinned section would flip back until a manual
+ * refresh. The query's `staleTime` converges it later.
+ *
+ * The PATCH returns a `SessionResponse` snapshot, which carries `labels` but
+ * NOT `updated_at` (only the list endpoint's `SessionListItem` has it). So the
+ * row inserted into the pinned cache is built from the existing cached row (for
+ * its `updated_at`, `title`, etc.) with the server-confirmed `labels` overlaid
+ * — never from the raw PATCH response, which would leave the row without a
+ * timestamp until the pinned query refetched (a blank time field on the new
+ * row). For the same reason the list overlay carries only `labels`, so pinning
+ * can't blank an existing row's timestamp.
+ */
+export function useTogglePinnedConversation() {
+  const queryClient = useQueryClient();
+
+  // Locate the fullest cached row for an id, so the pinned insert keeps a real
+  // `updated_at` (the PATCH snapshot lacks it). A project session lives only in
+  // its folder's ["project-sessions", name] cache when it's outside the main
+  // window, so that cache is searched too — otherwise its pinned row would be
+  // built from the timestamp-less snapshot.
+  const findRow = (id: string): Conversation | undefined =>
+    queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY)?.find((c) => c.id === id) ??
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
+      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
+      .find((c) => c.id === id) ??
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
+      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
+      .find((c) => c.id === id);
+
+  // Apply a pin/unpin to every cache that renders the row. `labels` is the
+  // authoritative label map to write; membership in the Pinned section is
+  // driven by the PINNED_CONVERSATIONS_KEY cache, so that patch is what makes
+  // the row visibly move.
+  const patch = (id: string, labels: Record<string, string>, pinned: boolean) => {
+    const existing = findRow(id);
+    // The pin toggle only changes `labels`; overlay just that so it can't
+    // clobber other fields (e.g. blank `updated_at`) on the list rows.
+    const itemsById = new Map([[id, { id, labels } satisfies SessionListWireItem]]);
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["conversations"],
+    })) {
+      const { data: next } = mergeItemsIntoPages(
+        data,
+        itemsById,
+        filtersFromConversationQueryKey(key),
+        undefined,
+      );
+      if (next !== data) queryClient.setQueryData(key, next);
     }
-    return backfilled;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resolvedIds]);
+    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+      old ? { ...old, labels } : old,
+    );
+    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
+    // Add the row on pin (its label carries the pin timestamp the sidebar sorts
+    // by) built from the existing row + labels; drop it on unpin.
+    queryClient.setQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY, (old) => {
+      const rest = (old ?? []).filter((c) => c.id !== id);
+      if (!pinned) return rest;
+      // Prefer the full cached row (keeps title/updated_at); fall back to a
+      // minimal row when the session isn't in any loaded cache (rare — the pin
+      // affordance lives on a visible row). The pinned query refetch fills the
+      // rest in later.
+      const row: Conversation = existing
+        ? { ...existing, labels }
+        : ({ id, object: "conversation", labels } as Conversation);
+      return [...rest, row];
+    });
+  };
+
+  return useMutation({
+    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
+      setConversationPinned(id, pinned),
+    // Move the row immediately — don't wait for the PATCH round-trip. Without
+    // this the row lingers in its project folder (or the flat list) until the
+    // network resolves, which reads as lag. Snapshot the pinned cache so a
+    // failed PATCH rolls back.
+    onMutate: ({ id, pinned }) => {
+      const prevPinned = queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY);
+      const base = findRow(id)?.labels ?? {};
+      const labels: Record<string, string> = pinned
+        ? { ...base, [PINNED_LABEL_KEY]: String(Date.now()) }
+        : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
+      patch(id, labels, pinned);
+      return { prevPinned };
+    },
+    onError: (_err, _vars, ctx) => {
+      // Restore the pinned section; the label overlays on the other caches are
+      // cosmetic and self-heal on the next reconcile.
+      if (ctx?.prevPinned !== undefined) {
+        queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, ctx.prevPinned);
+      }
+    },
+    onSuccess: (updated, { pinned }) => {
+      // No `markConversationSeen` here: a pin PATCH writes only the label row,
+      // never conversations.updated_at (unlike rename/archive/move, which bump
+      // it and need the anchor to suppress that self-bump). Anchoring here would
+      // instead mark a session with genuine unread activity as read on pin.
+      //
+      // Reconcile with the server-confirmed labels (authoritative pin
+      // timestamp). Don't invalidate the pinned query — the `?pinned=true` label
+      // index lags the write, so a refetch would momentarily revert the toggle;
+      // the query's `staleTime` converges it later.
+      patch(updated.id, updated.labels, pinned);
+    },
+  });
 }
 
 // ── Project hooks ─────────────────────────────────────────────────────────────

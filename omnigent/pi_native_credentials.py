@@ -335,20 +335,42 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
         return None
 
 
+# GPT model versions known to work fine with /chat/completions + function tools.
+# Any GPT model NOT in this set defaults to the Responses API (safer default for
+# newer models we haven't explicitly tested with completions).
+# These token fragments identify GPT models that work fine with
+# /chat/completions + function tools. Any GPT model whose id does NOT contain
+# one of these tokens defaults to the Responses API (safer for new models).
+# Use specific enough tokens so "gpt-5" doesn't match "gpt-5-5".
+_GPT_COMPLETIONS_COMPATIBLE: frozenset[str] = frozenset(
+    {
+        "gpt-5-4",  # gpt-5-4, gpt-5-4-mini, gpt-5-4-nano
+        "gpt-5-2",
+        "gpt-5-1",
+        "gpt-5-mini",
+        "gpt-5-nano",
+        "gpt-oss",  # excluded entirely via _unsupported_in_pi
+    }
+)
+
+
 def _needs_responses_api(model_id_lower: str) -> bool:
-    """Return True when a Databricks model requires the Responses API for tools.
+    """Return True when a GPT model requires the Responses API for tools.
 
-    Newer GPT models (gpt-5.5, gpt-5.6-*, gpt-5.3-codex) reject function tool
-    calls via ``/chat/completions`` with 400; they work via the Responses API at
-    the AI Gateway (``/ai-gateway/codex/v1/responses``). Detected by name: these
-    models have ``gpt-5.5``, ``gpt-5.6``, or ``gpt-5.3-codex`` in their id.
-    Non-GPT models (Kimi, Llama, GLM) and older GPT (5.4, 5.2, …) work fine
-    with ``/chat/completions`` + tools.
+    Some GPT models reject function tool calls via ``/chat/completions`` with
+    400; they work via the AI Gateway Responses API instead. Rather than
+    maintaining a denylist of newer versions, we maintain an allowlist of models
+    known to work with completions. Any GPT model not in the allowlist defaults
+    to the Responses API — safer for new models we haven't tested.
 
-    Expects a pre-lowercased model id (the caller typically has ``name_lower``
-    already computed).
+    Non-GPT models are handled separately (Kimi/inkling via reasoning:true,
+    Gemini/Qwen3/gpt-oss excluded via _unsupported_in_pi).
+
+    Expects a pre-lowercased model id.
     """
-    return any(token in model_id_lower for token in ("gpt-5-5", "gpt-5-6", "gpt-5-3-codex"))
+    if "gpt" not in model_id_lower:
+        return False
+    return not any(token in model_id_lower for token in _GPT_COMPLETIONS_COMPATIBLE)
 
 
 def _unsupported_in_pi(model_id_lower: str) -> bool:
@@ -363,14 +385,16 @@ def _unsupported_in_pi(model_id_lower: str) -> bool:
     Exclude these models from both providers so the picker can show them but
     Pi doesn't try to call them with tools.
 
-    Also includes gpt-oss models (gpt-oss-120b, gpt-oss-20b) which return
-    content as a typed array ``[{type:'reasoning',...},{type:'text',...}]``.
+    Also includes gpt-oss and qwen3 models which return content as a typed
+    array ``[{type:'reasoning',...},{type:'text',...}]`` when tools are present.
     Pi's openai-completions streaming handler does ``block.text += content``
     where content is an array, producing ``[object Object],[object Object]``.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
+    return (
+        "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower or "qwen3" in model_id_lower
+    )
 
 
 def _fetch_pi_model_lists(
@@ -441,7 +465,17 @@ def _fetch_pi_model_lists(
         else:
             is_llm = any(
                 t in name_lower
-                for t in ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi", "glm")
+                for t in (
+                    "claude",
+                    "gpt",
+                    "codex",
+                    "gemini",
+                    "llama",
+                    "qwen",
+                    "kimi",
+                    "glm",
+                    "inkling",
+                )
             )
         if not is_llm:
             continue
@@ -450,6 +484,12 @@ def _fetch_pi_model_lists(
         if isinstance(ready, str) and ready and ready.upper() != "READY":
             continue
         entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
+        # Kimi (and GLM/DeepSeek) stream output on reasoning_content channel.
+        # Pi's openai-completions parser requires reasoning:true on the model
+        # entry to consume that channel; without it the turn ends with
+        # "Stream ended without finish_reason".
+        if any(frag in name_lower for frag in ("kimi", "glm", "deepseek", "inkling")):
+            entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
         elif _needs_responses_api(name_lower):

@@ -27,6 +27,7 @@ import { RRule, rrulestr } from "rrule";
 // date makes BY* rules fully determine the schedule. Matches the server's
 // fixed-deterministic-anchor approach.
 const OCCURRENCE_ANCHOR = new Date(Date.UTC(2000, 0, 1, 0, 0, 0));
+const FIXED_PERIOD_SAFETY_MARGIN = 2;
 
 /** Days-of-week bit set helpers. RRule weekday order is MO..SU (0..6). */
 const WEEKDAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR].map((d) => d.weekday);
@@ -197,18 +198,21 @@ export function nextRunAtMs(
 ): number | null {
   const base = tryParse(rrule);
   if (!base) return null;
-  // Rebuild with a fixed dtstart so occurrence generation is anchored
-  // deterministically (see OCCURRENCE_ANCHOR) rather than to import-time now.
-  let rule: RRule;
-  try {
-    rule = new RRule({ ...base.origOptions, dtstart: OCCURRENCE_ANCHOR });
-  } catch {
-    return null;
-  }
   // rrule's `.after` treats the DTSTART/occurrences as UTC-naive wall times.
   // Query against a "now" that is itself the current wall time in the task's
   // timezone, so the comparison happens in the rule's frame.
   const nowInTz = shiftWallClock(now, timezone);
+  // Rebuild with a fixed dtstart so occurrence generation is anchored
+  // deterministically (see OCCURRENCE_ANCHOR) rather than to import-time now.
+  // For fixed-period rules, move that anchor forward by whole periods so rrule
+  // only iterates near "now" while preserving the original 2000-based phase.
+  const dtstart = occurrenceAnchorNear(base, nowInTz);
+  let rule: RRule;
+  try {
+    rule = new RRule({ ...base.origOptions, dtstart });
+  } catch {
+    return null;
+  }
   let occurrence: Date | null;
   try {
     occurrence = rule.after(nowInTz, false);
@@ -227,6 +231,40 @@ export function nextRunAtMs(
 function firstOf(v: number | number[] | null | undefined): number | null {
   if (v == null) return null;
   return Array.isArray(v) ? (v.length > 0 ? v[0]! : null) : v;
+}
+
+function occurrenceAnchorNear(rule: RRule, nowInRuleFrame: Date): Date {
+  const periodMs = fixedPeriodMs(rule);
+  if (periodMs == null) return OCCURRENCE_ANCHOR;
+
+  const elapsedMs = nowInRuleFrame.getTime() - OCCURRENCE_ANCHOR.getTime();
+  if (elapsedMs <= 0) return OCCURRENCE_ANCHOR;
+
+  const periodsSinceAnchor = Math.floor(elapsedMs / periodMs);
+  const periodsToAdvance = Math.max(0, periodsSinceAnchor - FIXED_PERIOD_SAFETY_MARGIN);
+  return new Date(OCCURRENCE_ANCHOR.getTime() + periodsToAdvance * periodMs);
+}
+
+function fixedPeriodMs(rule: RRule): number | null {
+  const interval =
+    typeof rule.origOptions.interval === "number" && rule.origOptions.interval > 1
+      ? rule.origOptions.interval
+      : 1;
+
+  switch (rule.origOptions.freq) {
+    case RRule.SECONDLY:
+      return interval * 1000;
+    case RRule.MINUTELY:
+      return interval * 60_000;
+    case RRule.HOURLY:
+      return interval * 3_600_000;
+    case RRule.DAILY:
+      return interval * 86_400_000;
+    case RRule.WEEKLY:
+      return interval * 604_800_000;
+    default:
+      return null;
+  }
 }
 
 /** Normalize a scalar-or-array RRULE option (e.g. bymonthday, bymonth) to a

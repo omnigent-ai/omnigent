@@ -2149,9 +2149,9 @@ def create_app(
         # source as /api/version), surfaced so the web UI can show it in the
         # session info popover alongside the per-session host version.
         # smart_routing_enabled: true when the server can route — either
-        # a RoutingClient is explicitly configured (OMNIGENT_SMART_ROUTING=1
-        # + llm: config) or the managed deployment registered a
-        # policy_llm_connection_factory (which means it has LLM capability
+        # a RoutingClient is configured (a server llm: block, or a
+        # routing.provider=external block) or the managed deployment registered
+        # a policy_llm_connection_factory (which means it has LLM capability
         # and will supply its own RoutingClient).
         try:
             from omnigent.runtime._globals import _caps

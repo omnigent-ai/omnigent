@@ -28,16 +28,20 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     open,
     initialName,
     initialPrompt,
+    editingTask,
   }: {
     open: boolean;
     initialName?: string;
     initialPrompt?: string;
+    editingTask?: ScheduledTask | null;
   }) =>
     open ? (
       <div
         data-testid="manual-dialog-open"
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
+        data-editing-task-id={editingTask?.id ?? ""}
+        data-editing-task-name={editingTask?.name ?? ""}
       />
     ) : null,
 }));
@@ -334,6 +338,17 @@ describe("suggestion prefill", () => {
 });
 
 describe("row actions", () => {
+  it("opens edit mode for a task from the row menu", () => {
+    setTasks([task({ id: "st_edit", name: "Morning brief" })]);
+    renderPage();
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("task-edit"));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog.getAttribute("data-editing-task-id")).toBe("st_edit");
+    expect(dialog.getAttribute("data-editing-task-name")).toBe("Morning brief");
+    expect(dialog.getAttribute("data-initial-name")).toBe("");
+  });
+
   it("pauses an active task via the row menu (Pause label reflects state)", () => {
     setTasks([task({ id: "st_1", state: "active" })]);
     renderPage();

@@ -41,11 +41,16 @@ from playwright.sync_api import Page, expect
 _HOST_ID = "host_e2e"
 
 # Bare session list/scan — the flat sidebar list. Anchored so it matches
-# `/v1/sessions` (+ query) but NOT `/v1/sessions/projects` or the per-session
-# `/v1/sessions/{id}/...` sub-paths, so the routes never overlap.
-_SESSIONS_RE = re.compile(r"/v1/sessions(\?(?!.*\bproject=)[^/]*)?$")
+# `/v1/sessions` (+ query) but NOT `/v1/sessions/projects`, the per-session
+# `/v1/sessions/{id}/...` sub-paths, or the `?project=` / `?pinned=` filtered
+# variants (handled by their own routes below), so the routes never overlap.
+_SESSIONS_RE = re.compile(r"/v1/sessions(\?(?!.*\b(?:project|pinned)=)[^/]*)?$")
 # Per-project list — `/v1/sessions?...&project=<name>` (folder contents).
 _PROJECT_SESSIONS_RE = re.compile(r"/v1/sessions\?[^/]*\bproject=")
+# Pinned list — `/v1/sessions?...&pinned=true` (the sidebar's Pinned section,
+# server-authoritative). Pins live on the server now, so the Pinned section is
+# driven by this query, not localStorage.
+_PINNED_SESSIONS_RE = re.compile(r"/v1/sessions\?[^/]*\bpinned=")
 _PROJECTS_RE = re.compile(r"/v1/sessions/projects$")
 _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 
@@ -105,13 +110,26 @@ def _row(
     }
 
 
-# The flat list carries every non-project row: the pinned one (peeled into
-# Pinned via localStorage), plus the unfiled "Sessions" rows — one plain, one
-# awaiting approval (pink "needs response" badge), one running (spinner).
+# Canonical pin label the client reads (the server collapses each viewer's
+# per-user `omnigent.pinned.<user>` key back to this bare key on the wire). Its
+# value is the epoch-ms pin time; any non-empty value means pinned.
+_PINNED_LABEL_KEY = "omnigent.pinned"
+_PINNED_AT_MS = str(_NOW_S * 1000)
+
+# The flat list carries every non-project row: the pinned one (also returned by
+# the `?pinned=true` query, which drives the Pinned section) plus the unfiled
+# "Sessions" rows — one plain, one awaiting approval (pink "needs response"
+# badge), one running (spinner). The pinned row carries the canonical pin label
+# so it renders in Pinned rather than the flat list.
 _SESSIONS_BODY = {
     "object": "list",
     "data": [
-        _row(_PINNED_ID, "Prototype the agent orchestration layer", updated_at=_NOW_S - _HOUR),
+        _row(
+            _PINNED_ID,
+            "Prototype the agent orchestration layer",
+            updated_at=_NOW_S - _HOUR,
+            labels={_PINNED_LABEL_KEY: _PINNED_AT_MS},
+        ),
         _row(
             "conv_flat_1",
             "Draft the enterprise onboarding checklist",
@@ -152,6 +170,24 @@ _PROJECT_SESSIONS_BODY = {
     ],
     "first_id": "conv_proj_1",
     "last_id": "conv_proj_1",
+    "has_more": False,
+}
+
+# The `?pinned=true` query's result — the sidebar's Pinned section, independent
+# of the loaded window. Just the one pinned row (same row as in the flat list,
+# carrying the canonical pin label so it sorts by pin time).
+_PINNED_SESSIONS_BODY = {
+    "object": "list",
+    "data": [
+        _row(
+            _PINNED_ID,
+            "Prototype the agent orchestration layer",
+            updated_at=_NOW_S - _HOUR,
+            labels={_PINNED_LABEL_KEY: _PINNED_AT_MS},
+        ),
+    ],
+    "first_id": _PINNED_ID,
+    "last_id": _PINNED_ID,
     "has_more": False,
 }
 
@@ -206,19 +242,21 @@ def test_populated_sidebar_matches_baseline(
     page.route("**/v1/agents", lambda r: fulfill_json(r, _AGENTS_BODY))
     page.route("**/v1/hosts", lambda r: fulfill_json(r, _HOSTS_BODY))
     page.route(_FILESYSTEM_RE, lambda r: fulfill_json(r, _EMPTY_LIST_BODY))
-    # Order matters: register the narrower project routes before the bare list.
+    # Order matters: register the narrower project/pinned routes before the bare
+    # list (the bare-list regex already excludes their query params, but keeping
+    # the specific routes first is clearest).
     page.route(_PROJECTS_RE, lambda r: fulfill_json(r, _PROJECTS_BODY))
     page.route(_PROJECT_SESSIONS_RE, lambda r: fulfill_json(r, _PROJECT_SESSIONS_BODY))
+    page.route(_PINNED_SESSIONS_RE, lambda r: fulfill_json(r, _PINNED_SESSIONS_BODY))
     page.route(_SESSIONS_RE, lambda r: fulfill_json(r, _SESSIONS_BODY))
 
-    # Seed the working-directory chip (fixed value) and the two sidebar prefs —
-    # the pinned session and the expanded "Moonshot" folder — before the SPA
-    # boots so both render on first paint.
+    # Seed the working-directory chip (fixed value) and the expanded "Moonshot"
+    # folder before the SPA boots so both render on first paint. Pins are no
+    # longer a localStorage pref — the Pinned section is driven by the
+    # `?pinned=true` route stubbed above.
     page.add_init_script(
         f'window.localStorage.setItem("omnigent:recent-workspaces",'
         f' JSON.stringify({{"{_HOST_ID}": ["/work/repo"]}}));'
-        f'window.localStorage.setItem("omnigent:pinned-conversation-ids",'
-        f" {json.dumps(json.dumps([_PINNED_ID]))});"
         f'window.localStorage.setItem("omnigent:expanded-project-sections",'
         f" {json.dumps(json.dumps([_PROJECT_OPEN]))});"
     )

@@ -1044,6 +1044,25 @@ def _extract_latest_user_content(
     return ""
 
 
+def _goal_objective_from_content(content: str | list[dict[str, Any]]) -> str | None:
+    """Return the objective from a standalone ``/goal`` user command."""
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for block in content:
+            if block.get("type") not in {"input_text", "text"}:
+                return None
+            text = block.get("text")
+            if not isinstance(text, str):
+                return None
+            text_parts.append(text)
+        content = "".join(text_parts)
+    command, separator, objective = content.strip().partition(" ")
+    if command != "/goal" or not separator:
+        return None
+    objective = objective.strip()
+    return objective or None
+
+
 def _build_initial_prompt(
     messages: list[Message],
 ) -> str | list[dict[str, Any]]:
@@ -1573,7 +1592,25 @@ class _CodexAppServerSession:
             self._applied_effort = None
 
         assert self.thread_id is not None
-        prompt = _prompt_for_turn(messages, is_new_thread=is_new_thread)
+        latest_user_content = _extract_latest_user_content(messages)
+        goal_objective = _goal_objective_from_content(latest_user_content)
+        prompt_messages = messages
+        if goal_objective is not None:
+            await self._request(
+                "thread/goal/set",
+                {
+                    "threadId": self.thread_id,
+                    "objective": goal_objective,
+                },
+            )
+            # A reset thread still needs prior history, with the command
+            # replaced by the clean objective sent to Codex.
+            prompt_messages = [message.copy() for message in messages]
+            for message in reversed(prompt_messages):
+                if message.get("role") == "user":
+                    message["content"] = goal_objective
+                    break
+        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:

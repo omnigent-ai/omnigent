@@ -149,6 +149,6 @@
   },
   "dependencies": {
     "electron-updater": "^6.3.9",
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^4.3.0"
   }
 }

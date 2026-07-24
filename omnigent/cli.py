@@ -3409,20 +3409,19 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    # Build the routing client when the feature is enabled via
-    # OMNIGENT_SMART_ROUTING=1. Two mutually-exclusive providers, chosen
-    # by ``routing.provider``:
-    #   - ``external``: call an external ``routes:select`` service.
-    #   - ``llm`` (default): the built-in judge using the ``llm:`` block.
-    # Hidden by default — managed deployments override
+    # Build the routing client from configuration alone — no opt-in env needed.
+    # Two mutually-exclusive providers, chosen by ``routing.provider``:
+    #   - ``external``: call an external ``routes:select`` service (built when a
+    #     ``routing:`` block declares ``provider: external``).
+    #   - ``llm`` (default): the built-in judge using the ``llm:`` block (built
+    #     whenever a server ``llm:`` block is configured).
+    # Stays None when neither is configured. Managed deployments override
     # RuntimeCaps.routing_client with their own implementation.
-    routing_client = None
-    if os.environ.get("OMNIGENT_SMART_ROUTING") == "1":
-        routing_cfg = cfg.get("routing")
-        if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
-            routing_client = _build_external_routing_client(routing_cfg)
-        else:
-            routing_client = _build_local_llm_routing_client(server_llm)
+    routing_cfg = cfg.get("routing")
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        routing_client = _build_external_routing_client(routing_cfg)
+    else:
+        routing_client = _build_local_llm_routing_client(server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),

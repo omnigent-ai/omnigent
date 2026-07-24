@@ -8,6 +8,7 @@ import {
   shouldShowGoalControl,
   shouldShowModelPicker,
   shouldShowPollyClaudeGoalControl,
+  shouldShowPollyCodexGoalControl,
 } from "./ChatPage";
 
 const CODEX_MODEL_OPTIONS: NativeModelOption[] = [
@@ -204,6 +205,39 @@ describe("shouldShowPollyClaudeGoalControl", () => {
       shouldShowPollyClaudeGoalControl({
         agentName: "claude",
         harness: "claude-sdk",
+        parentSessionId: null,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("shouldShowPollyCodexGoalControl", () => {
+  it("returns true only for top-level Polly sessions on Codex", () => {
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "polly",
+        harness: "codex",
+        parentSessionId: null,
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "polly",
+        harness: "claude-sdk",
+        parentSessionId: null,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "polly",
+        harness: "codex",
+        parentSessionId: "conv_parent",
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowPollyCodexGoalControl({
+        agentName: "codex",
+        harness: "codex",
         parentSessionId: null,
       }),
     ).toBe(false);

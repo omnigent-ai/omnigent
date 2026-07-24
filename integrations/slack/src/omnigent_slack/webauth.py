@@ -134,10 +134,9 @@ class WebAuthServer:
         is the Slack user's email (from ``users.info``); it is signed into the
         state and later matched against the OAuth-authenticated email, so the
         enrolled token can only be the requesting user's own. ``None`` when the
-        redirect URI isn't configured (no ``OMNIGENT_SLACK_WEBAUTH_BASE_URL`` /
-        ``DATABRICKS_APP_URL``), the state secret is missing, or the email is
-        absent — so the caller surfaces a clear message instead of a broken (or
-        unverifiable) link.
+        redirect URI isn't configured (no ``OMNIGENT_SLACK_DATABRICKS_APP_URL``),
+        the state secret is missing, or the email is absent — so the caller
+        surfaces a clear message instead of a broken (or unverifiable) link.
         """
         secret = self._settings.databricks_state_secret
         if not self._settings.databricks_redirect_uri or not secret or not email:

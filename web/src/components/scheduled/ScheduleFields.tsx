@@ -12,7 +12,11 @@
 // (scheduleBuilder.ts, scheduleText.ts) so they stay robust; they are not
 // reachable from this form today.
 
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { ClockIcon } from "lucide-react";
 import { Label } from "@/components/scheduled/Label";
+import { Input } from "@/components/ui/input";
+import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -22,13 +26,15 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import {
+  DEFAULT_SCHEDULE_MODEL,
   WEEKDAY_CODES,
+  parseMinuteOfHourInput,
+  parseTimeOfDayInput,
   validateSchedule,
   type ScheduleModel,
   type SchedulePreset,
   type WeekdayCode,
 } from "@/lib/scheduleBuilder";
-import { formatClockTime } from "@/lib/scheduleText";
 
 // Presets only: "custom" is deferred (see file header) and is
 // deliberately absent from this list, so it's unreachable from the dropdown.
@@ -39,14 +45,10 @@ const PRESET_OPTIONS: { value: SchedulePreset; label: string }[] = [
   { value: "weekly", label: "Weekly" },
 ];
 
-/** Time-of-day is constrained to 15-minute slots (no free typing). */
-const MINUTE_SLOTS = [0, 15, 30, 45] as const;
-
-/** Every 15-minute slot across the day (96 options), for the Time dropdown. */
-const TIME_SLOTS: { hour: number; minute: number }[] = Array.from({ length: 96 }, (_, i) => ({
-  hour: Math.floor(i / 4),
-  minute: (i % 4) * 15,
-}));
+const HOURS_12 = Array.from({ length: 12 }, (_, i) => i + 1);
+const MINUTES = Array.from({ length: 60 }, (_, i) => i);
+const PERIODS = ["AM", "PM"] as const;
+type Period = (typeof PERIODS)[number];
 
 const WEEKDAY_LABELS: Record<WeekdayCode, string> = {
   MO: "Mon",
@@ -75,6 +77,50 @@ export function ScheduleFields({
   const showWeekdays = model.preset === "weekly";
 
   const error = validateSchedule(model);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const hourColumnRef = useRef<HTMLDivElement | null>(null);
+  const minuteColumnRef = useRef<HTMLDivElement | null>(null);
+  const periodColumnRef = useRef<HTMLDivElement | null>(null);
+  const [timeText, setTimeText] = useState(() => formatInputValue(model, isHourly));
+  const [timePickerOpen, setTimePickerOpen] = useState(false);
+
+  useEffect(() => {
+    if (document.activeElement === inputRef.current) return;
+    setTimeText(formatInputValue(model, isHourly));
+  }, [isHourly, model.hour, model.minute]);
+
+  const pickerParts = toPickerParts(getPickerTime());
+
+  useEffect(() => {
+    if (!timePickerOpen || isHourly) return;
+    scrollSelectedIntoView(hourColumnRef.current);
+    scrollSelectedIntoView(minuteColumnRef.current);
+  }, [isHourly, pickerParts.hour12, pickerParts.minute, timePickerOpen]);
+
+  useEffect(() => {
+    if (isHourly) return;
+    const handleWheel = (event: WheelEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      const columns = [
+        hourColumnRef.current ?? document.querySelector('[data-testid="schedule-hour-column"]'),
+        minuteColumnRef.current ?? document.querySelector('[data-testid="schedule-minute-column"]'),
+        periodColumnRef.current ?? document.querySelector('[data-testid="schedule-period-column"]'),
+      ];
+      const column = columns.find((col) => col?.contains(target));
+      if (!column) return;
+      if (column.scrollHeight > column.clientHeight) {
+        column.scrollTop += event.deltaY;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      event.stopPropagation();
+    };
+    window.addEventListener("wheel", handleWheel, { capture: true, passive: false });
+    return () => {
+      window.removeEventListener("wheel", handleWheel, true);
+    };
+  }, [isHourly]);
 
   function toggleWeekday(code: WeekdayCode) {
     const has = model.weekdays.includes(code);
@@ -82,31 +128,196 @@ export function ScheduleFields({
     onChange({ ...model, weekdays: next });
   }
 
+  function handleTimeTextChange(value: string) {
+    if (isHourly) {
+      const digits = value.replace(/\D/g, "").slice(0, 2);
+      let minute = digits === "" ? Number.NaN : Number(digits);
+      if (Number.isInteger(minute) && minute > 59) minute = 59;
+      const text = Number.isInteger(minute) ? String(minute) : "";
+      setTimeText(text);
+      onChange({ ...model, minute: Number.isInteger(minute) ? minute : Number.NaN });
+      return;
+    }
+
+    setTimeText(value);
+    const parsed = parseTimeOfDayInput(value);
+    onChange({
+      ...model,
+      hour: parsed?.hour ?? Number.NaN,
+      minute: parsed?.minute ?? Number.NaN,
+    });
+  }
+
+  function canonicalizeTimeText() {
+    if (isHourly) {
+      const minute = parseMinuteOfHourInput(timeText);
+      if (minute !== null) setTimeText(formatMinuteInput(minute));
+      return;
+    }
+
+    const parsed = parseTimeOfDayInput(timeText);
+    if (parsed !== null) setTimeText(formatTimeInput(parsed.hour, parsed.minute));
+  }
+
+  function handleTimePickerOpenChange(next: boolean) {
+    setTimePickerOpen(next);
+    onSelectOpenChange?.(next);
+  }
+
+  function getPickerTime(): { hour: number; minute: number } {
+    const parsed = parseTimeOfDayInput(timeText);
+    if (parsed !== null) return parsed;
+    if (Number.isInteger(model.hour) && Number.isInteger(model.minute)) {
+      return { hour: model.hour, minute: model.minute };
+    }
+    return { hour: DEFAULT_SCHEDULE_MODEL.hour, minute: DEFAULT_SCHEDULE_MODEL.minute };
+  }
+
+  function applyPickerTime(next: Partial<{ hour12: number; minute: number; period: Period }>) {
+    const current = toPickerParts(getPickerTime());
+    const hour12 = next.hour12 ?? current.hour12;
+    const minute = next.minute ?? current.minute;
+    const period = next.period ?? current.period;
+    const hour = to24Hour(hour12, period);
+    setTimeText(formatTimeInput(hour, minute));
+    onChange({ ...model, hour, minute });
+  }
+
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="schedule-preset">Frequency</Label>
-        <Select
-          value={model.preset}
-          onValueChange={(value) => onChange({ ...model, preset: value as SchedulePreset })}
-          onOpenChange={onSelectOpenChange}
+      <div className="grid gap-3 sm:grid-cols-2 sm:gap-6" data-testid="schedule-frequency-time-row">
+        <div
+          className="flex w-full min-w-0 flex-col gap-1.5"
+          data-testid="schedule-frequency-control"
         >
-          <SelectTrigger id="schedule-preset" data-testid="schedule-preset-trigger">
-            <SelectValue />
-          </SelectTrigger>
-          {/* position="popper" opens the list anchored BELOW the trigger (auto-
-              flips up when no room) so it never overlaps the field label above,
-              unlike the default item-aligned mode. align="start" lines the
-              dropdown's left edge up with the trigger (Radix defaults to
-              center, which shifts it left). */}
-          <SelectContent position="popper" align="start">
-            {PRESET_OPTIONS.map((opt) => (
-              <SelectItem key={opt.value} value={opt.value}>
-                {opt.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+          <Label htmlFor="schedule-preset">Frequency</Label>
+          <Select
+            value={model.preset}
+            onValueChange={(value) => onChange({ ...model, preset: value as SchedulePreset })}
+            onOpenChange={onSelectOpenChange}
+          >
+            <SelectTrigger
+              id="schedule-preset"
+              data-testid="schedule-preset-trigger"
+              className="w-full"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            {/* position="popper" opens the list anchored BELOW the trigger (auto-
+                flips up when no room) so it never overlaps the field label above,
+                unlike the default item-aligned mode. align="start" lines the
+                dropdown's left edge up with the trigger (Radix defaults to
+                center, which shifts it left). */}
+            <SelectContent position="popper" align="start">
+              {PRESET_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="schedule-time-control">
+          <Label htmlFor="schedule-time">{isHourly ? "Minute" : "Time"}</Label>
+          {isHourly ? (
+            <Input
+              ref={inputRef}
+              id="schedule-time"
+              value={timeText}
+              data-testid="schedule-minute"
+              placeholder="0"
+              className="text-sm"
+              aria-invalid={error ? true : undefined}
+              onChange={(e) => handleTimeTextChange(e.target.value)}
+              onBlur={canonicalizeTimeText}
+            />
+          ) : (
+            <Popover open={timePickerOpen} onOpenChange={handleTimePickerOpenChange}>
+              <PopoverAnchor asChild>
+                <div className="relative">
+                  <Input
+                    ref={inputRef}
+                    id="schedule-time"
+                    value={timeText}
+                    data-testid="schedule-time"
+                    placeholder="5:00 PM"
+                    className="pr-8 text-sm"
+                    aria-invalid={error ? true : undefined}
+                    onFocus={() => handleTimePickerOpenChange(true)}
+                    onChange={(e) => handleTimeTextChange(e.target.value)}
+                    onBlur={canonicalizeTimeText}
+                  />
+                  <button
+                    type="button"
+                    aria-label="Open time picker"
+                    data-testid="schedule-time-picker-trigger"
+                    className="absolute top-1/2 right-2 flex size-4 -translate-y-1/2 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
+                    onClick={() => handleTimePickerOpenChange(!timePickerOpen)}
+                  >
+                    <ClockIcon className="size-3.5" />
+                  </button>
+                </div>
+              </PopoverAnchor>
+              <PopoverContent
+                align="start"
+                className="w-64 rounded-sm p-1.5"
+                onOpenAutoFocus={(event) => event.preventDefault()}
+              >
+                <div className="grid grid-cols-3 gap-1" data-testid="schedule-time-picker">
+                  <div
+                    ref={hourColumnRef}
+                    className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+                    data-testid="schedule-hour-column"
+                  >
+                    {HOURS_12.map((hour) => (
+                      <PickerCell
+                        key={hour}
+                        testId={`schedule-hour-${pad(hour)}`}
+                        selected={pickerParts.hour12 === hour}
+                        onClick={() => applyPickerTime({ hour12: hour })}
+                      >
+                        {pad(hour)}
+                      </PickerCell>
+                    ))}
+                  </div>
+                  <div
+                    ref={minuteColumnRef}
+                    className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+                    data-testid="schedule-minute-column"
+                  >
+                    {MINUTES.map((minute) => (
+                      <PickerCell
+                        key={minute}
+                        testId={`schedule-minute-${pad(minute)}`}
+                        selected={pickerParts.minute === minute}
+                        onClick={() => applyPickerTime({ minute })}
+                      >
+                        {pad(minute)}
+                      </PickerCell>
+                    ))}
+                  </div>
+                  <div
+                    ref={periodColumnRef}
+                    className="max-h-40 overflow-y-auto overscroll-contain pr-0.5"
+                    data-testid="schedule-period-column"
+                  >
+                    {PERIODS.map((period) => (
+                      <PickerCell
+                        key={period}
+                        testId={`schedule-period-${period}`}
+                        selected={pickerParts.period === period}
+                        onClick={() => applyPickerTime({ period })}
+                      >
+                        {period}
+                      </PickerCell>
+                    ))}
+                  </div>
+                </div>
+              </PopoverContent>
+            </Popover>
+          )}
+        </div>
       </div>
 
       {showWeekdays && (
@@ -137,84 +348,6 @@ export function ScheduleFields({
         </div>
       )}
 
-      <div className="flex flex-col gap-1.5">
-        <Label htmlFor="schedule-time">{isHourly ? "Minute" : "Time"}</Label>
-        {isHourly ? (
-          // Hourly fires every hour; only the minute-of-hour matters. Constrain
-          // to 15-min slots (0/15/30/45) via a dropdown — no free typing.
-          <Select
-            value={String(snapMinute(model.minute))}
-            onValueChange={(v) => onChange({ ...model, minute: Number(v) })}
-            onOpenChange={onSelectOpenChange}
-          >
-            <SelectTrigger id="schedule-time" data-testid="schedule-minute" className="w-28">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent position="popper" align="start">
-              {MINUTE_SLOTS.map((m) => (
-                <SelectItem key={m} value={String(m)}>
-                  {`:${pad(m)}`}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        ) : (
-          // Time-of-day constrained to 15-min slots (96/day) via a dropdown.
-          // Value encodes "H:M"; labels use the same 12h clock as the list rows.
-          <Select
-            value={`${snapHour(model)}:${snapMinute(model.minute)}`}
-            onValueChange={(v) => {
-              const [h, m] = v.split(":");
-              onChange({ ...model, hour: Number(h), minute: Number(m) });
-            }}
-            onOpenChange={(next) => {
-              onSelectOpenChange?.(next);
-              // Radix scrolls the SELECTED slot into view on open (even in
-              // popper mode), so a 9:00 AM default would land mid-list and hide
-              // 12:00 AM. Pin the viewport to the top so the list always starts
-              // at 12:00 AM (index 0), per product. Radix's scroll-into-view
-              // runs in a layout effect + a follow-up frame after open, so we
-              // pin on a short interval for a few ticks to reliably win the
-              // race regardless of machine speed, then stop.
-              if (next) {
-                let ticks = 0;
-                const pinTop = () => {
-                  document
-                    .querySelectorAll<HTMLElement>("[data-radix-select-viewport]")
-                    .forEach((vp) => {
-                      vp.scrollTop = 0;
-                    });
-                };
-                const timer = setInterval(() => {
-                  pinTop();
-                  if (++ticks >= 6) clearInterval(timer);
-                }, 16);
-                pinTop();
-              }
-            }}
-          >
-            <SelectTrigger id="schedule-time" data-testid="schedule-time" className="w-40">
-              <SelectValue />
-            </SelectTrigger>
-            {/* position="popper" + align="start" opens the list below the
-                trigger, left-aligned. We also reset the viewport scroll to top
-                on open (see onOpenChange) so the list starts at 12:00 AM (index
-                0) rather than scrolled to the selected slot. max-h ≈ 12 rows
-                (~28px each) so the 96 slots scroll inside the popover. */}
-            <SelectContent position="popper" align="start" className="max-h-[21rem]">
-              {TIME_SLOTS.map((slot) => (
-                <SelectItem
-                  key={`${slot.hour}:${slot.minute}`}
-                  value={`${slot.hour}:${slot.minute}`}
-                >
-                  {formatClockTime(slot.hour, slot.minute)}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        )}
-      </div>
-
       {/* describeSchedule/buildRRule stay in the lib for list rows and possible
           future previews; only the inline validation error renders here now. */}
       {error && (
@@ -226,26 +359,74 @@ export function ScheduleFields({
   );
 }
 
-/** Zero-pad a number to two digits (minute labels, e.g. ":05"). */
 function pad(n: number): string {
   return n.toString().padStart(2, "0");
 }
 
-/**
- * Snap a stored minute onto the nearest 15-min slot (0/15/30/45) so the Select's
- * controlled value always matches one of its options — otherwise a model minute
- * left off-grid (e.g. from the default 0, or a future preset) would show a blank
- * trigger. Rounds to nearest; 53 → 45, 8 → 15.
- */
-function snapMinute(n: number): number {
-  if (!Number.isFinite(n)) return 0;
-  const slot = Math.round(Math.min(59, Math.max(0, n)) / 15) * 15;
-  return slot === 60 ? 45 : slot;
+function formatInputValue(model: ScheduleModel, isHourly: boolean): string {
+  if (isHourly) return formatMinuteInput(model.minute);
+  if (!Number.isInteger(model.hour) || !Number.isInteger(model.minute)) return "";
+  return formatTimeInput(model.hour, model.minute);
 }
 
-/** The stored hour clamped to 0–23 for the Time dropdown's value. */
-function snapHour(model: ScheduleModel): number {
-  const h = model.hour;
-  if (!Number.isFinite(h)) return 0;
-  return Math.min(23, Math.max(0, Math.trunc(h)));
+function formatMinuteInput(minute: number): string {
+  if (!Number.isInteger(minute)) return "";
+  return String(Math.min(59, Math.max(0, minute)));
+}
+
+function formatTimeInput(hour: number, minute: number): string {
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return "";
+  const parts = toPickerParts({ hour, minute });
+  return `${pad(parts.hour12)}:${pad(parts.minute)} ${parts.period}`;
+}
+
+function toPickerParts(time: { hour: number; minute: number }): {
+  hour12: number;
+  minute: number;
+  period: Period;
+} {
+  const hour = Math.min(23, Math.max(0, time.hour));
+  return {
+    hour12: hour % 12 === 0 ? 12 : hour % 12,
+    minute: Math.min(59, Math.max(0, time.minute)),
+    period: hour >= 12 ? "PM" : "AM",
+  };
+}
+
+function to24Hour(hour12: number, period: Period): number {
+  return (hour12 % 12) + (period === "PM" ? 12 : 0);
+}
+
+function scrollSelectedIntoView(column: HTMLDivElement | null) {
+  column
+    ?.querySelector<HTMLElement>('[data-selected="true"]')
+    ?.scrollIntoView?.({ block: "center" });
+}
+
+function PickerCell({
+  children,
+  onClick,
+  selected,
+  testId,
+}: {
+  children: ReactNode;
+  onClick: () => void;
+  selected: boolean;
+  testId: string;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      data-selected={selected ? "true" : undefined}
+      data-testid={testId}
+      className={cn(
+        "flex h-8 w-full items-center justify-center rounded-sm text-sm transition-colors",
+        selected ? "bg-primary text-primary-foreground" : "text-foreground hover:bg-muted",
+      )}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
 }
