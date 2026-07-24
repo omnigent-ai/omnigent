@@ -768,7 +768,9 @@ def register_events_routes(
                     # parent hangs waiting for the child's inbox result. Heal
                     # the binding and re-deliver through the parent's live
                     # runner before failing.
-                    recovered = await _recover_subagent_status_forward_via_parent(
+                    from omnigent.server.routes import sessions as _sf
+
+                    recovered = await _sf._recover_subagent_status_forward_via_parent(
                         conv,
                         runner_router,
                         getattr(request.app.state, "tunnel_registry", None),
@@ -1005,11 +1007,13 @@ def register_events_routes(
             # below runs at once. A host that is offline, too old to answer,
             # or slow yields no verdict and the grace runs its normal
             # course, so the query only ever speeds up the cold path.
-            if conv.runner_id is not None and _HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0:
+            from omnigent.server.routes import sessions as _sf
+
+            if conv.runner_id is not None and _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S > 0:
                 _logger.info(
                     "Waiting up to %.1fs for host-bound runner %s to register "
                     "for session %s before relaunch",
-                    _HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+                    _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                     conv.runner_id,
                     session_id,
                 )
@@ -1019,7 +1023,7 @@ def register_events_routes(
                         runner_router,
                         _tunnel_registry,
                         runner_id=conv.runner_id,
-                        timeout_s=_HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+                        timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                         runner_exit_reports=runner_exit_reports,
                         host_conn=_grace_host_conn,
                         host_registry=_grace_host_reg,
@@ -1032,7 +1036,7 @@ def register_events_routes(
                         runner_router,
                         _tunnel_registry,
                         runner_id=conv.runner_id,
-                        timeout_s=_HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+                        timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                         runner_exit_reports=runner_exit_reports,
                     )
             # Runner is dead or still not spawned for a host-bound

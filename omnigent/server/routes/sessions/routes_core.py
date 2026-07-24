@@ -1572,7 +1572,11 @@ def register_core_routes(
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
             else:
-                runner_id = _registered_runner_id(runner_router, body.runner_id, user_id=user_id)
+                from omnigent.server.routes import sessions as _sf
+
+                runner_id = _sf._registered_runner_id(
+                    runner_router, body.runner_id, user_id=user_id
+                )
                 try:
                     await asyncio.to_thread(
                         conversation_store.replace_runner_id, session_id, runner_id

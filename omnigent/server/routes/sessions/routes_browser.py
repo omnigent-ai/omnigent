@@ -115,7 +115,7 @@ def register_browser_routes(
             _sessions_facade.session_stream.publish(session_id, event.model_dump())
             done, _pending = await asyncio.wait(
                 {future},
-                timeout=_BROWSER_ACTION_AWAIT_S,
+                timeout=_sessions_facade._BROWSER_ACTION_AWAIT_S,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if future in done and not future.cancelled():
