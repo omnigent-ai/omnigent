@@ -1545,6 +1545,13 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     compaction: CompactionConfig | None = None
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
+    # Optional tool surface restriction for local model compatibility.
+    # None = no filter (default, fully backwards-compatible).
+    # frozenset = only these tool names (plus always-on session tools) are
+    # exposed to the model via get_tool_schemas() and name lookup.
+    # Always-on tools (sys_session_list, sys_session_get_history,
+    # sys_session_get_info) are never filtered out regardless of this field.
+    allowed_tools: frozenset[str] | None = None
     os_env: OSEnvSpec | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False

@@ -173,6 +173,7 @@ def _make_spec(
     skills: list[SkillSpec] | None = None,
     mcp_servers: list[MCPServerConfig] | None = None,
     local_tools: list[LocalToolInfo] | None = None,
+    allowed_tools: frozenset[str] | None = None,
 ) -> AgentSpec:
     """
     Create a minimal ``AgentSpec`` with the given skills,
@@ -184,6 +185,7 @@ def _make_spec(
         no MCP servers.
     :param local_tools: Local tool infos, or ``None`` for
         no local tools.
+    :param allowed_tools: Optional tool-name allowlist.
     :returns: An ``AgentSpec`` with ``spec_version=1``.
     """
     return AgentSpec(
@@ -191,6 +193,7 @@ def _make_spec(
         skills=skills or [],
         mcp_servers=mcp_servers or [],
         local_tools=local_tools or [],
+        allowed_tools=allowed_tools,
     )
 
 
@@ -253,6 +256,46 @@ def test_registry_unknown_tool_returns_error(
 
 
 # ── get_tool_schemas ──────────────────────────────────
+
+
+def test_allowed_tools_filters_tool_surface() -> None:
+    """tools.allowed restricts schemas to listed and always-on tools."""
+    allowed = frozenset(["sys_add_policy", "sys_policy_registry"])
+    spec = _make_spec(allowed_tools=allowed)
+    manager = ToolManager(spec)
+    names = {s["function"]["name"] for s in manager.get_tool_schemas()}
+
+    expected = allowed | {
+        "sys_session_list",
+        "sys_session_get_history",
+        "sys_session_get_info",
+    }
+    assert names == expected
+
+
+def test_allowed_tools_empty_allowlist_keeps_only_always_on() -> None:
+    """An empty allowlist preserves only framework-required session tools."""
+    spec = _make_spec(allowed_tools=frozenset())
+    manager = ToolManager(spec)
+    names = {s["function"]["name"] for s in manager.get_tool_schemas()}
+
+    assert names == {
+        "sys_session_list",
+        "sys_session_get_history",
+        "sys_session_get_info",
+    }
+
+
+def test_allowed_tools_none_is_no_op() -> None:
+    """Without tools.allowed the tool surface remains unchanged."""
+    spec_with = _make_spec(allowed_tools=None)
+    spec_without = _make_spec()
+    manager_with = ToolManager(spec_with)
+    manager_without = ToolManager(spec_without)
+    names_with = {s["function"]["name"] for s in manager_with.get_tool_schemas()}
+    names_without = {s["function"]["name"] for s in manager_without.get_tool_schemas()}
+
+    assert names_with == names_without
 
 
 def test_schemas_include_load_skill_when_skills_exist(

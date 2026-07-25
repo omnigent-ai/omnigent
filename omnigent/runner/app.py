@@ -793,6 +793,20 @@ def _inject_mcp_schemas(
     event_body["tools"] = list(existing) + new_schemas
 
 
+def _filter_allowed_mcp_schemas(
+    schemas: list[dict[str, Any]],
+    allowed_tools: frozenset[str] | None,
+) -> list[dict[str, Any]]:
+    """Keep only MCP schemas named by an optional tool allowlist."""
+    if allowed_tools is None:
+        return schemas
+    return [
+        schema
+        for schema in schemas
+        if (schema.get("name") or _schema_tool_name(schema)) in allowed_tools
+    ]
+
+
 def _schema_tool_name(schema: dict[str, Any]) -> str | None:
     """
     Extract a tool's function name from its OpenAI-format schema.
@@ -5874,7 +5888,11 @@ def create_runner_app(
                         for t in _session_tool_schemas.get(conv, [])
                         if not (isinstance(t, dict) and "__" in (t.get("name") or ""))
                     ]
-                    _session_tool_schemas[conv] = _builtin_tools + list(mcp_result.schemas)
+                    _allowed_tools = cached_spec.allowed_tools
+                    _mcp_tools = _filter_allowed_mcp_schemas(
+                        list(mcp_result.schemas), _allowed_tools
+                    )
+                    _session_tool_schemas[conv] = _builtin_tools + _mcp_tools
                     _session_mcp_spec_hash[conv] = _mcp_hash
                 except (
                     httpx.HTTPError,
@@ -6232,8 +6250,14 @@ def create_runner_app(
             if _eager_spec_error is None and _turn_spec is not None:
                 try:
                     _mcp = await _turn_mcp.schemas_for(_turn_spec)
-                    _mcp_schemas = _mcp.schemas
-                    _mcp_tool_names = _mcp.tool_names
+                    _mcp_schemas = _filter_allowed_mcp_schemas(
+                        _mcp.schemas, _turn_spec.allowed_tools
+                    )
+                    _mcp_tool_names = {
+                        name
+                        for schema in _mcp_schemas
+                        if (name := schema.get("name") or _schema_tool_name(schema)) is not None
+                    }
                     for _srv, _err in _mcp.failures.items():
                         _logger.warning("runner MCP %r unavailable for this turn: %s", _srv, _err)
                 except Exception:

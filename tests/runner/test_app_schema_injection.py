@@ -12,7 +12,19 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.runner.app import _inject_mcp_schemas
+from omnigent.runner.app import _filter_allowed_mcp_schemas, _inject_mcp_schemas
+
+
+def test_filter_allowed_mcp_schemas_filters_flat_mcp_schemas() -> None:
+    schemas = [{"name": "read"}, {"name": "write"}]
+
+    assert _filter_allowed_mcp_schemas(schemas, frozenset({"read"})) == [{"name": "read"}]
+
+
+def test_filter_allowed_mcp_schemas_none_is_no_op() -> None:
+    schemas = [{"name": "read"}]
+
+    assert _filter_allowed_mcp_schemas(schemas, None) is schemas
 
 
 def _schema(name: str) -> dict[str, Any]:

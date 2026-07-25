@@ -93,6 +93,63 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 # string-coerced — their consumers read the nested mapping/list shape.
 _STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
 
+KNOWN_BUILTIN_TOOLS = frozenset(
+    [
+        "sys_add_policy",
+        "sys_policy_registry",
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+        "sys_call_async",
+        "sys_read_inbox",
+        "sys_cancel_async",
+        "sys_timer_set",
+        "sys_timer_cancel",
+        "load_skill",
+        "read_skill_file",
+        "web_search",
+        "web_fetch",
+        "upload_file",
+        "list_files",
+        "download_file",
+        "search_conversations",
+        "export_agent",
+        "hindsight_retain",
+        "hindsight_recall",
+        "hindsight_reflect",
+        "sys_session_list",
+        "sys_session_get_history",
+        "sys_session_get_info",
+        "sys_session_share",
+        "sys_session_send",
+        "sys_session_close",
+        "sys_list_models",
+        "sys_advise_models",
+        "sys_session_create",
+        "sys_session_rename",
+        "sys_agent_get",
+        "sys_agent_download",
+        "sys_agent_list",
+        "sys_cancel_task",
+        "list_comments",
+        "update_comment",
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_screenshot",
+        "sys_os_read",
+        "sys_os_write",
+        "sys_os_edit",
+        "sys_os_shell",
+        "sys_terminal_launch",
+        "sys_terminal_send",
+        "sys_terminal_read",
+        "sys_terminal_list",
+        "sys_terminal_close",
+    ]
+)
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip
 # SafeLoader's bool resolver process-wide.
@@ -251,6 +308,27 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # truthy/falsy values (``true`` / ``True`` / ``yes`` /
     # ``false`` / ``no``) consistently.
     async_enabled = bool(raw.get("async", True))
+    raw_allowed = raw_tools.get("allowed") if isinstance(raw_tools, dict) else None
+    if raw_allowed is not None:
+        from omnigent.tools.manager import ALWAYS_ON_TOOLS
+
+        if not isinstance(raw_allowed, list) or not all(
+            isinstance(item, str) for item in raw_allowed
+        ):
+            raise OmnigentError(
+                f"'tools.allowed' must be a list of strings, got: {raw_allowed!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        allowed_tools: frozenset[str] | None = frozenset(raw_allowed)
+        unknown = allowed_tools - KNOWN_BUILTIN_TOOLS - ALWAYS_ON_TOOLS
+        if unknown:
+            _log.warning(
+                "tools.allowed contains unrecognized built-in names: %s — "
+                "they will be silently absent if not registered for this agent",
+                unknown,
+            )
+    else:
+        allowed_tools = None
     # Top-level ``timers:`` flag gates the LLM-callable timer
     # builtins (``sys_timer_set``, ``sys_timer_cancel``).
     # Defaults to False to match
@@ -304,6 +382,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         local_tools=local_tools,
         sub_agents=sub_agents,
         async_enabled=async_enabled,
+        allowed_tools=allowed_tools,
         os_env=os_env,
         terminals=terminals,
         timers=timers,

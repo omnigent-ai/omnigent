@@ -9,12 +9,11 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.runtime import get_caps
-from omnigent.spec import AgentSpec
 from omnigent.spec.types import SharePolicy, ToolRuntime
 from omnigent.tools._srt import is_srt_available
 from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
@@ -51,9 +50,16 @@ from omnigent.tools.builtins import (
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
 
+if TYPE_CHECKING:
+    from omnigent.spec.types import AgentSpec
+
 # MCP lifecycle moved to runner; see designs/RUNNER_MCP.md.
 
 _logger = logging.getLogger(__name__)
+
+ALWAYS_ON_TOOLS: frozenset[str] = frozenset(
+    {"sys_session_list", "sys_session_get_history", "sys_session_get_info"}
+)
 
 
 class _UCFunctionSchemaTool(Tool):
@@ -196,6 +202,11 @@ class ToolManager:
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
         self._register_browser_tools()
+        # Apply optional tool surface filter for local model compatibility.
+        # Always-on session tools are preserved regardless of the allowlist.
+        if self._spec.allowed_tools is not None:
+            permitted = self._spec.allowed_tools | ALWAYS_ON_TOOLS
+            self._tools = {k: v for k, v in self._tools.items() if k in permitted}
 
     def _register_policy_tools(self) -> None:
         """
