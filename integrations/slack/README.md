@@ -6,6 +6,9 @@ bot talks to **one** Omnigent server, set by the operator via
 issues requests to that fixed host. Each user still authenticates as their own
 Omnigent identity against it.
 
+> This README is the operator/user guide (setup, scopes, running, auth). For the
+> architecture and key technical decisions, see **[DESIGN.md](DESIGN.md)**.
+
 ## Setup
 
 1. Create a Slack app with Socket Mode **and** Interactivity enabled (Socket
@@ -205,110 +208,22 @@ Mention the bot with a message to start a session:
 @your-bot help me inspect this failure
 ```
 
-Replies stream in live (via Slack's `chat.startStream` API) and render Markdown
-server-side. If a turn runs long enough that Slack finalizes the streaming
-message, the bot opens a fresh streaming reply in the same thread and keeps
-going, so a long answer arrives live across as many messages as it needs.
-Replies in that Slack thread continue the same Omnigent session. A channel
-thread belongs to whoever started it; a follow-up `@mention` from a different
-user is not added to that session — that user instead gets a private
-("Only visible to you") note explaining why, and pointing them to start their
-own thread.
+Replies stream in live and render Markdown. Replies in that Slack thread continue
+the same Omnigent session. A channel thread belongs to whoever started it; a
+follow-up from a different user gets a private ("Only visible to you") note
+pointing them to start their own thread.
 
-### Multi-agent turns
+When the agent needs you — a tool-call approval or a multiple-choice question —
+it appears in the thread as an **Approve / Deny** card or a radio/checkbox
+**Submit** form; answer it there (or in the web UI). A request it can't render
+with buttons (free-form typed input) links out to the web UI instead.
 
-`session.status: idle` is an ambiguous turn boundary, so at each idle the bot
-waits before deciding the turn is over — on two timescales:
+Send another message while the bot is still replying and it privately tells you
+to wait or continue in the web UI; a message to an idle thread just continues the
+conversation.
 
-- **Settle (short, ~2s).** A single agent oscillates `running`/`idle` *while
-  still streaming* its answer, with sub-second gaps between bursts. Every idle
-  first waits a brief settle window for the next burst, so a reply is never
-  truncated mid-answer. A genuinely final idle adds only this small tail.
-- **Snapshot + poll (coarse).** If still quiet after the settle, the bot checks
-  the session's rolled-up status, which reads `running` while any sub-agent
-  child is still working (a fan-out orchestrator like `debby` parked between
-  wake cycles). While running it polls (every 5s, up to a 10-minute cap) so a
-  slow sub-agent keeps the turn alive; otherwise the turn ends.
-
-While the agent works before the first tokens arrive, the thread shows a
-"Working on it…" placeholder. It's removed only once the reply is actually on
-screen — on the first streamed chunk, or after the finalizing flush for a
-buffered answer — so there's never an empty gap between the placeholder
-disappearing and the reply appearing.
-
-### Approvals & questions
-
-When the agent needs the user — a tool-call approval, or a multiple-choice
-question — the turn pauses and the bot surfaces it in the thread. It renders
-the server's `response.elicitation_request` in one of three ways:
-
-- **Approval** (a gated tool call): an **Approve / Deny** card with a preview of
-  the pending action. Click to resume; deny (or let it sit past the wait
-  window) to refuse.
-- **Question** (Claude's `AskUserQuestion` and equivalents): the choices render
-  as radio buttons (or checkboxes for multi-select) with a **Submit** — the
-  selected labels are sent back to the agent as its answer, exactly like the
-  web UI.
-- **Free-form input** (a request for typed values the bot can't collect with
-  buttons): the bot posts a link to resolve the request in the Omnigent web UI,
-  rather than mishandling it. The turn stays alive (via the idle grace window)
-  so it resumes once you answer there.
-
-The classification is by the *decision shape*, not the server's delivery mode.
-The server defaults to `url`-mode elicitations (carrying a suggested standalone
-approve page), but the bot still renders a `url`-mode approval or question
-natively and posts the verdict to the resolve endpoint — only genuinely
-uncollectable typed input falls back to the link.
-
-The card is updated in place with the outcome once answered, and the "Working
-on it…" placeholder is cleared while parked so it doesn't sit stale. Multiple
-requests in one turn are handled in order.
-
-This mirrors the web UI and CLI — the bot consumes `response.elicitation_request`
-and posts the verdict (with any selections as `content`) back to the session's
-resolve endpoint.
-
-While a request is outstanding the turn stays open, so a message sent to that
-thread meanwhile is deflected like any other mid-turn message (see below). If the
-user answers the request in the web UI instead of clicking the Slack card, the
-bot notices (it polls for external resolution) and continues without waiting. An
-unanswered card gives up after a few minutes so it can't hold the thread open
-indefinitely — the user can just re-send.
-
-**One turn at a time per thread.** Each turn opens its own event stream, so the
-bot runs one turn per thread at a time — a second concurrent stream would render
-into Slack twice. There is no queue. A message that arrives *while a thread is
-still streaming* is not run: the bot privately ("Only visible to you") tells the
-user it's still working and to re-send once it has replied, or to continue right
-now in the web UI (which accepts concurrent input and shows any pending actions).
-A message to a thread that is idle again runs normally — Slack stays a full
-conversational surface, not just a way to kick a session off. Messages that race
-the check are safe regardless: the server buffers a message that lands mid-turn
-and runs it as a continuation.
-
-**Ordering.** A streamed reply is a single Slack message anchored to the moment
-it opened, so text kept flowing into it would sort *before* any card or notice
-posted mid-turn — inverting cause and effect. The bot avoids this by *sealing*
-the current reply at each interruption (approval card, policy/file notice): the
-answer so far ends there, the out-of-band message sorts after it, and anything
-the agent says next opens a fresh reply below. So the thread reads in true
-order — reply, card, continued reply — even across several approvals in one turn.
-
-### Turn progress
-
-Beyond the streamed answer, the bot surfaces a few other signals when the
-harness emits them:
-
-- **Thinking** — while the agent reasons before producing output, the
-  placeholder switches to a "Thinking…" indicator so a long think isn't silent.
-- **Plan / todos** — a task list (from harnesses that report one, e.g. Claude
-  Code's `TodoWrite`) is posted once and edited in place as items progress.
-- **Blocked by policy** — when a tool call is hard-blocked by policy (a DENY,
-  with no approval offered), the bot posts why, so an absent action is
-  explained rather than silent.
-- **Produced files** — a note naming any file artifact the agent generated.
-
-All are best-effort and never interrupt the answer stream.
+For how any of this works under the hood — streaming, turn-end detection,
+elicitation handling, concurrency, ordering — see **[DESIGN.md](DESIGN.md)**.
 
 ## Development
 

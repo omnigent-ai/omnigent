@@ -8,6 +8,7 @@ from omnigent_slack.approvals import (
     ACTION_FORM_SUBMIT,
     ClickTarget,
     ElicitationCoordinator,
+    ElicitationOutcome,
     Verdict,
     elicitation_card_blocks,
     parse_action_value,
@@ -218,7 +219,7 @@ def test_resolve_form_answers_drops_unknown_indices() -> None:
 
 
 def test_resolved_card_drops_controls() -> None:
-    blocks = resolved_card_blocks(_binary(), outcome="Approved")
+    blocks = resolved_card_blocks(_binary(), outcome=ElicitationOutcome.APPROVED)
     assert not any(b.get("type") == "actions" for b in blocks)
     assert "Approved" in blocks[0]["text"]["text"]
 
