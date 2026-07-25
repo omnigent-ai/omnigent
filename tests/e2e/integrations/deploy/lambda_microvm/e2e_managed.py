@@ -25,6 +25,14 @@ The flow (each step asserts, exits non-zero on failure):
      first; without it this proves host-reuse, not a forced suspend/resume)
   6. delete the session, which terminates the MicroVM by its real ``microvmId``
 
+Set ``OMNIGENT_E2E_TOKEN`` when the server runs in accounts mode — binding to a
+non-local interface forces it on, and a MicroVM dialing back over a VPC egress
+connector needs a non-loopback bind:
+
+    OMNIGENT_E2E_TOKEN=$(curl -sX POST $SRV/auth/login -H 'Content-Type: application/json' \
+      -d '{"username":"...","password":"..."}' | jq -r .token) \
+      python tests/e2e/integrations/deploy/lambda_microvm/e2e_managed.py --server $SRV
+
 This is a manual driver, not a pytest-collected test (filename is ``e2e_*`` not
 ``test_*``): it needs live AWS + a configured server, so it never runs on the
 unit/e2e CI lanes. It satisfies the CONTRIBUTING happy-path e2e requirement for
@@ -34,10 +42,17 @@ the new provider the same way the sibling provider drivers do.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
 import httpx
+
+# Bearer token for a server running in accounts mode (any bind to a non-local
+# interface forces it on). Empty for a loopback single-user server, where the
+# API needs no credential.
+_TOKEN = os.environ.get("OMNIGENT_E2E_TOKEN", "")
+_HEADERS: dict[str, str] = {"Authorization": f"Bearer {_TOKEN}"} if _TOKEN else {}
 
 # Fixed by the lambda_microvm launcher (omnigent/onboarding/sandboxes/lambda_microvm.py).
 PROVIDER = "lambda_microvm"
@@ -50,7 +65,7 @@ def log(msg: str) -> None:
 
 def check_server(base: str) -> None:
     log(f"[1/6] checking {base}/v1/info")
-    info = httpx.get(f"{base}/v1/info", timeout=10.0).json()
+    info = httpx.get(f"{base}/v1/info", headers=_HEADERS, timeout=10.0).json()
     if not info.get("managed_sandboxes_enabled"):
         raise SystemExit("server does not advertise managed sandboxes — is sandbox: configured?")
     if info.get("sandbox_provider") != PROVIDER:
@@ -61,7 +76,7 @@ def check_server(base: str) -> None:
 
 
 def pick_agent(base: str, agent_id: str | None) -> str:
-    resp = httpx.get(f"{base}/v1/agents", timeout=10.0)
+    resp = httpx.get(f"{base}/v1/agents", headers=_HEADERS, timeout=10.0)
     resp.raise_for_status()
     agents = resp.json()["data"]
     if not agents:
@@ -87,7 +102,7 @@ def create_managed_session(base: str, agent_id: str) -> str:
             }
         ],
     }
-    r = httpx.post(f"{base}/v1/sessions", json=body, timeout=180.0)
+    r = httpx.post(f"{base}/v1/sessions", json=body, headers=_HEADERS, timeout=180.0)
     if r.status_code >= 300:
         raise SystemExit(f"create session failed: HTTP {r.status_code}: {r.text[:600]}")
     conv_id = r.json()["id"]
@@ -99,7 +114,7 @@ def wait_host_online(base: str, conv_id: str, timeout_s: float) -> str:
     log("[3/6] waiting for the MicroVM host to register (cold MicroVM boot is slow)")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        d = httpx.get(f"{base}/v1/sessions/{conv_id}", timeout=10.0).json()
+        d = httpx.get(f"{base}/v1/sessions/{conv_id}", headers=_HEADERS, timeout=10.0).json()
         if d.get("host_id"):
             log(f"      ✓ host online: host_id={d['host_id']}")
             return d["host_id"]
@@ -149,7 +164,7 @@ def _assistant_messages_from(items: list[dict]) -> list[str]:
 
 def _assistant_messages(base: str, conv_id: str) -> list[str]:
     """Fetch the session and return its per-message assistant texts."""
-    d = httpx.get(f"{base}/v1/sessions/{conv_id}", timeout=10.0).json()
+    d = httpx.get(f"{base}/v1/sessions/{conv_id}", headers=_HEADERS, timeout=10.0).json()
     return _assistant_messages_from(d.get("items") or [])
 
 
@@ -158,7 +173,7 @@ def wait_for_reply(base: str, conv_id: str, timeout_s: float) -> str:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            d = httpx.get(f"{base}/v1/sessions/{conv_id}", timeout=10.0).json()
+            d = httpx.get(f"{base}/v1/sessions/{conv_id}", headers=_HEADERS, timeout=10.0).json()
             if d.get("last_task_error"):
                 raise SystemExit(f"task error: {d['last_task_error']}")
             text = _assistant_text(d.get("items") or [])
@@ -200,13 +215,14 @@ def followup_turn_reuses_host(base: str, conv_id: str, host_id: str, timeout_s: 
                 ],
             },
         },
+        headers=_HEADERS,
         timeout=180.0,
     )
     if r.status_code >= 300:
         raise SystemExit(f"follow-up turn failed: HTTP {r.status_code}: {r.text[:600]}")
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        d = httpx.get(f"{base}/v1/sessions/{conv_id}", timeout=10.0).json()
+        d = httpx.get(f"{base}/v1/sessions/{conv_id}", headers=_HEADERS, timeout=10.0).json()
         if d.get("last_task_error"):
             raise SystemExit(f"task error on follow-up turn: {d['last_task_error']}")
         msgs = _assistant_messages_from(d.get("items") or [])
@@ -274,7 +290,7 @@ def main() -> int:
         else:
             log(f"[6/6] deleting session {conv_id} (terminates the MicroVM by its real id)")
             try:
-                httpx.delete(f"{base}/v1/sessions/{conv_id}", timeout=60.0)
+                httpx.delete(f"{base}/v1/sessions/{conv_id}", headers=_HEADERS, timeout=60.0)
             except httpx.HTTPError as exc:
                 log(f"      cleanup failed (MicroVM may linger until its lifetime cap): {exc}")
     log("PASS")
