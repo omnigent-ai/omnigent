@@ -216,3 +216,39 @@ def test_community_namespace_imports_external_harness_package(
 
     module = importlib.import_module("omnigent.community.harness.foo")
     assert module.VALUE == "ok"
+
+
+def test_builtin_background_title_generators_are_registered() -> None:
+    generators = hp.background_title_generators()
+
+    assert set(generators) >= {
+        "claude-sdk",
+        "claude-native",
+        "codex",
+        "codex-native",
+    }
+    assert generators["claude-sdk"].generator.endswith("sdk:generate_background_title")
+    assert generators["codex"].generator == generators["claude-sdk"].generator
+    assert generators["claude-native"].resolver_harness == "claude-sdk"
+    assert generators["codex-native"].resolver_harness is None
+
+
+def test_community_harness_can_register_background_title_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _contribution() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-foo",
+            valid_harnesses=frozenset({"foo"}),
+            harness_modules={"foo": "omnigent.community.harness.foo.inner.foo_harness"},
+            background_title_generators={
+                "foo": hp.BackgroundTitleGeneratorSpec(
+                    "omnigent.community.harness.foo.background_titles:generate"
+                )
+            },
+        )
+
+    _install_entry_points(monkeypatch, _EntryPoint("foo", _contribution))
+
+    generator = hp.background_title_generators()["foo"]
+    assert generator.generator == ("omnigent.community.harness.foo.background_titles:generate")

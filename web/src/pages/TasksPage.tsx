@@ -23,6 +23,7 @@ import {
 } from "@/components/scheduled/suggestions";
 import {
   useDeleteScheduledTask,
+  useRunScheduledTaskNow,
   useScheduledTasks,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
@@ -42,6 +43,7 @@ export function TasksPage() {
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
+  const runNowMutation = useRunScheduledTaskNow();
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
@@ -105,12 +107,16 @@ export function TasksPage() {
   }, [tasks, search, filter]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
+  // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be
+  // re-triggered mid-flight for the task whose mutation is pending.
   const busyId =
     updateMutation.isPending && updateMutation.variables
       ? updateMutation.variables.id
       : deleteMutation.isPending
         ? (deleteMutation.variables as string | undefined)
-        : undefined;
+        : runNowMutation.isPending
+          ? (runNowMutation.variables as string | undefined)
+          : undefined;
 
   function handlePauseToggle(task: ScheduledTask) {
     updateMutation.mutate({
@@ -121,6 +127,10 @@ export function TasksPage() {
 
   function handleDelete(task: ScheduledTask) {
     deleteMutation.mutate(task.id);
+  }
+
+  function handleRunNow(task: ScheduledTask) {
+    runNowMutation.mutate(task.id);
   }
 
   function handleEdit(task: ScheduledTask) {
@@ -217,6 +227,7 @@ export function TasksPage() {
               busy={busyId === task.id}
               onEdit={handleEdit}
               onPauseToggle={handlePauseToggle}
+              onRunNow={handleRunNow}
               onDelete={handleDelete}
             />
           ))}

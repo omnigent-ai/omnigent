@@ -135,7 +135,7 @@ async def test_prepare_background_title_skips_non_initial_sessions(
     assert pending is None
 
 
-@pytest.mark.parametrize("harness_override", ["codex-native", "pi"])
+@pytest.mark.parametrize("harness_override", ["pi"])
 async def test_prepare_background_title_skips_unsupported_explicit_harnesses(
     db_uri: str,
     harness_override: str,
@@ -163,6 +163,33 @@ async def test_prepare_background_title_skips_unsupported_explicit_harnesses(
     )
 
     assert pending is None
+
+
+async def test_prepare_background_title_supports_codex_native(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(
+        title=None,
+        agent_id=uuid.uuid4().hex,
+    )
+    conversation.harness_override = "codex-native"
+
+    async def generator(_request: BackgroundTitleRequest) -> str:
+        return "Debug authentication timeout"
+
+    pending = prepare_background_session_title(
+        coordinator=BackgroundSessionTitleCoordinator(store, generator),
+        conversation=conversation,
+        event=SessionEventInput(
+            type="message",
+            data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ),
+    )
+
+    assert pending is not None
+    assert pending.request.harness_override == "codex-native"
 
 
 async def test_default_seed_wait_allows_slow_native_session_startup(db_uri: str) -> None:

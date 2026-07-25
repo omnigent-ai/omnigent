@@ -974,3 +974,214 @@ async def test_publish_status_failed_edge_transitions_scheduled_run_to_failed(
     assert row.status == "failed"
     assert row.finished_at is not None
     assert row.error_code == "runner_disconnected"
+
+
+# ── serializer fields: last_run_status + next_run_at ─────────────────────────
+
+
+async def test_list_and_get_carry_last_run_status_and_next_run_at(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """LIST + GET surface the latest run's status and the scheduler's next fire.
+
+    ``last_run_status`` comes from the windowed store query (the most-recent run
+    by scheduled_at DESC); ``next_run_at`` comes from the live scheduler, so an
+    armed active task reports a non-null ISO timestamp.
+    """
+    import uuid
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    # A freshly created task has never run.
+    assert created["last_run_status"] is None
+    # It is armed on the scheduler, so next_run_at is a non-null ISO string.
+    assert isinstance(created["next_run_at"], str)
+
+    # Seed two runs; the newer (failed) one is the reported status.
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=1000,
+        status="succeeded",
+        conversation_id=uuid.uuid4().hex,
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        uuid.uuid4().hex,
+        scheduled_at=2000,
+        status="failed",
+        finished_at=2002,
+        conversation_id=uuid.uuid4().hex,
+    )
+
+    list_body = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    row = next(t for t in list_body["scheduled_tasks"] if t["id"] == task_id)
+    assert row["last_run_status"] == "failed"
+    assert isinstance(row["next_run_at"], str)
+
+    get_body = (await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())).json()
+    assert get_body["last_run_status"] == "failed"
+    assert isinstance(get_body["next_run_at"], str)
+
+
+async def test_paused_task_has_null_next_run_at(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A paused task is not armed, so next_run_at is null."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    patched = (
+        await auth_client.patch(
+            f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=_headers()
+        )
+    ).json()
+    assert patched["state"] == "paused"
+    assert patched["next_run_at"] is None
+
+
+# ── POST /v1/scheduled-tasks/{id}/run (run now) ──────────────────────────────
+
+
+async def test_run_now_triggers_and_records_a_run(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """POST /run returns 202 and drives the wired run-now trigger for the task.
+
+    The route delegates to ``app.state.scheduled_task_run_now`` (built over the
+    shared fire path). Here we stub that trigger with a recorder that writes a
+    ``running`` run row, then assert the row appears in the task's history and as
+    ``last_run_status`` — the integration contract the real trigger fulfills.
+    """
+    import time
+    import uuid
+
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    calls: list[tuple[int, str]] = []
+    now = int(time.time())
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        calls.append((workspace_id, scheduled_task_id))
+        # Use a current-time fire so the LIST endpoint's stale backstop (6h age
+        # from fired_at) does NOT reap this fresh in-flight run to ``failed``.
+        SqlAlchemyScheduledTaskStore(db_uri).create_run(
+            run_id=uuid.uuid4().hex,
+            scheduled_task_id=scheduled_task_id,
+            status="running",
+            scheduled_at=now,
+            conversation_id=uuid.uuid4().hex,
+            fired_at=now,
+        )
+        return True
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"triggered": True, "id": task_id}
+    # The trigger was invoked with the task's workspace + id.
+    assert calls == [(0, task_id)]
+
+    runs = (
+        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    ).json()["runs"]
+    assert len(runs) == 1
+    assert runs[0]["status"] == "running"
+    # And the completion badge source now reports it.
+    list_body = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    row = next(t for t in list_body["scheduled_tasks"] if t["id"] == task_id)
+    assert row["last_run_status"] == "running"
+
+
+async def test_run_now_allows_paused_task(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """Run-now is a manual override — a paused task is still triggerable (202)."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+    await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"state": "paused"}, headers=_headers()
+    )
+
+    triggered: list[str] = []
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        triggered.append(scheduled_task_id)
+        return True
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert resp.status_code == 202, resp.text
+    assert triggered == [task_id]
+
+
+async def test_run_now_conflict_when_already_in_flight(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """A trigger that reports it was skipped (already in flight) surfaces as 409."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        return False  # already in flight
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert resp.status_code == 409, resp.text
+
+
+async def test_run_now_404_for_nonowned_task(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """Running another user's task 404s (not enumerable across users)."""
+    _make_user(db_uri, "alice@example.com")
+    _make_user(db_uri, "bob@example.com")
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers("alice@example.com")
+        )
+    ).json()
+
+    async def _fake_run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        raise AssertionError("run_now must not be reached for a non-owned task")
+
+    auth_app.state.scheduled_task_run_now = _fake_run_now
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers("bob@example.com")
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_run_now_503_when_scheduler_not_running(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str
+) -> None:
+    """With no run-now trigger wired, the endpoint reports the subsystem is down."""
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    auth_app.state.scheduled_task_run_now = None
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
+    assert resp.status_code == 503, resp.text

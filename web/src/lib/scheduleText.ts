@@ -29,6 +29,11 @@ import { RRule, rrulestr } from "rrule";
 const OCCURRENCE_ANCHOR = new Date(Date.UTC(2000, 0, 1, 0, 0, 0));
 const FIXED_PERIOD_SAFETY_MARGIN = 2;
 
+// Millisecond units for the compact relative next-run delta (formatNextRunAt).
+const MIN_MS = 60_000;
+const HOUR_MS = 60 * MIN_MS;
+const DAY_MS = 24 * HOUR_MS;
+
 /** Days-of-week bit set helpers. RRule weekday order is MO..SU (0..6). */
 const WEEKDAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR].map((d) => d.weekday);
 const ALL_DAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR, RRule.SA, RRule.SU].map(
@@ -55,6 +60,42 @@ export function formatClockTime(hour: number, minute: number): string {
   const h12 = hour % 12 === 0 ? 12 : hour % 12;
   const mm = minute.toString().padStart(2, "0");
   return `${h12}:${mm} ${period}`;
+}
+
+/**
+ * Format the time until the SERVER's authoritative next-run instant as a
+ * compact relative delta, e.g. `in 30m`, `in 15h`, `in 6d`, or `soon`.
+ *
+ * `iso` is the server's `next_run_at` (the live scheduler's authoritative next
+ * fire). We compute ONLY the delta (`nextRunAt − now`) and format how far away
+ * it is — the instant itself stays server-authoritative. This is NOT the old
+ * client-recomputed countdown that was removed: that one recomputed WHICH
+ * instant is next on the client (and couldn't match the server anchor for
+ * INTERVAL>1 rules); here the instant comes from the server and only the
+ * "how far away" is derived, so the removal rule is not violated.
+ *
+ * Buckets (floor of the chosen unit — standard time-remaining convention):
+ *   < 60 min → `in Xm` (minimum `in 1m`), < 24 h → `in Xh`, else `in Xd`.
+ * A delta at or below ~0 (imminent / just passed due to clock skew) → `soon`.
+ * Returns `null` for a null / unparseable `iso` so the caller renders nothing.
+ *
+ * @param iso The server's `next_run_at` ISO string, or `null`.
+ * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
+ */
+export function formatNextRunAt(
+  iso: string | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  if (!iso) return null;
+  const instant = new Date(iso);
+  if (Number.isNaN(instant.getTime())) return null;
+
+  const deltaMs = instant.getTime() - now.getTime();
+  // Imminent or just-passed (timing skew): don't render a "0m" / negative delta.
+  if (deltaMs < MIN_MS) return "soon";
+  if (deltaMs < HOUR_MS) return `in ${Math.floor(deltaMs / MIN_MS)}m`;
+  if (deltaMs < DAY_MS) return `in ${Math.floor(deltaMs / HOUR_MS)}h`;
+  return `in ${Math.floor(deltaMs / DAY_MS)}d`;
 }
 
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */

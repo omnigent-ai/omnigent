@@ -31,7 +31,14 @@ from playwright.sync_api import Page, expect
 
 _COMPOSER = "Ask the agent anything…"
 _AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
+_AGENT_INFO_PANEL = '[data-testid="agent-info-panel"]'
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# Time for the popover's open animation (Radix ``duration-150`` zoom/slide) to
+# settle so an in-panel button is at rest before we click it. Spent while the
+# pointer already sits on the panel, so the panel can't close during it. Mirrors
+# ``_ANIM_SETTLE_MS`` in ``sessions/test_agent_info_hover.py``.
+_PANEL_SETTLE_MS = 250
 _ECHO_MCP_SERVER = _REPO_ROOT / "tests" / "tools" / "fixtures" / "echo_stdio_mcp_server.py"
 
 
@@ -128,14 +135,33 @@ def _open_popover(page: Page) -> None:
     follows. Pressing Escape first guarantees we re-open from a closed state
     rather than toggling an already-open popover shut.
 
+    After opening, park the pointer on the panel and let the open animation
+    settle. The trigger opens on hover and schedules a ``HOVER_CLOSE_DELAY_MS``
+    (150ms) close the moment the pointer leaves it (see ``AgentInfoButton`` in
+    ``web/src/components/AgentInfo.tsx``). A follow-up ``.click()`` on an
+    in-panel control (e.g. "Manage MCP servers") first waits for that control to
+    be *stable*, but the panel is still mid ``duration-150`` zoom/slide, so the
+    stability retries can outlast the 150ms close timer — the panel then
+    unmounts and the control detaches mid-click (the observed CI flake). Moving
+    the pointer onto the panel cancels the pending close (``cancelCloseOnEnter``)
+    the same way a real user's pointer does, and the settle wait lets the
+    animation finish so the control is at rest before callers click it.
+
     :param page: Playwright page on a ``/c/<id>`` route.
     """
     page.keyboard.press("Escape")
     trigger = page.locator(_AGENT_INFO_TRIGGER)
     expect(trigger).to_be_visible(timeout=30_000)
     trigger.click()
+    panel = page.locator(_AGENT_INFO_PANEL)
+    expect(panel).to_be_visible(timeout=15_000)
     # "Policies" section label proves the popover content mounted.
     expect(page.get_by_text("Policies", exact=True)).to_be_visible(timeout=15_000)
+    # Land the pointer on the panel so leaving the trigger can't schedule a
+    # hover-close under a subsequent in-panel click, then let the open
+    # animation settle so in-panel controls are stable geometry.
+    panel.hover()
+    page.wait_for_timeout(_PANEL_SETTLE_MS)
 
 
 def test_agent_info_policy_add_and_remove(
@@ -224,6 +250,12 @@ def test_agent_info_policy_integer_params_validate_and_submit(
     assert stored_policy["factory_params"] == {"limit": 100}
 
 
+# Belt-and-suspenders for the residual session-bind/hydration race the
+# ``_open_popover`` pointer-park fix can't reach: the header info trigger only
+# mounts after the session binds and hydrates, so a rare mid-hydration open can
+# still miss. Matches the sibling hover suite (``sessions/test_agent_info_hover``),
+# which reruns rather than papering over the race with longer per-action waits.
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_agent_info_mcp_server_add_and_remove(
     page: Page,
     seeded_session: tuple[str, str],

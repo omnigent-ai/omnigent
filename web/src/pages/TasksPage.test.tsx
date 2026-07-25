@@ -18,6 +18,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
+  useRunScheduledTaskNow: vi.fn(),
 }));
 
 // Stub the create dialog — its internals are covered separately; here we only
@@ -63,13 +64,16 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     hostId: null,
     state: "active",
     lastRunAt: null,
+    lastRunStatus: null,
     lastRunConversationId: null,
+    nextRunAt: null,
     ...overrides,
   };
 }
 
 const mutate = vi.fn();
 const deleteMutate = vi.fn();
+const runNowMutate = vi.fn();
 
 function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?: boolean } = {}) {
   vi.mocked(hooks.useScheduledTasks).mockReturnValue({
@@ -83,6 +87,7 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
 beforeEach(() => {
   mutate.mockReset();
   deleteMutate.mockReset();
+  runNowMutate.mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate,
     isPending: false,
@@ -93,6 +98,11 @@ beforeEach(() => {
     isPending: false,
     variables: undefined,
   } as unknown as ReturnType<typeof hooks.useDeleteScheduledTask>);
+  vi.mocked(hooks.useRunScheduledTaskNow).mockReturnValue({
+    mutate: runNowMutate,
+    isPending: false,
+    variables: undefined,
+  } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
 });
 
 afterEach(() => cleanup());

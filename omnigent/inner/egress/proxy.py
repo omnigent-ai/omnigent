@@ -27,6 +27,7 @@ import asyncio
 import base64
 import binascii
 import email.policy
+import functools
 import hmac
 import ipaddress
 import logging
@@ -708,7 +709,9 @@ class EgressProxy:
         connect_host = pinned_ip or host
         # Swap any synthetic credential placeholder for the real secret,
         # bound to this host (rejects cross-host replay with 403).
-        rewrite = self._rewrite_authorization(method=method, host=host, headers_raw=headers_raw)
+        rewrite = await self._rewrite_authorization_async(
+            method=method, host=host, headers_raw=headers_raw
+        )
         if rewrite.error is not None:
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
@@ -861,7 +864,9 @@ class EgressProxy:
             body = await asyncio.wait_for(reader.readexactly(content_length), timeout=30)
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
-        rewrite = self._rewrite_authorization(method=method, host=host, headers_raw=headers_raw)
+        rewrite = await self._rewrite_authorization_async(
+            method=method, host=host, headers_raw=headers_raw
+        )
         if rewrite.error is not None:
             logger.warning(
                 "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, rewrite.error
@@ -1126,6 +1131,34 @@ class EgressProxy:
         except Exception:  # noqa: BLE001 — response write is best-effort
             pass
 
+    async def _rewrite_authorization_async(
+        self, *, method: str, host: str, headers_raw: bytes
+    ) -> _AuthRewriteResult:
+        """
+        Async wrapper around :meth:`_rewrite_authorization`.
+
+        A refreshing credential source (e.g. a Databricks OAuth profile)
+        may re-mint a token via a blocking SDK/CLI call when its throttle
+        window elapses. That would stall the proxy's event loop, so the
+        rewrite runs in the default executor. The common case — no
+        credential rules configured — short-circuits inline with no
+        executor hop.
+
+        :param method: HTTP method (case-insensitive), e.g. ``"GET"``.
+        :param host: Upstream request host (case-insensitive).
+        :param headers_raw: Raw HTTP header block (CRLF-separated).
+        :returns: The rewrite result.
+        """
+        if not self._cred_by_host:
+            return _AuthRewriteResult(headers=headers_raw, error=None)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            functools.partial(
+                self._rewrite_authorization, method=method, host=host, headers_raw=headers_raw
+            ),
+        )
+
     def _rewrite_authorization(
         self, *, method: str, host: str, headers_raw: bytes
     ) -> _AuthRewriteResult:
@@ -1262,10 +1295,11 @@ class EgressProxy:
             ``"Basic <base64(username:real)>"``.
         :raises ValueError: If the rule carries an unsupported scheme.
         """
+        real_secret = rule.resolve_secret()
         if rule.scheme == "bearer":
-            return f"Bearer {rule.real_secret}"
+            return f"Bearer {real_secret}"
         if rule.scheme == "token":
-            return f"token {rule.real_secret}"
+            return f"token {real_secret}"
         if rule.scheme == "basic":
             # The parser always populates ``username`` for Basic
             # bindings; fail loud rather than invent one if a malformed
@@ -1274,7 +1308,7 @@ class EgressProxy:
                 raise ValueError(
                     f"basic credential rewrite for host {rule.host!r} is missing a username"
                 )
-            pair = f"{rule.username}:{rule.real_secret}".encode()
+            pair = f"{rule.username}:{real_secret}".encode()
             return "Basic " + base64.b64encode(pair).decode("ascii")
         raise ValueError(f"unsupported credential rewrite scheme: {rule.scheme!r}")
 
