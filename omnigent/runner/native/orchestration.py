@@ -1797,6 +1797,22 @@ async def _auto_create_pi_terminal(
     from omnigent.cli_auth import databricks_request_headers
 
     auth_headers = databricks_request_headers(launch_config.server_url, bearer_token=auth_token)
+    # Guest-on-shared-host: attach the tunnel binding token so the extension's
+    # POST /events (chat mirror) is authorized against THIS session by matching
+    # the token-derived runner id against the session's runner_id. Without it the
+    # SP bearer clears the ingress but has no user grant on the human's conv, so
+    # the server 404-masks the mirror. Gated on the same flag the transcript
+    # forwarder uses (see the guest-on-shared-host block below), so it isn't sent
+    # on ordinary own-host runs.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    _pi_binding_token = _runner_tunnel_binding_token_from_env()
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR) and _pi_binding_token:
+        auth_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _pi_binding_token
     # Build the Omnigent tool surface (sys_* tools) the Pi extension registers
     # via pi.registerTool. Reuses the same schema set the claude-native /
     # codex-native relay advertises, gated by the session's spec. Each tool's
@@ -2543,6 +2559,28 @@ async def _auto_create_hermes_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
+    # Guest-on-shared-host: when the server flagged this runner as serving a
+    # session whose host it doesn't own (a shared/externally-owned host such as
+    # a CoDA Databricks App), the refresh-capable SP bearer clears the ingress
+    # but has no user grant on the human's conversation, so the forwarder's and
+    # approval mirror's POST /v1/sessions/{id}/events would be 404-masked and
+    # the Hermes transcript / dangerous-command prompts would never reach Chat.
+    # Attach the tunnel binding token so the server's runner self-access check
+    # matches the token-derived runner id against the session's runner_id and
+    # grants LEVEL_EDIT. The flag gates the header so it isn't sent on ordinary
+    # own-host runs. Mirrors the pi-/claude-native paths.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    _hermes_forward_headers: dict[str, str] = {}
+    if os.environ.get(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR):
+        _hermes_binding_token = _runner_tunnel_binding_token_from_env()
+        if _hermes_binding_token:
+            _hermes_forward_headers[RUNNER_TUNNEL_TOKEN_HEADER] = _hermes_binding_token
+
     from omnigent.hermes_native_bridge import read_hermes_home
     from omnigent.hermes_native_forwarder import supervise_hermes_forwarder
     from omnigent.hermes_native_permissions import supervise_hermes_approval_mirror
@@ -2571,7 +2609,7 @@ async def _auto_create_hermes_terminal(
         await asyncio.gather(
             supervise_hermes_forwarder(
                 base_url=server_url,
-                headers={},
+                headers=dict(_hermes_forward_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 agent_name="hermes-native-ui",
@@ -2582,7 +2620,7 @@ async def _auto_create_hermes_terminal(
             ),
             supervise_hermes_approval_mirror(
                 base_url=server_url,
-                headers={},
+                headers=dict(_hermes_forward_headers),
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 auth=_runner_auth,

@@ -3884,7 +3884,7 @@ async def _validate_session_workspace(
 
     The caller's host ownership is checked BEFORE the ``host.stat``
     round-trip the validation performs, so a non-owner never reaches
-    another user's host (raises 403/404 via ``resolve_host_owner``).
+    another user's host (raises 403/404 via ``resolve_host_access``).
 
     :param user_id: Authenticated caller, e.g.
         ``"alice@example.com"``, or ``None`` when auth is disabled.
@@ -3916,6 +3916,8 @@ async def _validate_session_workspace(
         agent_cache=agent_cache,
         host_store=getattr(request.app.state, "host_store", None),
         host_registry=getattr(request.app.state, "host_registry", None),
+        host_permission_store=getattr(request.app.state, "host_permission_store", None),
+        permission_store=getattr(request.app.state, "permission_store", None),
     )
 
 

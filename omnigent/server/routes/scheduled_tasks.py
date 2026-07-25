@@ -26,7 +26,7 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import resolve_host_owner
+from omnigent.server.routes._host_launch import resolve_host_access
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -221,21 +221,25 @@ def create_scheduled_tasks_router(
             # without a workspace, so a non-owned / nonexistent host reference
             # fails fast with a clean 4xx instead of persisting and only
             # surfacing as a failed run at fire time. This is a LOCAL store read
-            # (no host.stat / workspace RPC), via the same resolve_host_owner the
+            # (no host.stat / workspace RPC), via the same resolve_host_access the
             # workspace-present branch below uses inside
             # validate_existing_host_workspace — and whose semantics
             # fire.py:_authorize_pinned_host mirrors — so create-time and
             # fire-time host authorization cannot drift. When user_id is None
-            # (single-user / auth disabled) resolve_host_owner skips the owner
+            # (single-user / auth disabled) resolve_host_access skips the owner
             # check, matching the fire path and the rest of the server.
             if host_id is not None:
                 host_store = getattr(request.app.state, "host_store", None)
-                if host_store is not None:
+                host_permission_store = getattr(request.app.state, "host_permission_store", None)
+                permission_store = getattr(request.app.state, "permission_store", None)
+                if host_store is not None and host_permission_store is not None:
                     await asyncio.to_thread(
-                        resolve_host_owner,
+                        resolve_host_access,
                         user_id=user_id,
                         host_id=host_id,
                         host_store=host_store,
+                        host_permission_store=host_permission_store,
+                        permission_store=permission_store,
                     )
             return None, validated_model, validated_effort
         if host_id is None:
@@ -251,6 +255,8 @@ def create_scheduled_tasks_router(
             agent_cache=agent_cache,
             host_store=getattr(request.app.state, "host_store", None),
             host_registry=getattr(request.app.state, "host_registry", None),
+            host_permission_store=getattr(request.app.state, "host_permission_store", None),
+            permission_store=getattr(request.app.state, "permission_store", None),
         )
         return canonical_workspace, validated_model, validated_effort
 
