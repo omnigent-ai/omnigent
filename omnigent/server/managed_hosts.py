@@ -216,9 +216,10 @@ def _env_positive_int(name: str, default: int) -> int:
 # boot), so a healthy launch registers in seconds; the budget covers a
 # cold registry pull of the image on first use.
 #
-# Tunable: an account pulling a ~1 GB host image for the first time can
-# exceed the default before the host process even starts, which surfaces
-# as a launch failure rather than a slow launch.
+# Shared by every managed provider, so the default stays tight enough to
+# detect a genuinely stuck launch. Tunable for deployments whose cold
+# image pull runs long (a constrained registry path, a large custom
+# image), where the default would report a slow launch as a failed one.
 MANAGED_HOST_ONLINE_TIMEOUT_S = _env_positive_int("OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S", 120)
 _ONLINE_POLL_INTERVAL_S = 1.0
 
