@@ -15,6 +15,7 @@ from omnigent._native_post_delivery import (
     RepostResult,
     _dead_letter_record_replayable,
     append_dead_letter,
+    post_external_session_status,
     post_may_have_been_delivered,
     replay_dead_letters,
 )
@@ -630,3 +631,38 @@ async def test_retry_loop_success_clears_a_prior_connectivity_failure() -> None:
         assert health.recent_post_failure(60.0) is None
     finally:
         health.clear()
+
+
+@pytest.mark.asyncio
+async def test_post_external_session_status_attaches_failure_reason() -> None:
+    """A failed status carries its reason as ``output``; idle omits it.
+
+    The server surfaces a failed edge's ``output`` as the session's failure
+    detail, so threading a drop reason there renders it instead of a bare
+    "failed"; a normal idle edge sends a bare status with no output field.
+    """
+    captured: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_x/events":
+            captured.append(json.loads(request.content))
+            return httpx.Response(204)
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        await post_external_session_status(
+            client,
+            session_id="conv_x",
+            status="failed",
+            output="transcript item item-1 rejected",
+        )
+        # No reason → no output field (e.g. a normal idle edge).
+        await post_external_session_status(client, session_id="conv_x", status="idle")
+
+    assert captured[0]["type"] == "external_session_status"
+    assert captured[0]["data"] == {
+        "status": "failed",
+        "output": "transcript item item-1 rejected",
+    }
+    assert captured[1]["data"] == {"status": "idle"}

@@ -32,6 +32,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -266,6 +267,12 @@ class QwenExecutor(Executor):
         # to allow. See _decide_permission.
         self._policy_evaluator: Any | None = None  # type: ignore[explicit-any]
         self._elicitation_handler: Any | None = None  # type: ignore[explicit-any]
+        # Adapter-injected tool bridge + the Omnigent-tool MCP relay it backs.
+        # Exposes Omnigent builtin tools to qwen via session/new.mcpServers (the
+        # shared serve-mcp relay); qwen keeps its own built-in tool registry.
+        self._tool_executor: Any | None = None  # type: ignore[explicit-any]
+        self._mcp = OmnigentAcpMcp(label="qwen")
+        self._omnigent_tools: list[Any] = []  # type: ignore[explicit-any]
 
     # ------------------------------------------------------------------
     # Low-level ACP helpers
@@ -585,10 +592,15 @@ class QwenExecutor(Executor):
         if self._session_id is not None:
             return self._session_id
 
+        mcp_servers = self._mcp.session_new_servers(
+            tools=self._omnigent_tools,
+            tool_executor=getattr(self, "_tool_executor", None),
+            loop=asyncio.get_event_loop(),
+        )
         params: dict[str, Any] = {  # type: ignore[explicit-any]
             "sessionId": secrets.token_urlsafe(16),
             "cwd": self._cwd,
-            "mcpServers": [],
+            "mcpServers": mcp_servers,
         }
         if self._model:
             params["model"] = self._model
@@ -1067,7 +1079,7 @@ class QwenExecutor(Executor):
     async def run_turn(
         self,
         messages: list[Message],
-        tools: list[Any],  # type: ignore[explicit-any]  # noqa: ARG002 — qwen runs its own tool registry; param required by the Executor interface
+        tools: list[Any],  # type: ignore[explicit-any]  # qwen runs its own tools; used for the Omnigent MCP relay
         system_prompt: str,
         config: ExecutorConfig | None = None,  # noqa: ARG002 — unused; required by the Executor interface
     ) -> AsyncIterator[ExecutorEvent]:
@@ -1083,6 +1095,8 @@ class QwenExecutor(Executor):
         :param system_prompt: Instructions for the session.
         :param config: Optional executor config (model override etc.).
         """
+        # Captured for the Omnigent MCP relay set up lazily at session/new.
+        self._omnigent_tools = tools or []
         try:
             # Lazily boot the subprocess. A missing/unspawnable ``qwen`` binary
             # raises here (FileNotFoundError / OSError) — surface it as a clean
@@ -1281,6 +1295,8 @@ class QwenExecutor(Executor):
 
     async def close(self) -> None:
         """Terminate the qwen subprocess and clean up."""
+        with contextlib.suppress(Exception):
+            self._mcp.close()
         if self._reader_task:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

@@ -43,6 +43,12 @@ prompt: |
   2. **Integration update** — a harness, model provider, MCP / tool, sandbox, or
      deploy target is **added, removed, or changes how it is configured**
      (e.g. "add Kiro to the setup harness menu", "add a new sandbox provider").
+  3. **Built-in policy update** — a built-in contextual policy is **added,
+     removed, or has its configurable behavior/parameters changed**. These live
+     under `omnigent/policies/builtins/` (e.g. `context.py`, `routing.py`,
+     `safety.py`) and are a user-facing surface people configure by name, so each
+     one has a docs entry. A new file or a new policy factory there (e.g. "add
+     `detect_task_switch` builtin policy") is **always needs-doc-update**.
 
   ## Never doc-worthy (choose no-doc-update)
   - Internal bugfixes that do NOT change documented behavior
@@ -58,9 +64,10 @@ prompt: |
   no-doc-update — be conservative: only choose **needs-doc-update** when a
   user-facing surface or an integration genuinely changed. Infer the nature of the
   change from the code: a new harness/provider/tool/sandbox/deploy target, a new
-  or changed CLI flag or config key, or a changed user-facing default lean
-  needs-doc; pure internal refactors, perf, tests, CI, build, and bugfixes that
-  don't alter documented behavior lean no-doc.
+  built-in policy under `omnigent/policies/builtins/`, a new or changed CLI flag
+  or config key, or a changed user-facing default lean needs-doc; pure internal
+  refactors, perf, tests, CI, build, and bugfixes that don't alter documented
+  behavior lean no-doc.
 
   ## Security
   You are running in CI with access to secrets. Never echo secrets, tokens, or

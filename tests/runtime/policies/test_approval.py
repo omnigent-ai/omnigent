@@ -40,11 +40,13 @@ from typing import Any
 
 import pytest
 
+from omnigent.errors import ElicitationDeclinedError
 from omnigent.policies.function import FunctionPolicy
 from omnigent.policies.types import ElicitationRequest, PolicyResult
 from omnigent.runtime.policies.approval import (
     ELICITATION_PENDING_TOOL_NAME,
     _await_elicitation,
+    _is_explicit_decline,
     _parse_verdict,
     _truncate,
 )
@@ -179,6 +181,27 @@ def _returns_none_park() -> Any:
     return _park
 
 
+# ── _is_explicit_decline ──────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"action": "decline"}', True),
+        ('{"action": "accept"}', False),
+        ('{"action": "cancel"}', False),  # cancel ≠ explicit decline
+        ('{"action": "DECLINE"}', False),  # case-sensitive
+        (None, False),
+        ("not json", False),
+        ("{}", False),
+    ],
+)
+def test_is_explicit_decline(raw: str | None, expected: bool) -> None:
+    """Only exact ``action == "decline"`` is an explicit decline.
+    cancel, accept, malformed, and None all return False."""
+    assert _is_explicit_decline(raw) is expected
+
+
 # ── _parse_verdict ─────────────────────────────────────
 
 
@@ -311,10 +334,12 @@ def test_elicitation_request_event_url_mode(monkeypatch: pytest.MonkeyPatch) -> 
         policy_names=["shell_gate"],
         content_preview="rm -rf /",
     )
-    event = _elicitation_request_event("elicit_abc", req, session_id="conv_123")
+    event = _elicitation_request_event(
+        "elicit_abc", req, session_id="0099dc8be6d82871e2e450424d46d1b7"
+    )
     params = event["params"]
     assert params["mode"] == "url"
-    assert params["url"] == "/approve/conv_123/elicit_abc"
+    assert params["url"] == "/approve/0099dc8be6d82871e2e450424d46d1b7/elicit_abc"
     # Message and extras are still present.
     assert params["message"] == "approve shell?"
 
@@ -331,7 +356,9 @@ def test_elicitation_request_event_form_mode_explicit(monkeypatch: pytest.Monkey
         policy_names=["gate"],
         content_preview="ls",
     )
-    event = _elicitation_request_event("elicit_abc", req, session_id="conv_123")
+    event = _elicitation_request_event(
+        "elicit_abc", req, session_id="0099dc8be6d82871e2e450424d46d1b7"
+    )
     params = event["params"]
     assert params["mode"] == "form"
     assert "url" not in params
@@ -395,34 +422,35 @@ async def test_accept_applies_labels(
 
 
 @pytest.mark.asyncio
-async def test_decline_does_not_apply_labels(
+async def test_decline_raises_elicitation_declined_error(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Ports omnigent ``test_label_policy_ask_deny``.
-    On explicit decline, labels are NOT applied — the
-    load-bearing §7.2 invariant that a denied ASK leaves
-    no side effects."""
+    """Explicit ``action == "decline"`` raises ElicitationDeclinedError
+    instead of returning False, so callers can abort the agent turn
+    rather than feeding a DENY to the LLM and continuing."""
     policy = _ask_policy("gate", set_labels={"integrity": "0"})
     engine = _engine_with_policies(conversation_store, [policy])
     recorder = _Recorder()
     result = _composed_ask(
         deciding_policy="gate",
+        reason="review needed",
         set_labels={"integrity": "0"},
     )
 
-    accepted = await _await_elicitation(
-        task_id="task_1",
-        root_task_id="task_1",
-        result=result,
-        phase=Phase.REQUEST,
-        content_preview="hello",
-        policy_engine=engine,
-        register=recorder.register,
-        emit=recorder.emit,
-        park=_accepting_park('{"action": "decline"}'),
-    )
-    assert accepted is False
-    # No labels landed — hot cache empty, store empty.
+    with pytest.raises(ElicitationDeclinedError) as exc_info:
+        await _await_elicitation(
+            task_id="task_1",
+            root_task_id="task_1",
+            result=result,
+            phase=Phase.REQUEST,
+            content_preview="hello",
+            policy_engine=engine,
+            register=recorder.register,
+            emit=recorder.emit,
+            park=_accepting_park('{"action": "decline"}'),
+        )
+    assert exc_info.value.policy_name == "gate"
+    # No labels landed — §7.2 invariant preserved.
     assert engine.labels == {}
     conv = conversation_store.get_conversation(engine.conversation_id)
     assert conv is not None

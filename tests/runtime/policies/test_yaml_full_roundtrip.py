@@ -93,9 +93,8 @@ async def test_yaml_full_schema_label(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Full `{initial, values, monotonic}` declaration
-    parses + builds correctly. Monotonic enforces at apply
-    time."""
+    """Full `{initial, values}` declaration parses + builds
+    correctly. Values enum enforces at apply time."""
     engine = _write_and_build(
         tmp_path,
         conversation_store,
@@ -107,7 +106,6 @@ guardrails:
     sensitivity:
       initial: public
       values: [public, internal, confidential]
-      monotonic: increasing
   policies:
     promote:
       type: function
@@ -129,8 +127,8 @@ guardrails:
     assert r.action == PolicyAction.ALLOW
     assert engine.labels["sensitivity"] == "confidential"
 
-    # Demote attempt → blocked by monotonic increasing.
-    engine.apply_label_writes({"sensitivity": "public"})
+    # Out-of-enum write is dropped.
+    engine.apply_label_writes({"sensitivity": "rogue"})
     # Still confidential.
     assert engine.labels["sensitivity"] == "confidential"
 

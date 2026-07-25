@@ -5,10 +5,10 @@ outbound WebSocket. The server sends control frames
 (launch/stop runner) over the tunnel; the host process spawns
 or terminates runner subprocesses accordingly.
 
-Per ``designs/DAEMON_API.md``, the host sends a ``host.hello``
-frame on connect advertising its version, name, and live runner
-IDs. The server validates ``frame_protocol_version`` for
-version-skew enforcement (strict-major).
+The host sends a ``host.hello`` frame on connect advertising its
+version, name, live runner IDs, and harness readiness, then reports
+readiness changes while connected. The server validates
+``frame_protocol_version`` for version-skew enforcement (strict-major).
 
 The endpoint registers the host in the :class:`HostRegistry`
 (in-memory, per-replica) and upserts the host in the ``hosts``
@@ -25,16 +25,25 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
+    HostDetectCredentialsResultFrame,
+    HostFsResultFrame,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
+    HostListWorktreesResultFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
+    HostRunnerStatusResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
@@ -64,8 +73,9 @@ def create_host_tunnel_router(
     host_store: HostStore,
     *,
     auth_provider: AuthProvider | None = None,
-    on_host_connect: Callable[[str], Awaitable[None]] | None = None,
-    on_host_disconnect: Callable[[str], Awaitable[None]] | None = None,
+    on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
+    on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
+    on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
@@ -98,6 +108,8 @@ def create_host_tunnel_router(
         runner-tunnel ``on_runner_disconnect`` path never fires).
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
+    :param on_host_update: Optional async callback fired when a connected
+        host reports changed harness readiness. Receives ``host_id`` and owner.
     :param local_single_user: When ``True``, allow a host to re-own a
         ``host_id`` already registered under a different owner — needed
         only for the single-user loopback local server, where the owner
@@ -131,6 +143,16 @@ def create_host_tunnel_router(
         7. Start sender, receiver, and ping loops.
         8. On disconnect: deregister, set offline in DB.
         """
+        # Legacy hosts dial in with ``host_<hex>`` — normalise to the stored
+        # bare form. Malformed ids are refused here because WebSocket routes
+        # bypass the app's StatementError→404 handler.
+        try:
+            host_id = uuid_to_bytes(host_id).hex()
+        except InvalidUuidError:
+            _logger.warning("Refusing host tunnel: malformed host id %r", host_id)
+            await ws.close(code=4003, reason="invalid host id")
+            return
+
         # Authenticate from the handshake BEFORE accepting the upgrade,
         # so an unauthenticated peer never completes the WS handshake — no
         # acceptance oracle and no pre-auth protocol I/O. ``get_user_id`` reads
@@ -142,14 +164,16 @@ def create_host_tunnel_router(
             # presented, it must resolve — never fall through to user auth
             # (a peer that chose this header has no user identity to fall
             # back on, and falling back would let a junk token downgrade
-            # into header/anonymous auth). The token is scoped to one
-            # host_id; presenting it for any other path fails closed so a
-            # leaked token cannot register arbitrary hosts.
-            managed = await asyncio.to_thread(host_store.resolve_launch_token, managed_token)
-            if managed is None or managed.host_id != host_id:
+            # into header/anonymous auth). The token is resolved against
+            # THIS path's host_id, so presenting it for any other path
+            # fails closed — a leaked token cannot register arbitrary hosts.
+            managed = await asyncio.to_thread(
+                host_store.resolve_launch_token, host_id, managed_token
+            )
+            if managed is None:
                 await ws.close(code=4004, reason="unauthenticated")
                 return
-            tunnel_owner = managed.owner
+            tunnel_owner = managed.user_id
         elif auth_provider is not None:
             tunnel_owner = auth_provider.get_user_id(ws)
             if tunnel_owner is None:
@@ -176,14 +200,14 @@ def create_host_tunnel_router(
         # the backstop for the connect/connect race this can't lock.
         if not allow_host_id_reown:
             existing = await asyncio.to_thread(host_store.get_host, host_id)
-            if existing is not None and existing.owner != tunnel_owner:
+            if existing is not None and existing.user_id != tunnel_owner:
                 _logger.warning(
                     "Refusing host %s: registered to owner %r but the "
                     "connecting peer authenticated as %r. Cross-owner "
                     "re-registration is not allowed — remove the stale "
                     "registration or reset the host id.",
                     host_id,
-                    existing.owner,
+                    existing.user_id,
                     tunnel_owner,
                 )
                 # Don't name the existing owner to this peer: in a multi-user
@@ -226,7 +250,7 @@ def create_host_tunnel_router(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
-                owner=tunnel_owner,
+                user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
             )
@@ -254,14 +278,22 @@ def create_host_tunnel_router(
                 name=f"host-ping:{host_id}",
             )
             receive_task = asyncio.create_task(
-                _receive_loop(ws, conn, host_id, runner_exit_reports, on_runner_exited),
+                _receive_loop(
+                    ws,
+                    conn,
+                    host_id,
+                    host_store,
+                    runner_exit_reports,
+                    on_runner_exited,
+                    on_host_update,
+                ),
                 name=f"host-receive:{host_id}",
             )
 
             if on_host_connect is not None:
                 try:
                     await asyncio.wait_for(
-                        on_host_connect(host_id),
+                        on_host_connect(host_id, tunnel_owner),
                         timeout=30.0,
                     )
                 except asyncio.TimeoutError:
@@ -297,7 +329,7 @@ def create_host_tunnel_router(
                 await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
-                        await on_host_disconnect(host_id)
+                        await on_host_disconnect(host_id, tunnel_owner)
                     except Exception:
                         _logger.exception(
                             "on_host_disconnect callback failed for %s",
@@ -316,7 +348,7 @@ def create_host_tunnel_router(
                 await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
-                        await on_host_disconnect(host_id)
+                        await on_host_disconnect(host_id, tunnel_owner)
                     except Exception:
                         _logger.exception(
                             "on_host_disconnect callback failed for %s",
@@ -370,18 +402,23 @@ async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
     host_id: str,
+    host_store: HostStore,
     runner_exit_reports: RunnerExitReports | None,
     on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection for resolving pending requests.
     :param host_id: Host id for logging.
+    :param host_store: Persistent store receiving live readiness updates.
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``
         when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_host_update: Callback fired after readiness changes persist;
+        ``None`` skips it.
     """
     while True:
         message = await ws.receive()
@@ -430,6 +467,20 @@ async def _receive_loop(
             )
             continue
 
+        if isinstance(frame, HostHarnessReadinessFrame):
+            await asyncio.to_thread(
+                host_store.update_harness_readiness,
+                host_id,
+                frame.configured_harnesses,
+            )
+            conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            if on_host_update is not None:
+                try:
+                    await on_host_update(host_id, conn.owner)
+                except Exception:
+                    _logger.exception("on_host_update callback failed for %s", host_id)
+            continue
+
         if isinstance(frame, HostLaunchRunnerResultFrame):
             future = conn.pending_launches.pop(frame.request_id, None)
             if future is not None and not future.done():
@@ -468,6 +519,12 @@ async def _receive_loop(
                 # connecting its tunnel has no runner-tunnel disconnect
                 # event, so this report is the only failure signal.
                 await on_runner_exited(frame.runner_id, frame.error)
+            continue
+
+        if isinstance(frame, HostRunnerStatusResultFrame):
+            status_future = conn.pending_runner_status.pop(frame.request_id, None)
+            if status_future is not None and not status_future.done():
+                status_future.set_result({"status": frame.status})
             continue
 
         if isinstance(frame, HostStatResultFrame):
@@ -530,6 +587,18 @@ async def _receive_loop(
                 )
             continue
 
+        if isinstance(frame, HostListWorktreesResultFrame):
+            list_wt_future = conn.pending_list_worktrees.pop(frame.request_id, None)
+            if list_wt_future is not None and not list_wt_future.done():
+                list_wt_future.set_result(
+                    {
+                        "status": frame.status,
+                        "worktrees": frame.worktrees,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
         if isinstance(frame, HostCreateDirResultFrame):
             create_dir_future = conn.pending_create_dirs.pop(frame.request_id, None)
             if create_dir_future is not None and not create_dir_future.done():
@@ -537,6 +606,62 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "path": frame.path,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostInstallHarnessResultFrame):
+            install_future = conn.pending_installs.pop(frame.request_id, None)
+            if install_future is not None and not install_future.done():
+                install_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostStoreSecretResultFrame):
+            secret_future = conn.pending_secret_writes.pop(frame.request_id, None)
+            if secret_future is not None and not secret_future.done():
+                secret_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostDetectCredentialsResultFrame):
+            detect_future = conn.pending_credential_detects.pop(frame.request_id, None)
+            if detect_future is not None and not detect_future.done():
+                detect_future.set_result({"credentials": frame.credentials})
+            continue
+
+        if isinstance(frame, HostFsResultFrame):
+            fs_future = conn.pending_fs_requests.pop(frame.request_id, None)
+            if fs_future is not None and not fs_future.done():
+                fs_future.set_result(
+                    {
+                        "status": frame.status,
+                        "payload": frame.payload,
+                        "error_status": frame.error_status,
+                        "error_code": frame.error_code,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostModelOptionsResultFrame):
+            model_future = conn.pending_model_options.pop(frame.request_id, None)
+            if model_future is not None and not model_future.done():
+                model_future.set_result(
+                    {
+                        "status": frame.status,
+                        "models": frame.models,
                         "error": frame.error,
                     }
                 )

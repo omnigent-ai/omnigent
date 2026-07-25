@@ -80,6 +80,17 @@ def _make_nonce() -> str:
     return "nonce" + uuid.uuid4().hex[:12]
 
 
+def _row_id_to_hex(value: object) -> str:
+    """Render a conversation id read via raw sqlite3 as bare 32-char hex.
+
+    The ``id`` column is a Uuid16 (16-byte BLOB), so ``sqlite3`` hands it
+    back as ``bytes``; ``--resume`` expects the hex string form.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    return str(value)
+
+
 def _argv_run_omnigent(
     *,
     omnigent_python: Path,
@@ -578,10 +589,15 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
 
     # Capture convA's id BEFORE planting B so we get the
     # right one — "newest" walks forward as more
-    # conversations are added.
+    # conversations are added. kind = 1 is the "default" enum code (the
+    # column is a SMALLINT; see omnigent.db.enum_codecs.CONVERSATION_KIND).
     with sqlite3.connect(str(persistent_db)) as conn:
         rows = conn.execute(
-            "SELECT id FROM conversations WHERE kind = 'default' ORDER BY updated_at DESC, id DESC"
+            "SELECT c.id FROM conversations c "
+            "JOIN omnigent_conversation_metadata m "
+            "  ON m.workspace_id = c.workspace_id AND m.id = c.id "
+            "WHERE m.kind = 1 "
+            "ORDER BY c.updated_at DESC, c.id DESC"
         ).fetchall()
     assert len(rows) == 1, (
         f"Expected exactly 1 conversation after plant A; got {len(rows)}. "
@@ -589,7 +605,7 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
         f"store. If >1, an unrelated test polluted the dir or the "
         f"HOME isolation broke."
     )
-    conv_a_id = rows[0][0]
+    conv_a_id = _row_id_to_hex(rows[0][0])
 
     # ── Run 2: plant nonce B, FRESH conversation (no
     # --continue / --session). A regression where -p mode
@@ -621,16 +637,21 @@ def test_run_omnigent_session_id_pins_the_specific_conversation(
     )
     assert nonce_b in plant_b.stdout.lower()
 
+    # kind = 1 is the "default" enum code (SMALLINT column).
     with sqlite3.connect(str(persistent_db)) as conn:
         rows = conn.execute(
-            "SELECT id FROM conversations WHERE kind = 'default' ORDER BY updated_at DESC, id DESC"
+            "SELECT c.id FROM conversations c "
+            "JOIN omnigent_conversation_metadata m "
+            "  ON m.workspace_id = c.workspace_id AND m.id = c.id "
+            "WHERE m.kind = 1 "
+            "ORDER BY c.updated_at DESC, c.id DESC"
         ).fetchall()
     assert len(rows) == 2, (
         f"Expected exactly 2 conversations after plant B; got {len(rows)}. "
         f"If 1, plant B threaded onto convA (the silent-resume "
         f"regression). If >2, leakage from another test."
     )
-    conv_b_id = rows[0][0]
+    conv_b_id = _row_id_to_hex(rows[0][0])
     assert conv_b_id != conv_a_id
 
     # ── Run 3: --resume convA_id must recover nonce A

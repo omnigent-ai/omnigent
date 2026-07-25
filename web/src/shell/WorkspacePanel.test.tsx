@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -24,6 +25,11 @@ vi.mock("./SubagentsPanel", () => ({
 vi.mock("./TodoPanel", () => ({
   TodoPanel: () => <div data-testid="todos-stub" />,
 }));
+vi.mock("@/components/BrowserPane/BrowserPane", () => ({
+  BrowserPane: ({ conversationId }: { conversationId: string }) => (
+    <div data-testid="browser-pane-stub">{conversationId}</div>
+  ),
+}));
 
 afterEach(() => {
   cleanup();
@@ -40,46 +46,82 @@ function renderWorkspace(
     rightRailTab?: RightRailTab;
     selectedFilePath?: string | null;
     openFiles?: string[];
+    showBrowserTab?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   render(
-    <WorkspacePanel
-      conversationId="conv_ws"
-      width={360}
-      handleProps={{ tabIndex: 0 }}
-      rightRailTab={overrides.rightRailTab ?? "files"}
-      onRightRailTabChange={onRightRailTabChange}
-      showFilesPanel
-      changedCount={0}
-      showShellsTab={false}
-      terminalsLength={0}
-      subagentsWorking={0}
-      agentCount={1}
-      isClaudeNative={false}
-      todosCompleted={0}
-      todosTotal={0}
-      rootSessionId={null}
-      selectedFilePath={overrides.selectedFilePath ?? null}
-      openFiles={overrides.openFiles ?? []}
-      openFileViewer={openFileViewer}
-      onCloseFile={onCloseFile}
-      onShowScopeView={vi.fn()}
-      onCommentsOpenChange={vi.fn()}
-      openTerminalsPanel={vi.fn()}
-      permissionLevel={null}
-      filesPanelSort={"recent" as ChangedSort}
-      onSortChange={vi.fn()}
-      filesPanelFlatView={false}
-      onFlatViewChange={vi.fn()}
-      filesPanelShowHidden={false}
-      onShowHiddenChange={vi.fn()}
-    />,
+    <TooltipProvider delayDuration={0}>
+      <WorkspacePanel
+        conversationId="conv_ws"
+        width={360}
+        handleProps={{ tabIndex: 0 }}
+        rightRailTab={overrides.rightRailTab ?? "files"}
+        onRightRailTabChange={onRightRailTabChange}
+        showFilesPanel
+        showBrowserTab={overrides.showBrowserTab ?? false}
+        changedCount={0}
+        showShellsTab={false}
+        terminalsLength={0}
+        subagentsWorking={0}
+        agentCount={1}
+        todosSupported={false}
+        todosCompleted={0}
+        todosTotal={0}
+        rootSessionId={null}
+        selectedFilePath={overrides.selectedFilePath ?? null}
+        openFiles={overrides.openFiles ?? []}
+        openFileViewer={openFileViewer}
+        onCloseFile={onCloseFile}
+        onShowScopeView={vi.fn()}
+        onCommentsOpenChange={vi.fn()}
+        openTerminalsPanel={vi.fn()}
+        permissionLevel={null}
+        filesPanelSort={"recent" as ChangedSort}
+        onSortChange={vi.fn()}
+        filesPanelFlatView={false}
+        onFlatViewChange={vi.fn()}
+        filesPanelShowHidden={false}
+        onShowHiddenChange={vi.fn()}
+      />
+    </TooltipProvider>,
   );
   return { openFileViewer, onCloseFile, onRightRailTabChange };
 }
+
+describe("WorkspacePanel surface presentation", () => {
+  it("uses an evenly inset desktop surface instead of clearing the header", () => {
+    renderWorkspace();
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    expect(panel).toHaveClass("md:m-2", "md:rounded-lg");
+    expect(panel).not.toHaveClass("md:mt-14", "md:mr-2", "md:mb-2");
+  });
+
+  it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {
+    renderWorkspace();
+
+    const filesTab = screen.getByRole("tab", { name: "Files" });
+    const agentsTab = screen.getByRole("tab", { name: "Agents 1" });
+    expect(filesTab).toHaveClass("size-8", "p-0");
+    expect(filesTab).not.toHaveAttribute("title");
+    expect(agentsTab).toHaveClass("size-8", "p-0");
+    expect(agentsTab).not.toHaveAttribute("title");
+  });
+
+  it.each([
+    { tabName: "Files", tooltip: "Files" },
+    { tabName: "Agents 1", tooltip: "Agents" },
+  ])("explains the $tabName pane icon with a hover tooltip", async ({ tabName, tooltip }) => {
+    renderWorkspace();
+
+    const tab = screen.getByRole("tab", { name: tabName });
+    fireEvent.pointerMove(tab.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(tooltip);
+  });
+});
 
 describe("WorkspacePanel open-file tabs", () => {
   it("renders a tab per open file labeled by basename, next to the fixed Files tab", () => {
@@ -177,5 +219,25 @@ describe("WorkspacePanel content area", () => {
     // slot and the viewer is unmounted.
     expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+});
+
+describe("WorkspacePanel browser tab", () => {
+  it("renders the Browser tab only when showBrowserTab is set", () => {
+    renderWorkspace({ showBrowserTab: true });
+    expect(screen.getByRole("tab", { name: /browser/i })).toBeInTheDocument();
+  });
+
+  it("omits the Browser tab when showBrowserTab is false", () => {
+    renderWorkspace({ showBrowserTab: false });
+    expect(screen.queryByRole("tab", { name: /browser/i })).toBeNull();
+  });
+
+  it("mounts the browser pane when the browser tab is selected", () => {
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    // The content slot swaps to the embedded browser pane (stubbed here).
+    expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
+    // And the file scope views are not mounted in that branch.
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
   });
 });

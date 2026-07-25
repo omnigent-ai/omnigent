@@ -1,19 +1,22 @@
 // Per-user tracking of which conversations have unseen messages.
 //
 // The "last seen" baseline (a wall-clock second per conversation) and the
-// explicit "marked unread" override live on the SERVER, in-memory and
-// per-user. The read path is the per-viewer `viewer_last_seen` /
-// `viewer_unread` fields embedded in the `GET /v1/sessions` list; the write
-// path is `PUT /v1/sessions/{id}/read-state`. This client keeps an in-memory
-// mirror, seeded from the conversation list and written back on every
-// mark-seen / mark-unread. That makes read-state shared across a user's
-// devices while the server is up. It is NOT persisted server-side, so a
-// server restart resets it (an accepted tradeoff — read-state has no
-// durable source to rederive from).
+// explicit "marked unread" override live in THIS BROWSER (localStorage),
+// mirrored best-effort to the server. The server's copy is in-memory and
+// per-replica: under replica sharding the list/`/updates` request can land
+// on a pod that never saw the user's read-state PUT, so its
+// `viewer_last_seen` / `viewer_unread` fields can be null even for a
+// session the user has read. The local copy is therefore the durable
+// source; the server seed only ever *raises* a baseline (max-merge), which
+// also picks up newer reads from the user's other devices when the serving
+// replica happens to have them. Cross-device unread is best-effort by
+// design.
 //
 // A conversation is "unseen" when its server-side updated_at exceeds the
-// stored baseline. Conversations with no stored entry are treated as seen
-// (no baseline) so a fresh load / post-restart doesn't light up every row.
+// stored baseline. A conversation with no baseline anywhere seeds to its
+// updated_at at load ("read as of load") — pod-independent, so the
+// automatic dot for a turn finishing after load always works, and a
+// null server seed can no longer permanently disable a row's dot.
 
 import { useEffect, useRef, useSyncExternalStore } from "react";
 
@@ -33,11 +36,58 @@ function notifySubscribers(): void {
 
 type LastSeenMap = Record<string, number>;
 
-// In-memory mirror of the server's per-user read-state, seeded from the
-// conversation list and updated optimistically on each mutation before the
-// PUT lands.
+// The browser-durable read-state, hydrated from localStorage at module
+// load, raised (never lowered) by the server seed, and updated
+// optimistically on each mutation before the best-effort PUT lands.
 const lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
+
+// localStorage persistence. Best-effort everywhere: storage can be
+// missing (SSR), full, or blocked — the in-memory mirror always works.
+const STORAGE_KEY = "omnigent.readState.v1";
+// Bound growth: keep only the newest baselines; older sessions fall back
+// to the seed's read-as-of-load behavior.
+const STORAGE_MAX_ENTRIES = 1000;
+
+function hydrateFromStorage(): void {
+  try {
+    const raw = globalThis.localStorage?.getItem(STORAGE_KEY);
+    if (!raw) return;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return;
+    const lastSeen = (parsed as { lastSeen?: unknown }).lastSeen;
+    if (typeof lastSeen === "object" && lastSeen !== null) {
+      for (const [id, value] of Object.entries(lastSeen)) {
+        if (typeof value === "number") lastSeenMap[id] = value;
+      }
+    }
+    const unread = (parsed as { unread?: unknown }).unread;
+    if (Array.isArray(unread)) {
+      for (const id of unread) {
+        if (typeof id === "string") explicitlyUnread.add(id);
+      }
+    }
+  } catch {
+    // Corrupt/blocked storage → start empty.
+  }
+}
+
+function persistToStorage(): void {
+  try {
+    let entries = Object.entries(lastSeenMap);
+    if (entries.length > STORAGE_MAX_ENTRIES) {
+      entries = entries.sort((a, b) => b[1] - a[1]).slice(0, STORAGE_MAX_ENTRIES);
+    }
+    globalThis.localStorage?.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ lastSeen: Object.fromEntries(entries), unread: [...explicitlyUnread] }),
+    );
+  } catch {
+    // Quota/blocked storage → in-memory state still serves this tab.
+  }
+}
+
+hydrateFromStorage();
 
 // Sessions already seeded from the list. Seeding is once-per-session: the
 // first time a conversation is seen we copy its server `viewer_*` into the
@@ -82,26 +132,38 @@ export interface ReadStateSeed {
   id: string;
   viewer_last_seen?: number | null;
   viewer_unread?: boolean;
+  updated_at?: number;
 }
 
 /**
  * Seeds the local mirror from the conversation list (the server's per-viewer
- * read path). Once-per-session: a conversation's server values are copied the
- * first time it appears, then ignored, so an in-flight list poll can't clobber
- * a local optimistic write. Flips {@link hydrated} on the first call (even for
- * an empty list) so the automatic mark-seen can resume. Notifies subscribers
- * when anything changed so rows recompute.
+ * read path). Once-per-session: a conversation is merged the first time it
+ * appears, then ignored, so an in-flight list poll can't clobber a local
+ * optimistic write. The merge is max(localStorage baseline, server value) —
+ * last-seen is monotonic, so taking the max is always safe and picks up a
+ * newer read from another device when the serving replica has it. A session
+ * with no baseline on either side seeds to its `updated_at` ("read as of
+ * load"): pod-independent, so a replica that can't see the user's read-state
+ * can never freeze a row's dot off. Flips {@link hydrated} on the first call
+ * (even for an empty list) so the automatic mark-seen can resume.
  */
 export function seedReadState(conversations: readonly ReadStateSeed[]): void {
   let changed = false;
   for (const conv of conversations) {
     if (seeded.has(conv.id)) continue;
     seeded.add(conv.id);
-    if (typeof conv.viewer_last_seen === "number") {
-      lastSeenMap[conv.id] = conv.viewer_last_seen;
+    const local = lastSeenMap[conv.id];
+    const server = typeof conv.viewer_last_seen === "number" ? conv.viewer_last_seen : undefined;
+    let baseline =
+      local !== undefined && server !== undefined ? Math.max(local, server) : (local ?? server);
+    if (baseline === undefined && typeof conv.updated_at === "number") {
+      baseline = conv.updated_at;
+    }
+    if (baseline !== undefined && baseline !== local) {
+      lastSeenMap[conv.id] = baseline;
       changed = true;
     }
-    if (conv.viewer_unread) {
+    if (conv.viewer_unread && !explicitlyUnread.has(conv.id)) {
       explicitlyUnread.add(conv.id);
       changed = true;
     }
@@ -110,7 +172,10 @@ export function seedReadState(conversations: readonly ReadStateSeed[]): void {
     hydrated = true;
     changed = true;
   }
-  if (changed) notifySubscribers();
+  if (changed) {
+    persistToStorage();
+    notifySubscribers();
+  }
 }
 
 /**
@@ -138,6 +203,11 @@ export function __resetReadStateForTests(): void {
   explicitlyUnread.clear();
   seeded.clear();
   hydrated = false;
+  try {
+    globalThis.localStorage?.removeItem(STORAGE_KEY);
+  } catch {
+    // Storage unavailable in this test environment — nothing to clear.
+  }
 }
 
 /**
@@ -148,6 +218,7 @@ export function __resetReadStateForTests(): void {
  */
 export function clearUnreadOverride(conversationId: string): void {
   if (explicitlyUnread.delete(conversationId)) {
+    persistToStorage();
     notifySubscribers();
     void syncReadState(conversationId);
   }
@@ -185,6 +256,7 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
   const stored = lastSeenMap[conversationId];
   if (stored !== undefined && stored >= baseline) return;
   lastSeenMap[conversationId] = baseline;
+  persistToStorage();
   notifySubscribers();
   void syncReadState(conversationId);
 }
@@ -207,6 +279,7 @@ export function markConversationSeen(conversationId: string, atSeconds?: number)
 export function markConversationUnread(conversationId: string, updatedAt: number): void {
   explicitlyUnread.add(conversationId);
   lastSeenMap[conversationId] = updatedAt - 1;
+  persistToStorage();
   notifySubscribers();
   void syncReadState(conversationId);
 }

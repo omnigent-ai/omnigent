@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { SessionState } from "@/hooks/useSessionState";
 import { cn } from "@/lib/utils";
+import type { ReactElement } from "react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
@@ -16,7 +17,7 @@ interface Visual {
   kind: SessionState["kind"];
   ariaLabel: string;
   tooltip: string;
-  render: () => JSX.Element;
+  render: () => ReactElement;
 }
 
 function describe(state: SessionState): Visual {
@@ -38,7 +39,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session running",
         tooltip: "Session running",
-        render: () => <RunningDot />,
+        render: () => <RunningDot className="size-2.5" />,
       };
     case "unseen":
       // Solid brand-pink dot — distinguished from the running indicator,
@@ -53,7 +54,7 @@ function describe(state: SessionState): Visual {
 }
 
 function Dot({ tone }: { tone: string }) {
-  return <span aria-hidden className={cn("size-2 shrink-0 rounded-full", tone)} />;
+  return <span aria-hidden className={cn("size-1.5 shrink-0 rounded-full", tone)} />;
 }
 
 export function SessionStateBadge({ state }: SessionStateBadgeProps) {

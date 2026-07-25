@@ -1,0 +1,688 @@
+# Cut or advance a release deterministically (designs/RELEASE-AUTOMATION.md):
+#
+#   dispatch with version=0.6.0rc1  ->  create release/v0.6.0 from `ref`, stamp the
+#   lockstep version (scripts/update_versions.py + `uv lock`), tag v0.6.0rc1,
+#   push branch + tag. Later dispatches (0.6.0rc2, 0.6.0, 0.6.1) reuse the
+#   existing release/v0.6.0 head and ignore `ref`.
+#
+# The branch + tag are pushed with the omnigent-ci App token, NOT GITHUB_TOKEN:
+# GITHUB_TOKEN-pushed tags trigger no workflows by GitHub policy, and the whole
+# release chain (github-release.yml -> draft-release-notes.yml, and
+# oss-publish-images.yml) hangs off the tag push.
+#
+# PyPI publishing does NOT happen here — after this run, dispatch the secure
+# release repo on the tag (see RELEASING.md). Everything here is idempotent:
+# re-dispatch with identical inputs after any failure and it converges
+# (branch exists -> reused; version stamped -> no new commit; tag at the
+# converged commit -> no-op; tag anywhere else -> loud failure).
+#
+# `dry_run` defaults TRUE (repo convention, same as the vscode release
+# workflows): the plan job prints exactly what would happen; nothing is pushed.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.6.0rc1 or 0.6.0 (no leading v)."
+        required: true
+        type: string
+      ref:
+        description: "Branch/tag/SHA to cut release/vX.Y.0 from. Only consulted when the branch does not exist yet (rc1); later phases build from the existing branch head."
+        required: false
+        default: main
+        type: string
+      dry_run:
+        description: "Plan only: validate + print what would happen, push nothing."
+        required: false
+        type: boolean
+        default: true
+      skip_ci_check:
+        description: "Skip the green-CI assertion on the base commit (flaky-check escape hatch — use deliberately)."
+        required: false
+        type: boolean
+        default: false
+      skip_benchmark:
+        description: "Skip the pre-cut benchmark regression check (escape hatch — use deliberately)."
+        required: false
+        type: boolean
+        default: false
+
+# Nothing here writes with GITHUB_TOKEN; pushes use the App token.
+permissions:
+  contents: read
+
+# Serialize all release runs: two concurrent cuts (even of different versions)
+# could race the same release/vX.Y.0 head.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Releases are maintainer-only. `workflow_dispatch` is open to anyone with
+  # write access, so gate on the dispatcher's actual repo role instead of a
+  # hand-kept list. `github.actor` on a dispatch is the dispatcher.
+  authorize:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require admin/maintain role
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          role="$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" --jq .role_name)"
+          case "$role" in
+            admin|maintain)
+              echo "Dispatcher ${ACTOR} has role ${role} — authorized." | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *)
+              echo "::error::Release workflows require the admin or maintain role (dispatcher ${ACTOR} has '${role}')."
+              exit 1 ;;
+          esac
+
+  # Resolve everything and validate BEFORE mutating anything. Runs checkout-free
+  # (pure API reads) and also serves as the whole dry run.
+  plan:
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      tag: ${{ steps.derive.outputs.tag }}
+      branch: ${{ steps.derive.outputs.branch }}
+      prerelease: ${{ steps.derive.outputs.prerelease }}
+      branch_exists: ${{ steps.state.outputs.branch_exists }}
+      base_sha: ${{ steps.state.outputs.base_sha }}
+      already_done: ${{ steps.state.outputs.already_done }}
+    steps:
+      - name: Validate version and derive names
+        id: derive
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Final X.Y.Z or a PEP 440 pre-release (a/b/rc). No dev/post here.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+            echo "::error::Invalid release version: ${VERSION} (expect 0.6.0 or 0.6.0rc1)"; exit 1
+          fi
+          major="${VERSION%%.*}"; rest="${VERSION#*.}"; minor="${rest%%.*}"
+          prerelease=false
+          case "$VERSION" in *a[0-9]*|*b[0-9]*|*rc[0-9]*) prerelease=true ;; esac
+          {
+            echo "version=${VERSION}"
+            echo "tag=v${VERSION}"
+            echo "branch=release/v${major}.${minor}.0"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve branch, base commit, and tag state
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.derive.outputs.version }}
+          TAG: ${{ steps.derive.outputs.tag }}
+          BRANCH: ${{ steps.derive.outputs.branch }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          # `gh api` prints the error body to STDOUT on 404, so capturing with
+          # `|| true` would treat the "Not Found" JSON as an existing ref —
+          # gate on the exit code instead.
+          if branch_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BRANCH}" --jq .object.sha 2>/dev/null)"; then
+            branch_exists=true
+            base_sha="$branch_sha"
+            # `ref` only applies at branch creation. An explicit non-default ref
+            # that disagrees with the branch head is a mistake, not a retarget.
+            if [ "$REF" != "main" ]; then
+              ref_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)"
+              if [ "$ref_sha" != "$branch_sha" ]; then
+                echo "::error::${BRANCH} already exists at ${branch_sha}; ref=${REF} (${ref_sha}) would not be used. Re-dispatch without ref, or delete the branch if this is recovery."
+                exit 1
+              fi
+            fi
+          else
+            branch_exists=false
+            base_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)"
+          fi
+
+          # Tag state: absent -> normal; at the converged release commit ->
+          # no-op; anywhere else -> refuse (never silently move a tag).
+          already_done=false
+          if tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha 2>/dev/null)"; then
+            tag_type="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.type)"
+            if [ "$tag_type" = "tag" ]; then
+              tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq .object.sha)"
+            fi
+            stamped="$(gh api -H "Accept: application/vnd.github.raw+json" \
+              "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=${TAG}" \
+              | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+            if [ "$tag_sha" = "$base_sha" ] && [ "$stamped" = "$VERSION" ]; then
+              already_done=true
+              echo "Tag ${TAG} already at the converged release commit ${base_sha} — nothing to do." \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::Tag ${TAG} already exists at ${tag_sha} (stamped version: ${stamped:-unknown}), which is not the converged branch head ${base_sha}. Delete the tag first if this is recovery (see RELEASING.md)."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "branch_exists=${branch_exists}"
+            echo "base_sha=${base_sha}"
+            echo "already_done=${already_done}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assert green CI on the base commit
+        if: steps.state.outputs.already_done != 'true' && !inputs.skip_ci_check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.state.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          # This gate is meta-CI, not CI itself. Every job this Release workflow
+          # spawns (plan, benchmark, cut, bump-main, …) leaves a check-run on
+          # the base commit; a single premature failure on a prior dispatch
+          # would otherwise poison the SHA and block every retry in a
+          # self-sustaining loop. Exclude *all* check-runs that belong to a run
+          # of this workflow, identified by run ID in details_url — not by job
+          # name, so a real nightly `benchmark` regression (different workflow)
+          # is still gated.
+          own_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?head_sha=${BASE_SHA}&per_page=100&status=completed" \
+            --jq '.workflow_runs[].id' 2>/dev/null | paste -sd, -)"
+          runs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BASE_SHA}/check-runs?per_page=100" \
+            --paginate --jq '.check_runs[] | [.name, .status, .conclusion // "-", .details_url] | @tsv')"
+          # Drop check-runs whose details_url references one of this
+          # workflow's own runs (e.g. .../actions/runs/<id>/job/<id>).
+          runs="$(printf '%s' "$runs" | awk -F'\t' -v rel="$own_runs" '
+            BEGIN { n=split(rel, a, ","); for (i=1; i<=n; i++) if (a[i]!="") runs[a[i]]=1 }
+            { own=0; for (r in runs) if (index($4, "/runs/" r "/")) { own=1; break }
+              if (!own) print $1 "\t" $2 "\t" $3 }')"
+          total="$(printf '%s' "$runs" | grep -c . || true)"
+          pending="$(printf '%s' "$runs" | awk -F'\t' '$2 != "completed"' || true)"
+          # Cancelled runs are chronically present on main (superseded
+          # benchmark/eval runs) — warn, don't block; real failures still gate.
+          bad="$(printf '%s' "$runs" | awk -F'\t' '$3 ~ /^(failure|timed_out|action_required|startup_failure)$/' || true)"
+          cancelled="$(printf '%s' "$runs" | awk -F'\t' '$3 == "cancelled"' || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::Failing check runs on ${BASE_SHA}:"; printf '%s\n' "$bad"; exit 1
+          fi
+          if [ -n "$pending" ]; then
+            echo "::error::Check runs still running on ${BASE_SHA} — wait for CI:"; printf '%s\n' "$pending"; exit 1
+          fi
+          if [ "$total" -eq 0 ]; then
+            echo "::error::No check runs found on ${BASE_SHA}. Wait for CI on that commit, or re-dispatch with skip_ci_check=true if you are sure."
+            exit 1
+          fi
+          if [ -n "$cancelled" ]; then
+            echo "::warning::Cancelled (superseded) check runs on ${BASE_SHA} — not blocking:"
+            printf '%s\n' "$cancelled"
+          fi
+          echo "CI green on ${BASE_SHA} (${total} completed check runs, none failing)." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Write the plan
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ steps.derive.outputs.version }}
+          TAG: ${{ steps.derive.outputs.tag }}
+          BRANCH: ${{ steps.derive.outputs.branch }}
+          BRANCH_EXISTS: ${{ steps.state.outputs.branch_exists }}
+          BASE_SHA: ${{ steps.state.outputs.base_sha }}
+          ALREADY_DONE: ${{ steps.state.outputs.already_done }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Release plan for ${TAG}"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Branch | \`${BRANCH}\` ($([ "$BRANCH_EXISTS" = "true" ] && echo "exists — reused" || echo "will be created")) |"
+            echo "| Base commit | \`${BASE_SHA}\` |"
+            echo "| Converged already | ${ALREADY_DONE} |"
+            echo "| Mode | $([ "$DRY_RUN" = "true" ] && echo "DRY RUN — nothing pushed" || echo "EXECUTE") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Seed the corpus at the OLDER release's schema head so both servers can
+  # boot: the baseline (older code) reads it natively, and the candidate (newer
+  # code) auto-migrates it forward on startup. Migrations are forward-only, so
+  # seeding at the newer schema would leave a DB the older code can't read.
+  # The seeded bench.db is passed to baseline + candidate as an artifact so
+  # they run in parallel on separate runners (each migrates/reads its own copy).
+  benchmark-seed:
+    needs: [authorize, plan]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark }}
+    outputs:
+      prev_tag: ${{ steps.prev.outputs.tag }}
+      has_prev: ${{ steps.prev.outputs.found }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out release base
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Find previous stable release tag
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PREV_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=20" \
+            --jq '[.[] | select(.prerelease == false and .draft == false)] | .[0].tag_name // empty')
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous stable release found — skipping regression check." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Previous stable release: ${PREV_TAG}" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Seed at the OLDER schema head so both servers can boot. When there is
+      # no previous release (first cut) seed at the current schema instead.
+      - name: Seed at previous release schema
+        if: steps.prev.outputs.found == 'true'
+        run: |
+          git checkout "${{ steps.prev.outputs.tag }}"
+          uv sync --extra dev
+          uv run --no-sync dev/benchmarks/omnigent/seed.py \
+            --database-uri "sqlite:///bench.db" \
+            --sessions 5000 --items-per-session 200
+
+      - name: Seed at current schema (no previous release)
+        if: steps.prev.outputs.found != 'true'
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/seed.py \
+            --database-uri "sqlite:///bench.db" \
+            --sessions 5000 --items-per-session 200
+
+      - name: Upload seeded corpus
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-db-${{ github.run_id }}
+          path: bench.db
+          retention-days: 1
+          if-no-files-found: error
+
+  # Benchmark the previous release. Skipped on the first cut (no prev tag).
+  benchmark-baseline:
+    needs: [benchmark-seed]
+    if: ${{ needs.benchmark-seed.outputs.has_prev == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out previous release
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.benchmark-seed.outputs.prev_tag }}
+          persist-credentials: false
+
+      - name: Download seeded corpus
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-db-${{ github.run_id }}
+          path: .
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run baseline benchmark
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/run.py \
+            --database-uri "sqlite:///bench.db" \
+            --iterations 100 --runs 3 --output baseline.json
+          echo "Baseline benchmark complete." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload baseline results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: baseline-results-${{ github.run_id }}
+          path: baseline.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # Benchmark the release candidate. Always runs (even on first cut, solo).
+  benchmark-candidate:
+    needs: [authorize, plan, benchmark-seed]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out release base
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Download seeded corpus
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-db-${{ github.run_id }}
+          path: .
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # The seeded bench.db is at the previous release's schema head. The
+      # candidate (newer code) auto-migrates on server boot, but the z7
+      # binary-UUID conversion is a per-row Python loop over ~1M items that
+      # takes >90s — longer than the benchmark harness's health-check window.
+      # Pre-migrate explicitly so the server boots against an already-current DB.
+      - name: Migrate corpus to release-base schema
+        run: |
+          uv run --no-sync omni debug db-upgrade "sqlite:///bench.db"
+          echo "Corpus migrated to release-base schema head." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run candidate benchmark
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/run.py \
+            --database-uri "sqlite:///bench.db" \
+            --iterations 100 --runs 3 --output candidate.json
+          echo "Candidate benchmark complete." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-results-${{ github.run_id }}
+          path: candidate.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # Compare baseline vs candidate. Downloaded as artifacts from the parallel
+  # jobs. A detected regression surfaces as an output flag that gates the
+  # benchmark-approve job (requiring manual sign-off) rather than failing
+  # outright. Skipped on the first cut (no baseline).
+  benchmark:
+    needs: [authorize, plan, benchmark-seed, benchmark-baseline, benchmark-candidate]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark && needs.benchmark-seed.outputs.has_prev == 'true' }}
+    outputs:
+      regression: ${{ steps.compare.outputs.regression }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out release base
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Download results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "{baseline,candidate}-results-${{ github.run_id }}"
+          merge-multiple: true
+          path: .
+
+      - name: Compare results
+        id: compare
+        run: |
+          set +e
+          uv run --no-sync dev/benchmarks/omnigent/compare.py \
+            --baseline baseline.json \
+            --candidate candidate.json \
+            --threshold 1.0 \
+            --output-markdown comparison.md
+          RC=$?
+          set -e
+          echo "regression=$([ $RC -ne 0 ] && echo 'true' || echo 'false')" >> "$GITHUB_OUTPUT"
+
+      - name: Write step summary
+        run: |
+          REGRESSION="${{ steps.compare.outputs.regression }}"
+          {
+            if [ "$REGRESSION" != "true" ]; then
+              echo "### Benchmark: PASS ✓"
+            else
+              echo "### Benchmark: REGRESSION DETECTED ✗"
+              echo ""
+              echo "> A regression exceeding the threshold was found."
+              echo "> The **benchmark-approve** job is awaiting maintainer sign-off before cut proceeds."
+            fi
+            echo ""
+            cat comparison.md 2>/dev/null || echo "_No comparison report generated._"
+            echo ""
+            echo "_Candidate vs ${{ needs.benchmark-seed.outputs.prev_tag }} · 100 iterations × 3 runs · SQLite · threshold 100% on P50/P95_"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: benchmark-release-${{ github.run_id }}
+          path: |
+            candidate.json
+            baseline.json
+            comparison.md
+          retention-days: 90
+          if-no-files-found: ignore
+
+  # Pauses for a maintainer to review and approve in the GitHub UI when the
+  # benchmark job detected a regression. Uses an environment with required
+  # reviewers — configure "benchmark-regression-gate" in repo Settings →
+  # Environments. Skipped (passes through) when there is no regression.
+  benchmark-approve:
+    needs: [authorize, plan, benchmark]
+    if: |
+      !inputs.dry_run &&
+      needs.plan.outputs.already_done != 'true' &&
+      !inputs.skip_benchmark &&
+      needs.benchmark.result == 'success' &&
+      needs.benchmark.outputs.regression == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: benchmark-regression-gate
+    steps:
+      - name: Regression approved by maintainer
+        run: |
+          echo "Benchmark regression approved. Proceeding with cut." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Stamp + tag + push. Only reached on a real run that isn't already converged.
+  cut:
+    needs: [authorize, plan, benchmark-candidate, benchmark, benchmark-approve]
+    # benchmark (compare) + benchmark-approve are skipped on the first cut (no
+    # previous release to compare against); benchmark-candidate always runs and
+    # is the real gate. `!cancelled` lets the optional compare/approve jobs be
+    # skipped without blocking, while still failing the run if they actually fail.
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Clean public resolution for `uv lock` — the committed lockfile must
+      # reference https://pypi.org/simple (never a proxy).
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Mint App token (omnigent)
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent
+
+      - name: Checkout base
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Existing branch: its head. New branch: the resolved base commit.
+          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      - name: Stamp the lockstep version
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          current="$(uv run --no-project --python 3.12 --with packaging \
+            python scripts/update_versions.py check 2>/dev/null || true)"
+          if [ "$current" = "$VERSION" ]; then
+            echo "Already stamped at ${VERSION} — skipping bump (idempotent re-run)."
+          else
+            uv run --no-project --python 3.12 --with packaging \
+              python scripts/update_versions.py pre-release --new-version "$VERSION"
+            uv lock
+          fi
+          uv run --no-project --python 3.12 --with packaging \
+            python scripts/update_versions.py check --expect "$VERSION"
+
+      - name: Commit, tag, and push
+        env:
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          BRANCH: ${{ needs.plan.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "omnigent-ci[bot]"
+          git config user.email "294685417+omnigent-ci[bot]@users.noreply.github.com"
+
+          git add pyproject.toml sdks/python-client/pyproject.toml sdks/ui/pyproject.toml \
+            omnigent/version.py uv.lock
+          if git diff --cached --quiet; then
+            echo "No version changes to commit (already stamped)."
+          else
+            git commit -s -m "release: ${TAG}"
+          fi
+
+          git tag "$TAG"
+          # One push for branch + tag, via the App token so the tag-push
+          # workflows fire. Non-fast-forward on the branch fails loudly.
+          push_url="https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$push_url" "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
+          echo "Pushed ${BRANCH} + ${TAG} at $(git rev-parse HEAD)." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Next steps
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Next steps"
+            echo ""
+            echo "1. Dispatch the secure-release repo on this tag:"
+            echo '   ```'
+            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "     -f ref=${TAG} -f destination=pypi -f dry-run=true    # gates rehearsal"
+            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "     -f ref=${TAG} -f destination=pypi -f dry-run=false   # real publish"
+            echo '   ```'
+            if [ "$PRERELEASE" = "true" ]; then
+              echo "2. Validate the rc from PyPI (see RELEASING.md). The GitHub draft for ${TAG} stays unpublished."
+            else
+              echo "2. Merge the CHANGELOG PR, curate the ${TAG} draft notes, then dispatch finalize-release.yml (tag=${TAG})."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # First cut of a cycle (rc1) immediately moves main to the next .dev0 so main
+  # never re-freezes and doc-sync keeps deriving the right X.Y-docs branch.
+  bump-main:
+    needs: [authorize, plan, cut]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.branch_exists == 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the post-release main bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A cut below main's current line (a throwaway rehearsal rc, or
+          # resurrecting an old series for a backport) must not walk main's
+          # version backwards.
+          MAIN_VERSION="$(gh api -H "Accept: application/vnd.github.raw+json" \
+            "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=main" \
+            | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+          export MAIN_VERSION
+          python3 -m pip install --quiet --disable-pip-version-check packaging
+          if ! python3 -c 'import os, sys; from packaging.version import Version; sys.exit(0 if Version(os.environ["VERSION"]) > Version(os.environ["MAIN_VERSION"]) else 1)'; then
+            echo "Released ${VERSION} sorts below main's ${MAIN_VERSION} — skipping the main bump." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh workflow run bump-version.yml --repo "$GITHUB_REPOSITORY" \
+            -f mode=post-release -f "new_version=${VERSION}" -f base_branch=main
+          echo "Dispatched bump-version.yml (post-release ${VERSION}) — review and merge the main bump PR." \
+            | tee -a "$GITHUB_STEP_SUMMARY"

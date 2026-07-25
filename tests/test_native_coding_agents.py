@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent._wrapper_labels import (
     KIRO_NATIVE_WRAPPER_VALUE,
     PI_NATIVE_WRAPPER_VALUE,
@@ -9,11 +11,11 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.harness_plugins import KIRO_NATIVE_CODING_AGENT, PI_NATIVE_CODING_AGENT
 from omnigent.native_coding_agents import (
-    KIRO_NATIVE_CODING_AGENT,
-    PI_NATIVE_CODING_AGENT,
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
+    native_shell_terminal_spec,
     public_agent_name,
 )
 
@@ -107,3 +109,40 @@ def test_public_agent_name_passes_through_regular_names() -> None:
     assert public_agent_name("nessie") == "nessie"
     assert public_agent_name("") == ""
     assert public_agent_name(None) is None
+
+
+@pytest.mark.posix_only
+def test_native_shell_terminal_spec_offers_installed_shells_default_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One terminal per installed shell, keyed by name, ``$SHELL`` first.
+
+    Every native wrapper declares this so "+ New shell" opens the user's login
+    shell by default while still offering the other installed shells. Each entry
+    is keyed and commanded by its basename and is an unsandboxed caller-process
+    shell with cwd override allowed.
+    """
+    monkeypatch.setattr("shutil.which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setenv("SHELL", "/usr/local/bin/fish")
+    spec = native_shell_terminal_spec()
+    # $SHELL (fish) leads, then the remaining offered shells in order.
+    assert list(spec) == ["fish", "bash", "zsh"]
+    for name, entry in spec.items():
+        assert entry["command"] == name
+        assert entry["allow_cwd_override"] is True
+        assert entry["os_env"] == {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {"type": "none"},
+        }
+
+
+def test_native_shell_terminal_spec_falls_back_to_bash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no shells installed the spec still offers a single bash terminal."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.delenv("SHELL", raising=False)
+    spec = native_shell_terminal_spec()
+    assert list(spec) == ["bash"]
+    assert spec["bash"]["command"] == "bash"

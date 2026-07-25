@@ -58,7 +58,7 @@ _E2E_PROMPT_POLICY_DIR = (
 _LABEL_GATE_EXTRA_CONFIG: dict = {
     "labels": {"tainted": "0"},
     "label_schema": {
-        "tainted": {"values": ["0", "1"], "monotonic": "max"},
+        "tainted": {"values": ["0", "1"]},
     },
     "policies": {
         "taint_on_banana": {

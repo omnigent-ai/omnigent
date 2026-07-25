@@ -8,9 +8,11 @@
 #   open http://localhost:8000  # web UI; start a local runner per the prompt
 #
 # Auth modes (OMNIGENT_AUTH_PROVIDER):
-#   - accounts (DEFAULT) — built-in accounts, no IdP needed. First
-#     boot prints the admin password to `docker compose logs` and
-#     saves it to /data/admin-credentials. Set
+#   - accounts (DEFAULT) — built-in accounts, no IdP needed. No
+#     credentials are auto-generated; first boot prints a "No admin
+#     yet" line and you create the first admin (username + password)
+#     via the web Create-admin form, or pre-seed it with
+#     OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD. Set
 #     OMNIGENT_ACCOUNTS_BASE_URL for any deploy reachable behind
 #     a public domain (defaults to http://<HOST>:<PORT> otherwise).
 #   - oidc — bring your own IdP. Set OMNIGENT_OIDC_* vars — see
@@ -60,9 +62,15 @@ services:
       ARTIFACT_DIR: /data/artifacts
       HOST: 0.0.0.0
       PORT: "8000"
-      # Pin the admin-credentials path to the persistent volume so
-      # the file survives container restarts. Empty/unset would
-      # write to /root/.omnigent/ inside the ephemeral container.
+      # Anchor the server's data dir on the persistent volume so
+      # file-backed operator config survives container restarts:
+      # the admin roster (/data/admins) and allowed-domains file
+      # (/data/allowed_domains), plus artifacts mounted elsewhere
+      # in the same volume. Account rows and password hashes live in
+      # PostgreSQL (the postgres-data volume), not here. The server
+      # resolves its data dir from this path's parent (/data);
+      # empty/unset would fall back to /root/.omnigent/ inside the
+      # ephemeral container.
       OMNIGENT_ADMIN_CREDENTIALS_PATH: /data/admin-credentials
 
       # ── Auth ─────────────────────────────────────────
@@ -97,6 +105,14 @@ services:
       OMNIGENT_OIDC_SESSION_TTL_HOURS: "${OMNIGENT_OIDC_SESSION_TTL_HOURS:-8}"
       OMNIGENT_OIDC_ALLOWED_DOMAINS: "${OMNIGENT_OIDC_ALLOWED_DOMAINS:-}"
       OMNIGENT_OIDC_LOGOUT_REDIRECT_URI: "${OMNIGENT_OIDC_LOGOUT_REDIRECT_URI:-}"
+      # Skip the email_verified id_token check — for IdPs (e.g. Okta
+      # without API Access Management) that omit the claim for
+      # directory-provisioned users. Off unless set; see .env.example.
+      OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION: "${OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION:-}"
+      # Read the email identity from a different id_token claim — for
+      # IdPs (e.g. Microsoft Entra ID) that issue preferred_username
+      # instead of email. Empty means the default (email); see .env.example.
+      OMNIGENT_OIDC_EMAIL_CLAIM: "${OMNIGENT_OIDC_EMAIL_CLAIM:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

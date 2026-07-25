@@ -171,6 +171,47 @@ def test_drive_write_to_created_file_allowed() -> None:
     assert result is None
 
 
+def test_drive_create_result_snake_case_id_recorded() -> None:
+    """A create result using snake_case ``document_id`` is recorded.
+
+    Regression guard: the Databricks Google MCP filters create results down to
+    snake_case id fields (``document_id``), not the raw camelCase
+    ``documentId``. If only camelCase were recognized, the created file would
+    not be tracked and a later write to it would be wrongly denied.
+    """
+    result = gdrive_policy()(
+        tr(
+            "mcp__google__docs_document_create",
+            '{"service": "docs", "operation": "create", "document_id": "1New"}',
+        )
+    )
+    assert result is not None
+    assert result["state_updates"] == [
+        {"key": CREATED_FILES_STATE_KEY, "action": "append", "value": "1New"}
+    ]
+
+
+def test_drive_edit_section_is_a_write_tool() -> None:
+    """``docs_document_edit_section`` is treated as a write (scoped like others).
+
+    Regression guard: the Docs content-edit tool must be recognized as a write,
+    not fall through to the "unknown tool" fail-closed branch. It is scoped by
+    its ``document_id`` arg, so a write to a created file is allowed and one to
+    an unowned file is denied.
+    """
+    policy = gdrive_policy()
+    allowed = policy(
+        tc(
+            "mcp__google__docs_document_edit_section",
+            {"document_id": "1New"},
+            {CREATED_FILES_STATE_KEY: ["1New"]},
+        )
+    )
+    assert allowed is None
+    denied = policy(tc("mcp__google__docs_document_edit_section", {"document_id": "1Foreign"}))
+    assert denied is not None and denied["result"] == "DENY"
+
+
 def test_drive_write_to_uncreated_file_denied() -> None:
     """A write to a file the agent did not create (nor allowlisted) is denied."""
     policy = gdrive_policy()
@@ -348,6 +389,208 @@ async def test_drive_created_file_roundtrip(
         )
     )
     assert write_foreign.action == PolicyAction.DENY
+
+
+# ── gdrive_policy: Bell-LaPadula "no write-down" (confidential compartment) ────
+
+_CONF_ID = "1ConfidentialDocABCDEFGHIJKLMNOPQRSTUV"
+_OTHER_ID = "1OtherDocABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
+
+
+def test_no_write_down_off_by_default() -> None:
+    """With no ``confidential_files``, reads and writes are unconstrained.
+
+    Guards backward-compat: the compartment rule is inert unless
+    ``confidential_files`` is configured.
+    """
+    policy = gdrive_policy()  # confidential_files defaults to empty
+    # A read of any file records nothing.
+    assert (
+        policy(
+            tr(
+                "mcp__google__docs_document_get",
+                "{}",
+                request_arguments={"document_id": _CONF_ID},
+            )
+        )
+        is None
+    )
+
+
+def test_no_write_down_reading_confidential_latches_state() -> None:
+    """Reading a confidential file flags the session's confidential-read latch."""
+    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    result = policy(
+        tr(
+            "mcp__google__docs_document_get",
+            "{}",
+            request_arguments={"document_id": _CONF_ID},
+        )
+    )
+    assert result is not None and result["result"] == "ALLOW"
+    assert result["state_updates"] == [
+        {"key": "gdrive_read_confidential", "action": "set", "value": True}
+    ]
+
+
+def test_no_write_down_reading_non_confidential_does_not_latch() -> None:
+    """Reading a file outside the compartment leaves the latch unset."""
+    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    result = policy(
+        tr(
+            "mcp__google__docs_document_get",
+            "{}",
+            request_arguments={"document_id": _OTHER_ID},
+        )
+    )
+    assert result is None  # nothing recorded
+
+
+def test_no_write_down_latch_is_idempotent() -> None:
+    """A second confidential read does not re-emit the latch update."""
+    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    result = policy(
+        tr(
+            "mcp__google__docs_document_get",
+            "{}",
+            session_state={"gdrive_read_confidential": True},
+            request_arguments={"document_id": _CONF_ID},
+        )
+    )
+    assert result is None  # already latched — no duplicate update
+
+
+def test_no_write_down_write_outside_compartment_denied() -> None:
+    """After reading confidential, a write to an outside file is denied."""
+    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    state = {"gdrive_read_confidential": True}
+    result = policy(tc("mcp__google__drive_file_update", {"file_id": _OTHER_ID}, state))
+    assert result is not None and result["result"] == "DENY"
+    assert "no write-down" in result["reason"]
+
+
+def test_no_write_down_write_inside_compartment_allowed() -> None:
+    """After reading confidential, a write to a confidential file the agent may
+    write (here, in ``write_files``) is allowed — it stays inside the set.
+
+    The no-write-down check does not fire (target is confidential), and the base
+    write rule permits it because the file is explicitly writable.
+    """
+    policy = gdrive_policy(confidential_files=[_CONF_ID], write_files=[_CONF_ID])
+    state = {"gdrive_read_confidential": True}
+    assert policy(tc("mcp__google__drive_file_update", {"file_id": _CONF_ID}, state)) is None
+
+
+def test_no_write_down_confidential_does_not_grant_write() -> None:
+    """Declaring a file confidential does not by itself make it writable.
+
+    Guards against a boundary-widening side effect: a confidential file the
+    agent neither created nor has in ``write_files`` is still denied by the base
+    write rule (``confidential_files`` is a containment declaration, not a
+    write grant).
+    """
+    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    result = policy(tc("mcp__google__drive_file_update", {"file_id": _CONF_ID}))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_no_write_down_create_after_confidential_denied() -> None:
+    """After reading confidential, creating a new (outside) file is denied.
+
+    A brand-new file is outside the confidential compartment, so writing into it
+    would move confidential data into a less-protected place.
+    """
+    policy = gdrive_policy(confidential_files=[_CONF_ID], allow_create=True)
+    state = {"gdrive_read_confidential": True}
+    result = policy(tc("mcp__google__docs_document_create", {"title": "leak"}, state))
+    assert result is not None and result["result"] == "DENY"
+    assert "no write-down" in result["reason"]
+
+
+def test_no_write_down_ask_action_escalates_instead_of_denying() -> None:
+    """``write_down_action='ASK'`` turns a violation into an approval prompt."""
+    policy = gdrive_policy(confidential_files=[_CONF_ID], write_down_action="ASK")
+    state = {"gdrive_read_confidential": True}
+    result = policy(tc("mcp__google__drive_file_update", {"file_id": _OTHER_ID}, state))
+    assert result is not None and result["result"] == "ASK"
+
+
+def test_no_write_down_no_confidential_read_yet_allows_write() -> None:
+    """Before reading any confidential file, writes are unconstrained by the rule.
+
+    The write still passes the base access rules because the file was created
+    this session.
+    """
+    policy = gdrive_policy(confidential_files=[_CONF_ID])
+    state = {CREATED_FILES_STATE_KEY: [_OTHER_ID]}
+    assert policy(tc("mcp__google__drive_file_update", {"file_id": _OTHER_ID}, state)) is None
+
+
+def test_no_write_down_invalid_action_rejected() -> None:
+    """A bad ``write_down_action`` is rejected at factory-build time."""
+    with pytest.raises(ValueError, match="write_down_action"):
+        gdrive_policy(confidential_files=[_CONF_ID], write_down_action="MAYBE")
+
+
+def test_no_write_down_confidential_files_accepts_urls() -> None:
+    """A Google URL in ``confidential_files`` matches a call targeting the bare ID."""
+    url = f"https://docs.google.com/document/d/{_CONF_ID}/edit"
+    policy = gdrive_policy(confidential_files=[url])
+    # Reading via the bare ID latches, proving the URL normalized to that ID.
+    result = policy(
+        tr(
+            "mcp__google__docs_document_get",
+            "{}",
+            request_arguments={"document_id": _CONF_ID},
+        )
+    )
+    assert result is not None
+    assert result["state_updates"][0]["key"] == "gdrive_read_confidential"
+
+
+@pytest.mark.asyncio
+async def test_no_write_down_roundtrip_read_then_blocked_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """End-to-end: read a confidential doc, then a later-turn outside write is denied.
+
+    Proves the confidential-read latch survives an engine rebuild via persisted
+    ``session_state`` — the demo's core narrative.
+    """
+    conv = conversation_store.create_conversation()
+    args = {"confidential_files": [_CONF_ID]}
+
+    engine1 = _engine(conversation_store, conv.id, {}, _DRIVE_HANDLER, args)
+    read_result = await engine1.evaluate(
+        EvaluationContext(
+            phase=Phase.TOOL_RESULT,
+            tool_name="mcp__google__docs_document_get",
+            content={"result": "{}"},
+            request_data={
+                "name": "mcp__google__docs_document_get",
+                "arguments": {"document_id": _CONF_ID},
+            },
+        )
+    )
+    assert read_result.action == PolicyAction.ALLOW
+    reloaded = conversation_store.get_conversation(conv.id)
+    assert reloaded is not None
+    assert reloaded.session_state.get("gdrive_read_confidential") is True
+
+    engine2 = _engine(
+        conversation_store, conv.id, dict(reloaded.session_state), _DRIVE_HANDLER, args
+    )
+    write = await engine2.evaluate(
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            tool_name="mcp__google__drive_file_update",
+            content={
+                "name": "mcp__google__drive_file_update",
+                "arguments": {"file_id": _OTHER_ID},
+            },
+        )
+    )
+    assert write.action == PolicyAction.DENY
 
 
 # ══════════════════════════════════════════════════════════════════════════════

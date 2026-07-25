@@ -545,7 +545,6 @@ class PromptPolicy(Policy):
             label_schema = {
                 key: {
                     "values": list(rule.values),
-                    "monotonic": rule.monotonic,
                 }
                 for key, rule in self._session._root_label_schema.items()
             }

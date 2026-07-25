@@ -133,8 +133,27 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
   }
   const resolvedWidth = clamp(effectiveRaw ?? defaultWidthPx(), minWidthPx);
   const dragging = useRef(false);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
   const minWidthRef = useRef(minWidthPx);
   minWidthRef.current = minWidthPx;
+
+  // While dragging, a transparent full-window overlay sits above the panel so
+  // the pointer stream keeps reaching the parent document. Without it, dragging
+  // over a cross-origin/sandboxed iframe (e.g. the HTML preview) routes mousemove
+  // /mouseup into the frame, the parent never sees mouseup, and the drag sticks.
+  const addDragOverlay = useCallback(() => {
+    if (overlayRef.current || typeof document === "undefined") return;
+    const el = document.createElement("div");
+    el.style.cssText =
+      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
+    document.body.appendChild(el);
+    overlayRef.current = el;
+  }, []);
+
+  const removeDragOverlay = useCallback(() => {
+    overlayRef.current?.remove();
+    overlayRef.current = null;
+  }, []);
 
   // Load the active session's saved width into the module store (and re-load
   // when it changes) so the live store and the drag handlers operate on the
@@ -160,12 +179,16 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
   // The resolvedWidth formula already enforces the visual minimum. No effect
   // needed — this lets the panel shrink back when minWidthPx drops.
 
-  const onMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    dragging.current = true;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-  }, []);
+  const onMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      dragging.current = true;
+      addDragOverlay();
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [addDragOverlay],
+  );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -192,6 +215,7 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
     function onMouseUp() {
       if (!dragging.current) return;
       dragging.current = false;
+      removeDragOverlay();
       persistStoredWidth();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
@@ -207,8 +231,9 @@ export function useResizableInlinePanel(sessionId: string | null, minWidthPx = M
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
       }
+      removeDragOverlay();
     };
-  }, []);
+  }, [removeDragOverlay]);
 
   return {
     panelWidth: resolvedWidth,

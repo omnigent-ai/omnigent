@@ -1722,7 +1722,7 @@ async def test_on_shutdown_hook_called_during_lifespan_teardown(
         await mgr.shutdown()
 
 
-# ── Idle-watchdog surfaces forwarder connectivity cause (issue #1119) ──
+# ── Idle-watchdog surfaces forwarder connectivity cause ──
 #
 # The pure-module unit test for ``_native_forwarder_health`` (record / recency
 # / clear) lives in ``tests/test_native_forwarder_health.py``. This file keeps

@@ -21,7 +21,7 @@ import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-rea
 import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
+import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -32,18 +32,46 @@ import { TruncatedBanner } from "./TruncatedBanner";
 import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
+import { MarkdownSearchBar } from "./MarkdownSearchBar";
 import {
   createCommentDecorationExtension,
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
+import {
+  createSearchDecorationExtension,
+  type SearchDecorationState,
+} from "./TipTapSearchExtension";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
-import { installMarkdownSerializerPatch } from "./tiptapMarkdownPatches";
+import {
+  installMarkdownParserPatch,
+  installMarkdownSerializerPatch,
+} from "./tiptapMarkdownPatches";
 
 // Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
 // installed once at module load, before any editor instance is created.
 installMarkdownSerializerPatch();
+
+// Post-parse normalisation wrapping loose inline runs (a standalone image in
+// document flow, `1. ![x](y)`) in a paragraph so block+ containers never get
+// a bare inline child — the crash residual #2320 documented (see
+// tiptapMarkdownPatches.ts).
+installMarkdownParserPatch();
+
+// @tiptap/markdown parses a list item whose first child is a non-paragraph
+// block — a nested list, a fenced code block, a blockquote, a heading, or a
+// table — into a `listItem` that violates the stock `paragraph block*` content
+// model. ProseMirror builds the initial doc via `nodeFromJSON`, which does NOT
+// validate content, so the invalid doc loads silently; the first transaction
+// that touches it (a user edit, or StarterKit's TrailingNode plugin on load)
+// then calls `contentMatchAt` and throws ("Called contentMatchAt on a node
+// with invalid content"), which the viewer's panel boundary catches — the
+// whole file view crashes instead of rendering. Relaxing the content model to
+// `block+` accepts a non-paragraph first child, keeping the parsed doc
+// schema-valid. Same class as the blockquote fix in #2004 (see toBlockContent),
+// for list items.
+const SafeListItem = ListItem.extend({ content: "block+" });
 
 // ---------------------------------------------------------------------------
 // MarkdownRichTextViewer — outer shell manages the editor key for remounting
@@ -67,6 +95,11 @@ interface MarkdownRichTextViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** Ref to the in-progress comment body; forwarded to MarkdownCommentPlugin. */
   pendingBodyRef?: React.RefObject<string>;
+  /** True when the toolbar "Find in file" toggle wants the search bar open. */
+  searchOpen?: boolean;
+  /** Called when the search bar is closed (Escape / ✕) so the parent can reset the toggle. */
+  onSearchHandled?: () => void;
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
 }
 
 export function MarkdownRichTextViewer({
@@ -80,6 +113,9 @@ export function MarkdownRichTextViewer({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
 }: MarkdownRichTextViewerProps) {
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
@@ -109,6 +145,8 @@ export function MarkdownRichTextViewer({
 
   // This ref is shared across remounts — the ProseMirror plugin reads it.
   const commentStateRef = useRef<CommentDecorationState | null>(null);
+  // Shared with the search plugin (find-in-file highlights).
+  const searchStateRef = useRef<SearchDecorationState | null>(null);
 
   return (
     <MarkdownRichTextViewerInner
@@ -134,6 +172,10 @@ export function MarkdownRichTextViewer({
       onSetActiveSelection={onSetActiveSelection}
       pendingBodyRef={pendingBodyRef}
       commentStateRef={commentStateRef}
+      searchStateRef={searchStateRef}
+      searchOpen={searchOpen ?? false}
+      onSearchHandled={onSearchHandled}
+      searchInputRef={searchInputRef}
       setContentRef={setContentRef}
     />
   );
@@ -161,6 +203,10 @@ interface InnerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   pendingBodyRef?: React.RefObject<string>;
   commentStateRef: React.RefObject<CommentDecorationState | null>;
+  searchStateRef: React.RefObject<SearchDecorationState | null>;
+  searchOpen: boolean;
+  onSearchHandled?: () => void;
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
   setContentRef: React.RefObject<((content: string) => void) | null>;
 }
 
@@ -182,6 +228,10 @@ function MarkdownRichTextViewerInner({
   onSetActiveSelection,
   pendingBodyRef,
   commentStateRef,
+  searchStateRef,
+  searchOpen,
+  onSearchHandled,
+  searchInputRef,
   setContentRef,
 }: InnerProps) {
   const [isCopied, setIsCopied] = useState(false);
@@ -193,6 +243,10 @@ function MarkdownRichTextViewerInner({
     [],
   );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // Fall back to a local ref when the parent doesn't pass one (the toolbar
+  // path always does; this keeps the bar usable in isolation/tests).
+  const fallbackSearchInputRef = useRef<HTMLInputElement>(null);
+  const localSearchInputRef = searchInputRef ?? fallbackSearchInputRef;
 
   const handleCopyContent = useCallback(() => {
     if (!navigator?.clipboard?.writeText) return;
@@ -265,7 +319,11 @@ function MarkdownRichTextViewerInner({
       // link/blockquote: false — StarterKit bundles its own versions whose
       // markdown handlers would shadow the GitHub-flavored replacements
       // below (duplicate extension names: first wins).
-      StarterKit.configure({ link: false, blockquote: false }),
+      // listItem: false — replaced by SafeListItem (content: block+) so a list
+      // item whose first child is a non-paragraph block doesn't build a
+      // schema-invalid doc that crashes the panel. See SafeListItem above.
+      StarterKit.configure({ link: false, blockquote: false, listItem: false }),
+      SafeListItem,
       // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
       // BulletList/OrderedList/ListItem but NOT TaskList/TaskItem, so without
       // these two the markdown parser drops the checkbox and renders a plain
@@ -285,6 +343,7 @@ function MarkdownRichTextViewerInner({
       Markdown,
       createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
+      createSearchDecorationExtension(searchStateRef),
     ],
     // commentStateRef is stable and a path change remounts this component
     // (editorKey), so the closed-over conversationId/path can't go stale;
@@ -380,6 +439,13 @@ function MarkdownRichTextViewerInner({
   return (
     <div className="relative flex flex-col h-full">
       {truncated && <TruncatedBanner />}
+      <MarkdownSearchBar
+        editor={editor}
+        searchStateRef={searchStateRef}
+        open={searchOpen}
+        onClose={() => onSearchHandled?.()}
+        inputRef={localSearchInputRef}
+      />
       {canEdit && (
         <ToolbarPlugin
           editor={editor}

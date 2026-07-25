@@ -123,6 +123,18 @@ _DEFAULT_ROTATION_INTERVAL_S = 3.0
 # exception, never a clean immediate return.
 _STREAM_REENTRY_BACKOFF_S = 0.5
 
+# Teardown drain passes for the interaction bridge + chained re-scan tasks. Cancelling
+# a bridge stops it scheduling a re-scan and vice versa, so the chain collapses fast;
+# a few extra passes give slack without risking an unbounded loop.
+_INTERACTION_DRAIN_PASSES = 4
+
+# Re-scan poll retry budget. The bridge-clear re-scan is the sole backstop on the
+# healthy-stream path (agy emits no frame while parked on a deferred gate and the poll
+# loop is only the failure fallback), so a single swallowed error would strand the gate
+# forever. Retry a bounded number of times before giving up.
+_INTERACTION_RESCAN_POLL_ATTEMPTS = 3
+_INTERACTION_RESCAN_POLL_BACKOFF_S = 0.2
+
 # POST retry policy, kept identical to the transcript forwarder's so mirrored
 # items are delivered with the same transient-retry semantics. Conversation
 # items persist with a random primary key and are NOT deduped server-side, so an
@@ -1030,11 +1042,25 @@ async def supervise_reader(
             body_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await body_task
-        active = state.interaction_task
-        if active is not None and not active.done():
-            active.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await active
+        # Drain the bridge and any chained re-scan tasks. Yield once per pass so
+        # a normally-completed bridge's pending ``_clear_slot`` callback lands in
+        # ``interaction_rescans`` before the snapshot — otherwise it escapes the
+        # drain and runs post-teardown. Suppress all exceptions (including
+        # CancelledError) to avoid aborting the drain with orphaned tasks.
+        for _ in range(_INTERACTION_DRAIN_PASSES):
+            await asyncio.sleep(0)
+            inflight = [
+                pending
+                for pending in (state.interaction_task, *state.interaction_rescans)
+                if pending is not None and not pending.done()
+            ]
+            if not inflight:
+                break
+            for pending in inflight:
+                pending.cancel()
+            for pending in inflight:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending
 
     # Report how many committed steps (turns) this run mirrored for the bound
     # cascade. The caller uses a count of 0 to distinguish "first TUI-minted
@@ -1105,6 +1131,9 @@ class _ReaderState:
         is later seen NO LONGER WAITING (answered in the agy TUI, or agy timed
         out) to WITHDRAW the still-parked web card (#1200, direction 2). An entry
         is removed once withdrawn so the withdraw posts at most once.
+    :param interaction_rescans: In-flight re-scan tasks scheduled by a bridge's
+        done-callback to surface a WAITING gate deferred while the bridge ran.
+        Held as strong refs so they are not GC'd mid-run; cancelled on teardown.
     """
 
     allocator: _ToolCallIdAllocator
@@ -1121,6 +1150,7 @@ class _ReaderState:
     cumulative_cache_read_input_tokens: int = 0
     interaction_task: asyncio.Task[None] | None = None
     surfaced_elicitations: dict[_StepKey, str] = field(default_factory=dict)
+    interaction_rescans: set[asyncio.Task[None]] = field(default_factory=set)
 
 
 async def _poll_loop(
@@ -1719,8 +1749,11 @@ def _maybe_handle_interaction(
     ``bridge_interaction`` already owns those retries via its own freshest-WAITING
     re-read, so spawning a second task for a retry step would surface a duplicate
     elicitation and a competing delivery. Subsequent WAITING steps are skipped
-    while a task is active; its done-callback then clears the slot so a genuinely
-    new later interaction can fire.
+    while a task is active; its done-callback then clears the slot AND re-scans the
+    freshest steps (:func:`_resurface_pending_interaction`) so a genuinely-NEW gate
+    deferred during that window — e.g. the next segment of a chained ``a && b``
+    command, each gated separately — is surfaced even when no further stream frame
+    will carry it (agy stays parked on that gate, emitting none) (#1472).
 
     The callback gets the SAME ``cascade_id`` + ``port`` (from ``state``) the
     reader discovered, so the bridge targets agy's live conversation without
@@ -1760,21 +1793,105 @@ def _maybe_handle_interaction(
     async def _run_bridge() -> None:
         await on_pending_interaction(cascade_id, state.port, pending)
 
-    def _clear_slot(completed: asyncio.Task[None]) -> None:
-        if state.interaction_task is completed:
-            state.interaction_task = None
-        if not completed.cancelled():
-            exc = completed.exception()
+    def _clear_rescan(done: asyncio.Task[None]) -> None:
+        state.interaction_rescans.discard(done)
+        if not done.cancelled():
+            exc = done.exception()
             if exc is not None:
                 _logger.warning(
-                    "agy interaction bridge task failed (cascade=%s): %r",
+                    "agy interaction re-scan task failed (cascade=%s): %r",
                     cascade_id,
                     exc,
                 )
 
+    def _clear_slot(completed: asyncio.Task[None]) -> None:
+        if state.interaction_task is completed:
+            state.interaction_task = None
+        if completed.cancelled():
+            # Reader teardown cancelled the bridge — the run is ending, so do NOT
+            # spawn a re-scan (teardown drains these tasks; a fresh one would race it).
+            return
+        exc = completed.exception()
+        if exc is not None:
+            _logger.warning(
+                "agy interaction bridge task failed (cascade=%s): %r",
+                cascade_id,
+                exc,
+            )
+        # Re-scan for a WAITING gate the single-in-flight guard deferred while this
+        # bridge ran (e.g. the next segment of a chained ``a && b`` command). agy
+        # emits no frame while parked on that gate, so without the re-scan it hangs.
+        # ``state.interacted`` makes already-surfaced steps no-ops.
+        rescan = asyncio.create_task(
+            _resurface_pending_interaction(
+                cascade_id=cascade_id,
+                state=state,
+                on_pending_interaction=on_pending_interaction,
+            ),
+            name="antigravity-interaction-rescan",
+        )
+        state.interaction_rescans.add(rescan)
+        rescan.add_done_callback(_clear_rescan)
+
     task = asyncio.create_task(_run_bridge(), name="antigravity-interaction-bridge")
     state.interaction_task = task
     task.add_done_callback(_clear_slot)
+
+
+async def _resurface_pending_interaction(
+    *,
+    cascade_id: str,
+    state: _ReaderState,
+    on_pending_interaction: OnPendingInteraction,
+) -> None:
+    """
+    Re-surface a WAITING interaction the single-in-flight guard deferred.
+
+    Scheduled by ``_clear_slot`` after a bridge finishes. Re-reads the freshest
+    trajectory snapshot and re-dispatches every step through
+    :func:`_maybe_handle_interaction`; ``state.interacted`` makes already-surfaced
+    steps no-ops, so only the deferred gate fires. That gate spawns the next bridge,
+    whose clear re-scans again, draining a chain of sequential gates one at a time.
+
+    The snapshot read is retried up to :data:`_INTERACTION_RESCAN_POLL_ATTEMPTS` times
+    because this is the sole backstop on the healthy-stream path (agy emits no frame
+    while parked on the deferred gate; the poll loop is only the failure fallback).
+
+    :param cascade_id: agy cascade id (equal to the conversation id).
+    :param state: Per-run reader state.
+    :param on_pending_interaction: Async callback for a distinct interaction.
+    """
+    steps: list[dict[str, object]] | None = None
+    for attempt in range(_INTERACTION_RESCAN_POLL_ATTEMPTS):
+        try:
+            steps = await asyncio.to_thread(get_trajectory_steps, state.port, cascade_id)
+            break
+        except (httpx.HTTPError, ValueError) as exc:
+            last = attempt == _INTERACTION_RESCAN_POLL_ATTEMPTS - 1
+            _logger.warning(
+                "agy interaction re-scan poll failed (cascade=%s, port=%s, attempt=%d/%d)%s: %r",
+                cascade_id,
+                state.port,
+                attempt + 1,
+                _INTERACTION_RESCAN_POLL_ATTEMPTS,
+                "; giving up — the poll fallback or a later frame must catch the deferred gate"
+                if last
+                else "; retrying",
+                exc,
+            )
+            if last:
+                return
+            await _sleep(_INTERACTION_RESCAN_POLL_BACKOFF_S)
+    if steps is None:  # pragma: no cover - the loop returns on the last failure
+        return
+    for step in steps:
+        _maybe_handle_interaction(
+            step,
+            key=_step_key(step),
+            cascade_id=cascade_id,
+            state=state,
+            on_pending_interaction=on_pending_interaction,
+        )
 
 
 async def _maybe_withdraw_interaction(

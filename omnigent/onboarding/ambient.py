@@ -35,6 +35,7 @@ from typing import Literal
 
 import tomllib
 
+from omnigent.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 from omnigent.onboarding.providers import PROVIDER_ENV_VARS
 
@@ -654,15 +655,16 @@ def detect_providers() -> list[DetectedProvider]:
         # the model-selection surface yet.
         if provider not in _ENV_KEY_FAMILY:
             continue
-        value = os.environ.get(env_var)
-        if not value:
+        resolved = getenv_nonempty_with_omnigent_prefix(env_var)
+        if resolved is None:
             continue
+        actual_env_var, _value = resolved
         detected.append(
             DetectedProvider(
                 name=provider,
                 kind=KEY_KIND,
                 family=_ENV_KEY_FAMILY[provider],
-                source=f"${env_var}",
+                source=f"${actual_env_var}",
             )
         )
 

@@ -177,10 +177,27 @@ Frontend changes follow the same expectation with a different toolchain:
 - Styling/formatting-only changes, copy tweaks with no flow change, and
   refactors with no behaviour change are exempt, same as the backend.
 
+## Developer Certificate of Origin
+
+To contribute to this repository, you must sign off your commits to certify
+that you have the right to contribute the code and that it complies with the
+open source license. If you can certify the contents of the [DCO](DCO), add a
+`Signed-off-by` line to each commit message:
+
+```
+Signed-off-by: Joe Smith <joe.smith@email.com>
+```
+
+Please use your real name — pseudonymous/anonymous contributions are not
+accepted. If your `user.name` and `user.email` git configs are set, `git
+commit -s` adds the sign-off automatically. The DCO check on every pull
+request enforces this, so unsigned commits will block merging.
+
 ## Pull requests
 
 - Branch from `main`, keep changes focused, and include tests or docs when relevant.
-- Sign off your commits with `git commit -s` (Developer Certificate of Origin).
+- Sign off your commits with `git commit -s` (see
+  [Developer Certificate of Origin](#developer-certificate-of-origin) above).
 - Fill in the PR template. For **UI / frontend changes**, check the
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking

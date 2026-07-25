@@ -23,6 +23,11 @@ import { getOmnigentHostConfig, hostFetch } from "./host";
 const RESERVED_USER_LOCAL = "local";
 
 let _currentUserId: string | null = null;
+// Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
+// `users.is_admin` column), so the SPA can gate admin chrome in EVERY
+// auth mode — including OIDC/SSO, where the accounts-only `/auth/me`
+// endpoint doesn't exist. Defaults false until the probe resolves.
+let _currentIsAdmin = false;
 let _resolved = false;
 let _resolvePromise: Promise<string | null> | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
@@ -87,8 +92,12 @@ export async function resolveIdentity(): Promise<string | null> {
         }
       }
       if (res.ok) {
-        const data = (await res.json()) as { user_id: string | null };
+        const data = (await res.json()) as {
+          user_id: string | null;
+          is_admin?: boolean;
+        };
         _currentUserId = data.user_id;
+        _currentIsAdmin = data.is_admin ?? false;
       }
     } catch {
       // Server unreachable — leave as null.
@@ -102,6 +111,15 @@ export async function resolveIdentity(): Promise<string | null> {
 /** Return the cached user ID (null before resolveIdentity completes). */
 export function getCurrentUserId(): string | null {
   return _currentUserId;
+}
+
+/**
+ * Whether the current user is an admin, per the `/v1/me` probe.
+ * Mode-agnostic — usable to gate admin chrome under header, accounts,
+ * AND OIDC. Returns false before `resolveIdentity` completes.
+ */
+export function getCurrentIsAdmin(): boolean {
+  return _currentIsAdmin;
 }
 
 /**

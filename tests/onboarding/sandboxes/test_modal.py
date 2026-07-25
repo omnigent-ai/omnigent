@@ -611,6 +611,8 @@ def test_exec_foreground_records_pid_and_streams_output(
     state = _install_fake_modal(monkeypatch)
     sandbox = _seed_sandbox(state)
     sandbox.exec_queue.append(_FakeProcess(stdout="host-output\n"))
+    # The cleanup exec on normal exit pops this next process.
+    sandbox.exec_queue.append(_FakeProcess())
 
     returncode = ModalSandboxLauncher().exec_foreground("sb-1", "omnigent host --server u")
 
@@ -618,12 +620,19 @@ def test_exec_foreground_records_pid_and_streams_output(
     call = sandbox.exec_calls[0]
     assert call.pty is True
     remote = call.argv[-1]
-    assert "echo $$ > /tmp/oa-foreground.pid" in remote
+    # The pidfile lives in a private, unpredictably-named dir created mode 700
+    # (fails closed if it already exists) so /tmp can't be pre-seeded.
+    assert "mkdir -m 700 /tmp/oa-foreground-" in remote
+    assert "echo $$ > /tmp/oa-foreground-" in remote and "/pid" in remote
     assert "TERM=xterm-256color" in remote
     # `exec` keeps the recorded pid across the swap to the real command.
     assert "exec omnigent host --server u" in remote
     # Output reached the local terminal.
     assert "host-output" in capsys.readouterr().out
+    # A normal exit cleans up the run dir so it isn't orphaned in /tmp.
+    assert len(sandbox.exec_calls) == 2
+    cleanup = sandbox.exec_calls[1].argv[-1]
+    assert cleanup.startswith("rm -rf /tmp/oa-foreground-")
 
 
 def test_exec_foreground_kills_remote_on_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -639,9 +648,12 @@ def test_exec_foreground_kills_remote_on_interrupt(monkeypatch: pytest.MonkeyPat
     with pytest.raises(KeyboardInterrupt):
         ModalSandboxLauncher().exec_foreground("sb-1", "omnigent host --server u")
 
-    # Second exec is the kill, addressed via the recorded pidfile.
+    # Second exec is the kill, addressed via the recorded pidfile. The pid is
+    # validated as numeric before being signalled, and the dir is cleaned up.
     assert len(sandbox.exec_calls) == 2
-    assert "kill $(cat /tmp/oa-foreground.pid)" in sandbox.exec_calls[1].argv[-1]
+    kill = sandbox.exec_calls[1].argv[-1]
+    assert 'case "$pid" in' in kill and 'kill "$pid"' in kill
+    assert "rm -rf /tmp/oa-foreground-" in kill
 
 
 # ── wheel_install_command ───────────────────────────────────

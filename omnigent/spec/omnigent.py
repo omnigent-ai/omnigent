@@ -97,17 +97,6 @@ _SYNTHETIC_SPEC_VERSION = 1
 # exists at runtime to walk.
 _OS_ENV_INHERIT_SENTINEL = "inherit"
 
-# Omnigent → omnigent mapping for the ``monotonic`` label
-# schema field. Omnigent uses ``max`` / ``min`` / ``none``
-# (datamodel.LabelSchemaRule.monotonic); omnigent uses
-# ``increasing`` / ``decreasing`` / absent (types.LabelDef.monotonic).
-# ``max`` is monotonically increasing (each write must be ≥ current);
-# ``min`` is monotonically decreasing (each write must be ≤ current).
-_OMNI_TO_AP_MONOTONIC: dict[str, str] = {
-    "max": "increasing",
-    "min": "decreasing",
-}
-
 # Omnigent loader policy-type discriminators. Used to dispatch
 # per-policy-type translation from the raw YAML dict.
 _POLICY_TYPE_FUNCTION = "function"
@@ -669,20 +658,16 @@ def _translate_labels_yaml(
     ``label_schema:`` (schemas) into Omnigent' unified
     ``guardrails.labels:`` shape.
 
-    Agent-plane's :class:`LabelDef` bundles ``initial``,
-    ``values``, and ``monotonic`` into one entry per key. The
-    omnigent ``monotonic: none`` sentinel maps to "no
-    monotonic constraint" on omnigent (field simply omitted
-    from the dict).
+    Agent-plane's :class:`LabelDef` bundles ``initial`` and
+    ``values`` into one entry per key.
 
     :param raw_labels: Initial values map, e.g.
         ``{"integrity": "1", "confidentiality": "0"}``.
     :param raw_label_schema: Schema map, e.g.
-        ``{"integrity": {"values": ["0", "1"], "monotonic": "min"}}``.
+        ``{"integrity": {"values": ["0", "1"]}}``.
     :returns: Agent-plane-shaped labels dict, e.g.
-        ``{"integrity": {"initial": "1", "values": ["0", "1"],
-        "monotonic": "decreasing"}}``. Empty dict when both
-        inputs are empty.
+        ``{"integrity": {"initial": "1", "values": ["0", "1"]}}``.
+        Empty dict when both inputs are empty.
     """
     initials = raw_labels or {}
     schemas = raw_label_schema or {}
@@ -696,14 +681,6 @@ def _translate_labels_yaml(
         if isinstance(schema, dict):
             if "values" in schema:
                 entry["values"] = schema["values"]
-            monotonic_raw = schema.get("monotonic")
-            if monotonic_raw in _OMNI_TO_AP_MONOTONIC:
-                entry["monotonic"] = _OMNI_TO_AP_MONOTONIC[monotonic_raw]
-            elif monotonic_raw not in (None, "none"):
-                # Unknown monotonic value — let the omnigent
-                # parser produce its own error downstream. We
-                # don't silently drop.
-                entry["monotonic"] = monotonic_raw
         out[key] = entry
     return out
 
@@ -908,8 +885,7 @@ def _translate_prompt_policy_yaml(
       ``model: databricks-claude-sonnet-4`` parses as provider
       ``"openai"`` and the request hits ``api.openai.com``.
     - Other fields (``on``, ``condition``, ``prompt``,
-      ``action``, ``set_labels``, ``ask_timeout``) pass through
-      unchanged.
+      ``set_labels``, ``ask_timeout``) pass through unchanged.
 
     :param raw_entry: Raw YAML mapping for one ``type: prompt``
         policy, e.g. ``{"type": "prompt", "on": ["request"],

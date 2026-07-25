@@ -17,16 +17,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
+import { BRAIN_HARNESS_LABELS, useBrainHarnessLabels } from "@/lib/agentLabels";
 import type { AgentBundleInput, MCPServerInput } from "@/lib/agentBundle";
 
 /**
  * Harness options for the picker. "default" uses the server's default
  * executor (no explicit harness in the bundle).
  */
-const HARNESS_OPTIONS: { value: string; label: string }[] = Object.entries(
-  BRAIN_HARNESS_LABELS,
-).map(([value, label]) => ({ value, label }));
+const DEFAULT_HARNESS = Object.keys(BRAIN_HARNESS_LABELS)[0];
 
 /** A single MCP server row in the form. */
 interface MCPFormEntry {
@@ -54,7 +52,7 @@ function emptyMCPEntry(key: number): MCPFormEntry {
   };
 }
 
-/** Parse "KEY=VAL" lines into a Record. */
+/** Parse "KEY=VAL" or "KEY: VAL" lines into a Record. */
 function parseKVLines(text: string): Record<string, string> | undefined {
   const lines = text
     .split("\n")
@@ -63,9 +61,15 @@ function parseKVLines(text: string): Record<string, string> | undefined {
   if (lines.length === 0) return undefined;
   const result: Record<string, string> = {};
   for (const line of lines) {
+    // Support both KEY=VALUE (env-var style) and KEY: VALUE (HTTP header style).
     const eq = line.indexOf("=");
-    if (eq > 0) {
-      result[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    const colon = line.indexOf(":");
+    let sep = -1;
+    if (eq > 0 && colon > 0) sep = Math.min(eq, colon);
+    else if (eq > 0) sep = eq;
+    else if (colon > 0) sep = colon;
+    if (sep > 0) {
+      result[line.slice(0, sep).trim()] = line.slice(sep + 1).trim();
     }
   }
   return Object.keys(result).length > 0 ? result : undefined;
@@ -121,10 +125,15 @@ export function CreateAgentDialog({
   onOpenChange: (open: boolean) => void;
   onCreate: (input: AgentBundleInput) => void;
 }) {
+  const brainHarnessLabels = useBrainHarnessLabels();
+  const harnessOptions = Object.entries(brainHarnessLabels).map(([value, label]) => ({
+    value,
+    label,
+  }));
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [instructions, setInstructions] = useState("");
-  const [harness, setHarness] = useState(HARNESS_OPTIONS[0].value);
+  const [harness, setHarness] = useState(DEFAULT_HARNESS);
   const [model, setModel] = useState("");
   const [mcpEntries, setMcpEntries] = useState<MCPFormEntry[]>([]);
   const [nextKey, setNextKey] = useState(0);
@@ -133,7 +142,7 @@ export function CreateAgentDialog({
     setName("");
     setDescription("");
     setInstructions("");
-    setHarness(HARNESS_OPTIONS[0].value);
+    setHarness(DEFAULT_HARNESS);
     setModel("");
     setMcpEntries([]);
     setNextKey(0);
@@ -231,7 +240,7 @@ export function CreateAgentDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {HARNESS_OPTIONS.map((opt) => (
+                {harnessOptions.map((opt) => (
                   <SelectItem key={opt.value} value={opt.value}>
                     {opt.label}
                   </SelectItem>
@@ -396,7 +405,7 @@ function MCPServerRow({
             data-testid="create-agent-mcp-headers"
             value={entry.headers}
             onChange={(e) => onChange({ headers: e.target.value })}
-            placeholder={"HTTP headers (KEY=VALUE per line)\ne.g. Authorization=Bearer tok_..."}
+            placeholder={"HTTP headers (one per line)\ne.g. Authorization: Bearer tok_..."}
             className="min-h-[60px] font-mono text-xs"
           />
         </>

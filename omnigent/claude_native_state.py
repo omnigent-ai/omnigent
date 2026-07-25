@@ -119,12 +119,23 @@ def _state_dir_for_conversation_id(conversation_id: str) -> Path:
     every byte that lands in the path is hex, so the result is
     always a single child of the state root.
 
-    :param conversation_id: Omnigent conversation id, e.g.
-        ``"conv_abc123"``.
+    Sessions created before ids dropped the ``conv_`` prefix hashed the
+    prefixed string, so their directories live under the legacy digest; when
+    the bare-digest directory is absent, the legacy one is returned (never
+    renamed — files inside may embed their own absolute path).
+
+    :param conversation_id: Omnigent conversation id, bare 32-char hex
+        (a legacy ``conv_``-prefixed form is accepted and normalised).
     :returns: Absolute directory path; not guaranteed to exist.
     """
-    digest = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:_ID_HASH_CHARS]
-    return _claude_native_state_root() / digest
+    bare = conversation_id.removeprefix("conv_")
+    root = _claude_native_state_root()
+    state_dir = root / hashlib.sha256(bare.encode("utf-8")).hexdigest()[:_ID_HASH_CHARS]
+    if not state_dir.exists():
+        legacy = root / hashlib.sha256(f"conv_{bare}".encode()).hexdigest()[:_ID_HASH_CHARS]
+        if legacy.exists():
+            return legacy
+    return state_dir
 
 
 def write_launch_state(conversation_id: str, working_directory: str) -> None:

@@ -1,31 +1,28 @@
 import { lazy, Suspense } from "react";
-import { Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage } from "@/pages/ChatPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
 
-// Lazy-load the three accounts pages so the bundle a header / OIDC
+// Lazy-load the accounts pages so the bundle a header / OIDC
 // deploy ships (where accounts is off) doesn't include them in the
 // main entry chunk. They're separate chunks that only download
-// when the user actually navigates to /login, /register, /members
-// — which never happens in non-accounts deploys because the route
-// table below doesn't register them.
+// when the user actually navigates to /login or /register — which
+// never happens in non-accounts deploys because the route table
+// below doesn't register them. (Members / Policies are lazy-loaded
+// too, but inside SettingsPage now that they're settings
+// sub-categories rather than standalone routes.)
 const LoginPage = lazy(() => import("@/pages/LoginPage").then((m) => ({ default: m.LoginPage })));
 const RegisterPage = lazy(() =>
   import("@/pages/RegisterPage").then((m) => ({ default: m.RegisterPage })),
 );
-const MembersPage = lazy(() =>
-  import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
-);
 const SetupPage = lazy(() => import("@/pages/SetupPage").then((m) => ({ default: m.SetupPage })));
-const PoliciesPage = lazy(() =>
-  import("@/pages/PoliciesPage").then((m) => ({ default: m.PoliciesPage })),
-);
 const ApprovePage = lazy(() =>
   import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage })),
 );
 const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })));
+const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -123,6 +120,7 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           {/* Settings renders into the chat outlet so the conversations
               sidebar stays put — entering settings only swaps the card's
               content (the section nav) and the main area. The active section
@@ -130,12 +128,21 @@ function App({ basename }: AppProps = {}) {
               defaults to Appearance. */}
           <Route path={`${prefix}/settings`} element={<SettingsPage />} />
           <Route path={`${prefix}/settings/:section`} element={<SettingsPage />} />
-          {info.accounts_enabled && (
-            <>
-              <Route path={`${prefix}/members`} element={<MembersPage />} />
-              <Route path={`${prefix}/policies`} element={<PoliciesPage />} />
-            </>
-          )}
+          {/* Members / Policies are now settings sub-categories
+              (/settings/members, /settings/policies) so entering them
+              keeps the settings sidebar nav instead of dropping back to
+              the conversation list. Redirect the old standalone paths so
+              existing bookmarks / links still land in the right place.
+              Registered in every multi-user mode (accounts AND OIDC) —
+              the sections self-gate to admins. */}
+          <Route
+            path={`${prefix}/members`}
+            element={<Navigate to={`${prefix}/settings/members`} replace />}
+          />
+          <Route
+            path={`${prefix}/policies`}
+            element={<Navigate to={`${prefix}/settings/policies`} replace />}
+          />
           <Route path={basename ? `${prefix}/*` : "*"} element={<NotFoundPage />} />
         </Route>
       </Routes>

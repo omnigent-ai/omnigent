@@ -63,7 +63,7 @@ describe("AgentCard icon selection", () => {
     // The SDK "cursor" harness also reads as Cursor via the harness fallback.
     { name: "x", harness: "cursor", expected: "cursor" },
     // Kiro native + the bare "kiro" harness both read as the Kiro glyph
-    // (they previously borrowed Cursor's — see #1137).
+    // (they previously borrowed Cursor's).
     { name: "kiro-native-ui", harness: "kiro-native", expected: "kiro" },
     { name: "x", harness: "kiro-native", expected: "kiro" },
     { name: "x", harness: "kiro", expected: "kiro" },

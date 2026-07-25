@@ -120,8 +120,7 @@ class FunctionPolicy(Policy):
         Build an event dict and invoke the underlying callable.
 
         The engine is responsible for selector + condition
-        gating + action whitelist validation +
-        set_labels filtering; this method only:
+        gating + set_labels filtering; this method only:
 
         1. Builds the ``event`` dict from the
            :class:`EvaluationContext`.
@@ -131,8 +130,7 @@ class FunctionPolicy(Policy):
         4. Coerces the ``{"result": ..., "data": ...}``
            return into a :class:`PolicyResult`.
         5. Lets any exception bubble up — the engine wraps it
-           in fail-closed DENY (or substituted ALLOW under the
-           classifier-only carve-out).
+           in a fail-closed DENY.
 
         :param ctx: Current evaluation context.
         :param context: Read-only engine context bundle

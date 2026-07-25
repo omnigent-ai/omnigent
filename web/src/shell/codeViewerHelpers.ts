@@ -96,6 +96,12 @@ export function isBinaryPath(path: string): boolean {
   return BINARY_EXTENSIONS.has(ext);
 }
 
+/** Jupyter notebooks get a read-only rendered preview (with raw-JSON source as
+ * the escape hatch), so they are previewable like markdown/html. */
+export function isNotebookPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".ipynb");
+}
+
 // Image formats the browser can render directly via an <img> tag. SVG is
 // included but is only ever rendered through a blob URL (never inlined into
 // the DOM), so scripts embedded in it cannot execute.
@@ -123,6 +129,19 @@ export function isImageFile(path: string, contentType?: string | null): boolean 
   if (contentType) return contentType.startsWith("image/");
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return IMAGE_EXTENSIONS.has(ext);
+}
+
+/**
+ * Return true if `path` should be previewed as a PDF.
+ *
+ * MIME-first: when the server supplies a `content_type` it is authoritative
+ * (handles files with missing or misleading extensions). Falls back to the
+ * `.pdf` extension when no content type is available (e.g. `guess_type`
+ * returned null).
+ */
+export function isPdfFile(path: string, contentType?: string | null): boolean {
+  if (contentType) return contentType === "application/pdf";
+  return path.split(".").pop()?.toLowerCase() === "pdf";
 }
 
 export function detectLang(path: string): BundledLanguage | "text" {

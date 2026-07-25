@@ -1174,6 +1174,85 @@ async def test_create_terminal_uses_declared_terminal_spec_over_body(
 
 
 @pytest.mark.asyncio
+async def test_create_terminal_resolves_declared_placeholder_cwd_to_workspace(
+    tmp_path: Path,
+) -> None:
+    """A UI-created shell whose declared spec has a placeholder cwd
+    (``.``) launches in the session workspace, not the runner's
+    process cwd (the dir ``omni host`` ran in).
+
+    The declared-terminal branch previously passed ``cwd: .`` through
+    unresolved, so ``create_terminal_instance`` fell back to
+    ``Path(".").resolve()`` — the host launch dir. The resolved
+    workspace must be baked into the launched spec (never via
+    ``cwd_override``, which the stub asserts stays ``None``).
+    """
+    from omnigent.inner.datamodel import (
+        AgentDef,
+        OSEnvSandboxSpec,
+        OSEnvSpec,
+        TerminalEnvSpec,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # Declared shell owns its os_env with the placeholder cwd — the
+    # real ``examples/polly`` ``shell`` terminal shape.
+    declared_shell = TerminalEnvSpec(
+        command="bash",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    agent = AgentDef(
+        name="polly-like",
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+        terminals={"shell": declared_shell},
+    )
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "agent_polly"})
+
+    async def _resolver(agent_id: str, session_id: str) -> AgentDef:
+        return agent
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    resource_registry = _CapturingResourceRegistry(tmp_path, runner_workspace=workspace)
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as c,
+    ):
+        resp = await c.post(
+            "/v1/sessions/conv_test/resources/terminals",
+            json={"terminal": "shell", "session_key": "u-abc123"},
+        )
+
+    assert resp.status_code == 200
+    launch = resource_registry.launches[0]
+    # Placeholder resolved to the workspace, not "." (the process cwd).
+    assert isinstance(launch.os_env, OSEnvSpec)
+    assert launch.os_env.cwd == str(workspace)
+    # The original declared spec is untouched (shared across launches).
+    assert isinstance(declared_shell.os_env, OSEnvSpec)
+    assert declared_shell.os_env.cwd == "."
+
+
+@pytest.mark.asyncio
 async def test_create_terminal_publishes_bridge_tmux_target(
     client: httpx.AsyncClient,
     tmp_path: Path,

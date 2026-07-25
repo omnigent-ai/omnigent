@@ -593,7 +593,6 @@ describe("response.output_item.done (routing_decision)", () => {
         status: "completed",
         response_id: "routing_1",
         model: "databricks-claude-opus-4-8",
-        tier: "expensive",
         applied: true,
         rationale: "multi-file refactor needs deep reasoning",
       },
@@ -602,7 +601,6 @@ describe("response.output_item.done (routing_decision)", () => {
     const ev = out[0] as RoutingDecision;
     expect(ev.type).toBe("routing_decision");
     expect(ev.model).toBe("databricks-claude-opus-4-8");
-    expect(ev.tier).toBe("expensive");
     expect(ev.applied).toBe(true);
     expect(ev.rationale).toBe("multi-file refactor needs deep reasoning");
     // The id (server re-publishes the persisted id) threads onto the event
@@ -620,14 +618,12 @@ describe("response.output_item.done (routing_decision)", () => {
         status: "completed",
         response_id: "routing_2",
         model: "databricks-claude-haiku-4-5",
-        tier: "cheap",
         applied: false,
         rationale: "trivial",
       },
     });
     const ev = out[0] as RoutingDecision;
     expect(ev.applied).toBe(false);
-    expect(ev.tier).toBe("cheap");
   });
 
   it("drops a malformed routing decision (empty model)", () => {
@@ -641,24 +637,6 @@ describe("response.output_item.done (routing_decision)", () => {
         status: "completed",
         response_id: "routing_3",
         model: "",
-        tier: "expensive",
-        applied: true,
-        rationale: "x",
-      },
-    });
-    expect(out).toEqual([]);
-  });
-
-  it("drops a routing decision with an unknown tier", () => {
-    const out = parse("response.output_item.done", {
-      type: "response.output_item.done",
-      item: {
-        id: "rd_bad_tier",
-        type: "routing_decision",
-        status: "completed",
-        response_id: "routing_4",
-        model: "databricks-claude-opus-4-8",
-        tier: "gigantic",
         applied: true,
         rationale: "x",
       },

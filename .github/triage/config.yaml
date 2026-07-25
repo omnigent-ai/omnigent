@@ -37,6 +37,7 @@ prompt: |
     "needs_info": true | false,
     "help_wanted": true | false,
     "duplicate_of": <issue number> | null,
+    "ranked_owners": ["<github-login>", ...],
     "reasoning": "<1-2 sentence explanation of your classification>"
   }
   ```
@@ -63,6 +64,16 @@ prompt: |
   - `comp:harnesses` — SDK harnesses (Claude, Cursor, Antigravity, etc.)
   - `comp:infra` — CI/CD, GitHub Actions workflows, Docker, deployment, packaging
   Use an empty array `[]` if you cannot determine the component.
+
+  **ranked_owners** — the AREAS section of the task prompt lists each area with
+  a definition and its owner GitHub logins. Determine which area(s) this issue
+  belongs to (using BOTH the definitions and the components above), then output
+  the owners of those area(s) ranked by how well-suited each is to own this
+  issue, most-suitable first. Use ONLY logins that appear in the AREAS owner
+  lists — never invent a username. If you cannot determine an area, output `[]`.
+  This is used to assign an owner for high-priority issues; a trusted step
+  validates every login against the area list before assigning, so only real
+  owners can be picked.
 
   **priority**:
   - `P0-critical` — service down, data loss, security vulnerability

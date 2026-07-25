@@ -347,4 +347,46 @@ describe("node view", () => {
     editor = null;
     expect(revokeObjectURL).toHaveBeenCalledWith(renderedUrl);
   });
+
+  it("renders explicit width/height as inline style, not attributes", () => {
+    // GitHub honors <img width/height>, but Tailwind Preflight's
+    // `img { height: auto }` overrides the width/height *attributes*, so a
+    // sized image would render square. The node view must put the dimensions
+    // on the inline style (which wins the cascade) — matching the preview.
+    editor = makeEditor(
+      '<img src="https://example.com/logo.png" alt="logo" width="200" height="100" />',
+    );
+    const img = editor.view.dom.querySelector("img")!;
+    expect(img.style.width).toBe("200px");
+    expect(img.style.height).toBe("100px");
+    // The presentational attributes are removed so Preflight can't win.
+    expect(img.hasAttribute("width")).toBe(false);
+    expect(img.hasAttribute("height")).toBe(false);
+    // Serialisation is unaffected — dimensions still round-trip to HTML.
+    const out = editor.getMarkdown();
+    expect(out).toContain('width="200"');
+    expect(out).toContain('height="100"');
+  });
+
+  it("clears the inline dimension style when a dimension attr is removed", () => {
+    editor = makeEditor(
+      '<img src="https://example.com/logo.png" alt="logo" width="200" height="100" />',
+    );
+    const img = editor.view.dom.querySelector("img")!;
+    expect(img.style.height).toBe("100px");
+    // Drop just the height attr; update() must clear the inline style too, or
+    // the removed dimension would visually persist.
+    let imagePos = -1;
+    editor.state.doc.descendants((node, pos) => {
+      if (node.type.name === "image") imagePos = pos;
+    });
+    editor.commands.command(({ tr, state }) => {
+      const node = state.doc.nodeAt(imagePos)!;
+      tr.setNodeMarkup(imagePos, undefined, { ...node.attrs, height: null });
+      return true;
+    });
+    expect(editor.view.dom.querySelector("img")!.style.height).toBe("");
+    // The other dimension is untouched.
+    expect(editor.view.dom.querySelector("img")!.style.width).toBe("200px");
+  });
 });

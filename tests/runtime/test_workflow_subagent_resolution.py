@@ -21,6 +21,10 @@ the child boots as the intended ``max_iterations=5`` curl helper instead.
 
 from __future__ import annotations
 
+import shutil
+
+import pytest
+
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.spec.types import (
     AgentSpec,
@@ -30,6 +34,21 @@ from omnigent.spec.types import (
     ToolsConfig,
 )
 from omnigent.tools.builtins.web_fetch import RESEARCHER_NAME, build_researcher_spec
+
+
+@pytest.fixture(autouse=True)
+def _default_sandbox_binary_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the seed-time sandbox probe host-independent for the suite.
+
+    ``build_researcher_spec`` calls ``shutil.which`` against the real host
+    PATH for a no-``os_env`` parent (``_ensure_default_sandbox_runnable``).
+    These tests exercise resolution, not the probe, so default it to
+    "binary present" (same fixture as
+    ``tests/tools/builtins/test_web_fetch.py``, which owns the
+    probe-specific coverage).
+    """
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
 
 
 def _coordinator_parent(*, web_fetch: bool = True) -> AgentSpec:
@@ -53,7 +72,9 @@ def _coordinator_parent(*, web_fetch: bool = True) -> AgentSpec:
         spec_version=1,
         name="concordia",
         llm=LLMConfig(model="openai/gpt-5.4"),
-        executor=ExecutorSpec(max_iterations=40),
+        # A real bootable omnigent-executor coordinator carries a harness; the
+        # researcher inherits it so the reconstructed child is spawnable.
+        executor=ExecutorSpec(max_iterations=40, config={"harness": "claude-sdk"}),
         tools=ToolsConfig(builtins=builtins),
         sub_agents=[panelist],
     )
@@ -76,7 +97,9 @@ def _nested_web_fetch_parent() -> AgentSpec:
         spec_version=1,
         name="researcher_host",
         llm=LLMConfig(model="anthropic/claude-nested-7"),
-        executor=ExecutorSpec(max_iterations=40),
+        # The web_fetch owner needs a real harness so the reconstructed
+        # researcher (built from THIS owner) is bootable.
+        executor=ExecutorSpec(max_iterations=40, config={"harness": "claude-sdk"}),
         tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
     )
     return AgentSpec(

@@ -92,7 +92,7 @@ export function useNativeServerSwitcherForMainSurface(
   }, []);
 }
 
-function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
+export function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
   if (!surface) return false;
   const rect = surface.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return false;
@@ -106,21 +106,41 @@ function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
   // A Radix dropdown / select / popover sets `pointer-events: none` on the body
   // while open WITHOUT covering the surface, so elementFromPoint falls through
   // to the document root (or null). That's a transient layer, not a panel —
-  // keep the surface "frontmost" so the native overlays don't blink out.
+  // keep the surface "frontmost" so the native overlays don't blink out. BUT a
+  // menu opened from inside the mobile sidebar (e.g. a conversation-row kebab)
+  // means the sidebar overlay is up: the dropped pointer-events hide it from
+  // the hit test, so probe the sidebar directly and treat the surface as
+  // obscured when it covers the probe point.
   if (!topElement || topElement === document.documentElement || topElement === document.body) {
-    return true;
+    return !isProbeCoveredByOpenSidebar(x, y);
   }
   // Likewise if a popover/menu/listbox actually covers the probe point: those
-  // are transient, unlike a persistent drawer/sidebar/sheet.
+  // are transient, unlike a persistent drawer/sidebar/sheet — unless the
+  // sidebar overlay is what's behind the menu (see above).
   if (
     topElement.closest(
       '[data-radix-popper-content-wrapper], [role="menu"], [role="listbox"], [role="tooltip"]',
     )
   ) {
-    return true;
+    return !isProbeCoveredByOpenSidebar(x, y);
   }
 
   return surface.contains(topElement);
+}
+
+/**
+ * Whether the open mobile sidebar overlay covers `(x, y)`. Used to keep the
+ * native overlays hidden when a Radix menu opened from within the sidebar sits
+ * on top of it — the menu's `pointer-events: none` on the body otherwise hides
+ * the sidebar from elementFromPoint, misreading the surface as frontmost. The
+ * sidebar drops `data-collapsed` when open; on desktop it's a floating card
+ * that never spans the centre probe, so the rect test naturally excludes it.
+ */
+function isProbeCoveredByOpenSidebar(x: number, y: number): boolean {
+  const sidebar = document.querySelector("aside.conversations-sidebar:not([data-collapsed])");
+  if (!sidebar) return false;
+  const r = sidebar.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
 
 function clamp(value: number, min: number, max: number): number {

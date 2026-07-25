@@ -42,6 +42,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from omnigent.errors import ElicitationDeclinedError
 from omnigent.policies.types import ElicitationRequest, PolicyResult
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.spec.types import Phase
@@ -97,9 +98,11 @@ async def _await_elicitation(
     in :func:`omnigent.runtime.workflow._drive_policy_approval`.
 
     On approve: applies the ASK-accumulated ``set_labels`` from the
-    engine's composed result. On refuse / cancel / timeout /
-    malformed verdict: returns ``False`` and applies nothing,
-    preserving POLICIES.md §7.2 ("no side effects on denied ASK").
+    engine's composed result. On cancel / timeout / malformed verdict:
+    returns ``False`` and applies nothing, preserving POLICIES.md §7.2
+    ("no side effects on denied ASK"). On explicit decline: raises
+    :class:`~omnigent.errors.ElicitationDeclinedError` so callers can
+    abort the agent turn rather than feeding a DENY to the LLM.
 
     :param task_id: The sub-agent's task ID (the parked workflow).
     :param root_task_id: The root task whose SSE stream receives
@@ -121,8 +124,9 @@ async def _await_elicitation(
         row wasn't completed on wake. Raises ``TimeoutError`` on
         deadline expiry.
     :returns: ``True`` only when the verdict's ``action`` is exactly
-        ``"accept"``; ``False`` otherwise (decline / cancel /
-        timeout / malformed).
+        ``"accept"``; ``False`` on cancel / timeout / malformed.
+    :raises ElicitationDeclinedError: when ``action == "decline"``
+        (explicit user refusal — distinct from cancel/timeout).
     """
     elicitation_id = f"elicit_{secrets.token_hex(16)}"
     elicitation = ElicitationRequest(
@@ -140,6 +144,12 @@ async def _await_elicitation(
         raw_verdict = await park(elicitation_id, effective_timeout)
     except TimeoutError:
         return False
+
+    if _is_explicit_decline(raw_verdict):
+        raise ElicitationDeclinedError(
+            result.reason or "",
+            policy_name=result.deciding_policy,
+        )
 
     approved = _parse_verdict(raw_verdict)
     if approved:
@@ -285,6 +295,28 @@ def resolve_ask_timeout(
     if deciding_spec is not None and deciding_spec.ask_timeout is not None:
         return deciding_spec.ask_timeout
     return engine.ask_timeout
+
+
+def _is_explicit_decline(raw: str | None) -> bool:
+    """True only when the verdict carries an explicit ``action == "decline"``.
+
+    Distinct from timeout / cancel / malformed: the user made an active
+    choice to refuse.  Used by :func:`_await_elicitation` to raise
+    :class:`~omnigent.errors.ElicitationDeclinedError` instead of
+    returning ``False``, so callers can abort cleanly.
+
+    :param raw: Raw verdict JSON string, or ``None``.
+    :returns: ``True`` only on exact ``action == "decline"``.
+    """
+    if raw is None:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    return parsed.get("action") == "decline"
 
 
 def _parse_verdict(raw: str | None) -> bool:

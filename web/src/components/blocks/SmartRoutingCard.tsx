@@ -72,6 +72,20 @@ export function parseRecommendations(output: string): Map<string, Recommendation
   } catch {
     return null;
   }
+  // The claude-sdk harness stores tool results as MCP content arrays
+  // ([{type:"text", text:"<json>"}]) rather than raw text strings.
+  // Unwrap the first text block before parsing the recommendations object.
+  if (Array.isArray(payload)) {
+    const textBlock = payload.find(
+      (b): b is { type: string; text: string } =>
+        typeof b === "object" &&
+        b !== null &&
+        (b as Record<string, unknown>).type === "text" &&
+        typeof (b as Record<string, unknown>).text === "string",
+    );
+    if (!textBlock) return null;
+    return parseRecommendations(textBlock.text);
+  }
   if (typeof payload !== "object" || payload === null) return null;
   const raw = (payload as Record<string, unknown>).recommendations;
   if (!Array.isArray(raw)) return null;
@@ -114,7 +128,7 @@ const ROUTING_VERBS = ["weighing", "matching", "tuning", "sizing up"] as const;
  *
  * Three states: while judging (`input-available`) the rows show their
  * worker with a shimmering per-task verb placeholder; on success each row gets
- * its recommended {@link ModelTierPill} plus the judge's rationale; on
+ * its recommended model pill plus the judge's rationale; on
  * failure (error string / unparseable output / no output recorded) the
  * dispatcher's message renders as a muted line — the orchestrator
  * dispatches with its own model choices in that case, so the card must

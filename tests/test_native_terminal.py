@@ -75,6 +75,90 @@ async def test_bind_session_runner_raises_click_exception_on_http_error() -> Non
             await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
 
 
+@pytest.mark.asyncio
+async def test_bind_session_runner_raises_click_exception_on_timeout() -> None:
+    """
+    Read timeouts surface as a "server overloaded" ClickException.
+
+    When the server connects but is too slow to answer, the PATCH raises
+    before any response exists. A timeout means reachable-but-slow, so the
+    message must say to retry rather than a raw ``httpx.ReadTimeout`` trace.
+    """
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Simulate the server never sending response headers.
+
+        :param request: HTTP request produced by
+            :func:`native_terminal.bind_session_runner`.
+        :raises httpx.ReadTimeout: Always, to model a slow/overloaded server.
+        """
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        with pytest.raises(click.ClickException, match="responding too slowly"):
+            await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+
+@pytest.mark.asyncio
+async def test_bind_session_runner_raises_click_exception_on_connect_error() -> None:
+    """
+    Connection failures surface as an "unreachable" ClickException.
+
+    A connect error (bad URL, reset, DNS failure) means the server was
+    never reached, so the message points at the URL/connection rather
+    than leaking a raw ``httpx.ConnectError`` stack trace.
+    """
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Simulate a failed connection attempt.
+
+        :param request: HTTP request produced by
+            :func:`native_terminal.bind_session_runner`.
+        :raises httpx.ConnectError: Always, to model an unreachable server.
+        """
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        with pytest.raises(click.ClickException, match="Couldn't reach the Omnigent server"):
+            await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+
+@pytest.mark.asyncio
+async def test_bind_session_runner_treats_connect_timeout_as_unreachable() -> None:
+    """
+    Connect timeouts point at the URL/connection, not server load.
+
+    ``httpx.ConnectTimeout`` subclasses ``TimeoutException``, but the
+    connect phase timing out means the server was never reached, so it
+    must not use the "responding too slowly" message.
+    """
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Simulate the connect phase timing out.
+
+        :param request: HTTP request produced by
+            :func:`native_terminal.bind_session_runner`.
+        :raises httpx.ConnectTimeout: Always, to model an unreachable server.
+        """
+        raise httpx.ConnectTimeout("connect timed out", request=request)
+
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        with pytest.raises(click.ClickException, match="Couldn't reach the Omnigent server"):
+            await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+
 def test_terminal_attach_url_encodes_path_components_and_switches_scheme() -> None:
     """
     Attach URLs preserve base paths and percent-encode ids.

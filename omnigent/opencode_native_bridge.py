@@ -82,15 +82,22 @@ _OPENCODE_POLICY_PLUGIN_JS = r"""
 // phases the reactive permission.asked path cannot reach.
 const BASE = (process.env.OMNIGENT_POLICY_URL || "").replace(/\/+$/, "");
 const SESSION = process.env.OMNIGENT_SESSION_ID || "";
-const AUTH = process.env.OMNIGENT_POLICY_AUTH || "";
+// Full routing header map (Authorization + workspace / deployment routing
+// selectors) baked by the runner so this out-of-process plugin's POSTs reach the
+// SAME server instance as the runner.
+let POLICY_HEADERS = {};
+try {
+  POLICY_HEADERS = JSON.parse(process.env.OMNIGENT_POLICY_HEADERS || "{}") || {};
+} catch (e) {
+  POLICY_HEADERS = {};
+}
 const TIMEOUT_MS = 600000;
 
 async function evaluate(type, target, data) {
   // Returns {result, reason}. Not wired (no server/session) -> no-op allow.
   if (!BASE || !SESSION) return { result: "ALLOW" };
   const url = BASE + "/v1/sessions/" + encodeURIComponent(SESSION) + "/policies/evaluate";
-  const headers = { "content-type": "application/json" };
-  if (AUTH) headers["authorization"] = AUTH;
+  const headers = { "content-type": "application/json", ...POLICY_HEADERS };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
@@ -168,9 +175,9 @@ def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
 
     The runner registers the returned path in the synthesized ``opencode.json``
     ``plugin`` field and stamps ``OMNIGENT_POLICY_URL`` / ``OMNIGENT_SESSION_ID``
-    / ``OMNIGENT_POLICY_AUTH`` on the ``opencode serve`` process so the plugin
-    can reach ``/policies/evaluate``. Overwritten each launch so a code update
-    ships without stale plugin files.
+    / ``OMNIGENT_POLICY_HEADERS`` on the ``opencode serve`` process so the plugin
+    can reach ``/policies/evaluate`` with workspace / deployment routing.
+    Overwritten each launch so a code update ships without stale plugin files.
 
     :param bridge_dir: OpenCode-native bridge directory.
     :returns: The written plugin file path (absolute).

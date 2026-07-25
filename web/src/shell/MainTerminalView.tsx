@@ -112,9 +112,12 @@ export function MainTerminalView({
   );
 
   return (
-    // Outer wrapper fills the main column. `pt-16` clears the
-    // absolute-positioned AppShell header on desktop; iOS native gets a
-    // safe-area-aware override in index.css. `px-3` gives a 12px gutter on
+    // Outer wrapper fills the main column. `pt-14` clears the 56px
+    // absolute-positioned AppShell header on desktop. The workspace rail now
+    // extends beside that header at the outer inset; this main-column surface
+    // still clears it. iOS native gets a safe-area-aware override in index.css.
+    // `px-3` gives a
+    // 12px gutter on
     // the sides. The card stretches to full width and height of the
     // available area. The ConnectionIndicator pill renders just below
     // this wrapper in ChatPage's MainAgentSurface.
@@ -124,7 +127,7 @@ export function MainTerminalView({
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
-      className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-16 pb-1.5"
+      className="main-terminal-view flex min-h-0 flex-1 flex-col px-3 pt-14 pb-1.5"
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {terminals.length === 0 ? (
@@ -162,6 +165,7 @@ export function MainTerminalView({
                     sessionId={conversationId}
                     terminalId={activeTerminal.id}
                     readOnly={readOnly}
+                    transport={activeTerminal.transport}
                     onStateChange={(state) => {
                       setTerminalConnectionState(activeTerminal.id, state);
                     }}

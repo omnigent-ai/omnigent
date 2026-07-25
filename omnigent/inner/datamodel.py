@@ -451,15 +451,59 @@ class CredentialProxyEntry:
 
 
 @dataclass
+class DatabricksProfileBinding:
+    """One Databricks ``~/.databrickscfg`` profile to proxy.
+
+    The host and OAuth/PAT token behind a profile are resolved in the
+    parent at runtime (via the ``databricks`` SDK) — never at parse time
+    and never inside the sandbox. The sandbox only ever sees a synthetic
+    ``oa_cred_*`` placeholder written into a materialized ``.databrickscfg``.
+
+    :param profile: The profile (section) name in ``~/.databrickscfg``,
+        e.g. ``"dbc-adb7b1a3-9097"``. Selected in the sandbox with
+        ``databricks --profile <name>`` (or as the default profile).
+    """
+
+    profile: str
+
+
+@dataclass
+class DatabricksProxySpec:
+    """Secretless proxy policy for the Databricks CLI.
+
+    Unlike the four host-keyed credential types, Databricks profiles bind
+    to a workspace host that is only known once the parent resolves the
+    profile at runtime, so they are carried here rather than in
+    :attr:`CredentialProxySpec.entries`.
+
+    :param profiles: The profiles to proxy. Only these profiles are
+        materialized into the sandbox ``.databrickscfg`` and swapped by
+        the egress proxy; every other profile is invisible to the sandbox.
+    :param default: Optional profile used when the CLI is invoked without
+        ``--profile`` (exported as ``DATABRICKS_CONFIG_PROFILE``). Must be
+        one of :attr:`profiles`.
+    :param config_env: Environment variable pointed at the materialized
+        config file (the Databricks CLI honors ``DATABRICKS_CONFIG_FILE``).
+    """
+
+    profiles: list[DatabricksProfileBinding]
+    default: str | None = None
+    config_env: str = "DATABRICKS_CONFIG_FILE"
+
+
+@dataclass
 class CredentialProxySpec:
     """Secretless credential-proxy policy for a sandbox.
 
     :param entries: Normalized per-host credential bindings. The real
         secrets stay in the parent; the sandbox only ever sees synthetic
         placeholders that the egress proxy rewrites.
+    :param databricks: Optional Databricks-CLI proxy policy (a list of
+        profiles). Resolved to per-workspace-host bindings at runtime.
     """
 
     entries: list[CredentialProxyEntry]
+    databricks: DatabricksProxySpec | None = None
 
 
 @dataclass
@@ -728,6 +772,13 @@ class TerminalEnvSpec:
         into ``no server running``. Opt-in because it changes the
         ``has-session``-means-alive contract; enabled for the claude-native
         agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
+    :param terminal_transport: How the web UI attaches to this terminal:
+        ``"control"`` (``tmux -C`` control mode, giving the browser xterm
+        native scrollback + selection — the default) or ``"pty"`` (the legacy
+        forked-``tmux attach`` PTY stream). ``None`` defers to the global
+        default, which is control mode unless ``terminal.transport`` in
+        ``~/.omnigent/config.yaml`` opts out to ``pty``. A per-attach
+        ``?transport=`` query overrides both.
     """
 
     command: str | None = None
@@ -744,6 +795,7 @@ class TerminalEnvSpec:
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
+    terminal_transport: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -841,61 +893,17 @@ class AgentDef:
 
 @dataclass
 class LabelSchemaRule:
-    """Schema and propagation constraints for a session label.
+    """Schema constraints for a session label.
 
-    ``monotonic`` controls both the write direction and child-to-parent
-    propagation:
-    - ``"max"``: value can only increase; child propagation takes the max.
-    - ``"min"``: value can only decrease; child propagation takes the min.
-    - ``"none"``: value can change freely; no child propagation.
+    Declares the set of allowed values for a label key.
+    Writes outside this set are silently dropped.
     """
 
     values: list[str] = field(default_factory=list)
-    monotonic: str = "none"  # "max", "min", or "none"
 
     def normalize(self, value: LabelValue) -> str | None:
         candidate = str(value)
         return candidate if candidate in self.values else None
 
-    def allows(self, current: str | None, new_value: str) -> bool:
-        if new_value not in self.values:
-            return False
-        if current is None:
-            return True
-        if current not in self.values:
-            return False
-
-        current_idx = self.values.index(current)
-        new_idx = self.values.index(new_value)
-        if self.monotonic == "max":
-            return new_idx >= current_idx
-        if self.monotonic == "min":
-            return new_idx <= current_idx
-        return True
-
-    def merged_with_child(self, parent_val: str | None, child_val: str | None) -> str | None:
-        """Merge parent and child values according to the monotonic rule."""
-        if self.monotonic == "none":
-            return None
-        if parent_val is None and child_val is None:
-            return None
-        if parent_val is None:
-            if child_val is None:
-                return None
-            if child_val not in self.values:
-                raise ValueError(f"Unknown child label value during propagation: {child_val!r}")
-            return child_val
-        if parent_val not in self.values:
-            raise ValueError(f"Unknown parent label value during propagation: {parent_val!r}")
-        if child_val is None:
-            return parent_val
-        if child_val not in self.values:
-            raise ValueError(f"Unknown child label value during propagation: {child_val!r}")
-
-        parent_idx = self.values.index(parent_val)
-        child_idx = self.values.index(child_val)
-        if self.monotonic == "max":
-            return self.values[max(parent_idx, child_idx)]
-        if self.monotonic == "min":
-            return self.values[min(parent_idx, child_idx)]
-        raise ValueError(f"Unknown monotonic mode: {self.monotonic!r}")
+    def allows(self, new_value: str) -> bool:
+        return new_value in self.values

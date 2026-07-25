@@ -188,25 +188,47 @@ describe("collectCommentInboxItems", () => {
     expect(items.map((i) => i.comment.id)).toEqual(["c_other"]);
   });
 
-  it("keeps anonymous comments and all comments for an anonymous viewer", () => {
-    // Single-user mode: created_by and the viewer id are both null —
-    // a null/null match must NOT exclude everything, or the inbox is
-    // permanently empty in single-user deployments.
+  it("excludes unauthored comments — nothing to show as someone else's", () => {
+    // A null author means single-user mode or a legacy pre-attribution
+    // comment. The inbox only surfaces comments an identifiable *other*
+    // person left, so an unauthored comment never qualifies — regardless
+    // of whether the viewer is known. This is what keeps a private /
+    // single-user session's inbox empty instead of echoing your own
+    // comments back at you.
     const anonymous = makeComment({ id: "c_anon", created_by: null });
     const fromNull = collectCommentInboxItems(
       [{ row: makeRow({ id: "conv_a" }), comments: [anonymous] }],
       new Set(),
       null,
     );
-    expect(fromNull.map((i) => i.comment.id)).toEqual(["c_anon"]);
+    expect(fromNull).toEqual([]);
 
-    // A known viewer still sees anonymous comments (they can't be hers).
     const fromKnown = collectCommentInboxItems(
       [{ row: makeRow({ id: "conv_a" }), comments: [anonymous] }],
       new Set(),
       "alice@example.com",
     );
-    expect(fromKnown.map((i) => i.comment.id)).toEqual(["c_anon"]);
+    expect(fromKnown).toEqual([]);
+  });
+
+  it("shows another user's comment on a shared session, hides your own", () => {
+    // A comment can only carry another user's `created_by` if they had
+    // access — so an other-authored comment implies the session is shared.
+    // Your own comment on the same shared session stays out of the inbox.
+    const items = collectCommentInboxItems(
+      [
+        {
+          row: makeRow({ id: "conv_shared" }),
+          comments: [
+            makeComment({ id: "c_mine", created_by: "alice@example.com" }),
+            makeComment({ id: "c_theirs", created_by: "bob@example.com" }),
+          ],
+        },
+      ],
+      new Set(),
+      "alice@example.com",
+    );
+    expect(items.map((i) => i.comment.id)).toEqual(["c_theirs"]);
   });
 
   it("sorts newest first, tie-breaking same-second comments on updated_at", () => {

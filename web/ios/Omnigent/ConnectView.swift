@@ -10,6 +10,7 @@ struct ConnectView: View {
   @State private var serverURL: String
   @State private var message: String?
   @State private var isConnecting = false
+  @State private var infoLink: InfoLink?
 
   init(prefill: String?, error: String?, onConnect: @escaping (URL) -> Void) {
     self.prefill = prefill
@@ -30,7 +31,7 @@ struct ConnectView: View {
           .frame(height: 80)
           .padding(.bottom, 12)
 
-        Text("Enter the URL of the Omnigents server. The iOS app loads its web UI directly.")
+        Text("Enter the URL of the Omnigents server.")
           .font(.system(size: 14))
           .lineSpacing(2)
           .multilineTextAlignment(.center)
@@ -46,6 +47,7 @@ struct ConnectView: View {
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
             .keyboardType(.URL)
+            .accessibilityIdentifier("server-url-field")
             .font(.system(size: 14))
             .padding(.horizontal, 12)
             .frame(height: 38)
@@ -70,6 +72,7 @@ struct ConnectView: View {
           }
         }
         .buttonStyle(PrimaryButtonStyle(background: primary, foreground: primaryForeground))
+        .accessibilityIdentifier("connect-button")
         .padding(.top, 16)
         .disabled(isConnecting)
         // Fires the moment connect() flips isConnecting, so the tap is
@@ -121,6 +124,45 @@ struct ConnectView: View {
     .padding(.horizontal, 16)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(DesignTokens.background(colorScheme))
+    .overlay(alignment: .topTrailing) {
+      infoMenu
+        .padding(.trailing, 16)
+        .padding(.top, 8)
+    }
+    .sheet(item: $infoLink) { link in
+      SafariView(url: link.url)
+        .ignoresSafeArea()
+    }
+  }
+
+  // Tucked into the top corner so the links stay out of the way but remain
+  // reachable — a tap reveals the website, docs, and privacy policy, each
+  // opened in an in-app Safari sheet rather than kicking out to the browser.
+  private var infoMenu: some View {
+    Menu {
+      Button {
+        infoLink = .website
+      } label: {
+        Label("Website", systemImage: "globe")
+      }
+      Button {
+        infoLink = .docs
+      } label: {
+        Label("Documentation", systemImage: "book")
+      }
+      Button {
+        infoLink = .privacy
+      } label: {
+        Label("Privacy Policy", systemImage: "hand.raised")
+      }
+    } label: {
+      Image(systemName: "info.circle")
+        .font(.system(size: 20))
+        .foregroundStyle(DesignTokens.mutedForeground(colorScheme))
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
+    }
+    .accessibilityLabel("About Omnigent")
   }
 
   private var primary: Color {
@@ -150,6 +192,24 @@ struct ConnectView: View {
           message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         }
       }
+    }
+  }
+}
+
+// External links surfaced from the info menu, presented in an in-app Safari
+// sheet. Identifiable so `.sheet(item:)` can drive the presentation.
+private enum InfoLink: Identifiable {
+  case website
+  case docs
+  case privacy
+
+  var id: Int { hashValue }
+
+  var url: URL {
+    switch self {
+    case .website: URL(string: "https://omnigent.ai")!
+    case .docs: URL(string: "https://omnigent.ai/docs")!
+    case .privacy: URL(string: "https://omnigent.ai/privacy")!
     }
   }
 }

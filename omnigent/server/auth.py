@@ -31,6 +31,8 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from enum import Enum
 
 from starlette.requests import HTTPConnection
 
@@ -46,6 +48,36 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+# Path prefixes a delegated (device-grant) access token may reach.
+# Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
+# any path not covered here, so it can never touch admin / user-management
+# endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
+# its underlying identity is an admin. Delegated clients only need these.
+_DELEGATED_ALLOWED_PREFIXES = (
+    "/health",
+    "/v1/agents",
+    "/v1/hosts",
+    "/v1/sessions",
+    "/v1/runners",
+    "/oauth/token",
+    "/oauth/revoke",
+)
+
+
+def delegated_path_allowed(path: str) -> bool:
+    """Return True if a delegated access token may access *path*.
+
+    Fail-closed: matches against :data:`_DELEGATED_ALLOWED_PREFIXES` and
+    rejects everything else. Exact match or a ``prefix/…`` sub-path
+    counts, so ``/v1/hosts`` and ``/v1/hosts/h1/runners`` pass but
+    ``/v1/hostsX`` does not.
+    """
+    for prefix in _DELEGATED_ALLOWED_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
+
 
 # Explicit single-user marker. Set by the managed local-server spawn
 # paths (`omnigent run` in chat.py, the daemon's
@@ -77,6 +109,78 @@ LEVEL_READ = 1
 LEVEL_EDIT = 2
 LEVEL_MANAGE = 3
 LEVEL_OWNER = 4
+
+
+class SharingMode(str, Enum):
+    """Server policy for creating new session permission grants.
+
+    - ``ON``: grants at any level (read/edit/manage) plus workspace/public read.
+    - ``READ_ONLY``: grants are capped at read (view) — edit/manage grants are
+      rejected; workspace/public read still allowed.
+    - ``RESTRICTED_READ_ONLY``: like ``READ_ONLY`` (grants capped at read), but
+      sessions whose working directory is a user home directory or the
+      filesystem root (see :func:`workspace_sharing_blocked`) cannot be shared
+      at all — not even read — because that cwd exposes an entire home/filesystem.
+    - ``OFF``: no new grants at all.
+
+    Value is the lowercase name so ``GET /v1/info`` and the
+    ``OMNIGENT_SHARING_MODE`` env var round-trip it directly. Defaults to ``ON``.
+    """
+
+    OFF = "off"
+    READ_ONLY = "read_only"
+    RESTRICTED_READ_ONLY = "restricted_read_only"
+    ON = "on"
+
+    @classmethod
+    def coerce(cls, value: object) -> SharingMode:
+        """Map a ``SharingMode``/str/``None`` to a mode, failing open to ``ON``
+        for anything unset or unrecognized (env-var parse + callable boundary)."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                return cls.ON
+        return cls.ON
+
+
+# Directories whose *direct children* are user home directories, across the
+# Unix / macOS / container layouts a runner might use: ``/home`` (Linux),
+# ``/Users`` (macOS), and ``/var/home`` (ostree — Silverblue/CoreOS/Flatcar,
+# where ``/home`` symlinks here). Matched by path *shape*, never by resolving
+# ``~``: the runner and its home may live on a different host than this server
+# process, so the local process's home is not a reliable signal. Deliberately
+# excludes project-workspace roots (``/workspace``, ``/workspaces/<repo>``) —
+# those hold a single checkout, not a whole home, and stay shareable.
+_HOME_PARENT_DIRS = ("/home", "/Users", "/var/home")
+# Absolute paths that are themselves a home or the filesystem root.
+_BLOCKED_WORKSPACE_ROOTS = ("/", "/root")
+
+
+def workspace_sharing_blocked(workspace: str | None) -> bool:
+    """True when a session's working directory is too broad to share under
+    :attr:`SharingMode.RESTRICTED_READ_ONLY` — the filesystem root or a user
+    home directory, whose whole contents a grant would expose.
+
+    Recognizes the filesystem root (``/``), root's home (``/root``), and any
+    direct child of a common home parent (see :data:`_HOME_PARENT_DIRS` — e.g.
+    ``/home/alice``, ``/Users/bob``, ``/var/home/carol``). A subdirectory of a
+    home (``/home/alice/proj``) is shareable, as is a ``None``/empty workspace
+    (no recorded cwd).
+
+    Pattern-based on purpose: the runner (and thus the home the session lives
+    in) may be on a different host than this server process, so only the path
+    shape is reliable — resolving the local ``~`` would test the wrong host.
+    """
+    if not workspace:
+        return False
+    path = os.path.normpath(workspace)
+    if path in _BLOCKED_WORKSPACE_ROOTS:
+        return True
+    parent, _, leaf = path.rpartition("/")
+    return bool(leaf) and parent in _HOME_PARENT_DIRS
 
 
 def env_var_is_truthy(name: str, *, default: bool = False) -> bool:
@@ -246,6 +350,27 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
+        """
+        Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
+
+        A managed runner runs in a sandbox with no logged-in user
+        credential of its own, so the server mints one for its HTTP
+        callbacks when auth is enabled (see the
+        ``POST /v1/runners/{id}/token`` endpoint). Default: ``None`` — no
+        minting (single-user / no-auth, or a provider whose identity is
+        asserted externally and can't be minted server-side, e.g.
+        header/proxy auth). The runner then authenticates with its tunnel
+        binding token alone.
+
+        :param user_id: The session owner the runner acts as, e.g.
+            ``"alice@example.com"``.
+        :param ttl_seconds: Token lifetime in seconds.
+        :returns: A bearer token string, or ``None`` when this provider
+            cannot mint one.
+        """
+        return None
+
 
 class UnifiedAuthProvider(AuthProvider):
     """Unified authentication provider that supports header-based,
@@ -308,6 +433,19 @@ class UnifiedAuthProvider(AuthProvider):
             else resolve_auth_header_strip_prefix()
         )
         self._cookie_cache: dict[str, tuple[str, float]] = {}
+        # Set by create_app when a device-grant store is wired. Returns
+        # True if a grant_id has been revoked (or is unknown → fail
+        # closed). Consulted only for delegated tokens (those carrying a
+        # ``grant_id`` claim); left None disables the check.
+        self._grant_revoked: Callable[[str], bool] | None = None
+
+    def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
+        """Wire the device-grant revocation lookup.
+
+        :param check: Callable mapping a ``grant_id`` to True when the
+            grant is revoked or unknown (fail closed).
+        """
+        self._grant_revoked = check
 
     @property
     def login_url(self) -> str | None:
@@ -347,6 +485,38 @@ class UnifiedAuthProvider(AuthProvider):
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
+
+    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
+        """
+        Mint a short-lived owner JWT for a managed-sandbox runner.
+
+        Accounts / OIDC modes sign a session JWT in the same HS256 format
+        :meth:`_check_cookie` validates, so the runner can present it as
+        ``Authorization: Bearer <jwt>`` on its HTTP callbacks and resolve
+        to *user_id*. Header/proxy mode returns ``None`` — identity there
+        is asserted by the upstream proxy and can't be minted server-side.
+
+        :param user_id: The session owner the runner acts as, e.g.
+            ``"alice@example.com"``.
+        :param ttl_seconds: Token lifetime in seconds.
+        :returns: An HS256-signed JWT, or ``None`` for header mode, an
+            empty/reserved user, or a missing cookie config.
+        """
+        if not user_id or user_id in _RESERVED_USERS:
+            return None
+        if self._source not in ("oidc", "accounts"):
+            return None
+        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if cookie_config is None:
+            return None
+        from omnigent.server.oidc import mint_session_token
+
+        return mint_session_token(
+            user_id,
+            cookie_config.cookie_secret,
+            ttl_seconds,
+            self._source,
+        )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
@@ -401,6 +571,18 @@ class UnifiedAuthProvider(AuthProvider):
         user_id = payload.get("sub")
         if not user_id or user_id in _RESERVED_USERS:
             return None
+
+        # Delegated (device-grant) tokens carry a ``grant_id`` claim.
+        # They get two extra, request-scoped checks — a fail-closed path
+        # allowlist and a live revocation lookup — so they are never
+        # served from the plain user-id cache (which would skip both).
+        grant_id = payload.get("grant_id")
+        if grant_id is not None:
+            if not delegated_path_allowed(request.url.path):
+                return None
+            if self._grant_revoked is not None and self._grant_revoked(grant_id):
+                return None
+            return user_id
 
         # Cache for remaining lifetime of the token.
         remaining = payload.get("exp", 0) - time.time()

@@ -99,6 +99,25 @@ export function useResizableCommentsPanel() {
   const width = Math.max(MIN_WIDTH_PX, Math.min(raw ?? DEFAULT_WIDTH_PX, MAX_WIDTH_PX));
   const dragging = useRef(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
+
+  // While dragging, a transparent full-window overlay sits above the panel so
+  // the pointer stream keeps reaching the parent document. Without it, dragging
+  // over a cross-origin/sandboxed iframe (e.g. the HTML preview) routes mousemove
+  // /mouseup into the frame, the parent never sees mouseup, and the drag sticks.
+  const addDragOverlay = useCallback(() => {
+    if (overlayRef.current || typeof document === "undefined") return;
+    const el = document.createElement("div");
+    el.style.cssText =
+      "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent;";
+    document.body.appendChild(el);
+    overlayRef.current = el;
+  }, []);
+
+  const removeDragOverlay = useCallback(() => {
+    overlayRef.current?.remove();
+    overlayRef.current = null;
+  }, []);
 
   const [isDesktop, setIsDesktop] = useState(
     () => typeof window !== "undefined" && window.innerWidth >= MD_BREAKPOINT,
@@ -120,12 +139,16 @@ export function useResizableCommentsPanel() {
     return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
 
-  const onMouseDown = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    dragging.current = true;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-  }, []);
+  const onMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      dragging.current = true;
+      addDragOverlay();
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [addDragOverlay],
+  );
 
   // Keyboard resize: left/right arrows widen/narrow by 20px.
   const onKeyDown = useCallback(
@@ -153,6 +176,7 @@ export function useResizableCommentsPanel() {
     function onMouseUp() {
       if (!dragging.current) return;
       dragging.current = false;
+      removeDragOverlay();
       persistStoredWidth();
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
@@ -167,8 +191,9 @@ export function useResizableCommentsPanel() {
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
       }
+      removeDragOverlay();
     };
-  }, [clampWidth]);
+  }, [clampWidth, removeDragOverlay]);
 
   // Re-clamp the stored width when the viewport resizes so a width chosen on
   // a wider layout doesn't crowd out the viewer after the window shrinks.

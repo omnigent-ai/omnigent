@@ -11,9 +11,12 @@
 // jsdom can't compute Tailwind styles, so geometry isn't directly testable;
 // these tests pin the class-level invariant that produced the bug.
 
-import { describe, expect, it } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 
-import { buttonVariants } from "./button";
+import { Button, buttonVariants } from "./button";
+
+afterEach(cleanup);
 
 // Matches a Tailwind translate utility (`translate-y-px`, `-translate-x-1/2`,
 // `translate-3`), bare or behind variant prefixes (`active:translate-y-px`).
@@ -55,5 +58,51 @@ describe("buttonVariants translate/transform composition", () => {
       className: "absolute top-1/2 -translate-y-1/2 right-9",
     });
     expect(merged).toContain("-translate-y-1/2");
+  });
+});
+
+describe("Button loading state", () => {
+  it("keeps the label in the DOM so the button width doesn't collapse or grow", () => {
+    // The label must stay rendered (just hidden) — replacing it with the
+    // spinner would shrink the button to the spinner's width and shift
+    // neighbouring buttons, which is exactly the bug this prop fixes.
+    render(<Button loading>Update goal</Button>);
+    expect(screen.getByText("Update goal")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+  });
+
+  it("disables the button and marks it busy while loading", () => {
+    render(<Button loading>Save</Button>);
+    const button = screen.getByRole("button");
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("does not render a spinner when not loading", () => {
+    render(<Button>Save</Button>);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("button")).not.toBeDisabled();
+  });
+
+  it("respects an explicit disabled prop independent of loading", () => {
+    render(
+      <Button disabled loading={false}>
+        Save
+      </Button>,
+    );
+    expect(screen.getByRole("button")).toBeDisabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("does not inject a spinner overlay when asChild is set", () => {
+    // asChild renders the child as the element via Radix Slot, which requires
+    // a single child; injecting an overlay would break that contract.
+    render(
+      <Button asChild loading>
+        <a href="/x">Link</a>
+      </Button>,
+    );
+    expect(screen.getByRole("link")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 });

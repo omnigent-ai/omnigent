@@ -17,6 +17,7 @@ fastlane/.env
 # fastlane run output
 fastlane/report.xml
 fastlane/Preview.html
+fastlane/screenshots/
 fastlane/test_output/
 
 # Auto-generated lane docs (regenerated on every fastlane run; see RELEASE.md)

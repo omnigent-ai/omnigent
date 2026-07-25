@@ -120,14 +120,28 @@ def record_usage_payload(bridge_dir: Path, payload: object) -> bool:
 def _cli_record_usage(bridge_dir: Path) -> int:
     """Hook entrypoint: read the JSON payload from stdin and append it.
 
+    The cursor ``stop`` hook fires once per completed turn, so this is also the
+    authoritative "turn finished" signal: it records a turn-end marker
+    (:func:`omnigent.cursor_native_status.record_turn_end`) on EVERY firing — even
+    a turn with no billable usage, which :func:`record_usage_payload` skips — so
+    the forwarder can POST an ``external_session_status: idle`` edge and wake the
+    parent orchestrator.
+
     Always emits ``{}`` (a no-op hook response cursor reads as "continue") and
-    exits 0 — a usage-capture failure must never block or fail the agent turn.
+    exits 0 — a usage/idle-capture failure must never block or fail the agent
+    turn.
     """
+    from omnigent import cursor_native_status
+
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
+        # Record the turn-end marker FIRST (and unconditionally) so the parent
+        # wake never depends on usage parsing succeeding or the turn being
+        # billable; usage capture is a best-effort addition on top.
+        cursor_native_status.record_turn_end(bridge_dir, payload)
         record_usage_payload(bridge_dir, payload)
-    except Exception:  # noqa: BLE001 — never let usage capture break the turn
+    except Exception:  # noqa: BLE001 — never let usage/idle capture break the turn
         _logger.debug("cursor usage recorder failed", exc_info=True)
     # cursor expects JSON on stdout; an empty object is the "continue" response.
     sys.stdout.write("{}")
@@ -169,6 +183,14 @@ class _UsageAccumulator:
         if isinstance(model, str) and model:
             self.model = model  # latest turn's model wins (mirrors a /model switch)
         return True
+
+    def seen_count(self) -> int:
+        """Distinct turns folded in so far (one per ``generation_id``).
+
+        Drives the forwarder's turn-completion wake edge: each newly-seen turn
+        posts one ``external_session_status: idle``.
+        """
+        return len(self.seen)
 
 
 def _read_usage_state(bridge_dir: Path) -> _UsageAccumulator:
@@ -263,11 +285,24 @@ async def forward_cursor_usage_to_session(
     totals advanced — POSTs an ``external_session_usage`` event. The accumulator
     is persisted to ``bridge_dir`` so a supervisor restart resumes without
     re-counting. Never returns normally; cancel the task to stop it.
+
+    A newly-observed usage line means cursor-agent fired its ``stop`` hook — a
+    turn completed. On that edge we also POST ``external_session_status: idle``,
+    the only signal that reaches the parent inbox wake (the forwarder mirrors
+    only conversation items, and the PTY-activity watcher is suppressed for
+    cursor-native). Idle delivery is idempotent server-side.
     """
     import httpx
 
+    from omnigent._native_post_delivery import post_external_session_status
+
     acc = _read_usage_state(bridge_dir)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    # Turns already woken this run. Seeded at 0 (not from persisted usage state):
+    # a restart re-posts one idle, which the server dedupes if already delivered
+    # — the safe direction. Seeding from persisted usage would permanently skip a
+    # wake whose idle POST crashed after the usage flush persisted.
+    idle_posted_turns = 0
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -287,6 +322,15 @@ async def forward_cursor_usage_to_session(
                     # Persist only after a successful POST so a failed flush is
                     # retried (the unseen turns stay unseen until they land).
                     await asyncio.to_thread(_write_usage_state, bridge_dir, acc)
+                # Wake the parent once per newly-seen turn, after the usage flush
+                # so the inbox read sees up-to-date cost. A failed idle is retried
+                # next poll (the counter only advances on success).
+                seen_turns = acc.seen_count()
+                if seen_turns > idle_posted_turns:
+                    await post_external_session_status(
+                        client, session_id=session_id, status="idle"
+                    )
+                    idle_posted_turns = seen_turns
             except asyncio.CancelledError:
                 raise
             except Exception:

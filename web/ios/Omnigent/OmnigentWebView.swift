@@ -123,6 +123,7 @@ struct OmnigentWebView: UIViewRepresentable {
         document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
       }
       const callbacks = new Set();
+      const openPathCallbacks = new Set();
       const viewModeCallbacks = new Set();
       const defineEmit = (name, fn) => {
         Object.defineProperty(window, name, {
@@ -135,6 +136,12 @@ struct OmnigentWebView: UIViewRepresentable {
       defineEmit("__omnigentNativeEmitNotificationActivated", (path) => {
         if (typeof path !== "string" || !path.startsWith("/")) return;
         for (const callback of callbacks) {
+          try { callback(path); } catch {}
+        }
+      });
+      defineEmit("__omnigentNativeEmitOpenPath", (path) => {
+        if (typeof path !== "string" || !path.startsWith("/")) return;
+        for (const callback of openPathCallbacks) {
           try { callback(path); } catch {}
         }
       });
@@ -199,6 +206,11 @@ struct OmnigentWebView: UIViewRepresentable {
           if (typeof callback !== "function") return () => {};
           callbacks.add(callback);
           return () => callbacks.delete(callback);
+        },
+        onOpenPath(callback) {
+          if (typeof callback !== "function") return () => {};
+          openPathCallbacks.add(callback);
+          return () => openPathCallbacks.delete(callback);
         },
         onSidebarDrag(callback) {
           if (typeof callback !== "function") return () => {};
@@ -441,7 +453,7 @@ struct OmnigentWebView: UIViewRepresentable {
       type: WKMediaCaptureType,
       decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
-      guard type == .microphone,
+      guard Self.isAllowedMediaCaptureType(type),
         origin.omnigentOrigin == pinnedOrigin,
         webView.url?.omnigentOrigin == pinnedOrigin
       else {
@@ -449,6 +461,15 @@ struct OmnigentWebView: UIViewRepresentable {
         return
       }
       decisionHandler(.grant)
+    }
+
+    private static func isAllowedMediaCaptureType(_ type: WKMediaCaptureType) -> Bool {
+      switch type {
+      case .camera, .microphone, .cameraAndMicrophone:
+        return true
+      @unknown default:
+        return false
+      }
     }
 
     private func isTrustedBridgeMessage(_ message: WKScriptMessage) -> Bool {

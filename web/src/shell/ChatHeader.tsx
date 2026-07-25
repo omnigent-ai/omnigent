@@ -11,6 +11,7 @@ import {
   PanelRightIcon,
   ShareIcon,
   TerminalIcon,
+  UserPlusIcon,
 } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -56,8 +57,8 @@ interface MobileSessionMenuProps {
   showShellsTab: boolean;
   /** Number of open terminals (entry badge). */
   terminalsLength: number;
-  /** Whether this is a claude-native session (gates the Tasks entry). */
-  isClaudeNative: boolean;
+  /** Whether the session publishes a todo list (gates the Tasks entry). */
+  todosSupported: boolean;
   /** Completed todo count (Tasks entry badge numerator). */
   todosCompleted: number;
   /** Total todo count (Tasks entry badge denominator + visibility). */
@@ -142,7 +143,7 @@ interface ChatHeaderProps {
  * canvas shows through, and chat content dissolves before it slides
  * under the controls (the conversation viewport's ``chat-scroll-fade``
  * mask, index.css; chat reserves clearance via ``pt-20``,
- * terminal-first via ``pt-16``). Left slot: open-sidebar +
+ * terminal-first via ``pt-14``). Left slot: open-sidebar +
  * back-to-parent. Right slot: desktop action buttons (Agent info ·
  * Share · right-panel toggle), a mobile three-dot menu mirroring the
  * same actions, and a mobile FAB that opens the rail tabs as
@@ -177,11 +178,11 @@ export function ChatHeader({
       className={cn(
         // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
         // the 32px controls. No own background — the app canvas shows
-        // through (a scrim can't track the canvas gradient; see #3010).
+        // through (a scrim can't track the canvas gradient).
         // Scrolled chat text can't render through the controls because the
         // conversation viewport fades its top edge instead (chat-scroll-fade
         // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between px-2 py-3",
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 items-center justify-between px-2 py-3 md:right-[var(--workspace-panel-offset,0px)]",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a
@@ -332,9 +333,11 @@ export function ChatHeader({
                   title={shareDisabledReason}
                   // share-button-glassy (index.css) paints the pink gradient,
                   // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-8 rounded-full px-6 text-13 font-normal text-white"
+                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white"
                 >
-                  <ShareIcon className="size-4" />
+                  <span className="flex size-4 shrink-0 items-center justify-center">
+                    <UserPlusIcon />
+                  </span>
                   Share
                 </Button>
               </span>
@@ -348,9 +351,11 @@ export function ChatHeader({
             onClick={onShare}
             // share-button-glassy (index.css) paints the pink gradient,
             // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-8 rounded-full px-6 text-13 font-normal text-white md:inline-flex"
+            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-[13px] font-normal text-white md:inline-flex"
           >
-            <ShareIcon className="size-4" />
+            <span className="flex size-4 shrink-0 items-center justify-center">
+              <UserPlusIcon />
+            </span>
             Share
           </Button>
         ) : null}
@@ -468,7 +473,7 @@ export function ChatHeader({
                     )}
                   </DropdownMenuItem>
                 )}
-                {mobileMenu.isClaudeNative && mobileMenu.todosTotal > 0 && (
+                {mobileMenu.todosSupported && mobileMenu.todosTotal > 0 && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenTodos}
                     className="gap-2.5 px-2.5 py-2 text-base"

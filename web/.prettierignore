@@ -20,3 +20,10 @@ ios/fastlane/README.md
 ios/fastlane/report.xml
 ios/fastlane/Preview.html
 ios/fastlane/test_output/
+
+# Android build/tooling artifacts. Git-ignored via android/.gitignore, but
+# Prettier doesn't read nested .gitignore files, so they're listed here too
+# (Gradle output includes HTML lint reports Prettier would otherwise choke on).
+android/build/
+android/app/build/
+android/.gradle/

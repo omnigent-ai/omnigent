@@ -563,6 +563,52 @@ describe("buildBubbles — tool joining", () => {
     ]);
   });
 
+  it("two calls under one response_id: the tool_result-resolved call completes while the live one spins", () => {
+    // The hermes-native contract: every tool call in a turn shares one
+    // response_id, so the bubble lifecycle is streaming for the whole turn.
+    // A finished call (resolved by its tool_result) must still render as
+    // completed, not inherit the turn's spinner — only the trailing live call.
+    const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
+    const blocks: AnyBlock[] = [
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_read", responseId: "resp_1", timestamp: 10 }),
+        executions: [mkExec("Read", "call_read")],
+        iteration: 0,
+      },
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_read", responseId: "resp_1", timestamp: 12 }),
+        name: "Read",
+        callId: "call_read",
+        agentName: "test",
+        output: "file content",
+      },
+      {
+        type: "text_chunk",
+        ctx: ctx({ responseId: "resp_1" }),
+        text: "Now running a slow tool.\n",
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_sleep", responseId: "resp_1", timestamp: 13 }),
+        executions: [mkExec("sleep", "call_sleep")],
+        iteration: 0,
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, active);
+    const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
+    const tools = items.filter((item): item is Extract<RenderItem, { kind: "tool" }> => {
+      return item.kind === "tool";
+    });
+
+    expect(tools.map((tool) => [tool.execution.name, tool.state])).toEqual([
+      ["Read", "output-available"],
+      ["sleep", "input-available"],
+    ]);
+  });
+
   it("keeps all unresolved tools in the trailing streaming tool phase active", () => {
     const active: ActiveResponse = { responseId: "resp_1", state: "streaming", error: null };
     const blocks: AnyBlock[] = [
@@ -1261,7 +1307,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
         type: "routing_decision",
         ctx: ctx({ itemId: "rd_1", responseId: "routing_1" }),
         model: "databricks-claude-opus-4-8",
-        tier: "expensive",
         applied: true,
         rationale: "multi-file refactor needs deep reasoning",
       },
@@ -1281,7 +1326,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
     const chip = bubbles[0] as Extract<Bubble, { kind: "routing_decision" }>;
     expect(chip.itemId).toBe("rd_1");
     expect(chip.model).toBe("databricks-claude-opus-4-8");
-    expect(chip.tier).toBe("expensive");
     expect(chip.applied).toBe(true);
     expect(chip.rationale).toBe("multi-file refactor needs deep reasoning");
   });
@@ -1292,7 +1336,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
         type: "routing_decision",
         ctx: ctx({ itemId: "rd_shadow", responseId: "routing_2" }),
         model: "databricks-claude-haiku-4-5",
-        tier: "cheap",
         applied: false,
         rationale: "trivial question",
       },
@@ -1312,7 +1355,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
         response_id: "routing_3",
         status: "completed",
         model: "databricks-claude-sonnet-4-6",
-        tier: "medium",
         applied: true,
         rationale: "moderate knowledge work",
       } as unknown as ConversationItem,
@@ -1326,7 +1368,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
     expect(chip.kind).toBe("routing_decision");
     expect(chip.itemId).toBe("rd_reload");
     expect(chip.model).toBe("databricks-claude-sonnet-4-6");
-    expect(chip.tier).toBe("medium");
   });
 
   it("live funnel: a response.output_item.done routing_decision reduces to the same bubble", () => {
@@ -1334,7 +1375,6 @@ describe("buildBubbles — routing_decision (intelligent model router) chip", ()
       {
         type: "routing_decision",
         model: "databricks-claude-opus-4-8",
-        tier: "expensive",
         applied: true,
         rationale: "hard turn",
         itemId: "rd_live",

@@ -111,7 +111,8 @@ def downgrade() -> None:
     op.execute(sa.text("DELETE FROM agents WHERE session_id IS NOT NULL"))
     with op.batch_alter_table("agents") as batch_op:
         batch_op.drop_index("ix_agents_template_name")
-        batch_op.drop_index("ix_agents_session_id")
+        # MySQL requires the FK to be dropped before the index that backs it.
         batch_op.drop_constraint("fk_agents_session_id", type_="foreignkey")
+        batch_op.drop_index("ix_agents_session_id")
         batch_op.drop_column("session_id")
         batch_op.create_unique_constraint("uq_agents_name", ["name"])

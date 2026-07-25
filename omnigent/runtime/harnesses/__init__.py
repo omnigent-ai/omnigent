@@ -24,6 +24,8 @@ sibling modules; this ``__init__.py`` is just the registry.
 
 from __future__ import annotations
 
+from omnigent.harness_plugins import harness_modules
+
 # Harness-name → fully-qualified module path. Each module must
 # export ``create_app() -> FastAPI``; the runner imports the module,
 # calls the factory, and serves the result over a Unix socket.
@@ -134,7 +136,7 @@ _HARNESS_MODULES: dict[str, str] = {
     # for each turn, managing its own session state via Hermes' SQLite
     # session store. See omnigent/inner/hermes_harness.py and
     # omnigent/inner/hermes_executor.py. The ``hermes`` binary must be
-    # on PATH (or set by HARNESS_HERMES_PATH).
+    # on PATH (or set by OMNIGENT_HERMES_PATH; legacy HARNESS_HERMES_PATH honored).
     "hermes": "omnigent.inner.hermes_harness",
     # hermes-native harness wrap. Drives the resident ``hermes`` TUI by
     # injecting each web-UI turn into its tmux pane and mirroring the transcript
@@ -144,5 +146,9 @@ _HARNESS_MODULES: dict[str, str] = {
     # omnigent/inner/hermes_native_harness.py.
     "hermes-native": "omnigent.inner.hermes_native_harness",
 }
+
+# Keep the historical mutable dict surface while sourcing builtins and
+# community plugins from the dynamic registry.
+_HARNESS_MODULES = harness_modules()
 
 __all__ = ["_HARNESS_MODULES"]

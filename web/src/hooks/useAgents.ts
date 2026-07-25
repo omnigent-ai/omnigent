@@ -17,6 +17,11 @@ export interface McpServerSummary {
   description?: string | null;
   /** HTTP SSE endpoint URL. Only present when transport === "http". */
   url?: string | null;
+  /**
+   * HTTP headers for the server. Values are always "[REDACTED]" in API
+   * responses; only key names are exposed.
+   */
+  headers?: Record<string, string>;
   /** Executable to spawn. Only present when transport === "stdio". */
   command?: string | null;
   /** Arguments passed to command. Only present when transport === "stdio". */
@@ -51,9 +56,11 @@ export interface Agent {
   /** Guardrails policies declared on the agent. Empty when none configured. */
   policies?: PolicySummary[];
   /** Terminal names declared in the spec's `terminals:` block, in
-   * declaration order (e.g. ["shell"]). Gates the "new terminal"
-   * affordance: empty means the agent has no terminal access and the
-   * UI must not offer creation. Only populated by `useSessionAgent`. */
+   * declaration order (e.g. ["shell"], or ["zsh", "bash"] for a native
+   * session offering the host's installed shells, default first). Gates
+   * the "new terminal" affordance: empty means the agent has no terminal
+   * access and the UI must not offer creation. Only populated by
+   * `useSessionAgent`. */
   terminals?: string[];
 }
 
@@ -97,14 +104,15 @@ async function fetchAgents(): Promise<Agent[]> {
 /**
  * Fetch the agents list, derived from active sessions.
  *
- * Refetches every 30 seconds so new agents from recently created
- * sessions appear without a manual refresh.
+ * Intended for the landing page (no active session); the session
+ * detail page uses `useSessionAgent` for the bound agent instead.
  */
-export function useAgents() {
+export function useAgents({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: ["agents"],
     queryFn: fetchAgents,
-    staleTime: 30_000,
+    staleTime: Infinity,
+    enabled,
   });
 }
 
@@ -165,6 +173,7 @@ export interface UpsertMcpServerInput {
   transport: "http" | "stdio";
   description?: string | null;
   url?: string | null;
+  headers?: Record<string, string> | null;
   command?: string | null;
   args?: string[];
 }

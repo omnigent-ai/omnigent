@@ -55,10 +55,8 @@ from omnigent._wrapper_labels import (
 # tmux / websocket dependencies.
 from omnigent.claude_native_state import read_launch_state as _read_claude_launch_state
 from omnigent.codex_native_state import read_launch_state as _read_codex_launch_state
-from omnigent.native_coding_agents import (
-    CODEX_NATIVE_CODING_AGENT,
-    native_coding_agent_for_wrapper_label,
-)
+from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 
 # Page size for the paginated picker.
 # Small enough that a 24-line terminal shows the whole page; big enough

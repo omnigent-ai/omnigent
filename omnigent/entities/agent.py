@@ -26,8 +26,6 @@ class Agent:
     :param description: Optional free-text description of the agent.
     :param updated_at: Unix epoch timestamp of the last update, or
         ``None`` if the agent has never been updated.
-    :param session_id: Owning conversation/session id for
-        session-scoped agents. ``None`` for template agents.
     """
 
     id: str
@@ -37,7 +35,7 @@ class Agent:
     version: int = 1
     description: str | None = None
     updated_at: int | None = None
-    session_id: str | None = None
+    session_id: str | None = None  # owning conversation id; None for template agents
 
 
 @dataclass

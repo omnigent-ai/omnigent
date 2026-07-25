@@ -1,5 +1,6 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -126,48 +127,64 @@ export function computeNextActiveOverride(
   return { id: activeId, updatedAt: active.updated_at };
 }
 
-export function togglePinnedConversationId(
-  pinnedIds: readonly string[],
-  conversationId: string,
-): string[] {
-  if (pinnedIds.includes(conversationId)) {
-    return pinnedIds.filter((id) => id !== conversationId);
+// A bare 32-char lowercase-hex conversation id — the shape the API returns now
+// that ids are stored as 16-byte binary uuids (legacy prefixes dropped).
+const BARE_CONVERSATION_ID_RE = /^[0-9a-f]{32}$/i;
+
+// Reduce a possibly-legacy conversation id to the bare hex form the server now
+// emits: drop dashes and any legacy prefix (``conv_``/``ag_``/…) and keep the
+// trailing 32 hex chars, mirroring the id-to-binary DB migration's transform.
+// A value that isn't a uuid tail (hand-crafted junk) is returned unchanged.
+export function bareConversationId(id: string): string {
+  const tail = id.replace(/-/g, "").slice(-32);
+  return BARE_CONVERSATION_ID_RE.test(tail) ? tail.toLowerCase() : id;
+}
+
+// Migrate stored pin ids to the bare-hex form, dropping duplicates that collapse
+// together (a legacy ``conv_<hex>`` and its bare twin). Legacy pins were
+// persisted in localStorage keyed by the conversation id, so ids pinned before
+// the id-to-binary migration still carry the old prefix. Applied when reading
+// those legacy pins for the one-time push up to server-side labels, so a
+// returning user's pins map to the bare ids the API now returns.
+export function migratePinnedConversationIds(ids: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const migrated: string[] = [];
+  for (const id of ids) {
+    const bare = bareConversationId(id);
+    if (seen.has(bare)) continue;
+    seen.add(bare);
+    migrated.push(bare);
   }
-  return [conversationId, ...pinnedIds];
+  return migrated;
+}
+
+// Drop conversations whose id already appeared, keeping the first occurrence.
+// The server pinned list and the paginated list overlap (a pinned session is
+// usually in both); merging them would otherwise render the row twice.
+export function dedupeConversationsById(conversations: readonly Conversation[]): Conversation[] {
+  const seen = new Set<string>();
+  const deduped: Conversation[] = [];
+  for (const conversation of conversations) {
+    if (seen.has(conversation.id)) continue;
+    seen.add(conversation.id);
+    deduped.push(conversation);
+  }
+  return deduped;
 }
 
 // Order pinned conversations by when they were pinned, not by `updated_at` —
 // a pinned session holds its slot even when a new message bumps its
-// `updated_at`. `pinnedIds` is kept most-recently-pinned-first (see
-// `togglePinnedConversationId`), so we reverse it: the oldest pin ranks
-// first (top) and a freshly pinned session lands at the bottom of the group.
-// Anything not in `pinnedIds` (shouldn't happen for this list) sinks to the
-// bottom in a stable order.
-export function orderByPinnedSequence(
-  conversations: Conversation[],
-  pinnedIds: readonly string[],
-): Conversation[] {
-  const oldestPinFirst = [...pinnedIds].reverse();
-  const rankById = new Map(oldestPinFirst.map((id, index) => [id, index]));
-  const rank = (c: Conversation): number => rankById.get(c.id) ?? Number.MAX_SAFE_INTEGER;
-  return [...conversations].sort((a, b) => rank(a) - rank(b));
-}
-
-export function normalizePinnedConversationIds(
-  pinnedIds: readonly string[],
-  conversations: readonly Conversation[],
-): string[] {
-  const validIds = new Set(conversations.map((conversation) => conversation.id));
-  const seen = new Set<string>();
-  const normalized: string[] = [];
-
-  for (const id of pinnedIds) {
-    if (!validIds.has(id) || seen.has(id)) continue;
-    seen.add(id);
-    normalized.push(id);
-  }
-
-  return normalized;
+// `updated_at`. The `omnigent.pinned` label value is the epoch-ms pin time;
+// sort ascending so the oldest pin ranks first (top) and a freshly pinned
+// session lands at the bottom of the group (matching the prior localStorage
+// behaviour). A missing/unparseable value sinks to the bottom, stably.
+export function orderByPinnedTimestamp(conversations: readonly Conversation[]): Conversation[] {
+  const pinnedAt = (c: Conversation): number => {
+    const raw = c.labels?.[PINNED_LABEL_KEY];
+    const ms = raw ? Number(raw) : NaN;
+    return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
+  };
+  return [...conversations].sort((a, b) => pinnedAt(a) - pinnedAt(b));
 }
 
 // ── Drag-and-drop ────────────────────────────────────────────────────────────

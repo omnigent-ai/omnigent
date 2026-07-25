@@ -3,13 +3,14 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { Slot } from "radix-ui";
 
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 
 // The pressed-state nudge uses the `transform` property (not translate-y-px)
 // so it composes with `translate`-based positioning: a caller centering the
 // button via -translate-y-1/2 would otherwise have its transform replaced on
 // :active, making the button jump out from under the cursor mid-click.
 const buttonVariants = cva(
-  "group/button inline-flex shrink-0 cursor-pointer items-center justify-center rounded-lg border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:not-aria-[haspopup]:[transform:translateY(1px)] disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  "group/button relative inline-flex shrink-0 cursor-pointer items-center justify-center rounded-lg border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:not-aria-[haspopup]:[transform:translateY(1px)] disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {
@@ -54,12 +55,30 @@ const Button = React.forwardRef<
   React.ComponentProps<"button"> &
     VariantProps<typeof buttonVariants> & {
       asChild?: boolean;
+      // When true, overlay a centered spinner and disable the button while
+      // keeping its width — the label stays in flow but hidden, so a
+      // submitting button doesn't grow and shove its neighbours.
+      loading?: boolean;
     }
 >(function Button(
-  { className, variant = "default", size = "default", asChild = false, ...props },
+  {
+    className,
+    variant = "default",
+    size = "default",
+    asChild = false,
+    loading = false,
+    disabled,
+    children,
+    ...props
+  },
   ref,
 ) {
   const Comp = asChild ? Slot.Root : "button";
+
+  // With asChild the child is the rendered element (e.g. a Radix trigger or an
+  // <a>); we can't inject an overlay without breaking Slot's single-child
+  // contract, so the loading affordance only applies to real <button>s.
+  const showLoading = loading && !asChild;
 
   return (
     <Comp
@@ -68,8 +87,21 @@ const Button = React.forwardRef<
       data-variant={variant}
       data-size={size}
       className={cn(buttonVariants({ variant, size, className }))}
+      disabled={disabled || showLoading}
+      aria-busy={showLoading || undefined}
       {...props}
-    />
+    >
+      {showLoading ? (
+        <>
+          <Spinner className="absolute inset-0 m-auto size-4" />
+          {/* `display: contents` keeps children as direct flex items (gap and
+              width preserved); `invisible` hides them without removing them. */}
+          <span className="contents invisible">{children}</span>
+        </>
+      ) : (
+        children
+      )}
+    </Comp>
   );
 });
 

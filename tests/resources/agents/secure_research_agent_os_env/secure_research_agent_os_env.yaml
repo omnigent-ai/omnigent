@@ -26,10 +26,8 @@ labels:
 label_schema:
   confidentiality:
     values: ["0", "1"]
-    monotonic: max
   integrity:
     values: ["0", "1"]
-    monotonic: min
 
 ask_timeout: 30
 policy_transparency: true

@@ -40,7 +40,7 @@ def _seed_session_with_grants(
     :param db_uri: SQLite URI for the per-test database.
     :param grants: Mapping of ``{user_email: level}`` to grant on the new
         session, e.g. ``{"alice@example.com": LEVEL_EDIT}``.
-    :returns: The newly created conversation ID, e.g. ``"conv_abc123"``.
+    :returns: The newly created conversation ID, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     """
     conv_store = SqlAlchemyConversationStore(db_uri)
     conversation = conv_store.create_conversation()
@@ -219,7 +219,7 @@ async def test_admin_cannot_add_comment_to_nonexistent_session(
 ) -> None:
     """Admin bypass must not allow orphan comments on missing sessions."""
     admin = "admin@example.com"
-    missing_session_id = "conv_does_not_exist"
+    missing_session_id = "1d0b12236c77f69f5073a53583de1a3f"
     perm_store = SqlAlchemyPermissionStore(db_uri)
     perm_store.ensure_user(admin, is_admin=True)
 
@@ -555,6 +555,39 @@ async def test_comment_api_serializes_updated_at(
     # stale updated_at means the session fingerprint misses edits.
     assert patched["updated_at"] == 2_000 * us
     assert patched["created_at"] == 1_000
+
+
+async def test_patch_rejects_unknown_status_with_400(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An out-of-domain status is a 400, not a 500.
+
+    ``comments.status`` is a closed enum (draft/addressed). A PATCH with an
+    unknown value must be rejected at the route with a clean validation
+    error rather than reaching the store, where the enum codec raises and
+    would otherwise surface as an opaque 500.
+    """
+    alice = "alice@example.com"
+    session_id = _seed_session_with_grants(db_uri, {alice: LEVEL_EDIT})
+    created = await _add_comment(
+        auth_client,
+        session_id,
+        user=alice,
+        path="src/app.py",
+        body="fix me",
+        start_index=0,
+        end_index=6,
+    )
+
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}/comments/{created['id']}",
+        json={"status": "resolved"},  # not a real comment status
+        headers={"X-Forwarded-Email": alice},
+    )
+    assert resp.status_code == 400, (
+        f"Unknown status must be a 400, got {resp.status_code}: {resp.text}"
+    )
 
 
 # ── Author-only edit/delete (one editor may not rewrite another's comment) ─────

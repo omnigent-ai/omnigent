@@ -15,8 +15,11 @@ from omnigent.codex_native_app_server import client_for_transport
 from omnigent.codex_native_bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
+    cancel_pending_mcp_startup,
+    mcp_startup_waiting_detail,
     read_bridge_startup_error,
     read_bridge_state,
+    read_mcp_startup,
     update_active_turn_id,
 )
 from omnigent.inner.executor import (
@@ -28,7 +31,11 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment, parse_data_uri
+from omnigent.inner.native_attachments import (
+    materialize_attachment,
+    parse_data_uri,
+    unresolved_attachment_marker,
+)
 from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
 
 _logger = logging.getLogger(__name__)
@@ -115,15 +122,31 @@ class CodexNativeExecutor(Executor):
 
     async def interrupt_session(self, session_key: str) -> bool:
         """
-        Interrupt the active native Codex turn.
+        Interrupt the active native Codex turn and any in-flight MCP startup.
+
+        Stop means "stop everything": the active turn (which codex may be
+        holding back until MCP startup settles) is interrupted with its
+        recorded turn id, and a still-pending MCP startup round is
+        cancelled the way the Codex TUI does — ``turn/interrupt`` with an
+        empty turn id (its ``startup_interrupt``). Either alone also works:
+        no recorded turn cancels just the startup; no pending startup
+        interrupts just the turn.
 
         :param session_key: Adapter session key. Unused because the
             bridge is per conversation.
-        :returns: ``True`` when an interrupt was sent.
+        :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
         state = read_bridge_state(self._bridge_dir)
-        if state is None or state.active_turn_id is None:
+        if state is None:
+            return False
+        # Flip the local map first: the cancelled record is what the web
+        # band and turn-error text read, even if Codex never acknowledges.
+        # Unlike the runner's Stop handler, the flipped map is not
+        # published here — the inner process has no server client; web
+        # Stop routes through the runner handler, which does publish.
+        pending = cancel_pending_mcp_startup(self._bridge_dir)
+        if state.active_turn_id is None and not pending:
             return False
         client = client_for_transport(
             state.socket_path,
@@ -131,13 +154,26 @@ class CodexNativeExecutor(Executor):
         )
         await client.connect()
         try:
-            await client.request(
-                "turn/interrupt",
-                {
-                    "threadId": state.thread_id,
-                    "turnId": state.active_turn_id,
-                },
-            )
+            if pending:
+                # Startup interrupt first and best-effort: the local
+                # cancel above already updated what Omnigent shows, and a
+                # failure here must not block the active-turn interrupt.
+                try:
+                    await client.request(
+                        "turn/interrupt",
+                        {"threadId": state.thread_id, "turnId": ""},
+                    )
+                except Exception:  # noqa: BLE001 - the local cancel above already took effect.
+                    _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
+                _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
+            if state.active_turn_id is not None:
+                await client.request(
+                    "turn/interrupt",
+                    {
+                        "threadId": state.thread_id,
+                        "turnId": state.active_turn_id,
+                    },
+                )
         finally:
             await client.close()
         return True
@@ -156,9 +192,8 @@ class CodexNativeExecutor(Executor):
             shape. The latest user message is delivered to Codex.
         :param tools: Tool schemas from Omnigent. Ignored here;
             native Codex owns its own tool surface.
-        :param system_prompt: System prompt from the agent spec.
-            Ignored because the native thread was created by the
-            wrapper.
+        :param system_prompt: System prompt from the agent spec. Native
+            startup instructions are configured before the app-server launches.
         :param config: Per-turn executor config. Its ``model`` and
             ``extra["reasoning_effort"]`` (carrying the Omnigent web
             ``/model`` pick) are applied via a ``thread/settings/update``
@@ -189,6 +224,11 @@ class CodexNativeExecutor(Executor):
                 state = read_bridge_state(self._bridge_dir)
                 if state is not None:
                     break
+
+        # No client-side wait for Codex MCP startup: the app-server accepts
+        # ``turn/start`` mid-startup and defers execution until the round
+        # settles (verified against codex 0.142.5), so sending immediately
+        # is safe. The web UI's MCP-startup band explains the wait.
 
         # Serialized against enqueue_session_message: the
         # turn/start-vs-turn/steer decision, the RPC, and the
@@ -242,19 +282,23 @@ class CodexNativeExecutor(Executor):
                                     **settings_overrides,
                                 },
                             )
-                        response = await client.request(
-                            "turn/start",
-                            {
-                                "threadId": state.thread_id,
-                                "input": input_items,
-                            },
-                        )
+                        turn_params: dict[str, Any] = {
+                            "threadId": state.thread_id,
+                            "input": input_items,
+                        }
+                        response = await client.request("turn/start", turn_params)
                         turn_id = response.get("result", {}).get("turn", {}).get("id")
                         if isinstance(turn_id, str) and turn_id:
                             update_active_turn_id(self._bridge_dir, turn_id)
                             _logger.info("Codex native started turn: turn_id=%s", turn_id)
                 except Exception as exc:  # noqa: BLE001 - converted into a harness error event.
                     error_msg = f"Codex native executor error: {exc}"
+                    # Name the servers a still-unsettled MCP startup is
+                    # blocked on — the most common cause of an injection
+                    # failure this early in the session's life.
+                    waiting = mcp_startup_waiting_detail(read_mcp_startup(self._bridge_dir))
+                    if waiting:
+                        error_msg = f"{error_msg} ({waiting})"
                 finally:
                     await client.close()
         if error_msg is not None:
@@ -388,6 +432,8 @@ def _content_to_input_items(content: Any, bridge_dir: Path) -> list[dict[str, An
                 path = materialize_attachment(block, bridge_dir)
                 if path is not None:
                     items.append({"type": "localImage", "path": str(path)})
+                else:
+                    items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
@@ -412,8 +458,9 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Bridge directory for materializing the file.
-    :returns: A Codex ``text`` input item, or ``None`` when the file
-        could not be decoded or materialized.
+    :returns: A Codex ``text`` input item; a visible could-not-load
+        marker item when the file failed to materialize; or ``None``
+        for an empty text file.
     """
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
@@ -431,4 +478,4 @@ def _file_block_to_input_item(block: dict[str, Any], bridge_dir: Path) -> dict[s
         # matching _ATTACHMENT_MARKER_RE in
         # omnigent/entities/conversation.py. Keep in sync.
         return {"type": "text", "text": f"[Attached file: {path}]"}
-    return None
+    return {"type": "text", "text": unresolved_attachment_marker(block)}

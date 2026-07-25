@@ -146,7 +146,7 @@ async def test_create_default_policy(
     assert body["type"] == "python"
     assert body["handler"] == "omnigent.policies.builtins.safety.ask_on_os_tools"
     assert body["enabled"] is True
-    assert body["id"].startswith("pol_")
+    assert len(body["id"]) == 32
     assert body["created_by"] == "admin@example.com"
 
 
@@ -369,7 +369,7 @@ async def test_get_nonexistent_returns_404(
     """GET /v1/policies/{id} with a bad ID returns 404."""
     _make_admin(db_uri)
     resp = await auth_client.get(
-        "/v1/policies/dpol_nonexistent",
+        "/v1/policies/21ed01e726fff00d3f8c012b8e44749b",
         headers=_admin_headers(),
     )
     assert resp.status_code == 404
@@ -382,7 +382,7 @@ async def test_update_nonexistent_returns_404(
     """PATCH /v1/policies/{id} with a bad ID returns 404."""
     _make_admin(db_uri)
     resp = await auth_client.patch(
-        "/v1/policies/dpol_nonexistent",
+        "/v1/policies/21ed01e726fff00d3f8c012b8e44749b",
         json={"name": "x"},
         headers=_admin_headers(),
     )

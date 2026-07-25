@@ -235,13 +235,28 @@ export function createWorkspaceImageExtension(
       return `[${image}](${linkDest}${formatMarkdownTitleSuffix(linkTitle as string | null)})`;
     },
     addNodeView() {
+      // Apply one image attribute onto the DOM element. width/height with an
+      // integer pixel value go onto the inline STYLE, not the attribute:
+      // Tailwind Preflight's `img { height: auto }` overrides the width/height
+      // *attributes* (presentational hints lose to author CSS), so an
+      // explicitly-sized image would render square. Inline styles win the
+      // cascade — matching how the read-only preview renders the same <img>.
+      // Serialisation is unaffected (renderMarkdown reads node.attrs, not DOM).
+      const applyAttr = (img: HTMLImageElement, key: string, value: unknown) => {
+        if ((key === "width" || key === "height") && /^\d+$/.test(String(value))) {
+          img.style[key] = `${value}px`;
+          img.removeAttribute(key);
+          return;
+        }
+        img.setAttribute(key, String(value));
+      };
       return ({ node, HTMLAttributes }) => {
         const img = document.createElement("img");
         for (const [key, value] of Object.entries(HTMLAttributes)) {
           // src is handled below: workspace paths must go through the
           // authenticated fetch, never directly onto the DOM.
           if (key === "src" || value == null) continue;
-          img.setAttribute(key, String(value));
+          applyAttr(img, key, value);
         }
         const src: string = node.attrs.src ?? "";
         let cancelled = false;
@@ -284,8 +299,14 @@ export function createWorkspaceImageExtension(
             if (newNode.type !== node.type || newNode.attrs.src !== src) return false;
             for (const [key, value] of Object.entries(newNode.attrs)) {
               if (key === "src") continue;
-              if (value == null) img.removeAttribute(key);
-              else img.setAttribute(key, String(value));
+              if (value == null) {
+                img.removeAttribute(key);
+                // width/height live on the inline style (see applyAttr); clear
+                // there too, or a removed dimension would visually persist.
+                if (key === "width" || key === "height") img.style[key] = "";
+              } else {
+                applyAttr(img, key, value);
+              }
             }
             node = newNode;
             return true;

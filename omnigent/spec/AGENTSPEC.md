@@ -193,6 +193,11 @@ Not machine-parsed — the entire contents (file or inline) are passed to the
 model as instructions. Optional; if absent, the model receives no agent-level
 system prompt (per-request `instructions` from the API still apply).
 
+This is the portable, user-authored portion of the system prompt. At runtime,
+Omnigent may append small framework-owned lifecycle or metadata instructions
+after the agent-level and per-request instructions. Those additions are not
+part of `AgentSpec` and must not be encoded into an agent image.
+
 ---
 
 ## Skills — `skills/<name>/SKILL.md`

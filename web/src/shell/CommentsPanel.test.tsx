@@ -25,13 +25,17 @@ const mockGetCurrentAuthorId = vi.mocked(getCurrentAuthorId);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function makeComment(id: string, status: Comment["status"] = "draft"): Comment {
+function makeComment(
+  id: string,
+  status: Comment["status"] = "draft",
+  range: { start_index: number; end_index: number } = { start_index: 0, end_index: 5 },
+): Comment {
   return {
     id,
     conversation_id: "conv_1",
     path: "file.py",
-    start_index: 0,
-    end_index: 5,
+    start_index: range.start_index,
+    end_index: range.end_index,
     body: `Comment ${id}`,
     status,
     created_at: 0,
@@ -428,5 +432,80 @@ describe("CommentsPanel resize affordance", () => {
     } finally {
       Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
     }
+  });
+});
+
+// ── Active-comment reveal (selecting a highlight in the file) ──────────────
+//
+// Selecting a highlighted range in the file sets activeSelection to that
+// comment's range. The panel must reveal the matching card: switch to the tab
+// that holds it (if needed) and scroll it into view. scrollIntoView isn't
+// implemented in jsdom, so it's stubbed to record the call.
+
+function renderWithSelection(
+  comments: Comment[],
+  addressedComments: Comment[],
+  activeSelection: ActiveSelection | null,
+) {
+  return render(
+    <CommentsPanel
+      comments={comments}
+      addressedComments={addressedComments}
+      activeSelection={activeSelection}
+      onAddComment={vi.fn()}
+      onAddressAll={vi.fn()}
+      onEditComment={vi.fn()}
+      onDeleteComment={vi.fn()}
+      onClickComment={vi.fn()}
+      canAddress={false}
+      addressPending={false}
+    />,
+  );
+}
+
+/** Run pending requestAnimationFrame callbacks (the scroll effect defers via rAF). */
+function flushRaf(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+describe("CommentsPanel active-comment reveal", () => {
+  const originalScrollIntoView = Element.prototype.scrollIntoView;
+
+  afterEach(() => {
+    Element.prototype.scrollIntoView = originalScrollIntoView;
+  });
+
+  it("scrolls the active comment's card into view", async () => {
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+
+    const target = makeComment("c2", "draft", { start_index: 40, end_index: 60 });
+    renderWithSelection([makeComment("c1"), target], [], {
+      start_index: 40,
+      end_index: 60,
+      anchor_content: "hello",
+    });
+    await flushRaf();
+
+    // Only the matching card scrolls, and it scrolls without yanking layout
+    // when already visible (block: nearest).
+    expect(scrollSpy).toHaveBeenCalledTimes(1);
+    expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest", behavior: "smooth" });
+  });
+
+  it("switches to the Addressed tab when the active comment lives there", async () => {
+    Element.prototype.scrollIntoView = vi.fn();
+
+    const addressed = makeComment("c2", "addressed", { start_index: 40, end_index: 60 });
+    renderWithSelection([makeComment("c1")], [addressed], {
+      start_index: 40,
+      end_index: 60,
+      anchor_content: "hello",
+    });
+    await flushRaf();
+
+    // The Addressed tab must become active so the card is rendered; its body
+    // ("Comment c2") is then in the document.
+    expect(screen.getByText("Comment c2")).toBeInTheDocument();
   });
 });

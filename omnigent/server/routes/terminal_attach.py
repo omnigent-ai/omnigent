@@ -88,6 +88,7 @@ from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -133,19 +134,24 @@ def create_terminal_attach_router(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        transport: str | None = Query(default=None),
     ) -> None:
         """
         Attach to a terminal by resource id via WebSocket.
 
         Proxies to the runner's resource-addressed WS endpoint when a
         runner tunnel factory is installed, or falls back to resolving
-        the terminal id locally and bridging the PTY in-process.
+        the terminal id locally and bridging in-process.
 
         :param websocket: The accepted FastAPI :class:`WebSocket`.
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id,
             e.g. ``"terminal_bash_s1"``.
         :param read_only: Pass ``-r`` to tmux when ``True``.
+        :param transport: Optional per-attach transport override
+            (``"control"`` / ``"pty"``); forwarded to the runner and used to
+            pick the control-mode vs PTY bridge in-process. ``None`` defers to
+            the terminal spec / global default.
         """
         from omnigent.entities.session_resources import (
             resolve_terminal_entry_by_resource_id,
@@ -165,11 +171,10 @@ def create_terminal_attach_router(
         if ws_factory is not None:
             from urllib.parse import urlencode
 
-            qs = urlencode(
-                {
-                    "read_only": "true" if read_only else "false",
-                }
-            )
+            qs_params = {"read_only": "true" if read_only else "false"}
+            if transport is not None:
+                qs_params["transport"] = transport
+            qs = urlencode(qs_params)
             runner_path = (
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
             )
@@ -235,8 +240,16 @@ def create_terminal_attach_router(
             )
             return
 
+        from omnigent.inner.terminal import (
+            TERMINAL_TRANSPORT_CONTROL,
+            resolve_terminal_transport,
+        )
         from omnigent.runtime import telemetry
 
+        resolved_transport = resolve_terminal_transport(
+            override=transport,
+            spec_transport=entry.instance.terminal_transport,
+        )
         with telemetry.span(
             "terminal.attach",
             attributes={
@@ -244,9 +257,15 @@ def create_terminal_attach_router(
                 "terminal.id": terminal_id,
                 "terminal.read_only": read_only,
                 "terminal.mode": "in-process",
+                "terminal.transport": resolved_transport,
             },
         ):
-            await bridge_tmux_pty_to_websocket(
+            bridge = (
+                bridge_tmux_control_to_websocket
+                if resolved_transport == TERMINAL_TRANSPORT_CONTROL
+                else bridge_tmux_pty_to_websocket
+            )
+            await bridge(
                 websocket,
                 socket_path=str(entry.instance.socket_path),
                 tmux_target=entry.instance.tmux_target,

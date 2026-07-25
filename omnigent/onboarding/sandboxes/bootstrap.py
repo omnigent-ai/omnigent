@@ -624,7 +624,7 @@ def set_sandbox_host_name(launcher: SandboxLauncher, sandbox_id: str, host_name:
         "cfg=yaml.safe_load(open(p)) if os.path.exists(p) else {}; "
         "cfg=cfg or {}; "
         f"h=cfg.get('host') or {{}}; h['name']='{safe_name}'; "
-        "h.setdefault('host_id', 'host_'+uuid.uuid4().hex); "
+        "h.setdefault('host_id', uuid.uuid4().hex); "
         "cfg['host']=h; "
         "yaml.safe_dump(cfg, open(p,'w'), default_flow_style=False, sort_keys=True)"
     )

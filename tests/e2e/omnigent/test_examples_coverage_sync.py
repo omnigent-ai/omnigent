@@ -169,6 +169,10 @@ _ALT_COVERED: frozenset[str] = frozenset(
         # risk_score_agent: the built-in session-risk-score policy is
         # exercised in tests/runtime/policies/test_example_omnigent_yamls.py.
         "risk_score_agent",
+        # info_flow_agent: the built-in gdrive information-flow policy
+        # (Bell-LaPadula + Biba) is exercised in
+        # tests/runtime/policies/test_example_omnigent_yamls.py.
+        "info_flow_agent",
         # qwen_perm_test: qwen-harness permission fixture exercised by
         # tests/inner/test_qwen_agent_integration.py against a mocked ACP
         # subprocess. The live qwen round-trip lives in

@@ -50,10 +50,13 @@ def test_evaluate_policy_deny_emits_kimi_decision(
     monkeypatch.setattr(
         kimi_native_hook,
         "post_evaluate_with_retry",
-        lambda *a, **k: httpx.Response(
-            200,
-            json={"result": "POLICY_ACTION_DENY", "reason": "blocked by policy"},
-            request=httpx.Request("POST", "http://x"),
+        lambda *a, **k: (
+            httpx.Response(
+                200,
+                json={"result": "POLICY_ACTION_DENY", "reason": "blocked by policy"},
+                request=httpx.Request("POST", "http://x"),
+            ),
+            None,
         ),
     )
 
@@ -79,8 +82,13 @@ def test_evaluate_policy_allow_emits_nothing(
     monkeypatch.setattr(
         kimi_native_hook,
         "post_evaluate_with_retry",
-        lambda *a, **k: httpx.Response(
-            200, json={"result": "POLICY_ACTION_ALLOW"}, request=httpx.Request("POST", "http://x")
+        lambda *a, **k: (
+            httpx.Response(
+                200,
+                json={"result": "POLICY_ACTION_ALLOW"},
+                request=httpx.Request("POST", "http://x"),
+            ),
+            None,
         ),
     )
 
@@ -119,14 +127,20 @@ def test_evaluate_policy_fails_closed_when_unreachable(
     """A governed PreToolUse with no usable verdict fails CLOSED (deny)."""
     bridge_dir = _governed_bridge(tmp_path)
     _feed_stdin(monkeypatch, {"hook_event_name": "PreToolUse", "tool_name": "Bash"})
-    monkeypatch.setattr(kimi_native_hook, "post_evaluate_with_retry", lambda *a, **k: None)
+    monkeypatch.setattr(
+        kimi_native_hook,
+        "post_evaluate_with_retry",
+        lambda *a, **k: (None, "connection error: simulated"),
+    )
 
     exit_code = kimi_native_hook.main(["evaluate-policy", "--bridge-dir", str(bridge_dir)])
 
     assert exit_code == 0
     out = json.loads(capsys.readouterr().out)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert out["hookSpecificOutput"]["permissionDecisionReason"] == _EVAL_UNAVAILABLE_REASON
+    assert out["hookSpecificOutput"]["permissionDecisionReason"].startswith(
+        _EVAL_UNAVAILABLE_REASON
+    )
 
 
 def _capture_injection(monkeypatch: pytest.MonkeyPatch) -> list[str]:

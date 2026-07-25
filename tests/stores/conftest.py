@@ -39,6 +39,17 @@ def conversation_store(db_uri: str) -> SqlAlchemyConversationStore:
 
 
 @pytest.fixture()
+def split_db_conversation_store(tmp_path: Path) -> SqlAlchemyConversationStore:
+    """
+    :returns: A SqlAlchemyConversationStore with two separate SQLite databases
+        (Omnigent DB + AP/conversations DB) to exercise split-DB routing.
+    """
+    omnigent_uri = f"sqlite:///{tmp_path}/omnigent.db"
+    conv_uri = f"sqlite:///{tmp_path}/conversations.db"
+    return SqlAlchemyConversationStore(omnigent_uri, conv_uri)
+
+
+@pytest.fixture()
 def artifact_store(tmp_path: Path) -> LocalArtifactStore:
     """
     :returns: A LocalArtifactStore in a temp directory.

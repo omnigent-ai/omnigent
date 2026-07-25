@@ -73,11 +73,23 @@ describe("parseRecommendations", () => {
     expect(recs!.size).toBe(2);
   });
 
+  it("unwraps claude-sdk MCP content-array format", () => {
+    // The claude-sdk harness stores tool results as [{type:"text", text:"<json>"}]
+    // rather than raw JSON strings — parseRecommendations must unwrap the envelope.
+    const wrapped = JSON.stringify([{ type: "text", text: TWO_TASK_OUTPUT }]);
+    const recs = parseRecommendations(wrapped);
+    expect(recs).not.toBeNull();
+    expect(recs!.size).toBe(2);
+    expect(recs!.get("refactor-auth")?.model).toBe("databricks-claude-opus-4-8");
+  });
+
   it("returns null for the dispatcher's Error: strings and non-JSON", () => {
     // Every failure mode of the tool returns a plain string, not JSON —
     // null is what flips the card into its failure rendering.
     expect(parseRecommendations("Error: the intelligent model router is OFF")).toBeNull();
     expect(parseRecommendations("{}")).toBeNull();
+    // Content array with no text block → null
+    expect(parseRecommendations(JSON.stringify([{ type: "image" }]))).toBeNull();
   });
 });
 

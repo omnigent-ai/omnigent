@@ -304,12 +304,17 @@ and list it in the config. Its env vars are injected into every managed
 sandbox, and the in-sandbox host forwards the standard harness credential
 vars (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 `CLAUDE_CODE_OAUTH_TOKEN`, `CODEX_ACCESS_TOKEN`, `OPENAI_API_KEY`,
-`OPENAI_BASE_URL`, `GEMINI_API_KEY`) to its runners:
+`OPENAI_BASE_URL`, `GEMINI_API_KEY`, plus their `OMNIGENT_`-prefixed
+aliases) to its runners:
 
 ```bash
 modal secret create omnigent-llm \
-  ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
+  OMNIGENT_ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-…
 ```
+
+Prefer `OMNIGENT_ANTHROPIC_API_KEY` for Claude Code API-key auth. Omnigent
+resolves it into Claude Code's `apiKeyHelper`, avoiding a raw
+`ANTHROPIC_API_KEY` in the Claude CLI process.
 
 ```yaml
 sandbox:

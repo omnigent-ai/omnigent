@@ -152,25 +152,27 @@ def _main_evaluate_policy(argv: list[str]) -> int:
     # The session is governed (bridge state + ap_server_url) and we have a
     # policy-relevant event: from here a failure to obtain a usable verdict
     # fails CLOSED for the tool-call gate (see ``fail_closed_hook_output``).
-    def _fail_closed() -> int:
-        out = fail_closed_hook_output(hook_event)
+    reauth = policy_hook_reauth(ap_server_url, headers)
+
+    def _fail_closed(detail: str | None = None) -> int:
+        out = fail_closed_hook_output(hook_event, detail)
         if out is not None:
             sys.stdout.write(json.dumps(out))
         return 0
 
     session_component = urllib.parse.quote(session_id, safe="")
     url = f"{ap_server_url.rstrip('/')}/v1/sessions/{session_component}/policies/evaluate"
-    resp = post_evaluate_with_retry(
+    resp, api_error = post_evaluate_with_retry(
         url,
         headers,
         eval_request,
         _EVALUATE_POLICY_TIMEOUT_S,
         "codex evaluate-policy hook",
         # Re-mint the baked one-shot token if it lapses mid-session.
-        reauth=policy_hook_reauth(ap_server_url, headers),
+        reauth=reauth,
     )
     if resp is None:
-        return _fail_closed()
+        return _fail_closed(api_error or reauth.failure_reason)
     if not resp.content:
         print("omnigent codex evaluate-policy hook: empty Omnigent response", file=sys.stderr)
         return _fail_closed()

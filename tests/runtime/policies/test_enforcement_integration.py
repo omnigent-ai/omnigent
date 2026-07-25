@@ -262,8 +262,7 @@ async def test_rate_limited_search_other_tools_not_gated(
 async def test_secure_research_initial_labels_seeded(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Two declared labels (with monotonic constraints) are
-    seeded to their initial values at build time."""
+    """Two declared labels are seeded to their initial values at build time."""
     engine = _load_engine("secure-research", conversation_store)
     assert engine.labels == {"confidentiality": "0", "integrity": "1"}
 
@@ -381,25 +380,14 @@ async def test_secure_research_write_file_gated_like_shell(
 
 
 @pytest.mark.asyncio
-async def test_secure_research_monotonic_constraint_persists(
+async def test_secure_research_taint_persists(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Once integrity drops to "0", a label write attempting
-    to restore it to "1" is silently dropped by
-    apply_label_writes — the monotonic constraint prevents
-    taint-clearing. (The engine enforces this path; the
-    store persists whatever it's given, but the engine
-    doesn't call it with monotonic violations once §10
-    validation lands in a later phase.)
-
-    For Phase 5, we verify the low-level invariant: after
-    taint, the value actually persisted is "0", and
-    subsequent apply_label_writes respects accumulated state.
-    """
+    """Once integrity drops to "0" via web_search taint,
+    the value is persisted and reflected in the store."""
     engine = _load_engine("secure-research", conversation_store)
 
     await _enforce_policy(engine, _tool_ctx("web_search", {"q": "x"}))
-    # Proof: integrity landed as "0" and remains.
     assert engine.labels["integrity"] == "0"
     conv = conversation_store.get_conversation(engine.conversation_id)
     assert conv.labels["integrity"] == "0"
