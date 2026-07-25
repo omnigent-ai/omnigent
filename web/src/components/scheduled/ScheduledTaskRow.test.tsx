@@ -53,14 +53,15 @@ function renderRow(
 
 afterEach(cleanup);
 
-describe("next-run text (server-sourced, relative)", () => {
-  it("renders the relative next-run with a 'Next run' prefix when nextRunAt is set", () => {
-    // ~2h in the future → "in 2h". Delta formatting is covered in
+describe("next-run text (server-sourced, absolute wall-clock)", () => {
+  it("renders the absolute next-run with a 'Next run' prefix when nextRunAt is set", () => {
+    // A near-future instant → an absolute "Today/Tomorrow at H:MM AM/PM" or
+    // "Mon D, H:MM AM/PM" label. Absolute formatting is covered in
     // scheduleText.test.ts; here we assert the row surfaces it with the prefix.
     const future = new Date(Date.now() + 2 * 60 * 60 * 1000 + 60_000).toISOString();
     renderRow(task({ nextRunAt: future }));
     const nextRun = screen.getByTestId("task-next-run");
-    expect(nextRun.textContent).toMatch(/^Next run in \d+h$/);
+    expect(nextRun.textContent).toMatch(/^Next run .*\d{1,2}:\d{2}\s?(AM|PM)$/);
   });
 
   it("renders NO next-run text when nextRunAt is null (paused / unarmed)", () => {

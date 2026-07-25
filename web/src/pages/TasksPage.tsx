@@ -216,10 +216,10 @@ export function TasksPage() {
           onPickSuggestion={openFromSuggestion}
         />
       ) : (
-        // Flat list — no boxed cards, and NO per-row hairline dividers (the row
-        // padding alone gives the spacing). The only divider on the page is the
-        // one before the Suggestions section (see SuggestionsSection).
-        <div className="flex flex-col" data-testid="tasks-list">
+        // Card list — each row is a bordered card (see ScheduledTaskRow), stacked
+        // with a gap so there's vertical spacing between cards. The only divider
+        // on the page is the one before the Suggestions section.
+        <div className="flex flex-col gap-2" data-testid="tasks-list">
           {filtered.map((task) => (
             <ScheduledTaskRow
               key={task.id}
