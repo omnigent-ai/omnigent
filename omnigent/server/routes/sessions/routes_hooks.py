@@ -46,6 +46,9 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user,
+)
+from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -65,6 +68,7 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     ElicitationRequestParams,
 )
@@ -463,10 +467,18 @@ def register_hooks_routes(
         """
         from omnigent.server.routes import sessions as _sf
 
-        user_id = _sf._get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # Runner capability or human permission: a runner evaluates policy
+        # hooks on its own session via the binding token; a human needs READ.
+        access = await authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.EVALUATE_POLICY,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
+        user_id = access.user_id
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:
             payload = await request.json()

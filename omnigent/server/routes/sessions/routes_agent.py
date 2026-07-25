@@ -38,6 +38,9 @@ from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -58,6 +61,7 @@ from omnigent.server.routes.sessions.routes_permissions import (
     _policy_type,
     _to_agent_object,
 )
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     AgentObject,
     MCPServerSummary,
@@ -100,10 +104,16 @@ def register_agent_routes(
         :returns: The bound agent's :class:`AgentObject`.
         :raises OmnigentError: If the session or agent is not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        access = await authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.READ_SESSION,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
+        user_id = access.user_id
         conv = access.conversation
         if conv is None:
             conv = conversation_store.get_conversation(session_id)
@@ -151,10 +161,16 @@ def register_agent_routes(
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        access = await authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.READ_SESSION,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
+        user_id = access.user_id
         conv = access.conversation
         if conv is None:
             conv = conversation_store.get_conversation(session_id)
@@ -362,9 +378,17 @@ def register_agent_routes(
                 detail="MCP proxy requires a runner_router; none configured on this server",
             )
 
-        user_id = _require_user(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        # Runner capability or human permission: a runner proxies its own
+        # MCP tool calls via the binding token; a human needs EDIT. Server-side
+        # TOOL_CALL / TOOL_RESULT policy still runs on every proxied call.
+        await authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.PROXY_MCP,
+            LEVEL_EDIT,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
 
         # Parse JSON-RPC body. Return a parse-error response (not HTTP

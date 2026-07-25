@@ -670,7 +670,7 @@ class HostStore:
                 session.query(SqlHost)
                 .filter(
                     SqlHost.workspace_id == current_workspace_id(),
-                    (SqlHost.owner == user_id) | (SqlHost.host_id.in_(granted_host_ids)),
+                    (SqlHost.user_id == user_id) | (SqlHost.host_id.in_(granted_host_ids)),
                 )
                 .order_by(SqlHost.updated_at.desc())
                 .all()

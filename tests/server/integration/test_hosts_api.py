@@ -1527,7 +1527,7 @@ async def test_shutdown_host_400_managed_sandbox(
     host_store.register_managed_host(
         host_id="6f0c09196f6441c5b6183de0905e31f2",
         name="sandbox-e",
-        owner="alice@test.com",
+        user_id="alice@test.com",
         token="tok-shut-e",
         provider="modal",
         sandbox_id="sb-1",

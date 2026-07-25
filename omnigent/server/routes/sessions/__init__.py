@@ -137,6 +137,7 @@ from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )

@@ -77,7 +77,7 @@ def check_host_access(
         return True
 
     host = host_store.get_host(host_id)
-    if host is not None and host.owner == user_id:
+    if host is not None and host.user_id == user_id:
         return True
 
     return host_permission_store.check_access(user_id, host_id, required_level)
@@ -115,7 +115,7 @@ def get_host_permission_level(
         return HOST_LEVEL_OWNER
 
     host = host_store.get_host(host_id)
-    if host is not None and host.owner == user_id:
+    if host is not None and host.user_id == user_id:
         return HOST_LEVEL_OWNER
 
     return host_permission_store.get_permission_level(user_id, host_id)

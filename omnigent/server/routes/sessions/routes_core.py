@@ -74,6 +74,9 @@ from omnigent.server.background_session_titles import (
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
+    authorize_runner_or_user,
+)
+from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -100,6 +103,7 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -670,15 +674,23 @@ def register_core_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         response.headers["Cache-Control"] = "no-store"
-        user_id = _get_user_id(request, auth_provider)
         # Single permission pass: authorize + resolve the display level +
         # fetch the conversation once, then reuse the conversation in the
         # snapshot (the snapshot's read is skipped). Replaces the former
         # require_access + get_permission_level + snapshot-get_conversation
-        # sequence, which made ~5-6 separate store round-trips.
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # sequence, which made ~5-6 separate store round-trips. A runner with
+        # a matching binding token reads its own session snapshot; a human
+        # resolves the display level + conversation in the same round trip.
+        access = await authorize_runner_or_user(
+            request,
+            session_id,
+            RunnerAction.READ_SESSION,
+            LEVEL_READ,
+            auth_provider,
+            permission_store,
+            conversation_store,
         )
+        user_id = access.user_id
         return await _get_session_snapshot(
             conversation_store,
             session_id,
@@ -1350,11 +1362,14 @@ def register_core_routes(
         body: AutomaticSessionRenameRequest,
     ) -> AutomaticSessionRenameResponse:
         """Replace the deterministic first-message title when still current."""
-        user_id = _get_user_id(request, auth_provider)
-        await _require_access(
-            user_id,
+        # Runner capability or human permission: a runner auto-titles its
+        # own session via the binding token; a human needs EDIT.
+        await authorize_runner_or_user(
+            request,
             session_id,
+            RunnerAction.RENAME_SESSION,
             LEVEL_EDIT,
+            auth_provider,
             permission_store,
             conversation_store,
         )
