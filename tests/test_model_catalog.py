@@ -772,6 +772,7 @@ def test_subscription_listing_is_static_and_unverified(
     # Exactly the curated claude tiers — these are aliases, not a live list.
     assert [m.id for m in listing.models] == [
         "claude-fable-5",
+        "claude-opus-5",
         "claude-opus-4-8",
         "claude-sonnet-5",
         "claude-sonnet-4-6",

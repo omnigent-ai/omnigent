@@ -83,6 +83,7 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
     "claude": (
         "claude-fable-5",
+        "claude-opus-5",
         "claude-opus-4-8",
         "claude-sonnet-5",
         "claude-sonnet-4-6",
