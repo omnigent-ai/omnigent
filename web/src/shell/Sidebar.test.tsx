@@ -321,15 +321,15 @@ describe("Sidebar session list", () => {
     expect(within(primaryNav).getByTestId("toggle-selection-mode")).toBeInTheDocument();
   });
 
-  it("renders the 'Scheduled' nav row directly under 'New session' and routes to /tasks", () => {
+  it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
 
     const scheduled = screen.getByTestId("scheduled-tasks-nav");
-    // Full-width nav ROW (a link), labeled just "Scheduled", pointing at /tasks —
+    // Full-width nav ROW (a link), labeled "Automations", pointing at /tasks —
     // not the old top-right icon button.
     expect(scheduled).toHaveAttribute("href", "/tasks");
-    expect(scheduled).toHaveTextContent("Scheduled");
+    expect(scheduled).toHaveTextContent("Automations");
     // The removed icon-button version must be gone.
     expect(screen.queryByTestId("scheduled-tasks-button")).toBeNull();
 
@@ -347,7 +347,7 @@ describe("Sidebar session list", () => {
     );
   });
 
-  it("marks the 'Scheduled' nav row active when on /tasks", () => {
+  it("marks the 'Automations' nav row active when on /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/tasks");
 

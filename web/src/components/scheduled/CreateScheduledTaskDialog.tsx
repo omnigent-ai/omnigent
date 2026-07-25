@@ -259,8 +259,8 @@ export function CreateScheduledTaskDialog({
           : err instanceof Error
             ? err.message
             : isEdit
-              ? "Couldn't update the scheduled task."
-              : "Couldn't create the scheduled task.",
+              ? "Couldn't update the automation."
+              : "Couldn't create the automation.",
       );
     }
   }
@@ -279,7 +279,7 @@ export function CreateScheduledTaskDialog({
         onInteractOutside={guardDialogDismiss}
       >
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
-          <DialogTitle>{isEdit ? "Edit scheduled task" : "New scheduled task"}</DialogTitle>
+          <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
           <DialogDescription>
             {isEdit
               ? "Update this recurring agent session. It fires on a connected host."

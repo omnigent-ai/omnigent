@@ -119,7 +119,7 @@ describe("TasksPage list", () => {
   it("renders the title, subtitle and task rows with schedule text", () => {
     setTasks([task()]);
     renderPage();
-    expect(screen.getByText("Scheduled tasks")).toBeInTheDocument();
+    expect(screen.getByText("Automations")).toBeInTheDocument();
     expect(screen.getByText(/Run agent sessions on a recurring schedule/i)).toBeInTheDocument();
     const row = screen.getByTestId("scheduled-task-row");
     expect(within(row).getByText("Nightly triage")).toBeInTheDocument();
@@ -162,7 +162,7 @@ describe("TasksPage list", () => {
     setTasks([]);
     renderPage();
     expect(screen.getByTestId("tasks-empty-state")).toBeInTheDocument();
-    expect(screen.getByText("No scheduled tasks yet")).toBeInTheDocument();
+    expect(screen.getByText("No automations yet")).toBeInTheDocument();
     expect(
       screen.getByText(
         "Create a task to run an agent session automatically on a recurring schedule.",
@@ -214,7 +214,7 @@ describe("TasksPage list", () => {
     expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
-    expect(screen.getByText("No scheduled tasks found")).toBeInTheDocument();
+    expect(screen.getByText("No automations found")).toBeInTheDocument();
     expect(screen.queryByText("No tasks match your filters")).toBeNull();
     expect(screen.queryByText("Try a different search or filter.")).toBeNull();
     expect(screen.getByTestId("tasks-filter-all")).toBeInTheDocument();
