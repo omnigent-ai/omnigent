@@ -113,7 +113,6 @@ def register_agent_routes(
             permission_store,
             conversation_store,
         )
-        user_id = access.user_id
         conv = access.conversation
         if conv is None:
             conv = conversation_store.get_conversation(session_id)
@@ -170,7 +169,6 @@ def register_agent_routes(
             permission_store,
             conversation_store,
         )
-        user_id = access.user_id
         conv = access.conversation
         if conv is None:
             conv = conversation_store.get_conversation(session_id)

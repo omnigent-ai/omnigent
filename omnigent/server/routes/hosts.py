@@ -37,8 +37,8 @@ from omnigent.host.frames import (
     HostLaunchRunnerFrame,
     HostListDirFrame,
     HostModelOptionsFrame,
-    HostStoreSecretFrame,
     HostShutdownFrame,
+    HostStoreSecretFrame,
     encode_host_frame,
 )
 from omnigent.onboarding.harness_install import (
@@ -131,6 +131,7 @@ async def _proxy_model_options(
             ) from exc
     finally:
         host_conn.pending_model_options.pop(request_id, None)
+
 
 # Host permission level → API string. Owner/admin resolve to "owner".
 _HOST_LEVEL_NAMES = {

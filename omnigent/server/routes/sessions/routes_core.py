@@ -396,6 +396,9 @@ def register_core_routes(
                     host_registry=host_registry,
                     conversation_store=conversation_store,
                     permission_store=permission_store,
+                    host_permission_store=getattr(
+                        request.app.state, "host_permission_store", None
+                    ),
                 )
                 conn = target.conn
                 binding_token = secrets.token_urlsafe(32)

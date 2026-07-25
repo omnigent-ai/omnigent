@@ -137,7 +137,6 @@ from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.mcp_pool import ServerMcpPool
 from omnigent.server.permissions import check_session_access
-from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -259,6 +258,7 @@ from omnigent.server.routes._sessions.orchestration import (
 from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status_impl as _publish_runner_recovered_status,
 )
+from omnigent.server.runner_capabilities import RunnerAction
 from omnigent.server.schemas import (
     AgentObject,
     AutomaticSessionRenameRequest,
