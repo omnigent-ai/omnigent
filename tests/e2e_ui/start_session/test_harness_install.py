@@ -240,6 +240,7 @@ async def _drive_install(base_url: str) -> None:
             # click it. Only then does the composer show the "Set up Codex"
             # notice for its unconfigured harness.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-harness-more").click()
             codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
             await expect(codex_option).to_be_visible(timeout=60_000)
             await codex_option.click()
