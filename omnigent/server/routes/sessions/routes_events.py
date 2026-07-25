@@ -52,10 +52,10 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
-    authorize_runner_or_user,
+    attribution_user as _attribution_user,
 )
 from omnigent.server.routes._auth_helpers import (
-    attribution_user as _attribution_user,
+    authorize_runner_or_user,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,

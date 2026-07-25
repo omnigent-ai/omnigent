@@ -441,7 +441,6 @@ def test_make_auth_token_factory_flag_unset_keeps_user_cred_first(
     assert factory() == "inherited-token"
 
 
-
 def test_make_auth_token_factory_none_without_creds_or_binding_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -35,10 +35,10 @@ from omnigent.server.auth import (
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import (
-    require_access as _require_access,
+    authorize_runner_or_user,
 )
 from omnigent.server.routes._auth_helpers import (
-    authorize_runner_or_user,
+    require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
@@ -381,7 +381,7 @@ def register_agent_routes(
         # Runner capability or human permission: a runner proxies its own
         # MCP tool calls via the binding token; a human needs EDIT. Server-side
         # TOOL_CALL / TOOL_RESULT policy still runs on every proxied call.
-        await authorize_runner_or_user(
+        _mcp_access = await authorize_runner_or_user(
             request,
             session_id,
             RunnerAction.PROXY_MCP,
@@ -390,6 +390,7 @@ def register_agent_routes(
             permission_store,
             conversation_store,
         )
+        user_id = _mcp_access.user_id
 
         # Parse JSON-RPC body. Return a parse-error response (not HTTP
         # 400) on failure — JSON-RPC errors travel in the body.

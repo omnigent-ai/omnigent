@@ -469,6 +469,9 @@ def register_hooks_routes(
 
         # Runner capability or human permission: a runner evaluates policy
         # hooks on its own session via the binding token; a human needs READ.
+        # Resolve user_id from the sessions module so test patches on
+        # ``sessions._get_user_id`` are honored.
+        _user_id = _sf._get_user_id(request, auth_provider)
         access = await authorize_runner_or_user(
             request,
             session_id,
@@ -477,8 +480,9 @@ def register_hooks_routes(
             auth_provider,
             permission_store,
             conversation_store,
+            user_id=_user_id,
         )
-        user_id = access.user_id
+        user_id = access.user_id if access.user_id is not None else _user_id
         is_read_only = access.level is not None and access.level < LEVEL_EDIT
         try:
             payload = await request.json()
