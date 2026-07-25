@@ -243,21 +243,19 @@ def _clear_binary_content(
     for i, msg in enumerate(messages):
         if i >= protect_from:
             break
-        content = msg.get("content")
-        if not isinstance(content, list):
+        if "content" not in msg:
             continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") in ("image", "file") and "data" in block:
-                block["data"] = _BINARY_CONTENT_CLEARED
-            for key, value in block.items():
-                if not isinstance(value, str):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
                     continue
-                block[key] = redact_inline_data_uris(
-                    value,
-                    lambda _media_type, _payload_length: _BINARY_CONTENT_CLEARED,
-                )
+                if block.get("type") in ("image", "file") and "data" in block:
+                    block["data"] = _BINARY_CONTENT_CLEARED
+        msg["content"] = redact_inline_data_uris(
+            content,
+            lambda _media_type, _payload_length: _BINARY_CONTENT_CLEARED,
+        )
     return messages
 
 

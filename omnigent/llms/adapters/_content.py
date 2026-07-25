@@ -13,7 +13,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-_INLINE_BASE64_DATA_URI = re.compile(r"data:([^;,\s]+);base64,([A-Za-z0-9+/=_-]+)")
+_INLINE_BASE64_DATA_URI = re.compile(
+    r"data:([^;,\s]*)(?:;[^;,\r\n]*)*;base64,[ \t]?([A-Za-z0-9+/=_-]+)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -66,7 +69,8 @@ def redact_inline_data_uris(
 
     Dict keys and all non-data-URI values are preserved. String values may
     contain surrounding text; only matching ``data:*;base64,...`` spans are
-    replaced.
+    replaced. Payload matching is intentionally single-line; embedded newlines
+    are not joined because doing so could consume adjacent prose.
 
     :param value: Arbitrarily nested dict/list/string content.
     :param marker: Builds replacement text from media type and payload length.

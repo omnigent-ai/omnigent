@@ -678,6 +678,13 @@ def test_resolve_content_type_uses_stored_type() -> None:
     assert _resolve_content_type("application/pdf", "report.pdf") == "application/pdf"
 
 
+def test_resolve_content_type_strips_mime_parameters() -> None:
+    """Stored MIME parameters are excluded from provider-facing data URIs."""
+    from omnigent.runtime.content_resolver import _resolve_content_type
+
+    assert _resolve_content_type("image/png;charset=binary", "photo.png") == "image/png"
+
+
 def test_resolve_content_type_ignores_octet_stream() -> None:
     """application/octet-stream is treated as unresolved — falls through to filename."""
     from omnigent.runtime.content_resolver import _resolve_content_type
