@@ -44,6 +44,7 @@ import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, shouldQueueSend } from "./ChatPage";
 import type { QueuedMessage } from "@/store/chatStore";
+import { sessionDrafts, setSessionTextDraft } from "@/lib/sessionDrafts";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -104,6 +105,26 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+describe("Composer revert notice", () => {
+  afterEach(() => {
+    cleanup();
+    sessionDrafts.delete("conv_notice");
+    window.sessionStorage.removeItem("omnigent.sessionDrafts");
+  });
+
+  it("shows the revert confirmation immediately above the chatbox", () => {
+    useChatStore.setState({ conversationId: "conv_notice" });
+    setSessionTextDraft("conv_notice", "retry this", "Conversation reverted.");
+
+    render(<Composer {...composerProps()} />);
+
+    const notice = screen.getByRole("status");
+    expect(notice).toHaveTextContent("Conversation reverted.");
+    expect(notice).toHaveClass("composer-notice", "w-fit", "rounded-full");
+    expect(notice.nextElementSibling).toContainElement(textarea());
+  });
+});
 
 describe("Composer Claude goal control", () => {
   afterEach(() => {

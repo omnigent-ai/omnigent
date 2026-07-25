@@ -7,6 +7,7 @@ import contextlib
 import json
 import secrets
 import time
+import urllib.parse
 from collections.abc import Callable
 from typing import Any
 
@@ -34,6 +35,8 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
+    ConversationItem,
+    MessageData,
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
@@ -114,6 +117,8 @@ from omnigent.server.schemas import (
     SessionListItem,
     SessionProjectSummary,
     SessionResponse,
+    SessionRevertRequest,
+    SessionRevertResponse,
     SessionSwitchAgentRequest,
     UpdateSessionRequest,
 )
@@ -132,6 +137,26 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+
+
+def _list_all_items_for_revert(
+    conversation_store: ConversationStore,
+    session_id: str,
+) -> list[ConversationItem]:
+    """Read a complete transcript through the store's cursor contract."""
+    items: list[ConversationItem] = []
+    after: str | None = None
+    while True:
+        page = conversation_store.list_items(
+            session_id,
+            limit=1000,
+            after=after,
+            order="asc",
+        )
+        items.extend(page.data)
+        if not page.has_more or not page.data:
+            return items
+        after = page.data[-1].id
 
 
 def register_core_routes(
@@ -2052,6 +2077,104 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
+
+    # ── POST /sessions/{source_id}/revert ────────────────────────
+
+    @router.post(
+        "/sessions/{source_id}/revert",
+        response_model=None,
+        responses={200: {"model": SessionRevertResponse}},
+    )
+    async def revert_session(
+        request: Request,
+        source_id: str,
+        body: SessionRevertRequest,
+    ) -> SessionRevertResponse:
+        """Rewind one session to immediately before a selected user message."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            source_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        source = access.conversation
+        if source is None:
+            source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        if source is None:
+            raise _session_not_found()
+        if source.kind == "sub_agent":
+            raise OmnigentError(
+                "Only top-level sessions can be reverted.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if _session_status_from_cache(source_id) in ("running", "waiting"):
+            raise OmnigentError(
+                "Wait for the current turn to finish before reverting.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        items = await asyncio.to_thread(
+            _list_all_items_for_revert,
+            conversation_store,
+            source_id,
+        )
+        target = next((item for item in items if item.id == body.user_message_id), None)
+        if target is None:
+            raise OmnigentError(
+                f"User message not found: {body.user_message_id!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if (
+            target.type != "message"
+            or not isinstance(target.data, MessageData)
+            or target.data.role != "user"
+            or target.data.is_meta
+            or (_message_text(target.data.content) or "").lstrip().startswith("[System:")
+        ):
+            raise OmnigentError(
+                "The revert point must be a user message.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if source.agent_id is None:
+            raise OmnigentError("Session has no agent binding.", code=ErrorCode.INVALID_INPUT)
+        agent = await asyncio.to_thread(agent_store.get, source.agent_id)
+        if agent is None:
+            raise OmnigentError("Session agent not found.", code=ErrorCode.NOT_FOUND)
+
+        target_is_cursor = await asyncio.to_thread(_agent_carries_cursor_fork_history, agent)
+        carry_history_into_native = target_is_cursor or await asyncio.to_thread(
+            _agent_carries_native_fork_history,
+            agent,
+        )
+        is_native = await asyncio.to_thread(_agent_is_native, agent)
+        runner_client = await _get_runner_client(source_id, runner_router) if is_native else None
+        if runner_client is not None:
+            try:
+                reset_response = await runner_client.post(
+                    f"/v1/sessions/{urllib.parse.quote(source_id, safe='')}/reset-state",
+                    timeout=15.0,
+                )
+                reset_response.raise_for_status()
+            except (httpx.HTTPError, ConnectionError) as exc:
+                raise OmnigentError(
+                    "The native session could not be reset. Please retry.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                ) from exc
+
+        draft = _message_text(target.data.content) or ""
+        try:
+            await asyncio.to_thread(
+                conversation_store.rewind_conversation,
+                source_id,
+                before_item_id=target.id,
+                carry_history_into_native=carry_history_into_native,
+            )
+        except LookupError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+
+        return SessionRevertResponse(draft=draft)
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────
 

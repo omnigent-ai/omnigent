@@ -609,7 +609,7 @@ export interface ChatState {
     opts?: SendOptions,
   ) => Promise<void>;
   stop: () => void;
-  switchTo: (conversationId: string | null) => Promise<void>;
+  switchTo: (conversationId: string | null, forceReload?: boolean) => Promise<void>;
   submitApproval: (
     elicitationId: string,
     action: "accept" | "decline" | "cancel",
@@ -1537,8 +1537,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  switchTo: async (conversationId) => {
-    if (get().conversationId === conversationId) return;
+  switchTo: async (conversationId, forceReload = false) => {
+    if (!forceReload && get().conversationId === conversationId) return;
 
     // Abort the prior session's stream. The reader loop in
     // bindStream's pump unwinds via AbortError and stops applying
@@ -1557,7 +1557,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // doesn't accrete stale keys; a restored bubble is reconciled
       // against the server snapshot in bindStream.
       const pendingByConversation = { ...s.pendingByConversation };
-      if (s.conversationId !== null) {
+      if (forceReload && conversationId !== null) {
+        delete pendingByConversation[conversationId];
+      } else if (s.conversationId !== null) {
         // Stash only THIS client's own UNSETTLED bubbles — client temp
         // ids (`pend_<n>`, set by send) whose POST hasn't returned.
         // Everything else is server-owned and re-seeded by the
@@ -1595,7 +1597,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // (``live:*``) never bleed across.
         blocks: [],
         pendingUserMessages:
-          conversationId !== null ? (pendingByConversation[conversationId]?.messages ?? []) : [],
+          conversationId !== null && !forceReload
+            ? (pendingByConversation[conversationId]?.messages ?? [])
+            : [],
         activeResponse: null,
         interruptedResponseIds: [],
         status: "idle",

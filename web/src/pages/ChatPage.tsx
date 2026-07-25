@@ -30,6 +30,7 @@ import {
   SettingsIcon,
   SquareIcon,
   TerminalIcon,
+  Undo2Icon,
   WifiOffIcon,
   XIcon,
 } from "lucide-react";
@@ -188,6 +189,7 @@ import { GoalControl, GoalStatusPill, useGoalState, type Goal } from "@/componen
 import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { saveDraftsToStorage, sessionDrafts, SESSION_TEXT_DRAFT_EVENT } from "@/lib/sessionDrafts";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -521,47 +523,6 @@ function truncateTitle(raw: string, max = 60): string {
   const cut = lastSpace > max - 10 ? lastSpace : slice.length;
   return slice.slice(0, cut).join("").trimEnd() + "…";
 }
-
-// Per-session draft storage — module-level so it survives the Composer
-// unmount/remount that happens during the loading gate between session
-// switches (ChatPage returns <HydratingPlaceholder /> while
-// loadingConversation is true, which unmounts the entire chat surface).
-// Text drafts are also persisted to sessionStorage so they survive page
-// refreshes; File objects can't be serialized, so only text round-trips.
-const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
-
-function loadDraftsFromStorage(): Map<string, { text: string; files: File[] }> {
-  try {
-    const raw = window.sessionStorage.getItem(SESSION_DRAFTS_KEY);
-    if (!raw) return new Map();
-    const entries = JSON.parse(raw) as Record<string, string>;
-    const map = new Map<string, { text: string; files: File[] }>();
-    for (const [id, text] of Object.entries(entries)) {
-      if (text) map.set(id, { text, files: [] });
-    }
-    return map;
-  } catch {
-    return new Map();
-  }
-}
-
-function saveDraftsToStorage(drafts: Map<string, { text: string; files: File[] }>): void {
-  try {
-    const obj: Record<string, string> = {};
-    for (const [id, draft] of drafts) {
-      if (draft.text) obj[id] = draft.text;
-    }
-    if (Object.keys(obj).length === 0) {
-      window.sessionStorage.removeItem(SESSION_DRAFTS_KEY);
-    } else {
-      window.sessionStorage.setItem(SESSION_DRAFTS_KEY, JSON.stringify(obj));
-    }
-  } catch {
-    // Storage full or unavailable — drafts still work in-memory.
-  }
-}
-
-const sessionDrafts = loadDraftsFromStorage();
 
 /**
  * Single component that drives the chat surface. Streaming + history
@@ -3090,6 +3051,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const sessionId = useChatStore((s) => s.conversationId);
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
+  const forkDialog = useForkDialog();
   // Plain-text path is the common case.
   // - input_image: render inline <img> when the file is uploaded (file_id
   //   doesn't start with "pending:"); show a chip while the upload is
@@ -3242,11 +3204,24 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
         </MessageContent>
       </div>
-      {text && (
+      {(text || forkDialog?.canRevert) && (
         <MessageActions className="mt-1 ml-auto opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
-          <MessageAction tooltip="Copy" onClick={handleCopy}>
-            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-          </MessageAction>
+          {text && (
+            <MessageAction tooltip="Copy" onClick={handleCopy}>
+              {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+            </MessageAction>
+          )}
+          {forkDialog?.canRevert &&
+            !bubble.itemId.startsWith("pend_") &&
+            !bubble.itemId.startsWith("pending_") && (
+              <MessageAction
+                tooltip="Revert to here"
+                data-testid="revert-from-message"
+                onClick={() => forkDialog.openRevertDialog({ userMessageId: bubble.itemId })}
+              >
+                <Undo2Icon size={14} />
+              </MessageAction>
+            )}
         </MessageActions>
       )}
     </Message>
@@ -3858,6 +3833,8 @@ export function Composer({
   subAgentLabel = null,
 }: ComposerProps) {
   const [value, setValue] = useState("");
+  const forkDialog = useForkDialog();
+  const [composerNotice, setComposerNotice] = useState<string | null>(null);
   const dictation = useDictationInsert(setValue);
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
@@ -4011,6 +3988,8 @@ export function Composer({
     const restored = conversationId ? sessionDrafts.get(conversationId) : undefined;
     setValue(restored?.text ?? "");
     setFiles(restored?.files ?? []);
+    setComposerNotice(restored?.notice ?? null);
+    if (restored) delete restored.notice;
     dirtyRef.current = false;
     if (!isMobileRef.current) textareaRef.current?.focus();
 
@@ -4170,6 +4149,31 @@ export function Composer({
     isMobile,
   });
 
+  useEffect(() => {
+    const applyDraft = (event: Event): void => {
+      const detail = (event as CustomEvent<{ sessionId: string; text: string; notice?: string }>)
+        .detail;
+      if (detail.sessionId !== conversationId) return;
+      const draft = sessionDrafts.get(detail.sessionId);
+      if (draft) delete draft.notice;
+      setValue(detail.text);
+      setFiles([]);
+      setMentionedItems([]);
+      setMention(null);
+      setComposerNotice(detail.notice ?? null);
+      dirtyRef.current = false;
+      if (!isMobileRef.current) textareaRef.current?.focus();
+    };
+    window.addEventListener(SESSION_TEXT_DRAFT_EVENT, applyDraft);
+    return () => window.removeEventListener(SESSION_TEXT_DRAFT_EVENT, applyDraft);
+  }, [conversationId, setMentionedItems]);
+
+  useEffect(() => {
+    if (!composerNotice) return;
+    const timeout = window.setTimeout(() => setComposerNotice(null), 4000);
+    return () => window.clearTimeout(timeout);
+  }, [composerNotice]);
+
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = value.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
   const showInterruptButton = isWorking && !hasDraft;
@@ -4274,6 +4278,17 @@ export function Composer({
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Failed to set model");
           });
+        return true;
+      }
+      case "/revert": {
+        if (!forkDialog?.canRevert) {
+          setCommandError("/revert is unavailable for this session");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        forkDialog.openRevertDialog({ userMessageId: arg || undefined });
         return true;
       }
       case "/context": {
@@ -4675,6 +4690,14 @@ export function Composer({
           Truthy (not just non-null) so an empty label never peeks a
           nameless tray. */}
       {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
+      {composerNotice && (
+        <div
+          role="status"
+          className="composer-notice mx-auto mb-2 w-fit max-w-full rounded-full border bg-popover px-4 py-2 text-center text-sm text-popover-foreground shadow-lg"
+        >
+          {composerNotice}
+        </div>
+      )}
       {/* Single rounded container — textarea on top, action row beneath.
           No top border on the surrounding form; the box itself is the
           visual container. The static neutral border carries through

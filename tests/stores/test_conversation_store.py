@@ -3435,8 +3435,10 @@ def test_fork_conversation_drops_instance_scoped_labels(
     conversation_store.set_labels(
         source.id,
         {
+            "omnigent.antigravity_native.bridge_id": source.id,
             "omnigent.claude_native.bridge_id": source.id,
             "omnigent.codex_native.bridge_id": source.id,
+            "omnigent.opencode_native.bridge_id": source.id,
             "omnigent.last_context_tokens": "39903",
             "omnigent.last_context_window": "1000000",
             # The dangerous bypass opt-in must NOT ride into the fork.
@@ -3589,6 +3591,54 @@ def test_fork_conversation_up_to_response_truncates_items(
     )
     # The source keeps its full 6-item history — fork must never mutate it.
     assert len(conversation_store.list_items(source.id).data) == 6
+
+
+def test_rewind_conversation_removes_selected_prompt_and_later_history(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Rewind mutates one session, resets runtime state, and keeps FTS valid."""
+    from omnigent.stores.conversation_store import (
+        CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        FORK_CARRY_HISTORY_LABEL_KEY,
+    )
+
+    source = conversation_store.create_conversation(title="Keep this title")
+    conversation_store.set_external_session_id(source.id, "native-session-old")
+    conversation_store.set_labels(
+        source.id,
+        {
+            "omnigent.claude_native.bridge_id": "bridge-old",
+            "omnigent.opencode_native.bridge_id": "opencode-old",
+            CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1",
+        },
+    )
+    _append_three_responses(conversation_store, source.id)
+    source_items = conversation_store.list_items(source.id).data
+
+    rewound = conversation_store.rewind_conversation(
+        source.id,
+        before_item_id=source_items[2].id,
+        carry_history_into_native=True,
+    )
+
+    rewound_items = conversation_store.list_items(source.id).data
+    texts = [
+        block["text"]
+        for item in rewound_items
+        for block in item.data.content  # type: ignore[union-attr]
+    ]
+    assert rewound.id == source.id
+    assert rewound.title == "Keep this title"
+    assert rewound.external_session_id is None
+    assert rewound.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
+    assert "omnigent.claude_native.bridge_id" not in rewound.labels
+    assert "omnigent.opencode_native.bridge_id" not in rewound.labels
+    assert rewound.labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] == "1"
+    assert texts == ["Q1", "A1"]
+    assert conversation_store.search("Q2", conversation_id=source.id) == []
+    assert [item.id for item in conversation_store.search("Q1", conversation_id=source.id)] == [
+        rewound_items[0].id
+    ]
 
 
 def test_fork_conversation_truncated_drops_external_session_directive(
@@ -3815,14 +3865,18 @@ def test_instance_scoped_label_keys_match_harness_constants() -> None:
     forks would re-inherit the source's bridge. Importing the real
     constants here makes that rename fail loudly at test time.
     """
+    from omnigent.antigravity_native_bridge import ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY
     from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY
     from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.opencode_native_bridge import OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY
     from omnigent.stores.conversation_store import _INSTANCE_SCOPED_LABEL_KEYS
 
     # Each harness's canonical bridge-id key must be in the denylist; a
     # miss means a rename slipped past the store's hard-coded literal.
+    assert ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert CODEX_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+    assert OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(

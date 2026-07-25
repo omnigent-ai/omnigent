@@ -20,6 +20,7 @@ import {
   listRunners,
   openSessionStream,
   postEvent,
+  revertSession,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
@@ -307,6 +308,19 @@ describe("forkSession", () => {
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
+  });
+});
+
+describe("revertSession", () => {
+  it("POSTs the selected user message and parses the draft", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ draft: "retry this" }));
+
+    const result = await revertSession("conv source", "msg_1");
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv%20source/revert");
+    expect(JSON.parse(init.body as string)).toEqual({ user_message_id: "msg_1" });
+    expect(result).toEqual({ draft: "retry this" });
   });
 });
 

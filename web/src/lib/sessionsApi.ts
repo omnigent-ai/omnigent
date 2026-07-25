@@ -533,6 +533,19 @@ export async function forkSession(
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+/** Rewind a session to immediately before a selected user message. */
+export async function revertSession(
+  sourceId: string,
+  userMessageId: string,
+): Promise<{ draft: string }> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/revert`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    body: JSON.stringify({ user_message_id: userMessageId }),
+  });
+  return readJsonOrThrow<{ draft: string }>(res);
+}
+
 /**
  * Switch an existing session in place to a different agent/harness:
  * ``POST /v1/sessions/{id}/switch-agent``.

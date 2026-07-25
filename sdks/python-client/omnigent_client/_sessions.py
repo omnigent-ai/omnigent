@@ -929,6 +929,22 @@ class SessionsNamespace:
             f"POST /v1/sessions/{source_session_id}/fork",
         )
 
+    async def revert(
+        self,
+        source_session_id: str,
+        user_message_id: str,
+    ) -> dict[str, Any]:
+        """Rewind a session and return the selected prompt as a draft."""
+        resp = await self._http.post(
+            f"{self._base}/v1/sessions/{source_session_id}/revert",
+            json={"user_message_id": user_message_id},
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return require_json_object(
+            resp,
+            f"POST /v1/sessions/{source_session_id}/revert",
+        )
+
     async def compact(self, session_id: str) -> None:
         """
         Request explicit context compaction for a session.

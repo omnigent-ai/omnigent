@@ -87,6 +87,7 @@ import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { CommandPalette } from "./CommandPalette";
 import { Toaster } from "@/components/ui/toast";
 import { ForkSessionDialog } from "./ForkSessionDialog";
+import { RevertSessionDialog } from "./RevertSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -255,6 +256,8 @@ export function AppShell() {
   );
   const [shareOpen, setShareOpen] = useState(false);
   const [forkOpen, setForkOpen] = useState(false);
+  const [revertOpen, setRevertOpen] = useState(false);
+  const [revertUserMessageId, setRevertUserMessageId] = useState<string | null>(null);
   // Truncation point for a "fork from here" opened from a message's
   // actions (ChatPage, via ForkDialogContext). `null` = full clone —
   // the mobile menu Clone entry's behavior. Cleared whenever the dialog
@@ -404,6 +407,8 @@ export function AppShell() {
   // the per-message "Fork from here" action is the only fork entry point.
   const canClone =
     !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 1);
+  const canRevert =
+    !!conversationId && isKnownTopLevel && (permissionLevel === null || permissionLevel >= 2);
   // Agent tools/policies exist to show.
   const hasAgentInfo = !!conversationId && agentHasInfo(boundAgent, conversationId);
   // Whether the mobile three-dot menu has any entry to offer.
@@ -1216,8 +1221,13 @@ export function AppShell() {
         setForkUpToResponseId(opts?.upToResponseId ?? null);
         setForkOpen(true);
       },
+      canRevert,
+      openRevertDialog: (opts?: { userMessageId?: string }) => {
+        setRevertUserMessageId(opts?.userMessageId ?? null);
+        setRevertOpen(true);
+      },
     }),
-    [canClone],
+    [canClone, canRevert],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -1480,6 +1490,18 @@ export function AppShell() {
               sessionId={conversationId}
               open={shareOpen}
               onOpenChange={setShareOpen}
+            />
+          )}
+          {conversationId && (
+            <RevertSessionDialog
+              key={`revert-session-dialog-${conversationId}`}
+              sourceSessionId={conversationId}
+              initialUserMessageId={revertUserMessageId}
+              open={revertOpen}
+              onOpenChange={(open) => {
+                setRevertOpen(open);
+                if (!open) setRevertUserMessageId(null);
+              }}
             />
           )}
           {conversationId && (

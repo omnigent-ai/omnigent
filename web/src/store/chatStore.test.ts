@@ -450,6 +450,32 @@ describe("chatStore — switchTo", () => {
     expect(state.conversationLoadError).toBeNull();
   });
 
+  it("reloads a rewound history without changing the active session id", async () => {
+    const original = [
+      userMessage("resp_1", "keep"),
+      assistantMessage("resp_1", "kept response"),
+      userMessage("resp_2", "discard"),
+    ];
+    seedSession("conv_rewind", original);
+    await useChatStore.getState().switchTo("conv_rewind");
+    useChatStore.setState({
+      pendingUserMessages: [
+        { tempId: "pend_stale", content: [{ type: "input_text", text: "discard" }] },
+      ],
+    });
+
+    seedSession("conv_rewind", original.slice(0, 2));
+    await useChatStore.getState().switchTo("conv_rewind", true);
+
+    const state = useChatStore.getState();
+    expect(state.conversationId).toBe("conv_rewind");
+    expect(state.blocks.map((block) => block.ctx.itemId)).toEqual(
+      original.slice(0, 2).map((item) => item.id),
+    );
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.pendingByConversation.conv_rewind).toBeUndefined();
+  });
+
   it("hydrates pendingUserMessages from the snapshot's pending_inputs (native rebind)", async () => {
     // The core fix: a native web message that hasn't round-tripped
     // through the transcript yet is replayed by the server in
