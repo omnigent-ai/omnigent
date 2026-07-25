@@ -18,7 +18,9 @@ Default view inside the sandbox:
   ``/etc/ld.so.cache``, ``/etc/ld.so.conf``,
   ``/etc/ld.so.conf.d``, ``/etc/ssl``, ``/etc/ca-certificates``,
   ``/etc/pki``) bound read-only via ``--ro-bind-try``.
-- Fresh ``/proc``, ``/dev``, and ``/tmp``.
+- Fresh ``/proc`` (bind-mounted from the host on outer sandboxes that
+  forbid a fresh procfs mount, e.g. Lakebox — see
+  :func:`_should_bind_host_proc`), ``/dev``, and ``/tmp``.
 - Cwd bind-mounted read-only by default; explicit
   ``write_paths: ["."]`` flips it to read-write. Top-level
   dotfiles / dotdirs in cwd are tmpfs-masked unless their name is
@@ -176,6 +178,86 @@ _ALLOWED_SOCKET_FAMILIES = (
     2,  # AF_INET  — IPv4
     10,  # AF_INET6 — IPv6
 )
+
+
+# ---------------------------------------------------------------------------
+# Nested-sandbox /proc handling
+# ---------------------------------------------------------------------------
+
+# Outer sandbox backends whose microVM/container permits binding the
+# existing ``/proc`` but forbids mounting a FRESH procfs under
+# ``--unshare-pid`` (masked ``/proc`` overmounts make ``mount proc``
+# return EPERM). On these backends the bwrap wrap binds the host
+# ``/proc`` instead of emitting ``--proc /proc``.
+#
+# Why an explicit allow-list rather than a "fresh-proc mount failed, retry
+# with a bind" fallback: binding the existing ``/proc`` is a security
+# DOWNGRADE. It exposes the outer process list plus the world-readable
+# per-process files (``cmdline`` / ``comm`` / ``stat`` / ``status``) to the
+# sandboxed helper. It does NOT expose the ptrace-gated files (``environ``
+# / ``mem`` / ``maps`` / ``fd``): the retained user namespace keeps those
+# blocked even for same-uid targets and even as namespaced root, and
+# ``--unshare-pid`` still contains signalling. That leak is acceptable on a
+# single-tenant dev microVM (Lakebox) but not on an arbitrary host, so the
+# downgrade is only taken for vetted backends. Add entries here as more
+# backends are verified safe.
+_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox"})
+
+# Env var an outer launcher may set to name the host's outer sandbox
+# backend (e.g. ``lakebox``). Authoritative when present; otherwise the
+# backend is autodetected (see ``_detect_host_sandbox_backend``). Note it
+# must survive ``SandboxPolicy.spawn_env_allowlist`` pruning to be visible
+# on the re-exec launcher path — the marker autodetect below is the
+# prune-proof fallback that lakebox relies on today.
+_HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
+
+# Marker directory the Databricks Lakebox runtime seeds inside every
+# microVM. Used to autodetect lakebox when the launcher hasn't declared the
+# backend via ``_HOST_SANDBOX_BACKEND_ENV``.
+_LAKEBOX_MARKER = Path("/run/lakebox")
+
+
+def _detect_host_sandbox_backend() -> str | None:
+    """
+    Identify the outer sandbox backend this host process runs under.
+
+    Prefers the explicit ``OMNIGENT_HOST_SANDBOX_BACKEND`` env var (set by
+    the launcher that provisioned this host); otherwise falls back to
+    lakebox autodetection via the :data:`_LAKEBOX_MARKER` directory. Runs
+    in the host/parent process — never inside the agent's sandbox — so the
+    signals it reads cannot be forged from within the sandbox.
+
+    :returns: Lower-cased backend name (e.g. ``"lakebox"``), or ``None``
+        when the host is not running under a recognised outer sandbox.
+    """
+    declared = os.environ.get(_HOST_SANDBOX_BACKEND_ENV)
+    if declared and declared.strip():
+        return declared.strip().lower()
+    try:
+        if _LAKEBOX_MARKER.is_dir():
+            return "lakebox"
+    except OSError:
+        # A stat() failure on the marker (permissions, a racing unmount)
+        # is not fatal: fall through to "no recognised backend" and keep
+        # the fresh-proc default rather than the proc-bind downgrade.
+        _LOGGER.debug("lakebox marker probe failed for %s", _LAKEBOX_MARKER, exc_info=True)
+    return None
+
+
+def _should_bind_host_proc() -> bool:
+    """
+    Whether the bwrap wrap should bind the existing ``/proc`` instead of
+    mounting a fresh procfs.
+
+    ``True`` only when the host runs under an outer sandbox backend in
+    :data:`_PROC_BIND_HOST_BACKENDS` (lakebox today). On every other host
+    the fresh-proc mount is kept, so ordinary hosts — and their fail-closed
+    behaviour when a fresh procfs mount is denied — are unchanged.
+
+    :returns: ``True`` to emit ``--bind /proc /proc``; ``False`` to emit
+        ``--proc /proc``.
+    """
+    return _detect_host_sandbox_backend() in _PROC_BIND_HOST_BACKENDS
 
 
 # ---------------------------------------------------------------------------
@@ -347,9 +429,18 @@ class BwrapSandboxBackend(SandboxBackend):
         # /proc, /dev (filtered by bwrap to a safe minimal device set),
         # and a private /tmp so the agent's writes there don't pollute
         # the host.
+        #
+        # ``--proc`` mounts a FRESH procfs tied to the new PID namespace so
+        # the helper sees only its own processes. Some nested outer
+        # sandboxes (Lakebox) forbid that mount under ``--unshare-pid``
+        # (masked ``/proc`` overmounts -> ``mount proc: EPERM``), so there
+        # we bind the host ``/proc`` instead. See ``_should_bind_host_proc``
+        # for the gate and the security trade-off.
+        if _should_bind_host_proc():
+            bwrap_args += ["--bind", "/proc", "/proc"]
+        else:
+            bwrap_args += ["--proc", "/proc"]
         bwrap_args += [
-            "--proc",
-            "/proc",
             "--dev",
             "/dev",
             "--tmpfs",
