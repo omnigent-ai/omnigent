@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import httpx
 from playwright.sync_api import Page, expect
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
@@ -81,6 +82,50 @@ def _create_task(
 def _row_by_name(page: Page, name: str):
     """The scheduled-task row whose title matches ``name``."""
     return page.locator('[data-testid="scheduled-task-row"]').filter(has_text=name)
+
+
+def _pick_minute(page: Page, minute: int) -> None:
+    """Open the time picker and click a minute cell, tolerating a flickered open.
+
+    The picker is a Radix popover nested inside the create-task dialog; under
+    load the dialog's focus management can fire a focus/interaction-outside that
+    closes it the moment it mounts, so the minute cells unmount between a
+    visibility check and the click. Re-open from a known-closed state and retry
+    until the cell is present, then click it.
+
+    Selecting a minute does not close the popover, and an open floating-ui
+    popover keeps recomputing its position — leaving the dialog's submit button
+    perpetually "not stable" for Playwright. So dismiss the picker (by clicking a
+    field inside the dialog, an interaction-outside — Escape would bubble to the
+    Radix Dialog and close it) and wait for it to unmount, letting the layout
+    settle before the caller submits.
+
+    :param page: Playwright page with the create/edit task dialog open.
+    :param minute: Minute of the hour to select (0-59).
+    """
+    trigger = page.get_by_test_id("schedule-time-picker-trigger")
+    cell = page.get_by_test_id(f"schedule-minute-{minute:02d}")
+    picker = page.get_by_test_id("schedule-time-picker")
+    name_input = page.get_by_test_id("task-name-input")
+    for _ in range(5):
+        # force=True skips the actionability "stable" wait: the trigger is a
+        # tiny translate-positioned button, so a busy render loop can leave it
+        # never-quite-stable even though the toggle is a no-arg click.
+        trigger.click(force=True)
+        try:
+            expect(cell).to_be_visible(timeout=3_000)
+            cell.click(force=True)
+            break
+        except (AssertionError, PlaywrightTimeoutError):
+            # The popover flickered shut before the click landed; dismiss any
+            # partial-open state (click-outside, not Escape) and try again.
+            name_input.click()
+    else:
+        expect(cell).to_be_visible(timeout=3_000)
+        cell.click(force=True)
+    # Dismiss the picker so its floating position stops churning the layout.
+    name_input.click()
+    expect(picker).to_be_hidden(timeout=5_000)
 
 
 def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
@@ -171,14 +216,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     assert time_input.input_value() == "9:37"
     page.get_by_test_id("task-name-input").click()
     expect(time_input).to_have_value("09:37 AM")
-    page.get_by_test_id("schedule-time-picker-trigger").click()
-    minute_column = page.get_by_test_id("schedule-minute-column")
-    expect(minute_column.locator('[data-testid^="schedule-minute-"]')).to_have_count(
-        60,
-        timeout=30_000,
-    )
-    expect(page.get_by_test_id("schedule-minute-37")).to_be_visible()
-    page.get_by_test_id("schedule-minute-37").click(force=True)
+    _pick_minute(page, 37)
     expect(time_input).to_have_value("09:37 AM")
     page.get_by_test_id("create-scheduled-task-submit").click()
 

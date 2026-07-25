@@ -135,9 +135,15 @@ def _open_popover(page: Page) -> None:
     follows. Pressing Escape first guarantees we re-open from a closed state
     rather than toggling an already-open popover shut.
 
-    After opening, park the pointer on the panel and let the open animation
-    settle. The trigger opens on hover and schedules a ``HOVER_CLOSE_DELAY_MS``
-    (150ms) close the moment the pointer leaves it (see ``AgentInfoButton`` in
+    The trigger hover-opens on the click's own pointer arrival, then the
+    click's Radix toggle can flip it back shut if it lands past the button's
+    hover-click grace window (see ``AgentInfo.tsx`` ``HOVER_CLICK_GRACE_MS``)
+    — a swallowed open under load. Retry the click until the panel mounts so
+    the race doesn't surface as a bare visibility timeout.
+
+    Once open, park the pointer on the panel and let the open animation settle.
+    The trigger schedules a ``HOVER_CLOSE_DELAY_MS`` (150ms) close the moment
+    the pointer leaves it (see ``AgentInfoButton`` in
     ``web/src/components/AgentInfo.tsx``). A follow-up ``.click()`` on an
     in-panel control (e.g. "Manage MCP servers") first waits for that control to
     be *stable*, but the panel is still mid ``duration-150`` zoom/slide, so the
@@ -152,9 +158,18 @@ def _open_popover(page: Page) -> None:
     page.keyboard.press("Escape")
     trigger = page.locator(_AGENT_INFO_TRIGGER)
     expect(trigger).to_be_visible(timeout=30_000)
-    trigger.click()
     panel = page.locator(_AGENT_INFO_PANEL)
-    expect(panel).to_be_visible(timeout=15_000)
+    for _ in range(5):
+        trigger.click()
+        try:
+            expect(panel).to_be_visible(timeout=3_000)
+            break
+        except AssertionError:
+            # The hover-open was toggled shut by the same click; re-arm from a
+            # closed state and try again.
+            page.keyboard.press("Escape")
+    else:
+        expect(panel).to_be_visible(timeout=3_000)
     # "Policies" section label proves the popover content mounted.
     expect(page.get_by_text("Policies", exact=True)).to_be_visible(timeout=15_000)
     # Land the pointer on the panel so leaving the trigger can't schedule a
