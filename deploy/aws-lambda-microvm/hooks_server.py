@@ -128,21 +128,20 @@ def _start_host_from_payload(raw_body: bytes) -> None:
         _host_started = True
     env = {k: str(v) for k, v in payload.items()}
     child_env = {**os.environ, **env}
-    # Detached so the /run ack returns fast; the host holds its own tunnel. Child
-    # output goes to a log file so a start failure is diagnosable (not DEVNULL).
+    # Detached so the /run ack returns fast; the host holds its own tunnel. The
+    # child's output is teed to BOTH the container stdout and the log file: a
+    # file inside the guest dies with the VM and is unreachable without an
+    # ingress connector, so a host that boots but never dials back would leave
+    # no trace. Container stdout reaches CloudWatch via the execution role.
     try:
-        # Outlives this try block (used by the Popen call and closed in the
-        # finally below), so a context manager doesn't fit here.
-        log_fh = open(_HOST_LOG_PATH, "ab")  # noqa: SIM115
-    except OSError:
-        log_fh = subprocess.DEVNULL
-    try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             ["/opt/omnigent/start_host.sh"],
             env=child_env,
-            stdout=log_fh,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            bufsize=1,
+            text=True,
         )
     except OSError as exc:
         # The spawn itself failed (missing/non-executable start_host.sh, fork
@@ -151,13 +150,27 @@ def _start_host_from_payload(raw_body: bytes) -> None:
         with _host_start_lock:
             _host_started = False
         print(f"hooks: failed to spawn start_host.sh: {exc}", file=sys.stderr)
-    finally:
-        # The child inherits its own copy of the fd on a successful spawn; the
-        # parent's handle is only needed to hand off stdout, so close it here
-        # either way (spawn success or failure) to avoid leaking it for the
-        # life of the MicroVM.
-        if log_fh is not subprocess.DEVNULL:
-            log_fh.close()
+        return
+
+    def _tee() -> None:
+        """Pump the host's output to container stdout (→ CloudWatch) and the file."""
+        try:
+            log_fh = open(_HOST_LOG_PATH, "a")  # noqa: SIM115
+        except OSError:
+            log_fh = None
+        try:
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
+                print(f"host: {line}", end="", flush=True)
+                if log_fh is not None:
+                    log_fh.write(line)
+                    log_fh.flush()
+        finally:
+            if log_fh is not None:
+                log_fh.close()
+
+    threading.Thread(target=_tee, daemon=True).start()
 
 
 class _HookHandler(BaseHTTPRequestHandler):

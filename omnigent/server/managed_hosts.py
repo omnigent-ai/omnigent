@@ -137,6 +137,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import os
 import posixpath
 import re
 import secrets
@@ -191,11 +192,34 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
     }
 )
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    """
+    Read a positive int from the environment, falling back on default.
+
+    :param name: Environment variable to read, e.g. ``"OMNIGENT_X_S"``.
+    :param default: Value used when unset, unparseable, or non-positive.
+    :returns: The resolved positive int.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 # How long a managed launch waits for the sandboxed host to register
 # before declaring failure. The image is pre-baked (no pip install at
 # boot), so a healthy launch registers in seconds; the budget covers a
 # cold registry pull of the image on first use.
-MANAGED_HOST_ONLINE_TIMEOUT_S = 120
+#
+# Tunable: an account pulling a ~1 GB host image for the first time can
+# exceed the default before the host process even starts, which surfaces
+# as a launch failure rather than a slow launch.
+MANAGED_HOST_ONLINE_TIMEOUT_S = _env_positive_int("OMNIGENT_MANAGED_HOST_ONLINE_TIMEOUT_S", 120)
 _ONLINE_POLL_INTERVAL_S = 1.0
 
 # Launch-token lifetime for the YAML modal path: Modal's 24h sandbox

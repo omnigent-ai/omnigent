@@ -45,12 +45,15 @@ Lambda MicroVMs uses two roles (see the AWS docs for exact trust policies):
 
 - **Build role** (`buildRoleArn`) — assumed while `create-microvm-image` builds
   the image. Needs `s3:GetObject` on your artifact bucket and CloudWatch Logs
-  write. Trusts `lambda.amazonaws.com` with an `aws:SourceAccount` condition
-  (confused-deputy prevention).
+  write. Trusts `lambda.amazonaws.com` for both `sts:AssumeRole` **and**
+  `sts:TagSession` (the build fails without `sts:TagSession`); an
+  `aws:SourceAccount` condition adds confused-deputy prevention.
 - **Execution role** (`executionRoleArn`) — assumed by the running microVM.
-  Needs CloudWatch Logs write. Add `bedrock:InvokeModel` here if you want
-  runners to reach Bedrock through the role instead of a long-lived key in the
-  microVM environment (see "Credentials" below).
+  Needs CloudWatch Logs write — without it the guest's stdout/stderr never
+  reach CloudWatch, so a host that fails to dial back leaves no trace. Add
+  `bedrock:InvokeModel` here if you want runners to reach Bedrock through the
+  role instead of a long-lived key in the microVM environment (see
+  "Credentials" below).
 
 ## Build the MicroVM image
 
@@ -71,11 +74,15 @@ zip -j omnigent-host-microvm.zip \
 aws s3 cp omnigent-host-microvm.zip s3://my-omnigent-artifacts/omnigent-host-microvm.zip
 
 # 2. Build the MicroVM image.
+# --hooks is REQUIRED: hooks are opt-in per image, and without it Lambda never
+# waits on /ready nor delivers the /run payload, so no host ever starts. The
+# port must match the shim's (9000).
 aws lambda-microvms create-microvm-image \
   --name omnigent-host \
   --base-image-arn arn:aws:lambda:<region>:aws:microvm-image:al2023-1 \
   --build-role-arn arn:aws:iam::<acct>:role/omnigent-microvm-build \
-  --code-artifact '{"uri":"s3://my-omnigent-artifacts/omnigent-host-microvm.zip"}'
+  --code-artifact '{"uri":"s3://my-omnigent-artifacts/omnigent-host-microvm.zip"}' \
+  --hooks '{"port":9000,"microvmHooks":{"run":"ENABLED"},"microvmImageHooks":{"ready":"ENABLED"}}'
 ```
 
 The launcher's `image_identifier` names the resulting image (`omnigent-host` or
@@ -119,11 +126,18 @@ model key enters the sandbox.
   is derived above that cap (override the requested lifetime with
   `OMNIGENT_LAMBDA_MICROVM_MAX_LIFETIME_S`).
 - **Idle suspend/resume.** The launcher sets an idle policy
-  (`maxIdleDurationSeconds` 900, `autoResumeEnabled` true), so an idle microVM
-  suspends to a snapshot and auto-resumes on the next request. Idle is measured
-  by **inbound** traffic to the microVM's proxy endpoint; because the Omnigent
-  host holds an **outbound** tunnel, a between-turns session suspends and the
-  managed wake path resumes it when the next message arrives.
+  (`maxIdleDurationSeconds` 900, `suspendedDurationSeconds` matched to the 8 h
+  lifetime, `autoResumeEnabled` true), so an idle microVM suspends to a snapshot
+  and the managed wake path resumes it when the next message arrives. Idle is
+  measured **only** by inbound traffic to the microVM's proxy endpoint, and this
+  host receives none (it holds an **outbound** tunnel), so:
+  - `autoResumeEnabled` never fires on its own — every wake comes from the
+    server's explicit `resume-microvm`. It stays on as a harmless backstop.
+  - A single turn running longer than `maxIdleDurationSeconds` can be
+    snapshot-frozen mid-work. Raise the idle window for long-running agents.
+  - `suspendedDurationSeconds` is when Lambda **terminates** a suspended VM, so
+    it matches the lifetime cap. A shorter value silently kills sessions idle
+    past it and the next wake fails with `ResourceNotFoundException`.
 - **Snapshot uniqueness.** A resumed microVM restores memory state, so reseed
   CSPRNGs and rotate any in-memory secrets on resume (the host does this on
   restart). See the AWS "snapshots and uniqueness" docs.

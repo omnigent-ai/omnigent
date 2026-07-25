@@ -91,6 +91,19 @@ def test_build_idle_policy_enables_auto_resume() -> None:
     assert policy["suspendedDurationSeconds"] > 0
 
 
+def test_build_idle_policy_suspends_for_the_full_lifetime() -> None:
+    """
+    A suspended VM survives to the lifetime cap, not less.
+
+    ``suspendedDurationSeconds`` is when Lambda TERMINATES a suspended VM, so
+    anything below the lifetime silently kills sessions idle longer than it and
+    the next wake fails with ResourceNotFoundException.
+    """
+    policy = build_idle_policy()
+    assert policy["suspendedDurationSeconds"] == resolve_max_lifetime_s()
+    assert policy["maxIdleDurationSeconds"] < policy["suspendedDurationSeconds"]
+
+
 def test_resolve_max_lifetime_defaults_to_eight_hours() -> None:
     """Absent an override, the requested lifetime is the 8 h platform cap."""
     assert resolve_max_lifetime_s() == 8 * 60 * 60

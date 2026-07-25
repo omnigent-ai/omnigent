@@ -128,13 +128,18 @@ _DEFAULT_MAX_LIFETIME_S: int = 8 * 60 * 60
 # leaked from a dead VM still expires. Mirrors the e2b/cwsandbox pattern.
 _TOKEN_TTL_SLACK_S: int = 3600
 
-# Idle policy defaults for run-microvm: an idle VM auto-suspends after 15 min of
-# no inbound traffic, may stay suspended up to 30 min before termination, and
-# auto-resumes on the next request. Tuned so a session that sits between turns
-# sleeps to a snapshot instead of holding warm compute, and wakes on the next
-# message via the managed wake path.
+# Idle policy defaults for run-microvm: an idle VM auto-suspends after 15 min,
+# then may stay suspended for the rest of its 8 h lifetime. Tuned so a session
+# that sits between turns sleeps to a snapshot instead of holding warm compute,
+# and wakes on the next message via the managed wake path.
+#
+# suspendedDurationSeconds is the time a VM may stay SUSPENDED *before Lambda
+# terminates it*, so it must match the total lifetime: a shorter value silently
+# kills any session idle longer than it, and the next wake fails with
+# ResourceNotFoundException. maximumDurationInSeconds already bounds lifetime,
+# and a suspended VM bills snapshot storage only.
 _DEFAULT_MAX_IDLE_S: int = 900
-_DEFAULT_SUSPENDED_S: int = 1800
+_DEFAULT_SUSPENDED_S: int = 28800
 
 # boto3 service name for the Lambda MicroVMs control plane.
 _SERVICE_NAME: str = "lambda-microvms"
@@ -216,12 +221,19 @@ def build_idle_policy() -> dict[str, object]:
     """
     Build the ``idlePolicy`` for ``run-microvm``.
 
-    Auto-suspend on idle and auto-resume on the next request are what let a
-    between-turns session sleep to a snapshot and wake cheaply. The snapshot
-    thaw restores the running ``omnigent host`` process with its still-valid
-    launch token (this provider sets ``resume_preserves_host = True``), so the
-    managed wake path (:func:`omnigent.server.managed_hosts.resume_managed_host`)
-    resumes the VM WITHOUT restarting the host — the host reconnects on its own.
+    Auto-suspend on idle is what lets a between-turns session sleep to a
+    snapshot and wake cheaply. The snapshot thaw restores the running
+    ``omnigent host`` process with its still-valid launch token (this provider
+    sets ``resume_preserves_host = True``), so the managed wake path
+    (:func:`omnigent.server.managed_hosts.resume_managed_host`) resumes the VM
+    WITHOUT restarting the host — the host reconnects on its own.
+
+    Lambda measures idleness only by traffic arriving at the MicroVM's inbound
+    endpoint. This host receives none (it holds an *outbound* tunnel to the
+    server), so ``autoResumeEnabled`` never fires on its own and every wake
+    comes from the server's explicit ``resume-microvm``. It stays enabled as a
+    harmless backstop. The same blindness means a turn running longer than
+    ``maxIdleDurationSeconds`` can be snapshot-frozen mid-work.
 
     :returns: The idle-policy mapping.
     """
