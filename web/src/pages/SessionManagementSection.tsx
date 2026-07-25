@@ -92,7 +92,11 @@ export function SessionManagementSection() {
   }, [searchInput]);
 
   const projectsQuery = useProjects();
-  const projectNames = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data]);
+  // `useProjects` returns `{ id, name }`; the filter API still keys by name.
+  const projectNames = useMemo(
+    () => (projectsQuery.data ?? []).map((p) => p.name),
+    [projectsQuery.data],
+  );
 
   // Drop a stale project filter once the projects list settles without it.
   useEffect(() => {

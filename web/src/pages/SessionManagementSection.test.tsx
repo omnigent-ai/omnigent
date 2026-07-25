@@ -58,7 +58,7 @@ vi.mock("@/hooks/useConversations", async () => {
       };
     },
     useProjects: () => ({
-      data: mocks.projectNames,
+      data: mocks.projectNames.map((name) => ({ id: null, name })),
       isSuccess: true,
       isFetching: false,
     }),
