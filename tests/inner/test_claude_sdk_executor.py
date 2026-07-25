@@ -84,6 +84,144 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertIn("ZEBRA-99", prompt)
         self.assertIn("Summarize our conversation.", prompt)
 
+    def test_history_unresolved_file_id_becomes_visible_marker(self):
+        # A prior-turn attachment the content resolver never inlined must
+        # not be serialized as raw block JSON — the model reads that as if
+        # the attachment were present and hallucinates its content.
+        executor = self._make_executor()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "file_img", "filename": "photo.png"},
+                    {"type": "input_text", "text": "look at this image"},
+                ],
+            },
+            {"role": "assistant", "content": "A photo."},
+            {"role": "user", "content": "What did I show you?"},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=False)
+        self.assertIn("[Attachment photo.png could not be loaded]", prompt)
+        self.assertNotIn("file_id", prompt)
+        self.assertIn("look at this image", prompt)
+
+    def _text_of(self, prompt):
+        """Join the text blocks of a structured prompt for framing assertions."""
+        return "\n".join(block["text"] for block in prompt if block.get("type") == "text")
+
+    def test_cold_reload_replays_historical_image_as_structured_block(self):
+        # A restarted/fresh SDK client must be able to *look at* an image from
+        # an earlier turn. Flattening it into a text marker leaves the model
+        # describing an attachment it cannot see.
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        image_data_uri = f"data:image/png;base64,{image_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_uri,
+                        "filename": "screenshot.png",
+                    },
+                    {"type": "input_text", "text": "What is shown here?"},
+                ],
+            },
+            {"role": "assistant", "content": "It shows a test image."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        images = [block for block in prompt if block.get("type") == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(
+            images[0]["source"],
+            {"type": "base64", "media_type": "image/png", "data": image_payload},
+        )
+        # The bytes travel as a structured block, never as prompt text.
+        text = self._text_of(prompt)
+        self.assertNotIn(image_payload, text)
+        self.assertNotIn("data:", text)
+        # Framing and ordering survive around the replayed image.
+        self.assertIn("Conversation so far:", text)
+        self.assertIn("What is shown here?", text)
+        self.assertIn("Respond to the latest user message", text)
+        self.assertIn("Summarize our conversation.", text)
+
+    def test_cold_reload_replays_historical_file_as_structured_document(self):
+        # The same fidelity requirement applies to non-image attachments: a
+        # resolved PDF must reach the SDK as a document block, not a marker.
+        executor = self._make_executor()
+        file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
+        file_data_uri = f"data:application/pdf;base64,{file_payload}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": file_data_uri,
+                        "filename": "doc.pdf",
+                    },
+                    {"type": "input_text", "text": "What does this document say?"},
+                ],
+            },
+            {"role": "assistant", "content": "It is a test document."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        documents = [block for block in prompt if block.get("type") == "document"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(
+            documents[0]["source"],
+            {"type": "base64", "media_type": "application/pdf", "data": file_payload},
+        )
+        text = self._text_of(prompt)
+        self.assertNotIn(file_payload, text)
+        self.assertIn("What does this document say?", text)
+
+    def test_cold_reload_keeps_unresolved_history_attachment_visible(self):
+        # A resolved and an unresolved attachment in the same history: the
+        # resolved one becomes real bytes, the unresolved one must still say
+        # so out loud rather than vanish from the structured prompt.
+        executor = self._make_executor()
+        image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{image_payload}",
+                        "filename": "resolved.png",
+                    },
+                    {
+                        "type": "input_image",
+                        "file_id": "file_missing",
+                        "filename": "lost.png",
+                    },
+                    {"type": "input_text", "text": "two attachments"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "What did I send?"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 1)
+        text = self._text_of(prompt)
+        self.assertIn("[Attachment lost.png could not be loaded]", text)
+        self.assertNotIn("file_id", text)
+        self.assertIn("two attachments", text)
+
 
 # ---------------------------------------------------------------------------
 # Tests: Constructor and properties
@@ -1738,6 +1876,101 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn("mcp__omnigent__sys_session_send", captured_options["allowed_tools"])
             self.assertIn(
                 "use `mcp__omnigent__sys_session_send` when instructions say `sys_session_send`",
+                captured_options["system_prompt"],
+            )
+            self.assertIsInstance(events[-1], TurnComplete)
+
+        _run(_t())
+
+    def test_session_rename_tool_uses_exact_sdk_mcp_name(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured_options = {}
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _FakeSDK:
+            AssistantMessage = type("AssistantMessage", (), {})
+            UserMessage = type("UserMessage", (), {})
+            SystemMessage = type("SystemMessage", (), {})
+            ResultMessage = _ResultMessage
+            StreamEvent = type("StreamEvent", (), {})
+            ClaudeAgentOptions = type(
+                "ClaudeAgentOptions",
+                (),
+                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
+            )
+            messages = []
+
+            @staticmethod
+            def tool(name, desc, params):
+                def decorator(handler):
+                    return type(
+                        "Tool",
+                        (),
+                        {
+                            "name": name,
+                            "description": desc,
+                            "parameters": params,
+                            "handler": handler,
+                        },
+                    )()
+
+                return decorator
+
+            @staticmethod
+            def create_sdk_mcp_server(**kwargs):
+                return kwargs
+
+            class ClaudeSDKClient:
+                def __init__(self, options):
+                    captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = getattr(options, "system_prompt", None)
+
+                async def connect(self):
+                    return None
+
+                async def query(self, prompt, session_id="default"):
+                    _FakeSDK.messages = [_ResultMessage(session_id, "done")]
+
+                async def receive_response(self):
+                    for message in _FakeSDK.messages:
+                        yield message
+
+                async def disconnect(self):
+                    return None
+
+        async def _t():
+            executor = ClaudeSDKExecutor()
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+                events = [
+                    event
+                    async for event in executor.run_turn(
+                        [{"role": "user", "content": "hi", "session_id": "session-a"}],
+                        [
+                            {
+                                "name": "sys_session_rename",
+                                "description": "Rename current session",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"title": {"type": "string"}},
+                                    "required": ["title"],
+                                },
+                            }
+                        ],
+                        "Call `sys_session_rename` before replying.",
+                    )
+                ]
+            self.assertIn(
+                "mcp__omnigent__sys_session_rename",
+                captured_options["allowed_tools"],
+            )
+            self.assertIn(
+                "use `mcp__omnigent__sys_session_rename` when instructions say "
+                "`sys_session_rename`",
                 captured_options["system_prompt"],
             )
             self.assertIsInstance(events[-1], TurnComplete)

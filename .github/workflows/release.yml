@@ -182,8 +182,24 @@ jobs:
           BASE_SHA: ${{ steps.state.outputs.base_sha }}
         run: |
           set -euo pipefail
+          # This gate is meta-CI, not CI itself. Every job this Release workflow
+          # spawns (plan, benchmark, cut, bump-main, …) leaves a check-run on
+          # the base commit; a single premature failure on a prior dispatch
+          # would otherwise poison the SHA and block every retry in a
+          # self-sustaining loop. Exclude *all* check-runs that belong to a run
+          # of this workflow, identified by run ID in details_url — not by job
+          # name, so a real nightly `benchmark` regression (different workflow)
+          # is still gated.
+          own_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?head_sha=${BASE_SHA}&per_page=100&status=completed" \
+            --jq '.workflow_runs[].id' 2>/dev/null | paste -sd, -)"
           runs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BASE_SHA}/check-runs?per_page=100" \
-            --paginate --jq '.check_runs[] | [.name, .status, .conclusion // "-"] | @tsv')"
+            --paginate --jq '.check_runs[] | [.name, .status, .conclusion // "-", .details_url] | @tsv')"
+          # Drop check-runs whose details_url references one of this
+          # workflow's own runs (e.g. .../actions/runs/<id>/job/<id>).
+          runs="$(printf '%s' "$runs" | awk -F'\t' -v rel="$own_runs" '
+            BEGIN { n=split(rel, a, ","); for (i=1; i<=n; i++) if (a[i]!="") runs[a[i]]=1 }
+            { own=0; for (r in runs) if (index($4, "/runs/" r "/")) { own=1; break }
+              if (!own) print $1 "\t" $2 "\t" $3 }')"
           total="$(printf '%s' "$runs" | grep -c . || true)"
           pending="$(printf '%s' "$runs" | awk -F'\t' '$2 != "completed"' || true)"
           # Cancelled runs are chronically present on main (superseded
@@ -230,18 +246,20 @@ jobs:
             echo "| Mode | $([ "$DRY_RUN" = "true" ] && echo "DRY RUN — nothing pushed" || echo "EXECUTE") |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Run benchmark on the release commit vs the previous stable release tag —
-  # same runner, back-to-back, so machine variance cancels out. A detected
-  # regression surfaces as an output flag that gates the benchmark-approve job
-  # (requiring manual sign-off) rather than failing outright. Skipped on dry
-  # runs, already-converged runs, and when skip_benchmark=true.
-  benchmark:
+  # Seed the corpus at the OLDER release's schema head so both servers can
+  # boot: the baseline (older code) reads it natively, and the candidate (newer
+  # code) auto-migrates it forward on startup. Migrations are forward-only, so
+  # seeding at the newer schema would leave a DB the older code can't read.
+  # The seeded bench.db is passed to baseline + candidate as an artifact so
+  # they run in parallel on separate runners (each migrates/reads its own copy).
+  benchmark-seed:
     needs: [authorize, plan]
     if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark }}
     outputs:
-      regression: ${{ steps.compare.outputs.regression }}
+      prev_tag: ${{ steps.prev.outputs.tag }}
+      has_prev: ${{ steps.prev.outputs.found }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     env:
       OMNIGENT_SKIP_WEB_UI: "true"
       UV_INDEX_URL: https://pypi.org/simple
@@ -251,7 +269,6 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
-          # Full history so we can re-checkout the previous release tag.
           fetch-depth: 0
           persist-credentials: false
 
@@ -265,40 +282,8 @@ jobs:
         with:
           enable-cache: true
 
-      # Seed once with the same corpus size as the nightly (5000×200) so the
-      # candidate and baseline numbers are on an equal footing and directly
-      # comparable to the nightly trend dashboard. The DB is reused for both
-      # candidate and baseline runs — both check out different code but share
-      # the same pre-populated SQLite file, keeping conditions identical.
-      # Cache key mirrors benchmark.yml: schema head + seed script hash.
-      - name: Resolve seed cache key
-        id: seedkey
-        run: |
-          HEAD="$(uv run --no-sync dev/benchmarks/omnigent/seed.py --print-head)"
-          echo "key=benchdb-sqlite-${HEAD}-5000x200-${{ hashFiles('dev/benchmarks/omnigent/seed.py') }}" \
-            >> "$GITHUB_OUTPUT"
-
-      - name: Restore seeded SQLite corpus
-        id: seedcache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v4
-        with:
-          path: bench.db
-          key: ${{ steps.seedkey.outputs.key }}
-
-      - name: Seed SQLite corpus
-        if: steps.seedcache.outputs.cache-hit != 'true'
-        run: |
-          uv run --no-sync dev/benchmarks/omnigent/seed.py \
-            --database-uri "sqlite:///bench.db" \
-            --sessions 5000 --items-per-session 200
-
-      - name: Benchmark candidate (release base)
-        run: |
-          uv sync --extra dev
-          uv run --no-sync dev/benchmarks/omnigent/run.py \
-            --database-uri "sqlite:///bench.db" \
-            --iterations 100 --runs 3 --output candidate.json
-          echo "Candidate benchmark complete." | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Install dependencies
+        run: uv sync --extra dev
 
       - name: Find previous stable release tag
         id: prev
@@ -317,20 +302,188 @@ jobs:
             echo "tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Benchmark previous release (${{ steps.prev.outputs.tag }})
+      # Seed at the OLDER schema head so both servers can boot. When there is
+      # no previous release (first cut) seed at the current schema instead.
+      - name: Seed at previous release schema
         if: steps.prev.outputs.found == 'true'
         run: |
           git checkout "${{ steps.prev.outputs.tag }}"
           uv sync --extra dev
+          uv run --no-sync dev/benchmarks/omnigent/seed.py \
+            --database-uri "sqlite:///bench.db" \
+            --sessions 5000 --items-per-session 200
+
+      - name: Seed at current schema (no previous release)
+        if: steps.prev.outputs.found != 'true'
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/seed.py \
+            --database-uri "sqlite:///bench.db" \
+            --sessions 5000 --items-per-session 200
+
+      - name: Upload seeded corpus
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-db-${{ github.run_id }}
+          path: bench.db
+          retention-days: 1
+          if-no-files-found: error
+
+  # Benchmark the previous release. Skipped on the first cut (no prev tag).
+  benchmark-baseline:
+    needs: [benchmark-seed]
+    if: ${{ needs.benchmark-seed.outputs.has_prev == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out previous release
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.benchmark-seed.outputs.prev_tag }}
+          persist-credentials: false
+
+      - name: Download seeded corpus
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-db-${{ github.run_id }}
+          path: .
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run baseline benchmark
+        run: |
           uv run --no-sync dev/benchmarks/omnigent/run.py \
             --database-uri "sqlite:///bench.db" \
             --iterations 100 --runs 3 --output baseline.json
-          # Return to release base so compare.py is available.
-          git checkout -
+          echo "Baseline benchmark complete." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload baseline results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: baseline-results-${{ github.run_id }}
+          path: baseline.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # Benchmark the release candidate. Always runs (even on first cut, solo).
+  benchmark-candidate:
+    needs: [authorize, plan, benchmark-seed]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out release base
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Download seeded corpus
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-db-${{ github.run_id }}
+          path: .
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # The seeded bench.db is at the previous release's schema head. The
+      # candidate (newer code) auto-migrates on server boot, but the z7
+      # binary-UUID conversion is a per-row Python loop over ~1M items that
+      # takes >90s — longer than the benchmark harness's health-check window.
+      # Pre-migrate explicitly so the server boots against an already-current DB.
+      - name: Migrate corpus to release-base schema
+        run: |
+          uv run --no-sync omni debug db-upgrade "sqlite:///bench.db"
+          echo "Corpus migrated to release-base schema head." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run candidate benchmark
+        run: |
+          uv run --no-sync dev/benchmarks/omnigent/run.py \
+            --database-uri "sqlite:///bench.db" \
+            --iterations 100 --runs 3 --output candidate.json
+          echo "Candidate benchmark complete." | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: candidate-results-${{ github.run_id }}
+          path: candidate.json
+          retention-days: 7
+          if-no-files-found: error
+
+  # Compare baseline vs candidate. Downloaded as artifacts from the parallel
+  # jobs. A detected regression surfaces as an output flag that gates the
+  # benchmark-approve job (requiring manual sign-off) rather than failing
+  # outright. Skipped on the first cut (no baseline).
+  benchmark:
+    needs: [authorize, plan, benchmark-seed, benchmark-baseline, benchmark-candidate]
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !inputs.skip_benchmark && needs.benchmark-seed.outputs.has_prev == 'true' }}
+    outputs:
+      regression: ${{ steps.compare.outputs.regression }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OMNIGENT_SKIP_WEB_UI: "true"
+      UV_INDEX_URL: https://pypi.org/simple
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Check out release base
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Download results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "{baseline,candidate}-results-${{ github.run_id }}"
+          merge-multiple: true
+          path: .
 
       - name: Compare results
         id: compare
-        if: steps.prev.outputs.found == 'true'
         run: |
           set +e
           uv run --no-sync dev/benchmarks/omnigent/compare.py \
@@ -340,11 +493,9 @@ jobs:
             --output-markdown comparison.md
           RC=$?
           set -e
-          # Expose regression flag as an output so the approval job can gate on it.
           echo "regression=$([ $RC -ne 0 ] && echo 'true' || echo 'false')" >> "$GITHUB_OUTPUT"
 
       - name: Write step summary
-        if: steps.prev.outputs.found == 'true'
         run: |
           REGRESSION="${{ steps.compare.outputs.regression }}"
           {
@@ -359,10 +510,10 @@ jobs:
             echo ""
             cat comparison.md 2>/dev/null || echo "_No comparison report generated._"
             echo ""
-            echo "_Candidate vs ${{ steps.prev.outputs.tag }} · 100 iterations × 3 runs · SQLite · threshold 100% on P50/P95_"
+            echo "_Candidate vs ${{ needs.benchmark-seed.outputs.prev_tag }} · 100 iterations × 3 runs · SQLite · threshold 100% on P50/P95_"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload benchmark artifacts
+      - name: Upload comparison artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -370,6 +521,7 @@ jobs:
           path: |
             candidate.json
             baseline.json
+            comparison.md
           retention-days: 90
           if-no-files-found: ignore
 
@@ -383,6 +535,7 @@ jobs:
       !inputs.dry_run &&
       needs.plan.outputs.already_done != 'true' &&
       !inputs.skip_benchmark &&
+      needs.benchmark.result == 'success' &&
       needs.benchmark.outputs.regression == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -394,8 +547,12 @@ jobs:
 
   # Stamp + tag + push. Only reached on a real run that isn't already converged.
   cut:
-    needs: [authorize, plan, benchmark, benchmark-approve]
-    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' }}
+    needs: [authorize, plan, benchmark-candidate, benchmark, benchmark-approve]
+    # benchmark (compare) + benchmark-approve are skipped on the first cut (no
+    # previous release to compare against); benchmark-candidate always runs and
+    # is the real gate. `!cancelled` lets the optional compare/approve jobs be
+    # skipped without blocking, while still failing the run if they actually fail.
+    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

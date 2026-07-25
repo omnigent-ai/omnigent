@@ -49,6 +49,7 @@ from pathlib import Path
 import httpx
 
 from omnigent._native_post_delivery import post_external_session_status
+from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 
 _logger = logging.getLogger(__name__)
 
@@ -91,10 +92,10 @@ def _warn_sqlite_once(context: str, exc: sqlite3.Error) -> None:
     _logger.warning("goose forwarder sqlite error during %s: %s", context, exc)
 
 
-# The executor injects ``[Attached: <path>]`` markers for web-UI attachments
-# before pasting into the TUI; strip them from the mirrored bubble (the path is
-# an internal bridge detail).
-_ATTACHMENT_MARKER_RE = re.compile(r"\[Attached:[^\]]*\]")
+# The executor injects ``[Attached: <path>]`` (or the could-not-load marker
+# from native_attachments) for web-UI attachments before pasting into the TUI;
+# strip them from the mirrored bubble (internal bridge details).
+_ATTACHMENT_MARKER_RE = re.compile(ATTACHMENT_MARKER_STRIP_PATTERN)
 
 
 def default_sessions_db() -> Path:

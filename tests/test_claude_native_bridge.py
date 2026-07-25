@@ -45,7 +45,6 @@ from omnigent.claude_native_bridge import (
     record_hook_event,
     start_tool_relay,
     stop_hook_seen_since,
-    user_prompt_submit_seen_since,
     write_tmux_target,
 )
 from omnigent.reasoning_effort import CLAUDE_EFFORTS
@@ -74,7 +73,11 @@ def subprocess_bridge_root() -> Iterator[Path]:
         ``python -m omnigent.claude_native_bridge`` accepts bridge
         writes without inheriting pytest monkeypatches.
     """
-    production_root = Path("/tmp") / f"omnigent-{os.getuid()}" / "claude-native"
+    production_root = (
+        Path(tempfile.gettempdir())
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+    )
     production_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(production_root.parent, 0o700)
     os.chmod(production_root, 0o700)
@@ -335,6 +338,21 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     # Confirm the bearer token did NOT land in the attacker-controlled
     # directory — the refusal happened before any file write.
     assert not (attacker_dir / "bridge.json").exists()
+
+
+def test_ensure_secure_dir_succeeds_without_getuid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows lacks ``os.getuid()``; bridge dir creation must still work."""
+    monkeypatch.delattr(os, "getuid", raising=False)
+
+    bridge_dir = tmp_path / "bridge-without-getuid"
+
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+
+    assert bridge_dir.is_dir()
 
 
 def test_trusted_parent_accepts_qwen_native_bridge_dir(
@@ -601,6 +619,164 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
         "content": [{"type": "output_text", "text": "Done."}],
     }
     assert current_response_id == tool_call.response_id
+
+
+def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
+    """
+    Reading an image file must not replay its base64 data as prompt text.
+
+    Claude's ``Read`` tool returns image files as a list of
+    ``{"type": "image", "source": {"type": "base64", ...}}`` blocks.
+    Serialized verbatim, a single image costs hundreds of thousands of
+    tokens and overflows the context window on resume. The stored
+    ``function_call_output`` must drop the base64 payload.
+    """
+    huge_b64 = "iVBORw0KGgo" + "A" * 100_000
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-tool-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_read_img",
+                                    "name": "Read",
+                                    "input": {"file_path": "chart.png"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "tool-result-1",
+                        "parentUuid": "assistant-tool-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_read_img",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/png",
+                                                "data": huge_b64,
+                                            },
+                                        }
+                                    ],
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    outputs = [item for item in items if item.item_type == "function_call_output"]
+    assert len(outputs) == 1
+    output = outputs[0].data["output"]
+    assert huge_b64 not in output, "base64 image data must not be replayed as text"
+    # The placeholder names the media type and tells the agent how to
+    # recover the image (re-run the tool call), so it is not silently lost.
+    assert "image/png image omitted from history" in output
+    assert "re-run the tool call" in output
+    assert len(output) < 300
+
+
+def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Path) -> None:
+    task_notification = (
+        "<task-notification>\n"
+        "<task-id>b1mhekpmy</task-id>\n"
+        '<summary>Monitor event: "PR 2086 E2E UI + npm test CI results"</summary>\n'
+        "<event>E2E UI Tests (shard 2/3)\tfail\t1m50s\thttps://example.test</event>\n"
+        "</task-notification>"
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "task-notification-1",
+                "message": {"role": "user", "content": task_notification},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert current_response_id is None
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": task_notification}],
+    }
+
+
+def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` user record is flagged, not rendered as a bubble.
+
+    Claude writes an ``isCompactSummary: true`` user record carrying the
+    continuation summary right after it compacts. The bridge must surface it
+    as a single ``message`` item with ``is_compact_summary=True`` (so the
+    forwarder can persist a durable compaction boundary) and preserve the
+    summary text — never drop it or route it through slash/scaffolding
+    detection.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "compact-summary-1",
+                "isCompactSummary": True,
+                "message": {
+                    "role": "user",
+                    "content": "This session is being continued. Prior summary: …",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].is_compact_summary is True
+    assert items[0].item_type == "message"
+    assert items[0].data["content"][0]["text"].startswith("This session is being continued")
 
 
 @pytest.mark.parametrize(
@@ -2085,6 +2261,53 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+def test_augment_claude_args_appends_caller_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Claude native appends framework instructions supplied by its launcher."""
+    framework_instruction = "Keep framework metadata separate."
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=framework_instruction,
+    )
+
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == framework_instruction
+
+
+def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
+    """Framework preapproval extends rather than replaces the user's allowlist."""
+    args = augment_claude_args(
+        ("--allowedTools", "Bash,mcp__user__tool"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        allowed_tools=("mcp__omnigent__sys_session_rename", "Bash"),
+    )
+
+    assert args.count("--allowedTools") == 1
+    index = args.index("--allowedTools")
+    assert args[index + 1].split(",") == [
+        "Bash",
+        "mcp__user__tool",
+        "mcp__omnigent__sys_session_rename",
+    ]
+
+
+def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+    """The bridge does not invent framework policy on its own."""
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert "--append-system-prompt" not in args
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.
@@ -2308,7 +2531,10 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
     Code would refuse to start with that capability advertised under
     org policy, breaking the native wrapper.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -2872,281 +3098,6 @@ def test_inject_user_message_raises_when_draft_never_submits(
         inject_user_message(bridge_dir, content="fix the flaky test")
 
 
-# ── user_prompt_submit_seen_since ────────────────────────────────────
-
-
-def test_user_prompt_submit_seen_since_detects_parent_prompt(
-    tmp_path: Path,
-) -> None:
-    """
-    A parent ``UserPromptSubmit`` after the cursor is detected.
-
-    This is the authoritative "submit registered" signal the delivery ack
-    keys on; without it a swallowed submit Enter looks like success.
-    """
-    bridge_dir = tmp_path / "bridge"
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-    assert not user_prompt_submit_seen_since(bridge_dir, 1)
-    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "p"})
-    assert user_prompt_submit_seen_since(bridge_dir, 1)
-
-
-def test_user_prompt_submit_seen_since_ignores_subagent_prompt(
-    tmp_path: Path,
-) -> None:
-    """
-    A subagent ``UserPromptSubmit`` must not count as the parent's submit.
-
-    Subagent hooks land in the same ``hooks.jsonl``; their
-    ``transcript_path`` carries a ``subagents/`` component. Counting one
-    would falsely ack a parent message that never registered.
-    """
-    bridge_dir = tmp_path / "bridge"
-    subagent_transcript = tmp_path / "session" / "subagents" / "agent-abc.jsonl"
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-    record_hook_event(
-        bridge_dir,
-        {
-            "hook_event_name": "UserPromptSubmit",
-            "session_id": "sub",
-            "transcript_path": str(subagent_transcript),
-        },
-    )
-    assert not user_prompt_submit_seen_since(bridge_dir, 1)
-
-
-def test_user_prompt_submit_seen_since_absent_file_is_false(
-    tmp_path: Path,
-) -> None:
-    """A missing ``hooks.jsonl`` reports no submit rather than raising."""
-    assert not user_prompt_submit_seen_since(tmp_path / "bridge", 0)
-
-
-# ── inject_user_message: end-to-end delivery ack ─────────────────────
-
-
-def _shrink_ack_timers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Collapse the ack poll cadence/timeouts so tests run in milliseconds.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    """
-    for name, value in {
-        "_CLAUDE_READY_POLL_INTERVAL_S": 0.01,
-        "_SUBMIT_RETRY_INTERVAL_S": 0.02,
-        "_PASTE_SETTLE_S": 0.0,
-        "_SUBMIT_VERIFY_TIMEOUT_S": 0.15,
-        "_SUBMIT_ACK_TIMEOUT_S": 0.15,
-        "_TURN_START_SETTLE_S": 0.03,
-        "_TURN_START_TIMEOUT_S": 0.15,
-    }.items():
-        monkeypatch.setattr(f"omnigent.claude_native_bridge.{name}", value)
-
-
-def test_inject_user_message_acks_when_turn_starts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Delivery succeeds once ``UserPromptSubmit`` + a turn-start hook land.
-
-    Models Claude accepting the prompt on Enter (fires ``UserPromptSubmit``)
-    and starting a turn (fires ``PreToolUse``). The helper must return
-    without raising and without extra retry Enters.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-
-    enters: list[list[str]] = []
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ ship the fix"
-        if cmd[-1] == "Enter":
-            enters.append(cmd)
-            tui["pane"] = "❯ "  # submitted — box clears
-            # Claude accepts the prompt and starts a turn.
-            record_hook_event(
-                bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "p"}
-            )
-            record_hook_event(bridge_dir, {"hook_event_name": "PreToolUse", "session_id": "p"})
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content="ship the fix")  # must not raise
-
-    assert len(enters) == 1, f"Healthy delivery should send exactly one Enter, got {len(enters)}."
-
-
-def test_inject_user_message_raises_when_prompt_never_registers(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The box clearing is not enough: no ``UserPromptSubmit`` means not delivered.
-
-    This is the blind-Enter / swallowed-submit gap. Previously the draft
-    leaving the box returned "success"; now, with the hook stream live and
-    no ``UserPromptSubmit`` recorded, the helper raises so the caller can
-    surface the drop.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-    # Hook stream is live (SessionStart already recorded) but the submit
-    # never produces a UserPromptSubmit.
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ never delivered"
-        if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "  # box clears (looks fine) but no UPS fires
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="UserPromptSubmit"):
-        inject_user_message(bridge_dir, content="never delivered")
-
-
-def test_inject_user_message_raises_on_draft_restore_stall(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Submit registers, draft is restored, no turn starts → raise.
-
-    The observed #2061 stall: ``UserPromptSubmit`` fires (submit took) but
-    the draft bounces back into the box and no assistant turn begins. The
-    ack re-submits the restored draft; when redelivery still yields no
-    turn-start it raises rather than stranding the message.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-
-    state = {"pane": "❯ ", "submitted": False}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            pane = state["pane"]
-            # The submit momentarily clears the box — the first capture-pane
-            # read after that clear sees empty, so the TUI-level submit
-            # verification passes — then draft-restore bounces the text back
-            # into the box for the delivery ack to catch as a stall.
-            if state["submitted"] and pane == "❯ ":
-                state["pane"] = "❯ stalled message"
-            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
-        if "paste-buffer" in cmd:
-            state["pane"] = "❯ stalled message"
-        if cmd[-1] == "Enter":
-            if not state["submitted"]:
-                # First submit registers and the box momentarily clears...
-                state["pane"] = "❯ "
-                record_hook_event(
-                    bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "p"}
-                )
-                # ...then draft-restore puts it back; no turn-start hook ever fires.
-                state["submitted"] = True
-            # Subsequent (nudge) Enters do NOT start a turn — the stall persists.
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="no assistant turn started"):
-        inject_user_message(bridge_dir, content="stalled message")
-
-
-def test_inject_user_message_degrades_without_hooks_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    With no ``hooks.jsonl`` the ack is skipped and delivery is not blocked.
-
-    The hook signal is unobservable for this bridge, so the helper must
-    fall back to pane-only behavior (prior semantics) instead of raising.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ no hooks here"
-        if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    inject_user_message(bridge_dir, content="no hooks here")  # must not raise
-    assert not (bridge_dir / "hooks.jsonl").exists()
-
-
-def test_inject_user_message_steering_skips_hook_ack(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    ``verify_delivery=False`` keeps legacy pane-only behavior.
-
-    Mid-turn steering can be queued without a prompt ack, so the strict
-    hook ack is bypassed: even with the hook stream live and no
-    ``UserPromptSubmit``, the helper returns once the box clears.
-    """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
-    _shrink_ack_timers(monkeypatch)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
-    )
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "p"})
-
-    tui = {"pane": "❯ "}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = "❯ steer me"
-        if cmd[-1] == "Enter":
-            tui["pane"] = "❯ "  # box clears; no UPS — would raise if strict
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    # Would raise under the default strict ack; verify_delivery=False must not.
-    inject_user_message(bridge_dir, content="steer me", verify_delivery=False)
-
-
 def test_inject_interrupt_sends_escape_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3509,7 +3460,10 @@ async def test_channel_server_relays_active_omnigent_tools(
     This fails if Claude Code can receive web-channel inputs but cannot
     call the Omnigent tools made available to the server-side agent.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_tools", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -3716,7 +3670,10 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     ``-32000: Connection closed``). Without the guard, the decode error kills
     ``_serve_mcp`` and the ``tools/list`` read below times out.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_crash", workspace=tmp_path)
 

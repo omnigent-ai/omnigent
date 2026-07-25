@@ -22,7 +22,7 @@ from typing import Any, Protocol
 
 from cachetools import TTLCache
 
-from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import HostHelloFrame
 
 _logger = logging.getLogger(__name__)
@@ -163,6 +163,11 @@ class WebSocketLike(Protocol):
 class HostConnection:
     """Per-host state while the tunnel is open.
 
+    :param workspace_id: Tenant partition the tunnel belongs to,
+        mirroring the ``hosts`` table's ``(workspace_id, host_id)`` PK.
+        Captured at register time so ``send_text``'s replaced-connection
+        guard keys on the full ``(workspace_id, host_id)`` without
+        reading request context from the long-lived sender loop.
     :param host_id: Stable host identifier, e.g.
         ``"host_a1b2c3d4..."``.
     :param ws: The live WebSocket to this host.
@@ -216,14 +221,38 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_installs: Per-``request_id`` futures for in-flight
+        ``host.install_harness`` requests. Resolved when the host sends
+        ``host.install_harness_result``. Values carry the result fields
+        (``status``, ``configured_harnesses``, ``error``). Same ``Any``
+        typing rationale as ``pending_stats``.
+    :param inflight_installs: Install tasks used to coalesce concurrent
+        install requests for the same harness family (a double-click, or
+        two spellings of one npm package) onto one in-flight install, so
+        npm's non-race-safe global writes never run twice at once. Keyed by
+        the resolved install key (not ``request_id``) and cleared when the
+        install completes.
+    :param pending_secret_writes: Per-``request_id`` futures for in-flight
+        ``host.store_secret`` requests (a UI-driven harness credential write).
+        Resolved when the host sends ``host.store_secret_result``. Values carry
+        the result fields (``status``, ``configured_harnesses``, ``error``) —
+        never the secret. Same ``Any`` typing rationale as ``pending_stats``.
+    :param credential_write_lock: Serializes credential writes to this host so
+        two overlapping requests (a double-click, or key + gateway in quick
+        succession) can't interleave the daemon's non-atomic
+        load→merge→save of ``config.yaml`` and clobber a sibling ``providers:``
+        entry. Held around the whole store-secret round-trip.
     :param pending_fs_requests: Per-``request_id`` futures for
         in-flight ``host.fs_request`` reads (the workspace file
         panel served from the host while the runner is offline).
         Resolved when the host sends ``host.fs_result``. Values
         carry ``status``, ``payload``, ``error_status``,
         ``error_code``, and ``error``.
+    :param pending_model_options: Per-``request_id`` futures for pre-launch
+        model catalogs resolved by the selected host.
     """
 
+    workspace_id: int
     host_id: str
     ws: WebSocketLike
     hello: HostHelloFrame
@@ -258,7 +287,23 @@ class HostConnection:
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_secret_writes: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_credential_detects: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    credential_write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_fs_requests: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
 
@@ -274,7 +319,9 @@ class HostRegistry:
     def __init__(self) -> None:
         """Initialize an empty host registry."""
         self._lock = threading.RLock()
-        self._hosts: dict[str, HostConnection] = {}
+        # Keyed by (workspace_id, host_id) to mirror the hosts-table PK:
+        # one stable host_id can be live in more than one workspace.
+        self._hosts: dict[tuple[int, str], HostConnection] = {}
 
     def register(
         self,
@@ -282,24 +329,38 @@ class HostRegistry:
         ws: WebSocketLike,
         hello: HostHelloFrame,
         owner: str | None,
+        workspace_id: int | None = None,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
-        If ``host_id`` is already registered (stale connection),
-        the old connection is replaced and its outbound queue is
-        poisoned with ``None`` so the sender loop exits.
+        If ``(workspace_id, host_id)`` is already registered (stale
+        connection), the old connection is replaced and its outbound
+        queue is poisoned with ``None`` so the sender loop exits.
+
+        Scoping the key by workspace means the same stable ``host_id``
+        (a laptop's config id) connecting to two workspaces is tracked
+        as two independent connections rather than one evicting the
+        other — matching the ``hosts`` table's ``(workspace_id,
+        host_id)`` PK.
 
         :param host_id: Stable host identifier, e.g.
             ``"host_a1b2c3d4..."``.
         :param ws: The live WebSocket.
         :param hello: The hello frame from the host.
         :param owner: Authenticated user ID, or ``None``.
+        :param workspace_id: Tenant partition the connection belongs to.
+            Defaults to the request-bound :func:`current_workspace_id`
+            (``0`` in single-tenant deployments); captured into the
+            connection so ``send_text`` need not read request context
+            from the sender loop.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
         host_id = _canonical_host_id(host_id)
         now = time.time()
         conn = HostConnection(
+            workspace_id=ws_id,
             host_id=host_id,
             ws=ws,
             hello=hello,
@@ -309,67 +370,84 @@ class HostRegistry:
             last_frame_at=now,
         )
         with self._lock:
-            old = self._hosts.get(host_id)
+            key = (ws_id, host_id)
+            old = self._hosts.get(key)
             if old is not None:
                 _logger.info(
-                    "replacing stale host connection: %s",
+                    "replacing stale host connection: ws=%s host=%s",
+                    ws_id,
                     host_id,
                 )
                 old.outbound_queue.put_nowait(None)
-            self._hosts[host_id] = conn
+            self._hosts[key] = conn
         return conn
 
-    def deregister(self, host_id: str) -> None:
+    def deregister(self, host_id: str, workspace_id: int | None = None) -> None:
         """Remove a host connection.
 
-        No-op if ``host_id`` is not registered.
+        No-op if ``(workspace_id, host_id)`` is not registered.
 
         :param host_id: Host identifier to remove, in any accepted
             spelling (see :func:`_canonical_host_id`).
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
         """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
-            self._hosts.pop(_canonical_host_id(host_id), None)
+            self._hosts.pop((ws_id, _canonical_host_id(host_id)), None)
 
-    def get(self, host_id: str) -> HostConnection | None:
+    def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
         """Look up a live host connection.
 
         :param host_id: Host identifier, in any accepted spelling
             (see :func:`_canonical_host_id`).
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
         :returns: The :class:`HostConnection` if online,
             otherwise ``None``.
         """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
-            return self._hosts.get(_canonical_host_id(host_id))
+            return self._hosts.get((ws_id, _canonical_host_id(host_id)))
 
-    def online_host_ids(self) -> list[str]:
-        """Return IDs of all currently connected hosts.
+    def online_host_ids(self, workspace_id: int | None = None) -> list[str]:
+        """Return IDs of all hosts connected in one workspace.
 
-        :returns: List of host_id strings.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: List of host_id strings live in the workspace.
         """
+        ws_id = current_workspace_id() if workspace_id is None else workspace_id
         with self._lock:
-            return list(self._hosts.keys())
+            return [hid for (ws, hid) in self._hosts if ws == ws_id]
 
-    def is_host_telemetry_opted_out(self, host_id: str) -> bool:
+    def is_host_telemetry_opted_out(self, host_id: str, workspace_id: int | None = None) -> bool:
         """Return whether the host has opted out of telemetry.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
         :returns: ``True`` when the host sent ``telemetry_opt_out=True``
             in its hello frame.  Defaults to ``False`` when the host is
             offline or unknown.
         """
-        conn = self.get(host_id)
+        conn = self.get(host_id, workspace_id)
         if conn is None:
             return False
         return conn.hello.telemetry_opt_out
 
-    def get_host_installation_id(self, host_id: str) -> str | None:
+    def get_host_installation_id(
+        self, host_id: str, workspace_id: int | None = None
+    ) -> str | None:
         """Return the installation ID the host advertised in its hello frame.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
         :returns: The host's installation ID, or ``None`` when offline or
             not set.
         """
-        conn = self.get(host_id)
+        conn = self.get(host_id, workspace_id)
         if conn is None:
             return None
         return conn.hello.installation_id
@@ -391,7 +469,7 @@ class HostRegistry:
             replaced (the outbound queue was poisoned).
         """
         with self._lock:
-            current = self._hosts.get(conn.host_id)
+            current = self._hosts.get((conn.workspace_id, conn.host_id))
             if current is not conn:
                 raise ConnectionError(f"host {conn.host_id!r} connection was replaced")
 

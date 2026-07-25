@@ -1,5 +1,21 @@
-import type { ReactNode } from "react";
-import { ThemeProvider as NextThemesProvider } from "next-themes";
+import { type ReactNode, useEffect } from "react";
+import { ThemeProvider as NextThemesProvider, useTheme } from "next-themes";
+import { reportColorScheme } from "@/lib/nativeBridge";
+
+/**
+ * Mirrors the in-app theme selection onto the Electron shell (nativeTheme), so
+ * the shell-owned update overlay, native dialogs, and menus follow the theme
+ * switcher rather than only the OS. No-op outside Electron. Renders nothing.
+ */
+function NativeThemeSync() {
+  const { theme } = useTheme();
+  useEffect(() => {
+    if (theme === "light" || theme === "dark" || theme === "system") {
+      reportColorScheme(theme);
+    }
+  }, [theme]);
+  return null;
+}
 
 /**
  * App-wide theme provider configured for Tailwind's `.dark` class variant.
@@ -20,6 +36,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       disableTransitionOnChange
       storageKey="web-theme"
     >
+      <NativeThemeSync />
       {children}
     </NextThemesProvider>
   );

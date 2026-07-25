@@ -91,8 +91,8 @@ import {
 } from "@/hooks/useTerminals";
 import type {
   ContentBlock,
-  CodexModelOption,
   ModelUsage,
+  NativeModelOption,
   PendingInput,
   SandboxStatus,
   Session,
@@ -178,35 +178,6 @@ export interface QueuedMessage {
    * Falls back to the current `boundAgentId` when absent.
    */
   agentId?: string;
-}
-
-/**
- * How many conversations keep a cached transcript. Bounds the memory a long
- * browsing session can accrete; the least-recently-viewed entry is evicted.
- */
-export const CONVERSATION_BLOCK_CACHE_LIMIT = 10;
-
-/** Monotonic recency stamp for {@link CachedConversation}, immune to clock stubs. */
-let blockCacheSeq = 0;
-
-/**
- * A conversation's last rendered transcript, kept so switching back to it
- * paints from memory instead of blanking behind the network.
- * See {@link ChatState.blocksByConversation}.
- */
-export interface CachedConversation {
-  /** Committed blocks only — in-flight `live:*` previews are never cached. */
-  blocks: AnyBlock[];
-  /**
-   * The window cursor and flag that were live alongside `blocks`. Cached
-   * atomically with them, or a restored transcript loses scroll-up paging.
-   */
-  oldestItemId: string | null;
-  hasMoreHistory: boolean;
-  /** Last known lifecycle, so the restored header doesn't flash "idle". */
-  sessionStatus: SessionStatus;
-  /** Recency for eviction; higher is more recent. */
-  seq: number;
 }
 
 /**
@@ -316,21 +287,6 @@ export interface ChatState {
    * {@link StashedPending.committedTexts}). Pruned to non-empty entries.
    */
   pendingByConversation: Record<string, StashedPending>;
-  /**
-   * Stale-while-revalidate cache of previously-viewed transcripts, keyed by
-   * conversation id. `switchTo` stashes the outgoing conversation here and
-   * paints the incoming one from it, so a switch-back renders instantly;
-   * `bindStream` still refetches and reconciles by item id behind it.
-   * Capped at {@link CONVERSATION_BLOCK_CACHE_LIMIT}.
-   */
-  blocksByConversation: Record<string, CachedConversation>;
-  /**
-   * The block identities `switchTo` restored from the cache for the current
-   * conversation, or `null` on a cold load. They are a placeholder for the
-   * fresh snapshot, so `bindStream`'s reconcile excludes them and merges
-   * against the live pump's blocks alone — exactly as a cold load does.
-   */
-  restoredCacheBlocks: Set<AnyBlock> | null;
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -532,12 +488,8 @@ export interface ChatState {
    * suggest ``/skill-name``.
    */
   skills: SkillSummary[];
-  /**
-   * Codex app-server model options for the active codex-native session.
-   * Populated from the session snapshot and updated when the server's
-   * background Codex ``model/list`` fetch lands.
-   */
-  codexModelOptions: CodexModelOption[];
+  /** Runner-owned model picker rows for the active native session. */
+  codexModelOptions: NativeModelOption[];
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Seeded from
@@ -725,6 +677,9 @@ export interface ChatState {
 }
 
 let queryClient: QueryClient | null = null;
+
+// Catalogs that resolved while their bind snapshot was still hydrating.
+const racedNativeModelOptions = new Map<string, NativeModelOption[]>();
 let pendingSeq = 0;
 let queueSeq = 0;
 // Tail of the send chain. Each `send` waits on the previous send's network
@@ -943,8 +898,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   pendingUserMessages: [],
   queuedMessages: [],
   pendingByConversation: {},
-  blocksByConversation: {},
-  restoredCacheBlocks: null,
   activeResponse: null,
   interruptedResponseIds: [],
   status: "idle",
@@ -1063,14 +1016,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   maybeFlushQueuedHead: () => {
     const s = get();
-    // Only when fully idle: both the local send lifecycle AND the server-side
-    // session status. No agent → nothing to send to.
+    // Flush once the agent loop is free to take a turn. `waiting` is NOT busy:
+    // the turn already ended and only background work (background shells /
+    // sub-agents) outlives it, so the server accepts a new turn immediately —
+    // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
+    // an actively `running` turn gate the flush. No agent → nothing to send to.
     if (
       s.conversationId === null ||
       s.boundAgentId === null ||
       s.status === "streaming" ||
-      s.sessionStatus === "running" ||
-      s.sessionStatus === "waiting"
+      s.sessionStatus === "running"
     ) {
       return;
     }
@@ -1629,61 +1584,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
           delete pendingByConversation[s.conversationId];
         }
       }
-      // Stash the outgoing conversation's rendered transcript so switching
-      // back to it paints from memory instead of blanking on the network.
-      // In-flight ``live:*`` previews are dropped: they belong to a turn
-      // that is still streaming, and re-serving them later would bleed a
-      // half-written bubble into the restored view. A conversation still
-      // loading has nothing worth keeping.
-      const blocksByConversation = { ...s.blocksByConversation };
-      if (s.conversationId !== null && !s.loadingConversation) {
-        const committed = s.blocks.filter((b) => !isLiveProvisionalBlock(b));
-        if (committed.length > 0) {
-          blockCacheSeq += 1;
-          blocksByConversation[s.conversationId] = {
-            blocks: committed,
-            oldestItemId: s.oldestItemId,
-            hasMoreHistory: s.hasMoreHistory,
-            sessionStatus: s.sessionStatus,
-            seq: blockCacheSeq,
-          };
-        }
-      }
-      const cached = conversationId !== null ? blocksByConversation[conversationId] : undefined;
       return {
         pendingByConversation,
-        blocksByConversation: evictColdestConversations(blocksByConversation),
         conversationId,
         // Clear any pending supersession redirect: we've now switched
         // sessions, so a leftover target (e.g. already consumed by the
         // navigate that brought us here) must not fire again.
         redirectToConversationId: null,
-        // Paint the cached transcript when we have one (bindStream still
-        // refetches and reconciles behind it), else start empty. Either way
-        // the outgoing session's in-flight preview blocks (``live:*``) are
-        // gone, so they never bleed across.
-        blocks: cached?.blocks ?? [],
-        restoredCacheBlocks: cached !== undefined ? new Set(cached.blocks) : null,
+        // Cleared here, so a different session's in-flight preview blocks
+        // (``live:*``) never bleed across.
+        blocks: [],
         pendingUserMessages:
           conversationId !== null ? (pendingByConversation[conversationId]?.messages ?? []) : [],
         activeResponse: null,
         interruptedResponseIds: [],
         status: "idle",
-        sessionStatus: cached?.sessionStatus ?? "idle",
+        sessionStatus: "idle",
         backgroundTaskCount: 0,
         isNativeTerminalSession: false,
         nativeVendorOwnsModel: false,
         boundAgentId: null,
         boundAgentName: null,
-        // A cached transcript is already on screen: revalidate silently
-        // rather than blanking it behind the loading state.
-        loadingConversation: conversationId !== null && cached === undefined,
+        loadingConversation: conversationId !== null,
         conversationLoadError: null,
-        // Restored atomically with the cached blocks, or scroll-up paging
-        // would silently break on the instant render.
-        hasMoreHistory: cached?.hasMoreHistory ?? false,
+        hasMoreHistory: false,
         loadingMoreHistory: false,
-        oldestItemId: cached?.oldestItemId ?? null,
+        oldestItemId: null,
         llmModel: null,
         sessionHarness: null,
         // ``selectedEffort`` / ``selectedModel`` are sticky user picks —
@@ -2068,11 +1994,41 @@ function isNativeModelCompatible(
   session: Session,
 ): boolean {
   switch (family) {
-    case "claude":
-      return isClaudeNativeModel(model);
+    case "claude": {
+      const options = session.codexModelOptions ?? [];
+      return (
+        isClaudeNativeModel(model) &&
+        options.some((option) => option.id === model || option.model === model)
+      );
+    }
     case "codex":
       return isCodexNativeModel(session.codexModelOptions ?? [], model);
   }
+}
+
+/**
+ * Recover a persisted native-model preference once its live catalog arrives.
+ *
+ * Bind snapshots deliberately invalidate runner-backed catalogs, so an empty
+ * option list at bind time means "loading," not "removed." The in-memory
+ * selection is cleared until compatibility can be checked; local storage keeps
+ * the preference available for this delayed handoff.
+ */
+function deferredNativeStickyModel(session: Session): string | null {
+  const family = nativeModelFamilyForSession(session);
+  if (
+    family === null ||
+    session.parentSessionId != null ||
+    session.costControlModeOverride === "on" ||
+    session.modelOverride != null
+  ) {
+    return null;
+  }
+  const stickyModel =
+    useChatStore.getState().selectedModel ?? loadPickerPref(PICKER_PREF_MODEL_KEY);
+  return stickyModel != null && isNativeModelCompatible(family, stickyModel, session)
+    ? stickyModel
+    : null;
 }
 
 /**
@@ -2347,6 +2303,7 @@ async function bindStream(
   get: Getter,
   hydratePending = false,
 ): Promise<void> {
+  racedNativeModelOptions.delete(id);
   const controller = new AbortController();
   set({ abortController: controller });
 
@@ -2470,40 +2427,33 @@ async function bindStream(
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
     set((state) => {
-      // The fresh initial window is the newest page. It still connects to a
-      // restored transcript when the two share an item id: the cache then
-      // extends contiguously from that overlap (older pages above, newer items
-      // to append), so keep the full restored transcript as the base and fold
-      // the window in — otherwise a scrolled-up multi-page transcript would
-      // collapse back to its last page. With NO shared id the cache is stale
-      // or disconnected from the current tail (e.g. many items committed while
-      // away), so drop it and rebuild from the window, as a cold load does.
-      const restored = state.restoredCacheBlocks;
-      const restoredItemIds =
-        restored === null
-          ? null
-          : new Set(
-              [...restored].map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
-            );
-      const overlapsRestored =
-        restoredItemIds !== null &&
-        snapshotBlocks.some((b) => b.ctx.itemId != null && restoredItemIds.has(b.ctx.itemId));
-      // On a cold load / dropped cache, ``priorBlocks`` is the live pump's
-      // blocks alone; on a kept cache it is the full restored transcript.
-      const priorBlocks = overlapsRestored
-        ? state.blocks
-        : restored === null
-          ? state.blocks
-          : state.blocks.filter((b) => !restored.has(b));
+      const racedOptions = racedNativeModelOptions.get(id);
+      const catalogWonBindRace =
+        bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
+      const effectiveBindingPatch = catalogWonBindRace
+        ? { ...bindingPatch, codexModelOptions: racedOptions! }
+        : bindingPatch;
+      // The raced branch preserves the selection the deferred handoff
+      // applied — but only when that selection exists in the raced catalog.
+      // A sticky pick the handoff REJECTED (e.g. a removed alias) must not
+      // linger visually selected with no server override behind it.
+      const preservedModelValid =
+        !catalogWonBindRace ||
+        state.selectedModel == null ||
+        nativeModelFamily === null ||
+        isNativeModelCompatible(nativeModelFamily, state.selectedModel, {
+          ...session,
+          codexModelOptions: racedOptions!,
+        });
       const seenItemIds = new Set(
-        priorBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
-      // Dedupe against any elicitation blocks already present — from the live
-      // pump or the restored transcript (the snapshot may race ahead of or
-      // behind the SSE event, so match by elicitationId).
+      // Dedupe against any elicitation blocks already produced by
+      // the live pump (the snapshot may race ahead of or behind
+      // the SSE event — match by elicitationId).
       const seenElicitationIds = new Set(
-        priorBlocks
+        state.blocks
           .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
           .map((b) => b.elicitationId),
       );
@@ -2521,14 +2471,7 @@ async function bindStream(
       // live blocks the pump already inserted) so the ApprovalCard
       // appears at the bottom of the chat — same position the live
       // stream would have given it.
-      // In-flight ``live:*`` previews belong to the turn streaming NOW, so
-      // any item committed while away (``unique``) is older and must land
-      // above them — matching the cold branch's committed-before-live order.
-      const priorLive = priorBlocks.filter(isLiveProvisionalBlock);
-      const priorCommitted = priorBlocks.filter((b) => !isLiveProvisionalBlock(b));
-      const allBlocks = overlapsRestored
-        ? [...priorCommitted, ...unique, ...priorLive, ...uniquePendingElicitations]
-        : [...unique, ...priorBlocks, ...uniquePendingElicitations];
+      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
@@ -2633,21 +2576,14 @@ async function bindStream(
             }
           : null;
       return {
-        ...bindingPatch,
+        ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
-        // The snapshot has superseded whatever the cache painted.
-        restoredCacheBlocks: null,
         pendingUserMessages: snapshotPending,
         pendingByConversation: prunedStash,
         loadingConversation: false,
-        // A kept restored transcript already holds pages older than the fresh
-        // initial window, so preserve its deeper cursor/flag — overwriting them
-        // with the shallow window would strand the paged-in history and break
-        // scroll-up. A cold load or dropped cache takes the fresh window.
-        hasMoreHistory: overlapsRestored ? state.hasMoreHistory : page.hasMore,
-        oldestItemId: overlapsRestored ? state.oldestItemId : oldestItemId,
-        // The window cursor moved: void any in-flight loadMoreHistory so a
-        // cursor-relative page can't prepend out of order.
+        hasMoreHistory: page.hasMore,
+        oldestItemId,
+        // The window cursor was reset: void any in-flight loadMoreHistory.
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
@@ -2657,11 +2593,15 @@ async function bindStream(
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
         backgroundTaskCount: session.backgroundTaskCount ?? 0,
         selectedEffort: effectiveEffort,
-        selectedModel: effectiveModel,
+        selectedModel:
+          catalogWonBindRace && preservedModelValid ? state.selectedModel : effectiveModel,
         // Session truth for the `/model` readout — overrides the snapshot
         // value spread via `...bindingPatch` so the claude-native sticky
         // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: effectiveSessionOverride,
+        sessionModelOverride:
+          catalogWonBindRace && preservedModelValid
+            ? state.sessionModelOverride
+            : effectiveSessionOverride,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -2672,6 +2612,7 @@ async function bindStream(
         }>,
       };
     });
+    racedNativeModelOptions.delete(id);
   } catch (err) {
     if (get().conversationId !== id) return;
     set({
@@ -2801,6 +2742,14 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  // `waiting` is a TURN-END snapshot (the turn finished; only background work
+  // outlives it), so it settles the local send lifecycle like `idle` — it must
+  // NOT reopen a streaming response. The server keeps `active_response_id`
+  // populated across `waiting` (it only pops on idle/failed), so grouping
+  // `waiting` with `running` below would re-open "streaming" on a reload/
+  // reconnect and strand the composer on the "(queued)" placeholder — re-queuing
+  // sends, the exact behavior this fix removes. `sessionStatus` stays `waiting`
+  // and `backgroundTaskCount` is recovered above, so the spinner survives.
   if (
     (session.status === "idle" || session.status === "failed") &&
     s.activeResponse?.state === "streaming"
@@ -2811,8 +2760,15 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
       error: null,
     };
     patch.status = "idle";
+  } else if (session.status === "waiting") {
+    // Turn ended, background work remains. Finalize a still-streaming response
+    // and free the local send lifecycle so the composer dispatches a new turn.
+    if (s.activeResponse?.state === "streaming") {
+      patch.activeResponse = { ...s.activeResponse, state: "completed", error: null };
+    }
+    patch.status = "idle";
   } else if (
-    (session.status === "running" || session.status === "waiting") &&
+    session.status === "running" &&
     session.activeResponseId != null &&
     s.activeResponse?.responseId !== session.activeResponseId
   ) {
@@ -3954,12 +3910,14 @@ interface RefetchRunnerBackedSessionStateOptions {
   refreshState?: boolean;
   /** Apply the broader binding metadata patch in addition to capabilities. */
   applyBindingPatch?: boolean;
+  /** The server has signalled that its model-options cache is populated. */
+  modelOptionsResolved?: boolean;
 }
 
 /**
  * Refetch runner-backed session state and apply it to the store.
  *
- * Skills and codex-native model options are runner-owned. When a session
+ * Skills and native model options are runner-owned. When a session
  * binds before those background fetches land, the snapshot carries empty
  * lists. The server later sends a bare nudge; refetching the snapshot is
  * how the store pulls the cache-warmed fields without clobbering live chat
@@ -3992,6 +3950,12 @@ async function refetchRunnerBackedSessionState(
     } else {
       session = await getSessionSlim(conversationId, { refreshState: options.refreshState });
     }
+    if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length === 0) {
+      // The event can race the bind snapshot's in-flight query. Once that
+      // request settles, issue a second read instead of accepting its stale [].
+      session = await getSessionSlim(conversationId);
+      queryClient?.setQueryData(["session", conversationId], session);
+    }
   } catch {
     // The runner may have dropped again before the fetch landed. Keep
     // the existing state rather than wiping it on a transient error.
@@ -4001,14 +3965,34 @@ async function refetchRunnerBackedSessionState(
   // while the request was in flight; applying now would leak another
   // session's capabilities into the open composer.
   if (useChatStore.getState().conversationId !== conversationId) return;
-  useChatStore.setState(
+  if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
+    racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
+  }
+  const currentState = useChatStore.getState();
+  const stickyModel = deferredNativeStickyModel(session);
+  const alreadyApplied = stickyModel != null && currentState.sessionModelOverride === stickyModel;
+  const statePatch: Partial<ChatState> =
     options.applyBindingPatch === true
       ? sessionBindingPatch(session)
       : {
           skills: session.skills ?? [],
           codexModelOptions: session.codexModelOptions ?? [],
-        },
-  );
+        };
+  if (stickyModel != null) {
+    statePatch.selectedModel = stickyModel;
+    statePatch.sessionModelOverride = stickyModel;
+  }
+  useChatStore.setState(statePatch);
+  if (stickyModel != null && !alreadyApplied) {
+    updateSession(conversationId, { modelOverride: stickyModel, silent: true }).catch(
+      (err: unknown) => {
+        console.warn(
+          `Failed to apply delayed sticky model=${stickyModel} to session ${conversationId}:`,
+          err,
+        );
+      },
+    );
+  }
 }
 
 /**
@@ -4063,25 +4047,6 @@ function contentKeyOf(content: MessageContentBlock[]): string {
     return v;
   };
   return JSON.stringify(canonical(content));
-}
-
-/**
- * Trim the transcript cache back to {@link CONVERSATION_BLOCK_CACHE_LIMIT},
- * dropping the least-recently-viewed conversations first. Without a cap a
- * long browsing session would hold every transcript it ever opened.
- */
-function evictColdestConversations(
-  cache: Record<string, CachedConversation>,
-): Record<string, CachedConversation> {
-  const ids = Object.keys(cache);
-  if (ids.length <= CONVERSATION_BLOCK_CACHE_LIMIT) return cache;
-  const next = { ...cache };
-  for (const id of ids
-    .sort((a, b) => cache[a]!.seq - cache[b]!.seq)
-    .slice(0, ids.length - CONVERSATION_BLOCK_CACHE_LIMIT)) {
-    delete next[id];
-  }
-  return next;
 }
 
 /**
@@ -4313,16 +4278,13 @@ export function handleSessionEvent(event: StreamEvent): void {
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
       useChatStore.setState((s) => {
-        if (
-          event.status === "idle" &&
-          event.responseId === undefined &&
-          s.activeResponse?.state === "streaming"
-        ) {
-          // A denied queued input publishes running→idle while the prior
-          // response is still streaming. That idle must not clear the
-          // prior turn's working signal; response_end owns that lifecycle.
-          return {};
-        }
+        // `sessionStatus` tracks the server's session-level status 1:1 — a
+        // server `idle` means the session is idle, full stop, and the
+        // "Working…" indicator (which reads only `sessionStatus`) turns off.
+        // There is exactly one idle heuristic and it lives server-side (the
+        // runner's PTY-activity watcher); the client must not second-guess it.
+        // The bubble lifecycle below (`status`/`activeResponse`) still defers
+        // to response_end, but that is separate from the session-level status.
         const patch: Partial<ChatState> = { sessionStatus: event.status };
         // The background-shell tally is STICKY. Only the Stop-hook-derived
         // status carries an authoritative count (the forwarder relabels its
@@ -4342,10 +4304,7 @@ export function handleSessionEvent(event: StreamEvent): void {
         } else if (event.status === "running" || event.status === "failed") {
           patch.backgroundTaskCount = 0;
         }
-        if (
-          event.responseId !== undefined &&
-          (event.status === "running" || event.status === "waiting")
-        ) {
+        if (event.responseId !== undefined && event.status === "running") {
           patch.status = "streaming";
           patch.activeResponse = {
             responseId: event.responseId,
@@ -4353,7 +4312,17 @@ export function handleSessionEvent(event: StreamEvent): void {
             error: null,
           };
         }
-        if (event.status === "idle" || event.status === "failed") {
+        // `waiting` is a TURN-END edge (the turn already finished; only
+        // background work — background shells / sub-agents — outlives it). It
+        // must finalize the local send lifecycle exactly like `idle`, NOT keep
+        // it "streaming": the composer's send gate and "(queued)" placeholder
+        // key off local `status`, so leaving it streaming would queue every new
+        // message until the background work ends. The claude/cursor-native Stop
+        // hook posts `waiting` WITH the ended turn's `response_id`, so it lands
+        // here rather than via a bare PTY `idle`. `sessionStatus` stays
+        // `waiting` (set above) and `backgroundTaskCount` is untouched, so the
+        // "Working…" spinner and sidebar dot keep reflecting the background work.
+        if (event.status === "idle" || event.status === "failed" || event.status === "waiting") {
           if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
             if (s.activeResponse.state !== "cancelled") {
@@ -4365,6 +4334,16 @@ export function handleSessionEvent(event: StreamEvent): void {
             }
           } else if (s.activeResponse === null) {
             patch.status = "idle";
+          } else if (event.status === "waiting") {
+            // Turn ended (background work remains) but the `waiting` edge's id
+            // doesn't match the tracked response — free the send lifecycle
+            // anyway so a new message isn't stranded behind background work,
+            // and finalize a still-streaming bubble so it doesn't linger with a
+            // spinner that no edge will ever close.
+            patch.status = "idle";
+            if (s.activeResponse?.state === "streaming") {
+              patch.activeResponse = { ...s.activeResponse, state: "completed", error: null };
+            }
           }
           // Clear ALL pending user messages on terminal status. Any
           // message still pending when the session reaches idle was
@@ -4669,10 +4648,12 @@ export function handleSessionEvent(event: StreamEvent): void {
       void refetchRunnerBackedSessionState(event.conversationId);
       return;
     case "session_model_options":
-      // Codex app-server `model/list` just resolved. Refetch the
-      // cache-warmed snapshot and apply `codexModelOptions`; the picker
-      // derives both model rows and effort levels from that catalog.
-      void refetchRunnerBackedSessionState(event.conversationId);
+      // A runner-owned native model catalog just resolved. Refetch the
+      // cache-warmed snapshot so the picker and any delayed sticky handoff
+      // use the same authoritative options.
+      void refetchRunnerBackedSessionState(event.conversationId, {
+        modelOptionsResolved: true,
+      });
       return;
     case "tool_result":
       // Tool results are not a reliable correlation signal for

@@ -204,11 +204,13 @@ async def _drive(base_url: str, created_session_id: str) -> None:
             def option(agent_id: str):
                 return page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
 
-            # Agent A is offered as the NEWER upload id — the stale template id
-            # must not appear (it was superseded). The seeded debby is present
-            # and untouched.
-            await expect(option(_UPLOAD_ID)).to_be_visible()
+            # The seeded (built-in) debby lists inline. Agent A is a custom
+            # agent, so it lives in the "Custom agents" submenu — drill in.
             await expect(option(_DEBBY_ID)).to_be_visible()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
+            # Agent A is offered as the NEWER upload id — the stale template id
+            # must not appear (it was superseded).
+            await expect(option(_UPLOAD_ID)).to_be_visible()
             assert await option(_TEMPLATE_ID).count() == 0, (
                 "stale template version leaked into the picker"
             )

@@ -258,17 +258,17 @@ def bootstrap_admin(
       creates with that password. Skips the auto-handoff entirely
       (the operator already knows the credential and wants the
       standard typed-login flow).
-    - ``admin`` missing, no pre-seed → mints a fresh random
-      password, writes it to stderr + the credentials file,
-      creates the user. ON LOOPBACK base URL ONLY: also mints
-      a magic-redeem URL + a CLI session token so the browser
-      and TUI sign in without typing.
+    - ``admin`` missing, no pre-seed → creates nothing and reports
+      ``needs_setup=True`` so the operator claims the first admin
+      through the web Create-admin form (``POST /auth/setup``) or a
+      terminal prompt. No password is ever auto-generated. On a
+      loopback base URL, ``open_url`` is set so the lifespan opens
+      the browser to that form; otherwise the "no admin yet" URL is
+      printed to stderr.
 
-    Ordering: the user row is persisted BEFORE the handoff tokens
-    so a token can never reference a non-existent user. If row
-    creation fails, no tokens are minted and the credentials
-    file's password is orphaned — recoverable by deleting the
-    file and rebooting.
+    Ordering (pre-seed path only): the user row is persisted BEFORE
+    any loopback handoff tokens so a token can never reference a
+    non-existent user.
 
     :param account_store: The accounts-specific store backing user
         identity + tokens. Mutually exclusive with PermissionStore

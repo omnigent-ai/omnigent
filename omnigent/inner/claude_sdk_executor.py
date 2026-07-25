@@ -46,6 +46,7 @@ from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
 from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
@@ -68,6 +69,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
+from .native_attachments import unresolved_attachment_marker
 from .sandbox import (
     create_exec_launcher,
     get_backend,
@@ -329,6 +331,184 @@ _QUERY_START_TIMEOUT_SECONDS = 30.0
 _STREAM_IDLE_WARN_SECONDS = 600.0
 
 # ── Multimodal content block conversion ──────────────────────
+
+
+def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ignore[explicit-any]
+    """If ``value`` contains an inline ``data:*;base64,...`` URI, return its
+    ``(media_type, base64_char_count)``; otherwise ``None``.
+
+    A resolved attachment block looks like::
+
+        {"type": "input_image",
+         "filename": "screenshot.png",
+         "image_url": "data:image/png;base64,iVBORw0KGgoAAAANS...=="}   # ~520k chars
+
+    (non-image files carry the same payload under ``file_data`` instead of
+    ``image_url``.) Returns e.g. ``("image/png", 519324)`` — the media type and
+    payload size used to build the compact
+    ``[image: screenshot.png, image/png, 519324 base64 chars]`` placeholder,
+    so the raw base64 never lands in the ``Conversation so far:`` prompt text.
+    """
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is not None:
+            return parsed.media_type, len(parsed.data)
+        return None
+    if isinstance(value, list):
+        for item in value:
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _get_inline_data_uri_info(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
+    """Deep-replace any whole-string inline base64 data URI with a compact
+    ``[attachment: …]`` marker, recursing through dict/list values. The fallback
+    path for values that reach ``json.dumps`` (nested dicts, non-block content)
+    so a resolver-produced base64 payload does not survive serialization. Only
+    whole-string data-URI values are redacted — not data URIs used as dict keys,
+    tuple members, or substrings embedded mid-text (the runner never emits
+    those)."""
+    if isinstance(value, str):
+        parsed = _parse_replay_data_uri(value)
+        if parsed is None:
+            return value
+        return f"[attachment: {parsed.media_type}, {len(parsed.data)} base64 chars]"
+    if isinstance(value, list):
+        return [_redact_inline_base64(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_inline_base64(item) for key, item in value.items()}
+    return value
+
+
+def _text_block(text: str) -> dict[str, Any]:  # type: ignore[explicit-any]
+    """Build an Anthropic text content block holding *text*."""
+    return {"type": "text", "text": text}
+
+
+def _coalesce_text_blocks(  # type: ignore[explicit-any]
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Merge runs of adjacent text blocks into one newline-joined block.
+
+    Keeps the replayed transcript readable as prose and makes the
+    text-only history render byte-identical to a plain string prompt.
+
+    :param blocks: Anthropic content blocks in transcript order.
+    :returns: The same sequence with consecutive text blocks merged.
+    """
+    merged: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+    for block in blocks:
+        if block.get("type") == "text" and merged and merged[-1].get("type") == "text":
+            merged[-1] = _text_block(f"{merged[-1]['text']}\n{block['text']}")
+        else:
+            merged.append(block)
+    return merged
+
+
+def _structured_history_block(  # type: ignore[explicit-any]
+    block: dict[str, Any],
+) -> dict[str, Any] | None:
+    """
+    Convert a resolved history attachment to a real Anthropic block.
+
+    :param block: A prior-turn content block carrying an inline data URI.
+    :returns: The ``image``/``document`` block, or ``None`` when the block
+        is not a convertible attachment shape — the caller then falls back
+        to the compact text marker rather than dropping the attachment.
+    """
+    if block.get("type") not in ("input_image", "input_file"):
+        return None
+    try:
+        # Covers a malformed data URI and a bad base64 payload alike
+        # (``binascii.Error`` subclasses ``ValueError``).
+        converted = _to_anthropic_content_blocks([block])
+    except ValueError:
+        return None
+    return converted[0] if converted else None
+
+
+def _render_prior_content_blocks(  # type: ignore[explicit-any]
+    content: Any,
+) -> list[dict[str, Any]]:
+    """Render one prior message's content for the ``Conversation so far:``
+    replay as Anthropic content blocks.
+
+    Why this exists: ``_build_prompt`` only serializes prior history when
+    ``resume_session=False`` — a *fresh* SDK client that must replay existing
+    multimodal history (forked/shared sessions, sub-agents with
+    ``pass_history=True``, or a client restarted mid-session). By that point a
+    historical image/file block's ``file_id`` has already been resolved to a
+    ``data:<media>;base64,...`` URI.
+
+    Those resolved attachments are replayed as **structured** ``image`` /
+    ``document`` blocks, interleaved in order with the surrounding text, so the
+    cold-started client can actually inspect the image instead of reading a
+    description of it. Structured blocks are also what keeps the prompt small:
+    ``json.dumps()``-ing the block flattened the whole base64 payload into
+    prompt TEXT, so the model tokenized the bytes as text rather than counting
+    them as an image — seven ~390KB PNGs expand to ~2.5M tokens, and one real
+    shared session hit a 3.5M-token prompt against a 1M limit.
+
+    Anything that cannot become a structured block never leaks bytes into text.
+    A resolver-produced inline attachment *value* — a whole-string
+    ``data:*;base64,...`` under ``image_url`` / ``file_data``, including nested
+    in dict/list values — is redacted, and an unconvertible attachment falls
+    back to a compact ``[image/attachment: <id>, <media_type>, <N> base64
+    chars]`` marker that preserves *that an attachment was present* without its
+    bytes. An attachment the resolver never inlined renders as the visible
+    "could not be loaded" marker. (This does not attempt to cover non-resolver
+    shapes such as a data URI used as a dict key, a tuple member, or a substring
+    embedded mid-text — the runner never emits those.)
+    """
+    if isinstance(content, str):
+        sanitized = _redact_inline_base64(content)
+        return [_text_block(str(sanitized))]
+    if not isinstance(content, list):
+        return [_text_block(json.dumps(_redact_inline_base64(content), ensure_ascii=True))]
+
+    rendered: list[dict[str, Any]] = []  # type: ignore[explicit-any]
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            text = block.get("text")
+            if block_type in ("input_text", "output_text", "text") and isinstance(text, str):
+                rendered.append(_text_block(str(_redact_inline_base64(text))))
+                continue
+
+            inline_data = _get_inline_data_uri_info(block)
+            if inline_data is not None:
+                structured = _structured_history_block(block)
+                if structured is not None:
+                    rendered.append(structured)
+                    continue
+                media_type, payload_chars = inline_data
+                kind = "image" if block_type == "input_image" else "attachment"
+                identifier = block.get("filename") or block.get("file_id") or block_type
+                rendered.append(
+                    _text_block(
+                        f"[{kind}: {identifier}, {media_type}, {payload_chars} base64 chars]"
+                    )
+                )
+                continue
+
+            if block.get("file_id"):
+                # No inline bytes and no resolved payload: the resolver never
+                # inlined this attachment. Serializing the raw block would read
+                # as if the attachment were present; say it was lost instead.
+                rendered.append(_text_block(unresolved_attachment_marker(block)))
+                continue
+
+        rendered.append(_text_block(json.dumps(_redact_inline_base64(block), ensure_ascii=True)))
+    return rendered
 
 
 def _parse_data_uri(uri: str) -> tuple[str, str]:
@@ -689,7 +869,11 @@ def _augment_system_prompt_for_omnigent_mcp_tools(
     if not tool_names:
         return system_prompt
 
-    examples = [name for name in ("sys_session_send", "sys_session_create") if name in tool_names]
+    examples = [
+        name
+        for name in ("sys_session_rename", "sys_session_send", "sys_session_create")
+        if name in tool_names
+    ]
     if examples:
         example_text = "; ".join(
             f"use `mcp__omnigent__{name}` when instructions say `{name}`" for name in examples
@@ -2748,29 +2932,38 @@ class ClaudeSDKExecutor(Executor):
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
         prior = messages[:-1] if messages else []
 
-        lines = ["Conversation so far:"]
+        prior_blocks: list[dict[str, Any]] = [  # type: ignore[explicit-any]
+            _text_block("Conversation so far:")
+        ]
         for msg in prior:
             role = str(msg.get("role", "user")).replace("_", " ")
             raw_content = msg.get("content")
-            if raw_content is None:
-                content = ""
-            elif isinstance(raw_content, str):
-                content = raw_content
+            rendered = [] if raw_content is None else _render_prior_content_blocks(raw_content)
+            if not rendered:
+                rendered = [_text_block("")]
+            # Label the message inline when it opens with text; an attachment
+            # that leads the message gets the label on its own line instead.
+            if rendered[0].get("type") == "text":
+                rendered[0] = _text_block(f"{role}: {rendered[0]['text']}")
             else:
-                content = json.dumps(raw_content, ensure_ascii=True)
-            lines.append(f"{role}: {content}")
-        lines.append("")
-        lines.append(
-            "Respond to the latest user message, using the conversation above as context."
+                rendered.insert(0, _text_block(f"{role}:"))
+            prior_blocks.extend(rendered)
+        prior_blocks.append(_text_block(""))
+        prior_blocks.append(
+            _text_block(
+                "Respond to the latest user message, using the conversation above as context."
+            )
         )
-        history_prefix = "\n".join(lines)
+        prior_blocks = _coalesce_text_blocks(prior_blocks)
 
         if isinstance(latest_content, list):
-            return [
-                {"type": "text", "text": history_prefix},
-                *latest_content,
-            ]
-        return f"{history_prefix}\n\nuser: {latest_content}"
+            return [*prior_blocks, *latest_content]
+        # Coalescing leaves an all-text history as the single opening block, so
+        # more than one block means an attachment survived and the prompt has
+        # to stay structured for its bytes to reach the model.
+        if len(prior_blocks) > 1:
+            return [*prior_blocks, _text_block(f"\nuser: {latest_content}")]
+        return f"{prior_blocks[0]['text']}\n\nuser: {latest_content}"
 
     @staticmethod
     def _extract_latest_user_content(

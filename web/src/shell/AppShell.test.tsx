@@ -320,6 +320,9 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
     public_sharing_enabled: true,
     server_version: null,
     smart_routing_enabled: false,
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
     ...overrides,
   };
 }
@@ -1608,6 +1611,27 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it("reserves the visible pane width plus its two desktop margins from the header", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_offset", permission_level: null }]);
+
+    renderShell("/c/conv_offset");
+
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    const panelWidth = Number.parseFloat(panel.style.width);
+    const headerGroup = panel.parentElement;
+    expect(headerGroup?.querySelector("header")).not.toBeNull();
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe(
+      `${panelWidth + 16}px`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
+    expect(headerGroup?.style.getPropertyValue("--workspace-panel-offset")).toBe("0px");
+  });
+
   it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
     // A no-os_env agent (available: false) with no shells and no todos
     // still has the unconditional Agents tab (the panel lists at least
@@ -2786,9 +2810,11 @@ describe("AppShell clone/fork action", () => {
 
 describe("AppShell share action", () => {
   it("shows the Share button to an owner of a top-level session", () => {
-    // permission_level null = owner. A top-level session can be shared.
+    // permission_level 4 = owner. Share is owner-only; a top-level session
+    // the viewer owns can be shared. (A multi-user owner's list row carries
+    // level 4; null only occurs in single-user mode, where Share is hidden.)
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top");
 
@@ -2800,7 +2826,7 @@ describe("AppShell share action", () => {
 
   it("disables the Share button when the server is local", () => {
     withWindowOrigin("http://localhost:6767", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top");
 
@@ -2819,7 +2845,7 @@ describe("AppShell share action", () => {
     // Non-local origin isolates the reason to the server policy (not the
     // local-server path), so the tooltip must be the sharing-off message.
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top", serverInfo({ sharing_mode: "off" }));
 
@@ -2852,7 +2878,7 @@ describe("AppShell share action", () => {
     // shape as single-user, but single_user is false — the button must stay.
     // This is the regression the single_user signal fixes.
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top", serverInfo({ single_user: false }));
 
@@ -2866,7 +2892,7 @@ describe("AppShell share action", () => {
     // read_only still permits (read) grants, so the affordance stays live —
     // the modal caps the level, the button is not disabled.
     withWindowOrigin("https://app.example.com", () => {
-      mockConversations([{ id: "conv_top", permission_level: null }]);
+      mockConversations([{ id: "conv_top", permission_level: 4 }]);
 
       renderShell("/c/conv_top", serverInfo({ sharing_mode: "read_only" }));
 
@@ -2952,7 +2978,7 @@ describe("Mobile header actions menu", () => {
       mockConversations([
         {
           id: "conv_host",
-          permission_level: null,
+          permission_level: 4,
           labels: {},
           host_id: "host_a1b2",
           runner_id: "runner_token_abc",
@@ -2979,7 +3005,7 @@ describe("Mobile header actions menu", () => {
 
   it("disables the mobile Share item when the server is local", () => {
     withWindowOrigin("http://127.0.0.1:6767", () => {
-      mockConversations([{ id: "conv_host", permission_level: null, labels: {} }]);
+      mockConversations([{ id: "conv_host", permission_level: 4, labels: {} }]);
 
       renderShell("/c/conv_host");
       openActionsMenu();

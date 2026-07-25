@@ -28,7 +28,10 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => mocks.del,
-  usePinnedConversationBackfill: () => [],
+  usePinnedConversations: () => ({ data: [], isSuccess: true }),
+  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  setConversationPinned: vi.fn(() => Promise.resolve({})),
+  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   // Rename/archive are wired on the row but not exercised here; minimal
   // stubs keep the row from crashing on mount.
   useRenameConversation: () => ({ mutate: vi.fn() }),
@@ -40,6 +43,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useProjects: () => ({ data: [] }),
   useMoveToProject: () => ({ mutate: vi.fn() }),
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
