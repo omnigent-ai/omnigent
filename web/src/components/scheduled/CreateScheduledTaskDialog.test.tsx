@@ -181,7 +181,9 @@ function scheduledTask(overrides: Partial<import("@/lib/scheduledTasksApi").Sche
     hostId: null,
     state: "active",
     lastRunAt: null,
+    lastRunStatus: null,
     lastRunConversationId: null,
+    nextRunAt: null,
     ...overrides,
   } satisfies import("@/lib/scheduledTasksApi").ScheduledTask;
 }

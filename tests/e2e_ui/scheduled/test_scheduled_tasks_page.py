@@ -2,10 +2,12 @@
 
 Covers the Scheduled Tasks page row behavior: a task row renders the
 human-readable schedule SUMMARY derived client-side from the stored RRULE
-(``describeSchedule``), and it does NOT render a "Next run in Xh"
-countdown — that was deliberately removed because a client-computed
-next-run can't be guaranteed to match the server's anchor for
-INTERVAL>1 rules, so only the always-correct summary is shown.
+(``describeSchedule``), plus a Run-now action and a relative next-run label
+("Next run in Xh"). That label is a DELTA formatted from the server's
+authoritative ``next_run_at`` (nextRunAt − now) — the client never recomputes
+WHICH instant is next (which couldn't match the server anchor for INTERVAL>1
+rules), so the old "no client-recomputed countdown" rule still holds. See
+``test_scheduled_task_row_run_controls``.
 
 Tasks are seeded through the same REST API the page consumes
 (``POST /v1/scheduled-tasks``), so this asserts the real render path
@@ -81,16 +83,17 @@ def _row_by_name(page: Page, name: str):
     return page.locator('[data-testid="scheduled-task-row"]').filter(has_text=name)
 
 
-def test_scheduled_task_rows_show_schedule_summary_without_countdown(
+def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     page: Page,
     live_server: str,
 ) -> None:
-    """Rows render the RRULE-derived schedule summary and no next-run countdown.
+    """Rows render the RRULE-derived schedule summary + the relative next-run label.
 
     Seeds three tasks whose summaries exercise the daily, weekdays, and
-    hourly-with-minute (the ``describeSchedule`` hourly fix) cases, then
-    asserts each row's schedule line shows the expected text and that the
-    countdown ("Next run") is absent anywhere on the page.
+    hourly-with-minute (the ``describeSchedule`` hourly fix) cases, then asserts
+    each row's schedule line shows the expected summary and that the armed rows
+    carry the server-derived relative "Next run in …" label (a delta from the
+    server's next_run_at, NOT a client-recomputed instant).
     """
     agent_id = _builtin_agent_id(live_server, "hello_world")
 
@@ -112,23 +115,28 @@ def test_scheduled_task_rows_show_schedule_summary_without_countdown(
     rows = page.locator('[data-testid="scheduled-task-row"]')
     expect(rows).to_have_count(3, timeout=30_000)
 
-    # Each row's schedule line shows the client-derived summary text.
+    # Each row's schedule line shows the client-derived summary text. The line
+    # also carries the relative next-run suffix ("· Next run in …") for an armed
+    # active task, so assert the summary is CONTAINED rather than the exact line.
     daily = _row_by_name(page, "Daily digest")
-    expect(daily.get_by_test_id("task-schedule-line")).to_have_text(
+    expect(daily.get_by_test_id("task-schedule-line")).to_contain_text(
         "Every day at 9:00 AM", timeout=30_000
     )
 
     weekday = _row_by_name(page, "Weekday triage")
-    expect(weekday.get_by_test_id("task-schedule-line")).to_have_text("Weekdays at 8:00 AM")
+    expect(weekday.get_by_test_id("task-schedule-line")).to_contain_text("Weekdays at 8:00 AM")
 
     # The hourly-minute fix: interval-1 hourly with a non-zero BYMINUTE shows
     # the minute rather than a bare "Hourly".
     hourly = _row_by_name(page, "Half-past sweep")
-    expect(hourly.get_by_test_id("task-schedule-line")).to_have_text("Hourly at :30")
+    expect(hourly.get_by_test_id("task-schedule-line")).to_contain_text("Hourly at :30")
 
-    # The "Next run in Xh" countdown was removed — it must not appear anywhere
-    # on the page (this pins the decision so it can't silently regress).
-    expect(page.get_by_text("Next run", exact=False)).to_have_count(0)
+    # The next-run label IS shown now — but as a DELTA from the server's
+    # next_run_at ("Next run in Xh/Xd"), not a client-recomputed instant. An
+    # armed daily task is always <24h out, so its label is "Next run in …".
+    # (The forbidden thing was a client recompute of WHICH instant is next; a
+    # delta off the server value is fine.)
+    expect(daily.get_by_test_id("task-next-run")).to_contain_text("Next run in", timeout=30_000)
 
 
 def test_scheduled_task_create_edit_modal_and_time_picker(
@@ -176,7 +184,8 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
 
     created_row = _row_by_name(page, "Typed time daily")
     expect(created_row).to_be_visible(timeout=30_000)
-    expect(created_row.get_by_test_id("task-schedule-line")).to_have_text(
+    # `to_contain_text`: the line may also carry the server next-run suffix.
+    expect(created_row.get_by_test_id("task-schedule-line")).to_contain_text(
         "Every day at 9:37 AM",
         timeout=30_000,
     )
@@ -214,7 +223,58 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(time_input).to_have_value("10:37 AM")
     submit.click()
 
-    expect(edit_row.get_by_test_id("task-schedule-line")).to_have_text(
+    expect(edit_row.get_by_test_id("task-schedule-line")).to_contain_text(
         "Every day at 10:37 AM",
         timeout=30_000,
     )
+
+
+def test_scheduled_task_row_run_controls(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Run controls: relative next-run label, and Run now → a run is recorded.
+
+    LLM-free. The seeded task pins no host, so a manual Run now resolves no online
+    host and records a ``failed`` run. This exercises the real
+    POST /v1/scheduled-tasks/{id}/run path (the ⋯-menu action) end-to-end and
+    confirms the run row is written, without ever dispatching an agent turn. The
+    completion pill was removed from the row UI, so completion is asserted via the
+    server-side run record rather than a visible badge.
+    """
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+    task_id = _create_task(
+        live_server, agent_id, "Run-now target", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+    )
+
+    page.goto(f"{live_server}/tasks")
+    row = _row_by_name(page, "Run-now target")
+    expect(row).to_be_visible(timeout=30_000)
+
+    # Relative next-run renders for an armed active task — a delta off the
+    # server's next_run_at ("Next run in …"), not a client-recomputed instant.
+    expect(row.get_by_test_id("task-next-run")).to_contain_text("Next run in", timeout=30_000)
+
+    # No run has fired yet → the run history is empty.
+    empty = httpx.get(f"{live_server}/v1/scheduled-tasks/{task_id}/runs", timeout=10.0)
+    assert empty.json()["runs"] == []
+
+    # Trigger Run now from the ⋯ menu.
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-run-now").click()
+
+    # The manual fire runs through the shared fire path and records a run row.
+    # With no online host it resolves to a ``failed`` run. Poll the history until
+    # the background fire lands (the POST returns 202 before the run is written).
+    def _has_failed_run() -> bool:
+        runs = httpx.get(f"{live_server}/v1/scheduled-tasks/{task_id}/runs", timeout=10.0).json()[
+            "runs"
+        ]
+        return len(runs) == 1 and runs[0]["status"] == "failed"
+
+    deadline = 0
+    while not _has_failed_run() and deadline < 100:
+        page.wait_for_timeout(200)
+        deadline += 1
+    assert _has_failed_run(), "Run now did not record a failed run within the timeout"

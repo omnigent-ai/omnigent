@@ -917,6 +917,143 @@ def test_list_running_runs_for_tasks_is_workspace_scoped(
         assert [r.id for r in got] == [_uid("run_w11")]
 
 
+# ── list_latest_run_status_for_tasks (Tasks-list completion badge source) ─────
+
+
+def test_list_latest_run_status_for_tasks_returns_most_recent_status(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Returns each task's single most-recent run status by scheduled_at DESC.
+
+    Powers the Tasks-list completion badge in one windowed query. A task with a
+    terminal run followed by a newer run reports the NEWER run's status (so a
+    run-now firing becomes the badge as soon as it is recorded).
+    """
+    for seed in ("a", "b"):
+        store.create(
+            scheduled_task_id=_uid(f"lst_{seed}"),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="u",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+    # task_a: an older succeeded run, then a newer failed run — failed wins.
+    store.create_run(
+        run_id=_uid("lst_a_old"),
+        scheduled_task_id=_uid("lst_a"),
+        status="succeeded",
+        scheduled_at=100,
+        finished_at=105,
+    )
+    store.create_run(
+        run_id=_uid("lst_a_new"),
+        scheduled_task_id=_uid("lst_a"),
+        status="failed",
+        scheduled_at=200,
+        finished_at=205,
+    )
+    # task_b: a single running run.
+    store.create_run(
+        run_id=_uid("lst_b_run"),
+        scheduled_task_id=_uid("lst_b"),
+        status="running",
+        scheduled_at=150,
+    )
+
+    got = store.list_latest_run_status_for_tasks([_uid("lst_a"), _uid("lst_b")])
+    assert got == {_uid("lst_a"): "failed", _uid("lst_b"): "running"}
+
+
+def test_list_latest_run_status_tiebreaks_on_id_desc(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Two runs at the SAME scheduled_at break the tie on id DESC.
+
+    Mirrors ``list_runs``' compound ``(scheduled_at DESC, id DESC)`` order so the
+    reported status matches the run that heads that task's history.
+    """
+    store.create(
+        scheduled_task_id=_uid("lst_tie"),
+        name="tie",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    # Same scheduled_at; the store orders id DESC, so whichever id sorts higher
+    # is "latest". Compute that deterministically and assert its status wins.
+    low_id, high_id = sorted([_uid("tie_x"), _uid("tie_y")])
+    store.create_run(
+        run_id=low_id,
+        scheduled_task_id=_uid("lst_tie"),
+        status="succeeded",
+        scheduled_at=300,
+        finished_at=305,
+    )
+    store.create_run(
+        run_id=high_id,
+        scheduled_task_id=_uid("lst_tie"),
+        status="skipped",
+        scheduled_at=300,
+    )
+    got = store.list_latest_run_status_for_tasks([_uid("lst_tie")])
+    assert got == {_uid("lst_tie"): "skipped"}
+
+
+def test_list_latest_run_status_omits_tasks_with_no_runs(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A task that has never run is absent from the map (badge → never run)."""
+    store.create(
+        scheduled_task_id=_uid("lst_norun"),
+        name="norun",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+    )
+    assert store.list_latest_run_status_for_tasks([_uid("lst_norun")]) == {}
+
+
+def test_list_latest_run_status_empty_ids_returns_empty(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An empty task-id list short-circuits to an empty map (no query)."""
+    assert store.list_latest_run_status_for_tasks([]) == {}
+
+
+def test_list_latest_run_status_is_workspace_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A task's runs are invisible to the latest-status query from another workspace."""
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("lst_w11"),
+            name="w11",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("lst_w11_run"),
+            scheduled_task_id=_uid("lst_w11"),
+            status="succeeded",
+            scheduled_at=100,
+            finished_at=105,
+        )
+    assert store.list_latest_run_status_for_tasks([_uid("lst_w11")]) == {}
+    with workspace_scope(11):
+        assert store.list_latest_run_status_for_tasks([_uid("lst_w11")]) == {
+            _uid("lst_w11"): "succeeded"
+        }
+
+
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
 
 

@@ -241,6 +241,27 @@ function seedPins(ids: string[]) {
 afterEach(cleanup);
 
 describe("Sidebar session list", () => {
+  it("keeps the session list scrollable without visible scrollbar chrome", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
+    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
+    expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
+    expect(scroller.className).not.toContain("scrollbar-gutter");
+  });
+
+  it("uses balanced title padding until row actions are revealed", () => {
+    mockConversations([conv("conv_balanced", "Codex", { title: "Balanced row title" })]);
+    renderSidebar();
+
+    const row = screen.getByText("Balanced row title").closest("a")!;
+    expect(row).toHaveClass("pr-28", "md:pr-2");
+    expect(row.className).toContain("md:group-hover:pr-14");
+    expect(row.className).toContain("md:group-focus-within:pr-14");
+    expect(row.className).not.toMatch(/(?:^|\s)md:pr-14(?:\s|$)/);
+  });
+
   it("renders no filter funnel and requests the list with archived included", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -318,7 +339,31 @@ describe("Sidebar session list", () => {
     expect(inbox).toHaveAttribute("href", "/inbox");
     expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
-    expect(within(primaryNav).getByTestId("toggle-selection-mode")).toBeInTheDocument();
+    expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
+  });
+
+  it("reveals session selection as an icon action on the Sessions header", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const sessionsSection = screen.getByText("Sessions").closest("section");
+    expect(sessionsSection).not.toBeNull();
+
+    const selectSessions = within(sessionsSection!).getByRole("button", {
+      name: "Select sessions",
+    });
+    expect(selectSessions).toHaveAttribute("data-testid", "toggle-selection-mode");
+    expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
+    expect(selectSessions).not.toHaveTextContent("Select sessions");
+    expect(selectSessions.parentElement).toHaveClass(
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:group-focus-within/header:opacity-100",
+    );
+
+    fireEvent.click(selectSessions);
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+    expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
   });
 
   it("renders the 'Scheduled' nav row directly under 'New session' and routes to /tasks", () => {
@@ -494,6 +539,43 @@ describe("Sidebar session list", () => {
       );
     });
     nowSpy.mockRestore();
+  });
+
+  it("keeps title-only and worktree session rows the same centered height", () => {
+    mockConversations([
+      conv("conv_plain", "Codex", { title: "Plain session" }),
+      conv("conv_worktree", "Codex", {
+        title: "Worktree session",
+        git_branch: "fix/sidebar-row-height",
+      }),
+    ]);
+    renderSidebar();
+
+    const plainRow = screen.getByText("Plain session").closest("a")!;
+    const worktreeRow = screen.getByText("Worktree session").closest("a")!;
+
+    expect(plainRow).toHaveClass("h-7", "justify-center");
+    expect(worktreeRow).toHaveClass("h-7", "justify-center");
+    expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
+  });
+
+  it("reveals git branch metadata in the session tooltip on hover", async () => {
+    const branch = "fix/sidebar-row-height";
+    mockConversations([
+      conv("conv_branch_tooltip", "Codex", {
+        title: "Worktree session",
+        git_branch: branch,
+      }),
+    ]);
+    renderSidebar();
+
+    const row = screen.getByText("Worktree session").closest("a")!;
+    expect(within(row).queryByText(branch)).toBeNull();
+
+    fireEvent.pointerMove(row, { pointerType: "mouse" });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("session-tooltip-branch")[0]).toHaveTextContent(branch);
+    });
   });
 
   it("shares one hosts observer across multiple ordinary session rows", () => {

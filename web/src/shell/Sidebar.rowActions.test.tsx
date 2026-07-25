@@ -261,6 +261,17 @@ describe("quick pin/unpin hover button", () => {
     expect(rowLink).not.toHaveClass("w-[calc(100%+1rem)]");
   });
 
+  it("holds action padding while the kebab menu is open", () => {
+    renderSidebar();
+
+    const rowLink = screen.getByRole("link", { name: "My Session" });
+    expect(rowLink).not.toHaveClass("md:pr-14");
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+
+    expect(rowLink).toHaveClass("md:pr-14");
+  });
+
   it("sizes the project-folder header controls to match the session-row kebab", () => {
     // The folder-header pencil + kebab share the right-edge column with the
     // session-row kebab, so they must be the same compact `icon-xs` (size-6)
@@ -466,7 +477,13 @@ describe("pinned row project flyout", () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
     // (a project-owned row otherwise sits inside a collapsed project folder).
     mocks.pinnedStore.set(["conv_1"]);
-    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    mockConversations([
+      {
+        ...CONV,
+        labels: { omni_project: "Moonshot" },
+        git_branch: "fix/sidebar-row-height",
+      },
+    ]);
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
@@ -482,6 +499,9 @@ describe("pinned row project flyout", () => {
     // `text-sm` that scaled with the UI font-size setting.
     expect(flyoutTitle).toHaveClass("sidebar-compact-text");
     expect(flyoutTitle).not.toHaveClass("text-sm");
+    expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
+      "fix/sidebar-row-height",
+    );
   });
 
   it("renders no project flyout for a pinned row with no project", () => {
