@@ -339,7 +339,31 @@ describe("Sidebar session list", () => {
     expect(inbox).toHaveAttribute("href", "/inbox");
     expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
-    expect(within(primaryNav).getByTestId("toggle-selection-mode")).toBeInTheDocument();
+    expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
+  });
+
+  it("reveals session selection as an icon action on the Sessions header", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const sessionsSection = screen.getByText("Sessions").closest("section");
+    expect(sessionsSection).not.toBeNull();
+
+    const selectSessions = within(sessionsSection!).getByRole("button", {
+      name: "Select sessions",
+    });
+    expect(selectSessions).toHaveAttribute("data-testid", "toggle-selection-mode");
+    expect(selectSessions).toHaveAttribute("data-size", "icon-xs");
+    expect(selectSessions).not.toHaveTextContent("Select sessions");
+    expect(selectSessions.parentElement).toHaveClass(
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:group-focus-within/header:opacity-100",
+    );
+
+    fireEvent.click(selectSessions);
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+    expect(within(sessionsSection!).queryByRole("button", { name: "Select sessions" })).toBeNull();
   });
 
   it("renders the 'Scheduled' nav row directly under 'New session' and routes to /tasks", () => {

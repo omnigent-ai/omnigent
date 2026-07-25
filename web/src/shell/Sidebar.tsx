@@ -700,9 +700,9 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             <Button
               asChild
               className={cn(
-                // Same shared nav-row construct as "New session" / "Inbox" /
-                // "Select sessions" so the active-pill, hover, insets, icon
-                // column, and text weight all match post-refactor.
+                // Same shared nav-row construct as "New session" / "Inbox" so
+                // the active-pill, hover, insets, icon column, and text weight
+                // all match post-refactor.
                 "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] px-2 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -753,20 +753,6 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                       </span>
                     )}
                   </Link>
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  aria-label="Select sessions"
-                  data-testid="toggle-selection-mode"
-                  className={cn(
-                    "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
-                    SIDEBAR_HOVER_HIGHLIGHT,
-                  )}
-                  onClick={() => setSelectionMode(true)}
-                >
-                  <ListChecksIcon className="size-3.5 text-muted-foreground" />
-                  Select sessions
                 </Button>
               </>
             )}
@@ -819,6 +805,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               pinnedConversationIds={pinnedConversationIds}
               pinnedConversations={pinnedConversations}
               onTogglePinned={togglePinnedConversation}
+              onEnterSelectionMode={() => setSelectionMode(true)}
               selectionMode={selectionMode}
               selectedIds={selectedIds}
               onToggleSelected={toggleSelected}
@@ -1034,6 +1021,7 @@ interface ConversationListProps {
   // outside the loaded pagination window still renders in the Pinned section.
   pinnedConversations: Conversation[];
   onTogglePinned: (conversationId: string) => void;
+  onEnterSelectionMode: () => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
@@ -1095,6 +1083,7 @@ function ConversationList({
   pinnedConversationIds,
   pinnedConversations,
   onTogglePinned,
+  onEnterSelectionMode,
   selectionMode,
   selectedIds,
   onToggleSelected,
@@ -1718,6 +1707,28 @@ function ConversationList({
                     selectedIds={selectedIds}
                     onToggleSelected={onToggleSelected}
                     onProjectAssigned={expandProject}
+                    headerAction={
+                      !selectionMode ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              aria-label="Select sessions"
+                              data-testid="toggle-selection-mode"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onEnterSelectionMode();
+                              }}
+                            >
+                              <ListChecksIcon className="size-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom">Select sessions</TooltipContent>
+                        </Tooltip>
+                      ) : undefined
+                    }
                   />
                 </ChatsDropZone>
               )}
