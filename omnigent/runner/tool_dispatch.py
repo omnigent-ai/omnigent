@@ -1183,6 +1183,71 @@ def _subagent_model_from_args(args: _JsonObject) -> str | None:
     return validate_model_override(raw_model)
 
 
+def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
+    """
+    Extract the optional ``reasoning_effort`` from
+    ``sys_session_send`` args.
+
+    :param args: Decoded tool arguments, e.g.
+        ``{"args": {"input": "fix the bug", "reasoning_effort": "high"}}``.
+    :returns: The requested effort, or ``None`` when absent.
+    :raises ValueError: If ``reasoning_effort`` is present but is not a
+        non-empty string.
+    """
+    raw_message = args.get("args")
+    if not isinstance(raw_message, dict):
+        return None
+    raw_effort = raw_message.get("reasoning_effort")
+    if raw_effort is None:
+        return None
+    if not isinstance(raw_effort, str) or not raw_effort:
+        raise ValueError("'reasoning_effort' must be a non-empty string when provided")
+    return raw_effort
+
+
+def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
+    """
+    Validate *effort* against the child harness's declared effort family.
+
+    A harness whose family is ``NONE`` has no effort plumbing, so an
+    override would be silently dropped — reject it instead.
+
+    :param effort: Requested effort, e.g. ``"high"``.
+    :param harness: Resolved child harness, e.g. ``"claude-native"``.
+    :returns: The canonical effort that harness accepts.
+    :raises ValueError: If the harness supports no effort override, or
+        the value falls outside its vocabulary.
+    """
+    from omnigent.harness_capabilities import EffortFamily
+    from omnigent.harness_plugins import harness_capabilities
+    from omnigent.reasoning_effort import (
+        ANTHROPIC_EFFORTS,
+        COPILOT_EFFORTS,
+        GEMINI_EFFORTS,
+        OPENAI_EFFORTS,
+        validate_effort,
+    )
+
+    canonical = canonicalize_harness(harness) if harness is not None else None
+    capabilities = harness_capabilities().get(canonical or "")
+    family = capabilities.effort if capabilities is not None else EffortFamily.NONE
+    supported_by_family = {
+        EffortFamily.ANTHROPIC: ANTHROPIC_EFFORTS,
+        EffortFamily.OPENAI: OPENAI_EFFORTS,
+        EffortFamily.GEMINI: GEMINI_EFFORTS,
+        EffortFamily.COPILOT: COPILOT_EFFORTS,
+    }
+    supported = supported_by_family.get(family)
+    if supported is None:
+        raise ValueError(
+            f"harness {canonical or harness or 'unknown'!r} does not support "
+            "a reasoning-effort override"
+        )
+    validated = validate_effort(effort, canonical or harness or "unknown", supported)
+    assert validated is not None
+    return validated
+
+
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -1650,6 +1715,11 @@ async def _execute_subagent_tool(
         return f"Error: sys_session_send invalid 'model': {exc}"
 
     try:
+        reasoning_effort = _subagent_reasoning_effort_from_args(args)
+    except ValueError as exc:
+        return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
+
+    try:
         file_ids = _subagent_file_ids_from_args(args)
     except ValueError as exc:
         return f"Error: sys_session_send invalid 'file_ids': {exc}"
@@ -1694,6 +1764,12 @@ async def _execute_subagent_tool(
                 "Error: sys_session_send 'harness' applies only when a "
                 "sub-agent session is first created; it cannot change an "
                 "existing session. Re-send without 'harness' to continue "
+                f"session {target_session_id!r}."
+            )
+        if reasoning_effort is not None:
+            return (
+                "Error: sys_session_send 'reasoning_effort' applies only when a "
+                "sub-agent session is first created; it cannot change an existing "
                 f"session {target_session_id!r}."
             )
         if cost_budget is not None:
@@ -1785,6 +1861,14 @@ async def _execute_subagent_tool(
                 f"{child_session_id}. Re-send without 'file_ids' to "
                 "continue it, or sys_session_close it first to spawn a "
                 "fresh session with the requested files."
+            )
+        if reasoning_effort is not None:
+            return (
+                f"Error: sys_session_send 'reasoning_effort' applies only when a "
+                f"sub-agent session is first created; {sub_agent_name!r} title "
+                f"{session_name!r} already exists as {child_session_id}. Re-send "
+                "without 'reasoning_effort' to continue it, or "
+                "sys_session_close it first to spawn a fresh session."
             )
         if cost_budget is not None:
             return (
@@ -1918,6 +2002,14 @@ async def _execute_subagent_tool(
                 agent_spec=agent_spec,
                 harness=child_harness,
             )
+        if reasoning_effort is not None:
+            try:
+                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                    reasoning_effort,
+                    child_harness,
+                )
+            except ValueError as exc:
+                return f"Error: sys_session_send invalid 'reasoning_effort': {exc}"
         resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
         if resp.status_code >= 400:
             return f"Error: failed to create child session: {resp.status_code} {resp.text[:200]}"
