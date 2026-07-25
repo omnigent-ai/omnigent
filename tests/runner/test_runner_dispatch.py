@@ -6405,6 +6405,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         requested_paths.append(request.url.path)
         if request.url.path == "/v1/sessions/conv_caller":
+            assert request.url.params["include_items"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6413,6 +6414,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
                     "agent_name": "main",
                     "status": "idle",
                     "created_at": 1,
+                    "updated_at": 42,
                     "runner_id": None,
                     "pending_elicitations": [],
                 },
@@ -6436,6 +6438,7 @@ async def test_sys_session_get_info_defaults_to_caller_session() -> None:
     # never queried (a stray /v1/runners call would mean the None-runner
     # short-circuit regressed).
     assert info["runner_online"] is None
+    assert info["last_activity_at"] == 42
     assert info["pending_elicitations"] == []
     assert info["pending_elicitation_count"] == 0
     assert not any(p.startswith("/v1/runners") for p in requested_paths)
@@ -6810,6 +6813,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            assert request.url.params["include_items"] == "false"
+            assert request.url.params["include_liveness"] == "false"
             return httpx.Response(
                 200,
                 json={
@@ -6818,6 +6823,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "agent_name": "researcher",
                     "status": "running",
                     "created_at": 1,
+                    "updated_at": 84,
                     "title": "auth flow",
                     "runner_id": "runner_1",
                     "host_id": None,
@@ -6849,6 +6855,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     info = json.loads(output)
     assert info["session_id"] == "conv_target"
     assert info["status"] == "running"
+    assert info["last_activity_at"] == 84
     assert info["title"] == "auth flow"
     assert info["agent_id"] == "ag_xyz"
     assert info["agent_name"] == "researcher"

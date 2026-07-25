@@ -132,6 +132,9 @@ class Session:
     :param status: Session lifecycle status. One of ``"idle"``,
         ``"running"``, or ``"failed"``.
     :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of the last persisted session
+        activity. ``None`` when connected to an older server that does not
+        return the field.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -179,6 +182,7 @@ class Session:
     agent_id: str
     status: str
     created_at: int
+    updated_at: int | None = None
     agent_name: str | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
@@ -208,11 +212,13 @@ class Session:
         labels_raw = raw.get("labels", {})
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
+        raw_updated_at = raw.get("updated_at")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
+            updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
             agent_name=raw.get("agent_name"),
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
