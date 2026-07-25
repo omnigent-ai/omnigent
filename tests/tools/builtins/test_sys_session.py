@@ -192,6 +192,7 @@ def test_send_schema_advertises_plain_string_and_purpose_object_args() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
@@ -233,6 +234,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
@@ -257,6 +259,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "harness",
         "cost_budget",
@@ -283,6 +286,7 @@ def test_send_schema_gates_harness_field_behind_allowlist_opt_in() -> None:
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "harness",
         "cost_budget",
