@@ -248,28 +248,34 @@ def test_create_worktree_option_like_base_branch_not_executed(
     assert _worktree_count(git_repo) == 1
 
 
-def test_create_worktree_duplicate_branch_fails(git_repo: Path) -> None:
-    """Creating two worktrees for the same branch name fails loud with the friendly error."""
+def test_create_worktree_duplicate_branch_checked_out_fails(git_repo: Path) -> None:
+    """Creating a second worktree for a branch already checked out fails loud."""
     create_worktree(repo_path=str(git_repo), branch_name="dup")
     with pytest.raises(WorktreeError) as exc:
         create_worktree(repo_path=str(git_repo), branch_name="dup")
-    # The pre-check catches the existing branch before git's raw error;
-    # we must NOT silently reuse the existing worktree.
-    assert "already exists" in exc.value.message
+    assert "already checked out" in exc.value.message
 
 
-def test_create_worktree_existing_branch_no_worktree_fails(git_repo: Path) -> None:
-    """A branch that exists WITHOUT a worktree is still rejected by the pre-check.
+def test_create_worktree_existing_branch_no_worktree_reuses(git_repo: Path) -> None:
+    """A branch that exists WITHOUT an active worktree is reused, not rejected.
 
-    Proves the pre-check keys off branch existence, not directory
-    occupancy — creating a worktree for a plain pre-existing branch
-    would otherwise hit git's raw error.
+    This is the common case when a previous session ended and the user
+    starts a new session on the same branch.
     """
     _git(git_repo, "branch", "preexisting")
-    with pytest.raises(WorktreeError) as exc:
-        create_worktree(repo_path=str(git_repo), branch_name="preexisting")
-    assert "already exists" in exc.value.message
-    assert "preexisting" in exc.value.message
+    created = create_worktree(repo_path=str(git_repo), branch_name="preexisting")
+    assert Path(created.worktree_path).is_dir()
+    assert _current_branch(Path(created.worktree_path)) == "preexisting"
+
+
+def test_create_worktree_reuses_after_worktree_removed(git_repo: Path) -> None:
+    """A branch whose worktree was removed can be reused for a new session."""
+    first = create_worktree(repo_path=str(git_repo), branch_name="reuse-me")
+    remove_worktree(worktree_path=first.worktree_path, branch="reuse-me", delete_branch=False)
+    assert _branch_exists(git_repo, "reuse-me")
+    second = create_worktree(repo_path=str(git_repo), branch_name="reuse-me")
+    assert Path(second.worktree_path).is_dir()
+    assert _current_branch(Path(second.worktree_path)) == "reuse-me"
 
 
 def test_create_worktree_non_repo_fails(tmp_path: Path) -> None:
