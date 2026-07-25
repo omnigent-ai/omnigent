@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
@@ -20,11 +20,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 // renders deterministically without a QueryClient / RunnerHealth provider. The
 // default is "not host-bound", so the badge self-hides and the existing branch/
 // ring/harness assertions are unchanged; host-aware tests override per case.
-const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
+const { copyTextMock, useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
+  copyTextMock: vi.fn(),
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
 }));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useSession")>()),
   useSession: (id: string | null | undefined) => useSessionMock(id),
@@ -113,6 +115,7 @@ function bindHost(name: string) {
 
 describe("Composer status line (branch + context ring)", () => {
   beforeEach(() => {
+    copyTextMock.mockReset().mockResolvedValue(undefined);
     // Default: no host bound, so HostBadge renders nothing.
     useSessionMock.mockReset().mockReturnValue({
       session: { hostId: null },
@@ -247,6 +250,26 @@ describe("Composer status line (branch + context ring)", () => {
     // `truncate` (overflow-hidden + ellipsis + nowrap) is the guard that
     // keeps a long branch from wrapping the tray onto a second line.
     expect(branch).toHaveClass("truncate");
+  });
+
+  it("copies the worktree path beside the branch name", async () => {
+    useSessionMock.mockReturnValue({
+      session: {
+        hostId: "host_a1b2",
+        workspace: "/Users/corey/repo-worktrees/feature-login",
+      },
+      isLoading: false,
+      error: null,
+    });
+    useChatStore.setState({ gitBranch: "feature/login" });
+    renderComposer();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy worktree path" }));
+
+    await waitFor(() =>
+      expect(copyTextMock).toHaveBeenCalledWith("/Users/corey/repo-worktrees/feature-login"),
+    );
+    expect(screen.getByRole("button", { name: "Copied worktree path" })).toBeInTheDocument();
   });
 
   it("renders the tray with a branch even when the ring is absent", () => {
