@@ -6,7 +6,14 @@
 
 import type { RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = ["files", "subagents", "terminals", "todos", "browser"];
+const RAIL_TABS: readonly RightRailTab[] = [
+  "files",
+  "artifacts",
+  "subagents",
+  "terminals",
+  "todos",
+  "browser",
+];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
@@ -19,6 +26,8 @@ export interface SessionWorkspaceState {
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
   selectedFilePath?: string | null;
+  /** Selected HTML entry in the Artifacts tab. */
+  selectedArtifactPath?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -65,6 +74,9 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedFilePath === null || typeof record.selectedFilePath === "string") {
     state.selectedFilePath = record.selectedFilePath;
+  }
+  if (record.selectedArtifactPath === null || typeof record.selectedArtifactPath === "string") {
+    state.selectedArtifactPath = record.selectedArtifactPath;
   }
   return state;
 }

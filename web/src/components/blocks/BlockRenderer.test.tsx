@@ -4,7 +4,7 @@
 
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -21,6 +21,75 @@ const FILE_VIEWER_NOOP = {
 };
 
 describe("BlockRenderer dispatch", () => {
+  it("renders a validated publish_design_artifact result as an artifact card", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "tool",
+        itemId: "tool_1",
+        execution: {
+          name: "publish_design_artifact",
+          arguments: {
+            entry_path: "artifacts/revenue-dashboard/index.html",
+            title: "Revenue dashboard",
+            operation: "created",
+          },
+          argsSummary: "artifacts/revenue-dashboard/index.html",
+          callId: "call_1",
+          agentName: "designer",
+          executedBy: "server",
+          output: null,
+        },
+        output: JSON.stringify({
+          ok: true,
+          entry_path: "artifacts/revenue-dashboard/index.html",
+          artifact_root: "artifacts/revenue-dashboard",
+          title: "Revenue dashboard",
+          operation: "created",
+          language: "html",
+          resource_count: 4,
+        }),
+        state: "output-available",
+        startedAt: null,
+        duration: 0.2,
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    expect(screen.getByTestId("design-artifact-card")).toBeDefined();
+    expect(screen.getByText("Revenue dashboard")).toBeDefined();
+  });
+
+  it("keeps malformed publish_design_artifact results as ordinary tool rows", () => {
+    const items: RenderItem[] = [
+      {
+        kind: "tool",
+        itemId: "tool_2",
+        execution: {
+          name: "publish_design_artifact",
+          arguments: { entry_path: "artifacts/revenue-dashboard/index.html" },
+          argsSummary: "artifacts/revenue-dashboard/index.html",
+          callId: "call_2",
+          agentName: "designer",
+          executedBy: "server",
+          output: null,
+        },
+        output: "not-json",
+        state: "output-available",
+        startedAt: null,
+        duration: 0.2,
+      },
+    ];
+
+    render(<BlockRenderer items={items} sessionStatus="idle" />);
+
+    expect(screen.queryByTestId("design-artifact-card")).toBeNull();
+    fireEvent.click(screen.getByText("See 1 step"));
+    expect(
+      screen.getByTitle("publish_design_artifact(artifacts/revenue-dashboard/index.html)"),
+    ).toBeDefined();
+  });
+
   it("renders a slash_command RenderItem via SlashCommandCard", () => {
     const items: RenderItem[] = [
       {

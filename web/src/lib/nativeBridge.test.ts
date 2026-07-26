@@ -5,6 +5,15 @@ import {
   isElectronShell,
   isIOSShell,
   isNativeShell,
+  hasNativeArtifactSurface,
+  hasNativeArtifactInspector,
+  hasNativeArtifactReview,
+  reloadNativeArtifactSurface,
+  reviewNativeArtifactSurface,
+  selectNativeArtifactElement,
+  inspectNativeArtifactSurface,
+  syncNativeArtifactSurface,
+  destroyNativeArtifactSurface,
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
@@ -194,6 +203,96 @@ describe("supportsBrowser", () => {
   it("is false under a non-Electron native shell (iOS)", () => {
     setIOS(true);
     expect(supportsBrowser()).toBe(false);
+  });
+});
+
+describe("artifact surface bridge", () => {
+  it("feature-detects new Electron methods and safely delegates", async () => {
+    const sync = vi.fn().mockResolvedValue(true);
+    const destroy = vi.fn().mockResolvedValue(undefined);
+    setElectron(true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentDesktop as object, {
+      syncArtifactSurface: sync,
+      destroyArtifactSurface: destroy,
+    });
+    const params = {
+      id: "surface",
+      url: "http://preview.localhost/p/grant/a",
+      visible: true,
+      bounds: { x: 1, y: 2, width: 3, height: 4 },
+    };
+
+    expect(hasNativeArtifactSurface()).toBe(true);
+    await expect(syncNativeArtifactSurface(params)).resolves.toBe(true);
+    await destroyNativeArtifactSurface("surface");
+    expect(sync).toHaveBeenCalledWith(params);
+    expect(destroy).toHaveBeenCalledWith("surface");
+  });
+
+  it("delegates the optional native element inspector", async () => {
+    const inspect = vi.fn().mockResolvedValue(true);
+    setElectron(true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentDesktop as object, {
+      inspectArtifactSurface: inspect,
+    });
+
+    expect(hasNativeArtifactInspector()).toBe(true);
+    await expect(inspectNativeArtifactSurface("surface")).resolves.toBe(true);
+    expect(inspect).toHaveBeenCalledWith("surface");
+  });
+
+  it("delegates native selection, reload, and diagnostics", async () => {
+    const selection = {
+      selector: "main > button",
+      tagName: "button",
+      role: "button",
+      accessibleName: "Save",
+      text: "Save",
+      html: "<button>Save</button>",
+      rect: { x: 1, y: 2, width: 3, height: 4 },
+      viewport: { width: 800, height: 600, devicePixelRatio: 1 },
+      styles: { display: "inline-flex" },
+      screenshotDataUrl: "data:image/png;base64,abc",
+    };
+    const diagnostics = {
+      viewport: { width: 800, height: 600 },
+      issues: [],
+      consoleMessages: [],
+      loadErrors: [],
+    };
+    const select = vi.fn().mockResolvedValue(selection);
+    const reload = vi.fn().mockResolvedValue(true);
+    const review = vi.fn().mockResolvedValue(diagnostics);
+    setElectron(true);
+    Object.assign((window as unknown as Record<string, unknown>).omnigentDesktop as object, {
+      selectArtifactElement: select,
+      reloadArtifactSurface: reload,
+      reviewArtifactSurface: review,
+    });
+
+    expect(hasNativeArtifactReview()).toBe(true);
+    await expect(selectNativeArtifactElement("surface")).resolves.toEqual(selection);
+    await expect(reloadNativeArtifactSurface("surface")).resolves.toBe(true);
+    await expect(reviewNativeArtifactSurface("surface")).resolves.toEqual(diagnostics);
+    expect(select).toHaveBeenCalledWith("surface");
+    expect(reload).toHaveBeenCalledWith("surface");
+    expect(review).toHaveBeenCalledWith("surface");
+  });
+
+  it("falls back safely when the shell is old", async () => {
+    setElectron(true);
+    expect(hasNativeArtifactSurface()).toBe(false);
+    await expect(
+      syncNativeArtifactSurface({
+        id: "surface",
+        url: "http://preview.localhost/p/grant/a",
+        visible: true,
+        bounds: { x: 0, y: 0, width: 1, height: 1 },
+      }),
+    ).resolves.toBe(false);
+    await expect(selectNativeArtifactElement("surface")).resolves.toBeNull();
+    await expect(reloadNativeArtifactSurface("surface")).resolves.toBe(false);
+    await expect(reviewNativeArtifactSurface("surface")).resolves.toBeNull();
   });
 });
 

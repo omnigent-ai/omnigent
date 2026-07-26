@@ -9,10 +9,12 @@ import {
 } from "lucide-react";
 import { type ReactElement, useCallback, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
+import { ArtifactIcon } from "@/components/icons/ArtifactIcon";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { FilesPanel } from "./FilesPanel";
+import { ArtifactsPanel } from "./ArtifactsPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -200,6 +202,10 @@ interface WorkspacePanelProps {
   selectedFilePath: string | null;
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
+  /** Selected HTML entry in the Artifacts tab. */
+  selectedArtifactPath: string | null;
+  /** Select an HTML entry for preview. */
+  onArtifactSelect: (entryPath: string) => void;
   /** Open a file in the inline viewer (adds/activates its tab). */
   openFileViewer: (path: string) => void;
   /** Close a single open file tab by path. */
@@ -262,6 +268,8 @@ export function WorkspacePanel({
   rootSessionId,
   selectedFilePath,
   openFiles,
+  selectedArtifactPath,
+  onArtifactSelect,
   openFileViewer,
   onCloseFile,
   onShowScopeView,
@@ -339,6 +347,18 @@ export function WorkspacePanel({
                   <FilePenLineIcon className="size-4" />
                   <span className="sr-only">Files</span>
                   {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
+                </TabsTrigger>
+              </WorkspaceTabTooltip>
+            )}
+            {showFilesPanel && (
+              <WorkspaceTabTooltip label="Artifacts">
+                <TabsTrigger
+                  value="artifacts"
+                  aria-label="Artifacts"
+                  className="size-8 shrink-0 rounded-md p-0"
+                >
+                  <ArtifactIcon className="size-4" />
+                  <span className="sr-only">Artifacts</span>
                 </TabsTrigger>
               </WorkspaceTabTooltip>
             )}
@@ -459,6 +479,12 @@ export function WorkspacePanel({
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
+          />
+        ) : rightRailTab === "artifacts" && showFilesPanel ? (
+          <ArtifactsPanel
+            conversationId={conversationId}
+            selectedPath={selectedArtifactPath}
+            onSelect={onArtifactSelect}
           />
         ) : rightRailTab === "browser" && showBrowserTab ? (
           // Embedded browser (Electron only) — BrowserPane self-gates and
