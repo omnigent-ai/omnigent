@@ -204,6 +204,58 @@ async def test_first_message_schedules_background_semantic_title(
     assert snapshot.json()["title"] == "Debug authentication timeout"
 
 
+async def test_user_message_reactivates_completed_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accepted user turn clears the caller's completion marker."""
+    from omnigent.stores.conversation_store import completed_label_key
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], title="Completed work")
+    completed = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"labels": {"omnigent.completed": "1721760000000"}},
+    )
+    assert completed.status_code == 200
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(
+        _session_id: str,
+        _runner_router: object,
+    ) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client",
+        get_runner_client,
+    )
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "One more follow-up"}],
+                },
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session["id"])
+    assert stored is not None
+    assert completed_label_key(None) not in stored.labels
+
+
 async def test_background_title_failure_does_not_break_subsequent_user_turn(
     client: httpx.AsyncClient,
     app: Any,

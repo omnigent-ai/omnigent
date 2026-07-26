@@ -464,3 +464,58 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+async def test_patch_completed_session_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Completion is reversible and appears on the ordinary session list."""
+    from omnigent.stores.conversation_store import completed_label_key
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    user_key = completed_label_key(None)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.completed": "1721760000000"}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["labels"]["omnigent.completed"] == "1721760000000"
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels[user_key] == "1721760000000"
+
+    listed = await client.get("/v1/sessions")
+    listed_session = next(row for row in listed.json()["data"] if row["id"] == session_id)
+    assert listed_session["labels"]["omnigent.completed"] == "1721760000000"
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.completed": ""}},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert user_key not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_per_user_completed_key(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Clients cannot change another user's private completion state."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    key = "omnigent.completed.bob@example.com"
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {key: "1721760000000"}},
+    )
+
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert key not in conv.labels

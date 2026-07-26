@@ -65,9 +65,14 @@ def route_client(db_uri: str) -> Iterator[tuple[TestClient, str]]:
 
 def test_input_policy_deny_persists_item_readable_from_items_api(
     route_client: tuple[TestClient, str],
+    db_uri: str,
 ) -> None:
     """Synchronous INPUT DENY both streams and persists the deny sentinel."""
+    from omnigent.stores.conversation_store import completed_label_key
+
     client, session_id = route_client
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    conversation_store.set_labels(session_id, {completed_label_key(None): "1721760000000"})
     spec = AgentSpec(
         spec_version=1,
         name="test-agent",
@@ -136,3 +141,6 @@ def test_input_policy_deny_persists_item_readable_from_items_api(
             "text": "[Denied by policy: Request contains BLOCK_THIS_TOKEN]",
         }
     ]
+    stored = conversation_store.get_conversation(session_id)
+    assert stored is not None
+    assert stored.labels[completed_label_key(None)] == "1721760000000"

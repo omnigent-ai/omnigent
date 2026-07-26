@@ -676,6 +676,51 @@ describe("Sidebar sections", () => {
     expect(screen.getByText("No sessions shared with you")).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
+
+  it("nests completed ungrouped sessions under Sessions", () => {
+    mockConversations([
+      conv("conv_active", "Claude Code"),
+      conv("conv_done", "Claude Code", {
+        labels: { "omnigent.completed": "1721760000000" },
+      }),
+    ]);
+    renderSidebar();
+
+    expect(screen.getByText("conv_active")).toBeInTheDocument();
+    expect(screen.queryByText("conv_done")).toBeNull();
+    const completed = screen.getByRole("button", { name: "Completed" });
+    expect(completed).toHaveAttribute("aria-expanded", "false");
+    expect(completed.firstElementChild).toHaveClass("lucide-chevron-right");
+    expect(completed.closest("section")?.parentElement).toHaveClass("mt-1");
+
+    fireEvent.click(completed);
+
+    expect(screen.getByText("conv_done")).toHaveClass("opacity-70");
+  });
+
+  it("keeps completed project sessions inside their project", () => {
+    projectsMock.push("Customer X");
+    seedPins(["conv_done"]);
+    mockConversations([
+      conv("conv_done", "Claude Code", {
+        labels: {
+          omni_project: "Customer X",
+          "omnigent.completed": "1721760000000",
+        },
+      }),
+    ]);
+    renderSidebar();
+
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(screen.queryByText("conv_done")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const completed = screen.getByRole("button", { name: "Completed" });
+    expect(completed).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(completed);
+
+    expect(screen.getByText("conv_done")).toBeInTheDocument();
+  });
 });
 
 // The sidebar splits sessions across two tabs: "My sessions" (owned, with the

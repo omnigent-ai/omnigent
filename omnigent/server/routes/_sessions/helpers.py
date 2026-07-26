@@ -178,6 +178,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    COMPLETED_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -7366,6 +7367,16 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"{PINNED_LABEL_KEY!r} key to pin for yourself",
             code=ErrorCode.INVALID_INPUT,
         )
+    suffixed_completed = next(
+        (k for k in labels if k.startswith(f"{COMPLETED_LABEL_KEY}.")),
+        None,
+    )
+    if suffixed_completed is not None:
+        raise OmnigentError(
+            f"label {suffixed_completed!r} is server-derived; set the bare "
+            f"{COMPLETED_LABEL_KEY!r} key for yourself",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _require_cost_control_label_authority(
@@ -7773,7 +7784,13 @@ def _child_session_summary_from_conversation(
     # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
     # defensively so a shared child's summary can never expose another viewer's
     # pin key. No collapse-to-canonical here: there's no pin to surface.
-    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    raw_labels = {
+        k: v
+        for k, v in conv.labels.items()
+        if not k.startswith(f"{PINNED_LABEL_KEY}.")
+        and k != COMPLETED_LABEL_KEY
+        and not k.startswith(f"{COMPLETED_LABEL_KEY}.")
+    }
     labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None

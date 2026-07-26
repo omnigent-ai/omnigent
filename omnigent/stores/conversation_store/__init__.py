@@ -104,6 +104,9 @@ PROJECT_LABEL_KEY = "omni_project"
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# Personal completion marker. The API exposes only the caller's marker.
+COMPLETED_LABEL_KEY = "omnigent.completed"
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
@@ -138,6 +141,14 @@ def pinned_label_key(user_id: str | None) -> str:
         # 64 hex chars — well within the budget and collision-safe.
         suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
     return f"{PINNED_LABEL_KEY}.{suffix}"
+
+
+def completed_label_key(user_id: str | None) -> str:
+    """Return the stored per-user completion key for ``user_id``."""
+    suffix = user_id if user_id is not None else "local"
+    if len(suffix) > 128 - len(COMPLETED_LABEL_KEY) - 1:
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return f"{COMPLETED_LABEL_KEY}.{suffix}"
 
 
 # Labels that must NOT cross into a new session context — deliberately

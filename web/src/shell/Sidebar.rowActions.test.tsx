@@ -45,6 +45,7 @@ const mocks = vi.hoisted(() => {
   };
   return {
     rename: { mutate: vi.fn() },
+    complete: { mutate: vi.fn() },
     isMobile: false,
     // Projects surfaced by the picker + the move-to-project mutation, so the
     // mobile in-place project view test can assert both the list and the pick.
@@ -60,6 +61,10 @@ const mocks = vi.hoisted(() => {
 // flips `mocks.isMobile` for the duration of that case.
 vi.mock("@/hooks/useIsMobileViewport", () => ({
   useIsMobileViewport: () => mocks.isMobile,
+}));
+
+vi.mock("@/hooks/useToggleCompletedConversation", () => ({
+  useToggleCompletedConversation: () => mocks.complete,
 }));
 
 vi.mock("@/hooks/useConversations", () => ({
@@ -218,6 +223,7 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
+  mocks.complete.mutate.mockReset();
   mocks.moveToProject.mutate.mockReset();
   mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
@@ -233,6 +239,50 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe("completed session actions", () => {
+  it("marks an idle session completed", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByTestId("complete-conversation"));
+
+    expect(mocks.complete.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      completed: true,
+    });
+  });
+
+  it("marks a completed session active", () => {
+    mockConversations([
+      {
+        ...CONV,
+        labels: { "omnigent.completed": "1721760000000" },
+      },
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Completed" }));
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    const action = screen.getByTestId("complete-conversation");
+    expect(action).toHaveTextContent("Mark active");
+    fireEvent.click(action);
+
+    expect(mocks.complete.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      completed: false,
+    });
+  });
+
+  it("disables completion while a session is running", () => {
+    mockConversations([{ ...CONV, status: "running" }]);
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("complete-conversation")).toHaveAttribute("data-disabled");
+  });
+});
 
 describe("quick pin/unpin hover button", () => {
   it("keeps the row full-width and the trailing controls inset from the right edge", () => {
