@@ -17,6 +17,11 @@ export interface McpServerSummary {
   description?: string | null;
   /** HTTP SSE endpoint URL. Only present when transport === "http". */
   url?: string | null;
+  /**
+   * HTTP headers for the server. Values are always "[REDACTED]" in API
+   * responses; only key names are exposed.
+   */
+  headers?: Record<string, string>;
   /** Executable to spawn. Only present when transport === "stdio". */
   command?: string | null;
   /** Arguments passed to command. Only present when transport === "stdio". */
@@ -168,6 +173,7 @@ export interface UpsertMcpServerInput {
   transport: "http" | "stdio";
   description?: string | null;
   url?: string | null;
+  headers?: Record<string, string> | null;
   command?: string | null;
   args?: string[];
 }

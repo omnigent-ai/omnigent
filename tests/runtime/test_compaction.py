@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ from omnigent.entities import (
     FunctionCallData,
     FunctionCallOutputData,
     MessageData,
+    StoredFile,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.llms.errors import RetryableLLMError
@@ -19,6 +21,7 @@ from omnigent.llms.types import MessageOutput, OutputText, Response
 from omnigent.runtime.compaction import (
     _BINARY_CONTENT_CLEARED,
     _TOOL_RESULT_CLEARED,
+    _clear_binary_content,
     _is_summary_auth_error,
     _pair_aware_drop_count,
     _truncate_oldest,
@@ -27,6 +30,7 @@ from omnigent.runtime.compaction import (
     count_tokens,
     summarize_history,
 )
+from omnigent.runtime.content_resolver import _resolve_file_id_block
 from omnigent.runtime.workflow import _route_bare_model_for_compaction
 from omnigent.spec.types import CompactionConfig, LLMConfig
 
@@ -459,6 +463,145 @@ async def test_layer1_clears_binary_content_and_preserves_file_id(
     )
     # Text block in the same message must be untouched.
     assert text_block["text"] == "Please describe this image"
+
+
+def test_clear_binary_content_handles_resolver_shapes() -> None:
+    """Resolver-produced attachment payloads are cleared before token counting."""
+    payload = "A" * 100_000
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{payload}",
+                    "file_id": "file_image",
+                    "filename": "screenshot.png",
+                },
+                {
+                    "type": "input_file",
+                    "file_data": f"data:application/pdf;base64,{payload}",
+                    "file_id": "file_pdf",
+                    "filename": "report.pdf",
+                },
+            ],
+        }
+    ]
+
+    tokens_before = count_tokens(messages, "openai/gpt-4o")
+    _clear_binary_content(messages, protect_from=len(messages))
+    tokens_after = count_tokens(messages, "openai/gpt-4o")
+
+    image_block, file_block = messages[0]["content"]
+    assert image_block["image_url"] == _BINARY_CONTENT_CLEARED
+    assert file_block["file_data"] == _BINARY_CONTENT_CLEARED
+    assert image_block["file_id"] == "file_image"
+    assert image_block["filename"] == "screenshot.png"
+    assert file_block["file_id"] == "file_pdf"
+    assert file_block["filename"] == "report.pdf"
+    assert tokens_after < tokens_before / 10
+
+
+def test_resolver_parameterized_image_is_cleared_before_token_counting() -> None:
+    """Resolver canonicalizes parameterized MIME and compaction clears its payload."""
+    payload = b"A" * 400_000
+    stored = StoredFile(
+        id="file_parameterized",
+        created_at=1000,
+        filename="photo.png",
+        bytes=len(payload),
+        content_type="image/png;charset=binary",
+    )
+
+    class _FileStore:
+        def get(self, file_id: str) -> StoredFile | None:
+            return stored if file_id == stored.id else None
+
+    class _ArtifactStore:
+        def get(self, file_id: str) -> bytes:
+            assert file_id == stored.id
+            return payload
+
+    resolved = _resolve_file_id_block(
+        {"type": "input_image", "file_id": stored.id, "filename": stored.filename},
+        _FileStore(),  # type: ignore[arg-type]
+        _ArtifactStore(),  # type: ignore[arg-type]
+    )
+    messages = [{"role": "user", "content": [resolved]}]
+
+    assert resolved["image_url"].startswith("data:image/png;base64,")
+    tokens_before = count_tokens(messages, "openai/gpt-4o")
+    _clear_binary_content(messages, protect_from=len(messages))
+    tokens_after = count_tokens(messages, "openai/gpt-4o")
+
+    compacted = messages[0]["content"][0]
+    assert compacted["image_url"] == _BINARY_CONTENT_CLEARED
+    assert compacted["filename"] == "photo.png"
+    assert tokens_after < tokens_before / 10
+
+
+def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
+    """Nested Chat Completions and Anthropic payload containers are redacted."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                    "filename": "chat-completions.png",
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "data:image/png;base64,REVG",
+                    },
+                    "filename": "anthropic.png",
+                },
+            ],
+        }
+    ]
+
+    _clear_binary_content(messages, protect_from=len(messages))
+
+    chat_completions, anthropic = messages[0]["content"]
+    assert chat_completions["image_url"]["url"] == _BINARY_CONTENT_CLEARED
+    assert anthropic["source"]["data"] == _BINARY_CONTENT_CLEARED
+    assert chat_completions["filename"] == "chat-completions.png"
+    assert anthropic["filename"] == "anthropic.png"
+
+
+def test_clear_binary_content_preserves_recent_nested_content_byte_identical() -> None:
+    """Messages in the protected recent window remain deeply unchanged."""
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                    "metadata": {"caption": "keep me"},
+                }
+            ],
+        }
+    ]
+    original = copy.deepcopy(messages)
+
+    _clear_binary_content(messages, protect_from=0)
+
+    assert messages == original
+
+
+def test_clear_binary_content_does_not_add_content_key() -> None:
+    """Old messages without content remain byte-identical."""
+    messages = [{"role": "assistant", "tool_calls": []}]
+    original = copy.deepcopy(messages)
+
+    _clear_binary_content(messages, protect_from=len(messages))
+
+    assert messages == original
 
 
 @pytest.mark.asyncio

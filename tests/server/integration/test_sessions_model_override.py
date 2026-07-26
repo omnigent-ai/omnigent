@@ -690,26 +690,30 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
 ) -> None:
     """Smart routing wins over the orchestrator's model choice for child sessions.
 
-    When sys_session_send passes ``model`` for a child session, the server
-    creates the child with that as ``model_override``. Previously the routing
-    gate (``effective_runner_override is None``) would then skip the judge
-    call entirely, silently letting the LLM's choice beat smart routing.
-
-    Now, when the parent session has the routing toggle on, the judge runs
-    regardless — and the routing verdict replaces the orchestrator's model
-    in the runner body and in the persisted ``model_override``.
+    When the parent session has the routing toggle on, a sub-agent created via
+    sys_session_send is forced to ``harness_override="auto"`` at create time
+    (ignoring the orchestrator's harness/model). The first-message auto-harness
+    path then routes both harness and model via ``route_session_harness`` and
+    the verdict replaces the orchestrator's choice in the runner body.
     """
     captured = _stub_runner_client(monkeypatch)
 
-    # Stub route_turn to return a deterministic verdict, bypassing the real LLM.
+    # Stub route_session_harness to return a deterministic (harness, model)
+    # verdict, bypassing the real LLM. Forced-auto children route through this.
     routed_model = "databricks-claude-haiku-4-5"
+    routed_harness = "claude-sdk"
 
-    async def _fake_route_turn(*_: Any, **__: Any) -> tuple[str, dict[str, Any]]:
-        return routed_model, {"rationale": "trivial task — cheap model suffices"}
+    async def _fake_route_session_harness(
+        *_: Any, **__: Any
+    ) -> tuple[str, str, dict[str, Any], None]:
+        return (
+            routed_harness,
+            routed_model,
+            {"model": routed_model, "rationale": "trivial task — cheap model suffices"},
+            None,
+        )
 
-    # Patch the module where route_turn is defined so the lazy import inside
-    # _forward_event_to_runner picks up the stub.
-    with patch("omnigent.server.smart_routing.route_turn", _fake_route_turn):
+    with patch("omnigent.server.smart_routing.route_session_harness", _fake_route_session_harness):
         agent = await create_test_agent(client)
 
         # Parent session with routing toggle on.
@@ -721,7 +725,8 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
         parent_id = parent_resp.json()["id"]
 
         # Child session with a model the orchestrator chose (simulates
-        # sys_session_send with model="databricks-claude-opus-4-8").
+        # sys_session_send with model="databricks-claude-opus-4-8"). The server
+        # forces harness_override="auto" for a routing-on parent's child.
         child_resp = await client.post(
             "/v1/sessions",
             json={
@@ -733,7 +738,7 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
         assert child_resp.status_code == 201, child_resp.text
         child_id = child_resp.json()["id"]
 
-        # First message to the child — routing should fire and override.
+        # First message to the child — auto-harness routing should fire.
         event_resp = await client.post(
             f"/v1/sessions/{child_id}/events",
             json={
@@ -753,4 +758,8 @@ async def test_smart_routing_overrides_orchestrator_model_for_child_session(
         f"Smart routing should have replaced the orchestrator's model with "
         f"{routed_model!r}; runner body had "
         f"{captured['body'].get('model_override')!r}."
+    )
+    assert captured["body"].get("harness_override") == routed_harness, (
+        f"Smart routing should have set the harness to {routed_harness!r}; "
+        f"runner body had {captured['body'].get('harness_override')!r}."
     )

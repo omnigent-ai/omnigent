@@ -133,8 +133,7 @@ prompt: You are a friendly assistant. Say hello and answer questions.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 # Required for PUT /filesystem/{path} seeding in UI tests (e.g. markdown
 # editor comments) — the runner returns 404 when os_env is absent.
@@ -200,8 +199,7 @@ prompt: You are a terse assistant with no filesystem.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 """
 _FILES_PROBE_ENV_AGENT_YAML = f"""\
 name: {_FILES_PROBE_ENV_AGENT_NAME}
@@ -209,8 +207,7 @@ prompt: You are a terse assistant with a filesystem.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 os_env:
   type: caller_process
@@ -291,6 +288,12 @@ def browser_type_launch_args(
     launch_args["args"] = [
         *launch_args.get("args", []),
         f"--host-resolver-rules=MAP {_PUBLIC_LOOPBACK_HOST} 127.0.0.1",
+        # Headless Chromium has no microphone; the dictation test
+        # (chat/test_dictation.py) needs getUserMedia to yield a fake
+        # input stream without a permission prompt. No effect on tests
+        # that never touch media capture.
+        "--use-fake-device-for-media-stream",
+        "--use-fake-ui-for-media-stream",
     ]
     # The pinned Playwright Docker image (the visual-snapshot renderer, both in
     # ui-snapshot.yml and the local regen script) runs as root, where Chromium
@@ -883,6 +886,10 @@ def live_server(
         "OPENAI_API_KEY": "mock-key",
         # Strip any ambient Anthropic credentials so they don't leak in.
         "ANTHROPIC_API_KEY": "",
+        # Deterministic dictation engine: /v1/info advertises dictation and
+        # WS /v1/dictation/stream transcribes any audio into FAKE_SCRIPT,
+        # so chat/test_dictation.py needs no sherpa models or real ASR.
+        "OMNIGENT_DICTATION_ENGINE": os.environ.get("OMNIGENT_DICTATION_ENGINE", "fake"),
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
     proc = subprocess.Popen(
@@ -1320,8 +1327,7 @@ prompt: |
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 os_env:
   type: caller_process
@@ -1946,7 +1952,7 @@ def server_pid(live_server: str) -> int:
 # 1 + executor.config.harness routes through the strict parser; arcname
 # config.yaml keeps it on that path.
 _CUSTOM_AGENT_NAME = "echo_probe"
-_CLAUDE_MOCK_MODEL = "claude-3-5-sonnet-20241022"
+_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
@@ -2318,10 +2324,9 @@ def _temp_omnigent_mock_config(
 ) -> Generator[None, None, None]:
     """Temporarily write a mock provider config to ~/.omnigent/config.yaml.
 
-    The runner reads this at terminal-creation time, so it only needs to be
-    in place between the PATCH that binds a session to the runner (which
-    triggers auto-boot) and the terminal connecting. Restores the original
-    file (or removes it) on exit.
+    Native credential helpers may read provider configuration on every turn,
+    so the mock config stays in place for the fixture's full lifetime.
+    Restores the original file (or removes it) on exit.
 
     :param mock_llm_server_url: Base URL of the mock LLM server, e.g.
         ``"http://127.0.0.1:51235"``.
@@ -2396,17 +2401,17 @@ def native_claude_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_claude_session(live_server, runner_id)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
-                respawned.wait(timeout=5)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
 
 
 @pytest.fixture
@@ -2434,17 +2439,17 @@ def native_codex_mock_session(
         ctx = contextlib.nullcontext()
     with ctx:
         session_id = _create_native_codex_session(live_server, runner_id)
-    try:
-        yield (live_server, session_id)
-    finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
-                respawned.wait(timeout=5)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
 
 
 @dataclass(frozen=True)

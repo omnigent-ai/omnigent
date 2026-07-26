@@ -2,7 +2,7 @@
 
 The font-size control lives on the Settings page (``pages/SettingsPage.tsx``,
 ``UiFontSizeControl``): a segmented pill with a ``−`` button, a numeric value,
-and a ``+`` button under a ``role="group"`` labelled "Font size". Stepping the
+and a ``+`` button under a ``role="group"`` labelled "Interface font size". Stepping the
 value writes the px choice to ``localStorage["omnigent:ui-font-size"]`` and
 applies it as the ``--ui-font-scale`` custom property on ``<html>`` (see
 ``lib/uiFontPreferences.ts``).
@@ -20,6 +20,7 @@ from __future__ import annotations
 from playwright.sync_api import Page, expect
 
 STORAGE_KEY = "omnigent:ui-font-size"
+GROUP_NAME = "Interface font size"
 
 
 def _ui_font_scale(page: Page) -> str:
@@ -38,7 +39,7 @@ def _stored_size(page: Page) -> str | None:
 def _open_appearance(page: Page, base_url: str) -> None:
     """Navigate to the Settings Appearance section and wait for the control."""
     page.goto(f"{base_url}/settings/appearance")
-    expect(page.get_by_role("group", name="Font size", exact=True)).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("group", name=GROUP_NAME, exact=True)).to_be_visible(timeout=30_000)
 
 
 def test_ui_font_size_scales_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
@@ -69,7 +70,7 @@ def test_ui_font_size_scales_and_persists(page: Page, seeded_session: tuple[str,
 
     # The choice survives a full reload (persisted + re-applied before paint).
     page.reload()
-    expect(page.get_by_role("group", name="Font size", exact=True)).to_be_visible(timeout=30_000)
+    expect(page.get_by_role("group", name=GROUP_NAME, exact=True)).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("ui-font-size-input")).to_have_value("18")
     assert _ui_font_scale(page) == "1.125", "scale was not restored after reload"
 

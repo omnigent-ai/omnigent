@@ -252,6 +252,45 @@ def test_build_pod_manifest_node_selector_can_override_arch() -> None:
     assert selector["disktype"] == "ssd"
 
 
+def test_build_pod_manifest_pvc_mounts_land_on_host_container_only() -> None:
+    """Each pvc_mounts entry becomes a persistentVolumeClaim volume mounted on host only."""
+    manifest = build_pod_manifest(
+        **_MANIFEST_KW,
+        pvc_mounts=[
+            {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True},
+            {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+        ],
+    )
+    spec = manifest["spec"]
+    volumes = {v["name"]: v for v in spec["volumes"]}
+    assert volumes["home"] == {"name": "home", "emptyDir": {}}
+    assert volumes["pvc-0"]["persistentVolumeClaim"] == {
+        "claimName": "omnigent-datasets",
+        "readOnly": True,
+    }
+    assert volumes["pvc-1"]["persistentVolumeClaim"] == {"claimName": "scratch"}
+    host_mounts = {m["name"]: m for m in spec["containers"][0]["volumeMounts"]}
+    assert host_mounts["pvc-0"] == {
+        "name": "pvc-0",
+        "mountPath": "/mnt/datasets",
+        "readOnly": True,
+    }
+    assert host_mounts["pvc-1"] == {"name": "pvc-1", "mountPath": "/mnt/scratch"}
+    # The init container keeps exactly its HOME emptyDir — no dataset exposure at clone time.
+    assert spec["initContainers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
+def test_build_pod_manifest_without_pvc_mounts_is_unchanged() -> None:
+    """No pvc_mounts → the single home emptyDir, exactly as before."""
+    manifest = build_pod_manifest(**_MANIFEST_KW)
+    assert manifest["spec"]["volumes"] == [{"name": "home", "emptyDir": {}}]
+    assert manifest["spec"]["containers"][0]["volumeMounts"] == [
+        {"name": "home", "mountPath": "/home/omnigent"}
+    ]
+
+
 def test_build_pod_manifest_is_restricted_and_least_privilege() -> None:
     """The Pod satisfies Pod Security 'restricted' and mounts no SA token."""
     manifest = build_pod_manifest(**_MANIFEST_KW)
@@ -479,6 +518,31 @@ def test_launch_host_creates_secret_then_pod_and_returns_workspace(
     assert fake_core.created_pods[0]["metadata"]["name"] == "omnigent-pod-1"
     # Nothing torn down on success.
     assert fake_core.deleted_pods == []
+
+
+def test_launch_host_threads_pvc_mounts_into_the_pod(fake_core: _FakeCore) -> None:
+    """A launcher built with pvc_mounts creates Pods carrying the PVC volume."""
+    fake_core.read_queue = [_pod(phase="Running")]
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pvc_mounts=[
+            {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True}
+        ],
+    )
+    launcher.start_host(
+        "omnigent-pod-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert {
+        "name": "pvc-0",
+        "persistentVolumeClaim": {"claimName": "omnigent-datasets", "readOnly": True},
+    } in fake_core.created_pods[0]["spec"]["volumes"]
 
 
 def test_launch_host_with_repo_returns_clone_dir(fake_core: _FakeCore) -> None:

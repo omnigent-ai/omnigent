@@ -556,6 +556,7 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.secret_name is None
     assert fake.in_cluster is None
     assert fake.resources is None
+    assert fake.pvc_mounts is None
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -686,6 +687,9 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"resources": {"requests": {"cpu": "not a quantity!"}}}, "valid Kubernetes quantity"),
         ({"resources": {"requests": {"disk": "1Gi"}}}, "unknown key"),
         ({"in_cluster": "yes"}, "must be a boolean"),
+        # A misspelled section key would silently no-op (e.g. no PVCs mounted)
+        # without the allowlist check.
+        ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
     ],
 )
 def test_parse_kubernetes_invalid_block_fails_loud(
@@ -700,6 +704,216 @@ def test_parse_kubernetes_invalid_block_fails_loud(
                 "kubernetes": kubernetes_block,
             }
         )
+
+
+def test_parse_kubernetes_pvc_mounts_normalizes_and_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pvc_mounts parse into normalized entries (read_only defaults True) on the launcher."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets"},
+                    {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts == [
+        {"claim_name": "omnigent-datasets", "mount_path": "/mnt/datasets", "read_only": True},
+        {"claim_name": "scratch", "mount_path": "/mnt/scratch", "read_only": False},
+    ]
+
+
+def test_parse_kubernetes_without_pvc_mounts_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitted (or empty) pvc_mounts reach the launcher as None — no volumes added."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"pvc_mounts": []},
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.launcher_factory() is fake
+    assert fake.pvc_mounts is None
+
+
+@pytest.mark.parametrize(
+    ("pvc_mounts", "expected_fragment"),
+    [
+        # Wrong container shapes.
+        ("nfs-share", "must be a list"),
+        ([["claim"]], "must be a mapping"),
+        # Unknown / missing keys.
+        ([{"claim_name": "c", "mount_path": "/mnt/x", "sub_path": "y"}], "unknown key"),
+        ([{"mount_path": "/mnt/x"}], "claim_name"),
+        ([{"claim_name": "c"}], "mount_path"),
+        # Bad claim names (PVC names are DNS-1123 subdomains).
+        ([{"claim_name": "Bad_Claim", "mount_path": "/mnt/x"}], "claim_name"),
+        # Bad mount paths: relative, unnormalized, root, reserved.
+        ([{"claim_name": "c", "mount_path": "mnt/x"}], "absolute"),
+        ([{"claim_name": "c", "mount_path": "/mnt/../etc"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/mnt/x/"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/home//omnigent"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/home/./omnigent"}], "normalized"),
+        # Exactly two leading slashes survive posixpath.normpath (POSIX) but
+        # the kernel collapses them, so '//home/omnigent' would shadow HOME.
+        ([{"claim_name": "c", "mount_path": "//home/omnigent"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "//mnt/x"}], "normalized"),
+        ([{"claim_name": "c", "mount_path": "/"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/home/omnigent/data"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run/secrets/x"}], "reserved"),
+        # Ancestors of reserved paths: a PVC at /home would mount over the
+        # HOME emptyDir's /home/omnigent mountpoint (likewise /var, /var/run
+        # over the Secret projections).
+        ([{"claim_name": "c", "mount_path": "/home"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run"}], "reserved"),
+        # /var/run -> /run and /var/lock -> /run/lock on the Debian-based
+        # host image: every spelling of any path under them must be
+        # rejected, not just the secrets subtree.
+        ([{"claim_name": "c", "mount_path": "/run"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/run/secrets"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/run/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/run/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/lock"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/var/lock/cache"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/tmp"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/etc"}], "reserved"),
+        # /opt hosts the image's omnigent venv (/opt/venv).
+        ([{"claim_name": "c", "mount_path": "/opt"}], "reserved"),
+        ([{"claim_name": "c", "mount_path": "/opt/venv"}], "reserved"),
+        # read_only must be a boolean, not a truthy string.
+        ([{"claim_name": "c", "mount_path": "/mnt/x", "read_only": "yes"}], "boolean"),
+        # Duplicates / nesting between entries.
+        (
+            [
+                {"claim_name": "a", "mount_path": "/mnt/x"},
+                {"claim_name": "b", "mount_path": "/mnt/x"},
+            ],
+            "duplicate",
+        ),
+        (
+            [
+                {"claim_name": "a", "mount_path": "/mnt/x"},
+                {"claim_name": "b", "mount_path": "/mnt/x/sub"},
+            ],
+            "nested",
+        ),
+    ],
+)
+def test_parse_kubernetes_pvc_mounts_invalid_fails_loud(
+    pvc_mounts: object, expected_fragment: str
+) -> None:
+    """An operator typo in pvc_mounts fails at parse (server startup), not at launch."""
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"pvc_mounts": pvc_mounts},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "mount_path", ["/home/other", "/home/omnigent-data", "/var/lib", "/runway"]
+)
+def test_parse_kubernetes_pvc_mounts_reserved_check_is_segment_aware(mount_path: str) -> None:
+    """Siblings sharing a string prefix with a reserved path (or its parent) are allowed."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {"pvc_mounts": [{"claim_name": "c", "mount_path": mount_path}]},
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_pvc_mounts_sibling_prefix_is_not_nested() -> None:
+    """/mnt/data vs /mnt/database share a string prefix but are distinct mounts."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "a", "mount_path": "/mnt/data"},
+                    {"claim_name": "b", "mount_path": "/mnt/database"},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
+
+
+def test_parse_kubernetes_pvc_mounts_nesting_is_rejected_regardless_of_order() -> None:
+    """The pairwise collision check catches nesting anywhere in a 3-entry list."""
+    with pytest.raises(ValueError, match="nested"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [
+                        {"claim_name": "a", "mount_path": "/mnt/x/sub"},
+                        {"claim_name": "b", "mount_path": "/mnt/y"},
+                        {"claim_name": "c", "mount_path": "/mnt/x"},
+                    ]
+                },
+            }
+        )
+
+
+def test_parse_kubernetes_pvc_mounts_rejects_explicit_null_read_only() -> None:
+    """An explicit YAML `read_only: null` is rejected, not silently defaulted."""
+    with pytest.raises(ValueError, match="boolean"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {
+                    "pvc_mounts": [{"claim_name": "c", "mount_path": "/mnt/x", "read_only": None}]
+                },
+            }
+        )
+
+
+def test_reserved_mount_prefixes_pin_the_launcher_home_dir() -> None:
+    """The mirrored HOME prefix must track the launcher's _HOME_DIR — a rename
+    there without updating the reserved list would let a mount shadow HOME."""
+    from omnigent.onboarding.sandboxes.kubernetes import _HOME_DIR
+    from omnigent.server.managed_hosts import _KUBERNETES_RESERVED_MOUNT_PREFIXES
+
+    assert _HOME_DIR in _KUBERNETES_RESERVED_MOUNT_PREFIXES
+
+
+def test_parse_kubernetes_pvc_mounts_allows_same_claim_at_two_paths() -> None:
+    """One claim may be mounted at two paths (e.g. RO datasets + RW scratch subtrees)."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "pvc_mounts": [
+                    {"claim_name": "shared", "mount_path": "/mnt/a"},
+                    {"claim_name": "shared", "mount_path": "/mnt/b", "read_only": False},
+                ]
+            },
+        }
+    )
+    assert cfg is not None
 
 
 @pytest.mark.parametrize(
@@ -1142,7 +1356,7 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1166,7 +1380,7 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     # launchers record their own name.
     host = host_store.get_host(result.host_id)
     assert host is not None
-    assert host.owner == _OWNER
+    assert host.user_id == _OWNER
     assert host.name == start.host_name
     assert host.status == "online"
     assert host.sandbox_provider == "modal"
@@ -1174,7 +1388,7 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     # The token injected into the sandbox is the one whose digest was
     # stored: resolving it (the tunnel's auth path) yields this host,
     # which also proves it is unexpired.
-    resolved = host_store.resolve_launch_token(start.token)
+    resolved = host_store.resolve_launch_token(start.host_id, start.token)
     assert resolved is not None
     assert resolved.host_id == result.host_id
     # Nothing was torn down on the success path.
@@ -1193,7 +1407,7 @@ async def test_launch_materializes_host_config_before_host_start(db_uri: str) ->
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1223,7 +1437,7 @@ async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register, can_resume=True)
@@ -1253,7 +1467,7 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1277,7 +1491,7 @@ async def test_launch_without_host_config_supports_legacy_start_host_signature(
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     class _LegacySignatureLauncher(FakeSandboxLauncher):
@@ -1337,7 +1551,7 @@ async def test_launch_with_injected_custom_launcher(db_uri: str) -> None:
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = _AcmeLauncher(on_host_start=_register)
@@ -1475,7 +1689,10 @@ async def test_launch_online_timeout_terminates_and_deletes_host(
     assert host_store.list_hosts(_OWNER) == []
     # The start command DID run (the failure was registration, not
     # startup), so its minted token exists — and must be dead.
-    assert host_store.resolve_launch_token(fake.host_starts[0].token) is None
+    assert (
+        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
+        is None
+    )
 
 
 async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
@@ -1491,7 +1708,7 @@ async def test_launch_with_repo_clones_into_workspace(db_uri: str) -> None:
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1602,9 +1819,11 @@ class _EntrypointFakeLauncher(FakeSandboxLauncher):
             }
         )
         # The token was registered before start_host, so it resolves now.
-        self.token_resolved_at_start = self._host_store.resolve_launch_token(token) is not None
+        self.token_resolved_at_start = (
+            self._host_store.resolve_launch_token(host_id, token) is not None
+        )
         # Simulate the host's entrypoint dialing back over the tunnel.
-        self._host_store.upsert_on_connect(host_id=host_id, name=host_name, owner=_OWNER)
+        self._host_store.upsert_on_connect(host_id=host_id, name=host_name, user_id=_OWNER)
         return f"/home/omnigent/workspace/{repo_name}" if repo_name else "/home/omnigent/workspace"
 
 
@@ -1683,7 +1902,7 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1704,14 +1923,14 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host is not None
     assert host.sandbox_id == "sb-fake-2"
     assert host.name == gen1.name
-    assert host.owner == _OWNER
+    assert host.user_id == _OWNER
     # Generation 2 authenticated with a NEW token; generation 1's is
     # revoked by the re-arm (its digest no longer matches anything).
     gen2_token = fake.host_starts[1].token
     assert gen2_token != gen1_token
-    resolved = host_store.resolve_launch_token(gen2_token)
+    resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, gen2_token)
     assert resolved is not None and resolved.host_id == first.host_id
-    assert host_store.resolve_launch_token(gen1_token) is None
+    assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
@@ -1730,7 +1949,7 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = FakeSandboxLauncher(on_host_start=_register)
@@ -1756,7 +1975,10 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     # cleanup (revoke_launch_token — covered directly in the host-store
     # suite). Gen 1's raw token is the only one observable here (the
     # failed start never executed), so assert on it.
-    assert host_store.resolve_launch_token(fake.host_starts[0].token) is None
+    assert (
+        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
+        is None
+    )
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -1769,7 +1991,7 @@ async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
     host = host_store.register_managed_host(
         host_id="8369cb15e751573a1ee641d5fa09c70a",
         name="managed-mismatch",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok",
         provider="daytona",
         sandbox_id="dt-1",
@@ -1804,7 +2026,7 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     host = host_store.register_managed_host(
         host_id="292a6322075a34e482fde44975da10f3",
         name="managed-resume-gate",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-gate",
         provider="islo",
         sandbox_id="sb-resume-gate",
@@ -1823,7 +2045,7 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     no_sandbox = host_store.register_managed_host(
         host_id="0c3d744a455047df9a3c0acf432d08dd",
         name="managed-resume-no-sandbox",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-no-sandbox",
         provider="islo",
         sandbox_id="sb-temp",
@@ -1842,7 +2064,7 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
-            owner=_OWNER,
+            user_id=_OWNER,
         )
 
     fake = _IsloFakeLauncher(on_host_start=_register, can_resume=True)
@@ -1868,8 +2090,8 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert woke.sandbox_id == "sb-fake-1"
     second_token = fake.host_starts[1].token
     assert second_token != first_token
-    assert host_store.resolve_launch_token(first_token) is None
-    resolved = host_store.resolve_launch_token(second_token)
+    assert host_store.resolve_launch_token(fake.host_starts[0].host_id, first_token) is None
+    resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, second_token)
     assert resolved is not None and resolved.host_id == first.host_id
 
 
@@ -1879,7 +2101,7 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
     host_store.register_managed_host(
         host_id="62d4405ba38711fe34bebfeb5a7adaf2",
         name="managed-resume-force",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-force",
         provider="islo",
         sandbox_id="sb-resume-force",
@@ -1888,7 +2110,7 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
     host_store.upsert_on_connect(
         host_id="62d4405ba38711fe34bebfeb5a7adaf2",
         name="managed-resume-force",
-        owner=_OWNER,
+        user_id=_OWNER,
     )
     assert host_store.is_online("62d4405ba38711fe34bebfeb5a7adaf2") is True
     fake = _IsloFakeLauncher(can_resume=True)
@@ -1899,8 +2121,13 @@ async def test_resume_managed_host_force_wakes_fresh_online_row(db_uri: str) -> 
 
     assert fake.resumed == ["sb-resume-force"]
     assert len(fake.host_starts) == 1
-    assert host_store.resolve_launch_token("tok-resume-force") is None
-    resolved = host_store.resolve_launch_token(fake.host_starts[0].token)
+    assert (
+        host_store.resolve_launch_token("62d4405ba38711fe34bebfeb5a7adaf2", "tok-resume-force")
+        is None
+    )
+    resolved = host_store.resolve_launch_token(
+        "62d4405ba38711fe34bebfeb5a7adaf2", fake.host_starts[0].token
+    )
     assert resolved is not None and resolved.host_id == "62d4405ba38711fe34bebfeb5a7adaf2"
 
 
@@ -1910,7 +2137,7 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     host_store.register_managed_host(
         host_id="249d058fbcde7b2ce941479cdb8c82d7",
         name="managed-resume-noop",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-noop",
         provider="modal",
         sandbox_id="sb-resume-noop",
@@ -1928,7 +2155,10 @@ async def test_resume_managed_host_noops_for_non_resumable_provider(db_uri: str)
     assert host is not None
     assert host.status == "offline"
     assert host.sandbox_id == "sb-resume-noop"
-    assert host_store.resolve_launch_token("tok-resume-noop") is not None
+    assert (
+        host_store.resolve_launch_token("249d058fbcde7b2ce941479cdb8c82d7", "tok-resume-noop")
+        is not None
+    )
 
 
 async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_uri: str) -> None:
@@ -1937,7 +2167,7 @@ async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_u
     host_store.register_managed_host(
         host_id="efbef7dede7be6577770cbb1287992f2",
         name="managed-resume-fail",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-resume-fail",
         provider="islo",
         sandbox_id="sb-resume-fail",
@@ -1957,7 +2187,10 @@ async def test_resume_managed_host_failure_preserves_existing_row_and_token(db_u
     assert host is not None
     assert host.status == "offline"
     assert host.sandbox_id == "sb-resume-fail"
-    assert host_store.resolve_launch_token("tok-resume-fail") is not None
+    assert (
+        host_store.resolve_launch_token("efbef7dede7be6577770cbb1287992f2", "tok-resume-fail")
+        is not None
+    )
 
 
 # ── terminate_managed_host ──────────────────────────────────
@@ -1974,7 +2207,7 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     host = host_store.register_managed_host(
         host_id="62a91eb065624754c6a6dfb5869dd7e8",
         name="managed-term1",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-1",
         provider="modal",
         sandbox_id="sb-term-1",
@@ -1985,7 +2218,9 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
 
     assert fake.terminated == ["sb-term-1"]
     assert host_store.get_host("62a91eb065624754c6a6dfb5869dd7e8") is None
-    assert host_store.resolve_launch_token("tok-term-1") is None
+    assert (
+        host_store.resolve_launch_token("62a91eb065624754c6a6dfb5869dd7e8", "tok-term-1") is None
+    )
 
 
 async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
@@ -2007,7 +2242,7 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     host = host_store.register_managed_host(
         host_id="057e7fa3f1cdb40c0ec393a3d42affc7",
         name="managed-term2",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-2",
         provider="modal",
         sandbox_id="sb-term-2",
@@ -2017,7 +2252,9 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
     await terminate_managed_host(host, host_store, _injected_config(fake))
 
     assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
-    assert host_store.resolve_launch_token("tok-term-2") is None
+    assert (
+        host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
+    )
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
@@ -2033,7 +2270,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     host = host_store.register_managed_host(
         host_id="487212fd2b157b6ab6a6d6d3ef06ce5b",
         name="managed-term3",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-3",
         # Row launched under a provider the current config doesn't run.
         provider="acme-cloud",
@@ -2045,13 +2282,15 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     # No cross-provider terminate was attempted.
     assert fake.terminated == []
     assert host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b") is None
-    assert host_store.resolve_launch_token("tok-term-3") is None
+    assert (
+        host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
+    )
 
     # config=None behaves the same: row deleted, nothing terminated.
     host2 = host_store.register_managed_host(
         host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",
-        owner=_OWNER,
+        user_id=_OWNER,
         token="tok-term-4",
         provider="modal",
         sandbox_id="sb-term-4",

@@ -5,7 +5,7 @@ Implements :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher`
 for `NVIDIA OpenShell <https://github.com/NVIDIA/openshell>`_ sandboxes
 on top of the official ``openshell`` Python SDK. Same posture as the
 Modal, Daytona, and CoreWeave launchers: the SDK is an optional
-dependency (``pip install 'omnigent[openshell]'``) imported lazily, so
+dependency (``uv pip install 'omnigent[openshell]'``) imported lazily, so
 the provider can be listed and the module probed without it.
 
 OpenShell is self-hosted: a gateway control plane manages sandbox
@@ -104,7 +104,7 @@ def _ensure_sdk() -> None:
     except ImportError as exc:
         raise click.ClickException(
             "The openshell SDK is required for the 'openshell' sandbox provider. "
-            "Install it with `pip install 'omnigent[openshell]'`, then select a "
+            "Install it with `uv pip install 'omnigent[openshell]'`, then select a "
             "gateway with `openshell gateway select <name>` (or set OPENSHELL_GATEWAY)."
         ) from exc
 

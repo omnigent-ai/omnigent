@@ -88,10 +88,10 @@ def test_confirm_alive_prunes_dead_record(tmp_path: Path) -> None:
 # ── CLI wiring ────────────────────────────────────────────────────
 
 
-def test_slack_start_hint_when_not_installed(data_dir: Path) -> None:
+def test_slack_background_hint_when_not_installed(data_dir: Path) -> None:
     runner = CliRunner()
     with mock.patch("omnigent.cli._slack_installed", return_value=False):
-        result = runner.invoke(cli, ["integration", "slack", "start"])
+        result = runner.invoke(cli, ["integration", "slack", "--background"])
     assert result.exit_code != 0
     assert "isn't installed" in result.output
     assert "omnigent-slack" in result.output
@@ -112,7 +112,7 @@ def test_slack_status_reports_not_running(data_dir: Path) -> None:
     assert "not running" in result.output
 
 
-def test_slack_start_status_stop_lifecycle(data_dir: Path) -> None:
+def test_slack_background_status_stop_lifecycle(data_dir: Path) -> None:
     runner = CliRunner()
     with (
         mock.patch("omnigent.cli._slack_installed", return_value=True),
@@ -125,7 +125,7 @@ def test_slack_start_status_stop_lifecycle(data_dir: Path) -> None:
         mock.patch.object(IntegrationDaemon, "confirm_alive", return_value=True),
     ):
         popen.return_value.pid = 9911
-        start = runner.invoke(cli, ["integration", "slack", "start"])
+        start = runner.invoke(cli, ["integration", "slack", "--background"])
         assert start.exit_code == 0, start.output
         assert "9911" in start.output
         # Argv targets the slack package in the current interpreter.
@@ -135,9 +135,9 @@ def test_slack_start_status_stop_lifecycle(data_dir: Path) -> None:
         status = runner.invoke(cli, ["integration", "slack", "status"])
         assert "running" in status.output and "9911" in status.output
 
-        # start again is idempotent — reports the existing pid, no 2nd spawn.
+        # --background again is idempotent — reports the existing pid, no 2nd spawn.
         popen.reset_mock()
-        again = runner.invoke(cli, ["integration", "slack", "start"])
+        again = runner.invoke(cli, ["integration", "slack", "--background"])
         assert "already running" in again.output
         popen.assert_not_called()
 
@@ -154,7 +154,7 @@ def test_slack_start_status_stop_lifecycle(data_dir: Path) -> None:
     assert "not running" in runner.invoke(cli, ["integration", "slack", "status"]).output
 
 
-def test_slack_start_reports_immediate_exit(data_dir: Path) -> None:
+def test_slack_background_reports_immediate_exit(data_dir: Path) -> None:
     """A daemon that dies on startup fails loudly with a log tail, not a lie."""
     runner = CliRunner()
     with (
@@ -165,7 +165,7 @@ def test_slack_start_reports_immediate_exit(data_dir: Path) -> None:
         mock.patch.object(IntegrationDaemon, "read_log_tail", return_value="Traceback: boom"),
     ):
         popen.return_value.pid = 5150
-        result = runner.invoke(cli, ["integration", "slack", "start"])
+        result = runner.invoke(cli, ["integration", "slack", "--background"])
     assert result.exit_code != 0
     assert "exited immediately" in result.output
     assert "boom" in result.output
@@ -184,6 +184,18 @@ def test_slack_foreground_runs_subprocess(data_dir: Path) -> None:
     assert result.exit_code == 0
     argv = run.call_args.args[0]
     assert argv[1:] == ["-m", "omnigent_slack"]
+
+
+def test_slack_start_subcommand_removed(data_dir: Path) -> None:
+    """The old ``start`` subcommand is gone — ``--background`` replaces it.
+
+    Guards the migration: a lingering ``start`` would be treated by Click as an
+    unknown subcommand (usage error), so this asserts the flag is the only way
+    in and the subcommand isn't silently re-added."""
+    runner = CliRunner()
+    result = runner.invoke(cli, ["integration", "slack", "start"])
+    assert result.exit_code != 0
+    assert "No such command 'start'" in result.output
 
 
 def test_slack_foreground_refuses_when_daemon_running(data_dir: Path) -> None:

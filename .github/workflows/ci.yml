@@ -141,6 +141,17 @@ jobs:
             paths: tests/db tests/deploy
             extra: databricks
             markexpr: databricks
+          # Slack integration (integrations/slack). Its tests live outside the
+          # top-level tests/ tree and import the decoupled `omnigent_slack`
+          # package, so this lane installs the `slack` extra to pull it in. The
+          # tests are run from the repo root on purpose: they rely on the root
+          # pyproject's `asyncio_mode = auto` (rootdir resolution), and
+          # coverage of the omnigent package is a no-op here (the code under
+          # test is omnigent_slack, not omnigent) — harmless, kept for a
+          # uniform pytest step.
+          - group: slack
+            paths: integrations/slack/tests
+            extra: slack
 
     steps:
       - name: Check out repo
@@ -414,8 +425,12 @@ jobs:
     # Combines per-shard coverage into a coverage-summary artifact. Runs in the
     # unprivileged pull_request context (read-only); code-coverage.yml consumes
     # the artifact and posts the status. Report-only.
+    #
+    # Only runs when every pytest shard passed: a failed shard drops its covered
+    # lines from the combine, so coverage off partial data would be misleading —
+    # and a red run gets re-run anyway, re-triggering this.
     needs: pytest
-    if: ${{ !cancelled() && !github.event.pull_request.draft }}
+    if: ${{ success() && !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

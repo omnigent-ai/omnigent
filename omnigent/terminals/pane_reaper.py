@@ -65,8 +65,8 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
 )
 
 # Default idle window before an unused native pane is reaped. Mirrors
-# ``HarnessProcessManager``'s 30-minute SDK-proxy default for consistency.
-_DEFAULT_IDLE_TIMEOUT_S = 30 * 60
+# ``HarnessProcessManager``'s 1-hour SDK-proxy default for consistency.
+_DEFAULT_IDLE_TIMEOUT_S = 60 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
@@ -91,7 +91,7 @@ def resolve_native_pane_idle_timeout_s() -> float:
     """Resolve the native-pane idle window in seconds.
 
     Honors :envvar:`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` (``0`` disables pane
-    reaping); otherwise the 30-minute default. An unparseable or negative value
+    reaping); otherwise the 1-hour default. An unparseable or negative value
     logs a warning and falls back to the default rather than failing the runner
     at boot — an env typo shouldn't take the runner down or (worse) make the
     reaper act on a bogus window.

@@ -15,7 +15,7 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +24,7 @@ from websockets.exceptions import InvalidStatus, InvalidURI
 
 from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -31,10 +32,14 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostCreateWorktreeFrame,
     HostCreateWorktreeResultFrame,
+    HostDetectCredentialsFrame,
+    HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostInstallHarnessFrame,
+    HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
     HostListDirEntry,
@@ -42,6 +47,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostListWorktreesFrame,
     HostListWorktreesResultFrame,
+    HostModelOptionsFrame,
+    HostModelOptionsResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -51,6 +58,8 @@ from omnigent.host.frames import (
     HostStatResultFrame,
     HostStopRunnerFrame,
     HostStopRunnerResultFrame,
+    HostStoreSecretFrame,
+    HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -61,11 +70,22 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
-from omnigent.onboarding.harness_install import harness_setup_hint
+from omnigent.onboarding.harness_auth import (
+    adopt_env_credential,
+    detect_adoptable_credentials,
+    store_harness_credential,
+)
+from omnigent.onboarding.harness_install import (
+    harness_cli_installed,
+    harness_setup_hint,
+    try_install_harness_cli,
+    ui_install_key,
+)
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
 )
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 from omnigent.process_logging import (
     LOG_TTY_FD_ENV_VAR,
     PROCESS_LOG_FILE_ENV_VAR,
@@ -75,7 +95,9 @@ from omnigent.process_logging import (
     process_log_dir,
 )
 from omnigent.runner.identity import (
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -526,6 +548,7 @@ def _build_runner_env(
     binding_token: str,
     workspace: str,
     parent_pid: int,
+    initial_auth_token: str | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -549,6 +572,9 @@ def _build_runner_env(
     :param workspace: Absolute runner cwd on the host, e.g.
         ``"/Users/alice/proj"``.
     :param parent_pid: Host process pid, for orphan detection.
+    :param initial_auth_token: Current host bearer for the runner's initial
+        server connection. The runner consumes and removes it before spawning
+        any children. ``None`` leaves the legacy auth path unchanged.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -567,6 +593,9 @@ def _build_runner_env(
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
+    env[RUNNER_DELEGATED_AUTH_ENV_VAR] = "1"
+    if initial_auth_token:
+        env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
     return env
@@ -669,6 +698,12 @@ class HostProcess:
         self._identity = identity
         self._server_url = server_url.rstrip("/")
         self._runners: dict[str, _RunnerHandle] = {}
+        # Retain the host's refreshable auth context after the first tunnel
+        # handshake so runner launches can reuse its warm bearer. Failed or
+        # unavailable resolution is not latched, allowing a later reconnect
+        # to retry credential discovery.
+        self._auth_token_factory: Callable[[], str | None] | None = None
+        self._auth_token_factory_resolved = False
         # Set on the first accepted WS upgrade. Distinguishes a host that
         # never authenticated (login redirects turn fatal after
         # _LOGIN_REDIRECT_FATAL_ATTEMPTS) from a live host hit by a server
@@ -1090,6 +1125,10 @@ class HostProcess:
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
+        initial_auth_token = await asyncio.to_thread(
+            self._current_auth_token,
+            initialize=False,
+        )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,
@@ -1097,6 +1136,7 @@ class HostProcess:
             binding_token=frame.binding_token,
             workspace=str(workspace),
             parent_pid=os.getpid(),
+            initial_auth_token=initial_auth_token,
         )
 
         try:
@@ -1257,7 +1297,8 @@ class HostProcess:
 
         :param runner_id: The runner to watch, e.g.
             ``"runner_abc123..."``.
-        :returns: None. Returns silently for intentional stops.
+        :returns: None. Returns silently for intentional stops and clean
+            (exit-code-0) shutdowns.
         """
         handle = self._runners.get(runner_id)
         if handle is None:  # pragma: no cover — spawned just before us
@@ -1267,6 +1308,15 @@ class HostProcess:
         if self._runners.get(runner_id) is not handle:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
+            return
+        if handle.proc.returncode == 0:
+            # A clean exit (code 0) is a graceful shutdown, not a crash — the
+            # idle reaper shutting an inactive runner down, or any orderly
+            # self-exit. Reporting it as host.runner_exited would attach a
+            # scary "runner process exited" error to a session the user only
+            # has to message to reactivate, so stay silent. A non-zero exit
+            # below is a genuine crash and still reports its cause.
+            _logger.info("Runner %s exited cleanly (code 0); no crash report", runner_id)
             return
         error = _runner_exit_error(handle.proc.returncode, handle.log_path)
         _logger.warning("Runner %s died unexpectedly: %s", runner_id, error)
@@ -1538,6 +1588,175 @@ class HostProcess:
             path=created,
         )
 
+    def _handle_install_harness(
+        self, frame: HostInstallHarnessFrame
+    ) -> HostInstallHarnessResultFrame:
+        """Handle a ``host.install_harness`` request from the server.
+
+        Runs the same installer :func:`try_install_harness_cli` (hence
+        ``omnigent setup``) uses, then recomputes readiness so the result frame
+        carries a fresh ``configured_harnesses`` map. The ``ui_install_key``
+        guard re-checks the allowlist as defence in depth against a spoofed
+        frame. Idempotent: an already-installed CLI skips the install. Runs off
+        the event loop (it shells out / probes ``PATH``).
+
+        :param frame: The install request frame. ``frame.harness`` is a UI
+            harness identifier, e.g. ``"claude"``.
+        :returns: Result frame with ``status`` ``"ok"``/``"failed"``, the
+            refreshed readiness map on success, and a reason on failure.
+        """
+        key = ui_install_key(frame.harness)
+        if key is None:
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"harness {frame.harness!r} is not installable from the UI",
+            )
+        if harness_cli_installed(key):
+            # Already installed — skip the slow npm re-resolve and just report
+            # current readiness (which may still be "needs-auth", e.g. codex).
+            _logger.info("Harness %s already installed; skipping install", frame.harness)
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                configured_harnesses=configured_harness_map(),
+            )
+        installed, reason = try_install_harness_cli(key)
+        if not installed:
+            return HostInstallHarnessResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=reason or "install failed",
+            )
+        _logger.info("Installed harness %s via UI request", frame.harness)
+        return HostInstallHarnessResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            configured_harnesses=configured_harness_map(),
+        )
+
+    def _handle_store_secret(self, frame: HostStoreSecretFrame) -> HostStoreSecretResultFrame:
+        """Handle a ``host.store_secret`` request from the server.
+
+        Writes a harness provider credential on THIS host via the same
+        non-interactive core (:func:`store_harness_credential` /
+        :func:`adopt_env_credential`) the ``omnigent setup`` wizard's
+        "add a key / gateway" path uses — the secret goes to the OS keychain
+        (else ``~/.omnigent/secrets.json``) and ``config.yaml`` gets a
+        ``providers:`` entry referencing it, never the raw secret. Then it
+        recomputes readiness so the result frame flips the badge (yellow →
+        green) without a reconnect.
+
+        The ``ui_install_key`` guard re-checks the allowlist as defence in depth
+        against a spoofed frame — only the UI-auth families (Claude/Codex/Pi)
+        can drive the writer. The secret is never logged. Runs off the event
+        loop (keychain / file I/O).
+
+        :param frame: The store-secret request. ``frame.harness`` is a UI
+            harness id; ``frame.kind`` is ``"key"`` / ``"gateway"`` / ``"adopt"``.
+        :returns: Result with ``status`` ``"ok"``/``"failed"``, refreshed
+            readiness on success, and a non-secret reason on failure.
+        """
+        # Resolve the harness to a provider family, re-checking the allowlist.
+        # claude→anthropic, codex→openai; pi consumes both and prefers anthropic
+        # (its first fallback family), so a typed pi key lands on anthropic.
+        install_key = ui_install_key(frame.harness)
+        family = {
+            ANTHROPIC_FAMILY: ANTHROPIC_FAMILY,
+            OPENAI_FAMILY: OPENAI_FAMILY,
+            "pi": ANTHROPIC_FAMILY,
+        }.get(install_key or "")
+        if family is None:
+            return HostStoreSecretResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"harness {frame.harness!r} is not configurable from the UI",
+            )
+
+        if frame.kind == "adopt":
+            if not frame.env_var:
+                return HostStoreSecretResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="adopt requires an env_var",
+                )
+            # Adopt ONLY a credential the host actually detected, and under its
+            # OWN family. Requiring a match in detect_adoptable_credentials()
+            # enforces the adopt boundary server-side (the raw API is owner-authz'd
+            # but otherwise unvalidated): without it a caller could name any set
+            # env var — a DB password, an unrelated secret — and have it persisted
+            # as a provider credential and sent to the vendor endpoint as auth.
+            # Using the detected family (not the harness default) also keeps a
+            # cross-family pick correct: pi consumes both anthropic + openai, so a
+            # detected $OPENAI_API_KEY adopted for pi lands on openai, not
+            # anthropic's endpoint.
+            detected_family = next(
+                (d.family for d in detect_adoptable_credentials() if d.env_var == frame.env_var),
+                None,
+            )
+            if detected_family is None:
+                return HostStoreSecretResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=f"{frame.env_var} is not an adoptable credential on this host",
+                )
+            result = adopt_env_credential(family=detected_family, env_var=frame.env_var)
+        elif frame.kind in ("key", "gateway"):
+            result = store_harness_credential(
+                family=family,
+                kind=frame.kind,
+                secret=frame.secret_value or "",
+                base_url=frame.base_url,
+                default_model=frame.default_model,
+                wire_api=frame.wire_api,
+            )
+        else:
+            return HostStoreSecretResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"unknown credential kind {frame.kind!r}",
+            )
+
+        if not result.stored:
+            return HostStoreSecretResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=result.reason or "could not write the credential",
+            )
+        # Deliberately log only the non-secret entry name, never the secret.
+        _logger.info(
+            "Wrote %s credential for %s (family %s) via UI request",
+            frame.kind,
+            frame.harness,
+            family,
+        )
+        return HostStoreSecretResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            configured_harnesses=configured_harness_map(),
+        )
+
+    def _handle_detect_credentials(
+        self, frame: HostDetectCredentialsFrame
+    ) -> HostDetectCredentialsResultFrame:
+        """Handle a ``host.detect_credentials`` request from the server.
+
+        Returns the adoptable credentials already on this host as NON-secret
+        descriptors (family + source label + env var name) so the UI can offer
+        a one-click "adopt". Never reads or returns a secret value; never raises
+        (a detection failure yields an empty list).
+
+        :param frame: The detect request (carries only a request id).
+        :returns: Result frame with the non-secret credential descriptors.
+        """
+        detected = detect_adoptable_credentials()
+        return HostDetectCredentialsResultFrame(
+            request_id=frame.request_id,
+            credentials=[
+                {"family": d.family, "source": d.source, "env_var": d.env_var} for d in detected
+            ],
+        )
+
     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
         """Serve a read-only workspace filesystem request from the host.
 
@@ -1608,6 +1827,45 @@ class HostProcess:
             request_id=frame.request_id,
             status="ok",
             payload=payload,
+        )
+
+    async def _handle_model_options(
+        self,
+        frame: HostModelOptionsFrame,
+    ) -> HostModelOptionsResultFrame:
+        """Resolve the launch picker catalog on the machine that will run it.
+
+        This is a pre-launch PREVIEW of the host's ambient default
+        configuration (``spec=None`` — no session exists yet, so there is no
+        agent spec to pin). A session whose spec pins a different provider
+        resolves its own catalog at launch, and the in-session picker
+        re-reads that authoritative snapshot after bind.
+        """
+        if canonicalize_harness(frame.harness) != "claude-native":
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"model options are unsupported for harness {frame.harness!r}",
+            )
+        try:
+            from omnigent.claude_native import (
+                claude_native_model_options,
+                resolve_native_claude_config,
+            )
+
+            config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+            models = await asyncio.to_thread(claude_native_model_options, config)
+        except Exception:
+            _logger.exception("Failed to resolve pre-launch Claude model options")
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="failed to resolve Claude model options",
+            )
+        return HostModelOptionsResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            models=models,
         )
 
     @staticmethod
@@ -1975,21 +2233,43 @@ class HostProcess:
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
-        try:
-            from omnigent.runner._entry import _make_auth_token_factory
+        token = self._current_auth_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
-            # Pass server_url explicitly. The factory's OIDC-token path
-            # would otherwise look up ``RUNNER_SERVER_URL`` from env,
-            # which only the runner subprocess sets — without it the
-            # stored ``omnigent login`` token is silently skipped and
-            # the factory falls through to the Databricks path.
-            factory = _make_auth_token_factory(server_url=self._server_url)
-            token = factory() if factory else None
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
+    def _current_auth_token(self, *, initialize: bool = True) -> str | None:
+        """Return a bearer from the host's retained refreshable auth context.
+
+        The first call builds the same factory the host tunnel already used.
+        Later calls reuse its SDK ``Config`` and in-memory token cache, so a
+        runner launch normally performs no CLI or network authentication.
+
+        :param initialize: Build the factory when it has not been used yet.
+            Runner launch passes ``False`` because it must only reuse the
+            already-warm host context, never add auth work to the launch path.
+        :returns: Current bearer token, or ``None`` when credentials are not
+            available or this is a managed host authenticated by launch token.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        if os.environ.get(HOST_TOKEN_ENV_VAR):
+            return None
+        try:
+            if not self._auth_token_factory_resolved:
+                if not initialize:
+                    return None
+                from omnigent.runner._entry import _make_auth_token_factory
+
+                factory = _make_auth_token_factory(server_url=self._server_url)
+                if factory is not None:
+                    self._auth_token_factory = factory
+                    self._auth_token_factory_resolved = True
+            if self._auth_token_factory is not None:
+                return self._auth_token_factory()
         except Exception:  # noqa: BLE001
             _logger.debug("Could not obtain auth token", exc_info=True)
-        return headers
+        return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
         """Announce readiness, then service host frames until disconnect.
@@ -2157,6 +2437,21 @@ class HostProcess:
             await ws.send(encode_host_frame(self._handle_list_dir(frame)))
         elif isinstance(frame, HostCreateDirFrame):
             await ws.send(encode_host_frame(self._handle_create_dir(frame)))
+        elif isinstance(frame, HostInstallHarnessFrame):
+            # The installer shells out (npm) and can run for minutes, so run
+            # it off the event loop and reply when it completes.
+            result = await asyncio.to_thread(self._handle_install_harness, frame)
+            await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostStoreSecretFrame):
+            # The credential write touches the OS keychain / config file, so run
+            # it off the event loop and reply when it completes.
+            result = await asyncio.to_thread(self._handle_store_secret, frame)
+            await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostDetectCredentialsFrame):
+            # Ambient detection may probe files / a localhost socket, so run it
+            # off the event loop.
+            result = await asyncio.to_thread(self._handle_detect_credentials, frame)
+            await ws.send(encode_host_frame(result))
         elif isinstance(frame, HostCreateWorktreeFrame):
             await ws.send(encode_host_frame(await self._handle_create_worktree(frame)))
         elif isinstance(frame, HostRemoveWorktreeFrame):
@@ -2168,6 +2463,8 @@ class HostProcess:
             # off the event loop and reply when it completes.
             result = await asyncio.to_thread(self._handle_fs_request, frame)
             await ws.send(encode_host_frame(result))
+        elif isinstance(frame, HostModelOptionsFrame):
+            await ws.send(encode_host_frame(await self._handle_model_options(frame)))
 
 
 def run_host_process(
