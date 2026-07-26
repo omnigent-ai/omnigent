@@ -730,6 +730,12 @@ def test_ensure_local_omnigent_server_spawn_records_and_returns_log_path(
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_SIG_PATH", sig_file)
     monkeypatch.setattr(local_server, "_LOCAL_SERVER_LOG_REF_PATH", log_ref)
     # Point the persistent data dir at tmp so logs/server lands under tmp.
+    # ``_local_data_dir`` consults OMNIGENT_DATA_DIR *before* falling back to
+    # ``Path.home()``, so the patch below only takes effect once that env var
+    # is out of the way. Without this delenv the test silently resolves to the
+    # ambient OMNIGENT_DATA_DIR and fails — which is exactly what happens to
+    # anyone following the isolation advice in the spawn guard's error message.
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
 
     class _Proc:
