@@ -66,20 +66,30 @@ def test_get_params_schema_returns_schema() -> None:
     assert schema["properties"]["limit"]["type"] == "integer"
 
 
-def test_blast_radius_schema_exposes_risky_action() -> None:
-    """The UI can configure risky shell operations as ASK or DENY."""
+def test_blast_radius_schema_explains_configuration() -> None:
+    """The UI explains how the three blast-radius settings interact."""
     load_registry()
     schema = get_params_schema("omnigent.policies.builtins.orchestration.blast_radius")
 
     assert schema is not None
+    assert schema["properties"]["gate_pushes"]["description"] == (
+        "Controls recoverable risky commands such as ordinary pushes, scoped recursive deletes, "
+        "PR merges, and deployments. True applies risky_action; false allows them without "
+        "prompting. Catastrophic commands are always denied."
+    )
     assert schema["properties"]["risky_action"] == {
         "type": "string",
         "enum": ["ASK", "DENY"],
         "description": (
-            "Verdict for ordinary git push and other recoverable high-blast-radius commands."
+            "Action when gate_pushes is true: ASK prompts the user before running the command; "
+            "DENY blocks it immediately. This setting never weakens catastrophic-command denial."
         ),
         "default": "ASK",
     }
+    assert schema["properties"]["deny_reason"]["description"] == (
+        "Message shown when the policy returns DENY, including catastrophic commands and "
+        "recoverable commands blocked by risky_action=DENY."
+    )
 
 
 def test_get_params_schema_none_for_direct_callable() -> None:

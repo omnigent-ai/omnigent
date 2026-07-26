@@ -649,28 +649,33 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "handler": "omnigent.policies.builtins.orchestration.blast_radius",
         "kind": "factory",
         "name": "Block Dangerous Shell Commands",
-        "description": "Classifies shell commands across Omnigent, Claude/Codex, Cursor, "
-        "Pi, Hermes, and Goose as safe, risky (configurable ASK or DENY), or "
-        "catastrophic (DENY) to prevent destructive operations like force-push or rm -rf /",
+        "description": "Allows safe shell commands, applies a configurable ASK or DENY action "
+        "to recoverable risky commands, and always denies catastrophic commands such as "
+        "force-push or rm -rf /. Supports Omnigent, Claude/Codex, Cursor, Pi, Hermes, and Goose.",
         "params_schema": {
             "type": "object",
             "properties": {
                 "gate_pushes": {
                     "type": "boolean",
-                    "description": "Gate ordinary pushes and other recoverable "
-                    "high-blast-radius commands.",
+                    "description": "Controls recoverable risky commands such as ordinary pushes, "
+                    "scoped recursive deletes, PR merges, and deployments. True applies "
+                    "risky_action; false allows them without prompting. Catastrophic commands "
+                    "are always denied.",
                     "default": True,
                 },
                 "risky_action": {
                     "type": "string",
                     "enum": ["ASK", "DENY"],
-                    "description": "Verdict for ordinary git push and other recoverable "
-                    "high-blast-radius commands.",
+                    "description": "Action when gate_pushes is true: ASK prompts the user before "
+                    "running the command; DENY blocks it immediately. This setting never "
+                    "weakens catastrophic-command denial.",
                     "default": "ASK",
                 },
                 "deny_reason": {
                     "type": "string",
-                    "description": "Reason shown when the policy denies a command.",
+                    "description": "Message shown when the policy returns DENY, including "
+                    "catastrophic commands and recoverable commands blocked by "
+                    "risky_action=DENY.",
                     "default": "Blocked by the blast-radius policy.",
                 },
             },
