@@ -30,6 +30,7 @@ from .async_utils import run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
     CredentialRewriteRule,
+    MaterializedFile,
     prepare_credential_proxy_runtime,
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
@@ -259,6 +260,33 @@ def _build_credential_proxy_parent_env(
     return resolved
 
 
+def _write_credential_proxy_files(
+    env: dict[str, str],
+    files: Sequence[MaterializedFile],
+    tmpdir: Path,
+) -> None:
+    """
+    Write placeholder-only credential-proxy files into the sandbox scratch dir.
+
+    Each file carries only synthetic ``oa_cred_*`` placeholders (never a
+    real secret), so writing it into the sandbox-visible scratch dir is
+    safe. When a file declares an ``env_var``, that variable is pointed at
+    the written file's absolute path so the tool discovers it (e.g.
+    ``DATABRICKS_CONFIG_FILE``).
+
+    :param env: The helper spawn env; pointer vars are set in place.
+    :param files: The files to materialize.
+    :param tmpdir: The sandbox scratch directory (a write root bound into
+        the sandbox).
+    """
+    for spec in files:
+        path = tmpdir / spec.name
+        path.write_text(spec.content, encoding="utf-8")
+        os.chmod(path, spec.mode)
+        if spec.env_var is not None:
+            env[spec.env_var] = str(path)
+
+
 @dataclass
 class OSEnvironment(ABC):
     """Base OS environment interface."""
@@ -441,6 +469,11 @@ class _HelperProcessClient:
                     parent_env=credential_parent_env,
                 )
                 env.update(credential_runtime.helper_env_updates)
+                # Materialize placeholder-only config files (e.g. a
+                # ``.databrickscfg`` listing proxied profiles with
+                # ``oa_cred_*`` tokens) into the scratch dir and point the
+                # tool at them. No real secret is written to the sandbox.
+                _write_credential_proxy_files(env, credential_runtime.sandbox_files, self._tmpdir)
 
         # Start L7 egress proxy if rules are configured. The proxy
         # listens on a Unix socket in the scratch tmpdir; the helper
@@ -711,8 +744,9 @@ class _HelperProcessClient:
         # ``require_auth=True`` because we have an inherited config
         # FD to deliver the token out of band — see the in-process
         # token injection in :func:`_run_helper`.
+        rules = list(self._egress_rules or [])
         handle = start_egress_proxy(
-            rules=self._egress_rules or [],
+            rules=rules,
             tmpdir=self._tmpdir,
             allow_private_destinations=self._egress_allow_private_destinations,
             require_auth=True,

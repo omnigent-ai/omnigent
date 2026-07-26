@@ -106,7 +106,7 @@ import {
   type QueuedMessage,
   useChatStore,
 } from "@/store/chatStore";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { isNativeTerminalSession, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -861,12 +861,15 @@ export function ChatPage() {
   // needs the session predicate (parent linkage), not a bare name check. An
   // eligible session's Smart Routing toggle lives in the gear modal — Claude
   // folds it into the Model dropdown; other routable agents get a standalone
-  // Switch row.
+  // Switch row. Native terminal sessions (Claude Code / Codex / Pi / …) are
+  // excluded: their CLI bakes the model at launch and can't per-turn route, so
+  // Smart Routing is meaningless there.
   const serverInfo = useServerInfo();
   const costRoutingEligible =
     serverInfo !== "loading" &&
     serverInfo.smart_routing_enabled &&
-    isCostRoutingSession(activeSession);
+    isCostRoutingSession(activeSession) &&
+    !isNativeTerminalSession(activeSession);
 
   // Non-null only when the active session is a sub-agent (child): the
   // composer then peeks a "Chatting with sub-agent …" tray and the

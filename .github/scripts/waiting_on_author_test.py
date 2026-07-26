@@ -51,10 +51,18 @@ class FakeAPI:
         pull: dict[str, Any] | None = None,
         issues: list[dict[str, Any]] | None = None,
         timeline_by_issue: dict[int, list[dict[str, Any]]] | None = None,
+        issue_comments: dict[int, list[dict[str, Any]]] | None = None,
+        review_comments: dict[int, list[dict[str, Any]]] | None = None,
+        reviews: dict[int, list[dict[str, Any]]] | None = None,
+        commits: dict[int, list[dict[str, Any]]] | None = None,
     ):
         self.pull = pull or pr()
         self.issues = issues or []
         self.timeline_by_issue = timeline_by_issue or {}
+        self.issue_comments = issue_comments or {}
+        self.review_comments = review_comments or {}
+        self.reviews = reviews or {}
+        self.commits = commits or {}
         self.removed: list[tuple[int, str]] = []
         self.closed: list[int] = []
         self.comments: list[tuple[int, str]] = []
@@ -71,6 +79,18 @@ class FakeAPI:
 
     def list_timeline(self, issue_number: int) -> list[dict[str, Any]]:
         return self.timeline_by_issue.get(issue_number, [])
+
+    def list_issue_comments(self, issue_number: int) -> list[dict[str, Any]]:
+        return self.issue_comments.get(issue_number, [])
+
+    def list_review_comments(self, pull_number: int) -> list[dict[str, Any]]:
+        return self.review_comments.get(pull_number, [])
+
+    def list_reviews(self, pull_number: int) -> list[dict[str, Any]]:
+        return self.reviews.get(pull_number, [])
+
+    def list_commits(self, pull_number: int) -> list[dict[str, Any]]:
+        return self.commits.get(pull_number, [])
 
     def close_pull(self, pull_number: int) -> None:
         self.closed.append(pull_number)
@@ -139,6 +159,56 @@ class WaitingOnAuthorTest(unittest.TestCase):
         self.assertEqual(api.closed, [20])
         self.assertEqual(len(api.comments), 1)
         self.assertIn(waiting_on_author.LABEL, api.comments[0][1])
+
+    def test_scheduled_sweep_removes_label_after_author_comment(self) -> None:
+        api = FakeAPI(
+            pull=pr(number=23, author="alice"),
+            issues=[issue(23)],
+            timeline_by_issue={23: [labeled_at("2026-07-01T00:00:00Z")]},
+            issue_comments={
+                23: [{"user": {"login": "alice"}, "created_at": "2026-07-20T00:00:00Z"}]
+            },
+        )
+        waiting_on_author.close_stale_waiting_prs(api, now=datetime(2026, 7, 24, tzinfo=UTC))
+        self.assertEqual(api.removed, [(23, waiting_on_author.LABEL)])
+        self.assertEqual(api.closed, [])
+
+    def test_scheduled_sweep_keeps_label_after_maintainer_comment(self) -> None:
+        api = FakeAPI(
+            pull=pr(number=24, author="alice"),
+            issues=[issue(24)],
+            timeline_by_issue={24: [labeled_at("2026-07-18T00:00:00Z")]},
+            issue_comments={
+                24: [{"user": {"login": "maintainer"}, "created_at": "2026-07-20T00:00:00Z"}]
+            },
+        )
+        waiting_on_author.close_stale_waiting_prs(api, now=datetime(2026, 7, 24, tzinfo=UTC))
+        self.assertEqual(api.removed, [])
+        self.assertEqual(api.closed, [])
+
+    def test_scheduled_sweep_removes_label_after_new_commit(self) -> None:
+        api = FakeAPI(
+            pull=pr(number=25, author="alice"),
+            issues=[issue(25)],
+            timeline_by_issue={25: [labeled_at("2026-07-01T00:00:00Z")]},
+            commits={25: [{"commit": {"author": {"date": "2026-07-20T00:00:00Z"}}}]},
+        )
+        waiting_on_author.close_stale_waiting_prs(api, now=datetime(2026, 7, 24, tzinfo=UTC))
+        self.assertEqual(api.removed, [(25, waiting_on_author.LABEL)])
+        self.assertEqual(api.closed, [])
+
+    def test_scheduled_sweep_ignores_author_comment_before_label(self) -> None:
+        api = FakeAPI(
+            pull=pr(number=26, author="alice"),
+            issues=[issue(26)],
+            timeline_by_issue={26: [labeled_at("2026-07-17T00:00:00Z")]},
+            issue_comments={
+                26: [{"user": {"login": "alice"}, "created_at": "2026-07-10T00:00:00Z"}]
+            },
+        )
+        waiting_on_author.close_stale_waiting_prs(api, now=datetime(2026, 7, 24, tzinfo=UTC))
+        self.assertEqual(api.removed, [])
+        self.assertEqual(api.closed, [26])
 
     def test_scheduled_sweep_leaves_6_day_pr_open(self) -> None:
         api = FakeAPI(

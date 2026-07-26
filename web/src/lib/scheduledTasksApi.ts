@@ -50,7 +50,21 @@ export interface ScheduledTask {
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
+  /**
+   * Status of the task's MOST RECENT run (`succeeded` / `failed` / `skipped` /
+   * `running` / `scheduled` / `incomplete`), or `null` when the task has never
+   * run. Server-computed from the latest run row so the list can show a
+   * completion badge without a per-row `/runs` fetch.
+   */
+  lastRunStatus: ScheduledTaskRunStatus | null;
   lastRunConversationId: string | null;
+  /**
+   * ISO-8601 timestamp of the next scheduled fire, computed by the SERVER's
+   * live scheduler (its authoritative anchor), or `null` when the task is
+   * paused / not armed. Never recompute this on the client — a client-computed
+   * next-run can't match the server anchor for INTERVAL>1 rules.
+   */
+  nextRunAt: string | null;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -115,7 +129,9 @@ interface ScheduledTaskWire {
   host_id: string | null;
   state: ScheduledTaskState;
   last_run_at: number | null;
+  last_run_status: ScheduledTaskRunStatus | null;
   last_run_conversation_id: string | null;
+  next_run_at: string | null;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -187,7 +203,9 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     hostId: wire.host_id,
     state: wire.state,
     lastRunAt: wire.last_run_at,
+    lastRunStatus: wire.last_run_status,
     lastRunConversationId: wire.last_run_conversation_id,
+    nextRunAt: wire.next_run_at,
   };
 }
 
@@ -281,6 +299,20 @@ export async function updateScheduledTask(
 export async function deleteScheduledTask(id: string): Promise<void> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "DELETE",
+  });
+  if (!res.ok) throw await errorFromResponse(res);
+}
+
+/**
+ * Trigger an immediate ("run now") fire of a task. A manual override that
+ * reuses the server's shared fire path; paused tasks are runnable. The server
+ * responds `202 Accepted` (the run launches in the background), so this returns
+ * `void` — callers invalidate the list + runs queries to pick up the new run's
+ * status. A `409` (already in flight) surfaces as a {@link ScheduledTaskApiError}.
+ */
+export async function runScheduledTaskNow(id: string): Promise<void> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/run`, {
+    method: "POST",
   });
   if (!res.ok) throw await errorFromResponse(res);
 }
