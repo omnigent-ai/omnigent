@@ -36,6 +36,11 @@ from omnigent.process_logging import (
     open_process_log_file,
 )
 
+try:
+    import pwd  # POSIX-only; absent on Windows.
+except ImportError:
+    pwd = None  # type: ignore[assignment]
+
 _LOCAL_SERVER_READY_TIMEOUT_SECONDS = 45.0
 
 # Max seconds to wait for a bind-race-doomed server child's natural
@@ -86,6 +91,86 @@ _LOCAL_SERVER_SIG_PATH = _local_data_dir() / "local_server.sig"
 # server this invocation didn't spawn. Absent for a foreground
 # ``omnigent server`` (its logs stream to the terminal, not a file).
 _LOCAL_SERVER_LOG_REF_PATH = _local_data_dir() / "local_server.logpath"
+
+
+def _real_home_dir() -> Path:
+    """Return the OS account's real home directory, ignoring ``HOME``.
+
+    :func:`_local_data_dir` (like ``Path.home()`` generally) honors the
+    ``HOME`` env var — exactly how an isolated test redirects the local
+    server's data dir into a tmp dir (see its docstring). A check for "is
+    this about to hit the REAL production home" can't just re-derive
+    ``Path.home()`` again: with ``OMNIGENT_DATA_DIR`` unset, that always
+    agrees with whatever ``HOME`` override (or lack of one) is already in
+    effect, so it can never distinguish an isolated invocation from an
+    unisolated one. Reading the passwd-database entry instead bypasses
+    ``HOME`` — and any test monkeypatch of ``Path.home`` itself — so this
+    stays pinned to the actual account's home dir no matter what the
+    process's environment or test doubles claim.
+
+    POSIX-only (``pwd`` has no Windows equivalent); on Windows, or if the
+    current uid has no passwd entry, falls back to ``Path.home()``.
+
+    :returns: The real home directory for the current OS user.
+    """
+    if pwd is not None:
+        with contextlib.suppress(KeyError, OSError):
+            return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    return Path.home()
+
+
+def _refuse_real_home_spawn_under_pytest(data_dir: Path) -> None:
+    """Refuse to spawn the local server against the real ``~/.omnigent`` under pytest.
+
+    Incident this guards against: an unisolated ``pytest`` run reached
+    this spawn path with neither ``OMNIGENT_DATA_DIR`` nor ``HOME``
+    overridden, so it resolved straight to the developer's live
+    ``~/.omnigent``. The spawned server's Alembic head was ahead of the
+    installed release, and Omnigent's startup auto-migration silently
+    carried the production DB forward by 12 migrations — two of which
+    dropped columns the installed app still read, breaking it until the
+    DB was restored by hand. Isolation for this surface is opt-in per
+    test (unlike the autouse claude/codex-native-state fixtures in
+    ``tests/conftest.py``), so a single missed test is enough to repeat
+    this. This is the fail-loud backstop for that gap.
+
+    Only checked under pytest — :data:`PYTEST_CURRENT_TEST` is set by
+    pytest for the whole setup/call/teardown of the test that reaches
+    this code, so it is visible here even though the spawn itself runs in
+    that same (parent) test process. A real user's ``omnigent run`` /
+    ``omnigent server`` never has this var set, so the guard can never
+    fire for them. A test that isolated itself — via ``OMNIGENT_DATA_DIR``,
+    via ``HOME``, or by monkeypatching ``Path.home`` directly (as the
+    spawn tests in ``tests/host/test_local_server.py`` do) — resolves
+    *data_dir* to something other than the real home, so this never fires
+    for them either.
+
+    :param data_dir: The resolved local-server data dir this spawn is
+        about to use, e.g. from :func:`_local_data_dir`.
+    :raises click.ClickException: if running under pytest and *data_dir*
+        resolves to the real OS home's ``.omnigent``.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    # Plain path equality, deliberately NOT ``.resolve()``: resolving symlinks
+    # would stat the real ``~/.omnigent`` to compare against, and this
+    # function must never touch that path even read-only. ``_real_home_dir``
+    # and ``_local_data_dir`` both already return absolute, expanduser'd
+    # paths, so a textual comparison is exact for the HOME/OMNIGENT_DATA_DIR
+    # overrides this guards against.
+    real_home_omnigent = _real_home_dir() / ".omnigent"
+    if data_dir.expanduser() != real_home_omnigent:
+        return
+    raise click.ClickException(
+        f"Refused to spawn the local Omnigent server against the real "
+        f"{real_home_omnigent} from a pytest run (PYTEST_CURRENT_TEST is "
+        f"set). This exact path once spawned unisolated, and the spawned "
+        f"server's startup auto-migration silently carried a live "
+        f"production DB forward, breaking the installed app.\n"
+        f"Set OMNIGENT_DATA_DIR (or HOME) to a temp directory before "
+        f"running tests, e.g. `export OMNIGENT_DATA_DIR=$(mktemp -d)`, "
+        f"then retry."
+    )
 
 
 def server_config_signature() -> str:
@@ -460,8 +545,9 @@ def ensure_local_omnigent_server() -> LocalServerStartup:
         (stop stale + start fresh) counts as ``spawned=True`` — the fresh
         server is ours.
     :raises click.ClickException: If the server does not become healthy
-        within the startup timeout, or if port contention persists after
-        a free-port respawn.
+        within the startup timeout, if port contention persists after a
+        free-port respawn, or if running under pytest with the local data
+        dir unisolated (see :func:`_refuse_real_home_spawn_under_pytest`).
     """
     desired_sig = server_config_signature()
     reused = local_server_url_if_healthy()
@@ -593,8 +679,12 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
     :param port: Loopback TCP port for the child to bind, e.g. ``6767``.
     :returns: The spawned subprocess plus its log path and base URL; the
         caller awaits readiness via :func:`_wait_for_local_omnigent_server`.
+    :raises click.ClickException: if running under pytest and the
+        resolved data dir is the real OS home (see
+        :func:`_refuse_real_home_spawn_under_pytest`).
     """
     data_dir = _local_data_dir()
+    _refuse_real_home_spawn_under_pytest(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "artifacts").mkdir(exist_ok=True)
     db_path = data_dir / "chat.db"

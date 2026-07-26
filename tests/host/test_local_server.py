@@ -460,6 +460,110 @@ def test_local_data_dir_honors_data_dir_not_config_home(
     assert local_server._local_data_dir() == tmp_path / "data"
 
 
+# ---------------------------------------------------------------------------
+# _refuse_real_home_spawn_under_pytest — the real-~/.omnigent spawn guard
+# ---------------------------------------------------------------------------
+
+
+def test_refuse_real_home_spawn_under_pytest_fires_on_real_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard raises when the resolved data dir is the real home under pytest.
+
+    Regression test for the incident: an unisolated pytest run reached the
+    spawn path with neither ``OMNIGENT_DATA_DIR`` nor ``HOME`` overridden,
+    resolving straight to the developer's real ``~/.omnigent`` — whose
+    startup auto-migration then broke the installed app. This test
+    simulates the same miss (``OMNIGENT_DATA_DIR`` unset, ``HOME``
+    untouched); ``PYTEST_CURRENT_TEST`` is already set by pytest for the
+    duration of this test, so the guard must raise.
+    """
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        local_server._refuse_real_home_spawn_under_pytest(local_server._local_data_dir())
+
+    message = str(excinfo.value)
+    expected_path = local_server._real_home_dir() / ".omnigent"
+    assert str(expected_path) in message
+    assert "OMNIGENT_DATA_DIR" in message
+
+
+def test_refuse_real_home_spawn_under_pytest_allows_omnigent_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Setting ``OMNIGENT_DATA_DIR`` isolates the spawn — the guard stays quiet.
+
+    This is the purpose-built data-isolation knob (:func:`_local_data_dir`);
+    once it points somewhere other than the real home, the guard must let
+    the resolved dir through unmodified.
+    """
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    local_server._refuse_real_home_spawn_under_pytest(local_server._local_data_dir())
+
+
+def test_refuse_real_home_spawn_under_pytest_allows_home_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Overriding ``Path.home`` (not just ``OMNIGENT_DATA_DIR``) also stays quiet.
+
+    The resumption e2e tests isolate by setting ``HOME`` rather than
+    ``OMNIGENT_DATA_DIR`` (see :func:`_local_data_dir`'s docstring), and
+    the spawn tests in this file simulate that by monkeypatching
+    ``Path.home`` directly. A guard that just re-derived
+    ``Path.home() / ".omnigent"`` to decide "is this the real home" would
+    trivially agree with itself here (``OMNIGENT_DATA_DIR`` is unset in
+    both cases) and fire on every one of those tests; comparing against
+    :func:`_real_home_dir` (a ``Path.home``-independent lookup) instead
+    proves it does not.
+    """
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+
+    local_server._refuse_real_home_spawn_under_pytest(local_server._local_data_dir())
+
+
+def test_refuse_real_home_spawn_under_pytest_noop_outside_pytest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``PYTEST_CURRENT_TEST`` set, the guard never fires.
+
+    A real user's ``omnigent run`` / ``omnigent server`` never has this
+    var set, so the guard must be a complete no-op for them — even when
+    handed the real home's data dir, as here.
+    """
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    local_server._refuse_real_home_spawn_under_pytest(local_server._real_home_dir() / ".omnigent")
+
+
+def test_spawn_local_server_refuses_real_home_under_pytest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_spawn_local_server`` itself refuses before touching anything.
+
+    Proves the guard is actually wired into the real spawn path and not
+    just unit-tested in isolation: with ``OMNIGENT_DATA_DIR`` unset and
+    ``HOME`` untouched, calling the real entry point must raise before
+    ``subprocess.Popen`` is ever reached (the stub below fails the test
+    if it is).
+    """
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+
+    def _must_not_popen(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("spawned a subprocess despite targeting the real home")
+
+    monkeypatch.setattr(local_server.subprocess, "Popen", _must_not_popen)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        local_server._spawn_local_server(8765)
+
+    assert "pytest" in str(excinfo.value).lower()
+
+
 def test_pick_local_port_returns_preferred_when_free() -> None:
     """``pick_local_port`` returns the preferred port when it's bindable.
 
