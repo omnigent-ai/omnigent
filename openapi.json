@@ -8562,6 +8562,17 @@
               "title": "Pinned",
               "type": "boolean"
             }
+          },
+          {
+            "description": "When `True`, return only sessions this user marked complete.",
+            "in": "query",
+            "name": "completed",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Completed",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {

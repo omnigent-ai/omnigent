@@ -11,6 +11,7 @@ import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
   fetchAllArchivedProjectNames,
+  fetchCompletedConversations,
   renameConversation,
   useArchiveConversation,
   useBulkArchiveConversations,
@@ -25,11 +26,13 @@ import {
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
+  useToggleCompletedConversation,
   useTogglePinnedConversation,
+  COMPLETED_CONVERSATIONS_KEY,
   PINNED_CONVERSATIONS_KEY,
   type Conversation,
 } from "./useConversations";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { COMPLETED_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -95,6 +98,34 @@ describe("renameConversation", () => {
   it("throws on non-2xx", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
     await expect(renameConversation("missing", "x")).rejects.toThrow(/404/);
+  });
+});
+
+describe("fetchCompletedConversations", () => {
+  it("follows cursors so older completed sessions are not truncated", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [conversation({ id: "conv_new" })],
+          first_id: "conv_new",
+          last_id: "conv_new",
+          has_more: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [conversation({ id: "conv_old" })],
+          first_id: "conv_old",
+          last_id: "conv_old",
+          has_more: false,
+        }),
+      );
+
+    const rows = await fetchCompletedConversations();
+
+    expect(rows.map((row) => row.id)).toEqual(["conv_new", "conv_old"]);
+    expect(fetchMock.mock.calls[0][0]).toContain("completed=true");
+    expect(fetchMock.mock.calls[1][0]).toContain("after=conv_new");
   });
 });
 
@@ -919,6 +950,61 @@ describe("useTogglePinnedConversation cache patching", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
+  });
+});
+
+describe("useToggleCompletedConversation cache patching", () => {
+  function seed(completed: boolean) {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "Session X",
+        created_at: 0,
+        labels: completed ? { [COMPLETED_LABEL_KEY]: "1721760000000" } : {},
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x", updated_at: 150 })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useToggleCompletedConversation(), { wrapper });
+    return { queryClient, rendered };
+  }
+
+  it("moves a completed row immediately and PATCHes the canonical label", async () => {
+    const { queryClient, rendered } = seed(true);
+
+    rendered.result.current.mutate({ id: "conv_x", completed: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const completed = queryClient.getQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY);
+    expect(completed?.[0].updated_at).toBe(150);
+    expect(completed?.[0].labels?.[COMPLETED_LABEL_KEY]).toBe("1721760000000");
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv_x");
+    expect(JSON.parse(init.body as string)).toEqual({
+      labels: { [COMPLETED_LABEL_KEY]: expect.any(String) },
+    });
+  });
+
+  it("removes a row from Completed when marked active", async () => {
+    const { queryClient, rendered } = seed(false);
+    queryClient.setQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY, [
+      conversation({
+        id: "conv_x",
+        updated_at: 150,
+        labels: { [COMPLETED_LABEL_KEY]: "1721760000000" },
+      }),
+    ]);
+
+    rendered.result.current.mutate({ id: "conv_x", completed: false });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(queryClient.getQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY)).toEqual([]);
   });
 });
 

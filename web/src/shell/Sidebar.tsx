@@ -100,16 +100,20 @@ import {
   type Conversation,
   useArchiveConversation,
   useBulkArchiveConversations,
+  useBulkCompleteConversations,
   useBulkDeleteConversations,
+  useCompletedConversations,
   useProjects,
   useProjectSessions,
   useConversations,
   useMoveToProject,
   useDeleteProject,
   useRenameProject,
+  COMPLETED_LABEL_KEY,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
   usePinnedConversations,
+  useToggleCompletedConversation,
   useTogglePinnedConversation,
   setConversationPinned,
   useRenameConversation,
@@ -501,6 +505,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
     },
     [togglePinnedMutation, pinnedIdSet],
   );
+  const { data: completedConversations = [], isSuccess: completedLoaded } =
+    useCompletedConversations();
 
   // One-time migration: pins used to live only in localStorage. Push any
   // still-local pins up to the server (as the `omnigent.pinned` label) the
@@ -718,7 +724,11 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             {selectionMode ? (
               <BulkActionBar
                 selectedIds={selectedIds}
-                allConversations={loadedRows}
+                allConversations={dedupeConversationsById([
+                  ...loadedRows,
+                  ...pinnedConversations,
+                  ...completedConversations,
+                ])}
                 visibleCount={visibleConversationCount}
                 onSelectAll={() => selectAll(getVisibleConversationsRef.current())}
                 onDeselectAll={deselectAll}
@@ -804,6 +814,8 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               activeTab={multiUser ? activeTab : "mine"}
               pinnedConversationIds={pinnedConversationIds}
               pinnedConversations={pinnedConversations}
+              completedConversations={completedConversations}
+              completedLoaded={completedLoaded}
               onTogglePinned={togglePinnedConversation}
               onEnterSelectionMode={() => setSelectionMode(true)}
               selectionMode={selectionMode}
@@ -928,7 +940,7 @@ function ProjectFolder({
     const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
     // Pinned sessions live in the global Pinned section, not their folder.
     return sortByUpdatedAtDesc(
-      loaded.filter((c) => !pinnedSet.has(c.id)),
+      loaded.filter((c) => !pinnedSet.has(c.id) && c.labels?.[COMPLETED_LABEL_KEY] == null),
       activeOverride,
     );
   }, [query.data, pinnedSet, activeOverride]);
@@ -1020,6 +1032,8 @@ interface ConversationListProps {
   // The server-authoritative pinned sessions, so a pinned session that sits
   // outside the loaded pagination window still renders in the Pinned section.
   pinnedConversations: Conversation[];
+  completedConversations: Conversation[];
+  completedLoaded: boolean;
   onTogglePinned: (conversationId: string) => void;
   onEnterSelectionMode: () => void;
   selectionMode: boolean;
@@ -1082,6 +1096,8 @@ function ConversationList({
   activeTab,
   pinnedConversationIds,
   pinnedConversations,
+  completedConversations,
+  completedLoaded,
   onTogglePinned,
   onEnterSelectionMode,
   selectionMode,
@@ -1105,6 +1121,10 @@ function ConversationList({
   const allConversations = useMemo(
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
+  );
+  const completedConversationIds = useMemo(
+    () => completedConversations.map((conversation) => conversation.id),
+    [completedConversations],
   );
 
   // Project folders ({ id, name }) for grouping sessions — first-class id
@@ -1145,7 +1165,13 @@ function ConversationList({
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
-    const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
+    // Completed sessions need the same treatment because they can also sit
+    // outside the loaded pagination window.
+    const allWithPinned = dedupeConversationsById([
+      ...allConversations,
+      ...pinnedConversations,
+      ...completedConversations,
+    ]);
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
     // "shared" is the ones others shared with them. The Pinned / Projects /
@@ -1155,6 +1181,14 @@ function ConversationList({
       activeTab === "shared"
         ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
         : notArchived.filter((c) => isOwnedByViewer(c, viewerId));
+    // Completed takes precedence over Pinned and Projects while preserving both
+    // labels, so marking active returns the row to its previous group.
+    const completed = tabScoped
+      .filter((c) => c.labels?.[COMPLETED_LABEL_KEY] != null)
+      .sort(
+        (a, b) => Number(b.labels?.[COMPLETED_LABEL_KEY]) - Number(a.labels?.[COMPLETED_LABEL_KEY]),
+      );
+    const active = tabScoped.filter((c) => c.labels?.[COMPLETED_LABEL_KEY] == null);
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -1163,7 +1197,7 @@ function ConversationList({
     // pinned session holds its slot when a new message bumps its `updated_at`.
     // Pins are ownership-agnostic, so a pinned shared session floats to Pinned
     // on the Shared tab just like an owned one on My sessions.
-    const pinned = orderByPinnedTimestamp(tabScoped.filter((c) => pinnedSet.has(c.id)));
+    const pinned = orderByPinnedTimestamp(active.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
     // Projects are a "My sessions"-only tool (filing into a project is
@@ -1178,7 +1212,7 @@ function ConversationList({
         : projects.map(({ id, name }) => {
             // Dual-read membership: a session belongs to this folder if it has
             // the first-class id OR the legacy omni_project label of this name.
-            const inProject = tabScoped.filter(
+            const inProject = active.filter(
               (c) =>
                 ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
                 !pinnedIdSet.has(c.id),
@@ -1194,17 +1228,18 @@ function ConversationList({
 
     // Sessions: the remainder of the tab's slice — not pinned, not filed.
     const sessions = sortByUpdatedAtDesc(
-      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
+      active.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
     );
     const archived = sortByUpdatedAtDesc(
       allWithPinned.filter((c) => c.archived === true),
       activeOverride,
     );
-    return { pinned, sessions, archived, projectGroups };
+    return { pinned, sessions, archived, completed, projectGroups };
   }, [
     allConversations,
     pinnedConversations,
+    completedConversations,
     pinnedSet,
     activeOverride,
     projects,
@@ -1246,6 +1281,27 @@ function ConversationList({
       });
     }
   }, [pinnedConversationIds]);
+
+  const prevCompletedIds = useRef(completedConversationIds);
+  const completedInitialized = useRef(false);
+  useEffect(() => {
+    if (!completedLoaded) return;
+    if (!completedInitialized.current) {
+      completedInitialized.current = true;
+      prevCompletedIds.current = completedConversationIds;
+      return;
+    }
+    const previous = new Set(prevCompletedIds.current);
+    const newlyCompleted = completedConversationIds.some((id) => !previous.has(id));
+    prevCompletedIds.current = completedConversationIds;
+    if (!newlyCompleted) return;
+    setCollapsedSections((collapsed) => {
+      if (!collapsed.includes("Completed")) return collapsed;
+      const next = collapsed.filter((title) => title !== "Completed");
+      writeCollapsedSidebarSections(next);
+      return next;
+    });
+  }, [completedConversationIds, completedLoaded]);
 
   // When a search query appears, auto-expand all sections so results
   // in collapsed groups are visible. The user can still manually collapse
@@ -1420,8 +1476,9 @@ function ConversationList({
   useEffect(() => {
     if (!activeId || !activeProjectName) return;
     if (pinnedSet.has(activeId)) return;
+    if (completedConversationIds.includes(activeId)) return;
     expandProject(activeProjectName);
-  }, [activeId, activeProjectName, pinnedSet, expandProject]);
+  }, [activeId, activeProjectName, pinnedSet, completedConversationIds, expandProject]);
 
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
@@ -1440,6 +1497,7 @@ function ConversationList({
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
       ...visible("Chats", sections.sessions),
+      ...visible("Completed", sections.completed),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
   useEffect(() => {
@@ -1455,6 +1513,7 @@ function ConversationList({
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
       ...visible("Chats", sections.sessions),
+      ...visible("Completed", sections.completed),
     ];
   };
   // Getter that builds the shift-select visible order on demand (at click
@@ -1472,6 +1531,7 @@ function ConversationList({
         ? []
         : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
       ...vis("Chats", sections.sessions),
+      ...vis("Completed", sections.completed),
     ];
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
@@ -1518,6 +1578,7 @@ function ConversationList({
   const totalVisible =
     sections.pinned.length +
     sections.sessions.length +
+    sections.completed.length +
     sections.projectGroups.length +
     sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
 
@@ -1731,6 +1792,43 @@ function ConversationList({
                     }
                   />
                 </ChatsDropZone>
+              )}
+              {sections.completed.length > 0 && (
+                <ConversationSection
+                  title="Completed"
+                  conversations={sections.completed}
+                  pinnedConversationIds={pinnedConversationIds}
+                  collapsed={effectiveCollapsedSections.includes("Completed")}
+                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Completed")}
+                  onRowClick={onRowClick}
+                  onTogglePinned={onTogglePinned}
+                  selectionMode={selectionMode}
+                  selectedIds={selectedIds}
+                  onToggleSelected={onToggleSelected}
+                  onProjectAssigned={expandProject}
+                  headerAction={
+                    !selectionMode && sections.sessions.length === 0 ? (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            aria-label="Select sessions"
+                            data-testid="toggle-selection-mode"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              onEnterSelectionMode();
+                            }}
+                          >
+                            <ListChecksIcon className="size-3.5" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent side="bottom">Select sessions</TooltipContent>
+                      </Tooltip>
+                    ) : undefined
+                  }
+                />
               )}
               {/* Both tabs render this same Pinned / Projects / Sessions tree;
               `sections` is scoped to the active tab's conversations (owned vs.
@@ -2163,13 +2261,16 @@ function ConversationMenuItems({
   conversation,
   isPinned,
   isArchived,
+  isCompleted,
   isOwner,
   sharingOff,
   isSingleUser,
   canStop,
   canMarkUnread,
+  canComplete,
   currentProject,
   onTogglePinned,
+  runToggleCompleted,
   onMarkUnread,
   onProjectAssigned,
   moveToProject,
@@ -2185,6 +2286,7 @@ function ConversationMenuItems({
   conversation: Conversation;
   isPinned: boolean;
   isArchived: boolean;
+  isCompleted: boolean;
   isOwner: boolean;
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off): disables the
   // Share item for everyone, independent of the per-user ownership check.
@@ -2196,8 +2298,10 @@ function ConversationMenuItems({
   // Whether "Mark as unread" applies: any row not already showing the
   // unread dot (the active thread and running sessions included).
   canMarkUnread: boolean;
+  canComplete: boolean;
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
+  runToggleCompleted: () => void;
   onMarkUnread: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
@@ -2271,7 +2375,7 @@ function ConversationMenuItems({
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
           hover-revealed quick-pin button. Archived rows omit it (archive
           outranks pin). */}
-      {!isArchived && (
+      {!isArchived && !isCompleted && (
         <C.Item
           data-testid="pin-conversation"
           className="md:hidden"
@@ -2342,6 +2446,31 @@ function ConversationMenuItems({
           <MailIcon className="size-3.5" />
           Mark as unread
         </C.Item>
+      )}
+      {isCompleted ? (
+        <C.Item data-testid="complete-conversation" onSelect={runToggleCompleted}>
+          <SquareIcon className="size-3.5" />
+          Mark active
+        </C.Item>
+      ) : canComplete ? (
+        <C.Item data-testid="complete-conversation" onSelect={runToggleCompleted}>
+          <SquareCheckIcon className="size-3.5" />
+          Mark as completed
+        </C.Item>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>
+              <C.Item data-testid="complete-conversation" disabled>
+                <SquareCheckIcon className="size-3.5" />
+                Mark as completed
+              </C.Item>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="left">
+            Wait for the session and pending approvals to finish
+          </TooltipContent>
+        </Tooltip>
       )}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
@@ -2584,6 +2713,7 @@ function ConversationRow({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const complete = useToggleCompletedConversation();
   const moveToProject = useMoveToProject();
   // Archive stops the runner first (resource hygiene): a hidden session
   // shouldn't keep a runner alive. This is NOT the user-facing Stop action
@@ -2595,6 +2725,7 @@ function ConversationRow({
   // instance so its pending/error state can't bleed into archiving's.
   const stopSession = useStopSession();
   const isArchived = conversation.archived === true;
+  const isCompleted = conversation.labels?.[COMPLETED_LABEL_KEY] != null;
   const [isEditing, setIsEditing] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
@@ -2633,6 +2764,8 @@ function ConversationRow({
       hostId: conversation.host_id,
       runnerId: conversation.runner_id,
     }) && runnerOnline !== false;
+  const canComplete =
+    conversation.status !== "running" && (conversation.pending_elicitations_count ?? 0) === 0;
 
   // The session's current project NAME, or null when unfiled — drives the
   // kebab submenu label ("Add to project" vs "Move session") and the pinned
@@ -2695,7 +2828,7 @@ function ConversationRow({
   } = useDraggable({
     id: conversation.id,
     data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing,
+    disabled: !isOwner || selectionMode || isArchived || isCompleted || isEditing,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -2827,6 +2960,10 @@ function ConversationRow({
     });
   }
 
+  function runToggleCompleted() {
+    complete.mutate({ id: conversation.id, completed: !isCompleted });
+  }
+
   // Shared by the kebab dropdown and the right-click context menu so the two
   // menus render identical items. `setMenuOpen` is supplied per-call (the
   // controlled kebab passes the real setter; the uncontrolled context menu a
@@ -2835,13 +2972,16 @@ function ConversationRow({
     conversation,
     isPinned,
     isArchived,
+    isCompleted,
     isOwner,
     sharingOff,
     isSingleUser,
     canStop,
     canMarkUnread,
+    canComplete,
     currentProject,
     onTogglePinned,
+    runToggleCompleted,
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
@@ -3019,7 +3159,7 @@ function ConversationRow({
         <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
           {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-          {!isArchived && (
+          {!isArchived && !isCompleted && (
             <Button
               type="button"
               variant="ghost"
@@ -3784,6 +3924,7 @@ function BulkActionBar({
   const navigate = useNavigate();
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   const bulkArchive = useBulkArchiveConversations();
+  const bulkComplete = useBulkCompleteConversations();
   const bulkDelete = useBulkDeleteConversations();
   const viewerId = useViewerId();
 
@@ -3809,10 +3950,28 @@ function BulkActionBar({
 
   const allSelectedSameArchiveGroup =
     ownedSelected.length > 0 && (archivedSelected.length === 0 || nonArchivedSelected.length === 0);
+  const completedSelected = useMemo(
+    () => selectedConversations.filter((c) => c.labels?.[COMPLETED_LABEL_KEY] != null),
+    [selectedConversations],
+  );
+  const activeSelected = useMemo(
+    () => selectedConversations.filter((c) => c.labels?.[COMPLETED_LABEL_KEY] == null),
+    [selectedConversations],
+  );
+  const allSelectedSameCompletionGroup =
+    selectedConversations.length > 0 &&
+    (completedSelected.length === 0 || activeSelected.length === 0);
+  const canCompleteAll = activeSelected.every(
+    (conversation) =>
+      conversation.status !== "running" && (conversation.pending_elicitations_count ?? 0) === 0,
+  );
+  const completingSelection = activeSelected.length > 0;
+  const showCompletionAction =
+    allSelectedSameCompletionGroup && (completingSelection || completedSelected.length > 0);
 
   const count = selectedIds.size;
   const allSelected = count > 0 && count === visibleCount;
-  const isBusy = bulkArchive.isPending || bulkDelete.isPending;
+  const isBusy = bulkArchive.isPending || bulkComplete.isPending || bulkDelete.isPending;
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
 
@@ -3837,6 +3996,15 @@ function BulkActionBar({
           onDeselectAll();
         },
       },
+    );
+  }
+
+  function handleComplete(completed: boolean) {
+    const rows = completed ? activeSelected : completedSelected;
+    if (rows.length === 0) return;
+    bulkComplete.mutate(
+      { ids: rows.map((conversation) => conversation.id), completed },
+      { onSuccess: onDeselectAll },
     );
   }
 
@@ -3900,6 +4068,26 @@ function BulkActionBar({
         </div>
 
         <div className="flex items-center gap-1.5 px-2">
+          {showCompletionAction && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 text-xs"
+              disabled={isBusy || (completingSelection && !canCompleteAll)}
+              onClick={() => handleComplete(completingSelection)}
+              data-testid={completingSelection ? "bulk-complete" : "bulk-mark-active"}
+            >
+              {bulkComplete.isPending ? (
+                <Loader2Icon className="size-3 animate-spin" />
+              ) : completingSelection ? (
+                <SquareCheckIcon className="size-3" />
+              ) : (
+                <SquareIcon className="size-3" />
+              )}
+              {completingSelection ? "Complete" : "Mark active"}
+            </Button>
+          )}
           {allSelectedSameArchiveGroup && nonArchivedSelected.length > 0 && (
             <Button
               type="button"
@@ -3954,7 +4142,7 @@ function BulkActionBar({
           </Button>
         </div>
 
-        {(bulkArchive.isError || bulkDelete.isError) && (
+        {(bulkArchive.isError || bulkComplete.isError || bulkDelete.isError) && (
           <p className="text-xs text-destructive" role="alert">
             Some actions failed. Retry or dismiss.
           </p>
@@ -4062,7 +4250,8 @@ function writeLegacyPinnedConversationIds(ids: string[]) {
 // starts expanded. Archived no longer lives in the sidebar (it's on the
 // Settings page). Once the user toggles any header, the stored array (even an
 // empty one) becomes the preference and persists across reloads.
-const DEFAULT_COLLAPSED_SIDEBAR_SECTIONS: string[] = [];
+// Completed is the exception: finished work starts collapsed.
+const DEFAULT_COLLAPSED_SIDEBAR_SECTIONS: string[] = ["Completed"];
 
 function readCollapsedSidebarSections(): string[] {
   if (typeof window === "undefined") return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;

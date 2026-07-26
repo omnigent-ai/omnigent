@@ -55,7 +55,7 @@ def test_fork_drops_per_user_pin_labels(
     """A fork is a NEW conversation, so it must not inherit the source's pins:
     neither the forker's nor any other user's per-user pin key rides along
     (those keys have a dynamic suffix, so a prefix drop is required)."""
-    from omnigent.stores.conversation_store import pinned_label_key
+    from omnigent.stores.conversation_store import completed_label_key, pinned_label_key
 
     source = conversation_store.create_conversation()
     conversation_store.set_labels(
@@ -63,6 +63,7 @@ def test_fork_drops_per_user_pin_labels(
         {
             pinned_label_key("alice"): "1721760000000",
             pinned_label_key("bob"): "1700000000000",
+            completed_label_key("alice"): "1721760002000",
             "kept": "yes",
         },
     )
@@ -72,6 +73,7 @@ def test_fork_drops_per_user_pin_labels(
     assert fork.labels["kept"] == "yes"
     assert pinned_label_key("alice") not in fork.labels
     assert pinned_label_key("bob") not in fork.labels
+    assert completed_label_key("alice") not in fork.labels
 
 
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
@@ -4936,6 +4938,32 @@ def test_pinned_label_key_fits_column_for_long_user_ids() -> None:
     assert key == pinned_label_key(long_id)  # deterministic
     # Distinct long ids don't collide.
     assert pinned_label_key("u" * 200) != pinned_label_key("v" * 200)
+
+
+def test_list_conversations_filters_by_completed_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The completed filter matches only the requesting user's marker."""
+    from omnigent.stores.conversation_store import completed_label_key
+
+    completed = conversation_store.create_conversation(title="completed")
+    other_user = conversation_store.create_conversation(title="other user's completed")
+    conversation_store.set_labels(completed.id, {completed_label_key("alice"): "1721760000000"})
+    conversation_store.set_labels(other_user.id, {completed_label_key("bob"): "1721760000000"})
+
+    page = conversation_store.list_conversations(completed=True, completed_owner="alice")
+
+    assert [conversation.id for conversation in page.data] == [completed.id]
+
+
+def test_completed_label_key_fits_column_for_long_user_ids() -> None:
+    from omnigent.stores.conversation_store import COMPLETED_LABEL_KEY, completed_label_key
+
+    assert completed_label_key("alice@example.com") == f"{COMPLETED_LABEL_KEY}.alice@example.com"
+    long_id = "u" * 200
+    assert len(completed_label_key(long_id)) <= 128
+    assert completed_label_key(long_id) == completed_label_key(long_id)
+    assert completed_label_key("u" * 200) != completed_label_key("v" * 200)
 
 
 def test_list_projects_owned_by_excludes_shared_only_projects(

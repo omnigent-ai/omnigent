@@ -19,7 +19,9 @@ import { type ReactNode, useCallback, useEffect, useRef } from "react";
 import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { COMPLETED_CONVERSATIONS_KEY, type Conversation } from "@/hooks/useConversations";
 import {
+  COMPLETED_LABEL_KEY,
   type ConversationsInfiniteData,
   type SessionListWireItem,
   collectConversationIds,
@@ -93,6 +95,26 @@ function applyItemsToCache(
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
   }
+  queryClient.setQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY, (old) => {
+    if (!old) return old;
+    let next = old;
+    for (const item of itemsById.values()) {
+      if (item.labels === undefined) continue;
+      const index = next.findIndex((conversation) => conversation.id === item.id);
+      if (index >= 0) foundAnywhere.add(item.id);
+      const completed = COMPLETED_LABEL_KEY in item.labels;
+      if (!completed && index >= 0) {
+        next = next.filter((conversation) => conversation.id !== item.id);
+      } else if (completed && index >= 0) {
+        next = next.map((conversation, i) =>
+          i === index ? { ...conversation, ...item } : conversation,
+        );
+      } else if (completed) {
+        next = [...next, item as Conversation];
+      }
+    }
+    return next;
+  });
   return {
     missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
     needsRefetch,
@@ -120,6 +142,12 @@ function removeIdsFromCache(queryClient: QueryClient, ids: string[]): boolean {
       }
     }
   }
+  queryClient.setQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY, (old) => {
+    if (!old) return old;
+    const next = old.filter((conversation) => !idSet.has(conversation.id));
+    if (next.length !== old.length) removedAny = true;
+    return next;
+  });
   return removedAny;
 }
 
@@ -168,6 +196,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
       queryKey: ["project-sessions"],
     });
     const ids = collectConversationIds([...entries, ...projectEntries].map(([, data]) => data));
+    for (const conversation of queryClient.getQueryData<Conversation[]>(
+      COMPLETED_CONVERSATIONS_KEY,
+    ) ?? []) {
+      if (!ids.includes(conversation.id)) ids.push(conversation.id);
+    }
     // Union in the open session. A directly-opened child / sub-agent
     // session is filtered out of the sidebar list, so it's absent from
     // every cached conversations page and wouldn't otherwise be watched —

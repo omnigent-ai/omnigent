@@ -19,12 +19,15 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkCompleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
   usePinnedConversations: () => ({ data: pinnedRef.current, isSuccess: true }),
   useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  useCompletedConversations: () => ({ data: [], isSuccess: true }),
+  useToggleCompletedConversation: () => ({ mutate: vi.fn() }),
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
@@ -37,6 +40,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
+  COMPLETED_LABEL_KEY: "omnigent.completed",
 }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 

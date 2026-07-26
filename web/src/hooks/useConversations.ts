@@ -20,6 +20,7 @@
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import {
+  COMPLETED_LABEL_KEY,
   filtersFromConversationQueryKey,
   mergeItemsIntoPages,
   PINNED_LABEL_KEY,
@@ -660,6 +661,24 @@ export function useBulkArchiveConversations() {
   });
 }
 
+export function useBulkCompleteConversations() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ ids, completed }: { ids: string[]; completed: boolean }) => {
+      const results = await Promise.allSettled(
+        ids.map((id) => setConversationCompleted(id, completed)),
+      );
+      const failed = ids.filter((_, index) => results[index].status === "rejected");
+      if (failed.length > 0) throw { failed, total: ids.length };
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      void queryClient.invalidateQueries({ queryKey: COMPLETED_CONVERSATIONS_KEY });
+    },
+  });
+}
+
 /**
  * Delete multiple conversations in parallel (stop + delete each).
  *
@@ -768,6 +787,7 @@ export function useBulkStopSessions() {
 // (see sessionListCache) so membership checks can read it without a value
 // import cycle; re-exported here for the existing consumers.
 export { PINNED_LABEL_KEY };
+export { COMPLETED_LABEL_KEY };
 
 // TanStack Query key for the server-authoritative pinned-session list.
 // Deliberately NOT under the ["conversations"] prefix: the list mutations do
@@ -777,6 +797,7 @@ export { PINNED_LABEL_KEY };
 // would be swept into those loops — the throw aborted the toggle's cache patch,
 // so a pinned row didn't move until a refetch. A sibling key keeps it isolated.
 export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
+export const COMPLETED_CONVERSATIONS_KEY = ["completed-conversations"] as const;
 
 /**
  * Fetch every pinned session (the `omnigent.pinned` label) via
@@ -807,6 +828,36 @@ export function usePinnedConversations() {
   });
 }
 
+export async function fetchCompletedConversations(): Promise<Conversation[]> {
+  const conversations: Conversation[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const params = new URLSearchParams({
+      order: "desc",
+      sort_by: "updated_at",
+      limit: "100",
+      completed: "true",
+    });
+    if (after) params.set("after", after);
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // eslint-disable-next-line no-await-in-loop
+    const page = (await res.json()) as ConversationsPage;
+    conversations.push(...page.data);
+    if (!page.has_more || !page.last_id) return conversations;
+    after = page.last_id;
+  }
+}
+
+export function useCompletedConversations() {
+  return useQuery<Conversation[]>({
+    queryKey: COMPLETED_CONVERSATIONS_KEY,
+    queryFn: fetchCompletedConversations,
+    staleTime: 30_000,
+  });
+}
+
 /**
  * PATCH the pinned label on a session. Pinning stores the epoch-ms pin time as
  * the value (so the Pinned section can order by pin recency); an empty string
@@ -824,6 +875,21 @@ export async function setConversationPinned(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       labels: { [PINNED_LABEL_KEY]: pinned ? String(pinnedAt) : "" },
+    }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
+export async function setConversationCompleted(
+  id: string,
+  completed: boolean,
+): Promise<Conversation> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      labels: { [COMPLETED_LABEL_KEY]: completed ? String(Date.now()) : "" },
     }),
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -942,6 +1008,76 @@ export function useTogglePinnedConversation() {
       // index lags the write, so a refetch would momentarily revert the toggle;
       // the query's `staleTime` converges it later.
       patch(updated.id, updated.labels, pinned);
+    },
+  });
+}
+
+export function useToggleCompletedConversation() {
+  const queryClient = useQueryClient();
+
+  const findRow = (id: string): Conversation | undefined =>
+    queryClient
+      .getQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY)
+      ?.find((c) => c.id === id) ??
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
+      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
+      .find((c) => c.id === id) ??
+    queryClient
+      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
+      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
+      .find((c) => c.id === id);
+
+  const patch = (id: string, labels: Record<string, string>, completed: boolean) => {
+    const existing = findRow(id);
+    const itemsById = new Map([[id, { id, labels } satisfies SessionListWireItem]]);
+    for (const queryKey of [["conversations"], ["project-sessions"]]) {
+      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+        queryKey,
+      })) {
+        const filters =
+          key[0] === "conversations"
+            ? filtersFromConversationQueryKey(key)
+            : PROJECT_FOLDER_FILTERS;
+        const { data: next } = mergeItemsIntoPages(data, itemsById, filters, undefined);
+        if (next !== data) queryClient.setQueryData(key, next);
+      }
+    }
+    queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
+      old ? { ...old, labels } : old,
+    );
+    queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
+    queryClient.setQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY, (old) => {
+      const rest = (old ?? []).filter((c) => c.id !== id);
+      if (!completed) return rest;
+      const row: Conversation = existing
+        ? { ...existing, labels }
+        : ({ id, object: "conversation", labels } as Conversation);
+      return [...rest, row];
+    });
+  };
+
+  return useMutation({
+    mutationFn: ({ id, completed }: { id: string; completed: boolean }) =>
+      setConversationCompleted(id, completed),
+    onMutate: ({ id, completed }) => {
+      const previous = queryClient.getQueryData<Conversation[]>(COMPLETED_CONVERSATIONS_KEY);
+      const base = findRow(id)?.labels ?? {};
+      const wasCompleted = previous?.some((conversation) => conversation.id === id) ?? false;
+      const labels: Record<string, string> = completed
+        ? { ...base, [COMPLETED_LABEL_KEY]: String(Date.now()) }
+        : Object.fromEntries(Object.entries(base).filter(([k]) => k !== COMPLETED_LABEL_KEY));
+      patch(id, labels, completed);
+      return { previous, base, wasCompleted };
+    },
+    onError: (_err, { id }, context) => {
+      if (context) patch(id, context.base, context.wasCompleted);
+      if (context?.previous !== undefined) {
+        queryClient.setQueryData(COMPLETED_CONVERSATIONS_KEY, context.previous);
+      }
+    },
+    onSuccess: (updated, { completed }) => {
+      patch(updated.id, updated.labels, completed);
     },
   });
 }

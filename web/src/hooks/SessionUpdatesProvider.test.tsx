@@ -10,6 +10,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { COMPLETED_CONVERSATIONS_KEY } from "@/hooks/useConversations";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 
@@ -116,6 +117,16 @@ describe("SessionUpdatesProvider watch-set", () => {
     seedConversations(client, ["conv_open", "conv_b"]);
     renderProvider(client, ["/c/conv_open"]);
     expect(lastWatched()).toEqual(["conv_b", "conv_open"]);
+  });
+
+  it("watches completed rows outside the loaded sidebar page", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    client.setQueryData(COMPLETED_CONVERSATIONS_KEY, [conv("conv_completed")]);
+
+    renderProvider(client, ["/"]);
+
+    expect(lastWatched()).toEqual(["conv_a", "conv_completed"]);
   });
 
   it("re-pushes the watch-set with the new open id on navigation", () => {
@@ -306,6 +317,24 @@ describe("SessionUpdatesProvider fingerprint pruning", () => {
 });
 
 describe("SessionUpdatesProvider list invalidation", () => {
+  it("removes a reactivated row from the completed cache", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    client.setQueryData(COMPLETED_CONVERSATIONS_KEY, [
+      { ...conv("conv_a"), labels: { "omnigent.completed": "1721760000000" } },
+    ]);
+    renderProvider(client, ["/"]);
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...conv("conv_a"), labels: {} }],
+      }),
+    );
+
+    expect(client.getQueryData(COMPLETED_CONVERSATIONS_KEY)).toEqual([]);
+  });
+
   it("invalidates the archived-project-names scan on a remote removal", () => {
     // Another client archiving/relabeling/deleting must refresh the Archived
     // view's project picker — only local mutations invalidate it otherwise.

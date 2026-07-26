@@ -157,8 +157,10 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    COMPLETED_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
+    completed_label_key,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -463,11 +465,14 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
     reads the same bare key it writes) and stops other users' pin keys from
     bloating the payload.
 
+    Completion labels follow the same per-user collapse.
+
     :param labels: The stored conversation labels.
     :param user_id: The requesting viewer, or ``None`` in single-user mode.
     :returns: A copy with all ``omnigent.pinned.*`` keys removed and the
         canonical ``omnigent.pinned`` key added when the viewer's own pin
         is present.
+        Completion keys are handled the same way.
     """
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
@@ -478,6 +483,14 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
     }
     if my_pin is not None:
         cleaned[PINNED_LABEL_KEY] = my_pin
+    my_completed = labels.get(completed_label_key(user_id))
+    cleaned = {
+        k: v
+        for k, v in cleaned.items()
+        if k != COMPLETED_LABEL_KEY and not k.startswith(f"{COMPLETED_LABEL_KEY}.")
+    }
+    if my_completed is not None:
+        cleaned[COMPLETED_LABEL_KEY] = my_completed
     return cleaned
 
 
