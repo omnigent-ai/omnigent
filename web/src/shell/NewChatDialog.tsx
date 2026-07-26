@@ -159,7 +159,7 @@ import {
   parseMentionToken,
   rankMentionEntries,
 } from "@/lib/composerMentions";
-import { OttoEyes } from "@/components/OttoEyes";
+import { LandingAgentMascot, landingAgentMascotVariant } from "@/components/LandingAgentMascot";
 import { SkillPills } from "@/components/SkillPills";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { type CostControlMode } from "@/components/CostRoutingControl";
@@ -179,6 +179,7 @@ const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
 const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
   polly: "Multi-agent coding",
   debby: "Multi-agent debate",
+  willy: "Omnigent design",
 };
 
 // Agents whose bundled skills render as always-visible pills under the
@@ -960,6 +961,28 @@ function PickerSectionHeader({ children }: { children: ReactNode }) {
  * BEFORE selecting, so the harness-switch reseed effect in the screen reads it
  * back as the same value and doesn't clobber the choice.
  */
+export type AgentHarnessPickerProps = {
+  agentEntries: AvailableAgent[];
+  harnessEntries: AvailableAgent[];
+  effectiveAgentId: string | null;
+  agentLabel: string;
+  hasAgents: boolean;
+  host: Host | undefined | null;
+  onSelectAgent: (agent: AvailableAgent) => void;
+  pendingAgent: AgentBundleInput | null;
+  pendingAgentId: string;
+  onSelectPending: () => void;
+  onCreateCustomAgent: () => void;
+  sandboxSelected: boolean;
+  trigger?: ReactNode;
+  onOpenChange?: (open: boolean) => void;
+  dropdownModal?: boolean;
+  contentClassName?: string;
+  contentAlign?: "start" | "center" | "end";
+  triggerClassName?: string;
+  triggerLabelClassName?: string;
+};
+
 export function AgentHarnessPicker({
   agentEntries,
   harnessEntries,
@@ -973,54 +996,21 @@ export function AgentHarnessPicker({
   onSelectPending,
   onCreateCustomAgent,
   sandboxSelected,
+  trigger,
   onOpenChange,
   dropdownModal = true,
   contentClassName,
   contentAlign = "end",
   triggerClassName,
   triggerLabelClassName,
-}: {
-  agentEntries: AvailableAgent[];
-  harnessEntries: AvailableAgent[];
-  effectiveAgentId: string | null;
-  agentLabel: string;
-  hasAgents: boolean;
-  host: Host | undefined | null;
-  onSelectAgent: (agent: AvailableAgent) => void;
-  pendingAgent: AgentBundleInput | null;
-  pendingAgentId: string;
-  onSelectPending: () => void;
-  onCreateCustomAgent: () => void;
-  sandboxSelected: boolean;
-  // ── Optional reuse hooks (all default-undefined) ─────────────────────────
-  // These let a host OTHER than the composer footer embed the picker without
-  // changing its default behavior. The interactive New Chat call site passes
-  // none of them, so it renders exactly as before. The scheduled-task create
-  // dialog passes them to: forward the dropdown open/close into its own
-  // outside-click dismiss guard (`onOpenChange`), bound + left-align the menu
-  // in a tall modal (`contentClassName` / `contentAlign`), and style the
-  // trigger to match sibling <Select> fields (`triggerClassName` /
-  // `triggerLabelClassName`).
-  /** Notified when the picker dropdown opens/closes. */
-  onOpenChange?: (open: boolean) => void;
-  /** Whether the Radix dropdown should modal-block outside content. Defaults true. */
-  dropdownModal?: boolean;
-  /** Extra classes merged onto the dropdown content (e.g. a tighter max-h). */
-  contentClassName?: string;
-  /** Dropdown alignment. Defaults to "end" (composer footer). */
-  contentAlign?: "start" | "center" | "end";
-  /** Extra classes merged onto the trigger Button. */
-  triggerClassName?: string;
-  /** Extra classes merged onto the trigger's label span. */
-  triggerLabelClassName?: string;
-}) {
+}: AgentHarnessPickerProps) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
   const queryClient = useQueryClient();
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = info !== "loading" && info.harness_install_enabled;
-  const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Touch devices can't hover, so the desktop submenu flyouts ("More",
   // "Custom agents") are unreachable there. On mobile we swap the dropdown's
@@ -1186,29 +1176,30 @@ export function AgentHarnessPicker({
       }}
     >
       <DropdownMenuTrigger asChild>
-        <Button
-          ref={triggerRef}
-          type="button"
-          variant="ghost"
-          size="sm"
-          disabled={!hasAgents}
-          data-testid="new-chat-landing-agent-select"
-          // Drop the Button's focus-visible ring/border that otherwise shows
-          // when focus returns to the trigger after a pick. `triggerClassName`
-          // (default undefined) lets an embedder override sizing/border to match
-          // its own form fields; tailwind-merge lets the passed classes win.
-          className={cn(
-            "h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0",
-            triggerClassName,
-          )}
-        >
-          <span
-            className={cn("max-w-[12rem] truncate text-xs text-foreground", triggerLabelClassName)}
+        {trigger ?? (
+          <Button
+            ref={triggerRef}
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={!hasAgents}
+            data-testid="new-chat-landing-agent-select"
+            className={cn(
+              "h-8 gap-1.5 pr-1 pl-2.5 font-normal text-muted-foreground hover:text-foreground focus-visible:border-transparent focus-visible:ring-0",
+              triggerClassName,
+            )}
           >
-            {hasAgents ? agentLabel : "No agents"}
-          </span>
-          <ChevronDownIcon className="size-3.5 opacity-60" />
-        </Button>
+            <span
+              className={cn(
+                "max-w-[12rem] truncate text-xs text-foreground",
+                triggerLabelClassName,
+              )}
+            >
+              {hasAgents ? agentLabel : "No agents"}
+            </span>
+            <ChevronDownIcon className="size-3.5 opacity-60" />
+          </Button>
+        )}
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align={contentAlign}
@@ -2282,6 +2273,7 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  const mascotVariant = landingAgentMascotVariant(selectedAgent?.name);
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -2734,17 +2726,15 @@ export function NewChatLandingScreen() {
     if (mentionFsQuery.isPlaceholderData) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
-      .map(
-        (e): WorkspaceFile => ({
-          path: e.path.startsWith(workspaceRoot)
-            ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
-            : e.name,
-          name: e.name,
-          type: e.type === "directory" ? "directory" : "file",
-          bytes: e.bytes,
-          modified_at: e.modified_at,
-        }),
-      );
+      .map((e): WorkspaceFile => ({
+        path: e.path.startsWith(workspaceRoot)
+          ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
+          : e.name,
+        name: e.name,
+        type: e.type === "directory" ? "directory" : "file",
+        bytes: e.bytes,
+        modified_at: e.modified_at,
+      }));
     return rankMentionEntries(rows, mentionFilter);
   }, [
     mentionEnabled,
@@ -3135,10 +3125,53 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex flex-col items-center gap-3.5 sm:flex-row">
-          <OttoEyes className="h-18 w-auto shrink-0" />
-          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
+        <div className="flex flex-col items-center gap-1.5" data-testid="new-chat-landing-hero">
+          <AgentHarnessPicker
+            agentEntries={agentEntries}
+            harnessEntries={[]}
+            effectiveAgentId={effectiveAgentId}
+            agentLabel={agentLabel}
+            hasAgents={agentList.length > 0}
+            host={harnessWarningHost}
+            onSelectAgent={handleSelectAgent}
+            pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
+            pendingAgentId={PENDING_AGENT_ID}
+            onSelectPending={handleSelectPending}
+            onCreateCustomAgent={() => setCreateAgentOpen(true)}
+            sandboxSelected={sandboxSelected}
+            contentAlign="center"
+            trigger={
+              <button
+                type="button"
+                disabled={agentList.length === 0}
+                aria-label={
+                  agentList.length > 0
+                    ? `Change agent. Current agent: ${agentLabel}`
+                    : "No agents available"
+                }
+                data-testid="new-chat-landing-mascot-agent-select"
+                className="group relative cursor-pointer rounded-[28px] transition-transform duration-150 hover:scale-[1.03] active:scale-[0.98] disabled:cursor-default disabled:hover:scale-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-4 focus-visible:ring-offset-background"
+              >
+                <LandingAgentMascot agentName={selectedAgent?.name} />
+                <span
+                  aria-hidden="true"
+                  data-testid="new-chat-landing-mascot-agent-hint"
+                  className="pointer-events-none absolute bottom-0 left-1/2 z-20 flex -translate-x-1/2 translate-y-1/2 items-center gap-0.5 whitespace-nowrap rounded-full border border-border/80 bg-popover/95 px-2 py-1 text-[11px] font-medium text-popover-foreground opacity-0 shadow-sm backdrop-blur-sm transition-[opacity,transform] duration-150 group-hover:translate-y-[45%] group-hover:opacity-100 group-focus-visible:translate-y-[45%] group-focus-visible:opacity-100 group-data-[state=open]:invisible"
+                >
+                  Change agent
+                  <ChevronDownIcon className="size-3 opacity-60" />
+                </span>
+              </button>
+            }
+          />
+          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground">
+            {mascotVariant === "willy" ? (
+              <>
+                What should we <span className="willy-design-word">design</span>?
+              </>
+            ) : (
+              "What should we do?"
+            )}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">

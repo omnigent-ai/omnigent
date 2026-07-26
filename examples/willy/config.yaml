@@ -1,0 +1,33 @@
+spec_version: 1
+name: willy
+description: >-
+  A product design agent for web applications and dashboards. Willy turns a
+  brief into editable HTML artifacts, reviews the result against product UI
+  principles, and publishes the reviewed entry point for browser preview.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+instructions: artifacts.md
+
+guardrails:
+  policies:
+    deny_shell:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.deny_tools
+        arguments:
+          tool_names: [sys_os_shell]
+          deny_reason: Willy artifacts use virtual filesystem tools; shell access is disabled.
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

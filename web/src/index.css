@@ -1109,6 +1109,185 @@
   animation: otto-blink 3.4s ease-in-out infinite;
 }
 
+/* Willy's landing identity keeps Otto intact while surrounding the mascot
+ * with a small animated studio scene: glowing paint, counter-rotating orbits,
+ * and a gently floating brush. */
+@keyframes willy-landing-drift {
+  0%,
+  100% {
+    transform: translate3d(0, 2px, 0) rotate(-4deg);
+  }
+  50% {
+    transform: translate3d(0, -5px, 0) rotate(-4deg);
+  }
+}
+
+@keyframes willy-landing-halo-pulse {
+  0%,
+  100% {
+    opacity: 0.72;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes willy-landing-orbit-pink {
+  0%,
+  100% {
+    transform: rotate(-18deg) scale(0.97);
+  }
+  50% {
+    transform: rotate(-8deg) scale(1.04);
+  }
+}
+
+@keyframes willy-landing-orbit-green {
+  0%,
+  100% {
+    transform: rotate(19deg) scale(1.03);
+  }
+  50% {
+    transform: rotate(11deg) scale(0.96);
+  }
+}
+
+@keyframes willy-landing-satellite-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.78);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.4);
+  }
+}
+
+@keyframes willy-landing-brush-sway {
+  0%,
+  100% {
+    transform: translate3d(0, 1px, 0) rotate(10deg);
+  }
+  50% {
+    transform: translate3d(2px, -4px, 0) rotate(17deg);
+  }
+}
+
+.willy-landing-halo {
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--brand-accent) 24%, transparent) 0%,
+    color-mix(in srgb, var(--brand-accent) 10%, transparent) 38%,
+    color-mix(in srgb, var(--success) 6%, transparent) 58%,
+    transparent 74%
+  );
+  filter: blur(5px);
+  transform-origin: center;
+  animation: willy-landing-halo-pulse 3.8s ease-in-out infinite;
+}
+
+.dark .willy-landing-halo {
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--brand-accent) 38%, transparent) 0%,
+    color-mix(in srgb, var(--brand-accent) 15%, transparent) 40%,
+    color-mix(in srgb, var(--success) 9%, transparent) 58%,
+    transparent 76%
+  );
+  filter: blur(7px);
+}
+
+.willy-landing-mascot {
+  transform-origin: 55% 65%;
+  filter: drop-shadow(0 8px 16px color-mix(in srgb, var(--brand-accent) 18%, transparent));
+  animation: willy-landing-drift 3.2s ease-in-out infinite;
+  will-change: transform;
+}
+
+.dark .willy-landing-mascot {
+  filter: drop-shadow(0 9px 18px color-mix(in srgb, var(--brand-accent) 30%, transparent));
+}
+
+.willy-landing-mascot .otto-eye {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: otto-blink 3.4s ease-in-out infinite;
+}
+
+.willy-landing-orbit {
+  transform-origin: center;
+  will-change: transform;
+}
+
+.willy-landing-orbit--pink {
+  border-color: color-mix(in srgb, var(--brand-accent) 58%, transparent);
+  box-shadow:
+    inset 0 0 16px color-mix(in srgb, var(--brand-accent) 12%, transparent),
+    0 0 12px color-mix(in srgb, var(--brand-accent) 9%, transparent);
+  animation: willy-landing-orbit-pink 5.2s ease-in-out infinite;
+}
+
+.willy-landing-orbit--green {
+  border-color: color-mix(in srgb, var(--success) 48%, transparent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--success) 8%, transparent);
+  animation: willy-landing-orbit-green 6.2s ease-in-out infinite;
+}
+
+.willy-landing-satellite {
+  animation: willy-landing-satellite-pulse 2.6s ease-in-out infinite;
+}
+
+.willy-landing-satellite--pink {
+  background: var(--brand-accent);
+  box-shadow: 0 0 11px var(--brand-accent);
+}
+
+.willy-landing-satellite--green {
+  background: var(--success);
+  box-shadow: 0 0 10px var(--success);
+  animation-delay: -1.3s;
+}
+
+.willy-landing-paint-mark {
+  background: color-mix(in srgb, var(--brand-accent) 34%, transparent);
+  filter: blur(1px);
+  transform: rotate(-12deg);
+}
+
+.willy-landing-paintbrush {
+  filter: drop-shadow(0 6px 8px color-mix(in srgb, var(--brand-accent) 16%, transparent));
+  transform-origin: 30% 78%;
+  animation: willy-landing-brush-sway 3.6s ease-in-out infinite;
+  will-change: transform;
+}
+
+.willy-design-word {
+  position: relative;
+  display: inline-block;
+  color: var(--brand-accent);
+  font-weight: 550;
+  letter-spacing: -0.045em;
+  text-shadow: 0 3px 12px color-mix(in srgb, var(--brand-accent) 14%, transparent);
+}
+
+.willy-design-word::after {
+  position: absolute;
+  right: 0.06em;
+  bottom: -0.11em;
+  left: 0.08em;
+  height: 0.1em;
+  min-height: 2px;
+  background: color-mix(in srgb, var(--brand-accent) 78%, transparent);
+  clip-path: polygon(0 40%, 12% 16%, 61% 0, 100% 30%, 92% 82%, 34% 100%, 5% 78%);
+  content: "";
+  opacity: 0.68;
+  transform: rotate(-1.6deg);
+  transform-origin: left center;
+}
+
 @keyframes compaction-slide {
   0% {
     transform: translateX(-100%);
