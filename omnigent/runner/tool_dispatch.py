@@ -31,6 +31,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -3459,8 +3460,6 @@ def _server_now_from(resp: httpx.Response) -> int:
     raw = resp.headers.get("date")
     if raw:
         try:
-            from email.utils import parsedate_to_datetime
-
             return int(parsedate_to_datetime(raw).timestamp())
         except (TypeError, ValueError):
             pass
