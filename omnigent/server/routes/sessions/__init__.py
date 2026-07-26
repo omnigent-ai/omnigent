@@ -118,6 +118,7 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.artifact_previews import ArtifactPreviewService
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -347,6 +348,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    artifact_preview_service: ArtifactPreviewService | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -476,6 +478,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         host_registry=host_registry,
+        artifact_preview_service=artifact_preview_service,
     )
 
     register_browser_routes(

@@ -50,6 +50,10 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.runner.managed_artifacts import (
+    PUBLISH_DESIGN_ARTIFACT_TOOL,
+    publish_managed_artifact,
+)
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -4617,7 +4621,12 @@ async def execute_tool(
             # /mcp endpoint, which enforces TOOL_CALL and TOOL_RESULT
             # policies centrally before forwarding to the runner's
             # /mcp/execute. No runner-side policy gate needed.
-            output = await mcp_manager.call_tool(agent_spec, tool_name, args)
+            output = await mcp_manager.call_tool(
+                agent_spec,
+                tool_name,
+                args,
+                session_id=conversation_id,
+            )
         elif tool_name in _OS_ENV_TOOLS:
             output = await _execute_os_env_tool(
                 tool_name,
@@ -4800,6 +4809,10 @@ async def execute_tool(
                 server_client=server_client,
                 conversation_id=conversation_id,
             )
+        elif tool_name == PUBLISH_DESIGN_ARTIFACT_TOOL:
+            if conversation_id is None:
+                raise RuntimeError("publish_design_artifact requires a session id")
+            output = json.dumps(await publish_managed_artifact(conversation_id, args))
         elif _is_spec_local_python_tool(tool_name, agent_spec):
             output = await _execute_local_python_tool(
                 tool_name,
@@ -5153,6 +5166,50 @@ async def _execute_os_env_tool(
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
+    from omnigent.runner.managed_artifacts import (
+        edit_managed_artifact_text,
+        is_managed_artifact_namespace,
+        read_managed_artifact_text,
+        write_managed_artifact_text,
+    )
+
+    path = args.get("path")
+    if (
+        conversation_id is not None
+        and tool_name in {SysOsReadTool.name(), SysOsWriteTool.name(), SysOsEditTool.name()}
+        and is_managed_artifact_namespace(path)
+    ):
+        try:
+            if tool_name == SysOsReadTool.name():
+                result = await read_managed_artifact_text(
+                    conversation_id,
+                    path,
+                    offset=args.get("offset", 1),
+                    limit=(
+                        value if (value := args.get("limit")) is not None else _DEFAULT_READ_LIMIT
+                    ),
+                )
+            elif tool_name == SysOsWriteTool.name():
+                raw_content = args.get("content")
+                if raw_content is None:
+                    content = ""
+                elif isinstance(raw_content, str):
+                    content = raw_content
+                else:
+                    return json.dumps({"error": "content must be a string"})
+                result = await write_managed_artifact_text(conversation_id, path, content)
+            else:
+                result = await edit_managed_artifact_text(
+                    conversation_id,
+                    path,
+                    old_text=args.get("oldText") or args.get("old_string"),
+                    new_text=args.get("newText") or args.get("new_string"),
+                    edits=args.get("edits"),
+                )
+        except Exception as exc:
+            _logger.exception("managed artifact OS tool dispatch failed for %s", tool_name)
+            return json.dumps({"error": str(exc)})
+        return json.dumps(result)
 
     os_env = None
     try:

@@ -51,6 +51,11 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
+from omnigent.server.artifact_previews import (
+    ArtifactPreviewHostMiddleware,
+    ArtifactPreviewService,
+    create_artifact_preview_public_router,
+)
 from omnigent.server.auth import AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -1143,6 +1148,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
+    artifact_preview_origin: str | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1298,6 +1304,24 @@ def create_app(
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
+    )
+
+    async def _artifact_preview_runner_client(session_id: str) -> Any | None:
+        try:
+            return runner_router.client_for_session_resources(session_id).client
+        except (LookupError, OmnigentError):
+            return None
+
+    configured_preview_origin = (
+        artifact_preview_origin or os.environ.get("OMNIGENT_ARTIFACT_PREVIEW_ORIGIN", "").strip()
+    )
+    artifact_preview_service = (
+        ArtifactPreviewService(
+            preview_origin=configured_preview_origin,
+            runner_client_for_session=_artifact_preview_runner_client,
+        )
+        if configured_preview_origin
+        else None
     )
     host_registry = HostRegistry()
     # Shared between the host tunnel (which records ``host.runner_exited``
@@ -1628,6 +1652,11 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
+    if artifact_preview_service is not None:
+        app.add_middleware(
+            ArtifactPreviewHostMiddleware,
+            preview_hostname=artifact_preview_service.preview_hostname,
+        )
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -2287,6 +2316,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            artifact_preview_service=artifact_preview_service,
         ),
         prefix="/v1",
         tags=["sessions"],
@@ -2301,6 +2331,8 @@ def create_app(
         prefix="/v1",
         tags=["imports"],
     )
+    if artifact_preview_service is not None:
+        app.include_router(create_artifact_preview_public_router(artifact_preview_service))
     # Per-user LLM cost report (omni usage). User-scoped, not session-scoped,
     # so it gets its own router rather than living under /sessions.
     app.include_router(

@@ -575,6 +575,85 @@ class CallerProcessFilesystem:
             truncated=byte_truncated or line_truncated,
         )
 
+    async def read_artifact(
+        self,
+        path: str,
+        *,
+        artifact_root: str,
+        max_bytes: int = _MAX_READ_BYTES,
+    ) -> FileContent:
+        """Atomically read a regular artifact file without following symlinks."""
+        import json as _json
+
+        validated = _validate_path(path)
+        root = _validate_path(artifact_root)
+        if not root.startswith("artifacts/") and root != "artifacts":
+            raise InvalidPath("artifact_root must be under artifacts/")
+        if validated == root:
+            allowed = root.lower().endswith(".html")
+        else:
+            allowed = validated.startswith(f"{root}/") and not root.lower().endswith(".html")
+        if not allowed:
+            raise InvalidPath(f"Path {path!r} is outside artifact root {artifact_root!r}")
+        if max_bytes < 1 or max_bytes > _MAX_READ_BYTES:
+            raise InvalidPath("max_bytes is outside the allowed range")
+
+        parts = validated.split("/")
+        script = "\n".join(
+            [
+                "import os, json, base64, stat",
+                f"parts = {_json.dumps(parts)}",
+                f"cap = {max_bytes}",
+                "flags_dir = os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0)",
+                "flags_file = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)",
+                "fd = os.open('.', flags_dir)",
+                "try:",
+                "    for part in parts[:-1]:",
+                "        next_fd = os.open(part, flags_dir, dir_fd=fd)",
+                "        os.close(fd)",
+                "        fd = next_fd",
+                "    file_fd = os.open(parts[-1], flags_file, dir_fd=fd)",
+                "    try:",
+                "        info = os.fstat(file_fd)",
+                "        if not stat.S_ISREG(info.st_mode) or info.st_size > cap:",
+                "            raise OSError('invalid artifact resource')",
+                "        chunks = []",
+                "        remaining = cap + 1",
+                "        while remaining > 0:",
+                "            chunk = os.read(file_fd, min(65536, remaining))",
+                "            if not chunk:",
+                "                break",
+                "            chunks.append(chunk)",
+                "            remaining -= len(chunk)",
+                "        data = b''.join(chunks)",
+                "        if len(data) > cap:",
+                "            raise OSError('artifact resource too large')",
+                "        print(json.dumps({'data': base64.b64encode(data).decode('ascii')}))",
+                "    finally:",
+                "        os.close(file_fd)",
+                "finally:",
+                "    os.close(fd)",
+            ]
+        )
+        result = await _run_os_env_async(
+            self._os_env.shell,
+            f"python3 -c {_shell_quote(script)}",
+        )
+        if "error" in result:
+            raise FilesystemPathNotFound(f"Artifact resource {path!r} not found")
+        try:
+            payload = _json.loads(result.get("stdout", ""))
+            data = base64.b64decode(payload["data"], validate=True)
+        except (KeyError, TypeError, ValueError, _json.JSONDecodeError) as exc:
+            raise FilesystemPathNotFound(f"Artifact resource {path!r} not found") from exc
+        return FileContent(
+            path=validated,
+            data=data,
+            bytes=len(data),
+            encoding=None,
+            truncated=False,
+        )
+
     async def write(
         self,
         path: str,

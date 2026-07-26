@@ -412,6 +412,16 @@ class RunnerMcpManager:
             an ``InputRequiredResult`` requiring user input before
             the tool can execute.
         """
+        from omnigent.runner.managed_artifacts import (
+            PUBLISH_DESIGN_ARTIFACT_TOOL,
+            publish_managed_artifact,
+        )
+
+        if tool_name == PUBLISH_DESIGN_ARTIFACT_TOOL:
+            if session_id is None:
+                raise RuntimeError("publish_design_artifact requires a session id")
+            return json.dumps(await publish_managed_artifact(session_id, arguments))
+
         configs = list(spec.mcp_servers or [])
         if not configs:
             raise RuntimeError(

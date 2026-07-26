@@ -33,6 +33,7 @@ from omnigent.runner.app import (
     _auto_create_antigravity_terminal,
     _auto_create_codex_terminal,
 )
+from omnigent.runner.managed_artifacts import artifact_spawn_env
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
@@ -53,7 +54,7 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cursor-native session pre-spawn emits only the bridge dir env.
+    """Cursor-native session pre-spawn emits bridge and artifact env.
 
     This locks the runner boundary, not just the bridge helper: the
     session-creation route must pass a cursor-native bridge dir into the
@@ -62,6 +63,7 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
     none consume an active-session guard.
     """
     monkeypatch.setattr(cursor_native_bridge, "_BRIDGE_ROOT", tmp_path / "cursor-bridge")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     spec = AgentSpec(
         spec_version=1,
         name="cursor-native-agent",
@@ -99,7 +101,8 @@ async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
     assert env == {
         cursor_native_bridge.BRIDGE_DIR_ENV_VAR: str(
             cursor_native_bridge.bridge_dir_for_session_id("0229f28e408c700b084b2a2e265f9b3c")
-        )
+        ),
+        **artifact_spawn_env("0229f28e408c700b084b2a2e265f9b3c"),
     }
     assert "HARNESS_CURSOR_NATIVE_REQUEST_SESSION_ID" not in env
 
@@ -109,8 +112,9 @@ async def test_create_session_threads_kiro_bridge_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Kiro-native session pre-spawn emits the Kiro bridge dir env."""
+    """Kiro-native session pre-spawn emits bridge and artifact env."""
     monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     spec = AgentSpec(
         spec_version=1,
         name="kiro-native-agent",
@@ -148,8 +152,50 @@ async def test_create_session_threads_kiro_bridge_dir(
     assert env == {
         kiro_native_bridge.KIRO_NATIVE_BRIDGE_DIR_ENV_VAR: str(
             kiro_native_bridge.bridge_dir_for_session_id("823dbd1aab969b5a813fac59bb977a77")
-        )
+        ),
+        **artifact_spawn_env("823dbd1aab969b5a813fac59bb977a77"),
     }
+
+
+@pytest.mark.asyncio
+async def test_create_session_prelaunch_includes_managed_artifact_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK prelaunch receives the session-scoped managed artifact directory."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    spec = AgentSpec(
+        spec_version=1,
+        name="artifact-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": "conv_artifacts", "agent_id": "ag_artifacts"},
+        )
+
+    assert response.status_code == 201, response.text
+    assert len(pm.get_client_calls) == 1
+    conversation_id, harness, spawn_env = pm.get_client_calls[0]
+    assert conversation_id == "conv_artifacts"
+    assert harness == "claude-sdk"
+    assert spawn_env is not None
+    assert spawn_env["OMNIGENT_ARTIFACT_DIR"] == str(
+        tmp_path / "data" / "artifacts" / "sessions" / "conv_artifacts"
+    )
 
 
 @pytest.mark.asyncio

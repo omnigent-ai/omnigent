@@ -3549,6 +3549,10 @@ def server(
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
         server_config=cfg,
+        artifact_preview_origin=(
+            os.environ.get("OMNIGENT_ARTIFACT_PREVIEW_ORIGIN", "").strip()
+            or f"http://preview.localhost:{port}"
+        ),
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
