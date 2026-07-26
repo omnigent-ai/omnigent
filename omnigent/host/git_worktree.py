@@ -276,7 +276,7 @@ def _branch_checked_out_worktree(repo_root: str, branch_name: str) -> str | None
     """
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
     if result.returncode != 0:
-        return None
+        raise _git_error("git worktree list failed", result)
     ref_suffix = f"refs/heads/{branch_name}"
     path: str | None = None
     for line in result.stdout.splitlines():
