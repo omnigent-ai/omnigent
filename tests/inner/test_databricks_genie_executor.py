@@ -1,34 +1,50 @@
-"""Tests for :class:`DatabricksGenieExecutor` with a fake Genie client.
+"""Tests for :class:`DatabricksGenieExecutor` with a fake Responses client.
 
-The executor talks to a Databricks Genie space via ``WorkspaceClient.genie``. A
-small set of fakes mirror the ``databricks-sdk`` shapes the executor reads
-(``GenieMessage`` / ``GenieAttachment`` / ``StatementResponse``), so every branch
-is exercised without the SDK or a live workspace.
+The executor drives a Genie space in Agent mode over the Genie Responses API.
+A small set of fakes mirror the streamed shapes it reads — ``response.created``,
+``response.output_item.done`` items, ``response.failed``, ``response.completed``
+— so every branch is exercised without the OpenAI SDK, the Databricks SDK, or a
+live workspace.
+
+Two node shapes matter and both are covered: parsed models (attribute access)
+and raw dicts (key access). Genie's Agent mode is Beta and free to ship fields
+and item variants the installed SDK does not model, which it then leaves
+unvalidated, so the executor reads either shape deliberately.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
-import types
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
 import pytest
 
+from omnigent.inner import databricks_executor
 from omnigent.inner.databricks_genie_executor import (
-    DatabricksGenieError,
+    _MAX_RESULT_ROWS,
     DatabricksGenieExecutor,
+    _block_separator,
     _extract_text,
     _latest_user_text,
     _md_cell,
-    _render_statement,
+    _parse_arguments,
+    _reasoning_text,
+    _render_table,
 )
 from omnigent.inner.executor import (
     ExecutorError,
+    ReasoningChunk,
     TextChunk,
+    ToolCallComplete,
+    ToolCallRequest,
+    ToolCallStatus,
     TurnComplete,
 )
+from omnigent.inner.open_responses_sdk import _OPENAI_KEY_PLACEHOLDER
 
 
 def _run(coro: Any) -> Any:
@@ -42,378 +58,1024 @@ def _run(coro: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Fakes mirroring the databricks-sdk Genie shapes the executor reads
+# Fakes mirroring the streamed Responses shapes the executor reads
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class FakeTextAttachment:
-    content: str | None = None
+class FakeError:
+    """Stand-in for the ``error`` object on a failed response."""
+
+    type: str = ""
+    code: str = ""
+    message: str = ""
 
 
 @dataclass
-class FakeQueryAttachment:
-    title: str | None = None
-    description: str | None = None
-    query: str | None = None
-    statement_id: str | None = "stmt-1"
+class FakeResponseInfo:
+    """Stand-in for the ``response`` object carried by lifecycle events."""
+
+    conversation_id: str | None = None
+    error: FakeError | None = None
+    incomplete_details: Any = None
 
 
 @dataclass
-class FakeAttachment:
-    text: FakeTextAttachment | None = None
-    query: FakeQueryAttachment | None = None
+class FakeEvent:
+    """Stand-in for one streamed SSE event."""
+
+    type: str
+    item: Any = None
+    response: FakeResponseInfo | None = None
 
 
 @dataclass
-class FakeMessage:
-    """Stand-in for ``GenieMessage``."""
+class FakeTextPart:
+    """``output_text`` content part; ``metadata`` carries Genie's result table."""
 
-    conversation_id: str | None = "conv-1"
-    message_id: str | None = "msg-1"
-    content: str | None = None
-    attachments: list[FakeAttachment] | None = None
-
-
-@dataclass
-class FakeColumn:
-    name: str = ""
+    text: str
+    type: str = "output_text"
+    metadata: Any = None
 
 
 @dataclass
-class FakeSchema:
-    columns: list[FakeColumn] = field(default_factory=list)
+class FakeMessageItem:
+    content: list[Any] = field(default_factory=list)
+    type: str = "message"
 
 
 @dataclass
-class FakeManifest:
-    schema: FakeSchema | None = None
+class FakeReasoningItem:
+    content: list[Any] = field(default_factory=list)
+    summary: list[Any] = field(default_factory=list)
+    type: str = "reasoning"
 
 
 @dataclass
-class FakeResultData:
-    data_array: list[list[Any]] | None = None
+class FakeFunctionCallItem:
+    name: str = "execute_sql"
+    arguments: str = "{}"
+    call_id: str = "call_1"
+    id: str = "fc_1"
+    type: str = "function_call"
 
 
-@dataclass
-class FakeStatementResponse:
-    manifest: FakeManifest | None = None
-    result: FakeResultData | None = None
+class FakeResponses:
+    """Stands in for ``client.responses``: records kwargs, replays a script.
+
+    ``error`` is public so a test can arm a failure between turns (the 409
+    "another turn is in progress" case only makes sense on a second call).
+    """
+
+    def __init__(self, events: Any = (), *, error: Exception | None = None) -> None:
+        self.events = events
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+        self.last_kwargs: dict[str, Any] = {}
+
+    def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        self.last_kwargs = kwargs
+        if self.error is not None:
+            raise self.error
+        return iter(self.events)
 
 
-class FakeGenie:
-    """Mimics ``WorkspaceClient.genie``, scripting one message per call."""
-
-    def __init__(
-        self,
-        message: FakeMessage,
-        *,
-        raise_on_send: Exception | None = None,
-    ) -> None:
-        self._message = message
-        self._raise_on_send = raise_on_send
-        self.start_calls: list[tuple[str, str]] = []
-        self.create_calls: list[tuple[str, str, str]] = []
-
-    def start_conversation_and_wait(
-        self, space_id: str, content: str, timeout: Any = None
-    ) -> FakeMessage:
-        self.start_calls.append((space_id, content))
-        if self._raise_on_send is not None:
-            raise self._raise_on_send
-        return self._message
-
-    def create_message_and_wait(
-        self, space_id: str, conversation_id: str, content: str, timeout: Any = None
-    ) -> FakeMessage:
-        self.create_calls.append((space_id, conversation_id, content))
-        if self._raise_on_send is not None:
-            raise self._raise_on_send
-        return self._message
+class FakeClient:
+    def __init__(self, events: Any = (), *, error: Exception | None = None) -> None:
+        self.responses = FakeResponses(events, error=error)
 
 
-class FakeStatementExecution:
-    """Mimics ``WorkspaceClient.statement_execution`` for result-row fetches."""
+class _Status4xx(Exception):
+    """Exception shaped like an OpenAI ``APIStatusError`` (carries a status code)."""
 
-    def __init__(
-        self,
-        statement: FakeStatementResponse | None = None,
-        *,
-        raise_on_get: Exception | None = None,
-    ) -> None:
-        self._statement = statement
-        self._raise_on_get = raise_on_get
-        self.get_calls: list[object] = []
-
-    def get_statement(self, statement_id: object) -> FakeStatementResponse | None:
-        self.get_calls.append(statement_id)
-        if self._raise_on_get is not None:
-            raise self._raise_on_get
-        return self._statement
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
-class FakeWorkspaceClient:
-    def __init__(
-        self, genie: FakeGenie, statement_execution: FakeStatementExecution | None = None
-    ) -> None:
-        self.genie = genie
-        self.statement_execution = statement_execution or FakeStatementExecution()
+def _created(conversation_id: str | None = None) -> FakeEvent:
+    return FakeEvent("response.created", response=FakeResponseInfo(conversation_id))
+
+
+def _item_done(item: Any) -> FakeEvent:
+    return FakeEvent("response.output_item.done", item=item)
+
+
+def _completed(conversation_id: str | None = None) -> FakeEvent:
+    return FakeEvent("response.completed", response=FakeResponseInfo(conversation_id))
+
+
+def _failed(**error: str) -> FakeEvent:
+    return FakeEvent("response.failed", response=FakeResponseInfo(error=FakeError(**error)))
+
+
+def _incomplete(reason: str | None = None) -> FakeEvent:
+    details = {"reason": reason} if reason is not None else None
+    return FakeEvent("response.incomplete", response=FakeResponseInfo(incomplete_details=details))
+
+
+def _error_event(**fields: str) -> dict[str, Any]:
+    """A bare ``error`` event — no ``response`` wrapper, fields at the top level."""
+    return {"type": "error", **fields}
+
+
+def _text_item(*parts: FakeTextPart) -> FakeMessageItem:
+    return FakeMessageItem(content=list(parts))
 
 
 def _user(text: str) -> dict[str, Any]:
     return {"role": "user", "content": text}
 
 
-def _events(executor: DatabricksGenieExecutor, messages: list[dict[str, Any]]) -> list[Any]:
+def _events(
+    executor: DatabricksGenieExecutor, messages: list[dict[str, Any]] | None = None
+) -> list[Any]:
     async def _collect() -> list[Any]:
-        return [e async for e in executor.run_turn(messages, [], "SYS")]
+        return [e async for e in executor.run_turn(messages or [_user("q")], [], "SYS")]
 
     return _run(_collect())
 
 
+def _texts(events: list[Any]) -> list[str]:
+    return [e.text for e in events if isinstance(e, TextChunk)]
+
+
+def _response(events: list[Any]) -> str | None:
+    return next(e.response for e in events if isinstance(e, TurnComplete))
+
+
 # ---------------------------------------------------------------------------
-# Happy paths
+# I/O matrix: first turn, follow-up turn, request shape
 # ---------------------------------------------------------------------------
 
 
-def test_text_only_answer_starts_conversation() -> None:
-    """A text-only Genie answer streams one TextChunk + TurnComplete."""
-    genie = FakeGenie(
-        FakeMessage(attachments=[FakeAttachment(text=FakeTextAttachment(content="42 sales"))])
+def test_first_turn_maps_every_item_kind_to_its_event() -> None:
+    """Reasoning, SQL, and report items become the matching executor events."""
+    client = FakeClient(
+        [
+            _created("conv-1"),
+            _item_done(
+                FakeReasoningItem(content=[{"type": "reasoning_text", "text": "Plan it."}])
+            ),
+            _item_done(FakeFunctionCallItem(arguments='{"query": "SELECT 1"}')),
+            _item_done({"type": "function_call_output", "call_id": "call_1", "output": "[[1]]"}),
+            _item_done(_text_item(FakeTextPart(text="One row."))),
+            _completed(),
+        ]
     )
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
+    executor = DatabricksGenieExecutor(space_id="sp", client=client)
 
-    events = _events(executor, [_user("how many sales?")])
+    events = _events(executor)
 
-    texts = [e.text for e in events if isinstance(e, TextChunk)]
-    completes = [e for e in events if isinstance(e, TurnComplete)]
-    assert texts == ["42 sales"]
-    assert len(completes) == 1 and completes[0].response == "42 sales"
-    # First turn → start_conversation, not create_message.
-    assert genie.start_calls == [("sp", "how many sales?")]
-    assert genie.create_calls == []
-
-
-def test_query_answer_includes_sql_and_result_rows() -> None:
-    """A query attachment renders title + SQL + the fetched result table."""
-    statement = FakeStatementResponse(
-        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("region"), FakeColumn("n")])),
-        result=FakeResultData(data_array=[["EMEA", "1200"], ["APAC", None]]),
-    )
-    genie = FakeGenie(
-        FakeMessage(
-            attachments=[
-                FakeAttachment(text=FakeTextAttachment(content="Here is the breakdown.")),
-                FakeAttachment(
-                    query=FakeQueryAttachment(
-                        title="By region",
-                        description="totals per region",
-                        query="SELECT region, count(*) n FROM s GROUP BY region",
-                        statement_id="stmt-region",
-                    )
-                ),
-            ]
-        ),
-    )
-    stmt_exec = FakeStatementExecution(statement)
-    executor = DatabricksGenieExecutor(
-        space_id="sp", workspace_client=FakeWorkspaceClient(genie, stmt_exec)
-    )
-
-    events = _events(executor, [_user("breakdown by region")])
-    response = next(e.response for e in events if isinstance(e, TurnComplete))
-
-    assert "Here is the breakdown." in response
-    assert 'Generated SQL ("By region"):' in response
-    assert "totals per region" in response
-    # SQL is wrapped in a fenced code block.
-    assert "```sql\nSELECT region, count(*) n FROM s GROUP BY region\n```" in response
-    # The result is a valid GFM table: header, delimiter, then data rows.
-    assert "Result (2 rows):" in response
-    assert "| region | n |" in response
-    assert "| --- | --- |" in response
-    assert "| EMEA | 1200 |" in response
-    # None cell rendered as an empty cell.
-    assert "| APAC |  |" in response
-    # The result is fetched via the Statement Execution API by statement id.
-    assert stmt_exec.get_calls == ["stmt-region"]
+    assert [type(e).__name__ for e in events] == [
+        "ReasoningChunk",
+        "ToolCallRequest",
+        "ToolCallComplete",
+        "TextChunk",
+        "TurnComplete",
+    ]
+    reasoning = next(e for e in events if isinstance(e, ReasoningChunk))
+    assert reasoning.delta == "Plan it."
+    assert reasoning.event_type == "reasoning_text"
+    assert _response(events) == "One row."
 
 
-def test_follow_up_turn_continues_conversation() -> None:
-    """The second turn reuses the stored conversation id via create_message."""
-    genie = FakeGenie(
-        FakeMessage(attachments=[FakeAttachment(text=FakeTextAttachment(content="ok"))])
-    )
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
+def test_first_turn_request_omits_conversation_id() -> None:
+    """With no stored id, the request body carries no ``conversation_id``."""
+    client = FakeClient([_created("conv-1"), _completed()])
+    executor = DatabricksGenieExecutor(space_id="sp", client=client)
+
+    _events(executor, [_user("how many sales?")])
+
+    kwargs = client.responses.last_kwargs
+    assert kwargs["model"] == "genie-agent"
+    assert kwargs["stream"] is True
+    assert kwargs["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "how many sales?"}],
+        }
+    ]
+    assert "conversation_id" not in kwargs.get("extra_body", {})
+
+
+def test_follow_up_turn_sends_the_captured_conversation_id() -> None:
+    """The id from ``response.created`` is sent on the next turn's request."""
+    client = FakeClient([_created("conv-42"), _completed()])
+    executor = DatabricksGenieExecutor(space_id="sp", client=client)
 
     _events(executor, [_user("first")])
     _events(executor, [_user("second")])
 
-    assert genie.start_calls == [("sp", "first")]
-    assert genie.create_calls == [("sp", "conv-1", "second")]
+    assert "conversation_id" not in client.responses.calls[0].get("extra_body", {})
+    assert client.responses.calls[1]["extra_body"]["conversation_id"] == "conv-42"
 
 
-def test_message_content_fallback_when_no_attachments() -> None:
-    """With no attachments, the message's own content is used as the answer."""
-    genie = FakeGenie(FakeMessage(attachments=[], content="bare answer"))
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
+def test_input_carries_only_the_latest_user_message() -> None:
+    """Genie owns the history, so prior turns are never replayed into ``input``."""
+    client = FakeClient([_created("conv-1"), _completed()])
+    executor = DatabricksGenieExecutor(space_id="sp", client=client)
 
-    events = _events(executor, [_user("q")])
-    assert next(e.response for e in events if isinstance(e, TurnComplete)) == "bare answer"
+    _events(
+        executor,
+        [
+            _user("old question"),
+            {"role": "assistant", "content": "old answer"},
+            _user("new question"),
+        ],
+    )
+
+    sent = client.responses.last_kwargs["input"]
+    assert len(sent) == 1
+    assert sent[0]["content"] == [{"type": "input_text", "text": "new question"}]
 
 
-def test_empty_answer_emits_turn_complete_without_text_chunk() -> None:
-    """An empty response yields only TurnComplete (no empty TextChunk)."""
-    genie = FakeGenie(FakeMessage(attachments=[], content=None))
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
+def test_response_without_conversation_id_leaves_the_next_turn_fresh() -> None:
+    """No id in ``response.created`` → the follow-up starts a new conversation."""
+    client = FakeClient([_created(None), _completed()])
+    executor = DatabricksGenieExecutor(space_id="sp", client=client)
 
-    events = _events(executor, [_user("q")])
+    _events(executor, [_user("first")])
+    _events(executor, [_user("second")])
+
+    assert all("conversation_id" not in c.get("extra_body", {}) for c in client.responses.calls)
+
+
+def test_conversation_id_is_captured_from_response_completed() -> None:
+    """Genie may name the conversation only at the end; the next turn still continues it."""
+    client = FakeClient([_created(None), _completed("conv-late")])
+    executor = DatabricksGenieExecutor(space_id="sp", client=client)
+
+    _events(executor, [_user("first")])
+    _events(executor, [_user("second")])
+
+    assert "conversation_id" not in client.responses.calls[0].get("extra_body", {})
+    assert client.responses.calls[1]["extra_body"]["conversation_id"] == "conv-late"
+
+
+def test_enable_viz_is_sent_only_when_enabled() -> None:
+    """``enable_viz`` reaches ``extra_body`` as a real bool, and only when on."""
+    on = FakeClient([_completed()])
+    _events(DatabricksGenieExecutor(space_id="sp", client=on, enable_viz=True))
+    assert on.responses.last_kwargs["extra_body"] == {"enable_viz": True}
+
+    off = FakeClient([_completed()])
+    _events(DatabricksGenieExecutor(space_id="sp", client=off, enable_viz=False))
+    assert "enable_viz" not in off.responses.last_kwargs.get("extra_body", {})
+
+
+# ---------------------------------------------------------------------------
+# I/O matrix: table chunks
+# ---------------------------------------------------------------------------
+
+
+def test_table_chunk_is_re_rendered_from_metadata() -> None:
+    """A result chunk renders from ``columns``/``preview_rows``, not its Markdown."""
+    client = FakeClient(
+        [
+            _item_done(
+                _text_item(
+                    FakeTextPart(
+                        text="| unstable | model markdown |",
+                        metadata={
+                            "columns": [{"name": "region"}, {"name": "n"}],
+                            "preview_rows": [["EMEA", "1200"]],
+                        },
+                    )
+                )
+            ),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert _texts(events) == ["| region | n |\n| --- | --- |\n| EMEA | 1200 |"]
+    assert "unstable" not in (_response(events) or "")
+
+
+def test_table_chunk_without_metadata_emits_the_raw_text() -> None:
+    """No metadata → Genie's own text is all there is, so it passes through."""
+    client = FakeClient([_item_done(_text_item(FakeTextPart(text="just prose"))), _completed()])
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+    assert _texts(events) == ["just prose"]
+
+
+def test_fetch_failed_metadata_emits_the_raw_text() -> None:
+    """``status: fetch_failed`` disqualifies the rows even when some are present.
+
+    The stale preview below would otherwise render, so the raw text winning is
+    the status check doing its job — not the empty-metadata fallback.
+    """
+    client = FakeClient(
+        [
+            _item_done(
+                _text_item(
+                    FakeTextPart(
+                        text="Result unavailable.",
+                        metadata={
+                            "status": "fetch_failed",
+                            "columns": ["stale"],
+                            "preview_rows": [["do not render"]],
+                        },
+                    )
+                )
+            ),
+            _completed(),
+        ]
+    )
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+    assert _texts(events) == ["Result unavailable."]
+
+
+def test_metadata_without_rows_falls_back_to_the_raw_text() -> None:
+    """Metadata that renders nothing must not blank out the chunk."""
+    client = FakeClient(
+        [
+            _item_done(
+                _text_item(
+                    FakeTextPart(text="no rows", metadata={"columns": [{"name": "a"}]}),
+                )
+            ),
+            _completed(),
+        ]
+    )
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+    assert _texts(events) == ["no rows"]
+
+
+# ---------------------------------------------------------------------------
+# Separator: report parts must open their own Markdown block
+# ---------------------------------------------------------------------------
+
+
+def test_table_part_after_prose_starts_a_fresh_markdown_block() -> None:
+    """A table glued to the end of a sentence is not a table to any renderer."""
+    client = FakeClient(
+        [
+            _item_done(
+                _text_item(
+                    FakeTextPart(text="Here are your top customers [1](u)."),
+                    FakeTextPart(
+                        text="| ignored |",
+                        metadata={
+                            "columns": ["customer"],
+                            "preview_rows": [["Acme"]],
+                        },
+                    ),
+                )
+            ),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    chunks = _texts(events)
+    assert chunks[1].startswith("\n\n| customer |")
+    assert (
+        _response(events)
+        == "Here are your top customers [1](u).\n\n| customer |\n| --- |\n| Acme |"
+    )
+
+
+def test_part_already_ending_in_a_newline_gains_exactly_one() -> None:
+    """Topping up to a blank line must not produce three consecutive newlines."""
+    client = FakeClient(
+        [
+            _item_done(_text_item(FakeTextPart(text="first line\n"), FakeTextPart(text="second"))),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert _texts(events) == ["first line\n", "\nsecond"]
+    assert _response(events) == "first line\n\nsecond"
+
+
+def test_separator_spans_separate_message_items() -> None:
+    """Parts split across two message items are separated just the same."""
+    client = FakeClient(
+        [
+            _item_done(_text_item(FakeTextPart(text="prose"))),
+            _item_done(_text_item(FakeTextPart(text="more"))),
+            _completed(),
+        ]
+    )
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+    assert _texts(events) == ["prose", "\n\nmore"]
+
+
+@pytest.mark.parametrize(
+    ("previous", "expected"),
+    [
+        ("", ""),  # first chunk of the turn — nothing to separate from
+        ("prose", "\n\n"),  # no trailing newline → open a blank line
+        ("prose\n", "\n"),  # one already there → top up to two
+        ("prose\n\n", ""),  # already a blank line → add nothing
+        ("prose\n\n\n", ""),  # more than enough → never trim
+    ],
+)
+def test_block_separator(previous: str, expected: str) -> None:
+    assert _block_separator(previous) == expected
+
+
+def test_turn_complete_equals_the_concatenated_text_chunks() -> None:
+    """The load-bearing invariant: policy reads TurnComplete, the UI reads chunks."""
+    client = FakeClient(
+        [
+            _item_done(_text_item(FakeTextPart(text="alpha"))),
+            _item_done(
+                _text_item(
+                    FakeTextPart(text="beta\n"),
+                    FakeTextPart(
+                        text="| md |",
+                        metadata={"columns": ["c"], "preview_rows": [["v"]]},
+                    ),
+                )
+            ),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert _response(events) == "".join(_texts(events))
+
+
+# ---------------------------------------------------------------------------
+# I/O matrix: tool-call correlation
+# ---------------------------------------------------------------------------
+
+
+def test_call_and_output_share_one_non_empty_call_id() -> None:
+    """The adapter pairs strictly by ``call_id``; an unpaired event is dropped."""
+    client = FakeClient(
+        [
+            _item_done(
+                FakeFunctionCallItem(call_id="call_abc", arguments='{"query": "SELECT 1"}')
+            ),
+            _item_done({"type": "function_call_output", "call_id": "call_abc", "output": "ok"}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    request = next(e for e in events if isinstance(e, ToolCallRequest))
+    complete = next(e for e in events if isinstance(e, ToolCallComplete))
+    assert request.metadata["call_id"] == complete.metadata["call_id"] == "call_abc"
+    assert request.name == complete.name == "execute_sql"
+    assert request.args == {"query": "SELECT 1"}
+    assert complete.result == "ok"
+
+
+def test_function_call_output_arriving_as_a_raw_dict_still_correlates() -> None:
+    """A raw-dict item correlates exactly like a parsed model does.
+
+    Agent mode is Beta and may stream item variants the installed SDK does not
+    model, which arrive unvalidated as plain dicts; key access must work exactly
+    like attribute access or those SQL calls render as perpetual in-progress
+    cards.
+    """
+    client = FakeClient(
+        [
+            _item_done(
+                {"type": "function_call", "call_id": "c9", "name": "run_sql", "arguments": "{}"}
+            ),
+            _item_done({"type": "function_call_output", "call_id": "c9", "output": {"rows": 2}}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    request = next(e for e in events if isinstance(e, ToolCallRequest))
+    complete = next(e for e in events if isinstance(e, ToolCallComplete))
+    assert request.metadata["call_id"] == complete.metadata["call_id"] == "c9"
+    assert request.name == complete.name == "run_sql"
+    assert complete.result == {"rows": 2}
+
+
+def test_id_less_call_and_output_are_paired_by_position() -> None:
+    """Genie may omit ids; a synthesized one still has to be shared and non-empty."""
+    client = FakeClient(
+        [
+            _item_done({"type": "function_call", "arguments": "{}"}),
+            _item_done({"type": "function_call_output", "output": "ok"}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    request = next(e for e in events if isinstance(e, ToolCallRequest))
+    complete = next(e for e in events if isinstance(e, ToolCallComplete))
+    assert request.metadata["call_id"]
+    assert request.metadata["call_id"] == complete.metadata["call_id"]
+    # No name on either item → the observed-SQL default.
+    assert request.name == "execute_sql"
+
+
+def test_mixed_explicit_and_id_less_outputs_each_complete_their_own_call() -> None:
+    """An id-less output takes the oldest call still awaiting one, not the next by index.
+
+    Genie answers the second call first here; positional pairing that counted
+    every output would hand the id-less one to that same call twice and leave
+    the first call hanging.
+    """
+    client = FakeClient(
+        [
+            _item_done({"type": "function_call", "arguments": "{}"}),  # id-less → synthesized
+            _item_done({"type": "function_call", "call_id": "b", "arguments": "{}"}),
+            _item_done({"type": "function_call_output", "call_id": "b", "output": "second"}),
+            _item_done({"type": "function_call_output", "output": "first"}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    requests = [e for e in events if isinstance(e, ToolCallRequest)]
+    completions = [e for e in events if isinstance(e, ToolCallComplete)]
+    synthesized = requests[0].metadata["call_id"]
+    assert synthesized and synthesized != "b"
+    assert [e.metadata["call_id"] for e in completions] == ["b", synthesized]
+    assert [e.result for e in completions] == ["second", "first"]
+
+
+def test_output_naming_an_unknown_call_is_dropped() -> None:
+    """An id we never issued must not produce a completion against another call."""
+    client = FakeClient(
+        [
+            _item_done(FakeFunctionCallItem(call_id="known")),
+            _item_done({"type": "function_call_output", "call_id": "stranger", "output": "?"}),
+            _item_done({"type": "function_call_output", "call_id": "known", "output": "ok"}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    completions = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert [e.metadata["call_id"] for e in completions] == ["known"]
+    assert completions[0].result == "ok"
+
+
+def test_second_output_for_a_finished_call_is_dropped() -> None:
+    """One call, one completion — a repeat would render a duplicate result card."""
+    client = FakeClient(
+        [
+            _item_done(FakeFunctionCallItem(call_id="c1")),
+            _item_done({"type": "function_call_output", "call_id": "c1", "output": "first"}),
+            _item_done({"type": "function_call_output", "call_id": "c1", "output": "again"}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    completions = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert [e.result for e in completions] == ["first"]
+
+
+def test_uncorrelatable_output_is_dropped_not_ghost_emitted() -> None:
+    """An output with no id and no preceding call cannot pair, so it is dropped."""
+    client = FakeClient(
+        [
+            _item_done({"type": "function_call_output", "output": "orphan"}),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["TurnComplete"]
+
+
+def test_malformed_call_arguments_are_preserved_not_assumed() -> None:
+    """Genie documents ``arguments`` keys as unstable, so non-JSON is kept raw."""
+    client = FakeClient(
+        [_item_done(FakeFunctionCallItem(arguments="not json at all")), _completed()]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    request = next(e for e in events if isinstance(e, ToolCallRequest))
+    assert request.args == {"raw": "not json at all"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, {}),  # absent → nothing to show
+        ("", {}),  # empty string → nothing to show
+        ({"query": "SELECT 1"}, {"query": "SELECT 1"}),  # already a mapping
+        ('{"query": "SELECT 1"}', {"query": "SELECT 1"}),  # JSON object
+        ('["SELECT 1"]', {"raw": ["SELECT 1"]}),  # JSON, but not an object
+        (["SELECT 1"], {"raw": ["SELECT 1"]}),  # already decoded, not an object
+        (7, {"raw": 7}),  # a scalar is still worth showing
+        (False, {"raw": False}),  # falsy but present
+    ],
+)
+def test_parse_arguments_never_silently_drops_a_present_value(
+    raw: object, expected: dict[str, Any]
+) -> None:
+    """Unstable ``arguments`` shapes are preserved under ``raw``, not discarded."""
+    assert _parse_arguments(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# I/O matrix: failures and guard rails
+# ---------------------------------------------------------------------------
+
+
+def test_response_failed_emits_one_error_and_no_turn_complete() -> None:
+    """A terminal failure names ``type``, ``code``, and ``message`` — and stops."""
+    client = FakeClient(
+        [
+            _created("conv-1"),
+            _failed(type="INVALID_STATE", code="RESOURCE_EXHAUSTED", message="warehouse is down"),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "type=INVALID_STATE" in events[0].message
+    assert "code=RESOURCE_EXHAUSTED" in events[0].message
+    assert "warehouse is down" in events[0].message
+
+
+def test_error_event_is_terminal_like_a_failed_response() -> None:
+    """A bare ``error`` event carries its fields at the top level, not under ``response``."""
+    client = FakeClient(
+        [
+            _created("conv-1"),
+            _error_event(code="INTERNAL_ERROR", message="genie exploded"),
+            _completed(),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["ExecutorError"]
+    assert "code=INTERNAL_ERROR" in events[0].message
+    assert "genie exploded" in events[0].message
+
+
+def test_response_incomplete_errors_and_names_the_reason() -> None:
+    """Genie stopping early is a failed turn, not a short answer."""
+    client = FakeClient(
+        [
+            _item_done(_text_item(FakeTextPart(text="half an answer"))),
+            _incomplete("max_output_tokens"),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["TextChunk", "ExecutorError"]
+    assert "max_output_tokens" in events[-1].message
+
+
+def test_response_incomplete_without_details_still_errors() -> None:
+    """No ``incomplete_details`` → still terminal, just without a named reason."""
+    client = FakeClient([_created("conv-1"), _incomplete()])
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["ExecutorError"]
+    assert "reason=" not in events[0].message
+
+
+def test_stream_ending_without_a_terminal_event_is_not_a_completed_turn() -> None:
+    """A dropped connection truncates the report; reporting success would hide that."""
+    client = FakeClient([_created("conv-1"), _item_done(_text_item(FakeTextPart(text="half")))])
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["TextChunk", "ExecutorError"]
+    assert "ended before Genie completed the turn" in events[-1].message
+
+
+def test_unresolved_sql_call_is_cancelled_when_the_turn_fails() -> None:
+    """An unanswered call would otherwise render as a permanent in-progress card."""
+    client = FakeClient(
+        [
+            _item_done(FakeFunctionCallItem(call_id="call_x")),
+            _failed(type="INTERNAL", code="X", message="boom"),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == [
+        "ToolCallRequest",
+        "ToolCallComplete",
+        "ExecutorError",
+    ]
+    cancelled = events[1]
+    assert cancelled.status is ToolCallStatus.CANCELLED
+    assert cancelled.metadata["call_id"] == "call_x"
+    assert cancelled.name == "execute_sql"
+
+
+def test_resolved_sql_call_is_not_cancelled_when_the_stream_truncates() -> None:
+    """Only calls still awaiting an output are cancelled — no duplicate cards."""
+    client = FakeClient(
+        [
+            _item_done(FakeFunctionCallItem(call_id="c1")),
+            _item_done({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+        ]
+    )
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    completions = [e for e in events if isinstance(e, ToolCallComplete)]
+    assert [e.status for e in completions] == [ToolCallStatus.SUCCESS]
+    assert [type(e).__name__ for e in events][-1] == "ExecutorError"
+
+
+def test_feature_disabled_404_points_at_the_beta_preview() -> None:
+    """Agent mode is Beta; a 404 FEATURE_DISABLED is a workspace toggle, not a bug."""
+    client = FakeClient(error=_Status4xx(404, "FEATURE_DISABLED: genie agents"))
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "Beta" in events[0].message
+    assert "preview" in events[0].message
+
+
+def test_plain_404_does_not_claim_the_preview_is_disabled() -> None:
+    """A 404 without FEATURE_DISABLED is a bad space id, so keep the generic text."""
+    client = FakeClient(error=_Status4xx(404, "space not found"))
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+    assert "Beta" not in events[0].message
+    assert "space not found" in events[0].message
+
+
+def test_conflict_409_names_the_in_progress_conversation() -> None:
+    """409 means the previous turn is still generating for this conversation."""
+    client = FakeClient([_created("conv-77"), _completed()])
+    executor = DatabricksGenieExecutor(space_id="sp", client=client)
+    _events(executor, [_user("first")])
+
+    client.responses.error = _Status4xx(409, "RESOURCE_CONFLICT")
+    events = _events(executor, [_user("second")])
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "conv-77" in events[0].message
+    assert "in progress" in events[0].message
+
+
+def test_stream_error_mid_turn_becomes_one_executor_error() -> None:
+    """A transport failure while reading the stream ends the turn cleanly."""
+
+    def _explode() -> Any:
+        yield _item_done(_text_item(FakeTextPart(text="partial")))
+        raise RuntimeError("connection reset")
+
+    client = FakeClient(_explode())
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["TextChunk", "ExecutorError"]
+    assert "connection reset" in events[-1].message
+
+
+def test_missing_space_id_errors_without_any_http_call() -> None:
+    """No space id → an actionable ExecutorError, and the endpoint is never hit."""
+    client = FakeClient([_completed()])
+
+    events = _events(DatabricksGenieExecutor(space_id=None, client=client))
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "executor.model" in events[0].message
+    assert client.responses.calls == []
+
+
+def test_blank_user_text_errors_without_any_http_call() -> None:
+    """A whitespace-only prompt is not worth a request."""
+    client = FakeClient([_completed()])
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client), [_user("   ")])
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "no user message" in events[0].message
+    assert client.responses.calls == []
+
+
+def test_history_without_a_user_message_errors_without_any_http_call() -> None:
+    """An assistant-only history hits the same guard."""
+    client = FakeClient([_completed()])
+
+    events = _events(
+        DatabricksGenieExecutor(space_id="sp", client=client),
+        [{"role": "assistant", "content": "hello"}],
+    )
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert client.responses.calls == []
+
+
+def test_empty_report_completes_with_an_empty_response() -> None:
+    """A stream with no text yields TurnComplete("") and no empty TextChunk."""
+    client = FakeClient([_created("conv-1"), _completed()])
+
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
     assert [type(e).__name__ for e in events] == ["TurnComplete"]
     assert events[0].response == ""
 
 
-# ---------------------------------------------------------------------------
-# Error / guard paths
-# ---------------------------------------------------------------------------
-
-
-def test_missing_space_id_errors() -> None:
-    """No space id → an actionable ExecutorError, no SDK call."""
-    genie = FakeGenie(FakeMessage())
-    executor = DatabricksGenieExecutor(space_id=None, workspace_client=FakeWorkspaceClient(genie))
-
-    events = _events(executor, [_user("q")])
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-    assert "executor.model" in events[0].message
-    assert genie.start_calls == []
-
-
-def test_empty_user_message_errors() -> None:
-    """A blank/absent user message → ExecutorError before any SDK call."""
-    genie = FakeGenie(FakeMessage())
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
-
-    events = _events(executor, [_user("   ")])
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-    assert "no user message" in events[0].message
-    assert genie.start_calls == []
-
-
-def test_send_exception_becomes_executor_error() -> None:
-    """An SDK error during send (e.g. Genie message FAILED / timed out — the SDK's
-    ``*_and_wait`` raises ``OperationFailed`` — or auth failure) becomes an ExecutorError."""
-    genie = FakeGenie(FakeMessage(), raise_on_send=RuntimeError("workspace down"))
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
-
-    events = _events(executor, [_user("q")])
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-    assert "workspace down" in events[0].message
-
-
-def test_query_result_fetch_failure_is_best_effort() -> None:
-    """A result-fetch failure drops the table but keeps the SQL/text answer."""
-    genie = FakeGenie(
-        FakeMessage(
-            attachments=[
-                FakeAttachment(query=FakeQueryAttachment(query="SELECT 1")),
-            ]
-        ),
-    )
-    stmt_exec = FakeStatementExecution(raise_on_get=RuntimeError("result expired"))
-    executor = DatabricksGenieExecutor(
-        space_id="sp", workspace_client=FakeWorkspaceClient(genie, stmt_exec)
+def test_unknown_event_types_are_ignored() -> None:
+    """Genie's Beta stream may carry events we do not map; they must not break it."""
+    client = FakeClient(
+        [
+            FakeEvent("response.in_progress"),
+            FakeEvent("response.output_item.added", item=FakeFunctionCallItem()),
+            _item_done(_text_item(FakeTextPart(text="done"))),
+            _completed(),
+        ]
     )
 
-    events = _events(executor, [_user("q")])
-    response = next(e.response for e in events if isinstance(e, TurnComplete))
-    assert "Generated SQL:" in response
-    assert "SELECT 1" in response
-    assert "Result (" not in response
+    events = _events(DatabricksGenieExecutor(space_id="sp", client=client))
+
+    assert [type(e).__name__ for e in events] == ["TextChunk", "TurnComplete"]
 
 
-def test_query_attachment_without_sql_renders_description_only() -> None:
-    """A query attachment with a description but no SQL omits the SQL line."""
-    genie = FakeGenie(
-        FakeMessage(
-            attachments=[
-                FakeAttachment(query=FakeQueryAttachment(description="just a note", query=None))
-            ]
+# ---------------------------------------------------------------------------
+# Lazy client construction
+# ---------------------------------------------------------------------------
+
+
+class _FakeAuth(httpx.Auth):
+    """Stand-in for the refreshing Databricks bearer auth."""
+
+    token = "dapi-secret-token"
+
+    def auth_flow(self, request: httpx.Request) -> Any:
+        request.headers["Authorization"] = f"Bearer {self.token}"
+        yield request
+
+
+@pytest.fixture
+def _stub_databricks_auth(monkeypatch: pytest.MonkeyPatch) -> _FakeAuth:
+    """Resolve Databricks credentials to a fake auth + host, with no I/O."""
+    auth = _FakeAuth()
+    monkeypatch.setattr(
+        databricks_executor,
+        "_resolve_databricks_auth",
+        lambda profile=None, **_: (auth, "https://ws.example.com/"),
+    )
+    return auth
+
+
+def test_lazy_client_is_built_once_and_reused(_stub_databricks_auth: _FakeAuth) -> None:
+    """The client is constructed on first use and shared by every later turn."""
+    executor = DatabricksGenieExecutor(space_id="space-1", profile="dev")
+
+    client = executor._ensure_client("space-1")
+    try:
+        assert executor._ensure_client("space-1") is client
+        assert str(client.base_url).rstrip("/") == (
+            "https://ws.example.com/api/2.0/genie/agents/space-1"
         )
-    )
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
-    response = next(
-        e.response for e in _events(executor, [_user("q")]) if isinstance(e, TurnComplete)
-    )
-    assert "Generated SQL:" in response
-    assert "just a note" in response
+    finally:
+        client.close()
 
 
-def test_message_without_conversation_id_does_not_thread() -> None:
-    """A message lacking a conversation id leaves the next turn starting fresh."""
-    genie = FakeGenie(
-        FakeMessage(
-            conversation_id=None,
-            attachments=[FakeAttachment(text=FakeTextAttachment(content="ok"))],
-        )
-    )
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
+def test_lazy_client_never_snapshots_a_token(_stub_databricks_auth: _FakeAuth) -> None:
+    """Auth rides the per-request httpx hook so OAuth refresh keeps working."""
+    executor = DatabricksGenieExecutor(space_id="space-1", profile="dev")
 
-    _events(executor, [_user("first")])
-    _events(executor, [_user("second")])
-
-    # No conversation id was recorded, so both turns start a new conversation.
-    assert genie.start_calls == [("sp", "first"), ("sp", "second")]
-    assert genie.create_calls == []
+    client = executor._ensure_client("space-1")
+    try:
+        assert client.api_key == _OPENAI_KEY_PLACEHOLDER
+        assert _FakeAuth.token not in str(client.api_key)
+        # ``_client`` is the OpenAI SDK's httpx client; the auth hook living
+        # there is what makes the token per-request rather than a snapshot.
+        assert client._client.auth is _stub_databricks_auth
+    finally:
+        client.close()
 
 
-# ---------------------------------------------------------------------------
-# Lazy client construction (databricks-sdk import)
-# ---------------------------------------------------------------------------
+def test_lazy_client_applies_the_turn_timeout_and_disables_retries(
+    _stub_databricks_auth: _FakeAuth,
+) -> None:
+    """Genie's 409 is in the SDK's default retry set but is never retryable."""
+    executor = DatabricksGenieExecutor(space_id="space-1", timeout_seconds=900.0)
+
+    client = executor._ensure_client("space-1")
+    try:
+        assert client.timeout == 900.0
+        assert client.max_retries == 0
+    finally:
+        client.close()
 
 
-def test_lazy_client_built_from_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no injected client, a WorkspaceClient is built from the SDK once."""
-    genie = FakeGenie(
-        FakeMessage(attachments=[FakeAttachment(text=FakeTextAttachment(content="hi"))])
-    )
-    constructed: list[dict[str, Any]] = []
+def test_close_closes_an_owned_client_and_is_safe_twice(_stub_databricks_auth: _FakeAuth) -> None:
+    """Harness shutdown must release the connection pool this executor opened."""
+    executor = DatabricksGenieExecutor(space_id="space-1")
+    http_client = executor._ensure_client("space-1")._client  # type: ignore[attr-defined]
 
-    def _client_factory(**kwargs: Any) -> FakeWorkspaceClient:
-        constructed.append(kwargs)
-        return FakeWorkspaceClient(genie)
+    _run(executor.close())
 
-    fake_sdk = types.ModuleType("databricks.sdk")
-    fake_sdk.WorkspaceClient = _client_factory  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "databricks.sdk", fake_sdk)
-
-    executor = DatabricksGenieExecutor(space_id="sp", profile="dev")
-    events = _events(executor, [_user("q")])
-
-    assert next(e.response for e in events if isinstance(e, TurnComplete)) == "hi"
-    # Built exactly once, with the configured profile, then reused.
-    assert constructed == [{"profile": "dev"}]
-    _events(executor, [_user("again")])
-    assert len(constructed) == 1
+    assert http_client.is_closed
+    assert executor._client is None
+    _run(executor.close())  # second call must not raise
 
 
-def test_missing_sdk_errors_with_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A missing databricks-sdk surfaces an ExecutorError with an install hint."""
+def test_close_leaves_an_injected_client_alone() -> None:
+    """A client we did not build belongs to its caller, so closing must not touch it."""
+    injected = FakeClient([_completed()])
+    executor = DatabricksGenieExecutor(space_id="sp", client=injected)
 
+    _run(executor.close())
+
+    assert executor._client is injected
+
+
+def test_close_without_ever_building_a_client_is_a_no_op() -> None:
+    """A turn-less executor still gets closed at shutdown."""
+    _run(DatabricksGenieExecutor(space_id="sp").close())
+
+
+def test_failed_client_construction_does_not_orphan_the_http_client(
+    _stub_databricks_auth: _FakeAuth,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing else holds the pool if the OpenAI constructor rejects our arguments."""
+    built: list[httpx.Client] = []
+    real_client = httpx.Client
+
+    def _record(**kwargs: Any) -> httpx.Client:
+        client = real_client(**kwargs)
+        built.append(client)
+        return client
+
+    def _reject(**_: Any) -> Any:
+        raise TypeError("unexpected keyword argument")
+
+    monkeypatch.setattr(httpx, "Client", _record)
+    monkeypatch.setattr("openai.OpenAI", _reject)
+
+    executor = DatabricksGenieExecutor(space_id="sp")
+    with pytest.raises(TypeError):
+        executor._ensure_client("sp")
+
+    assert [c.is_closed for c in built] == [True]
+    assert executor._http_client is None
+
+
+def test_client_construction_runs_off_the_event_loop() -> None:
+    """Credential resolution blocks (file I/O + a token mint), so it needs a thread."""
+    built_on: list[int] = []
+    executor = DatabricksGenieExecutor(space_id="sp")
+
+    def _record(agent_id: str) -> object:
+        built_on.append(threading.get_ident())
+        return FakeClient([_completed()])
+
+    executor._ensure_client = _record  # type: ignore[method-assign]
+
+    async def _collect() -> int:
+        async for _ in executor.run_turn([_user("q")], [], "SYS"):
+            pass
+        return threading.get_ident()
+
+    loop_thread = _run(_collect())
+
+    assert built_on and built_on[0] != loop_thread
+
+
+def test_missing_databricks_sdk_names_the_package_and_the_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the SDK there is no way to authenticate; say what to install."""
     real_import = __import__
 
     def _no_databricks_sdk(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name == "databricks.sdk":
-            raise ImportError("No module named 'databricks.sdk'")
+        if name.startswith("databricks.sdk"):
+            raise ImportError(f"No module named {name!r}")
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.delitem(sys.modules, "databricks.sdk", raising=False)
+    monkeypatch.delitem(sys.modules, "databricks.sdk.config", raising=False)
     monkeypatch.setattr("builtins.__import__", _no_databricks_sdk)
 
-    executor = DatabricksGenieExecutor(space_id="sp")
-    events = _events(executor, [_user("q")])
+    events = _events(DatabricksGenieExecutor(space_id="sp"))
 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
@@ -422,14 +1084,21 @@ def test_missing_sdk_errors_with_install_hint(monkeypatch: pytest.MonkeyPatch) -
 
 
 # ---------------------------------------------------------------------------
-# Capability flags & message extraction
+# Capability flags
 # ---------------------------------------------------------------------------
 
 
 def test_capability_flags() -> None:
+    """Streaming is real; Genie runs its own SQL so Session must not re-dispatch."""
     executor = DatabricksGenieExecutor(space_id="sp")
-    assert executor.supports_streaming() is False
+    assert executor.supports_streaming() is True
     assert executor.supports_tool_calling() is False
+    assert executor.handles_tools_internally() is True
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers: message extraction
+# ---------------------------------------------------------------------------
 
 
 def test_extract_text_edge_cases() -> None:
@@ -450,34 +1119,35 @@ def test_latest_user_text_no_user_message_returns_empty() -> None:
     assert _latest_user_text([]) == ""
 
 
-def test_run_turn_with_no_user_role_errors() -> None:
-    """A history with no user message → the empty-prompt guard fires."""
-    genie = FakeGenie(FakeMessage())
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
-    events = _events(executor, [{"role": "assistant", "content": "hello"}])
-    assert len(events) == 1
-    assert isinstance(events[0], ExecutorError)
-    assert "no user message" in events[0].message
+@pytest.mark.parametrize(
+    ("item", "expected"),
+    [
+        ({"content": "Plan it."}, "Plan it."),  # text directly on ``content``
+        ({"summary": "Summarized."}, "Summarized."),  # …or on ``summary``
+        ({"content": [{"text": "a"}, {"text": "b"}]}, "a\nb"),  # list of parts
+        ({"content": ["a", "b"]}, "a\nb"),  # list of bare strings
+        ({"content": "", "summary": "fallback"}, "fallback"),  # empty → next field
+        ({"content": [], "text": "last resort"}, "last resort"),  # neither field → ``text``
+        ({}, ""),  # nothing to show
+    ],
+)
+def test_reasoning_text_reads_either_shape(item: dict[str, Any], expected: str) -> None:
+    """Genie may carry planning as a string or a list of parts; both must surface."""
+    assert _reasoning_text(item) == expected
 
 
-def test_latest_user_text_handles_multimodal_parts() -> None:
-    """The latest user message wins, and list-of-parts content is joined."""
-    genie = FakeGenie(
-        FakeMessage(attachments=[FakeAttachment(text=FakeTextAttachment(content="ok"))])
-    )
-    executor = DatabricksGenieExecutor(space_id="sp", workspace_client=FakeWorkspaceClient(genie))
-
+def test_latest_user_text_takes_the_last_user_turn_and_joins_parts() -> None:
+    """The newest user message wins, and list-of-parts content is joined."""
     messages = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": "ignored"},
         {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "image"}]},
     ]
-    _events(executor, messages)
-    assert genie.start_calls == [("sp", "hello")]
+    assert _latest_user_text(messages) == "hello"
 
 
 # ---------------------------------------------------------------------------
-# _md_cell / _render_statement (pure helpers) — table formatting
+# Pure helpers: table formatting
 # ---------------------------------------------------------------------------
 
 
@@ -496,112 +1166,70 @@ def test_md_cell(value: object, expected: str) -> None:
     assert _md_cell(value) == expected
 
 
-def test_render_statement_no_rows_returns_empty() -> None:
-    assert _render_statement(FakeStatementResponse(result=FakeResultData(data_array=[]))) == ""
-    assert _render_statement(FakeStatementResponse(result=None)) == ""
+def test_render_table_without_rows_returns_empty() -> None:
+    assert _render_table({"columns": ["a"], "preview_rows": []}) == ""
+    assert _render_table({"columns": ["a"]}) == ""
+    assert _render_table(None) == ""
 
 
-def test_render_statement_without_columns_synthesizes_headers() -> None:
-    """With no schema, generic ``col1, col2`` headers keep the table valid GFM."""
-    stmt = FakeStatementResponse(
-        manifest=None,
-        result=FakeResultData(data_array=[["a", "b"]]),
-    )
-    rendered = _render_statement(stmt)
-    assert rendered == "Result (1 row):\n\n| col1 | col2 |\n| --- | --- |\n| a | b |"
+def test_render_table_emits_valid_gfm() -> None:
+    """Header row, delimiter row, then one line per preview row."""
+    metadata = {
+        "columns": [{"name": "region"}, {"name": "n"}],
+        "preview_rows": [["EMEA", "1200"]],
+    }
+    assert _render_table(metadata) == "| region | n |\n| --- | --- |\n| EMEA | 1200 |"
 
 
-def test_render_statement_emits_valid_gfm_table() -> None:
-    """Header row, delimiter row, blank-line separation, and pipe-bounded cells."""
-    stmt = FakeStatementResponse(
-        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("region"), FakeColumn("n")])),
-        result=FakeResultData(data_array=[["EMEA", "1200"]]),
-    )
-    assert _render_statement(stmt) == (
-        "Result (1 row):\n\n| region | n |\n| --- | --- |\n| EMEA | 1200 |"
-    )
+def test_render_table_accepts_plain_string_columns() -> None:
+    """Genie may name columns as bare strings rather than objects."""
+    metadata = {"columns": ["a", "b"], "preview_rows": [["1", "2"]]}
+    assert _render_table(metadata) == "| a | b |\n| --- | --- |\n| 1 | 2 |"
 
 
-def test_render_statement_pads_ragged_rows() -> None:
+def test_render_table_accepts_keyed_rows() -> None:
+    """Rows keyed by column name are ordered by the header, not by dict order."""
+    metadata = {
+        "columns": ["first", "second"],
+        "preview_rows": [{"second": "B", "first": "A"}],
+    }
+    assert _render_table(metadata) == "| first | second |\n| --- | --- |\n| A | B |"
+
+
+def test_render_table_without_columns_synthesizes_headers() -> None:
+    """With no column metadata, generic ``col1, col2`` keeps the table valid GFM."""
+    metadata = {"preview_rows": [["a", "b"]]}
+    assert _render_table(metadata) == "| col1 | col2 |\n| --- | --- |\n| a | b |"
+
+
+def test_render_table_takes_headers_from_keyed_rows_when_columns_are_absent() -> None:
+    """Keyed rows know their own labels; without them the row renders as blanks."""
+    metadata = {"preview_rows": [{"region": "EMEA", "n": "3"}]}
+    assert _render_table(metadata) == "| region | n |\n| --- | --- |\n| EMEA | 3 |"
+
+
+def test_render_table_pads_ragged_rows() -> None:
     """A row shorter than the column count is padded with empty cells."""
-    stmt = FakeStatementResponse(
-        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("a"), FakeColumn("b")])),
-        result=FakeResultData(data_array=[["x"]]),
-    )
-    assert _render_statement(stmt) == "Result (1 row):\n\n| a | b |\n| --- | --- |\n| x |  |"
+    metadata = {"columns": ["a", "b"], "preview_rows": [["x"]]}
+    assert _render_table(metadata) == "| a | b |\n| --- | --- |\n| x |  |"
 
 
-def test_render_statement_sanitizes_multiline_cells() -> None:
-    """A multi-line / pipe-bearing cell is collapsed to one row so the table holds."""
-    stmt = FakeStatementResponse(
-        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("review")])),
-        result=FakeResultData(data_array=[["line one\nline two | tail"]]),
-    )
-    assert _render_statement(stmt) == (
-        "Result (1 row):\n\n| review |\n| --- |\n| line one line two \\| tail |"
-    )
+def test_render_table_sanitizes_multiline_and_piped_cells() -> None:
+    """A multi-line / pipe-bearing cell is collapsed so the table holds together."""
+    metadata = {"columns": ["review"], "preview_rows": [["line one\nline two | tail"]]}
+    assert _render_table(metadata) == "| review |\n| --- |\n| line one line two \\| tail |"
 
 
-def test_render_statement_truncates_beyond_cap() -> None:
-    rows = [[str(i)] for i in range(55)]
-    stmt = FakeStatementResponse(
-        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("i")])),
-        result=FakeResultData(data_array=rows),
-    )
-    rendered = _render_statement(stmt)
-    assert "Result (55 rows):" in rendered
+def test_render_table_truncates_beyond_the_row_cap() -> None:
+    """Genie previews upstream; this is our own bound on what we echo back."""
+    rows = [[str(i)] for i in range(_MAX_RESULT_ROWS + 5)]
+    rendered = _render_table({"columns": ["i"], "preview_rows": rows})
+
     assert "… (5 more rows)" in rendered
-    assert "| --- |" in rendered
-    # Exactly the first 50 rows are shown; row index 50+ is summarized away.
-    assert "| 49 |" in rendered
-    assert "| 50 |" not in rendered
+    assert f"| {_MAX_RESULT_ROWS - 1} |" in rendered
+    assert f"| {_MAX_RESULT_ROWS} |" not in rendered
 
 
-def test_render_statement_single_omitted_row_is_singular() -> None:
-    rows = [[str(i)] for i in range(51)]
-    stmt = FakeStatementResponse(
-        manifest=FakeManifest(schema=FakeSchema(columns=[FakeColumn("i")])),
-        result=FakeResultData(data_array=rows),
-    )
-    assert "… (1 more row)" in _render_statement(stmt)
-
-
-def test_statement_with_no_rows_renders_no_table() -> None:
-    """A statement that resolves with no rows renders the SQL but no table."""
-    genie = FakeGenie(
-        FakeMessage(attachments=[FakeAttachment(query=FakeQueryAttachment(query="SELECT 1"))]),
-    )
-    stmt_exec = FakeStatementExecution(
-        FakeStatementResponse(result=FakeResultData(data_array=None))
-    )
-    executor = DatabricksGenieExecutor(
-        space_id="sp", workspace_client=FakeWorkspaceClient(genie, stmt_exec)
-    )
-    events = _events(executor, [_user("q")])
-    response = next(e.response for e in events if isinstance(e, TurnComplete))
-    assert "SELECT 1" in response
-    assert "Result (" not in response
-
-
-def test_query_with_missing_statement_id_skips_result_fetch() -> None:
-    """No statement id → the result table is skipped without an SDK call."""
-    genie = FakeGenie(
-        FakeMessage(
-            attachments=[
-                FakeAttachment(query=FakeQueryAttachment(query="SELECT 1", statement_id=None))
-            ],
-        )
-    )
-    stmt_exec = FakeStatementExecution()
-    executor = DatabricksGenieExecutor(
-        space_id="sp", workspace_client=FakeWorkspaceClient(genie, stmt_exec)
-    )
-    events = _events(executor, [_user("q")])
-    response = next(e.response for e in events if isinstance(e, TurnComplete))
-    assert "SELECT 1" in response
-    assert stmt_exec.get_calls == []
-
-
-def test_genie_error_str() -> None:
-    """The custom error type carries its message (used in ExecutorError text)."""
-    assert "boom" in str(DatabricksGenieError("boom"))
+def test_render_table_single_omitted_row_is_singular() -> None:
+    rows = [[str(i)] for i in range(_MAX_RESULT_ROWS + 1)]
+    assert "… (1 more row)" in _render_table({"columns": ["i"], "preview_rows": rows})

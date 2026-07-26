@@ -7,26 +7,34 @@ resolves ``"databricks-genie"`` to this module via
 :data:`omnigent.runtime.harnesses._HARNESS_MODULES`.
 
 Wraps a :class:`omnigent.inner.databricks_genie_executor.DatabricksGenieExecutor`,
-which converses with a remote Databricks Genie space over the Genie Conversation
-API. Mirrors the cursor wrap's env-var config flow.
+which converses with a remote Databricks Genie space in Agent mode over the
+Genie Responses API. Mirrors the cursor wrap's env-var config flow.
 
-Env vars read at startup (set by
-:func:`omnigent.runtime.workflow._build_databricks_genie_spawn_env`):
+Env vars read at startup. Three are spec-driven — set by
+:func:`omnigent.runtime.workflow._build_databricks_genie_spawn_env`:
 
 - ``HARNESS_DATABRICKS_GENIE_MODEL``: the Genie space id (carried in
   ``executor.model``). ``None`` surfaces as a turn error telling the user to set
   it.
 - ``HARNESS_DATABRICKS_GENIE_PROFILE``: the Databricks profile from
-  ``~/.databrickscfg`` used to authenticate the workspace client. ``None`` lets
-  the SDK use its own resolution order.
+  ``~/.databrickscfg`` used to authenticate. ``None`` lets the SDK use its own
+  resolution order.
+- ``HARNESS_DATABRICKS_GENIE_ENABLE_VIZ``: optional opt-in asking Genie to
+  attach visualizations to its answer, from ``executor.config["enable_viz"]``.
+  Off unless set to ``"true"``/``"1"``.
+
+The remaining one has no spec surface — the spawn-env builder never exports it,
+so it is read from the ambient environment the harness subprocess inherits:
+
 - ``HARNESS_DATABRICKS_GENIE_TIMEOUT``: optional per-turn deadline (seconds,
-  float) handed to Genie's blocking ``*_and_wait`` helpers. Malformed values
-  fall back to the executor default.
+  float) applied to the streamed response. Values that are not a positive,
+  finite number fall back to the executor default.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 from fastapi import FastAPI
@@ -43,20 +51,29 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_DATABRICKS_GENIE_MODEL"
 _ENV_PROFILE = "HARNESS_DATABRICKS_GENIE_PROFILE"
 _ENV_TIMEOUT = "HARNESS_DATABRICKS_GENIE_TIMEOUT"
+_ENV_ENABLE_VIZ = "HARNESS_DATABRICKS_GENIE_ENABLE_VIZ"
+
+# ``executor.config`` scalars reach the harness stringified, so a YAML ``true``
+# arrives as ``"True"``; accept the spellings a user could plausibly write.
+_TRUTHY = frozenset({"true", "1"})
 
 
 def _resolve_timeout() -> float:
     """Resolve the per-turn timeout from :data:`_ENV_TIMEOUT`.
 
+    Only a positive, finite number of seconds is a usable HTTP deadline —
+    ``0``, a negative, ``nan``, and ``inf`` all parse as floats but would either
+    fail every request or never bound a wedged stream.
+
     :returns: The parsed timeout in seconds, or
         :data:`~omnigent.inner.databricks_genie_executor._DEFAULT_TIMEOUT_SECONDS`
-        when the env var is unset or malformed.
+        when the env var is unset or does not name a positive, finite number.
     """
     raw = os.environ.get(_ENV_TIMEOUT, "").strip()
     if not raw:
         return _DEFAULT_TIMEOUT_SECONDS
     try:
-        return float(raw)
+        timeout = float(raw)
     except ValueError:
         _logger.warning(
             "%s is not a valid float (%r); falling back to %s seconds",
@@ -65,6 +82,24 @@ def _resolve_timeout() -> float:
             _DEFAULT_TIMEOUT_SECONDS,
         )
         return _DEFAULT_TIMEOUT_SECONDS
+    if not math.isfinite(timeout) or timeout <= 0:
+        _logger.warning(
+            "%s must be a positive, finite number of seconds (%r); falling back to %s seconds",
+            _ENV_TIMEOUT,
+            raw,
+            _DEFAULT_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_TIMEOUT_SECONDS
+    return timeout
+
+
+def _resolve_enable_viz() -> bool:
+    """Resolve the visualization opt-in from :data:`_ENV_ENABLE_VIZ`.
+
+    :returns: ``True`` for ``"true"``/``"True"``/``"1"``; ``False`` when the
+        env var is unset or holds anything else.
+    """
+    return os.environ.get(_ENV_ENABLE_VIZ, "").strip().lower() in _TRUTHY
 
 
 def _build_databricks_genie_executor() -> Executor:
@@ -78,6 +113,7 @@ def _build_databricks_genie_executor() -> Executor:
         space_id=os.environ.get(_ENV_MODEL) or None,
         profile=os.environ.get(_ENV_PROFILE) or None,
         timeout_seconds=_resolve_timeout(),
+        enable_viz=_resolve_enable_viz(),
     )
 
 

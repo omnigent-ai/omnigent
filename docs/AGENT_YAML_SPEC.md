@@ -153,10 +153,18 @@ the workspace.
 
 `harness: databricks-genie` (alias `genie`) registers a remote Databricks
 **AI/BI Genie space** as the agent's harness (`pip install
-"omnigent[databricks]"`). Each turn is forwarded to the Genie space, which
-answers natural-language questions over your curated data; the response carries
-Genie's summary, the SQL it generated, and the result rows. Follow-up turns
-continue the same Genie conversation.
+"omnigent[databricks]"`). Each turn is posted to the space's Genie **Agent-mode
+Responses API** (`POST /api/2.0/genie/agents/{space_id}/responses`) and streamed
+back over SSE as each step of the turn completes — whole items, not
+token-by-token deltas. Genie's planning arrives as reasoning and each SQL query
+it runs shows up as a tool call while the turn is still running; the report text
+lands when Genie finishes writing it, with result rows re-rendered as Markdown
+tables (capped at 50 rows). Follow-up turns continue the same Genie
+conversation.
+
+Genie Agent mode is a Databricks **Beta** API gated on a workspace preview
+toggle. Until a workspace admin turns it on, the endpoint answers 404
+`FEATURE_DISABLED` and the turn fails saying exactly that.
 
 A Genie space is the conversational unit, so its **space id** is carried in
 `executor.model`. Authentication reuses the Databricks CLI: run
@@ -172,15 +180,34 @@ executor:
     profile: DEFAULT             # ~/.databrickscfg profile; omit to use defaults
 ```
 
-Unlike the gateway-backed harnesses, Genie talks to the workspace through the
-databricks-sdk `WorkspaceClient`, not the Databricks AI gateway, and it dispatches
-no Omnigent tools — the space queries its own data directly. See
-[`examples/genie`](../examples/genie).
+Two Genie-specific knobs:
+
+- **`enable_viz`** (default `false`) asks Genie to attach visualizations to its
+  answer; left off, the field is omitted from the request entirely. It is read
+  from `executor.config`, so it belongs in a bundle spec such as
+  [`examples/genie/config.yaml`](../examples/genie/config.yaml) — the
+  single-file format above has no `config:` block. For a single-file spec, set
+  `HARNESS_DATABRICKS_GENIE_ENABLE_VIZ=true` in the environment instead.
+- **`HARNESS_DATABRICKS_GENIE_TIMEOUT`** overrides the per-turn HTTP deadline in
+  seconds (default `900`), which has to cover Genie planning, running real
+  warehouse queries, and writing its report.
+
+Unlike the gateway-backed harnesses, Genie talks to the workspace directly with
+the credentials the Databricks SDK resolves from your profile — every request
+carries a freshly minted bearer token, so a long turn survives OAuth token
+expiry — not through the Databricks AI gateway. It also dispatches no Omnigent
+tools: the space runs its own SQL, so those calls are surfaced as observations.
+See [`examples/genie`](../examples/genie).
 
 CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
 `executor.auth` block or your `omnigent setup` provider config — there is
-no profile flag.
+no profile flag. `databricks-genie` is the exception on the provider half: it
+takes the profile from the spec alone (`executor.auth.profile`, or the legacy
+`executor.profile` / `executor.config.profile`), so a default provider from
+`omnigent setup` does not apply to it; with no profile in the spec it falls back
+to the Databricks SDK's own resolution (`DATABRICKS_CONFIG_PROFILE` env var /
+`[DEFAULT]` section).
 
 ## Qwen Code
 

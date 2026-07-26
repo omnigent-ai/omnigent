@@ -624,9 +624,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         interrupt=True,
         streaming=True,
     ),
-    # Genie answers each turn with one complete message over the databricks-sdk
-    # Genie API — DatabricksGenieExecutor.supports_streaming() returns False and
-    # it does not override interrupt_session(), so both are declared False. The
+    # Genie streams each turn's reasoning, SQL, and report over the Agent-mode
+    # Responses API — DatabricksGenieExecutor.supports_streaming() returns True.
+    # It does not override interrupt_session(), so interrupt stays False. The
     # conversation id it threads across turns lives on the executor instance and
     # is not rehydrated on resume, hence COLD_ONLY.
     "databricks-genie": _C(
@@ -638,7 +638,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=False,
-        streaming=False,
+        streaming=True,
     ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()

@@ -1919,9 +1919,11 @@ def _build_databricks_genie_spawn_env(spec: AgentSpec) -> dict[str, str]:
     - the Databricks profile (``executor.auth: {type: databricks, profile}`` or
       the legacy ``executor.profile`` / ``executor.config["profile"]``) →
       ``HARNESS_DATABRICKS_GENIE_PROFILE``
+    - ``executor.config["enable_viz"]`` (Genie's visualization opt-in) →
+      ``HARNESS_DATABRICKS_GENIE_ENABLE_VIZ``
 
-    Genie reaches the workspace via the databricks-sdk ``WorkspaceClient``
-    (Databricks-CLI / OAuth / PAT auth), NOT the Databricks AI gateway — so, like
+    Genie reaches the workspace with Databricks-CLI / OAuth / PAT credentials
+    resolved by the databricks-sdk, NOT the Databricks AI gateway — so, like
     cursor, it is intentionally absent from :data:`AgentHarnessType` and the
     gateway / ucode dicts above, and there is no base-URL / gateway resolution
     here.
@@ -1943,6 +1945,12 @@ def _build_databricks_genie_spawn_env(spec: AgentSpec) -> dict[str, str]:
         profile = spec.executor.config.get("profile") or spec.executor.profile or None
     if profile:
         env["HARNESS_DATABRICKS_GENIE_PROFILE"] = profile
+
+    # ``executor.config`` scalars reach the harness stringified, so a YAML
+    # ``true`` lands here as ``"True"`` and the wrap parses it back to a bool.
+    enable_viz = spec.executor.config.get("enable_viz")
+    if enable_viz is not None:
+        env["HARNESS_DATABRICKS_GENIE_ENABLE_VIZ"] = str(enable_viz)
     return env
 
 

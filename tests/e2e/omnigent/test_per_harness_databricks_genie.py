@@ -6,21 +6,28 @@ Runs ``omnigent run hello_world.yaml --harness databricks-genie --model
 databricks-genie harness: CLI parse → spec materialize → spawn the
 ``databricks-genie`` harness subprocess →
 :class:`~omnigent.inner.databricks_genie_executor.DatabricksGenieExecutor`
-driving a remote Genie space over the ``databricks-sdk`` Genie API →
-``TurnComplete`` → the ``-p`` one-shot printer.
+streaming a remote Genie space over the Agent-mode Responses API
+(``POST /api/2.0/genie/agents/{agent_id}/responses``) → ``TurnComplete`` → the
+``-p`` one-shot printer.
 
 **Prerequisites (skipped when absent):**
-- The ``databricks-sdk`` package installed (the ``databricks`` extra).
+- The ``databricks-sdk`` package installed (the ``databricks`` extra) — it
+  resolves the workspace credentials the request's bearer auth refreshes.
 - ``OMNIGENT_GENIE_SPACE_ID`` set to a real Genie space id.
 - A resolvable Databricks credential — typically ``databricks auth login``
   having written ``~/.databrickscfg`` (optionally named via
   ``OMNIGENT_GENIE_PROFILE`` → ``DATABRICKS_CONFIG_PROFILE``).
+- The workspace preview toggle for Genie **Agent mode** enabled. The APIs are
+  Beta; without it the endpoint answers 404 ``FEATURE_DISABLED``. This one
+  cannot be detected up front — it only shows up as a failed run — so a run
+  that reports it is skipped rather than failed (see below).
 
-**Why this test cannot use the mock LLM server:** Genie is a proprietary
-Databricks conversational API reached through ``WorkspaceClient.genie``; it does
-not honour ``OPENAI_BASE_URL``. The harness can only be exercised against a real
-workspace, so the test **skips** (rather than fails) when the prerequisites are
-absent so the e2e shards stay green; it runs for real wherever they are present.
+**Why this test cannot use the mock LLM server:** the Genie Responses endpoint
+is OpenAI-shaped but lives at a workspace-specific Databricks URL derived from
+the resolved credentials, so it does not honour ``OPENAI_BASE_URL``. The harness
+can only be exercised against a real workspace, so the test **skips** (rather
+than fails) when the prerequisites are absent so the e2e shards stay green; it
+runs for real wherever they are present.
 """
 
 from __future__ import annotations
@@ -38,8 +45,19 @@ _PROMPT = "Give me a one-sentence summary of what this space can answer."
 # Minimum assistant-text length proving a genuine Genie reply (not empty/error).
 _MIN_ASSISTANT_CHARS = 4
 
-# Genie cold-starts a conversation and may run a warehouse query; allow headroom.
-_RUN_TIMEOUT_SEC = 300
+# Outlast the executor's own per-turn deadline (900s) plus process startup, so a
+# slow warehouse query surfaces as the executor's actionable error rather than a
+# truncated subprocess.
+_RUN_TIMEOUT_SEC = 960
+
+# Substrings in a failed run that mean "the environment isn't ready", not "the
+# harness is broken" — the workspace preview toggle for Agent mode (Beta) is off,
+# or no Databricks credential could be minted. Neither is detectable up front.
+_UNAVAILABLE_MARKERS = (
+    "FEATURE_DISABLED",
+    "Agent-mode APIs are Beta",
+    "Databricks authentication failed",
+)
 
 
 def test_per_harness_databricks_genie_one_shot(
@@ -54,7 +72,8 @@ def test_per_harness_databricks_genie_one_shot(
     if importlib.util.find_spec("databricks.sdk") is None:
         pytest.skip(
             "databricks-genie prerequisite missing: the 'databricks-sdk' package is "
-            "not installed (install the 'databricks' extra)."
+            "not installed (install the 'databricks' extra), so no workspace "
+            "credential can be resolved for the Responses request."
         )
     space_id = os.environ.get("OMNIGENT_GENIE_SPACE_ID", "").strip()
     if not space_id:
@@ -93,6 +112,16 @@ def test_per_harness_databricks_genie_one_shot(
         text=True,
         timeout=_RUN_TIMEOUT_SEC,
     )
+
+    if result.returncode != 0:
+        combined = f"{result.stdout}\n{result.stderr}"
+        marker = next((m for m in _UNAVAILABLE_MARKERS if m in combined), None)
+        if marker is not None:
+            pytest.skip(
+                f"databricks-genie prerequisite missing: the run reported {marker!r}. "
+                "Enable the workspace preview for Genie Agent mode (Beta) and "
+                "authenticate via 'databricks auth login' to run this live gate."
+            )
 
     assistant_text = result.stdout.strip()
     assert result.returncode == 0, (
