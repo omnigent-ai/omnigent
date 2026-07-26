@@ -203,6 +203,9 @@ class WorkspaceReader:
             before=before,
             order=order,
         )
+        ignored = self._registry.ignored_paths([entry["path"] for entry in page.data])
+        for entry in page.data:
+            entry["ignored"] = entry["path"] in ignored
         return {
             "object": "list",
             "data": page.data,
@@ -366,6 +369,9 @@ class WorkspaceReader:
             if len(results) >= limit:
                 break
         results.sort(key=lambda e: e["path"])
+        ignored = self._registry.ignored_paths([entry["path"] for entry in results])
+        for entry in results:
+            entry["ignored"] = entry["path"] in ignored
         return {"object": "list", "data": results, "has_more": len(results) >= limit}
 
     # ── Changed files / diff ───────────────────────────────────────
