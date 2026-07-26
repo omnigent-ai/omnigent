@@ -157,40 +157,114 @@ def build_on_fire(
         dispatch = launch_dispatch
 
     async def on_fire(workspace_id: int, scheduled_task_id: str) -> None:
-        # Re-read the row: never trust the armed timer. A deleted or
-        # non-active row is a logged no-op done synchronously.
-        with workspace_scope(workspace_id):
-            task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
-            if task is None:
-                _logger.info(
-                    "scheduled fire: task %s no longer exists — skipping", scheduled_task_id
-                )
-                return
-            if task.state != "active":
-                _logger.info(
-                    "scheduled fire: task %s is %s (not active) — skipping",
-                    scheduled_task_id,
-                    task.state,
-                )
-                return
-
-        key = (workspace_id, scheduled_task_id)
-        if key in _IN_FLIGHT_TASKS:
-            _logger.info("scheduled fire: task %s already in flight — skipping", scheduled_task_id)
-            return
-        _IN_FLIGHT_TASKS.add(key)
-
-        # Fire-and-forget: the session create + launch runs in the background so
-        # on_fire returns immediately and the scheduler re-arms the timer now.
-        fire_task = asyncio.create_task(
-            _run_fire(deps, workspace_id, scheduled_task_id, dispatch, preflight),
-            name=f"scheduled-fire-{scheduled_task_id}",
+        await _trigger_fire(
+            deps,
+            workspace_id,
+            scheduled_task_id,
+            dispatch,
+            preflight,
+            require_active=True,
         )
-        _PENDING_FIRES.add(fire_task)
-        fire_task.add_done_callback(_PENDING_FIRES.discard)
-        fire_task.add_done_callback(lambda _task: _IN_FLIGHT_TASKS.discard(key))
 
     return on_fire
+
+
+def build_run_now(
+    deps: FireDeps,
+    *,
+    launch_dispatch: LaunchDispatch | None = None,
+) -> Callable[[int, str], Awaitable[bool]]:
+    """Build the manual "run now" trigger — an immediate fire of a task.
+
+    Reuses the exact scheduled-fire machinery (the same
+    :func:`_run_fire_for_task` body, dispatch/preflight seams, and the shared
+    ``_IN_FLIGHT_TASKS`` overlap guard) so a manual run cannot duplicate the fire
+    logic and cannot collide with a scheduled fire of the same task. It differs
+    from :func:`build_on_fire` in ONE way: a **paused** task is still runnable
+    (``require_active=False``), because run-now is an explicit manual override.
+    A deleted / missing row is still a no-op.
+
+    Fire-and-forget like the scheduler path: the session create + launch runs in
+    the background and the returned callback resolves as soon as the fire is
+    accepted. The caller (the ``POST /run`` route) therefore returns ``202
+    Accepted`` rather than the finished run.
+
+    :returns: ``async run_now(workspace_id, scheduled_task_id) -> bool`` that
+        returns ``True`` if a fire was started, ``False`` if it was skipped
+        (row gone, or a fire for that task is already in flight).
+    """
+    preflight: ConnectedHostPreflight | None = None
+    if launch_dispatch is None:
+        dispatch = _make_connected_host_dispatch(deps)
+        preflight = _make_connected_host_preflight(deps)
+    else:
+        dispatch = launch_dispatch
+
+    async def run_now(workspace_id: int, scheduled_task_id: str) -> bool:
+        return await _trigger_fire(
+            deps,
+            workspace_id,
+            scheduled_task_id,
+            dispatch,
+            preflight,
+            require_active=False,
+        )
+
+    return run_now
+
+
+async def _trigger_fire(
+    deps: FireDeps,
+    workspace_id: int,
+    scheduled_task_id: str,
+    dispatch: LaunchDispatch,
+    preflight: ConnectedHostPreflight | None,
+    *,
+    require_active: bool,
+) -> bool:
+    """Synchronously guard a fire, then dispatch the run in the background.
+
+    Shared by the scheduled fire path (``require_active=True``) and the manual
+    run-now trigger (``require_active=False``). The re-read + guard run
+    synchronously so an obviously dead fire costs nothing; the create/launch is
+    fire-and-forget so the caller (scheduler timer or ``POST /run`` route)
+    returns immediately.
+
+    :returns: ``True`` if a background fire was started, ``False`` if skipped
+        (row gone / not active when required / already in flight).
+    """
+    # Re-read the row: never trust the caller. A deleted (or, for the scheduled
+    # path, non-active) row is a logged no-op done synchronously.
+    with workspace_scope(workspace_id):
+        task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
+        if task is None:
+            _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
+            return False
+        if require_active and task.state != "active":
+            _logger.info(
+                "scheduled fire: task %s is %s (not active) — skipping",
+                scheduled_task_id,
+                task.state,
+            )
+            return False
+
+    key = (workspace_id, scheduled_task_id)
+    if key in _IN_FLIGHT_TASKS:
+        _logger.info("scheduled fire: task %s already in flight — skipping", scheduled_task_id)
+        return False
+    _IN_FLIGHT_TASKS.add(key)
+
+    # Fire-and-forget: the session create + launch runs in the background so the
+    # caller returns immediately (the scheduler re-arms the timer now; the route
+    # returns 202).
+    fire_task = asyncio.create_task(
+        _run_fire(deps, workspace_id, scheduled_task_id, dispatch, preflight, require_active),
+        name=f"scheduled-fire-{scheduled_task_id}",
+    )
+    _PENDING_FIRES.add(fire_task)
+    fire_task.add_done_callback(_PENDING_FIRES.discard)
+    fire_task.add_done_callback(lambda _task: _IN_FLIGHT_TASKS.discard(key))
+    return True
 
 
 async def _run_fire(
@@ -199,18 +273,20 @@ async def _run_fire(
     scheduled_task_id: str,
     dispatch: LaunchDispatch,
     preflight: ConnectedHostPreflight | None,
+    require_active: bool = True,
 ) -> None:
     """Background body of a firing: create session, grant, launch, record run.
 
     Wrapped so any failure is logged rather than propagated — a failed fire must
-    not crash the scheduler.
+    not crash the scheduler. ``require_active`` mirrors the synchronous guard:
+    the scheduled path requires an active row, run-now allows a paused row.
     """
     with workspace_scope(workspace_id):
         task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
         if task is None:
             _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
             return
-        if task.state != "active":
+        if require_active and task.state != "active":
             _logger.info(
                 "scheduled fire: task %s is %s (not active) — skipping",
                 scheduled_task_id,

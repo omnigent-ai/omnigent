@@ -1700,6 +1700,63 @@ async def test_credential_rewrite_swaps_bearer_and_token(
 
 
 @pytest.mark.asyncio
+async def test_credential_rewrite_swaps_via_refreshing_provider(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """A rule with a ``secret_provider`` resolves the live token per swap.
+
+    This is the Databricks-CLI shape: the real bearer expires, so the rule
+    carries a provider (not a static secret). The upstream must receive the
+    provider's current value, proving ``resolve_secret()`` is called on the
+    swap path (and thus long sessions pick up a refreshed token).
+    """
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}dbx123"
+    calls = {"n": 0}
+
+    def provider() -> str:
+        calls["n"] += 1
+        return f"live-token-{calls['n']}"
+
+    rule = CredentialRewriteRule(
+        host="127.0.0.1",
+        scheme="bearer",
+        synthetic=synthetic,
+        secret_provider=provider,
+    )
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+
+    proxy = EgressProxy(
+        parse_rules(["* 127.0.0.1/**"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        response = await _proxied_http_get(
+            proxy_port=proxy_port,
+            upstream_port=upstream_port,
+            authorization=f"Bearer {synthetic}",
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert b"200 OK" in response, f"Request did not complete: {response[:200]!r}"
+    assert len(captured) == 1
+    # The provider was invoked and its live token (not the synthetic)
+    # reached upstream.
+    assert calls["n"] == 1
+    assert captured[0].authorization == "Bearer live-token-1"
+    assert synthetic not in (captured[0].authorization or "")
+
+
+@pytest.mark.asyncio
 async def test_credential_rewrite_swaps_basic_password(
     ca_paths: tuple[Path, Path, Path],
 ) -> None:

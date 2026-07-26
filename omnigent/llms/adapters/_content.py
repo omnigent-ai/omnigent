@@ -1,13 +1,22 @@
-"""Shared helpers for translating multimodal content across adapters.
+"""Shared helpers for translating multimodal content.
 
 Provides data-URI parsing used by Anthropic, Gemini, and Bedrock
 adapters when converting Chat Completions ``image_url`` parts to
-their provider-native image formats.
+their provider-native image formats, plus recursive redaction for
+history paths that serialize inline attachments as text.
 """
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
+
+_INLINE_BASE64_DATA_URI = re.compile(
+    r"data:([^;,\s]*)(?:;[^;,\r\n]*)*;base64,[ \t]?([A-Za-z0-9+/=_-]+)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -50,3 +59,30 @@ def parse_data_uri(uri: str) -> DataUriParts | None:
     media_type = rest[:sep_idx]
     data = rest[sep_idx + len(separator) :]
     return DataUriParts(media_type=media_type, data=data)
+
+
+def redact_inline_data_uris(
+    value: Any,  # type: ignore[explicit-any]
+    marker: Callable[[str, int], str],
+) -> Any:  # type: ignore[explicit-any]
+    """Recursively replace inline base64 data URIs with compact markers.
+
+    Dict keys and all non-data-URI values are preserved. String values may
+    contain surrounding text; only matching ``data:*;base64,...`` spans are
+    replaced. Payload matching is intentionally single-line; embedded newlines
+    are not joined because doing so could consume adjacent prose.
+
+    :param value: Arbitrarily nested dict/list/string content.
+    :param marker: Builds replacement text from media type and payload length.
+    :returns: A copy with inline base64 payloads redacted.
+    """
+    if isinstance(value, str):
+        return _INLINE_BASE64_DATA_URI.sub(
+            lambda match: marker(match.group(1), len(match.group(2))),
+            value,
+        )
+    if isinstance(value, list):
+        return [redact_inline_data_uris(item, marker) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_inline_data_uris(item, marker) for key, item in value.items()}
+    return value

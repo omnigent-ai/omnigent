@@ -67,15 +67,6 @@ _REPL_TERMINAL_NAME = "tui"
 _REPL_TERMINAL_SESSION_KEY = "main"
 _NO_BODY_STATUS_CODES = {204, 304}
 
-_BACKGROUND_TITLE_HARNESS_ADAPTERS = {
-    "claude-sdk": "claude-sdk",
-    "claude-native": "claude-sdk",
-    "codex": "codex",
-}
-_BACKGROUND_TITLE_MAX_PROMPT_CHARS = 4_000
-_BACKGROUND_TITLE_MAX_OUTPUT_TOKENS = 32
-_BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS = 60.0
-
 
 def _publish_tmux_target_for_bridge(
     *,

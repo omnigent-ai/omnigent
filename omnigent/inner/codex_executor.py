@@ -688,7 +688,12 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
-def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
+def _populate_codex_home_config(
+    target_dir: Path,
+    source_dir: Path,
+    *,
+    minimal_config: bool | None = None,
+) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
 
@@ -713,15 +718,18 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
     :param source_dir: The primary ``CODEX_HOME`` directory
         (typically ``$CODEX_HOME`` or ``~/.codex``). Missing files are
         skipped.
+    :param minimal_config: Copy only auth and provider-routing config when
+        ``True``. ``None`` preserves the environment-controlled behavior.
     """
     if not source_dir.is_dir():
         return
 
-    minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
+    if minimal_config is None:
+        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
     symlink_files = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
