@@ -1489,8 +1489,9 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 def test_get_openai_client_profile_uses_callback_auth(monkeypatch):
     """Explicit ``profile`` uses httpx callback auth, not a static ``api_key``.
 
-    Verifies that when a Databricks profile is provided, the client
-    is constructed with an ``http_client`` carrying a
+    Verifies that a Unity Catalog model-service name does not override an
+    explicit Databricks profile. The client is constructed with an
+    ``http_client`` carrying a
     ``_DatabricksBearerAuth`` that refreshes tokens per-request,
     and that the ``api_key`` is a placeholder (not the real token).
 
@@ -1521,7 +1522,10 @@ def test_get_openai_client_profile_uses_callback_auth(monkeypatch):
     import openai as _openai_mod
 
     with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
-        _get_openai_async_client(profile="dev")
+        _get_openai_async_client(
+            profile="dev",
+            model="production.agents.support_assistant",
+        )
 
     assert captured["base_url"] == "https://profile-host.example.com/ai-gateway/openai/v1"
     assert captured["api_key"] != "should-not-be-used"
@@ -1723,6 +1727,20 @@ def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
     assert captured["base_url"] == "https://env-host.example.com/v1"
     assert captured["api_key"] == "env-key"
     assert "http_client" not in captured
+
+
+def test_get_openai_client_model_service_without_provider_fails_loudly(monkeypatch):
+    """A model-service name alone does not imply ambient Databricks routing.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="No provider credentials"):
+        _get_openai_async_client(model="production.agents.support_assistant")
 
 
 def test_get_openai_client_invalid_profile_raises_auth_error(monkeypatch):
