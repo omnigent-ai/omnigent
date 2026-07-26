@@ -8822,6 +8822,16 @@
               "title": "Pinned",
               "type": "boolean"
             }
+          },
+          {
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
