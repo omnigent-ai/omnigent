@@ -404,7 +404,7 @@ def create_worktree(
                 f"choose a different branch name"
             )
 
-    if base_branch is not None:
+    if base_branch is not None and not branch_exists:
         _ensure_base_resolvable(repo_root, base_branch)
     worktree_path = _resolve_worktree_path(repo_root, branch_name)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
