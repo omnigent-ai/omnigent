@@ -66,6 +66,22 @@ def test_get_params_schema_returns_schema() -> None:
     assert schema["properties"]["limit"]["type"] == "integer"
 
 
+def test_blast_radius_schema_exposes_risky_action() -> None:
+    """The UI can configure risky shell operations as ASK or DENY."""
+    load_registry()
+    schema = get_params_schema("omnigent.policies.builtins.orchestration.blast_radius")
+
+    assert schema is not None
+    assert schema["properties"]["risky_action"] == {
+        "type": "string",
+        "enum": ["ASK", "DENY"],
+        "description": (
+            "Verdict for ordinary git push and other recoverable high-blast-radius commands."
+        ),
+        "default": "ASK",
+    }
+
+
 def test_get_params_schema_none_for_direct_callable() -> None:
     """``get_params_schema`` returns ``None`` for a direct (non-factory) callable."""
     load_registry()
