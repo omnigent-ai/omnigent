@@ -40,6 +40,18 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY as _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+)
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_COLLABORATION_MODES as _CODEX_NATIVE_COLLABORATION_MODES,
+)
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_PERMISSION_PROFILE_IDS as _CODEX_NATIVE_PERMISSION_PROFILE_IDS,
+)
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY as _CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY,
+)
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -166,13 +178,10 @@ _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nicknam
 _CODEX_NATIVE_SUBAGENT_ROLE_LABEL_KEY = "omnigent.codex_native.agent_role"
 
 
-_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
-
-
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE: str = "external_codex_collaboration_mode_change"
 
 
-_CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"})
+_EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE: str = "external_codex_permission_profile_change"
 
 
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
@@ -365,6 +374,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    _EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE,
 }
 
 
@@ -687,6 +697,8 @@ __all__ = [
     "_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
     "_CODEX_NATIVE_HARNESS",
     "_CODEX_NATIVE_MODEL",
+    "_CODEX_NATIVE_PERMISSION_PROFILE_IDS",
+    "_CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK",
     "_CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY",
     "_CODEX_NATIVE_SUBAGENT_PARENT_THREAD_ID_LABEL_KEY",
@@ -706,6 +718,7 @@ __all__ = [
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
     "_EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE",
+    "_EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE",
     "_EXTERNAL_CODEX_SUBAGENT_START_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_TYPE",
     "_EXTERNAL_COMPACTION_STATUS_VALUES",

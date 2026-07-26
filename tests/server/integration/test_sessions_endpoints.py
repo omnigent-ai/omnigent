@@ -5992,6 +5992,45 @@ async def test_post_external_codex_collaboration_mode_change_rejects_unknown_mod
     assert "external_codex_collaboration_mode_change" in resp.text
 
 
+async def test_post_external_codex_permission_profile_change_persists_label(
+    client: httpx.AsyncClient,
+) -> None:
+    """Codex's in-terminal permissions pick survives in session metadata."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_permission_profile_change",
+            "data": {"permission_profile": ":danger-full-access"},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["labels"]["omnigent.codex_native.permission_profile"] == ":danger-full-access"
+
+
+async def test_post_external_codex_permission_profile_change_rejects_unknown_profile(
+    client: httpx.AsyncClient,
+) -> None:
+    """Unknown permission profiles cannot become resume directives."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_permission_profile_change",
+            "data": {"permission_profile": ":root-everything"},
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "external_codex_permission_profile_change" in resp.text
+
+
 def _model_change_notes(published: list[tuple[str, dict[str, Any]]]) -> list[str]:
     """
     Extract ``[System: ...]`` model-change note texts from published events.

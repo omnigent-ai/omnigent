@@ -38,6 +38,7 @@ from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
     _find_codex_cli,
+    _strip_approval_sandbox_flags,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
@@ -87,6 +88,12 @@ from omnigent.native_terminal import (
 )
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
+)
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+    CODEX_NATIVE_COLLABORATION_MODES,
+    CODEX_NATIVE_PERMISSION_PROFILE_IDS,
+    CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY,
 )
 
 _logger = logging.getLogger(__name__)
@@ -1011,6 +1018,8 @@ async def _prepare_codex_terminal(
     async with httpx.AsyncClient(base_url=base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
         thread_id: str | None = None
+        collaboration_mode: str | None = None
+        permission_profile: str | None = None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
@@ -1029,6 +1038,12 @@ async def _prepare_codex_terminal(
                     f"Conversation {session_id!r} is not a codex-native session."
                 )
             bridge_id = str(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
+            raw_collaboration_mode = labels.get(CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY)
+            if raw_collaboration_mode in CODEX_NATIVE_COLLABORATION_MODES:
+                collaboration_mode = raw_collaboration_mode
+            raw_permission_profile = labels.get(CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY)
+            if raw_permission_profile in CODEX_NATIVE_PERMISSION_PROFILE_IDS:
+                permission_profile = raw_permission_profile
             existing_terminal = await _find_running_codex_terminal(client, session_id)
             external_session_id = payload.get("external_session_id")
             thread_id = external_session_id if isinstance(external_session_id, str) else None
@@ -1118,7 +1133,12 @@ async def _prepare_codex_terminal(
                 )
                 await event_client.connect()
             else:
-                await preload_codex_thread_for_resume(codex_ws_url, thread_id)
+                await preload_codex_thread_for_resume(
+                    codex_ws_url,
+                    thread_id,
+                    collaboration_mode=collaboration_mode,
+                    permission_profile=permission_profile,
+                )
                 write_bridge_state(
                     bridge_dir,
                     CodexNativeBridgeState(
@@ -1134,7 +1154,11 @@ async def _prepare_codex_terminal(
             launched_terminal = await _launch_codex_terminal(
                 client,
                 session_id,
-                codex_args=codex_args,
+                codex_args=tuple(
+                    _strip_approval_sandbox_flags(codex_args)
+                    if permission_profile is not None
+                    else codex_args
+                ),
                 command=command,
                 thread_id=thread_id,
                 remote_url=codex_ws_url,

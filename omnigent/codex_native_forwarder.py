@@ -105,6 +105,7 @@ _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
 # when ``data.started`` is true) so the web UI paints a live reasoning block.
 _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE = "external_output_reasoning_delta"
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
+_EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE = "external_codex_permission_profile_change"
 # Per-attempt client budget for the elicitation long-poll, slightly above
 # the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
 # the server's own timeout (empty-body fail-ask) wins over a client cut.
@@ -333,6 +334,10 @@ class _CodexForwarderState:
     :param posted_collaboration_mode: Last collaboration mode kind already
         mirrored to Omnigent via
         ``external_codex_collaboration_mode_change``.
+    :param permission_profile: Latest named Codex permission profile, e.g.
+        ``":workspace"`` or ``":danger-full-access"``.
+    :param posted_permission_profile: Last permission profile already mirrored
+        to Omnigent.
     :param parent_session_id: Omnigent parent session id, e.g.
         ``"conv_parent"``. Set by ``supervise_forwarder`` so collab-agent
         helpers can register child sessions without extra parameter
@@ -385,6 +390,8 @@ class _CodexForwarderState:
     posted_effort_known: bool = False
     collaboration_mode: str | None = None
     posted_collaboration_mode: str | None = None
+    permission_profile: str | None = None
+    posted_permission_profile: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
@@ -427,6 +434,7 @@ class _CodexForwarderState:
         if not isinstance(result, dict):
             return
         self._note_model_fields(result)
+        self._note_permission_profile_fields(result)
         # Do NOT seed ``posted_model`` here. Omnigent must learn the session's
         # ACTUAL model — including the spawn default — because the cost-budget
         # gate resolves the model as ``conv.model_override or spec.llm.model``,
@@ -451,6 +459,7 @@ class _CodexForwarderState:
             self._note_model_fields(settings)
             self._note_effort_fields(settings)
             self._note_collaboration_mode_fields(settings)
+            self._note_permission_profile_fields(settings)
 
     def record_completed_plan(self, params: dict[str, Any]) -> None:
         """
@@ -811,6 +820,15 @@ class _CodexForwarderState:
         mode = raw_mode.get("mode")
         if isinstance(mode, str) and mode:
             self.collaboration_mode = mode
+
+    def _note_permission_profile_fields(self, payload: dict[str, Any]) -> None:
+        """Record the named profile selected in Codex's permissions picker."""
+        raw_profile = payload.get("activePermissionProfile")
+        if not isinstance(raw_profile, dict):
+            return
+        profile_id = raw_profile.get("id")
+        if isinstance(profile_id, str) and profile_id:
+            self.permission_profile = profile_id
 
 
 @dataclass(frozen=True)
@@ -2069,6 +2087,9 @@ async def _subscribe_until_ready(
             await _sync_model_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
+            await _sync_codex_permission_profile_change(
+                ap_client, session_id=session_id, forwarder_state=forwarder_state
+            )
         await _replay_resume_response(
             ap_client,
             session_id=session_id,
@@ -2769,6 +2790,27 @@ async def _sync_codex_collaboration_mode_change(
         forwarder_state.posted_collaboration_mode = mode
 
 
+async def _sync_codex_permission_profile_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Mirror Codex's active named permission profile to Omnigent."""
+    profile = forwarder_state.permission_profile
+    if not profile or profile == forwarder_state.posted_permission_profile:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type=_EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE,
+        data={"permission_profile": profile},
+    )
+    _log_failed_session_event_post(_EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE, response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_permission_profile = profile
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -2845,6 +2887,9 @@ async def _maybe_handle_turn_event(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
             await _sync_codex_collaboration_mode_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_codex_permission_profile_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
         return True

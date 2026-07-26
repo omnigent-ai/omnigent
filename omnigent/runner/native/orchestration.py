@@ -360,6 +360,10 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
+    :param permission_profile: Last profile selected in Codex's permissions
+        picker. Reapplied when an existing thread resumes.
+    :param collaboration_mode: Last Codex collaboration mode. Reapplied when
+        an existing thread resumes.
     """
 
     workspace: Path
@@ -371,6 +375,8 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
+    permission_profile: str | None
+    collaboration_mode: str | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -732,6 +738,10 @@ async def _codex_native_launch_config(
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+        CODEX_NATIVE_COLLABORATION_MODES,
+        CODEX_NATIVE_PERMISSION_PROFILE_IDS,
+        CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -744,6 +754,8 @@ async def _codex_native_launch_config(
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
     bypass_sandbox = False
+    permission_profile: str | None = None
+    collaboration_mode: str | None = None
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -754,6 +766,22 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        raw_collaboration_mode = labels.get(CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY)
+        if raw_collaboration_mode is not None:
+            if raw_collaboration_mode not in CODEX_NATIVE_COLLABORATION_MODES:
+                raise RuntimeError(
+                    f"Invalid Codex collaboration mode for session {session_id!r}: "
+                    f"{raw_collaboration_mode!r}."
+                )
+            collaboration_mode = raw_collaboration_mode
+        raw_permission_profile = labels.get(CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY)
+        if raw_permission_profile is not None:
+            if raw_permission_profile not in CODEX_NATIVE_PERMISSION_PROFILE_IDS:
+                raise RuntimeError(
+                    f"Invalid Codex permission profile for session {session_id!r}: "
+                    f"{raw_permission_profile!r}."
+                )
+            permission_profile = raw_permission_profile
     return _CodexNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -764,6 +792,8 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        permission_profile=permission_profile,
+        collaboration_mode=collaboration_mode,
     )
 
 
@@ -3335,6 +3365,7 @@ async def _auto_create_codex_terminal(
 
     from omnigent.codex_native_app_server import (
         CodexAppServerClient,
+        _strip_approval_sandbox_flags,
         build_codex_native_server,
         build_codex_remote_args,
         codex_session_meta_model_provider,
@@ -3618,7 +3649,12 @@ async def _auto_create_codex_terminal(
     else:
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
-        await preload_codex_thread_for_resume(codex_ws_url, launch_config.external_session_id)
+        await preload_codex_thread_for_resume(
+            codex_ws_url,
+            launch_config.external_session_id,
+            collaboration_mode=launch_config.collaboration_mode,
+            permission_profile=launch_config.permission_profile,
+        )
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
@@ -3660,10 +3696,18 @@ async def _auto_create_codex_terminal(
                 # pass the persisted external_session_id so the runner-owned
                 # TUI reopens the existing app-server thread.
                 args=build_codex_remote_args(
-                    codex_args=tuple(launch_config.terminal_launch_args or ()),
+                    codex_args=tuple(
+                        _strip_approval_sandbox_flags(
+                            tuple(launch_config.terminal_launch_args or ())
+                        )
+                        if launch_config.permission_profile is not None
+                        else (launch_config.terminal_launch_args or ())
+                    ),
                     thread_id=launch_config.external_session_id,
                     remote_url=codex_ws_url,
-                    bypass_sandbox=launch_config.bypass_sandbox,
+                    bypass_sandbox=(
+                        launch_config.bypass_sandbox and launch_config.permission_profile is None
+                    ),
                     # The --remote TUI loads its own config and does not
                     # inherit the app-server's -c flags; pass the same
                     # provider/model overrides so it resolves the

@@ -2131,6 +2131,37 @@ async def _persist_external_codex_collaboration_mode_change(
     _publish_collaboration_mode(session_id, mode)
 
 
+async def _persist_external_codex_permission_profile_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Persist the named profile selected in Codex's permissions picker."""
+    raw_profile = body.data.get("permission_profile")
+    if not isinstance(raw_profile, str) or not raw_profile.strip():
+        raise OmnigentError(
+            "external_codex_permission_profile_change requires "
+            "data.permission_profile to be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    profile = raw_profile.strip()
+    if profile not in _CODEX_NATIVE_PERMISSION_PROFILE_IDS:
+        raise OmnigentError(
+            "external_codex_permission_profile_change requires "
+            f"data.permission_profile in {sorted(_CODEX_NATIVE_PERMISSION_PROFILE_IDS)}; "
+            f"got {profile!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if conv.labels.get(_CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY) == profile:
+        return
+    await asyncio.to_thread(
+        conversation_store.set_labels,
+        session_id,
+        {_CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY: profile},
+    )
+
+
 def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
@@ -8463,6 +8494,7 @@ __all__ = [
     "_permission_level_from_grants",
     "_persist_external_assistant_message",
     "_persist_external_codex_collaboration_mode_change",
+    "_persist_external_codex_permission_profile_change",
     "_persist_external_model_change",
     "_persist_external_model_options",
     "_persist_external_reasoning_effort_change",

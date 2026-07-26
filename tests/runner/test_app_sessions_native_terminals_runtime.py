@@ -402,9 +402,17 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                     "terminal_launch_args": [
                         "--config",
                         "approval_policy=on-request",
+                        "--sandbox",
+                        "danger-full-access",
+                        "--ask-for-approval",
+                        "never",
                     ],
                     "model_override": "gpt-5.4-mini",
                     "external_session_id": thread_id,
+                    "labels": {
+                        "omnigent.codex_native.collaboration_mode": "plan",
+                        "omnigent.codex_native.permission_profile": ":read-only",
+                    },
                 },
                 request=httpx.Request("GET", url),
             )
@@ -516,9 +524,15 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
-    preload_calls: list[tuple[str, str]] = []
+    preload_calls: list[tuple[str, str, str | None, str | None]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        collaboration_mode: str | None = None,
+        permission_profile: str | None = None,
+    ) -> None:
         """
         Record preloading of the known Codex thread.
 
@@ -530,7 +544,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "stale bridge state must be cleared until the new app-server has "
             "loaded the resume thread"
         )
-        preload_calls.append((transport, loaded_thread_id))
+        preload_calls.append((transport, loaded_thread_id, collaboration_mode, permission_profile))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """
@@ -591,12 +605,14 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.args[3] == "--remote"
     assert launched.args[4].startswith("ws://127.0.0.1:")
     assert launched.args[5] == thread_id
+    assert "--sandbox" not in launched.args
+    assert "--ask-for-approval" not in launched.args
     assert launched.env["OPENAI_API_KEY"] == "sk-test"
     assert "IGNORED" not in launched.env
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
-    assert preload_calls == [(app_server.listen_url, thread_id)]
+    assert preload_calls == [(app_server.listen_url, thread_id, "plan", ":read-only")]
     assert published_events[0]["type"] == "session.resource.created"
     assert forward_calls == [
         {
@@ -805,7 +821,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(transport: str, loaded_thread_id: str, **_: Any) -> None:
         """
         Record preloading of the cloned Codex thread.
 
@@ -1069,7 +1085,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
     forward_calls: list[dict[str, Any]] = []
     preload_calls: list[tuple[str, str]] = []
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(transport: str, loaded_thread_id: str, **_: Any) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         preload_calls.append((transport, loaded_thread_id))
 
