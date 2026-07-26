@@ -63,6 +63,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkCompleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
@@ -84,6 +85,13 @@ vi.mock("@/hooks/useConversations", () => ({
         : ids.filter((x) => x !== id);
     },
   }),
+  useCompletedConversations: () => ({
+    data: conversationsRef.current.filter((conversation) =>
+      Boolean(conversation.labels?.["omnigent.completed"]),
+    ),
+    isSuccess: true,
+  }),
+  useToggleCompletedConversation: () => ({ mutate: vi.fn() }),
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => ({ mutate: vi.fn() }),
@@ -128,6 +136,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
   fetchProjectSessionIds: fetchProjectSessionIdsMock,
   PROJECT_LABEL_KEY: "omni_project",
+  COMPLETED_LABEL_KEY: "omnigent.completed",
 }));
 // Header / dialog children that pull their own context — stub to keep the
 // test scoped to the conversation list + funnel.
@@ -675,6 +684,33 @@ describe("Sidebar sections", () => {
     showSharedTab();
     expect(screen.getByText("No sessions shared with you")).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
+  });
+
+  it("moves completed sessions into their own group ahead of pins and projects", () => {
+    projectsMock.push("Customer X");
+    seedPins(["conv_done"]);
+    mockConversations([
+      conv("conv_done", "Claude Code", {
+        labels: {
+          omni_project: "Customer X",
+          "omnigent.completed": "1700000000000",
+        },
+      }),
+      conv("conv_active", "Claude Code"),
+    ]);
+    renderSidebar();
+
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(
+      within(screen.getByText("Sessions").closest("section")!).getByText("conv_active"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("conv_done")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Completed" }));
+
+    expect(
+      within(screen.getByText("Completed").closest("section")!).getByText("conv_done"),
+    ).toBeInTheDocument();
   });
 });
 
@@ -1277,18 +1313,28 @@ describe("Sidebar collapsed project marker", () => {
   });
 });
 
-// Every section is expanded by default, but a collapse the user makes
-// persists across reloads.
+// Completed starts tucked away; the everyday sections start expanded. A
+// collapse the user makes persists across reloads.
 describe("Sidebar default section collapse", () => {
-  it("expands Pinned and Sessions by default when there is no stored preference", () => {
+  it("expands Pinned and Sessions but collapses Completed by default", () => {
     seedPins(["conv_pin"]);
-    mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
+    mockConversations([
+      conv("conv_pin", "Claude Code"),
+      conv("conv_recent", "Claude Code"),
+      conv("conv_done", "Claude Code", {
+        labels: { "omnigent.completed": "1700000000000" },
+      }),
+    ]);
     renderSidebar();
 
     expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: /Sessions/ })).toHaveAttribute(
       "aria-expanded",
       "true",
+    );
+    expect(screen.getByRole("button", { name: /Completed/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
     );
   });
 

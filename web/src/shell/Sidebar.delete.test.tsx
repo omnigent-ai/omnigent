@@ -30,6 +30,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useStopAndDeleteConversation: () => mocks.del,
   usePinnedConversations: () => ({ data: [], isSuccess: true }),
   useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
+  useCompletedConversations: () => ({ data: [], isSuccess: true }),
+  useToggleCompletedConversation: () => ({ mutate: vi.fn() }),
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   // Rename/archive are wired on the row but not exercised here; minimal
@@ -37,6 +39,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkCompleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
@@ -47,6 +50,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
+  COMPLETED_LABEL_KEY: "omnigent.completed",
 }));
 
 // Heavy sibling widgets in the sidebar pull their own hooks/providers;

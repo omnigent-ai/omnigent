@@ -87,6 +87,7 @@ from omnigent.session_lifecycle import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
+from omnigent.stores.conversation_store import completed_label_key
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.telemetry import emit as _tel_emit
@@ -417,6 +418,15 @@ def register_events_routes(
             # persist or relay to the harness (which rejects
             # ``function_call`` as an unknown inbound event type).
             return {"verdict": "allow"}
+
+        if body.type == "message" and body.data.get("role") == "user":
+            completion_key = completed_label_key(user_id)
+            if completion_key in conv.labels:
+                await asyncio.to_thread(
+                    conversation_store.delete_label,
+                    session_id,
+                    completion_key,
+                )
 
         if body.type == _INTERRUPT_TYPE:
             _publish_interrupted(session_id)

@@ -50,6 +50,7 @@ const mocks = vi.hoisted(() => {
     // mobile in-place project view test can assert both the list and the pick.
     projects: [] as string[],
     moveToProject: { mutate: vi.fn() },
+    complete: { mutate: vi.fn() },
     conversations: [] as unknown[],
     pinnedStore,
   };
@@ -86,11 +87,14 @@ vi.mock("@/hooks/useConversations", () => ({
     mutate: ({ id, pinned }: { id: string; pinned: boolean }) =>
       mocks.pinnedStore.toggle(id, pinned),
   }),
+  useCompletedConversations: () => ({ data: [], isSuccess: true }),
+  useToggleCompletedConversation: () => mocks.complete,
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
   useRenameConversation: () => mocks.rename,
   useArchiveConversation: () => ({ mutate: vi.fn() }),
   useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useBulkCompleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
@@ -113,6 +117,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
+  COMPLETED_LABEL_KEY: "omnigent.completed",
 }));
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this
@@ -219,6 +224,7 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
 beforeEach(() => {
   mocks.rename.mutate.mockReset();
   mocks.moveToProject.mutate.mockReset();
+  mocks.complete.mutate.mockReset();
   mocks.projects = [];
   // Default every test to the desktop viewport; the mobile flyout test opts in.
   mocks.isMobile = false;
@@ -233,6 +239,54 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe("completed session actions", () => {
+  it("marks an idle session complete from the row menu", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    const item = screen.getByTestId("complete-conversation");
+    expect(item).toHaveTextContent("Mark as completed");
+
+    fireEvent.click(item);
+
+    expect(mocks.complete.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      completed: true,
+    });
+  });
+
+  it("offers Mark active for a session in the Completed group", () => {
+    mockConversations([
+      {
+        ...CONV,
+        labels: { "omnigent.completed": "1700000000000" },
+      },
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByText("Completed"));
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    const item = screen.getByTestId("complete-conversation");
+    expect(item).toHaveTextContent("Mark active");
+
+    fireEvent.click(item);
+
+    expect(mocks.complete.mutate).toHaveBeenCalledWith({
+      id: "conv_1",
+      completed: false,
+    });
+  });
+
+  it("disables completion while a session is running", () => {
+    mockConversations([{ ...CONV, status: "running" }]);
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+
+    expect(screen.getByTestId("complete-conversation")).toHaveAttribute("data-disabled");
+  });
+});
 
 describe("quick pin/unpin hover button", () => {
   it("keeps the row full-width and the trailing controls inset from the right edge", () => {

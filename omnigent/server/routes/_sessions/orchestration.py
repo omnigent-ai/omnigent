@@ -157,8 +157,10 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    COMPLETED_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
+    completed_label_key,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -452,32 +454,20 @@ async def _best_effort_stop(
 
 
 def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str, str]:
-    """
-    Collapse per-user pin keys to the canonical pin label for one viewer.
-
-    Pins are stored per-user as ``omnigent.pinned.<user>`` (see
-    :func:`pinned_label_key`). On the wire we present a single canonical
-    ``omnigent.pinned`` key — set iff THIS viewer pinned the session — and drop
-    every ``omnigent.pinned.*`` key. That keeps the per-user dimension server-
-    side (a viewer never sees who else pinned a shared session, and the client
-    reads the same bare key it writes) and stops other users' pin keys from
-    bloating the payload.
-
-    :param labels: The stored conversation labels.
-    :param user_id: The requesting viewer, or ``None`` in single-user mode.
-    :returns: A copy with all ``omnigent.pinned.*`` keys removed and the
-        canonical ``omnigent.pinned`` key added when the viewer's own pin
-        is present.
-    """
-    my_key = pinned_label_key(user_id)
-    my_pin = labels.get(my_key)
+    """Expose only this viewer's canonical pin and completion labels."""
+    personal = (
+        (PINNED_LABEL_KEY, pinned_label_key(user_id)),
+        (COMPLETED_LABEL_KEY, completed_label_key(user_id)),
+    )
     cleaned = {
         k: v
         for k, v in labels.items()
-        if k != PINNED_LABEL_KEY and not k.startswith(f"{PINNED_LABEL_KEY}.")
+        if all(k != canonical and not k.startswith(f"{canonical}.") for canonical, _ in personal)
     }
-    if my_pin is not None:
-        cleaned[PINNED_LABEL_KEY] = my_pin
+    for canonical, stored in personal:
+        value = labels.get(stored)
+        if value is not None:
+            cleaned[canonical] = value
     return cleaned
 
 

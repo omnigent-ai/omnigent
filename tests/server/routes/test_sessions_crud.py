@@ -464,3 +464,62 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+# ── Completed session label (omnigent.completed) ────────────────────
+
+
+async def test_patch_and_list_completed_sessions(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Completion is a reversible, per-user label exposed canonically."""
+    from omnigent.stores.conversation_store import completed_label_key
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    user_key = completed_label_key(None)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.completed": "1721760000000"}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["labels"]["omnigent.completed"] == "1721760000000"
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels[user_key] == "1721760000000"
+    assert "omnigent.completed" not in conv.labels
+
+    listed = await client.get("/v1/sessions?completed=true")
+    assert listed.status_code == 200
+    assert [session["id"] for session in listed.json()["data"]] == [session_id]
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.completed": ""}},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert user_key not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_per_user_completed_key(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Clients cannot change another user's private completion state."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    key = "omnigent.completed.bob@example.com"
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {key: "1721760000000"}},
+    )
+
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert key not in conv.labels

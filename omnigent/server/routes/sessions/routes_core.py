@@ -124,9 +124,11 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    COMPLETED_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
+    completed_label_key,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -757,6 +759,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        completed: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -804,6 +807,8 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
+        :param completed: When ``True``, return only sessions this user
+            marked complete.
         :returns: A :class:`PaginatedList` of
             :class:`SessionListItem`.
         """
@@ -850,6 +855,8 @@ def register_core_routes(
             pinned=pinned,
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
+            completed=completed,
+            completed_owner=user_id,
         )
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
@@ -1448,10 +1455,12 @@ def register_core_routes(
         # Owner implies edit, so a single check at the resolved level gates all
         # three with no redundant second permission-store read.
         set_project = "project_id" in body.model_fields_set
-        pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
-            PINNED_LABEL_KEY
-        }
-        if pin_only:
+        personal_label_only = (
+            body.model_fields_set == {"labels"}
+            and bool(body.labels)
+            and set(body.labels or {}) <= {PINNED_LABEL_KEY, COMPLETED_LABEL_KEY}
+        )
+        if personal_label_only:
             required_level = LEVEL_READ
         elif body.archived is not None or set_project:
             required_level = LEVEL_OWNER
@@ -1521,12 +1530,13 @@ def register_core_routes(
                 )
             requested_codex_collaboration_mode = body.collaboration_mode
         labels_to_set = dict(body.labels or {})
-        # Pins are per-user. The client writes the canonical ``omnigent.pinned``
-        # key; rewrite it to the caller's per-user key so one user's pin doesn't
-        # pin the session for everyone with access. Empty value (unpin) carries
-        # through to the delete-clear loop below under the per-user key.
+        # Personal sidebar labels use canonical client keys and per-user
+        # storage keys so collaborators can organize the same session
+        # independently.
         if PINNED_LABEL_KEY in labels_to_set:
             labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
+        if COMPLETED_LABEL_KEY in labels_to_set:
+            labels_to_set[completed_label_key(user_id)] = labels_to_set.pop(COMPLETED_LABEL_KEY)
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
                 requested_codex_collaboration_mode
@@ -1754,14 +1764,13 @@ def register_core_routes(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        # Some labels are cleared by DELETE, not by upserting an empty value:
-        # the project membership (empty = "remove from project") and the pinned
-        # flag (empty = "unpin"). Split any empty-valued clear keys out before
-        # the bulk upsert so other labels are unaffected. Labels are upsert-only,
-        # so without this an empty string would linger as a stored value.
-        # The pinned key was rewritten to the caller's per-user key above, so
-        # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        # Project and personal labels use an empty value as a delete request.
+        # Split them out before the bulk upsert so no empty label row lingers.
+        for _clear_key in (
+            PROJECT_LABEL_KEY,
+            pinned_label_key(user_id),
+            completed_label_key(user_id),
+        ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)

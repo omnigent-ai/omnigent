@@ -104,40 +104,29 @@ PROJECT_LABEL_KEY = "omni_project"
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
-# Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
-# reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
-_PINNED_LABEL_LOCAL_USER = "local"
+# Personal completion marker used by the sidebar's Completed group. The value
+# is the epoch-ms completion time; the API exposes only the caller's marker.
+COMPLETED_LABEL_KEY = "omnigent.completed"
 
-# ``conversation_labels.key`` is ``String(128)``. The prefix ``omnigent.pinned.``
-# is 16 chars, so a raw ``user_id`` suffix must stay ≤ 112 chars to fit. User ids
-# are ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
-# could overflow the key column — Postgres errors, MySQL silently truncates (and
-# two long ids could then collide on the truncated key). To stay safe while
-# keeping the common case (emails) human-readable in the DB, ids that don't fit
-# are replaced with a fixed-width hash suffix.
-_PINNED_LABEL_MAX_SUFFIX_LEN = 128 - len(PINNED_LABEL_KEY) - 1  # minus the "." joiner
+_PERSONAL_LABEL_LOCAL_USER = "local"
+
+
+def _personal_label_key(prefix: str, user_id: str | None) -> str:
+    """Build a per-user label key that fits the 128-character DB column."""
+    suffix = user_id if user_id is not None else _PERSONAL_LABEL_LOCAL_USER
+    if len(suffix) > 128 - len(prefix) - 1:
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return f"{prefix}.{suffix}"
 
 
 def pinned_label_key(user_id: str | None) -> str:
-    """
-    The per-user pinned-label key for ``user_id``.
+    """Return the stored per-user pin key for ``user_id``."""
+    return _personal_label_key(PINNED_LABEL_KEY, user_id)
 
-    Deterministic in ``user_id`` (the write path and the ``pinned=True`` filter
-    derive the key the same way, so they always match). Normal ids are used
-    verbatim for DB readability; an id too long to fit the ``String(128)`` key
-    column is replaced with a fixed-width ``sha256`` suffix so it can never
-    overflow or collide via silent truncation.
 
-    :param user_id: Authenticated user id, e.g. ``"alice@example.com"``, or
-        ``None`` in single-user / no-auth mode (→ the ``local`` sentinel).
-    :returns: ``"omnigent.pinned.<suffix>"`` (suffix = the id, or its hash when
-        the id is too long).
-    """
-    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
-    if len(suffix) > _PINNED_LABEL_MAX_SUFFIX_LEN:
-        # 64 hex chars — well within the budget and collision-safe.
-        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
-    return f"{PINNED_LABEL_KEY}.{suffix}"
+def completed_label_key(user_id: str | None) -> str:
+    """Return the stored per-user completion key for ``user_id``."""
+    return _personal_label_key(COMPLETED_LABEL_KEY, user_id)
 
 
 # Labels that must NOT cross into a new session context — deliberately
@@ -612,6 +601,8 @@ class ConversationStore(ABC):
         project: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
+        completed: bool = False,
+        completed_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -718,6 +709,9 @@ class ConversationStore(ABC):
         :param pinned_owner: The user whose pins ``pinned=True`` filters to
             (their per-user key). ``None`` → the single-user ``local`` sentinel.
             Ignored unless ``pinned`` is ``True``.
+        :param completed: When ``True``, return only sessions the caller marked
+            complete.
+        :param completed_owner: The user whose completion marker to filter by.
         :param title: When set, only return conversations whose
             ``title`` matches exactly. ``None`` disables the filter.
             Powers the ``(agent, title)`` child-session lookup in

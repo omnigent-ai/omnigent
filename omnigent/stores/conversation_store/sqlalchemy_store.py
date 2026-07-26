@@ -79,6 +79,7 @@ from omnigent.session_import.models import (
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
+    COMPLETED_LABEL_KEY,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -90,6 +91,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     SessionConnectivity,
+    completed_label_key,
     pinned_label_key,
 )
 
@@ -2133,6 +2135,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         project: str | None = None,
         pinned: bool = False,
         pinned_owner: str | None = None,
+        completed: bool = False,
+        completed_owner: str | None = None,
         title: str | None = None,
     ) -> PagedList[Conversation]:
         """
@@ -2193,6 +2197,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             loaded pagination window.
         :param pinned_owner: The user whose pins ``pinned=True`` filters to.
             ``None`` → the single-user ``local`` sentinel.
+        :param completed: When ``True``, restrict to sessions marked complete
+            by ``completed_owner``.
+        :param completed_owner: The user whose completion marker to filter by.
         :param owned_by: When set, restrict to sessions the user owns
             (an ``owner``-level grant) — stricter than ``accessible_by``,
             which also matches sessions merely shared with them. Powers
@@ -2408,6 +2415,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                         select(SqlConversationLabel.conversation_id).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
                             SqlConversationLabel.key == pinned_label_key(pinned_owner),
+                        )
+                    )
+                )
+            if completed:
+                stmt = stmt.where(
+                    SqlConversation.id.in_(
+                        select(SqlConversationLabel.conversation_id).where(
+                            SqlConversationLabel.workspace_id == current_workspace_id(),
+                            SqlConversationLabel.key == completed_label_key(completed_owner),
                         )
                     )
                 )
@@ -3539,16 +3555,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             # message instead of dropping it. Forks of chat-only sources
             # (no workspace) get no such label and resume in-process like
             # a brand-new chat session.
-            # Per-user pin keys (``omnigent.pinned.<user>``) are dynamic-suffix,
-            # so they're never in the exact-match drop sets — drop them by prefix
-            # instead. A fork is a NEW conversation; inheriting the source's pins
-            # would show the clone as pinned for the forker AND carry every other
-            # user's pin key along as dead data.
+            # Per-user sidebar labels belong to the source, not the new fork.
             fork_labels = {
                 key: value
                 for key, value in _fetch_labels(session, source_conversation_id).items()
                 if key not in (_INSTANCE_SCOPED_LABEL_KEYS | _FORK_ONLY_DROPPED_LABEL_KEYS)
                 and not key.startswith(f"{PINNED_LABEL_KEY}.")
+                and not key.startswith(f"{COMPLETED_LABEL_KEY}.")
             }
             source_workspace = source_meta_ref.workspace if source_meta_ref else None
             source_ext_session = source_meta_ref.external_session_id if source_meta_ref else None

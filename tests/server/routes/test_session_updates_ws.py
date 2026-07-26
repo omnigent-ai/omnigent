@@ -582,16 +582,11 @@ def test_session_added_for_inaccessible_session_is_not_pushed(
             )
 
 
-def test_pin_label_collapses_to_canonical_key_on_the_wire(
+def test_personal_labels_collapse_to_canonical_keys_on_the_wire(
     app: FastAPI, stores, fast_rescan: None
 ) -> None:
-    """Pins are stored per-user (``omnigent.pinned.<user>``), but the watch
-    stream collapses the caller's own pin key to the canonical
-    ``omnigent.pinned`` and never emits another user's per-user key. Exercised
-    via the normal rescan-diff path: pinning a watched session out of band
-    surfaces on the next ``changed`` frame (``fast_rescan`` shrinks the tick).
-    """
-    from omnigent.stores.conversation_store import pinned_label_key
+    """The watch stream exposes only the caller's canonical personal labels."""
+    from omnigent.stores.conversation_store import completed_label_key, pinned_label_key
 
     conversation_store, _agent_store, _permission_store = stores
     s1 = _seed_session(stores, owner=ALICE, title="watched")
@@ -607,6 +602,8 @@ def test_pin_label_collapses_to_canonical_key_on_the_wire(
             {
                 pinned_label_key(ALICE): "1721760000000",
                 pinned_label_key(BOB): "1700000000000",
+                completed_label_key(ALICE): "1721760002000",
+                completed_label_key(BOB): "1700000002000",
             },
         )
         changed = _recv_until(ws, {"changed"})
@@ -615,9 +612,12 @@ def test_pin_label_collapses_to_canonical_key_on_the_wire(
         labels = items[s1]["labels"]
         # Alice's pin surfaces as the canonical bare key…
         assert labels.get("omnigent.pinned") == "1721760000000"
+        assert labels.get("omnigent.completed") == "1721760002000"
         # …and neither per-user key (hers or Bob's) leaks onto the wire.
         assert pinned_label_key(ALICE) not in labels
         assert pinned_label_key(BOB) not in labels
+        assert completed_label_key(ALICE) not in labels
+        assert completed_label_key(BOB) not in labels
 
 
 # ── comments fingerprint ──────────────────────────────────────────────

@@ -178,6 +178,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    COMPLETED_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -7350,22 +7351,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
-    # Pins are per-user: the client may only write the bare canonical
-    # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
-    # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting
-    # one from a client would let a caller pin/unpin a shared session for
-    # another user, or forge arbitrary per-user pin rows, defeating the per-user
-    # isolation. Reject any suffixed form; only the bare key is client-writable.
-    suffixed_pin = next(
-        (k for k in labels if k.startswith(f"{PINNED_LABEL_KEY}.")),
-        None,
-    )
-    if suffixed_pin is not None:
-        raise OmnigentError(
-            f"label {suffixed_pin!r} is server-derived; set the bare "
-            f"{PINNED_LABEL_KEY!r} key to pin for yourself",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    for canonical in (PINNED_LABEL_KEY, COMPLETED_LABEL_KEY):
+        suffixed = next((k for k in labels if k.startswith(f"{canonical}.")), None)
+        if suffixed is not None:
+            raise OmnigentError(
+                f"label {suffixed!r} is server-derived; set the bare "
+                f"{canonical!r} key for yourself",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
 
 def _require_cost_control_label_authority(
@@ -7769,11 +7762,14 @@ def _child_session_summary_from_conversation(
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
-    # Child sessions aren't pinnable (the pin affordance lives on top-level
-    # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
-    # defensively so a shared child's summary can never expose another viewer's
-    # pin key. No collapse-to-canonical here: there's no pin to surface.
-    raw_labels = {k: v for k, v in conv.labels.items() if not k.startswith(f"{PINNED_LABEL_KEY}.")}
+    raw_labels = {
+        k: v
+        for k, v in conv.labels.items()
+        if all(
+            k != canonical and not k.startswith(f"{canonical}.")
+            for canonical in (PINNED_LABEL_KEY, COMPLETED_LABEL_KEY)
+        )
+    }
     labels = labels_with_closed_status(raw_labels, conv.title)
     tool: str | None
     session_name: str | None
