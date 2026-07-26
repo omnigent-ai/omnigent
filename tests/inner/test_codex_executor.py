@@ -1538,11 +1538,14 @@ class TestCodexExecutor(unittest.TestCase):
 
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], TurnComplete)
+            self.assertEqual(events[0].response, "")
             self.assertIsNone(events[0].usage)
 
         _run(_t())
 
-    def test_app_server_run_turn_drains_final_answer_after_turn_completed(self):
+    def test_app_server_run_turn_drains_final_answer_after_turn_completed_with_buffered_delta(
+        self,
+    ):
         async def _t():
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
@@ -1557,6 +1560,16 @@ class TestCodexExecutor(unittest.TestCase):
 
             async def _inject_trailing_final_answer() -> None:
                 await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "turnId": "turn-1",
+                            "itemId": "msg-progress",
+                            "delta": "working...",
+                        },
+                    }
+                )
                 session._events.put_nowait(
                     {
                         "method": "turn/completed",
@@ -1595,13 +1608,15 @@ class TestCodexExecutor(unittest.TestCase):
             ]
             await inject_task
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], TurnComplete)
-            self.assertEqual(events[0].response, "done")
+            self.assertEqual(len(events), 2, events)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertEqual(events[0].text, "working...")
+            self.assertIsInstance(events[1], TurnComplete)
+            self.assertEqual(events[1].response, "done")
 
         _run(_t())
 
-    def test_app_server_run_turn_uses_buffered_delta_when_completed_item_is_missing(self):
+    def test_app_server_run_turn_rejects_buffered_delta_without_terminal_item(self):
         async def _t():
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
@@ -1614,40 +1629,48 @@ class TestCodexExecutor(unittest.TestCase):
             session.thread_id = "thread-1"
             session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
 
-            await session._events.put(
-                {
-                    "method": "item/agentMessage/delta",
-                    "params": {
-                        "turnId": "turn-1",
-                        "itemId": "msg-1",
-                        "delta": "done",
-                    },
-                }
-            )
-            await session._events.put(
-                {
-                    "method": "turn/completed",
-                    "params": {
-                        "turn": {"id": "turn-1"},
-                    },
-                }
-            )
-
-            events = [
-                event
-                async for event in session.run_turn(
-                    messages=[{"role": "user", "content": "hi"}],
-                    tools=[],
-                    system_prompt="",
-                    model="gpt-5.4-mini",
-                    cwd=".",
-                    sandbox="workspace-write",
+            async def _inject_completed_without_final_answer() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "turnId": "turn-1",
+                            "itemId": "msg-1",
+                            "delta": "done",
+                        },
+                    }
                 )
-            ]
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "turn": {"id": "turn-1"},
+                        },
+                    }
+                )
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], TurnComplete)
-            self.assertEqual(events[0].response, "done")
+            inject_task = asyncio.create_task(_inject_completed_without_final_answer())
+            with patch("omnigent.inner.codex_executor._TURN_COMPLETED_DRAIN_SECONDS", 0.001):
+                events = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[],
+                        system_prompt="",
+                        model="gpt-5.4-mini",
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
+            await inject_task
+
+            self.assertEqual(len(events), 2, events)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertEqual(events[0].text, "done")
+            self.assertIsInstance(events[1], ExecutorError)
+            self.assertFalse(events[1].retryable)
+            self.assertIn("terminal final-answer", events[1].message)
 
         _run(_t())
 
