@@ -37,6 +37,12 @@ from omnigent.server.schemas import (
     ServerStreamEvent,
     SkillSummary,
 )
+from omnigent.session_lifecycle import (
+    LAST_CONTEXT_AT_LABEL_KEY,
+    LAST_CONTEXT_TOKENS_LABEL_KEY,
+    LAST_CONTEXT_WINDOW_LABEL_KEY,
+    LAST_TURN_AT_LABEL_KEY,
+)
 from omnigent.spec.types import (
     StateUpdate,
 )
@@ -178,10 +184,16 @@ _CODEX_NATIVE_COLLABORATION_MODES: frozenset[str] = frozenset({"default", "plan"
 _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 
 
-_LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
+_LAST_CONTEXT_TOKENS_LABEL_KEY: str = LAST_CONTEXT_TOKENS_LABEL_KEY
 
 
-_LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
+_LAST_CONTEXT_WINDOW_LABEL_KEY: str = LAST_CONTEXT_WINDOW_LABEL_KEY
+
+
+_LAST_CONTEXT_AT_LABEL_KEY: str = LAST_CONTEXT_AT_LABEL_KEY
+
+
+_LAST_TURN_AT_LABEL_KEY: str = LAST_TURN_AT_LABEL_KEY
 
 
 _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
@@ -740,10 +752,12 @@ __all__ = [
     "_INTERRUPT_TYPE",
     "_KIRO_NATIVE_WRAPPER_LABEL_VALUE",
     "_LABEL_VALUE_MAX_LEN",
+    "_LAST_CONTEXT_AT_LABEL_KEY",
     "_LAST_CONTEXT_TOKENS_LABEL_KEY",
     "_LAST_CONTEXT_WINDOW_LABEL_KEY",
     "_LAST_TASK_ERROR_CODE_LABEL_KEY",
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
+    "_LAST_TURN_AT_LABEL_KEY",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
