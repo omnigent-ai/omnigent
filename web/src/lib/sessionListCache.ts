@@ -35,6 +35,9 @@ export const PROJECT_LABEL_KEY = "omni_project";
  */
 export const PINNED_LABEL_KEY = "omnigent.pinned";
 
+/** Personal completion timestamp returned for the current viewer. */
+export const COMPLETED_LABEL_KEY = "omnigent.completed";
+
 /** Filter dimensions encoded by a `["conversations", ...]` query key. */
 export interface ConversationListFilters {
   searchQuery: string;

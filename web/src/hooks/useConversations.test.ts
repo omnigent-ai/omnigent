@@ -5,9 +5,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  COMPLETED_LABEL_KEY,
+  PINNED_LABEL_KEY,
+  type ConversationsInfiniteData,
+} from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
+import { useToggleCompletedConversation } from "./useToggleCompletedConversation";
 import {
   deleteConversation,
   fetchAllArchivedProjectNames,
@@ -29,7 +34,6 @@ import {
   PINNED_CONVERSATIONS_KEY,
   type Conversation,
 } from "./useConversations";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -919,6 +923,44 @@ describe("useTogglePinnedConversation cache patching", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
+  });
+});
+
+it("patches completion into every sidebar cache", async () => {
+  const row = conversation({ id: "conv_done" });
+  const page = infinitePage([row]);
+  const listKeys = [
+    ["conversations", "", true],
+    ["project-sessions", "Project"],
+  ];
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      ...row,
+      labels: { [COMPLETED_LABEL_KEY]: "1721760000000" },
+    }),
+  );
+  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  for (const key of listKeys) queryClient.setQueryData(key, page);
+  queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, [row]);
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  const rendered = renderHook(() => useToggleCompletedConversation(), { wrapper });
+
+  rendered.result.current.mutate({ id: row.id, completed: true });
+  await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+  for (const key of listKeys) {
+    const cached = queryClient.getQueryData<ConversationsInfiniteData>(key);
+    expect(cached?.pages[0].data[0].labels[COMPLETED_LABEL_KEY]).toBe("1721760000000");
+  }
+  expect(
+    queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY)?.[0].labels[
+      COMPLETED_LABEL_KEY
+    ],
+  ).toBe("1721760000000");
+  const request = fetchMock.mock.calls[0][1] as RequestInit;
+  expect(JSON.parse(request.body as string)).toEqual({
+    labels: { [COMPLETED_LABEL_KEY]: expect.any(String) },
   });
 });
 

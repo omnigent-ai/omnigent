@@ -2,8 +2,8 @@
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
 // archived sessions included, rendering the non-archived ones as grouped
-// sections (Pinned / Projects / Sessions / Shared with me). Archived sessions
-// are no longer listed here — they live on the Settings page.
+// sections (Pinned / Projects / Sessions / Completed). Archived sessions are
+// no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -676,6 +676,43 @@ describe("Sidebar sections", () => {
     expect(screen.getByText("No sessions shared with you")).toBeInTheDocument();
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
+
+  it("groups completed sessions once and shows project above workspace", () => {
+    projectsMock.push("Customer X");
+    seedPins(["conv_done"]);
+    mockConversations([
+      conv("conv_active", "Claude Code"),
+      conv("conv_done", "Claude Code", {
+        project_id: "p_Customer X",
+        workspace: "/Users/me/omnigent-worktrees/customer-onboarding",
+        labels: { "omnigent.completed": "1721760000000" },
+      }),
+    ]);
+    renderSidebar();
+
+    expect(screen.getByText("conv_active")).toBeInTheDocument();
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(screen.queryByText("conv_done")).toBeNull();
+    const completed = screen.getByRole("button", { name: "Completed" });
+    expect(completed).toHaveAttribute("aria-expanded", "false");
+    expect(completed.children[0]).toHaveTextContent("Completed");
+    expect(completed.children[1]).toHaveClass("lucide-chevron-right", "md:opacity-0");
+
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    expect(screen.getAllByRole("button", { name: "Completed" })).toHaveLength(1);
+    fireEvent.click(completed);
+
+    const row = screen.getByText("conv_done").closest("a")!;
+    const project = within(row).getByTestId("completed-session-project");
+    const workspace = within(row).getByTestId("completed-session-workspace");
+    expect(project).toHaveTextContent("Customer X");
+    expect(workspace).toHaveTextContent("/Users/me/omnigent-worktrees/customer-onboarding");
+    expect([
+      ...row.querySelectorAll(
+        '[data-testid="completed-session-project"], [data-testid="completed-session-workspace"]',
+      ),
+    ]).toEqual([project, workspace]);
+  });
 });
 
 // The sidebar splits sessions across two tabs: "My sessions" (owned, with the
@@ -1277,8 +1314,8 @@ describe("Sidebar collapsed project marker", () => {
   });
 });
 
-// Every section is expanded by default, but a collapse the user makes
-// persists across reloads.
+// Active sections expand by default; completed work starts collapsed. Changes
+// to either state persist across reloads.
 describe("Sidebar default section collapse", () => {
   it("expands Pinned and Sessions by default when there is no stored preference", () => {
     seedPins(["conv_pin"]);

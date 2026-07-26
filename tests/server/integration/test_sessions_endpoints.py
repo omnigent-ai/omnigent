@@ -148,6 +148,11 @@ async def test_first_message_schedules_background_semantic_title(
     """The first user turn returns normally while title generation runs separately."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
+    completed = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"labels": {"omnigent.completed": "1721760000000"}},
+    )
+    assert completed.status_code == 200
     generated = asyncio.Event()
 
     async def generator(request: BackgroundTitleRequest) -> str:
@@ -202,6 +207,7 @@ async def test_first_message_schedules_background_semantic_title(
     await coordinator.wait_for_idle()
     snapshot = await client.get(f"/v1/sessions/{session['id']}")
     assert snapshot.json()["title"] == "Debug authentication timeout"
+    assert "omnigent.completed" not in snapshot.json()["labels"]
 
 
 async def test_background_title_failure_does_not_break_subsequent_user_turn(

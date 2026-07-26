@@ -124,9 +124,11 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    COMPLETED_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationNotFoundError,
+    completed_label_key,
     pinned_label_key,
 )
 from omnigent.stores.file_store import FileStore
@@ -1437,6 +1439,7 @@ def register_core_routes(
         #   session may pin it — including a read-only collaborator on a session
         #   shared with them. Only when the pinned label is the request's ONLY
         #   mutation.
+        #   Completion markers follow the same read-level rule.
         # * OWNER — archiving/unarchiving or filing into a project. Both are
         #   owner-only: projects are owner-private (an editor must not move a
         #   session between them), and archive pairs with a client-driven,
@@ -1451,7 +1454,10 @@ def register_core_routes(
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
-        if pin_only:
+        completed_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
+            COMPLETED_LABEL_KEY
+        }
+        if pin_only or completed_only:
             required_level = LEVEL_READ
         elif body.archived is not None or set_project:
             required_level = LEVEL_OWNER
@@ -1527,6 +1533,9 @@ def register_core_routes(
         # through to the delete-clear loop below under the per-user key.
         if PINNED_LABEL_KEY in labels_to_set:
             labels_to_set[pinned_label_key(user_id)] = labels_to_set.pop(PINNED_LABEL_KEY)
+        # Completion uses the same canonical-on-the-wire, per-user storage.
+        if COMPLETED_LABEL_KEY in labels_to_set:
+            labels_to_set[completed_label_key(user_id)] = labels_to_set.pop(COMPLETED_LABEL_KEY)
         if requested_codex_collaboration_mode is not None:
             labels_to_set[_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = (
                 requested_codex_collaboration_mode
@@ -1761,7 +1770,12 @@ def register_core_routes(
         # so without this an empty string would linger as a stored value.
         # The pinned key was rewritten to the caller's per-user key above, so
         # clear that one (not the canonical bare key) on an empty value.
-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
+        # Completion uses the same caller-specific clear.
+        for _clear_key in (
+            PROJECT_LABEL_KEY,
+            pinned_label_key(user_id),
+            completed_label_key(user_id),
+        ):
             if labels_to_set.get(_clear_key) == "":
                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)

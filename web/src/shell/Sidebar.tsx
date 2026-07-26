@@ -116,6 +116,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
 } from "@/hooks/useConversations";
+import { useToggleCompletedConversation } from "@/hooks/useToggleCompletedConversation";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -140,6 +141,7 @@ import {
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
+import { COMPLETED_LABEL_KEY } from "@/lib/sessionListCache";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
@@ -178,6 +180,13 @@ const SIDEBAR_HOVER_HIGHLIGHT =
 const SIDEBAR_ACTIVE_HIGHLIGHT =
   "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
+
+function sortByCompletedAtDesc(conversations: readonly Conversation[]): Conversation[] {
+  return [...conversations].sort(
+    (a, b) =>
+      Number(b.labels?.[COMPLETED_LABEL_KEY] ?? 0) - Number(a.labels?.[COMPLETED_LABEL_KEY] ?? 0),
+  );
+}
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -926,9 +935,10 @@ function ProjectFolder({
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     const loaded = query.data?.pages.flatMap((page) => page.data) ?? [];
-    // Pinned sessions live in the global Pinned section, not their folder.
+    // Completed sessions live in the global Completed section; pinned sessions
+    // live in the global Pinned section.
     return sortByUpdatedAtDesc(
-      loaded.filter((c) => !pinnedSet.has(c.id)),
+      loaded.filter((c) => c.labels?.[COMPLETED_LABEL_KEY] == null && !pinnedSet.has(c.id)),
       activeOverride,
     );
   }, [query.data, pinnedSet, activeOverride]);
@@ -1149,12 +1159,14 @@ function ConversationList({
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
     // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
     // "shared" is the ones others shared with them. The Pinned / Projects /
-    // Sessions structure is then built from that slice, so both tabs reuse the
-    // same section layout with different conversations.
+    // Sessions / Completed structure is then built from that slice, so both
+    // tabs reuse the same section layout with different conversations.
     const tabScoped =
       activeTab === "shared"
         ? notArchived.filter((c) => !isOwnedByViewer(c, viewerId))
         : notArchived.filter((c) => isOwnedByViewer(c, viewerId));
+    const completed = tabScoped.filter((c) => c.labels?.[COMPLETED_LABEL_KEY] != null);
+    const active = tabScoped.filter((c) => c.labels?.[COMPLETED_LABEL_KEY] == null);
 
     // Pinned takes precedence over Project: pinning a session moves it OUT of
     // its project into the flat global Pinned section (no nested pins). Ordered
@@ -1163,7 +1175,7 @@ function ConversationList({
     // pinned session holds its slot when a new message bumps its `updated_at`.
     // Pins are ownership-agnostic, so a pinned shared session floats to Pinned
     // on the Shared tab just like an owned one on My sessions.
-    const pinned = orderByPinnedTimestamp(tabScoped.filter((c) => pinnedSet.has(c.id)));
+    const pinned = orderByPinnedTimestamp(active.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
     // Projects are a "My sessions"-only tool (filing into a project is
@@ -1172,19 +1184,26 @@ function ConversationList({
     // (it lives under Pinned), so pinning a project's last session leaves the
     // folder showing "No sessions".
     const filedIds = new Set<string>();
-    const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
+    const projectGroups: {
+      id: string | null;
+      name: string;
+      conversations: Conversation[];
+    }[] =
       activeTab === "shared"
         ? []
         : projects.map(({ id, name }) => {
+            const belongsToProject = (conversation: Conversation) =>
+              (id !== null && conversation.project_id === id) ||
+              conversation.labels?.[PROJECT_LABEL_KEY] === name;
             // Dual-read membership: a session belongs to this folder if it has
             // the first-class id OR the legacy omni_project label of this name.
-            const inProject = tabScoped.filter(
-              (c) =>
-                ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-                !pinnedIdSet.has(c.id),
-            );
+            const inProject = active.filter((c) => belongsToProject(c) && !pinnedIdSet.has(c.id));
             inProject.forEach((c) => filedIds.add(c.id));
-            return { id, name, conversations: sortByUpdatedAtDesc(inProject, activeOverride) };
+            return {
+              id,
+              name,
+              conversations: sortByUpdatedAtDesc(inProject, activeOverride),
+            };
           });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
@@ -1194,14 +1213,20 @@ function ConversationList({
 
     // Sessions: the remainder of the tab's slice — not pinned, not filed.
     const sessions = sortByUpdatedAtDesc(
-      tabScoped.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
+      active.filter((c) => !pinnedIdSet.has(c.id) && !filedIds.has(c.id)),
       activeOverride,
     );
     const archived = sortByUpdatedAtDesc(
       allWithPinned.filter((c) => c.archived === true),
       activeOverride,
     );
-    return { pinned, sessions, archived, projectGroups };
+    return {
+      pinned,
+      sessions,
+      completed: sortByCompletedAtDesc(completed),
+      archived,
+      projectGroups,
+    };
   }, [
     allConversations,
     pinnedConversations,
@@ -1410,6 +1435,7 @@ function ConversationList({
   const activeProjectName = useMemo(() => {
     if (!activeId) return null;
     const active = allConversations.find((c) => c.id === activeId);
+    if (active?.labels?.[COMPLETED_LABEL_KEY] != null) return null;
     return active?.labels?.[PROJECT_LABEL_KEY] ?? null;
   }, [activeId, allConversations]);
   // Auto-expand the project folder holding the selected session, so navigating
@@ -1432,14 +1458,15 @@ function ConversationList({
     // expanded AND that individual project folder is expanded (folders are
     // collapsed unless explicitly opened — inverse of the fixed sections).
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (name: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(name) ? list : [];
+    const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
+      !projectsCollapsed && expandedProjects.includes(group.name) ? group.conversations : [];
     // `sections` is already scoped to the active tab, so the same Pinned /
     // Projects / Sessions walk covers both tabs (Projects is empty on shared).
     return [
       ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...sections.projectGroups.flatMap(projectVisible),
       ...visible("Chats", sections.sessions),
+      ...visible("Completed", sections.completed),
     ].map((c) => c.id);
   }, [sections, effectiveCollapsedSections, expandedProjects]);
   useEffect(() => {
@@ -1449,12 +1476,13 @@ function ConversationList({
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : [...list];
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (name: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(name) ? [...list] : [];
+    const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
+      !projectsCollapsed && expandedProjects.includes(group.name) ? [...group.conversations] : [];
     return [
       ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...sections.projectGroups.flatMap(projectVisible),
       ...visible("Chats", sections.sessions),
+      ...visible("Completed", sections.completed),
     ];
   };
   // Getter that builds the shift-select visible order on demand (at click
@@ -1472,6 +1500,7 @@ function ConversationList({
         ? []
         : sections.projectGroups.flatMap((g) => projectRenderedIdsRef.current.get(g.name) ?? [])),
       ...vis("Chats", sections.sessions),
+      ...vis("Completed", sections.completed),
     ];
   };
   useSessionSwitchHotkey(orderedConversationIds, activeId);
@@ -1518,6 +1547,7 @@ function ConversationList({
   const totalVisible =
     sections.pinned.length +
     sections.sessions.length +
+    sections.completed.length +
     sections.projectGroups.length +
     sections.projectGroups.reduce((sum, g) => sum + g.conversations.length, 0);
 
@@ -1732,15 +1762,32 @@ function ConversationList({
                   />
                 </ChatsDropZone>
               )}
-              {/* Both tabs render this same Pinned / Projects / Sessions tree;
-              `sections` is scoped to the active tab's conversations (owned vs.
-              shared), and Projects is empty on the Shared tab. */}
+              {sections.completed.length > 0 && (
+                <ConversationSection
+                  title="Completed"
+                  marker={projectMarkerState(sections.completed)}
+                  conversations={sections.completed}
+                  pinnedConversationIds={pinnedConversationIds}
+                  collapsed={effectiveCollapsedSections.includes("Completed")}
+                  onToggleCollapsed={() => effectiveToggleSectionCollapsed("Completed")}
+                  onRowClick={onRowClick}
+                  onTogglePinned={onTogglePinned}
+                  selectionMode={selectionMode}
+                  selectedIds={selectedIds}
+                  onToggleSelected={onToggleSelected}
+                  onProjectAssigned={expandProject}
+                />
+              )}
+              {/* Both tabs render this same Pinned / Projects / Sessions /
+              Completed tree; `sections` is scoped to the active tab's
+              conversations (owned vs. shared), and Projects is empty on the
+              Shared tab. */}
               {/* Archived sessions are no longer listed here — they live on the
               Settings page ("Archived chats"), reachable from the footer. */}
-              {/* Infinite-scroll sentinel for the global list. Pagination extends
-              the Chats list, so it hides with a collapsed Chats group — a loader
-              under a collapsed group reads orphaned. */}
-              {!effectiveCollapsedSections.includes("Chats") && (
+              {/* The global stream feeds Sessions and Completed. Hide its loader
+              only when both sections are collapsed. */}
+              {(!effectiveCollapsedSections.includes("Chats") ||
+                !effectiveCollapsedSections.includes("Completed")) && (
                 <InfiniteScrollSentinel
                   hasMore={hasMorePages}
                   isFetching={isFetchingNextPage}
@@ -2163,13 +2210,16 @@ function ConversationMenuItems({
   conversation,
   isPinned,
   isArchived,
+  isCompleted,
   isOwner,
   sharingOff,
   isSingleUser,
   canStop,
   canMarkUnread,
+  canComplete,
   currentProject,
   onTogglePinned,
+  onToggleCompleted,
   onMarkUnread,
   onProjectAssigned,
   moveToProject,
@@ -2185,6 +2235,7 @@ function ConversationMenuItems({
   conversation: Conversation;
   isPinned: boolean;
   isArchived: boolean;
+  isCompleted: boolean;
   isOwner: boolean;
   // Server-wide sharing kill switch (OMNIGENT_SHARING_MODE=off): disables the
   // Share item for everyone, independent of the per-user ownership check.
@@ -2196,8 +2247,10 @@ function ConversationMenuItems({
   // Whether "Mark as unread" applies: any row not already showing the
   // unread dot (the active thread and running sessions included).
   canMarkUnread: boolean;
+  canComplete: boolean;
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
+  onToggleCompleted: () => void;
   onMarkUnread: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
@@ -2271,7 +2324,7 @@ function ConversationMenuItems({
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
           hover-revealed quick-pin button. Archived rows omit it (archive
           outranks pin). */}
-      {!isArchived && (
+      {!isArchived && !isCompleted && (
         <C.Item
           data-testid="pin-conversation"
           className="md:hidden"
@@ -2342,6 +2395,31 @@ function ConversationMenuItems({
           <MailIcon className="size-3.5" />
           Mark as unread
         </C.Item>
+      )}
+      {isCompleted ? (
+        <C.Item data-testid="complete-conversation" onSelect={onToggleCompleted}>
+          <SquareIcon className="size-3.5" />
+          Mark active
+        </C.Item>
+      ) : canComplete ? (
+        <C.Item data-testid="complete-conversation" onSelect={onToggleCompleted}>
+          <SquareCheckIcon className="size-3.5" />
+          Mark as completed
+        </C.Item>
+      ) : (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div>
+              <C.Item data-testid="complete-conversation" disabled>
+                <SquareCheckIcon className="size-3.5" />
+                Mark as completed
+              </C.Item>
+            </div>
+          </TooltipTrigger>
+          <TooltipContent side="left">
+            Wait for the session and pending approvals to finish
+          </TooltipContent>
+        </Tooltip>
       )}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
           shared session shows no project affordance. */}
@@ -2584,6 +2662,7 @@ function ConversationRow({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const complete = useToggleCompletedConversation();
   const moveToProject = useMoveToProject();
   // Archive stops the runner first (resource hygiene): a hidden session
   // shouldn't keep a runner alive. This is NOT the user-facing Stop action
@@ -2595,6 +2674,7 @@ function ConversationRow({
   // instance so its pending/error state can't bleed into archiving's.
   const stopSession = useStopSession();
   const isArchived = conversation.archived === true;
+  const isCompleted = conversation.labels?.[COMPLETED_LABEL_KEY] != null;
   const [isEditing, setIsEditing] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
@@ -2633,6 +2713,8 @@ function ConversationRow({
       hostId: conversation.host_id,
       runnerId: conversation.runner_id,
     }) && runnerOnline !== false;
+  const canComplete =
+    conversation.status !== "running" && (conversation.pending_elicitations_count ?? 0) === 0;
 
   // The session's current project NAME, or null when unfiled — drives the
   // kebab submenu label ("Add to project" vs "Move session") and the pinned
@@ -2651,7 +2733,7 @@ function ConversationRow({
   // and leave it overlaying the chat after navigation. Forcing null there
   // routes the row through the plain ContextMenu/link path and restores the
   // native `title` tooltip.
-  const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
+  const projectFlyoutName = !isMobile && isPinned && !isCompleted ? currentProject : null;
 
   const label = conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
@@ -2695,7 +2777,7 @@ function ConversationRow({
   } = useDraggable({
     id: conversation.id,
     data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing,
+    disabled: !isOwner || selectionMode || isArchived || isCompleted || isEditing,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -2827,6 +2909,10 @@ function ConversationRow({
     });
   }
 
+  function runToggleCompleted() {
+    complete.mutate({ id: conversation.id, completed: !isCompleted });
+  }
+
   // Shared by the kebab dropdown and the right-click context menu so the two
   // menus render identical items. `setMenuOpen` is supplied per-call (the
   // controlled kebab passes the real setter; the uncontrolled context menu a
@@ -2835,13 +2921,16 @@ function ConversationRow({
     conversation,
     isPinned,
     isArchived,
+    isCompleted,
     isOwner,
     sharingOff,
     isSingleUser,
     canStop,
     canMarkUnread,
+    canComplete,
     currentProject,
     onTogglePinned,
+    onToggleCompleted: runToggleCompleted,
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
@@ -2859,7 +2948,8 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "sidebar-compact-text relative flex h-7 flex-col justify-center rounded-[var(--radius-otto-sm)] py-0.5 pl-2 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
+        "sidebar-compact-text relative flex min-h-7 flex-col justify-center rounded-[var(--radius-otto-sm)] py-0.5 pl-2 text-left text-foreground transition-[color,background-color,transform] duration-[var(--duration-otto-fast)] ease-[var(--ease-otto)] motion-safe:hover:-translate-y-px",
+        isCompleted ? "gap-0.5 py-1" : "h-7",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -2903,11 +2993,38 @@ function ConversationRow({
           here. Leading icons (agent type, pin, shared) were removed to keep
           rows text-clean; pinned rows still group under "Pinned". */}
       <div className="flex w-full items-center gap-1.5">
-        <span className="relative min-w-0 truncate">
+        <span
+          className={cn(
+            "relative min-w-0 truncate",
+            isCompleted &&
+              "opacity-70 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100",
+            isActive && "opacity-100",
+          )}
+        >
           {label}
           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
         </span>
       </div>
+      {isCompleted && currentProject && (
+        <span
+          data-testid="completed-session-project"
+          className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground"
+          title={currentProject}
+        >
+          <FolderIcon aria-hidden className="size-3 shrink-0" />
+          <span className="truncate">{currentProject}</span>
+        </span>
+      )}
+      {isCompleted && conversation.workspace && (
+        <span
+          data-testid="completed-session-workspace"
+          className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground opacity-70"
+          title={conversation.workspace}
+        >
+          <FolderOpenIcon aria-hidden className="size-3 shrink-0" />
+          <span className="truncate">{conversation.workspace}</span>
+        </span>
+      )}
     </Link>
   );
 
@@ -3019,7 +3136,7 @@ function ConversationRow({
         <div className="-translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5">
           {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
-          {!isArchived && (
+          {!isArchived && !isCompleted && (
             <Button
               type="button"
               variant="ghost"
@@ -4058,11 +4175,9 @@ function writeLegacyPinnedConversationIds(ids: string[]) {
   }
 }
 
-// Default collapse state: every section (Pinned / Projects / Chats / Shared)
-// starts expanded. Archived no longer lives in the sidebar (it's on the
-// Settings page). Once the user toggles any header, the stored array (even an
-// empty one) becomes the preference and persists across reloads.
-const DEFAULT_COLLAPSED_SIDEBAR_SECTIONS: string[] = [];
+// Active sections start expanded; completed work stays tucked away until the
+// user opens it. Once toggled, the preference persists across reloads.
+const DEFAULT_COLLAPSED_SIDEBAR_SECTIONS = ["Completed"];
 
 function readCollapsedSidebarSections(): string[] {
   if (typeof window === "undefined") return DEFAULT_COLLAPSED_SIDEBAR_SECTIONS;

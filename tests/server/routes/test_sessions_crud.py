@@ -382,7 +382,7 @@ async def test_patch_session_pins_and_unpins(
     the session for the CALLER: the server rewrites it to the per-user key
     ``omnigent.pinned.<user>`` in storage (so it doesn't pin for others), and an
     empty value deletes that per-user key (unpin)."""
-    from omnigent.stores.conversation_store import pinned_label_key
+    from omnigent.stores.conversation_store import completed_label_key, pinned_label_key
 
     conv_store = SqlAlchemyConversationStore(db_uri)
     # No auth header on this client ⇒ the single-user ``local`` identity.
@@ -413,6 +413,26 @@ async def test_patch_session_pins_and_unpins(
     assert conv is not None
     assert user_key not in conv.labels
 
+    completion_key = completed_label_key(None)
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.completed": "1721760000000"}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["labels"]["omnigent.completed"] == "1721760000000"
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels[completion_key] == "1721760000000"
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.completed": ""}},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert completion_key not in conv.labels
+
 
 async def test_patch_rejects_client_supplied_per_user_pin_key(
     client: httpx.AsyncClient,
@@ -435,6 +455,16 @@ async def test_patch_rejects_client_supplied_per_user_pin_key(
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
     assert "omnigent.pinned.bob@example.com" not in conv.labels
+
+    key = "omnigent.completed.bob@example.com"
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {key: "1721760000000"}},
+    )
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert key not in conv.labels
 
 
 async def test_list_sessions_pinned_filter(
