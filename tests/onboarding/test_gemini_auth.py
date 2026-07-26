@@ -113,6 +113,7 @@ def test_default_checks_both_platform_paths(
     macos = tmp_path / "oauth_creds.json"
     linux = tmp_path / "antigravity-cli" / "antigravity-oauth-token"
     monkeypatch.setattr(ga, "GEMINI_OAUTH_CRED_PATHS", (macos, linux))
+    monkeypatch.setattr(ga, "_GEMINI_DIR", tmp_path)
 
     # Neither present → not logged in.
     assert ga.gemini_auth_has_credential() is False
@@ -126,4 +127,19 @@ def test_default_checks_both_platform_paths(
     # Symmetrically: only the macOS-format file present → logged in.
     linux.unlink()
     _write(macos, {"access_token": "ya29.macos"})
+    assert ga.gemini_login_detected() is True
+
+
+def test_cli_settings_json_detected_when_no_token_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When token files are absent, agy settings.json indicates configured CLI."""
+    macos = tmp_path / "oauth_creds.json"
+    linux = tmp_path / "antigravity-cli" / "antigravity-oauth-token"
+    settings = tmp_path / "antigravity-cli" / "settings.json"
+    monkeypatch.setattr(ga, "GEMINI_OAUTH_CRED_PATHS", (macos, linux))
+    monkeypatch.setattr(ga, "_GEMINI_DIR", tmp_path)
+
+    assert ga.gemini_login_detected() is False
+    _write(settings, {"model": "Gemini 3.6 Flash (High)"})
     assert ga.gemini_login_detected() is True

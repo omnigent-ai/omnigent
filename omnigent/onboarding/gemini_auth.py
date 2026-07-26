@@ -99,8 +99,11 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
     (:data:`GEMINI_OAUTH_CRED_PATHS`) and returns ``True`` if any carries a
     usable token — so a logged-in user is recognized on both macOS
     (``oauth_creds.json``) and Linux
-    (``antigravity-cli/antigravity-oauth-token``). With *creds_path* set, checks
-    only that file.
+    (``antigravity-cli/antigravity-oauth-token``).  As a fallback, the mere
+    existence of ``~/.gemini/antigravity-cli/settings.json`` (written by
+    ``agy`` on macOS when OAuth credentials live in Keychain rather than a
+    flat JSON file) is also accepted.  With *creds_path* set, checks only
+    that file (the settings.json fallback is skipped).
 
     A file counts as a completed login when it parses as a JSON object with a
     non-empty ``access_token`` / ``refresh_token`` string, flat or nested under
@@ -108,13 +111,17 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
     :func:`omnigent.onboarding.harness_install.harness_cli_logged_in`.
 
     :param creds_path: A specific credential file to check; ``None`` checks all
-        of :data:`GEMINI_OAUTH_CRED_PATHS`.
+        of :data:`GEMINI_OAUTH_CRED_PATHS` plus the settings.json fallback.
     :returns: ``True`` when a usable Gemini credential is present; ``False``
         when every checked file is missing, unreadable, non-UTF-8, not JSON, not
         an object, or token-less.
     """
     paths = (creds_path,) if creds_path is not None else GEMINI_OAUTH_CRED_PATHS
-    return any(_file_carries_token(path) for path in paths)
+    if any(_file_carries_token(path) for path in paths):
+        return True
+    if creds_path is None and (_GEMINI_DIR / "antigravity-cli" / "settings.json").is_file():
+        return True
+    return False
 
 
 def gemini_login_detected() -> bool:
@@ -125,8 +132,9 @@ def gemini_login_detected() -> bool:
     layer to check whether the ``antigravity-native`` harness has a Google
     subscription credential without spawning any subprocess.
 
-    :returns: ``True`` when agy's token (macOS ``~/.gemini/oauth_creds.json`` or
-        Linux ``~/.gemini/antigravity-cli/antigravity-oauth-token``) carries a
-        usable credential; ``False`` otherwise.
+    :returns: ``True`` when agy's token (macOS ``~/.gemini/oauth_creds.json``,
+        Linux ``~/.gemini/antigravity-cli/antigravity-oauth-token``, or
+        macOS ``~/.gemini/antigravity-cli/settings.json`` as fallback) indicates
+        a configured CLI; ``False`` otherwise.
     """
     return gemini_auth_has_credential()
