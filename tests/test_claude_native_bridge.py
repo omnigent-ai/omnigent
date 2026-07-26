@@ -739,6 +739,46 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
     }
 
 
+def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` user record is flagged, not rendered as a bubble.
+
+    Claude writes an ``isCompactSummary: true`` user record carrying the
+    continuation summary right after it compacts. The bridge must surface it
+    as a single ``message`` item with ``is_compact_summary=True`` (so the
+    forwarder can persist a durable compaction boundary) and preserve the
+    summary text — never drop it or route it through slash/scaffolding
+    detection.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "compact-summary-1",
+                "isCompactSummary": True,
+                "message": {
+                    "role": "user",
+                    "content": "This session is being continued. Prior summary: …",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].is_compact_summary is True
+    assert items[0].item_type == "message"
+    assert items[0].data["content"][0]["text"].startswith("This session is being continued")
+
+
 @pytest.mark.parametrize(
     "raw_text",
     [

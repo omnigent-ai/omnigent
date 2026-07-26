@@ -181,7 +181,9 @@ function scheduledTask(overrides: Partial<import("@/lib/scheduledTasksApi").Sche
     hostId: null,
     state: "active",
     lastRunAt: null,
+    lastRunStatus: null,
     lastRunConversationId: null,
+    nextRunAt: null,
     ...overrides,
   } satisfies import("@/lib/scheduledTasksApi").ScheduledTask;
 }
@@ -282,7 +284,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         editingTask={scheduledTask({ agentId: "ag_1" })}
       />,
     );
-    expect(screen.getByText("Edit scheduled task")).toBeInTheDocument();
+    expect(screen.getByText("Edit automation")).toBeInTheDocument();
     expect(screen.getByText(/Update this recurring agent session/i)).toBeInTheDocument();
     expect(screen.getByTestId("create-scheduled-task-submit")).toHaveTextContent("Save changes");
     expect((screen.getByTestId("task-name-input") as HTMLInputElement).value).toBe("Morning brief");

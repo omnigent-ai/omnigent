@@ -313,12 +313,21 @@ class ClaudeTranscriptItem:
     :param data: Item payload shaped like ``SessionEventInput.data``.
     :param response_id: Synthetic response id used to group the
         Claude turn in AP/web UI rendering.
+    :param is_compact_summary: ``True`` when this item was parsed from a
+        Claude ``isCompactSummary: true`` user record — the continuation
+        summary Claude writes immediately after it compacts its own
+        context. The forwarder uses this flag to persist a durable
+        Omnigent compaction boundary (see
+        :func:`omnigent.claude_native_forwarder._forward_available_items`)
+        instead of rendering the summary as a user bubble. Defaults to
+        ``False`` for every ordinary transcript item.
     """
 
     source_id: str
     item_type: str
     data: dict[str, Any]
     response_id: str
+    is_compact_summary: bool = False
 
 
 @dataclass(frozen=True)
@@ -4654,6 +4663,35 @@ def _user_transcript_items_from_entry(
     content = message.get("content") if isinstance(message, dict) else None
     source_key = _transcript_source_key(entry, line_number, record_offset)
     fallback_response_id = _response_id_from_source(source_key)
+
+    # ``isCompactSummary: true`` is the continuation-summary user record
+    # Claude writes right after it compacts its own context. It is the
+    # reliable, always-present compaction signal (the post-compaction
+    # ``SessionStart source=compact`` hook that normally persists the
+    # boundary is flaky and sometimes never fires). Surface it as a
+    # single flagged ``message`` item carrying the summary text so the
+    # forwarder can persist a durable compaction boundary instead of
+    # rendering the summary verbatim as a user bubble. Only the flag and
+    # text matter downstream — skip the slash/terminal/scaffolding
+    # detection the ordinary user path runs.
+    if entry.get("isCompactSummary") is True:
+        summary_text = content if isinstance(content, str) else _summary_text_from_blocks(content)
+        return (
+            current_response_id,
+            [
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "compact_summary"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": summary_text}],
+                    },
+                    response_id=fallback_response_id,
+                    is_compact_summary=True,
+                )
+            ],
+        )
+
     items: list[ClaudeTranscriptItem] = []
 
     if isinstance(content, str):
@@ -5092,6 +5130,34 @@ def _source_id(source_key: str, item_index: int, item_type: str) -> str:
     :returns: Stable source id string.
     """
     return f"{source_key}:{item_index}:{item_type}"
+
+
+def _summary_text_from_blocks(content: Any) -> str:
+    """
+    Join the text of a compact-summary record's content blocks.
+
+    A Claude ``isCompactSummary`` record usually carries its summary as
+    a plain string, but the JSONL format may also ship list-form
+    ``[{"type": "text", "text": ...}]`` blocks. This flattens the
+    list case to a single string so the compaction summary is preserved
+    regardless of shape.
+
+    :param content: The record's ``message.content`` — a string, a list
+        of content blocks, or anything else.
+    :returns: The concatenated summary text, or ``""`` when no text is
+        present.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts)
 
 
 def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, Any]:
