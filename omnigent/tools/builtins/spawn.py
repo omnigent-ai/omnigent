@@ -473,10 +473,15 @@ class SysSessionListTool(Tool):
       ``sys_session_get_info`` / ``sys_session_close``.
     - ``sessions`` — a **global** view of every session the caller can
       access (bounded by the server's per-user permission model), each
-      with its status and runner connectivity. An optional
-      ``agent_name`` filter narrows this list. This powers
-      orchestration: discovering sessions to inspect
-      (``sys_agent_get`` / ``sys_session_get_info``) or drive
+      with its status, runner connectivity, and context state
+      (``context_tokens``, ``context_window``, ``context_used_fraction``,
+      ``context_as_of``, ``context_stale``, ``seconds_since_last_turn``)
+      so sessions can be ranked by occupancy without a
+      ``sys_session_get_info`` per row. Flattened here, where rows are
+      read in bulk; ``sys_session_get_info`` nests the same values and
+      explains their semantics. An optional ``agent_name`` filter narrows
+      this list. This powers orchestration: discovering sessions to
+      inspect (``sys_agent_get`` / ``sys_session_get_info``) or drive
       (``sys_session_send`` by ``session_id``).
 
     The global ``sessions`` view is populated only on the runner
@@ -498,8 +503,11 @@ class SysSessionListTool(Tool):
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
             "every session "
-            "you can access, each with status + runner connectivity, "
-            "for orchestration (inspect via sys_agent_get / "
+            "you can access, each with status + runner connectivity plus "
+            "context state (context_tokens, context_window, "
+            "context_used_fraction, context_as_of, context_stale, "
+            "seconds_since_last_turn) for ranking sessions by how full "
+            "they are, for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
             "sessions running that agent."
@@ -606,6 +614,22 @@ class SysSessionGetInfoTool(Tool):
     approval prompts. For the conversation transcript, use
     ``sys_session_get_history`` instead.
 
+    Also reports the state needed to manage a session's context
+    deliberately: a ``context`` block (``tokens``, ``window``,
+    ``used_fraction``, ``as_of``, ``age_seconds``, ``stale``) and
+    ``last_turn_completed_at`` / ``seconds_since_last_turn``, alongside
+    ``created_at`` / ``updated_at``.
+
+    Two distinct timestamps, because they answer different questions.
+    ``context.as_of`` is when the occupancy was measured — terminal-backed
+    harnesses report usage mid-turn, so it is not a turn boundary.
+    ``last_turn_completed_at`` is when the session last stopped working.
+
+    ``context.stale`` is advisory and deliberately conservative: set when
+    nothing has been measured, when a turn is in flight, or when the
+    session changed after the reading. ``status`` remains the
+    authoritative answer to whether a session is currently working.
+
     ``session_id`` is optional — when omitted, the caller's own
     session is described.
 
@@ -628,7 +652,14 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host, reasoning effort, model, parent session, workspace, "
-            "and outstanding approval prompts. Global read — any "
+            "and outstanding approval prompts. Also context occupancy "
+            "(context.tokens/window/used_fraction, measured at "
+            "context.as_of, context.age_seconds ago) and when the last "
+            "turn ended (last_turn_completed_at, seconds_since_last_turn) "
+            "— use these to decide whether to compact a session or start "
+            "a fresh one. context.stale means the reading may lag (never "
+            "measured, turn in flight, or activity since); status is the "
+            "authoritative in-flight signal. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
             "use sys_session_get_history for the conversation transcript."
