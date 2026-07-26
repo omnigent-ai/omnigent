@@ -108,11 +108,13 @@ class _ConversationStore:
         after: str | None = None,
         kind: str | None = "default",
         root_conversation_id: str | None = None,
+        include_archived: bool = False,
     ) -> PagedList[Conversation]:
         """Return the spawn tree sharing ``root_conversation_id``.
 
         ``load_session_usage`` walks the tree via this method to sum a
-        parent's subtree usage. With an explicit graph, return every
+        parent's subtree usage, and passes ``include_archived=True`` —
+        archived conversations still hold spend. With an explicit graph, return every
         conversation sharing the root; otherwise synthesize the single
         childless conversation the legacy tests expect.
         """

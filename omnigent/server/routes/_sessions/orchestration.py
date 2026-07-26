@@ -83,6 +83,9 @@ from omnigent.runtime.policies.approval import (
     resolve_ask_timeout,
 )
 from omnigent.runtime.policies.builder import (
+    _sum_subtree_usage,
+    ancestor_ids_from_tree,
+    load_session_tree,
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
@@ -191,7 +194,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
-    _ancestor_session_ids,
     _await_settled_managed_launch,
     _build_new_item,
     _build_policy_engine_from_spec,
@@ -868,6 +870,7 @@ def _build_session_list_item(
 def _publish_subtree_cost_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
+    conv: Conversation | None = None,
 ) -> None:
     """
     Re-publish each ancestor's subtree-summed cost after a child usage update.
@@ -880,18 +883,35 @@ def _publish_subtree_cost_to_ancestors(
     display side.) For each ancestor of *session_id*, recompute its subtree
     priced cost and publish a ``session.usage`` event carrying it.
 
+    One tree load serves the whole walk. Every ancestor of this session is in
+    the same tree, so both the chain and each ancestor's sum are derived from
+    one set of freshly-read rows — previously each ancestor paged the tree
+    again, and the chain came from a conversation row that may have been read
+    before a concurrent delete/recreate moved this session elsewhere.
+
     Sync (does store reads + SSE fan-out); call via
     :func:`asyncio.to_thread`, mirroring the elicitation ancestor-publish
     helpers. ``session_stream.publish`` is safe to call from a worker thread.
 
-    :param conv_store: Store used to discover ancestors and sum each
-        ancestor's subtree usage.
+    :param conv_store: Store used to load the tree.
     :param session_id: The child session whose usage just changed, e.g.
         ``"conv_child123"``.
+    :param conv: The child's already-loaded conversation row, when the caller
+        holds one. Only its ``root_conversation_id`` is used, and only as a
+        hint: :func:`load_session_tree` verifies the tree it names actually
+        contains this session and resolves the root itself when it does not.
+        The parameter belongs to this function, not to whichever caller first
+        needed it, so that no caller can be removed and leave a signature
+        behind that its remaining callers already depend on.
     :returns: None.
     """
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        ancestor_usage = load_session_usage(ancestor_id, conv_store)
+    tree = load_session_tree(
+        session_id,
+        conv_store,
+        conv.root_conversation_id if conv is not None else None,
+    )
+    for ancestor_id in ancestor_ids_from_tree(tree, session_id):
+        ancestor_usage = _sum_subtree_usage(tree, ancestor_id)
         subtree_cost = _priced_cost_for_display(ancestor_usage)
         usage_by_model = _usage_by_model_for_display(ancestor_usage)
         if subtree_cost is None and usage_by_model is None:
@@ -1915,7 +1935,8 @@ async def _hold_native_ask_gate_impl(
         if result.set_labels:
             engine.apply_label_writes(result.set_labels)
         if result.state_updates:
-            engine.apply_state_updates(result.state_updates)
+            with contextlib.suppress(ConversationNotFoundError):
+                engine.apply_state_updates(result.state_updates)
     return approved
 
 
@@ -6073,7 +6094,7 @@ async def _evaluate_tool_call_policy(
     if spec is None:
         return None
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
 
     try:
@@ -6230,7 +6251,7 @@ async def _evaluate_input_policy(
     request_content = {"user_content": user_text, "attachments": attachments}
 
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
@@ -8120,7 +8141,7 @@ async def _handle_mcp_tools_call(
     # only) and TOOL_RESULT (both paths). Engine construction reads
     # session-policy specs and labels from the DB, so keep it off-loop too.
     engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
     )
 
     if is_retry:
@@ -8200,7 +8221,8 @@ async def _handle_mcp_tools_call(
                 if _pending.set_labels:
                     await asyncio.to_thread(engine.apply_label_writes, _pending.set_labels)
                 if _pending.state_updates:
-                    await asyncio.to_thread(engine.apply_state_updates, _pending.state_updates)
+                    with contextlib.suppress(ConversationNotFoundError):
+                        await asyncio.to_thread(engine.apply_state_updates, _pending.state_updates)
         else:
             # ALLOW — policy no longer requires approval (e.g. label
             # state changed between the original ASK and this retry).

@@ -679,6 +679,86 @@ async def _measure_read_runner_file(env: BenchEnvironment, ctx: JourneyContext) 
     await env.read_runner_file(session_id, _RUNNER_FILE_PATH)
 
 
+# ── policy evaluate ──────────────────────────────────────────
+
+_POLICY_EVALUATE_PAYLOAD = {
+    "event": {
+        "type": "PHASE_TOOL_CALL",
+        "data": {"name": "Bash", "arguments": {"command": "ls"}},
+    }
+}
+
+
+async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
+    """Create an agent-bound session with a declared policy and warm the caches.
+
+    The agent must declare at least one policy so ``any_policies_apply`` is
+    true and the full engine build (single tree scan + preloaded conversation)
+    runs on every evaluate call. A zero-policy spec short-circuits before the
+    build, which would measure the wrong path.
+
+    Two warm calls are made before returning so the agent-spec and
+    session-policy caches are populated; the measured iteration then reflects
+    steady-state overhead, not cold-cache cost.
+    """
+    assert env.client is not None
+    import io
+    import tarfile
+
+    import yaml
+
+    config: dict[str, object] = {
+        "spec_version": 1,
+        "name": "bench-policy-agent",
+        "guardrails": {
+            "policies": {
+                "allow_all": {
+                    "type": "function",
+                    "on": ["tool_call"],
+                    "function": "tests.runtime.policies.conftest._always_allow",
+                }
+            }
+        },
+    }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        payload = yaml.safe_dump(config).encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    bundle = buf.getvalue()
+
+    resp = await env.client.post(
+        "/v1/agents",
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    resp.raise_for_status()
+    agent_id = resp.json()["id"]
+
+    session_resp = await env.client.post("/v1/sessions", json={"agent_id": agent_id})
+    session_resp.raise_for_status()
+    session_id = session_resp.json()["id"]
+
+    # Warm the spec + policy caches — the measured iteration is steady-state.
+    for _ in range(2):
+        await env.client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_POLICY_EVALUATE_PAYLOAD,
+        )
+
+    return session_id
+
+
+async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    session_id = cast(str, ctx)  # _setup_policy_evaluate_session
+    assert env.client is not None
+    resp = await env.client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_POLICY_EVALUATE_PAYLOAD,
+    )
+    resp.raise_for_status()
+
+
 # ── registry ─────────────────────────────────────────────────
 
 ALL_JOURNEYS: dict[str, Journey] = {
@@ -753,6 +833,15 @@ ALL_JOURNEYS: dict[str, Journey] = {
             setup=_setup_target_session,
             concurrency_safe=True,
             description="POST /v1/sessions/{id}/comments — create a review comment.",
+        ),
+        Journey(
+            name="policy_evaluate",
+            kind="latency",
+            measure=_measure_policy_evaluate,
+            setup=_setup_policy_evaluate_session,
+            concurrency_safe=True,
+            description="POST /v1/sessions/{id}/policies/evaluate — PreToolUse hook "
+            "(single tree scan, preloaded conversation row, caches warm).",
         ),
         # Runner (full-turn) journeys — with_runner=True, openai-agents, mock LLM.
         Journey(
