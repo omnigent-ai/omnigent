@@ -712,7 +712,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             >
               <Link to="/tasks" onClick={onNavClick}>
                 <ClockIcon className="size-3.5 text-muted-foreground" />
-                Scheduled
+                Automations
               </Link>
             </Button>
             {selectionMode ? (

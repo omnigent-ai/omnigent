@@ -145,7 +145,7 @@ export function TasksPage() {
     <PageScroll contentClassName="px-6">
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
-          <h1 className="text-2xl font-semibold">Scheduled tasks</h1>
+          <h1 className="text-2xl font-semibold">Automations</h1>
           <p className="text-sm text-muted-foreground">
             Run agent sessions on a recurring schedule. Tasks fire on a connected host.
           </p>
@@ -164,7 +164,7 @@ export function TasksPage() {
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search scheduled tasks…"
+            placeholder="Search automations…"
             data-testid="tasks-search"
             className="pl-9"
           />
@@ -199,7 +199,7 @@ export function TasksPage() {
           className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm"
         >
           <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
-          <span className="flex-1">Couldn’t load scheduled tasks.</span>
+          <span className="flex-1">Couldn’t load automations.</span>
           <Button variant="outline" size="sm" onClick={() => void refetch()}>
             Retry
           </Button>
@@ -207,7 +207,7 @@ export function TasksPage() {
       ) : isLoading ? (
         <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
-          Loading scheduled tasks…
+          Loading automations…
         </div>
       ) : filtered.length === 0 ? (
         <EmptyState
@@ -265,14 +265,12 @@ function EmptyState({
   return (
     <div className="py-8" data-testid="tasks-empty-state">
       {hasAny && (
-        <div className="py-10 text-center text-sm text-muted-foreground">
-          No scheduled tasks found
-        </div>
+        <div className="py-10 text-center text-sm text-muted-foreground">No automations found</div>
       )}
       {!hasAny && (
         <div className="flex flex-col items-center gap-2 py-12 text-center">
           <ClockIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-sm font-medium">No scheduled tasks yet</p>
+          <p className="text-sm font-medium">No automations yet</p>
           <p className="max-w-sm text-xs text-muted-foreground">
             Create a task to run an agent session automatically on a recurring schedule.
           </p>
