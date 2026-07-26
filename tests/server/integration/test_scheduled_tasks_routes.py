@@ -56,6 +56,9 @@ def _stub_host_workspace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture()
 def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.host_permission_store.sqlalchemy_store import (
+        SqlAlchemyHostPermissionStore,
+    )
     from omnigent.stores.host_store import HostStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -71,6 +74,7 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         # ownership) resolves against actual host rows. Without it,
         # ``app.state.host_store`` is None and the route skips the check.
         host_store=HostStore(db_uri),
+        host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
 

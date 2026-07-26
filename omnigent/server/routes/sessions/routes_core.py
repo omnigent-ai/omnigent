@@ -62,6 +62,7 @@ from omnigent.server._elicitation_registry import (
     _ParkedHarnessElicitation,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.audit import audit_event
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -772,6 +773,7 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        all: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sessions with cursor-based pagination.
@@ -835,6 +837,20 @@ def register_core_routes(
         # disabled entirely — no auth_provider).
         user_id = _require_user(request, auth_provider)
         normalized_query = search_query if search_query else None
+        # Admin fleet view: drop the ACL filter so every owner's sessions
+        # are returned. Fail closed — a non-admin asking for all=true gets
+        # 403, never a silently owner-scoped list. Audit the disclosure.
+        fleet_view = False
+        if all:
+            is_admin = (
+                await asyncio.to_thread(permission_store.is_admin, user_id)
+                if permission_store is not None and user_id is not None
+                else False
+            )
+            if not is_admin:
+                raise HTTPException(status_code=403, detail="admin privileges required")
+            fleet_view = True
+            audit_event("session.fleet.list", actor=user_id, target="*")
         # A specific project folder ("My sessions"-only) must show only the
         # viewer's own sessions — a session shared with them but filed under a
         # like-named project belongs on "Shared with me", not in this folder.
@@ -842,7 +858,7 @@ def register_core_routes(
         # the store resolves the project NAME to the caller's own project id.
         # The flat list (project=None) and Unfiled (project="") stay unscoped so
         # shared sessions still surface for the "Shared with me" tab.
-        owned_by = user_id if project else None
+        owned_by = None if fleet_view else (user_id if project else None)
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -850,7 +866,7 @@ def register_core_routes(
             before=before,
             agent_id=agent_id,
             agent_name=agent_name,
-            accessible_by=user_id,
+            accessible_by=None if fleet_view else user_id,
             owned_by=owned_by,
             has_agent_id=True,
             # The store treats ``None`` as "no kind filter"; the API

@@ -231,7 +231,7 @@ def create_scheduled_tasks_router(
             if host_id is not None:
                 host_store = getattr(request.app.state, "host_store", None)
                 host_permission_store = getattr(request.app.state, "host_permission_store", None)
-                permission_store = getattr(request.app.state, "permission_store", None)
+                _local_permission_store = getattr(request.app.state, "permission_store", None)
                 if host_store is not None and host_permission_store is not None:
                     await asyncio.to_thread(
                         resolve_host_access,
@@ -239,7 +239,7 @@ def create_scheduled_tasks_router(
                         host_id=host_id,
                         host_store=host_store,
                         host_permission_store=host_permission_store,
-                        permission_store=permission_store,
+                        permission_store=_local_permission_store,
                     )
             return None, validated_model, validated_effort
         if host_id is None:

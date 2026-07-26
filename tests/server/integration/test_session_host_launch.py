@@ -88,14 +88,17 @@ async def _capture_launch_frame_flag(*, session_owner: str | None, host_owner: s
     )
     conversation_store = SimpleNamespace(replace_runner_id=lambda *a, **k: None)
     permission_store = SimpleNamespace(
-        list_for_session=lambda _cid: (
-            [
-                SessionPermission(
-                    user_id=session_owner, conversation_id="conv_flag_test", level=LEVEL_OWNER
-                )
-            ]
-            if session_owner is not None
-            else []
+        list_for_session=lambda _cid, **_kwargs: (
+            (
+                [
+                    SessionPermission(
+                        user_id=session_owner, conversation_id="conv_flag_test", level=LEVEL_OWNER
+                    )
+                ]
+                if session_owner is not None
+                else []
+            ),
+            0,
         )
     )
     host_conn = SimpleNamespace(owner=host_owner, pending_launches={})
