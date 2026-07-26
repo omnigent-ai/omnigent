@@ -3270,7 +3270,8 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
   // Elicitation cards (e.g. AskUserQuestion form) want full chat-column
   // width to match the composer, not the default w-fit shrink-to-content.
   const hasElicitation = bubble.items.some((it) => it.kind === "elicitation");
-  const isWide = hasElicitation || containsMarkdownTable(bubble.items);
+  const hasError = bubble.items.some((it) => it.kind === "error");
+  const isWide = hasElicitation || hasError || containsMarkdownTable(bubble.items);
 
   return (
     <>
@@ -3314,7 +3315,7 @@ function AssistantBubble({ bubble }: { bubble: Extract<Bubble, { kind: "assistan
         )}
       </Message>
 
-      {bubble.lifecycle === "failed" && (
+      {bubble.lifecycle === "failed" && !hasError && (
         <p className="text-destructive text-xs">Error: {bubble.error}</p>
       )}
     </>

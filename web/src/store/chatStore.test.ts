@@ -3272,6 +3272,48 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("keeps durable errors while replacing a transient disconnect", () => {
+      const errorBlock = (code: string, itemId: string | null): ErrorBlock => ({
+        type: "error",
+        ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId },
+        message: code,
+        source: "execution",
+        code,
+      });
+      useChatStore.setState({
+        blocks: [errorBlock("old_failure", "err_old"), errorBlock("runner_disconnected", null)],
+      });
+
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "idle",
+      });
+      expect(
+        useChatStore
+          .getState()
+          .blocks.map((block) => (block.type === "error" ? block.code : block.type)),
+      ).toEqual(["old_failure"]);
+
+      const failed: SessionStatusEvent = {
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "failed",
+        error: { code: "startup_failed", message: "The new runner failed to start." },
+      };
+      handleSessionEvent(failed);
+
+      // Replaying the same status must not duplicate the synthetic error.
+      handleSessionEvent(failed);
+
+      expect(
+        useChatStore
+          .getState()
+          .blocks.filter((block) => block.type === "error")
+          .map((block) => block.code),
+      ).toEqual(["old_failure", "startup_failed"]);
+    });
+
     it("idle settles sessionStatus but preserves a still-streaming bubble until response_end", () => {
       useChatStore.setState({
         status: "streaming",

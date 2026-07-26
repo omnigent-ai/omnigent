@@ -215,6 +215,28 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByText(/Error: rate limited/)).toBeInTheDocument();
   });
 
+  it("renders an error alert across the full chat column", () => {
+    render(
+      <BubbleView
+        bubble={{
+          ...assistantText("", "failed"),
+          items: [
+            {
+              kind: "error",
+              itemId: null,
+              source: "",
+              code: "runner_disconnected",
+              message: "Runner disconnected unexpectedly.",
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId("message-bubble")).toHaveClass("max-w-full");
+    expect(screen.getByRole("alert").parentElement).toHaveClass("w-full");
+  });
+
   it("renders the compacting shimmer for a compaction_loading bubble", () => {
     // WHY: the compaction_loading branch owns the busy slot during context
     // compaction — it must show its own indicator.

@@ -1277,7 +1277,7 @@ describe("BlockStream — terminal lifecycles", () => {
     }
   });
 
-  it("failure without error does not emit ErrorBlock", () => {
+  it("failure without error emits a fallback ErrorBlock", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },
       {
@@ -1287,8 +1287,14 @@ describe("BlockStream — terminal lifecycles", () => {
     ]);
 
     const types = blockTypes(blocks);
-    expect(types).not.toContain("error");
+    expect(types).toContain("error");
     expect(types).toContain("response_end");
+    expect(blocks.find((block) => block.type === "error")).toMatchObject({
+      type: "error",
+      source: "execution",
+      code: "response_failed",
+      message: "The harness failed without providing error details.",
+    });
   });
 });
 
@@ -1307,6 +1313,7 @@ describe("BlockStream — status events", () => {
 
     const err = blocks.find((b) => b.type === "error");
     expect(err).toBeDefined();
+    expect(blocks.filter((b) => b.type === "error")).toHaveLength(1);
     if (err && err.type === "error") {
       expect(err.message).toBe("API key invalid");
       expect(err.code).toBe("llm_auth_failed");

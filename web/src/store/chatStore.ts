@@ -4371,28 +4371,41 @@ export function handleSessionEvent(event: StreamEvent): void {
             patch.pendingUserMessages = [];
           }
         }
-        // Surface the error inline when the harness reports a terminal failure
-        // with a structured error payload (e.g. token expiration on startup).
-        // `response.failed` / `response.error` handle mid-turn failures, but
-        // startup failures only emit `session.status: failed` — nothing
-        // converts that into a visible ErrorBlock. Synthesize one here so the
-        // user sees the message without having to reload.
+        // Recovery or a concrete failure supersedes a transient disconnect.
+        const statusError = event.status === "failed" ? event.error : undefined;
+        let blocks = s.blocks;
+        if (event.status !== "failed" || statusError?.code !== "runner_disconnected") {
+          const filtered = blocks.filter(
+            (block) =>
+              block.type !== "error" ||
+              block.ctx.itemId !== null ||
+              block.code !== "runner_disconnected",
+          );
+          if (filtered.length !== blocks.length) blocks = filtered;
+        }
+        // Startup failures have no response.error event, so render their
+        // session.status detail unless that exact error is already visible.
         if (
-          event.status === "failed" &&
-          event.error != null &&
-          !s.blocks.some((b) => b.type === "error")
+          statusError != null &&
+          !blocks.some(
+            (block) =>
+              block.type === "error" &&
+              block.code === statusError.code &&
+              block.message === statusError.message,
+          )
         ) {
-          patch.blocks = [
-            ...s.blocks,
+          blocks = [
+            ...blocks,
             {
               type: "error",
               ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
-              message: event.error.message,
+              message: statusError.message,
               source: "",
-              code: event.error.code,
+              code: statusError.code,
             } satisfies ErrorBlock,
           ];
         }
+        if (blocks !== s.blocks) patch.blocks = blocks;
         return patch;
       });
       // Refetch the snapshot at turn START too: the runner persists

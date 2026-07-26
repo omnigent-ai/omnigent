@@ -104,7 +104,7 @@ describe("BlockRenderer dispatch", () => {
       {
         kind: "error",
         itemId: null,
-        source: "",
+        source: "execution",
         code: "required_terminal_exited",
         message,
       },
@@ -115,6 +115,7 @@ describe("BlockRenderer dispatch", () => {
     const alert = screen.getByRole("alert");
     expect(alert).toHaveClass("min-w-0");
     expect(alert).toHaveClass("overflow-hidden");
+    expect(alert).toHaveClass("border-[0.5px]");
 
     const description = container.querySelector('[data-slot="alert-description"]');
     expect(description).not.toBeNull();
@@ -130,6 +131,39 @@ describe("BlockRenderer dispatch", () => {
     expect(messageNode.textContent).toContain(
       "  - first diagnostic line\n  - second diagnostic line",
     );
+    expect(screen.getByText("Error")).toBeInTheDocument();
+    expect(screen.getByText(/Source:/)).toHaveTextContent("execution");
+    expect(screen.getByText(/Code:/)).toHaveTextContent("required_terminal_exited");
+  });
+
+  it("explains runner disconnect recovery compactly", () => {
+    render(
+      <BlockRenderer
+        sessionStatus="failed"
+        items={[
+          {
+            kind: "error",
+            itemId: null,
+            source: "",
+            code: "runner_disconnected",
+            message: "Runner disconnected unexpectedly.",
+          },
+        ]}
+      />,
+    );
+
+    const title = screen.getByText("Runner disconnected");
+    const description = screen.getByText("Send another message to reconnect automatically.");
+    const alert = screen.getByRole("alert");
+
+    expect(title).toHaveClass("text-amber-700");
+    expect(description.parentElement).toHaveClass("text-foreground");
+    expect(alert.querySelector("svg")).toHaveClass("text-amber-700");
+    expect(alert).toHaveClass("bg-card");
+    expect(alert).not.toHaveClass("bg-amber-500/5");
+    expect(screen.queryByText(/the runner lost its connection/i)).not.toBeInTheDocument();
+    expect(alert).toHaveClass("py-1.5");
+    expect(screen.queryByRole("button", { name: "Reconnect now" })).not.toBeInTheDocument();
   });
 
   it("treats a trailing reasoning item as streaming when sessionStatus is running", () => {
