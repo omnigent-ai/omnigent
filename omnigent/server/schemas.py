@@ -1603,6 +1603,12 @@ class SessionResponse(BaseModel):
         still running" even though the session has settled to ``"idle"``.
         ``None`` (the default / omitted) when no shells are tracked.
     :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of the last row activity —
+        an item append, a title change, and so on. Generic activity,
+        NOT turn completion; a caller wanting the latter reads the
+        ``omnigent.last_turn_at`` label. Optional here (unlike the
+        required field on :class:`SessionListItem`) so a snapshot can
+        still be constructed without a conversation row.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -1815,6 +1821,7 @@ class SessionResponse(BaseModel):
     status: Literal["idle", "running", "waiting", "failed"]
     background_task_count: int | None = None
     created_at: int
+    updated_at: int | None = None
     title: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
