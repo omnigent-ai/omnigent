@@ -1403,7 +1403,12 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[0], TurnComplete)
             self.assertEqual(
                 events[0].usage,
-                {"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
+                {
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "total_tokens": 125,
+                    "model": "gpt-5.4-mini",
+                },
             )
             # The cached usage must be cleared after consumption so the next
             # turn doesn't inherit stale numbers.
@@ -2143,11 +2148,12 @@ def test_extract_codex_last_turn_usage_splits_cached_out_of_input() -> None:
             "total": {"inputTokens": 100, "outputTokens": 50, "totalTokens": 150},
         },
     }
-    assert _extract_codex_last_turn_usage(params) == {
+    assert _extract_codex_last_turn_usage(params, "gpt-5.4-mini") == {
         "input_tokens": 6,  # 7 total input - 1 cached
         "output_tokens": 3,
         "total_tokens": 10,
         "cache_read_input_tokens": 1,
+        "model": "gpt-5.4-mini",
     }
 
 
@@ -2160,7 +2166,35 @@ def test_extract_codex_last_turn_usage_no_cache_key_when_uncached() -> None:
     from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
 
     params = {"tokenUsage": {"last": {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}}}
-    assert _extract_codex_last_turn_usage(params) == {
+    assert _extract_codex_last_turn_usage(params, "gpt-5.4-mini") == {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+        "model": "gpt-5.4-mini",
+    }
+
+
+def test_extract_codex_last_turn_usage_stamps_resolved_model() -> None:
+    """The turn's resolved model is stamped into the usage dict as ``model``.
+
+    Without this, an agent spec that pins no ``llm.model`` (e.g. Debby's
+    ``gpt`` head, which deliberately runs on whatever model the codex
+    harness/provider resolves by default) has no signal the server can use to
+    attribute this turn's usage to a model — the flat session total still
+    accumulates, but ``session_usage.by_model`` silently never gets an entry
+    for it (see ``_extract_codex_last_turn_usage``'s docstring).
+    """
+    from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
+
+    params = {"tokenUsage": {"last": {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}}}
+    assert _extract_codex_last_turn_usage(params, "databricks-gpt-5-5") == {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10,
+        "model": "databricks-gpt-5-5",
+    }
+    # A falsy/empty resolved model must not synthesize a misleading key.
+    assert _extract_codex_last_turn_usage(params, "") == {
         "input_tokens": 7,
         "output_tokens": 3,
         "total_tokens": 10,
@@ -2171,11 +2205,11 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     """Missing or non-dict shapes return None rather than raising."""
     from omnigent.inner.codex_executor import _extract_codex_last_turn_usage
 
-    assert _extract_codex_last_turn_usage(None) is None
-    assert _extract_codex_last_turn_usage("not a dict") is None
-    assert _extract_codex_last_turn_usage({}) is None
-    assert _extract_codex_last_turn_usage({"tokenUsage": None}) is None
-    assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}) is None
+    assert _extract_codex_last_turn_usage(None, "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage("not a dict", "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage({}, "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage({"tokenUsage": None}, "gpt-5.4-mini") is None
+    assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}, "gpt-5.4-mini") is None
 
 
 def _make_skill_dir(root: Path, name: str) -> Path:
