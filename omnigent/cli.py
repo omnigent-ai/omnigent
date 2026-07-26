@@ -696,6 +696,18 @@ _LOCAL_DAEMON_ENV_PREFIXES: tuple[str, ...] = (
     "OMNIGENT_",
     "OPENAI_",
 )
+_HOST_DAEMON_PROXY_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    }
+)
 _HostJsonValue: TypeAlias = (
     str | int | float | bool | None | list["_HostJsonValue"] | dict[str, "_HostJsonValue"]
 )
@@ -3021,6 +3033,7 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
+            or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3032,7 +3045,9 @@ def _build_host_daemon_env(
         env = {
             key: value
             for key, value in os.environ.items()
-            if key in _RUNNER_ENV_ALLOWLIST or key.startswith(daemon_env_prefixes)
+            if key in _RUNNER_ENV_ALLOWLIST
+            or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key.startswith(daemon_env_prefixes)
         }
     return env
 
