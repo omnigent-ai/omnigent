@@ -27,6 +27,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -54,6 +55,10 @@ from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
+    LAST_CONTEXT_AT_LABEL_KEY,
+    LAST_CONTEXT_TOKENS_LABEL_KEY,
+    LAST_CONTEXT_WINDOW_LABEL_KEY,
+    LAST_TURN_AT_LABEL_KEY,
     is_session_closed,
     title_without_closed_marker,
 )
@@ -3437,6 +3442,120 @@ async def _runner_online_or_none(
     return online if isinstance(online, bool) else None
 
 
+def _server_now_from(resp: httpx.Response) -> int:
+    """
+    Read the server's clock from a response's ``Date`` header.
+
+    Every timestamp in a session snapshot is stamped by the server, while
+    this code runs on a runner that may be a container on another machine.
+    Subtracting a local clock from a server timestamp mixes the two and can
+    report a negative age, so ages are derived from the server's own clock
+    as of the response that carried the values.
+
+    :param resp: The response whose ``Date`` header to read.
+    :returns: Server epoch seconds, falling back to local time when the
+        header is missing or unparseable.
+    """
+    raw = resp.headers.get("date")
+    if raw:
+        try:
+            from email.utils import parsedate_to_datetime
+
+            return int(parsedate_to_datetime(raw).timestamp())
+        except (TypeError, ValueError):
+            pass
+    return int(time.time())
+
+
+def _int_label(labels: Any, key: str) -> int | None:
+    """
+    Read a non-negative integer label, or ``None`` when absent or malformed.
+
+    Labels are stored as strings, so the context metrics and turn stamps
+    all arrive as digit text.
+
+    :param labels: The snapshot's ``labels`` mapping (any type — a
+        non-mapping is treated as absent).
+    :param key: Label key to read, e.g. ``"omnigent.last_turn_at"``.
+    :returns: The parsed integer, or ``None``.
+    """
+    if not isinstance(labels, dict):
+        return None
+    raw = labels.get(key)
+    return int(raw) if isinstance(raw, str) and raw.isdigit() else None
+
+
+def _seconds_since(moment: int | None, server_now: int) -> int | None:
+    """
+    Age of *moment* against the server's clock, floored at zero.
+
+    :param moment: Epoch seconds being aged, or ``None``.
+    :param server_now: Server epoch seconds to measure against.
+    :returns: Non-negative seconds elapsed, or ``None`` when *moment* is
+        ``None``. Clamped so a server clock that ticks backwards between
+        two responses reports ``0`` rather than a negative age.
+    """
+    return None if moment is None else max(0, server_now - moment)
+
+
+def _context_block(snap: dict[str, Any], server_now: int) -> dict[str, Any]:
+    """
+    Project a session's context occupancy from its snapshot.
+
+    Always returns the block, with null readings and ``stale`` set when
+    nothing has been measured — an absent key reads to a model as "this
+    tool cannot report that", where an explicit null reads as "unknown
+    right now", which is the true state.
+
+    ``stale`` is advisory and deliberately conservative: it is set when
+    there is no measurement, when a turn is in flight (the reading
+    necessarily predates the current prompt), and when the row saw
+    activity after the reading was taken. ``status`` remains the
+    authoritative answer to "is this session working".
+
+    Accepts either shape the server serves: the single-session snapshot,
+    which resolves ``last_total_tokens`` / ``context_window`` into named
+    fields, or a session-list row, which carries neither and is read from
+    its labels instead. A list row's window is therefore known only once a
+    harness has reported one — the snapshot's spec-derived fallback isn't
+    computed per row, since resolving it can hit the provider catalog.
+
+    :param snap: A session snapshot or session-list row.
+    :param server_now: Server epoch seconds, for the age.
+    :returns: The context block.
+    """
+    labels = snap.get("labels")
+    tokens = snap.get("last_total_tokens")
+    if tokens is None:
+        tokens = _int_label(labels, LAST_CONTEXT_TOKENS_LABEL_KEY)
+    window = snap.get("context_window")
+    if window is None:
+        window = _int_label(labels, LAST_CONTEXT_WINDOW_LABEL_KEY)
+    measured_at = _int_label(labels, LAST_CONTEXT_AT_LABEL_KEY)
+    updated_at = snap.get("updated_at")
+
+    used_fraction: float | None = None
+    if isinstance(tokens, int) and isinstance(window, int) and window > 0:
+        # Not clamped to 1.0: a fill above the window is real information
+        # (a lagging post-compaction reading, or a wrong window), and
+        # hiding it would mask exactly the case worth acting on.
+        used_fraction = round(tokens / window, 3)
+
+    stale = (
+        measured_at is None
+        or snap.get("status") == "running"
+        or (isinstance(updated_at, int) and updated_at > measured_at)
+    )
+    return {
+        "tokens": tokens,
+        "window": window,
+        "used_fraction": used_fraction,
+        "as_of": measured_at,
+        "age_seconds": _seconds_since(measured_at, server_now),
+        "stale": stale,
+    }
+
+
 async def _session_get_info_via_rest(
     args: dict[str, Any],
     conversation_id: str,
@@ -3455,6 +3574,12 @@ async def _session_get_info_via_rest(
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound). The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
+
+    Also projects the state a caller needs to manage the session's context
+    deliberately rather than run it until something breaks: a ``context``
+    block (see :func:`_context_block`) and the turn timestamps. Ages are
+    measured against the server's clock (see :func:`_server_now_from`),
+    not the runner's.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
     (the server denied the read, so from the caller's vantage the target
@@ -3483,6 +3608,8 @@ async def _session_get_info_via_rest(
         return json.dumps({"error": f"sys_session_get_info returned {resp.status_code}"})
     snap: dict[str, Any] = resp.json()
     pending = snap.get("pending_elicitations") or []
+    server_now = _server_now_from(resp)
+    last_turn_completed_at = _int_label(snap.get("labels"), LAST_TURN_AT_LABEL_KEY)
     return json.dumps(
         {
             "session_id": snap.get("id"),
@@ -3513,6 +3640,16 @@ async def _session_get_info_via_rest(
             # waiting on.
             "pending_elicitations": pending,
             "pending_elicitation_count": len(pending),
+            # Context occupancy, for deciding whether to compact this session
+            # or hand its task to a fresh one before it hits the wall.
+            "context": _context_block(snap, server_now),
+            # When the session last stopped working, and how long ago. Both
+            # are needed: the caller has no clock relationship to the server,
+            # and the elapsed time is what a cache-warmth decision turns on.
+            "last_turn_completed_at": last_turn_completed_at,
+            "seconds_since_last_turn": _seconds_since(last_turn_completed_at, server_now),
+            "created_at": snap.get("created_at"),
+            "updated_at": snap.get("updated_at"),
         }
     )
 
@@ -4193,7 +4330,10 @@ async def _collect_global_sessions(
     Fetch the global session list via ``GET /v1/sessions``, with connectivity.
 
     Projects each accessible session to ``{session_id, agent_name, title,
-    status, runner_id, runner_online, parent_session_id}``.
+    status, runner_id, runner_online, parent_session_id}`` plus its
+    context state (``context_*``, flattened — see :func:`_context_block`)
+    and ``seconds_since_last_turn``, so a caller can pick which session to
+    act on without a follow-up ``sys_session_get_info`` per row.
     ``runner_online`` is resolved once per unique bound runner (see
     :func:`_resolve_runner_online_map`). An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
@@ -4218,6 +4358,8 @@ async def _collect_global_sessions(
     if not isinstance(rows, list):
         return []
     online = await _resolve_runner_online_map(rows, server_client)
+    server_now = _server_now_from(resp)
+    contexts = [_context_block(r, server_now) for r in rows]
     return [
         {
             "session_id": r.get("id"),
@@ -4231,8 +4373,19 @@ async def _collect_global_sessions(
             "runner_id": r.get("runner_id"),
             "runner_online": online.get(r.get("runner_id")),
             "parent_session_id": r.get("parent_session_id"),
+            # Context state, flattened rather than nested as on
+            # ``sys_session_get_info``: these rows are scanned in bulk, where
+            # a nested object per row costs far more to read than it informs.
+            "context_tokens": ctx["tokens"],
+            "context_window": ctx["window"],
+            "context_used_fraction": ctx["used_fraction"],
+            "context_as_of": ctx["as_of"],
+            "context_stale": ctx["stale"],
+            "seconds_since_last_turn": _seconds_since(
+                _int_label(r.get("labels"), LAST_TURN_AT_LABEL_KEY), server_now
+            ),
         }
-        for r in rows
+        for r, ctx in zip(rows, contexts, strict=True)
     ]
 
 

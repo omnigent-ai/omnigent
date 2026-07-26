@@ -5634,6 +5634,8 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
     assert sessions_params.get("agent_name") == "researcher"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
+    # Rows carry no context labels here, so every context field reads null
+    # and ``context_stale`` is true — "not measured", not "measured empty".
     assert out["sessions"] == [
         {
             "session_id": "s1",
@@ -5643,6 +5645,12 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "context_tokens": None,
+            "context_window": None,
+            "context_used_fraction": None,
+            "context_as_of": None,
+            "context_stale": True,
+            "seconds_since_last_turn": None,
         },
         {
             "session_id": "s2",
@@ -5652,12 +5660,85 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "context_tokens": None,
+            "context_window": None,
+            "context_used_fraction": None,
+            "context_as_of": None,
+            "context_stale": True,
+            "seconds_since_last_turn": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
     # r1, so exactly one status call (not one per session). A count of 2
     # would mean the dedup regressed into a per-session fan-out.
     assert runner_status_calls == ["r1"]
+
+
+@pytest.mark.asyncio
+async def test_session_list_rows_read_context_from_labels() -> None:
+    """Global ``sessions`` rows carry context state, sourced from labels.
+
+    List rows are ``SessionListItem``, which has no resolved
+    ``last_total_tokens`` / ``context_window`` fields — only ``labels``. So
+    a caller can rank sub-agents by occupancy from one list call instead of
+    a ``sys_session_get_info`` per row.
+    """
+    from email.utils import formatdate
+
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/sessions/conv_x/child_sessions":
+            return httpx.Response(200, json={"object": "list", "data": []})
+        if path == "/v1/sessions/conv_x":
+            return httpx.Response(200, json={"id": "conv_x", "parent_session_id": None})
+        if path == "/v1/sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "s1",
+                            "agent_name": "researcher",
+                            "title": "auth",
+                            "status": "idle",
+                            "runner_id": None,
+                            "parent_session_id": None,
+                            "updated_at": _SERVER_NOW - 700,
+                            "labels": {
+                                "omnigent.last_context_tokens": "150000",
+                                "omnigent.last_context_window": "200000",
+                                "omnigent.last_context_at": str(_SERVER_NOW - 600),
+                                "omnigent.last_turn_at": str(_SERVER_NOW - 300),
+                            },
+                        },
+                    ],
+                },
+                headers={"date": formatdate(_SERVER_NOW, usegmt=True)},
+            )
+        raise AssertionError(f"unexpected path {path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_list",
+                "{}",
+                conversation_id="conv_x",
+                server_client=client,
+            )
+        )
+
+    row = out["sessions"][0]
+    # Flat on rows, not the nested block get_info returns — these are read
+    # in bulk.
+    assert row["context_tokens"] == 150_000
+    assert row["context_window"] == 200_000
+    assert row["context_used_fraction"] == 0.75
+    assert row["context_as_of"] == _SERVER_NOW - 600
+    assert row["context_stale"] is False
+    assert row["seconds_since_last_turn"] == 300
 
 
 @pytest.mark.asyncio
@@ -6730,6 +6811,201 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     assert info["pending_elicitations"] == [{"id": "el_1"}, {"id": "el_2"}]
     # Metadata-only: the full transcript is never embedded.
     assert "items" not in info
+
+
+# Fixed server clock for the context/timestamp cases, so ages are exact
+# rather than "roughly now" — a projection that silently fell back to the
+# runner's own clock would drift off these values.
+_SERVER_NOW = 1_785_000_000
+
+
+def _snapshot_with_context(
+    *,
+    status: str = "idle",
+    labels: dict[str, str] | None = None,
+    updated_at: int = _SERVER_NOW - 700,
+    last_total_tokens: int | None = 48_213,
+    context_window: int | None = 200_000,
+) -> dict[str, Any]:
+    """Build a session snapshot carrying context metrics.
+
+    :param status: Session status, e.g. ``"running"``.
+    :param labels: Session labels; defaults to a measurement 600s old and a
+        turn that ended 300s ago.
+    :param updated_at: Row activity time.
+    :param last_total_tokens: Context tokens in use, or ``None``.
+    :param context_window: Context window, or ``None``.
+    :returns: A snapshot dict for the mock ``GET /v1/sessions/{id}``.
+    """
+    return {
+        "id": "conv_target",
+        "agent_id": "ag_xyz",
+        "agent_name": "researcher",
+        "status": status,
+        "created_at": _SERVER_NOW - 10_000,
+        "updated_at": updated_at,
+        "labels": {
+            "omnigent.last_context_at": str(_SERVER_NOW - 600),
+            "omnigent.last_turn_at": str(_SERVER_NOW - 300),
+        }
+        if labels is None
+        else labels,
+        "last_total_tokens": last_total_tokens,
+        "context_window": context_window,
+        "runner_id": None,
+        "pending_elicitations": [],
+    }
+
+
+async def _get_info_with(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Run ``sys_session_get_info`` against a snapshot on a pinned server clock.
+
+    The ``Date`` header is what the projection ages timestamps against, so
+    pinning it makes the derived seconds deterministic.
+
+    :param snapshot: Snapshot the mock server returns.
+    :returns: The parsed tool output.
+    """
+    from email.utils import formatdate
+
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json=snapshot,
+                headers={"date": formatdate(_SERVER_NOW, usegmt=True)},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+    return json.loads(output)
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_projects_context_and_turn_timestamps() -> None:
+    """
+    ``sys_session_get_info`` reports context occupancy and turn recency.
+
+    These are what let a caller choose deliberately between compacting a
+    session and handing its task to a fresh one: how full the window is,
+    and whether the cached prefix is likely still warm. Ages are measured
+    against the server's ``Date`` header, since the runner's own clock has
+    no defined relationship to the timestamps in the snapshot.
+    """
+    info = await _get_info_with(_snapshot_with_context())
+
+    assert info["context"]["tokens"] == 48_213
+    assert info["context"]["window"] == 200_000
+    # 48213 / 200000 = 0.241065, rounded so the model isn't handed
+    # 0.24106500000000002.
+    assert info["context"]["used_fraction"] == 0.241
+    assert info["context"]["as_of"] == _SERVER_NOW - 600
+    assert info["context"]["age_seconds"] == 600
+    # Measured, not mid-turn, and no row activity since — the reading
+    # describes the session as it stands.
+    assert info["context"]["stale"] is False
+
+    assert info["last_turn_completed_at"] == _SERVER_NOW - 300
+    assert info["seconds_since_last_turn"] == 300
+    assert info["created_at"] == _SERVER_NOW - 10_000
+    assert info["updated_at"] == _SERVER_NOW - 700
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_context_stale_while_turn_in_flight() -> None:
+    """A running turn marks the reading stale.
+
+    The measurement necessarily predates the prompt now being processed,
+    so acting on it would size the window against the previous turn.
+    """
+    info = await _get_info_with(_snapshot_with_context(status="running"))
+
+    assert info["context"]["stale"] is True
+    # Still reported — stale means "treat as a lower bound", not "unusable".
+    assert info["context"]["tokens"] == 48_213
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_context_stale_when_row_changed_after_reading() -> None:
+    """Row activity after the reading marks it stale.
+
+    Items appended since the measurement are context the reading doesn't
+    account for. Writing the fill labels does not touch ``updated_at``, so
+    this compares two independent clocks rather than always tripping.
+    """
+    info = await _get_info_with(_snapshot_with_context(updated_at=_SERVER_NOW - 60))
+
+    assert info["context"]["stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_context_present_but_null_when_never_measured() -> None:
+    """An unmeasured session reports nulls, not a missing ``context`` key.
+
+    A missing key reads to a model as "this tool cannot report occupancy";
+    an explicit null with ``stale`` set reads as "not known right now",
+    which is the true state and the one worth retrying.
+    """
+    info = await _get_info_with(
+        _snapshot_with_context(labels={}, last_total_tokens=None, context_window=None)
+    )
+
+    assert info["context"] == {
+        "tokens": None,
+        "window": None,
+        "used_fraction": None,
+        "as_of": None,
+        "age_seconds": None,
+        "stale": True,
+    }
+    assert info["last_turn_completed_at"] is None
+    assert info["seconds_since_last_turn"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_ages_never_go_negative() -> None:
+    """A timestamp ahead of the server clock reports zero, not a negative age.
+
+    Clock skew between the write and the read must not produce a negative
+    "seconds ago", which reads as a bug rather than as freshness.
+    """
+    info = await _get_info_with(
+        _snapshot_with_context(
+            labels={
+                "omnigent.last_context_at": str(_SERVER_NOW + 120),
+                "omnigent.last_turn_at": str(_SERVER_NOW + 120),
+            }
+        )
+    )
+
+    assert info["context"]["age_seconds"] == 0
+    assert info["seconds_since_last_turn"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_used_fraction_reports_overfull_window() -> None:
+    """A fill above the window is reported as-is, not clamped to 1.0.
+
+    An over-window reading means something worth acting on — a lagging
+    post-compaction measurement, or a window that isn't what was assumed.
+    Clamping would hide exactly the case that needs attention.
+    """
+    info = await _get_info_with(
+        _snapshot_with_context(last_total_tokens=220_000, context_window=200_000)
+    )
+
+    assert info["context"]["used_fraction"] == 1.1
 
 
 @pytest.mark.asyncio
