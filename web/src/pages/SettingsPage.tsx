@@ -148,6 +148,7 @@ import {
   PALETTES,
   type PaletteSwatch,
   readThemePalette,
+  themePaletteLabel,
   type ThemeSelection,
   writeThemePalette,
 } from "@/lib/themePalette";
@@ -581,6 +582,7 @@ function ColorThemeControl() {
     selection === "custom"
       ? null
       : (PALETTES.find((palette) => palette.id === selection) ?? PALETTES[0]);
+  const customBasePalette = PALETTES.find((palette) => palette.id === customTheme.basePalette);
   const editableTheme = selectedPalette
     ? createCustomThemeFromPalette(selectedPalette)
     : customTheme;
@@ -608,11 +610,12 @@ function ColorThemeControl() {
   const selected =
     selection === "custom"
       ? {
-          label: "Custom",
           light: customSwatches.light,
           dark: customSwatches.dark,
         }
       : selectedPalette!;
+  const selectedLabel =
+    selection === "custom" ? "Custom" : themePaletteLabel(selectedPalette!, isDark);
 
   return (
     <ThemeSubsection
@@ -630,7 +633,7 @@ function ColorThemeControl() {
               <div className="text-sm font-medium">Theme palette</div>
               <div className="truncate text-xs text-muted-foreground">
                 {selection === "custom"
-                  ? `Based on ${PALETTES.find((palette) => palette.id === customTheme.basePalette)?.label ?? "Omnigent"}`
+                  ? `Based on ${customBasePalette ? themePaletteLabel(customBasePalette, isDark) : "Omnigent"}`
                   : selectedPalette?.blurb}
               </div>
             </div>
@@ -648,7 +651,7 @@ function ColorThemeControl() {
             >
               <SelectValue>
                 <PaletteChip swatch={isDark ? selected.dark : selected.light} />
-                <span>{selected.label}</span>
+                <span>{selectedLabel}</span>
               </SelectValue>
             </SelectTrigger>
             <SelectContent>
@@ -659,7 +662,7 @@ function ColorThemeControl() {
                   data-testid={`palette-${palette.id}`}
                 >
                   <PaletteChip swatch={isDark ? palette.dark : palette.light} />
-                  <span>{palette.label}</span>
+                  <span>{themePaletteLabel(palette, isDark)}</span>
                 </SelectItem>
               ))}
               <SelectItem value="custom" data-testid="palette-custom">
