@@ -75,10 +75,12 @@ export function formatClockTime(hour: number, minute: number): string {
  * INTERVAL>1 rules); here the instant comes from the server and only the
  * "how far away" is derived, so the removal rule is not violated.
  *
- * Buckets (floor of the chosen unit — standard time-remaining convention),
- * with a singular noun when the value is exactly 1:
+ * Buckets (rounded to the nearest of the chosen unit — the closest "about how
+ * long" reading), with a singular noun when the value is exactly 1:
  *   < 60 min → `in N min(s)` (minimum `in 1 min`), < 24 h → `in N hour(s)`,
- *   else `in N day(s)`.
+ *   else `in N day(s)`. Each threshold uses the already-rounded value so a delta
+ *   that rounds up to a full unit promotes to the next unit (never `in 60 mins`
+ *   or `in 24 hours`).
  * A delta at or below ~0 (imminent / just passed due to clock skew) → `soon`.
  * Returns `null` for a null / unparseable `iso` so the caller renders nothing.
  *
@@ -96,9 +98,17 @@ export function formatNextRunAt(
   const deltaMs = instant.getTime() - now.getTime();
   // Imminent or just-passed (timing skew): don't render a "0 mins" / negative delta.
   if (deltaMs < MIN_MS) return "soon";
-  if (deltaMs < HOUR_MS) return `in ${pluralize(Math.floor(deltaMs / MIN_MS), "min")}`;
-  if (deltaMs < DAY_MS) return `in ${pluralize(Math.floor(deltaMs / HOUR_MS), "hour")}`;
-  return `in ${pluralize(Math.floor(deltaMs / DAY_MS), "day")}`;
+  // Round to nearest — the closest approximation of "about how long" (a 1h49m
+  // delta reads "in 2 hours", not the floored "in 1 hour"). Each guard tests the
+  // ALREADY-ROUNDED value so a delta that rounds up to a full unit PROMOTES to
+  // the next unit rather than printing "in 60 mins" / "in 24 hours" (e.g. 59m40s
+  // → "in 1 hour", 23h40m → "in 1 day").
+  const mins = Math.round(deltaMs / MIN_MS);
+  if (mins < 60) return `in ${pluralize(mins, "min")}`;
+  const hours = Math.round(deltaMs / HOUR_MS);
+  if (hours < 24) return `in ${pluralize(hours, "hour")}`;
+  const days = Math.round(deltaMs / DAY_MS);
+  return `in ${pluralize(days, "day")}`;
 }
 
 /** `1 min` / `8 mins` — singular noun only when the count is exactly 1. */
