@@ -487,7 +487,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
           data-testid="run-status-dot"
           data-run-icon="unread"
           data-run-unread={true}
-          className="size-2.5 shrink-0 rounded-full bg-blue-500"
+          className="size-2.5 shrink-0 rounded-full bg-brand-accent"
         />
       </IndicatorWithTooltip>
     );

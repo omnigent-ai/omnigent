@@ -2,7 +2,7 @@
 // + configuration + run-history rendering from mocked hooks, the header actions
 // (Run now fires the mutation + shows a toast, delete navigates back, edit opens the dialog),
 // and the run-row rendering rules: the LEFT status-icon column (failed triangle
-// > skipped calendar-off > running pulsing dot > succeeded-unread blue dot > succeeded-read grey dot),
+// > skipped calendar-off > running spinner > succeeded-unread brand-accent dot > succeeded-read grey dot),
 // duration, errorCode messages, and the whole-row click affordance (a run with a
 // conversation is a link; a skipped run is not) — never a fabricated summary.
 //
@@ -427,17 +427,18 @@ describe("run history", () => {
     expect(link.className).toContain("hover:bg-muted");
   });
 
-  it("renders a BLUE unread dot with an 'Unread' tooltip for an unread success", async () => {
+  it("renders an unread dot (brand-accent) with an 'Unread' tooltip for an unread success", async () => {
     isConversationUnseen.mockReturnValue(true);
     setTask(task());
     setRuns([run({ status: "succeeded", conversationId: "c_9" })]);
     renderPage();
     const row = screen.getByTestId("task-detail-run");
-    // The dot flips to blue once the unread query resolves.
+    // The dot flips to the unread state once the unread query resolves.
     await waitFor(() => expect(row).toHaveAttribute("data-run-unread", "true"));
     const dot = within(row).getByTestId("run-status-dot");
     expect(dot).toHaveAttribute("data-run-icon", "unread");
-    expect(dot.className).toContain("bg-blue-500");
+    // Color matches the sidebar's unread indicator (brand-accent, not blue-500).
+    expect(dot.className).toContain("bg-brand-accent");
     // No status ICON (that leading slot only holds fail/skip icons).
     expect(within(row).queryByTestId("run-status-icon")).toBeNull();
     // Focusing the tooltip trigger (Radix opens on focus in jsdom) → "Unread".

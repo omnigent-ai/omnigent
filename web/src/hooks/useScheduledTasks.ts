@@ -134,9 +134,12 @@ export function useDeleteScheduledTask() {
 }
 
 // Max attempts and interval for the post-run-now accelerated poll. The poll
-// stops as soon as a new run row appears, or after the cap (~10s ceiling).
-const RUN_NOW_POLL_MAX = 10;
+// stops when the newest run reaches a terminal status, or after the cap (~20s
+// ceiling — enough to cover the typical ~5s running→succeeded transition).
+const RUN_NOW_POLL_MAX = 20;
 const RUN_NOW_POLL_INTERVAL_MS = 1_000;
+
+const TERMINAL_STATUSES = new Set(["succeeded", "failed", "skipped"]);
 
 // Guard against stacking pollers when Run now is clicked rapidly. One active
 // poller per task id at a time — the timer id is stored here and cleared when
@@ -146,11 +149,13 @@ const runNowPollers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 /**
  * Trigger an immediate ("run now") fire of a task, then refresh the list and
  * that task's run history. The server returns 202 (fire-and-forget) and writes
- * the run row in the background, so a single invalidate would miss it until the
- * 60s background poll. To make the new run appear within ~1-2s, we kick off a
- * bounded accelerated poll of the runs query after success: refetch every 1s
- * until a new run row lands or after 10 attempts (~10s ceiling), then do a
- * final invalidate and stop.
+ * the run row in the background as status "running", then transitions it to a
+ * terminal status ("succeeded"/"failed"/"skipped") a few seconds later. A
+ * single invalidate would miss both transitions. We kick off a bounded
+ * accelerated poll: refetch every 1s until the newest run reaches a terminal
+ * status, or after the 20-attempt cap (~20s ceiling), then final-invalidate and
+ * stop. This ensures the spinner resolves and the unread dot appears once the
+ * run completes.
  */
 export function useRunScheduledTaskNow() {
   const queryClient = useQueryClient();
@@ -164,9 +169,9 @@ export function useRunScheduledTaskNow() {
       // refresh (mirrors the old behaviour; the poll below is additive).
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(id) });
 
-      // Snapshot the pre-fire run count so we know when a new row has landed.
+      // Snapshot the pre-fire newest-run id so we can identify the new row.
       const pre = queryClient.getQueryData<ScheduledTaskRun[]>(scheduledTaskRunsKey(id));
-      const preCount = pre?.length ?? 0;
+      const preNewestId = pre?.[0]?.id ?? null;
 
       // Cancel any in-flight poller for this task (double-click guard).
       const existing = runNowPollers.get(id);
@@ -178,9 +183,14 @@ export function useRunScheduledTaskNow() {
         attempts += 1;
         void queryClient.refetchQueries({ queryKey: scheduledTaskRunsKey(id) }).then(() => {
           const current = queryClient.getQueryData<ScheduledTaskRun[]>(scheduledTaskRunsKey(id));
-          const currentCount = current?.length ?? 0;
-          if (currentCount > preCount || attempts >= RUN_NOW_POLL_MAX) {
-            // New row appeared (or cap reached) — do a final broad invalidate and stop.
+          // The newest run is index 0 (most-recent-first). We only stop once the
+          // RUN WE JUST FIRED has reached a terminal status — a new row that is
+          // still "running"/"scheduled" keeps the poll going.
+          const newestRun = current?.[0];
+          const isNewRun = newestRun != null && newestRun.id !== preNewestId;
+          const isTerminal = isNewRun && TERMINAL_STATUSES.has(newestRun.status);
+          if (isTerminal || attempts >= RUN_NOW_POLL_MAX) {
+            // Terminal (or cap reached) — final invalidate and stop.
             runNowPollers.delete(id);
             void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(id) });
           } else {

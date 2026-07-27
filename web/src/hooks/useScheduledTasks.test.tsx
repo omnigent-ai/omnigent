@@ -132,98 +132,119 @@ describe("mutations invalidate the list", () => {
   });
 });
 
+const RUNNING_RUN: api.ScheduledTaskRun = { ...RUN, status: "running" };
+const SUCCEEDED_RUN: api.ScheduledTaskRun = { ...RUN, status: "succeeded" };
+
+function countRunRefetches(spy: { mock: { calls: unknown[][] } }) {
+  return spy.mock.calls.filter(
+    (args) =>
+      JSON.stringify(args[0]) === JSON.stringify({ queryKey: scheduledTaskRunsKey("st_1") }),
+  ).length;
+}
+
 describe("run-now fast-poll after 202", () => {
-  it("starts polling runs after run-now and stops once a new row appears", async () => {
+  it("keeps polling while the newest run is 'running' and stops once it reaches a terminal status", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { queryClient, wrapper } = makeWrapper();
+      queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
 
-    const { queryClient, wrapper } = makeWrapper();
+      // First refetch returns running; second returns succeeded (terminal).
+      vi.mocked(api.listScheduledTaskRuns)
+        .mockResolvedValueOnce([RUNNING_RUN])
+        .mockResolvedValue([SUCCEEDED_RUN]);
 
-    // Seed the runs query directly so there is no async waitFor needed.
-    queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
+      const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
+      const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
 
-    // First refetch still returns empty; subsequent return [RUN] (new row appeared).
-    vi.mocked(api.listScheduledTaskRuns).mockResolvedValueOnce([]).mockResolvedValue([RUN]);
+      await act(async () => {
+        void result.current.mutateAsync("st_1");
+        await Promise.resolve();
+      });
 
-    const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
+      // 1s: first poll — sees RUNNING_RUN (non-terminal), keeps going.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      expect(countRunRefetches(refetchSpy)).toBeGreaterThanOrEqual(1);
 
-    const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
+      // 1s: second poll — sees SUCCEEDED_RUN (terminal), stops.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+      const countAfterStop = countRunRefetches(refetchSpy);
+      expect(countAfterStop).toBeGreaterThanOrEqual(2);
 
-    // Fire the mutation (202 response resolves, onSuccess runs synchronously in fake-timer mode).
-    await act(async () => {
-      void result.current.mutateAsync("st_1");
-      // Drain microtasks so onSuccess fires.
-      await Promise.resolve();
-    });
-
-    // Advance 1s → first poll fires and resolves.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_000);
-    });
-
-    // Advance 1s → second poll fires (run now visible, poller should stop after this).
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_000);
-    });
-
-    // At least 2 refetches of the runs query (poll started and ran).
-    const runRefetches = refetchSpy.mock.calls.filter(
-      (args) =>
-        JSON.stringify(args[0]) === JSON.stringify({ queryKey: scheduledTaskRunsKey("st_1") }),
-    );
-    expect(runRefetches.length).toBeGreaterThanOrEqual(2);
-
-    // The poll is bounded: even after a further 5s, total refetches stay <= the cap.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(5_000);
-    });
-    const totalRunRefetches = refetchSpy.mock.calls.filter(
-      (args) =>
-        JSON.stringify(args[0]) === JSON.stringify({ queryKey: scheduledTaskRunsKey("st_1") }),
-    );
-    expect(totalRunRefetches.length).toBeLessThanOrEqual(10);
-
-    vi.useRealTimers();
+      // No more refetches in the next 5s — poller has stopped.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(countRunRefetches(refetchSpy)).toBeLessThanOrEqual(20);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("run-now stops polling after the attempt cap even without a new row", async () => {
+  it("does NOT stop early when the new row is still running (non-terminal)", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { queryClient, wrapper } = makeWrapper();
+      queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
 
-    const { queryClient, wrapper } = makeWrapper();
+      // Runs always return the running row — never transitions to terminal.
+      vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
 
-    // Seed empty runs directly — no async fetch needed.
-    queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
+      const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
+      const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
 
-    // Runs never appear — always empty.
-    vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([]);
+      await act(async () => {
+        void result.current.mutateAsync("st_1");
+        await Promise.resolve();
+      });
 
-    const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
+      // After 3 polls (3s) the poller is still going (run still running).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3_000);
+      });
+      expect(countRunRefetches(refetchSpy)).toBeGreaterThanOrEqual(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
-    const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
+  it("run-now stops polling after the attempt cap even without a terminal run", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { queryClient, wrapper } = makeWrapper();
+      queryClient.setQueryData(scheduledTaskRunsKey("st_1"), [] as api.ScheduledTaskRun[]);
 
-    await act(async () => {
-      void result.current.mutateAsync("st_1");
-      await Promise.resolve();
-    });
+      // Runs never terminal — always returns running row (simulates stuck run).
+      vi.mocked(api.listScheduledTaskRuns).mockResolvedValue([RUNNING_RUN]);
 
-    // Advance past the 10-attempt cap (10 × 1s + 1s buffer).
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(11_000);
-    });
+      const refetchSpy = vi.spyOn(queryClient, "refetchQueries");
+      const { result } = renderHook(() => useRunScheduledTaskNow(), { wrapper });
 
-    const runRefetches = refetchSpy.mock.calls.filter(
-      (args) =>
-        JSON.stringify(args[0]) === JSON.stringify({ queryKey: scheduledTaskRunsKey("st_1") }),
-    );
-    // At most _RUN_NOW_POLL_MAX (10) poll refetches.
-    expect(runRefetches.length).toBeLessThanOrEqual(10);
+      await act(async () => {
+        void result.current.mutateAsync("st_1");
+        await Promise.resolve();
+      });
 
-    // No more refetches after another 5s.
-    const countAfterCap = refetchSpy.mock.calls.length;
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(5_000);
-    });
-    expect(refetchSpy.mock.calls.length).toBe(countAfterCap);
+      // Advance past the 20-attempt cap (20 × 1s + 1s buffer).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(21_000);
+      });
 
-    vi.useRealTimers();
+      // At most RUN_NOW_POLL_MAX (20) poll refetches.
+      expect(countRunRefetches(refetchSpy)).toBeLessThanOrEqual(20);
+
+      // No more refetches after another 5s.
+      const countAfterCap = refetchSpy.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+      expect(refetchSpy.mock.calls.length).toBe(countAfterCap);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
