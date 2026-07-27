@@ -51,6 +51,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
+  CLAUDE_NATIVE_EFFORTS,
   ConfigRow,
   DescribedSelect,
   EFFORT_SELECT_NONE,
@@ -207,22 +208,6 @@ const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; descriptio
     label: "Bypass permissions",
     description: "Runs everything; no prompts or safety checks",
   },
-];
-
-// Claude-native reasoning-effort options for the new-session model/effort
-// picker. There is deliberately no hardcoded model/effort default: a fresh
-// session leaves both unselected and omits `model_override` / `reasoning_effort`
-// from the create, so Claude Code falls back to its own configured model — the
-// same "no override" semantics the in-session picker's `null` state and the
-// `/model default` / `/effort default` commands use. Effort levels mirror
-// CLAUDE_NATIVE_EFFORT_LEVELS in ChatPage's in-session picker (ANTHROPIC_EFFORTS
-// server-side).
-const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "xHigh" },
-  { value: "max", label: "Max" },
 ];
 
 // Cursor execution modes. "default" sends no flags; other values map to CLI
