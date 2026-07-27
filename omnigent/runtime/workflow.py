@@ -1997,13 +1997,15 @@ def _build_copilot_spawn_env(
     Build the ``HARNESS_COPILOT_*`` env-var dict the copilot harness wrap reads.
 
     Maps spec.executor fields → the ``HARNESS_COPILOT_*`` env vars defined in
-    ``omnigent/inner/copilot_harness.py`` and the ``copilot-native`` shim.
-    Like the cursor / antigravity
-    builders there is NO gateway or Databricks-profile resolution: the GitHub
-    Copilot SDK talks only to GitHub's Copilot backend (a GitHub token) and has
-    no custom API base-URL override, so it never routes through the Databricks
-    AI gateway. That is also why copilot is intentionally absent from
-    :data:`AgentHarnessType` and the gateway/ucode dicts above.
+    ``omnigent/inner/copilot_harness.py``. Scoped to the SDK ``copilot`` harness
+    only: ``copilot-native`` reads none of these vars — it is a tmux-hosted TUI
+    whose credentials reach the pane through the terminal env, and whose own
+    bridge vars come from ``build_copilot_native_spawn_env``. Like the cursor /
+    antigravity builders there is NO gateway or Databricks-profile resolution:
+    the GitHub Copilot SDK talks only to GitHub's Copilot backend (a GitHub
+    token) and has no custom API base-URL override, so it never routes through
+    the Databricks AI gateway. That is also why copilot has no gateway/ucode
+    entry in the dicts above.
 
     Auth: an explicit ``executor.auth: {type: api_key, api_key: ...}`` carries
     the GitHub token, forwarded as ``HARNESS_COPILOT_GITHUB_TOKEN`` (the copilot

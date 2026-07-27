@@ -8,10 +8,23 @@ from typing import Any
 
 import pytest
 
-from omnigent.copilot_native_bridge import read_tmux_info
+from omnigent.copilot_native_bridge import (
+    BRIDGE_DIR_ENV_VAR,
+    REQUEST_SESSION_ID_ENV_VAR,
+    bridge_dir_for_session_id,
+    read_tmux_info,
+)
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.runner import create_runner_app
+from omnigent.runner.app import ResolvedSpec
 from omnigent.runner.native.orchestration import _auto_create_copilot_terminal
 from omnigent.runner.resource_registry import COPILOT_NATIVE_TERMINAL_ROLE
+from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests.runner.conftest import (
+    _FakeProcessManager,
+    _runner_client,
+    _ScriptedHarnessClient,
+)
 from tests.runner.helpers import NullServerClient
 
 _SESSION_ID = "conv_copilot_native_1"
@@ -182,3 +195,55 @@ async def test_auto_create_copilot_terminal_tears_down_on_publish_failure(
         )
 
     assert registry.closed == ["terminal_copilot_main"]
+
+
+@pytest.mark.asyncio
+async def test_copilot_native_spawn_env_carries_the_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The harness process is spawned with the native bridge env vars.
+
+    ``CopilotNativeExecutor`` raises on construction without
+    ``HARNESS_COPILOT_NATIVE_BRIDGE_DIR``, so the first web turn died before
+    anything reached tmux. The copilot branch cannot use the peer
+    ``spawn_env is None`` idiom: the spec-derived dict is non-empty, so the
+    bridge vars have to be merged in rather than substituted.
+    """
+    import omnigent.copilot_native_bridge as copilot_native_bridge
+
+    monkeypatch.setattr(copilot_native_bridge, "_BRIDGE_ROOT", tmp_path / "copilot-bridge")
+    session_id = "0f0d1c3b8a5e4f6c9d2b7a1e4c8f3b6d"
+    spec = AgentSpec(
+        spec_version=1,
+        name="copilot-native-agent",
+        executor=ExecutorSpec(config={"harness": "copilot-native"}),
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=tmp_path)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6"},
+        )
+
+    assert resp.status_code == 201
+    assert pm.get_client_calls
+    _conv, harness, env = pm.get_client_calls[-1]
+    assert harness == "copilot-native"
+    assert env is not None
+    assert env[BRIDGE_DIR_ENV_VAR] == str(bridge_dir_for_session_id(session_id))
+    assert env[REQUEST_SESSION_ID_ENV_VAR] == session_id
+    # The SDK harness's vars are not part of the native contract; the token in
+    # particular must not be handed to a process that never reads it.
+    assert not [key for key in env if key.startswith("HARNESS_COPILOT_GITHUB_TOKEN")]

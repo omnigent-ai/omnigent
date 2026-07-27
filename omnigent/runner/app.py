@@ -2625,6 +2625,17 @@ def create_runner_app(
                 from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
 
                 spawn_env = build_kimi_native_spawn_env(session_id)
+            if harness_name == "copilot-native":
+                from omnigent.copilot_native_bridge import build_copilot_native_spawn_env
+
+                # Merged, not `spawn_env is None`-guarded like its peers: the
+                # copilot spec builder already returned a non-empty dict, so the
+                # peer idiom would never fire and the executor would raise on
+                # its first turn for want of the bridge dir.
+                spawn_env = {
+                    **(spawn_env or {}),
+                    **build_copilot_native_spawn_env(session_id),
+                }
             _session_spec_cache[session_id] = spec_entry
         else:
             harness_name = "runner-test-default"
@@ -6178,6 +6189,14 @@ def create_runner_app(
             from omnigent.kimi_native_bridge import build_kimi_native_spawn_env
 
             spawn_env = build_kimi_native_spawn_env(conv_id)
+        if harness_name == "copilot-native":
+            from omnigent.copilot_native_bridge import build_copilot_native_spawn_env
+
+            # Merged, not `spawn_env is None`-guarded like its peers: the copilot
+            # spec builder already returned a non-empty dict, so the peer idiom
+            # would never fire and the executor would raise on its first turn for
+            # want of the bridge dir.
+            spawn_env = {**(spawn_env or {}), **build_copilot_native_spawn_env(conv_id)}
 
         agent_version = dispatch.agent_version if dispatch else body.get("agent_version")
         if agent_version is not None and conv_id in _version_cache:
@@ -9848,7 +9867,7 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
             env = _build_acp_spawn_env(spec, cwd=cwd, workdir=workdir)
-        elif harness in {"copilot", "copilot-native"}:
+        elif harness == "copilot":
             env = _build_copilot_spawn_env(spec, cwd=cwd, workdir=workdir)
         else:
             builder_path = spawn_env_builders().get(harness)
