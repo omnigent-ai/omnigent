@@ -247,10 +247,9 @@ function artifactPreviewOriginForServer(serverUrl) {
   if (server.protocol !== "http:" && server.protocol !== "https:") {
     throw new Error("artifact preview servers require an HTTP(S) URL");
   }
+  const serverHostname = server.hostname.replace(/^\[|\]$/g, "");
   const loopback = new Set(["localhost", "127.0.0.1", "::1"]);
-  const hostname = loopback.has(server.hostname)
-    ? "preview.localhost"
-    : `preview.${server.hostname}`;
+  const hostname = loopback.has(serverHostname) ? "preview.localhost" : `preview.${serverHostname}`;
   return `${server.protocol}//${hostname}${server.port ? `:${server.port}` : ""}`;
 }
 

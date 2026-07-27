@@ -90,6 +90,10 @@ describe("artifact preview URL policy", () => {
       "http://preview.localhost:6767",
     );
     assert.equal(
+      artifactPreviewOriginForServer("http://[::1]:6767/workspace"),
+      "http://preview.localhost:6767",
+    );
+    assert.equal(
       artifactPreviewOriginForServer("https://app.example.com"),
       "https://preview.app.example.com",
     );

@@ -577,7 +577,40 @@ function pinWindow(win, origin) {
  */
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
-  if (state) state.serverUrl = serverUrl;
+  if (!state) return;
+  if (state.serverUrl !== serverUrl) {
+    state.artifactPreviewOriginServerUrl = null;
+    state.artifactPreviewOriginPromise = null;
+  }
+  state.serverUrl = serverUrl;
+}
+
+async function artifactPreviewOriginForSender(event, serverUrl) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const state = win && windows.get(win);
+  if (!state) return artifactPreviewOriginForServer(serverUrl);
+  if (state.artifactPreviewOriginServerUrl !== serverUrl || !state.artifactPreviewOriginPromise) {
+    state.artifactPreviewOriginServerUrl = serverUrl;
+    state.artifactPreviewOriginPromise = (async () => {
+      try {
+        const base = serverUrl.endsWith("/") ? serverUrl : `${serverUrl}/`;
+        const response = await event.sender.session.fetch(new URL("v1/info", base).href);
+        if (response.ok) {
+          const info = await response.json();
+          if (typeof info?.artifact_preview_origin === "string") {
+            const configured = new URL(info.artifact_preview_origin);
+            if (configured.protocol === "http:" || configured.protocol === "https:") {
+              return configured.origin;
+            }
+          }
+        }
+      } catch {
+        // Older servers and transient info-probe failures use the safe derived origin.
+      }
+      return artifactPreviewOriginForServer(serverUrl);
+    })();
+  }
+  return state.artifactPreviewOriginPromise;
 }
 
 /**
@@ -1064,6 +1097,8 @@ function createWindow(targetUrl, opts = {}) {
     // Clean server identity (no conversation path) for host/server CLI
     // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
     serverUrl: destination ? serverUrl : null,
+    artifactPreviewOriginServerUrl: null,
+    artifactPreviewOriginPromise: null,
     ephemeral,
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
@@ -2051,7 +2086,7 @@ function registerIpc() {
     if (!serverUrl) throw new Error("artifact surfaces require a connected server");
     return artifactSurfaceManager.sync(win, {
       ...params,
-      expectedOrigin: artifactPreviewOriginForServer(serverUrl),
+      expectedOrigin: await artifactPreviewOriginForSender(event, serverUrl),
     });
   });
 
