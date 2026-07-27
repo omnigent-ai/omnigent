@@ -532,15 +532,19 @@ def _fetch_pi_model_lists(
         # work correctly via the Responses API using system.ai.* ids.
         system_ai_id = _DATABRICKS_TO_SYSTEM_AI.get(name)
         entry: dict[str, Any] = {"id": system_ai_id or name, "input": ["text", "image"]}
-        # GLM/DeepSeek stream on reasoning_content channel → need reasoning:true.
-        if any(frag in name_lower for frag in ("glm", "deepseek")):
+        # GLM/DeepSeek/kimi/inkling stream on reasoning_content channel → need
+        # reasoning:true. Substring matching guards unnamed variants (renamed,
+        # versioned, or newly-added endpoints not yet in _DATABRICKS_TO_SYSTEM_AI).
+        if any(frag in name_lower for frag in ("glm", "deepseek", "kimi", "inkling")):
             entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
         elif _needs_responses_api(name_lower) or system_ai_id is not None:
-            # system.ai.* models use openai-responses at /ai-gateway/codex/v1
-            if system_ai_id is not None:
-                entry["reasoning"] = True
+            # Mapped kimi/inkling use system.ai.* ids + openai-responses at
+            # /ai-gateway/codex/v1. Unmapped kimi/inkling variants without a
+            # system.ai.* alias still land here via substring, keeping reasoning:true
+            # so Pi reads reasoning_content — but they'll still hit the missing
+            # finish_reason issue until the upstream Pi fix lands.
             gpt_responses.append(entry)
         elif not _unsupported_in_pi(name_lower):
             completions.append(entry)

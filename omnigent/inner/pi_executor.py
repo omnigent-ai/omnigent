@@ -1941,11 +1941,19 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
+            from omnigent.pi_native_credentials import _DATABRICKS_TO_SYSTEM_AI
+
+            # Translate databricks-* model ids that work via system.ai.* to their
+            # system.ai.* alias so _build_models_json routes them to the Responses
+            # API provider (avoids the missing finish_reason issue on kimi/inkling).
+            effective_model = (
+                _DATABRICKS_TO_SYSTEM_AI.get(model, model) if model is not None else model
+            )
             models_json = _build_models_json(
                 self._databricks_host,
                 self._databricks_token,
                 self._base_urls_override,
-                model=model,
+                model=effective_model,
             )
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
