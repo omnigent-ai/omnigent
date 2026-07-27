@@ -4090,15 +4090,29 @@ async def _auto_create_copilot_terminal(
             tmux_start_on_attach=False,
         ),
     )
+    # Advertise the tmux socket+target so the copilot-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste). Publication is
+    # transactional: the pane is already live and registered by this point, so a
+    # failure here would otherwise leave a running terminal that a later ensure
+    # finds and reuses — skipping the very setup that failed, and leaving the
+    # session permanently unable to inject.
     terminal_registry = resource_registry.terminal_registry
     if terminal_registry is not None:
         instance = terminal_registry.get(session_id, "copilot", "main")
         if instance is not None and instance.running:
-            write_tmux_target(
-                bridge_dir,
-                socket_path=instance.socket_path,
-                tmux_target=instance.tmux_target,
-            )
+            try:
+                write_tmux_target(
+                    bridge_dir,
+                    session_id=session_id,
+                    socket_path=instance.socket_path,
+                    tmux_target=instance.tmux_target,
+                )
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await resource_registry.close_terminal(
+                        session_id, terminal_resource_id("copilot", "main")
+                    )
+                raise
             if model:
                 try:
                     await asyncio.to_thread(inject_model_command, bridge_dir, model=model)
