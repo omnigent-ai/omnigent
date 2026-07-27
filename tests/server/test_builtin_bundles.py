@@ -31,18 +31,20 @@ _BUILDERS = [
     ("_build_kiro_native_bundle", "kiro-native-ui.yaml", False),
     ("_build_debby_bundle", "config.yaml", True),
     ("_build_polly_bundle", "config.yaml", True),
+    ("_build_willy_bundle", "config.yaml", True),
 ]
 
 
 def _shipped_example_missing(builder: str) -> bool:
     """Return True when ``builder``'s shipped-example source is not packaged here.
 
-    debby/polly are only seeded when their bundle ships with the wheel; a
+    debby/polly/willy are only seeded when their bundle ships with the wheel; a
     generic deployment legitimately omits them. Skip rather than fail there.
     """
     source = {
         "_build_debby_bundle": app._DEBBY_BUNDLE_SOURCE,
         "_build_polly_bundle": app._POLLY_BUNDLE_SOURCE,
+        "_build_willy_bundle": app._WILLY_BUNDLE_SOURCE,
     }[builder]
     return not (source / "config.yaml").is_file()
 
@@ -71,6 +73,18 @@ def test_bundle_builder_produces_valid_tarball(
     assert any(m.lstrip("./") == spec_entry or m.endswith("/" + spec_entry) for m in members), (
         f"{builder} tarball is missing its spec entry {spec_entry!r}; members={members!r}."
     )
+
+
+def test_willy_bundle_contains_editable_artifact_instructions() -> None:
+    """Willy ships its human-editable artifact contract inside the bundle."""
+    if _shipped_example_missing("_build_willy_bundle"):
+        pytest.skip("willy source not packaged in this deployment")
+
+    members = _tar_members(app._build_willy_bundle())
+    assert any(
+        member.lstrip("./") == "artifacts.md" or member.endswith("/artifacts.md")
+        for member in members
+    ), f"Willy bundle is missing artifacts.md; members={members!r}."
 
 
 @pytest.mark.parametrize(("builder", "spec_entry", "shipped_example"), _BUILDERS)

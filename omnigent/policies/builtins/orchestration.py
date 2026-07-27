@@ -591,6 +591,67 @@ def worktree_guard(
     return _evaluate
 
 
+def deny_tools(
+    *,
+    tool_names: list[str],
+    deny_reason: str = "This tool is disabled for this agent.",
+) -> Callable[[_Json, _Json], _Json]:
+    """Deny calls to an explicit set of tool names.
+
+    Use this factory when an agent should retain a broad runtime tool surface
+    but a small capability subset is incompatible with its contract.
+
+    :param tool_names: Exact tool names to deny.
+    :param deny_reason: Reason surfaced to the agent when a call is denied.
+    :returns: An evaluator returning DENY for configured tools, ALLOW otherwise.
+    :raises ValueError: If no non-empty tool name is configured.
+    """
+    blocked = {str(name).strip() for name in tool_names if str(name).strip()}
+    if not blocked:
+        raise ValueError("deny_tools requires at least one tool name")
+
+    def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
+        if _tool_call(event, blocked) is None:
+            return _ALLOW
+        return _decision("DENY", deny_reason)
+
+    return _evaluate
+
+
+def require_artifact_paths(
+    *,
+    deny_reason: str = "This agent may only access managed paths under artifacts/.",
+) -> Callable[[_Json, _Json], _Json]:
+    """Deny filesystem tool calls whose path is outside ``artifacts/``."""
+
+    path_tools = {
+        "sys_os_read",
+        "sys_os_write",
+        "sys_os_edit",
+        "Read",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "read",
+        "write",
+        "edit",
+    }
+
+    def _evaluate(event: _Json, config: _Json) -> _Json:  # noqa: ARG001
+        args = _tool_call(event, path_tools)
+        if args is None:
+            return _ALLOW
+        path = args.get("path") if "path" in args else args.get("file_path")
+        if not isinstance(path, str) or not path or "\\" in path:
+            return _decision("DENY", deny_reason)
+        normalized = os.path.normpath(path)
+        if normalized == "artifacts" or not normalized.startswith("artifacts/"):
+            return _decision("DENY", deny_reason)
+        return _ALLOW
+
+    return _evaluate
+
+
 def read_only_os(
     *,
     deny_reason: str = (
@@ -645,6 +706,22 @@ def read_only_os(
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 POLICY_REGISTRY: list[dict[str, Any]] = [
+    {
+        "handler": "omnigent.policies.builtins.orchestration.require_artifact_paths",
+        "kind": "factory",
+        "name": "Require Managed Artifact Paths",
+        "description": (
+            "Restricts filesystem reads, writes, and edits to virtual artifacts/ paths."
+        ),
+    },
+    {
+        "handler": "omnigent.policies.builtins.orchestration.deny_tools",
+        "kind": "factory",
+        "name": "Deny Selected Tools",
+        "description": (
+            "Denies an explicit list of tool names while allowing every other policy event."
+        ),
+    },
     {
         "handler": "omnigent.policies.builtins.orchestration.blast_radius",
         "kind": "factory",

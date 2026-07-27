@@ -668,6 +668,69 @@ def test_ensure_default_polly_agent_seeds_card(seed_stores: _SeedStores) -> None
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+def test_ensure_default_willy_agent_seeds_design_bundle(seed_stores: _SeedStores) -> None:
+    """Willy is seeded with its two design skills and publish tool."""
+    server_app._ensure_default_willy_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._WILLY_AGENT_NAME)
+    assert seeded is not None, "willy was not registered"
+    loaded = seed_stores.agent_cache.load(
+        seeded.id,
+        seeded.bundle_location,
+        expand_env=False,
+    )
+    assert [skill.name for skill in loaded.spec.skills] == [
+        "design-product-ui",
+        "review-product-ui",
+    ]
+    assert [tool.name for tool in loaded.spec.local_tools] == ["publish_design_artifact"]
+    assert loaded.spec.skills_filter == "none"
+    artifact_instructions = server_app._WILLY_BUNDLE_SOURCE / "artifacts.md"
+    assert loaded.spec.instructions == artifact_instructions.read_text()
+    assert "virtual `artifacts/`" in loaded.spec.instructions
+    assert "genuinely ambiguous" in loaded.spec.instructions
+    design_skill = next(skill for skill in loaded.spec.skills if skill.name == "design-product-ui")
+    assert "3–5 questions" in design_skill.content
+    assert "visual references, palette, typography" in design_skill.content
+    assert "says to use your judgment" in design_skill.content
+    assert loaded.spec.guardrails is not None
+    assert loaded.spec.guardrails.policies is not None
+    deny_shell = next(
+        policy for policy in loaded.spec.guardrails.policies if policy.name == "deny_shell"
+    )
+    assert deny_shell.function is not None
+    assert deny_shell.function.path == "omnigent.inner.nessie.policies.deny_tools"
+    assert deny_shell.function.arguments == {
+        "tool_names": ["sys_os_shell", "Bash", "bash", "Shell"],
+        "deny_reason": "Willy artifacts use virtual filesystem tools; shell access is disabled.",
+    }
+    artifact_paths_only = next(
+        policy
+        for policy in loaded.spec.guardrails.policies
+        if policy.name == "artifact_paths_only"
+    )
+    assert artifact_paths_only.function is not None
+    assert (
+        artifact_paths_only.function.path
+        == "omnigent.inner.nessie.policies.require_artifact_paths"
+    )
+
+
+def test_ensure_default_agents_includes_willy(seed_stores: _SeedStores) -> None:
+    """The startup seeder exposes Willy in the built-in agent catalog."""
+    server_app._ensure_default_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    assert seed_stores.agent_store.get_by_name(server_app._WILLY_AGENT_NAME) is not None
+
+
 def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -> None:
     """
     Seeding registers antigravity-native-ui as a built-in the picker renders.

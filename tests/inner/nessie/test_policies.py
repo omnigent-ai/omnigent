@@ -15,8 +15,10 @@ import pytest
 
 from omnigent.inner.nessie.policies import (
     blast_radius,
+    deny_tools,
     headless_subagent_purpose_guard,
     read_only_os,
+    require_artifact_paths,
     spawn_bounds,
     worktree_guard,
 )
@@ -528,3 +530,58 @@ def test_read_only_os_allows_reads_and_shell() -> None:
     assert _result(evaluate(_tool_call("sys_os_read", path="a.py"), {})) == "ALLOW"
     assert _result(evaluate(_tool_call("sys_os_shell", command="rg secret"), {})) == "ALLOW"
     assert _result(evaluate(_tool_call("Read", file_path="a.py"), {})) == "ALLOW"
+
+
+def test_deny_tools_blocks_configured_tool_names() -> None:
+    """deny_tools rejects only the explicitly configured capabilities."""
+    evaluate = deny_tools(
+        tool_names=["sys_os_shell"],
+        deny_reason="Willy artifacts must use virtual filesystem tools.",
+    )
+
+    denied = evaluate(_tool_call("sys_os_shell", command="find ~/.omnigent"), {})
+    assert _result(denied) == "DENY"
+    assert denied["reason"] == "Willy artifacts must use virtual filesystem tools."
+    assert _result(evaluate(_tool_call("sys_os_write", path="artifacts/a.html"), {})) == "ALLOW"
+
+
+@pytest.mark.parametrize("tool", ["sys_os_shell", "Bash", "bash", "Shell"])
+def test_deny_tools_blocks_willy_shell_aliases(tool: str) -> None:
+    evaluate = deny_tools(tool_names=["sys_os_shell", "Bash", "bash", "Shell"])
+
+    assert _result(evaluate(_tool_call(tool, command="pwd"), {})) == "DENY"
+
+
+def test_deny_tools_allows_non_tool_events() -> None:
+    """deny_tools leaves unrelated policy phases untouched."""
+    evaluate = deny_tools(tool_names=["sys_os_shell"])
+    assert _result(evaluate({"type": "request", "data": "hello"}, {})) == "ALLOW"
+
+
+@pytest.mark.parametrize(
+    "tool,args",
+    [
+        ("sys_os_read", {"path": "README.md"}),
+        ("sys_os_write", {"path": "../escape.html"}),
+        ("sys_os_edit", {"path": "/tmp/escape.html"}),
+        ("Read", {"file_path": "artifacts\\escape.html"}),
+        ("Write", {"file_path": "artifacts/../escape.html"}),
+    ],
+)
+def test_require_artifact_paths_denies_non_artifact_filesystem_access(
+    tool: str, args: dict[str, Any]
+) -> None:
+    assert _result(require_artifact_paths()(_tool_call(tool, **args), {})) == "DENY"
+
+
+@pytest.mark.parametrize("tool", ["sys_os_read", "sys_os_write", "sys_os_edit"])
+def test_require_artifact_paths_allows_managed_artifact_paths(tool: str) -> None:
+    assert (
+        _result(
+            require_artifact_paths()(
+                _tool_call(tool, path="artifacts/revenue/index.html"),
+                {},
+            )
+        )
+        == "ALLOW"
+    )
