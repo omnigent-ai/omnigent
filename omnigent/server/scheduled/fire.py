@@ -12,7 +12,7 @@ firing:
    ``host_id`` resolves the owner's most-recently-active live host at fire time;
    a task that pinned no ``workspace`` (research / summaries / chat-only) starts
    the runner in the host's home directory. A pinned host that is missing or
-   offline — and an owner with no live host at all — records a failed/skipped
+   offline — and an owner with no live host at all — records a skipped
    run instead of a running run.
 #. **Creates a session** bound to the task's agent, carrying the resolved
    ``workspace`` / ``host_id`` and the stored ``model_override`` /
@@ -333,7 +333,8 @@ async def _run_fire_for_task(
         # host at fire time. An unset ``workspace`` (research / summaries /
         # chat-only) defaults to the host's home directory so the runner still
         # has a real cwd. If no live host can be resolved, this records a
-        # failed run — the same honest behavior as a pinned host that is offline.
+        # skipped run — the host being offline at fire time means the occurrence
+        # didn't run, not that something broke.
         #
         # ``task`` stays the source of truth for the persisted row; ``effective``
         # carries the resolved host_id / defaulted workspace through preflight,
@@ -348,7 +349,7 @@ async def _run_fire_for_task(
                 task,
                 None,
                 scheduled_at,
-                status="failed",
+                status="skipped",
                 error=str(exc),
                 error_code=exc.error_code,
             )
@@ -363,7 +364,7 @@ async def _run_fire_for_task(
                 task,
                 None,
                 scheduled_at,
-                status="failed",
+                status="skipped",
                 error=error,
                 error_code=error_code,
             )
@@ -379,7 +380,7 @@ async def _run_fire_for_task(
                     task,
                     None,
                     scheduled_at,
-                    status="failed",
+                    status="skipped",
                     error=str(exc),
                     error_code=exc.error_code,
                 )
@@ -404,7 +405,7 @@ async def _run_fire_for_task(
                 task,
                 None,
                 scheduled_at,
-                status="failed",
+                status="skipped",
                 error=error,
                 error_code=error_code,
             )
@@ -480,7 +481,7 @@ async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> Schedu
 
     * ``host_id`` unset → the owner's most-recently-active ONLINE host. No live
       host (or no host store/registry) raises :class:`_CannotLaunchScheduledFire`
-      so the caller records a failed run instead of silently no-oping.
+      so the caller records a skipped run instead of silently no-oping.
     * ``workspace`` unset → the launch host's home directory, canonicalized to an
       absolute realpath via a ``host.stat`` round-trip, so the runner launches
       with a real cwd and the stored row never holds a literal ``~``. This HOME
@@ -545,7 +546,7 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
     host — the host expands the tilde against its own ``HOME`` and returns the
     absolute ``canonical_path``, the same value the normal session-create path
     stores. Raises :class:`_CannotLaunchScheduledFire` if the host is gone or
-    can't resolve its home dir, so the caller records an honest failed run.
+    can't resolve its home dir, so the caller records a skipped run.
     """
     from omnigent.server.routes._workspace_validation import (
         WorkspaceValidationError,

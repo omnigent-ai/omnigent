@@ -498,7 +498,7 @@ async def test_launch_failure_is_swallowed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_validation_failure_records_failed_without_session() -> None:
+async def test_validation_failure_records_skipped_without_session() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(model_override="--danger")})
 
@@ -514,7 +514,7 @@ async def test_validation_failure_records_failed_without_session() -> None:
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "invalid_input"
     assert store.runs[0]["conversation_id"] is None
 
@@ -599,9 +599,9 @@ async def test_unset_host_resolves_owner_online_host_and_runs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unset_host_no_online_host_records_failed() -> None:
-    """An unset host_id with no live host is an honest failure, not a no-op: it
-    records a failed run with the no_online_host code and creates no session."""
+async def test_unset_host_no_online_host_records_skipped() -> None:
+    """An unset host_id with no live host records a skipped run (the occurrence
+    didn't run because no host was available), not a failure."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
         rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
@@ -627,7 +627,7 @@ async def test_unset_host_no_online_host_records_failed() -> None:
     assert launched == []
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "no_online_host"
     assert store.runs[0]["conversation_id"] is None
 
@@ -762,17 +762,17 @@ async def test_pinned_nonowned_host_no_workspace_rejected_before_stat(
     assert resolve_calls == []
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_not_owned"
     assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_no_workspace_unresolvable_home_records_failed(
+async def test_no_workspace_unresolvable_home_records_skipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the host can't resolve its home dir, the fire records an honest failed
-    run rather than launching with a bogus workspace."""
+    """If the host can't resolve its home dir, the fire records a skipped run
+    rather than launching with a bogus workspace."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(
         rows={"task_1": _task(user_id="alice@example.com", host_id=None, workspace=None)}
@@ -798,7 +798,7 @@ async def test_no_workspace_unresolvable_home_records_failed(
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "default_workspace_unresolved"
 
 
@@ -846,16 +846,16 @@ async def test_defaulted_workspace_is_boundary_validated(
     # The boundary check ran against the resolved absolute workspace.
     assert seen["validate_workspace"] is True
     assert seen["workspace"] == "/home/alice"
-    # The boundary failure was recorded honestly; no session was created.
+    # The boundary failure records a skipped run; no session was created.
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "invalid_input"
 
 
 @pytest.mark.asyncio
-async def test_no_host_store_records_failed_when_host_unset() -> None:
-    """No host store/registry configured + an unset host is an honest failure."""
+async def test_no_host_store_records_skipped_when_host_unset() -> None:
+    """No host store/registry configured + an unset host records a skipped run."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(host_id=None, workspace=None)})
 
@@ -867,7 +867,7 @@ async def test_no_host_store_records_failed_when_host_unset() -> None:
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_registry_unavailable"
     assert store.runs[0]["conversation_id"] is None
 
@@ -922,7 +922,7 @@ async def test_resolve_default_workspace_raises_when_home_missing(
 
 
 @pytest.mark.asyncio
-async def test_no_host_registry_records_failed_without_session() -> None:
+async def test_no_host_registry_records_skipped_without_session() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
 
@@ -934,13 +934,13 @@ async def test_no_host_registry_records_failed_without_session() -> None:
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_registry_unavailable"
     assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_offline_connected_host_records_failed_without_session() -> None:
+async def test_offline_connected_host_records_skipped_without_session() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice@example.com")})
 
@@ -957,7 +957,7 @@ async def test_offline_connected_host_records_failed_without_session() -> None:
 
     assert conv_store.created == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["status"] == "skipped"
     assert store.runs[0]["error_code"] == "host_offline"
     assert store.runs[0]["conversation_id"] is None
 
