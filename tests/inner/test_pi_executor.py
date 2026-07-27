@@ -2977,11 +2977,13 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
     ]
-    # Newer GPT models (reject tools via /chat/completions) → responses API.
+    # Newer GPT models + Kimi/inkling (use system.ai.* ids) → responses API.
     openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
     assert openai_responses_ids == [
         "databricks-gpt-5-5",
         "databricks-gpt-5-5-pro",
+        "system.ai.kimi-k2-7-code",
+        "system.ai.inkling",
     ]
     # The llama serving endpoint no longer exists; the provider stays as
     # the routing home for future non-Claude/GPT endpoints.

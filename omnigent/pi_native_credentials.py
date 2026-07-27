@@ -71,6 +71,14 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 
+# Mapping from databricks-* serving-endpoint ids to system.ai.* ids for models
+# that require the Responses API. These models don't send finish_reason via
+# /chat/completions, but work correctly via /ai-gateway/codex/v1/responses.
+_DATABRICKS_TO_SYSTEM_AI: dict[str, str] = {
+    "databricks-kimi-k2-7-code": "system.ai.kimi-k2-7-code",
+    "databricks-inkling": "system.ai.inkling",
+}
+
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
 # workspace bearer token, so we set ``authHeader`` (Authorization: Bearer).
@@ -520,16 +528,19 @@ def _fetch_pi_model_lists(
         ready = state.get("ready") if isinstance(state, dict) else None
         if isinstance(ready, str) and ready and ready.upper() != "READY":
             continue
-        entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
-        # Kimi (and GLM/DeepSeek) stream output on reasoning_content channel.
-        # Pi's openai-completions parser requires reasoning:true on the model
-        # entry to consume that channel; without it the turn ends with
-        # "Stream ended without finish_reason".
-        if any(frag in name_lower for frag in ("kimi", "glm", "deepseek", "inkling")):
+        # Kimi and inkling don't send finish_reason via /chat/completions but
+        # work correctly via the Responses API using system.ai.* ids.
+        system_ai_id = _DATABRICKS_TO_SYSTEM_AI.get(name)
+        entry: dict[str, Any] = {"id": system_ai_id or name, "input": ["text", "image"]}
+        # GLM/DeepSeek stream on reasoning_content channel → need reasoning:true.
+        if any(frag in name_lower for frag in ("glm", "deepseek")):
             entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
-        elif _needs_responses_api(name_lower):
+        elif _needs_responses_api(name_lower) or system_ai_id is not None:
+            # system.ai.* models use openai-responses at /ai-gateway/codex/v1
+            if system_ai_id is not None:
+                entry["reasoning"] = True
             gpt_responses.append(entry)
         elif not _unsupported_in_pi(name_lower):
             completions.append(entry)

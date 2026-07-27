@@ -592,6 +592,24 @@ _DATABRICKS_RESPONSES_MODELS = [
         "maxTokens": 128000,
         "input": ["text", "image"],
     },
+    # Kimi and inkling don't send finish_reason via /chat/completions; use
+    # system.ai.* ids which work via the Responses API at /ai-gateway/codex/v1.
+    {
+        "id": "system.ai.kimi-k2-7-code",
+        "name": "Kimi K2.7 Code",
+        "contextWindow": 131072,
+        "maxTokens": 8192,
+        "input": ["text", "image"],
+        "reasoning": True,
+    },
+    {
+        "id": "system.ai.inkling",
+        "name": "Inkling",
+        "contextWindow": 131072,
+        "maxTokens": 8192,
+        "input": ["text", "image"],
+        "reasoning": True,
+    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [
@@ -852,17 +870,19 @@ def _pi_model_is_reasoning(model: str) -> bool:
 
 
 def _pi_needs_responses_api(model: str) -> bool:
-    """Return True when a GPT model requires the Responses API for tools.
+    """Return True when a model requires the Responses API at /ai-gateway/codex/v1.
 
-    Uses the same allowlist logic as pi_native_credentials._needs_responses_api:
-    GPT models known to work with /chat/completions + tools are allowlisted;
-    everything else (newer models) defaults to the Responses API.
+    Covers two cases:
+    - Newer GPT models that reject function tools via /chat/completions.
+    - system.ai.* models (Kimi, inkling) that need the Responses API to avoid
+      the missing finish_reason issue.
     """
-    from omnigent.pi_native_credentials import (
-        _needs_responses_api,
-    )
+    from omnigent.pi_native_credentials import _needs_responses_api
 
-    return _needs_responses_api(model.lower())
+    lower = model.lower()
+    if lower.startswith("system.ai."):
+        return True
+    return _needs_responses_api(lower)
 
 
 def _pi_provider_for_model(model: str) -> str:
@@ -870,7 +890,7 @@ def _pi_provider_for_model(model: str) -> str:
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
-    if "gpt" in lower:
+    if "gpt" in lower or lower.startswith("system.ai."):
         return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
     return "databricks-completions"
 
