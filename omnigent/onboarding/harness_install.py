@@ -382,17 +382,22 @@ def ui_credential_configurable_harnesses() -> frozenset[str]:
 _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
     ANTHROPIC_FAMILY: SetupStep(
         kind="auth",
-        title="Sign in to Claude",
-        detail="Uses your Claude subscription — sign in on the host.",
-        action="command",
+        # UI-authable: the dialog opens a form listing every way to authenticate
+        # (subscription login, API key, gateway, or adopting a detected key), so
+        # the row is a neutral "set up auth" rather than naming just one path —
+        # the subscription ``command`` below is one option inside that form, not
+        # the whole step.
+        title="Set up authentication",
+        detail="Sign in with your Claude subscription, an API key, or a gateway.",
+        action="auth",
         command="claude auth login --claudeai",
         status_key="authed",
     ),
     OPENAI_FAMILY: SetupStep(
         kind="auth",
-        title="Sign in to Codex",
-        detail="Uses your ChatGPT subscription — sign in on the host.",
-        action="command",
+        title="Set up authentication",
+        detail="Sign in with your ChatGPT subscription, an API key, or a gateway.",
+        action="auth",
         command="codex login",
         status_key="authed",
     ),
@@ -406,13 +411,14 @@ _UI_AUTH_STEP_BY_KEY: dict[str, SetupStep] = {
     ),
     PI_KEY: SetupStep(
         kind="auth",
-        title="Add a Pi credential",
-        # Pi is UI-authable: the setup dialog renders an inline credential form
-        # (API key / gateway / adopt) for it, keyed on kind == "auth". No
-        # ``command`` — Pi has no subscription CLI login, so no copy-signpost.
-        # ``status_key="authed"`` makes the step trackable so it isn't dropped
-        # as "unknown" (which would make the dialog wrongly read "ready").
-        detail="Add an API key or gateway so Pi can run.",
+        # Same neutral "set up auth" framing as claude/codex — the dialog opens a
+        # form listing the ways to authenticate. Pi has NO subscription CLI login
+        # (``command=None``, so the form omits that option), so the detail names
+        # only the applicable paths. ``status_key="authed"`` keeps the step
+        # trackable so it isn't dropped as "unknown" (which would wrongly read
+        # "ready").
+        title="Set up authentication",
+        detail="Add an API key or a gateway so Pi can run.",
         action="auth",
         command=None,
         status_key="authed",

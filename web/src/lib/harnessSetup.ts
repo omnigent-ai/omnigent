@@ -28,7 +28,7 @@ export interface ResolvedSetupStep {
   kind: string;
   title: string;
   detail: string;
-  /** ``"install"`` (one-click), ``"command"`` (run on host), ``"setup"`` (omnigent setup). */
+  /** ``"install"`` (one-click), ``"command"`` (run on host), ``"setup"`` (omni setup). */
   action: string;
   command: string | null;
   status: SetupStepStatus;
@@ -124,6 +124,44 @@ export function harnessInstallableOnHost(
 }
 
 /**
+ * The provider family a UI-authable *harness* configures, or ``null`` when the
+ * harness isn't one the UI authenticates. Mirrors the backend's harness→family
+ * resolution: Claude → anthropic, Codex → openai, Pi → anthropic (its preferred
+ * fallback family). The single source of truth for "which harnesses the UI can
+ * authenticate" — {@link harnessAuthableOnHost} keys off a non-null result, and
+ * the credential form scopes host-wide detected credentials to this family so
+ * the adopt affordance can't offer (and persist) a cross-family key — e.g. an
+ * Anthropic key for Codex.
+ */
+export function harnessCredentialFamily(harness: string | null | undefined): string | null {
+  if (!harness) return null;
+  if (["claude", "claude-native", "native-claude"].includes(harness)) return "anthropic";
+  if (["codex", "codex-native", "native-codex"].includes(harness)) return "openai";
+  if (["pi", "pi-native", "native-pi"].includes(harness)) return "anthropic";
+  return null;
+}
+
+/**
+ * Whether the UI can write a credential for *harness* on *host* (the M3 auth
+ * form vs. a copy-command signpost). True only when the feature is on, the host
+ * is online, and the harness is one whose credential omnigent owns (Claude /
+ * Codex / Pi). Mirrors the server's UI-auth allowlist so the form never posts a
+ * credential the route would reject.
+ */
+export function harnessAuthableOnHost(
+  info: ServerInfo | "loading",
+  harness: string | null | undefined,
+  host: Host | undefined | null,
+): boolean {
+  return (
+    info !== "loading" &&
+    info.harness_install_enabled &&
+    harnessCredentialFamily(harness) !== null &&
+    host?.status === "online"
+  );
+}
+
+/**
  * Resolve a server step's done/todo status from the host's readiness value.
  *
  * The host reports one availability per harness — ``true`` (ready),
@@ -174,13 +212,7 @@ export function resolveSetupSteps(
   // Showing an untrackable step pre-install and then having it vanish once the
   // binary lands (the harness reports "ready") is more confusing than never
   // showing it. But never drop the *only* step — a non-installable harness's
-  // sole "run omnigent setup" step must still render.
+  // sole "run omni setup" step must still render.
   const trackable = resolved.filter((s) => s.status !== "unknown");
   return trackable.length > 0 ? trackable : resolved;
-}
-
-/** How many tracked (non-``unknown``) steps are done, for the progress header. */
-export function setupProgress(steps: ResolvedSetupStep[]): { done: number; total: number } {
-  const tracked = steps.filter((s) => s.status !== "unknown");
-  return { done: tracked.filter((s) => s.status === "done").length, total: tracked.length };
 }
