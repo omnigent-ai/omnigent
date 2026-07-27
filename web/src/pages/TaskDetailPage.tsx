@@ -15,8 +15,8 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  CalendarOffIcon,
   ChevronLeftIcon,
-  CircleSlashIcon,
   Loader2Icon,
   PencilIcon,
   PlayIcon,
@@ -425,7 +425,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
   if (run.status === "skipped") {
     return (
       <IndicatorWithTooltip tooltip={describeRunError(run.errorCode, "skipped")}>
-        <CircleSlashIcon
+        <CalendarOffIcon
           data-testid="run-status-icon"
           data-run-icon="skipped"
           className="size-4 shrink-0 text-muted-foreground"

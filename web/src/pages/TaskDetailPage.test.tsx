@@ -2,7 +2,7 @@
 // + configuration + run-history rendering from mocked hooks, the header actions
 // (Run now fires the mutation, delete navigates back, edit opens the dialog),
 // and the run-row rendering rules: the LEFT status-icon column (failed triangle
-// > skipped circle-slash > succeeded-unread blue dot > succeeded-read grey dot),
+// > skipped calendar-off > succeeded-unread blue dot > succeeded-read grey dot),
 // duration, errorCode messages, and the whole-row click affordance (a run with a
 // conversation is a link; a skipped run is not) — never a fabricated summary.
 //
@@ -410,7 +410,7 @@ describe("run history", () => {
     await waitFor(() => expect(screen.getAllByText("Run failed").length).toBeGreaterThan(0));
   });
 
-  it("renders a skipped run with a muted circle-slash icon and is NOT clickable", async () => {
+  it("renders a skipped run with a muted calendar-off icon and is NOT clickable", async () => {
     setTask(task());
     setRuns([
       run({
