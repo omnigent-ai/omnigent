@@ -13,18 +13,21 @@
  */
 
 import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
-  ArrowRightIcon,
   ChevronLeftIcon,
+  CircleSlashIcon,
   Loader2Icon,
   PencilIcon,
   PlayIcon,
   Trash2Icon,
+  TriangleAlertIcon,
 } from "lucide-react";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import {
   useDeleteScheduledTask,
@@ -33,6 +36,12 @@ import {
   useScheduledTaskRuns,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
+import { fetchConversationById } from "@/hooks/useConversations";
+import {
+  isConversationUnseen,
+  isExplicitlyUnread,
+  useUnseenTick,
+} from "@/hooks/useUnseenConversations";
 import { useNow } from "@/hooks/useNow";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -43,7 +52,7 @@ import {
   formatRunDuration,
   formatRunTimestamp,
 } from "@/lib/scheduleText";
-import type { ScheduledTaskRun, ScheduledTaskRunStatus } from "@/lib/scheduledTasksApi";
+import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
 
 export function TaskDetailPage() {
@@ -288,82 +297,191 @@ function ConfigField({ label, value, testId }: { label: string; value: string; t
 }
 
 /**
- * One run in the history list: a status dot, the fire timestamp (bold), the
- * duration (muted), and a detail line — an errorCode-derived message for
- * skipped/failed runs, or an "Open conversation →" link when the run produced
- * a conversation. No fabricated per-run summary.
+ * Resolve whether a succeeded run's conversation is genuinely UNREAD, using the
+ * SAME read-state signal as the sidebar's "new messages" dot.
+ *
+ * IMPORTANT: the run row carries only `conversationId`; unread lives on the
+ * conversation. The single-session `GET /v1/sessions/{id}` (what
+ * `fetchConversationById` calls) does NOT return `viewer_unread` — that field
+ * is only on the LIST items (`SessionListItem`), verified against the schema
+ * and the live backend. So we don't read a `viewer_unread` off the fetch.
+ * Instead we fetch the conversation for its authoritative `updated_at` +
+ * `status`, then feed those to the app's `isConversationUnseen` (the read-state
+ * mirror in `useUnseenConversations`), OR honor an explicit "mark unread".
+ * `useUnseenTick()` makes this recompute the instant the user opens the thread
+ * (marking it read) without a refetch. A deleted conversation → `null` → read.
+ */
+function useRunUnread(conversationId: string | null, enabled: boolean): boolean {
+  // Re-render when the read-state mirror changes (open thread → mark read).
+  useUnseenTick();
+  const { data: conversation } = useQuery({
+    queryKey: ["conversation-unread", conversationId],
+    queryFn: () => fetchConversationById(conversationId as string),
+    enabled: enabled && conversationId !== null,
+    staleTime: 30_000,
+  });
+  if (!conversationId || !conversation) return false;
+  if (isExplicitlyUnread(conversationId)) return true;
+  return isConversationUnseen(conversationId, conversation.updated_at, conversation.status);
+}
+
+/**
+ * One run in the history list. Layout (LEFT status column + whole-row click):
+ * - LEADING: a single status icon chosen by priority (see `RunStatusIcon`) —
+ *   failed triangle > skipped circle-slash > succeeded-unread blue dot >
+ *   succeeded-read grey dot — each with an explanatory tooltip.
+ * - BODY: the fire timestamp (bold), the duration (muted), and — for
+ *   skipped/failed — an errorCode-derived message. No fabricated summary.
+ *
+ * When the run produced a conversation the ENTIRE row is the click target
+ * (a real `<Link>`: keyboard-focusable, Enter/Space activate natively) that
+ * navigates to `/c/:conversationId`, with a hover highlight + pointer cursor.
+ * Runs without a conversation (e.g. skipped) render as a plain, non-interactive
+ * row: no highlight, no pointer, not focusable.
  */
 function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
-  const detail = runDetail(run);
+  // Unread only applies to a succeeded run that produced a conversation.
+  const unread = useRunUnread(
+    run.conversationId,
+    run.status === "succeeded" && run.conversationId !== null,
+  );
 
-  return (
-    <li
-      data-testid="task-detail-run"
-      data-run-status={run.status}
-      className="flex items-start gap-3 rounded-lg px-2 py-2"
-    >
-      <span
-        aria-hidden
-        data-testid="run-status-dot"
-        className={cn("mt-1.5 size-2 shrink-0 rounded-full", statusDotClass(run.status))}
-      />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex items-baseline gap-2">
+  const body = (
+    <>
+      <span className="flex size-4 shrink-0 items-center justify-center">
+        <RunStatusIcon run={run} unread={unread} />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="flex items-baseline gap-2">
           <span className="text-sm font-semibold">{timestamp ?? "—"}</span>
           {duration && (
             <span className="text-xs text-muted-foreground" data-testid="run-duration">
               {duration}
             </span>
           )}
-        </div>
-        {detail}
-      </div>
+        </span>
+      </span>
+    </>
+  );
+
+  const commonClassName = "flex items-center gap-3 rounded-lg px-2 py-2";
+
+  // Clickable when the run has a conversation to open. A real <Link> (anchor)
+  // is focusable and Enter/Space-activatable for free; the hover highlight +
+  // pointer cursor signal clickability without any explicit link text.
+  if (run.conversationId) {
+    return (
+      <li data-testid="task-detail-run" data-run-status={run.status} data-run-unread={unread}>
+        <Link
+          to={`/c/${run.conversationId}`}
+          data-testid="run-open"
+          aria-label="Open conversation"
+          className={cn(
+            commonClassName,
+            "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
+          )}
+        >
+          {body}
+        </Link>
+      </li>
+    );
+  }
+
+  // No conversation → not clickable, no hover highlight, not focusable.
+  return (
+    <li
+      data-testid="task-detail-run"
+      data-run-status={run.status}
+      data-run-unread={run.status === "succeeded" ? unread : undefined}
+      className={commonClassName}
+    >
+      {body}
     </li>
   );
 }
 
 /**
- * The run's detail line. Skipped/failed → a human message from the errorCode;
- * otherwise, if the run produced a conversation, an "Open conversation →" link.
- * Returns null when there's nothing honest to show (e.g. a scheduled/running
- * run with no conversation yet).
+ * The leading LEFT status icon for a run. Exactly one renders, by priority:
+ *   1. failed              → amber warning triangle, tooltip = errorCode message.
+ *   2. skipped             → muted circle-slash, tooltip = skip reason.
+ *   3. succeeded + UNREAD  → blue filled dot, tooltip = "Unread".
+ *   4. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
+ *   5. scheduled/running/incomplete → muted grey dot, no tooltip (not terminal).
  */
-function runDetail(run: ScheduledTaskRun): React.ReactNode {
-  if (run.status === "skipped" || run.status === "failed") {
+function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean }) {
+  if (run.status === "failed") {
     return (
-      <span className="text-xs text-muted-foreground" data-testid="run-error-detail">
-        {describeRunError(run.errorCode, run.status)}
-      </span>
+      <IndicatorWithTooltip tooltip={describeRunError(run.errorCode, "failed")}>
+        <TriangleAlertIcon
+          data-testid="run-status-icon"
+          data-run-icon="failed"
+          className="size-4 shrink-0 text-amber-500"
+        />
+      </IndicatorWithTooltip>
     );
   }
-  if (run.conversationId) {
+  if (run.status === "skipped") {
     return (
-      <Link
-        to={`/c/${run.conversationId}`}
-        data-testid="run-open-conversation"
-        className="inline-flex w-fit items-center gap-1 text-xs text-primary transition-colors hover:underline"
-      >
-        Open conversation
-        <ArrowRightIcon className="size-3" />
-      </Link>
+      <IndicatorWithTooltip tooltip={describeRunError(run.errorCode, "skipped")}>
+        <CircleSlashIcon
+          data-testid="run-status-icon"
+          data-run-icon="skipped"
+          className="size-4 shrink-0 text-muted-foreground"
+        />
+      </IndicatorWithTooltip>
     );
   }
-  return null;
+  if (run.status === "succeeded" && unread) {
+    return (
+      <IndicatorWithTooltip tooltip="Unread">
+        <span
+          aria-hidden
+          data-testid="run-status-dot"
+          data-run-icon="unread"
+          data-run-unread={true}
+          className="size-2.5 shrink-0 rounded-full bg-blue-500"
+        />
+      </IndicatorWithTooltip>
+    );
+  }
+  // Succeeded+read gets a tooltip ("Completed"); non-terminal statuses share the
+  // same muted dot but with no tooltip (nothing meaningful to say yet).
+  const dot = (
+    <span
+      aria-hidden
+      data-testid="run-status-dot"
+      data-run-icon={run.status === "succeeded" ? "read" : "pending"}
+      data-run-unread={run.status === "succeeded" ? false : undefined}
+      className="size-2.5 shrink-0 rounded-full bg-muted-foreground/40"
+    />
+  );
+  if (run.status === "succeeded") {
+    return <IndicatorWithTooltip tooltip="Completed">{dot}</IndicatorWithTooltip>;
+  }
+  return dot;
 }
 
-/** Status → colored dot. Mirrors the list's completion-badge color semantics. */
-function statusDotClass(status: ScheduledTaskRunStatus): string {
-  switch (status) {
-    case "succeeded":
-      return "bg-emerald-500";
-    case "failed":
-      return "bg-destructive";
-    case "skipped":
-      return "bg-amber-500";
-    default:
-      // scheduled / running / incomplete — not yet a terminal signal.
-      return "bg-muted-foreground/40";
-  }
+/** Wrap a status indicator in the shared Tooltip (app already provides the
+ * TooltipProvider). The trigger uses `asChild` so it renders the child element
+ * directly (icon/dot) rather than a nested button. */
+function IndicatorWithTooltip({
+  tooltip,
+  children,
+}: {
+  tooltip: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        {/* A span wrapper keeps the trigger focusable/hoverable for both the
+            svg icon and the pure-CSS dot span. Vertical alignment to the
+            timestamp baseline is set per-child (icons vs. the smaller dot). */}
+        <span className="inline-flex shrink-0">{children}</span>
+      </TooltipTrigger>
+      <TooltipContent data-testid="run-status-tooltip">{tooltip}</TooltipContent>
+    </Tooltip>
+  );
 }
