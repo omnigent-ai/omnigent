@@ -4,8 +4,9 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from starlette.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities import Conversation
 from omnigent.runtime import get_runner_router, set_runner_router
@@ -228,6 +229,14 @@ def test_preview_hostname_cannot_reach_application_routes() -> None:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
+    reached_websocket = False
+
+    @app.websocket("/ws")
+    async def websocket_route(websocket: WebSocket) -> None:
+        nonlocal reached_websocket
+        reached_websocket = True
+        await websocket.accept()
+
     app.include_router(create_artifact_preview_public_router(service))
     client = TestClient(app)
 
@@ -238,6 +247,13 @@ def test_preview_hostname_cannot_reach_application_routes() -> None:
         ).status_code
         == 404
     )
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            "/ws",
+            headers={"host": "preview.localhost:6767", "origin": "http://preview.localhost:6767"},
+        ):
+            pass
+    assert reached_websocket is False
     assert (
         client.get(
             "/p/not-a-grant/artifacts/revenue/index.html",
@@ -245,6 +261,40 @@ def test_preview_hostname_cannot_reach_application_routes() -> None:
         ).status_code
         == 404
     )
+
+
+@pytest.mark.asyncio
+async def test_grants_are_bounded_per_session_and_expired_grants_are_purged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_client = _runner_client()
+
+    async def resolve(_session_id: str) -> httpx.AsyncClient:
+        return runner_client
+
+    now = 100.0
+    monkeypatch.setattr(
+        "omnigent.server.artifact_previews.time.monotonic",
+        lambda: now,
+    )
+    service = ArtifactPreviewService(
+        preview_origin="http://preview.localhost:6767",
+        runner_client_for_session=resolve,
+        ttl_seconds=10,
+        max_grants=3,
+        max_grants_per_session=2,
+    )
+
+    first = await service.create_grant("conv_preview", "artifacts/one.html")
+    second = await service.create_grant("conv_preview", "artifacts/two.html")
+    third = await service.create_grant("conv_preview", "artifacts/three.html")
+    assert first.token not in service._grants
+    assert {second.token, third.token} == set(service._grants)
+
+    now = 111.0
+    fresh = await service.create_grant("conv_other", "artifacts/fresh.html")
+    assert set(service._grants) == {fresh.token}
+    await runner_client.aclose()
 
 
 @pytest.mark.asyncio

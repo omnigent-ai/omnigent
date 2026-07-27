@@ -1952,13 +1952,25 @@ async def test_runner_os_env_tools_route_artifact_paths_to_managed_storage(
     )
     assert json.loads(edit)["replacements"] == 1
 
+    delete = await _execute_os_env_tool(
+        "sys_os_edit",
+        {
+            "path": "artifacts/revenue/index.html",
+            "oldText": "Revenue",
+            "newText": "",
+        },
+        agent_spec=spec,
+        conversation_id="conv_managed_artifact",
+    )
+    assert json.loads(delete)["replacements"] == 1
+
     read = await _execute_os_env_tool(
         "sys_os_read",
         {"path": "artifacts/revenue/index.html"},
         agent_spec=spec,
         conversation_id="conv_managed_artifact",
     )
-    assert json.loads(read)["content"] == "<h1>Revenue</h1>"
+    assert json.loads(read)["content"] == "<h1></h1>"
     assert (
         tmp_path
         / "data"
@@ -1967,7 +1979,7 @@ async def test_runner_os_env_tools_route_artifact_paths_to_managed_storage(
         / "conv_managed_artifact"
         / "revenue"
         / "index.html"
-    ).read_text() == "<h1>Revenue</h1>"
+    ).read_text() == "<h1></h1>"
     assert not (workspace / "artifacts").exists()
 
 

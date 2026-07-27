@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.runner.managed_artifacts as managed_artifacts
 from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
 from omnigent.runner.managed_artifacts import (
     artifact_spawn_env,
@@ -28,6 +29,21 @@ def test_managed_artifact_dir_uses_configured_data_dir(
     assert artifact_spawn_env("conv_abc123") == {
         "OMNIGENT_ARTIFACT_DIR": str(tmp_path / "artifacts" / "sessions" / "conv_abc123")
     }
+
+
+@pytest.mark.asyncio
+async def test_managed_artifact_io_fails_closed_without_secure_posix_primitives(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(managed_artifacts, "_SECURE_MANAGED_ARTIFACT_IO", False)
+
+    with pytest.raises(
+        managed_artifacts.ManagedArtifactsUnsupported,
+        match="POSIX O_DIRECTORY/O_NOFOLLOW",
+    ):
+        await write_managed_artifact_text("conv_windows", "artifacts/example.html", "hello")
     assert with_artifact_spawn_env({"EXISTING": "1"}, "conv_abc123") == {
         "EXISTING": "1",
         "OMNIGENT_ARTIFACT_DIR": str(tmp_path / "artifacts" / "sessions" / "conv_abc123"),

@@ -5202,8 +5202,12 @@ async def _execute_os_env_tool(
                 result = await edit_managed_artifact_text(
                     conversation_id,
                     path,
-                    old_text=args.get("oldText") or args.get("old_string"),
-                    new_text=args.get("newText") or args.get("new_string"),
+                    old_text=(
+                        args.get("oldText") if "oldText" in args else args.get("old_string")
+                    ),
+                    new_text=(
+                        args.get("newText") if "newText" in args else args.get("new_string")
+                    ),
                     edits=args.get("edits"),
                 )
         except Exception as exc:

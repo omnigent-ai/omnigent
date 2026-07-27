@@ -19,6 +19,8 @@ from omnigent.artifact_paths import canonical_artifact_entry_path
 _DEFAULT_TTL_SECONDS = 600
 _DEFAULT_REQUEST_BUDGET = 256
 _DEFAULT_TRANSFER_BUDGET = 64 * 1024 * 1024
+_DEFAULT_MAX_GRANTS = 4096
+_DEFAULT_MAX_GRANTS_PER_SESSION = 64
 _MAX_RESOURCE_BYTES = 10 * 1024 * 1024
 
 PREVIEW_CSP = "; ".join(
@@ -92,6 +94,8 @@ class ArtifactPreviewService:
         ttl_seconds: int = _DEFAULT_TTL_SECONDS,
         request_budget: int = _DEFAULT_REQUEST_BUDGET,
         transfer_budget: int = _DEFAULT_TRANSFER_BUDGET,
+        max_grants: int = _DEFAULT_MAX_GRANTS,
+        max_grants_per_session: int = _DEFAULT_MAX_GRANTS_PER_SESSION,
     ) -> None:
         origin = preview_origin.rstrip("/")
         parsed = urllib.parse.urlsplit(origin)
@@ -103,16 +107,32 @@ class ArtifactPreviewService:
         self._ttl_seconds = ttl_seconds
         self._request_budget = request_budget
         self._transfer_budget = transfer_budget
+        self._max_grants = max_grants
+        self._max_grants_per_session = max_grants_per_session
         self._grants: dict[str, _GrantState] = {}
         self._lock = asyncio.Lock()
+
+    def _make_grant_capacity_locked(self, session_id: str, now: float) -> None:
+        expired = [token for token, grant in self._grants.items() if grant.expires_at <= now]
+        for token in expired:
+            self._grants.pop(token, None)
+        session_tokens = [
+            token for token, grant in self._grants.items() if grant.session_id == session_id
+        ]
+        while len(session_tokens) >= self._max_grants_per_session:
+            self._grants.pop(session_tokens.pop(0), None)
+        while len(self._grants) >= self._max_grants:
+            self._grants.pop(next(iter(self._grants)))
 
     async def create_grant(self, session_id: str, entry_path: str) -> ArtifactPreviewGrant:
         entry_path, artifact_root = canonical_artifact_entry_path(entry_path)
         if await self._runner_client_for_session(session_id) is None:
             raise ArtifactPreviewUnavailable
         token = secrets.token_urlsafe(32)
-        expires_at = time.monotonic() + self._ttl_seconds
+        now = time.monotonic()
+        expires_at = now + self._ttl_seconds
         async with self._lock:
+            self._make_grant_capacity_locked(session_id, now)
             self._grants[token] = _GrantState(
                 session_id=session_id,
                 entry_path=entry_path,
@@ -183,9 +203,12 @@ class ArtifactPreviewHostMiddleware:
         self.preview_hostname = preview_hostname.lower()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
+        if scope["type"] in {"http", "websocket"}:
             headers = dict(scope.get("headers", []))
             host = headers.get(b"host", b"").decode("latin-1").split(":", 1)[0].lower()
+            if host == self.preview_hostname and scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 1008})
+                return
             if host == self.preview_hostname and not scope.get("path", "").startswith("/p/"):
                 response = Response(status_code=404)
                 await response(scope, receive, send)

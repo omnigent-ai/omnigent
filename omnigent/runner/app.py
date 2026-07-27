@@ -8405,7 +8405,10 @@ def create_runner_app(
     ) -> Response:
         """Read one preview resource with atomic no-follow confinement."""
         from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
-        from omnigent.runner.managed_artifacts import read_managed_artifact
+        from omnigent.runner.managed_artifacts import (
+            ManagedArtifactsUnsupported,
+            read_managed_artifact,
+        )
 
         await _ensure_session_registered(session_id)
         try:
@@ -8417,6 +8420,11 @@ def create_runner_app(
             )
         except (FilesystemPathNotFound, InvalidPath):
             return Response(status_code=404)
+        except ManagedArtifactsUnsupported as exc:
+            return JSONResponse(
+                status_code=501,
+                content={"error": {"code": "unsupported", "message": str(exc)}},
+            )
         media_type = mimetypes.guess_type(relative_path)[0] or "application/octet-stream"
         return Response(
             content=b"" if request.method == "HEAD" else content.data,

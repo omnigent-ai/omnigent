@@ -23,6 +23,20 @@ from omnigent.runner.identity import ARTIFACT_DIR_ENV_VAR
 _MAX_READ_BYTES = 10 * 1024 * 1024
 PUBLISH_DESIGN_ARTIFACT_TOOL = "publish_design_artifact"
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SECURE_MANAGED_ARTIFACT_IO = (
+    os.name == "posix" and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+)
+
+
+class ManagedArtifactsUnsupported(RuntimeError):
+    """Raised when the host cannot provide no-follow dir-fd artifact I/O."""
+
+
+def _require_secure_managed_artifact_io() -> None:
+    if not _SECURE_MANAGED_ARTIFACT_IO:
+        raise ManagedArtifactsUnsupported(
+            "managed artifact I/O requires POSIX O_DIRECTORY/O_NOFOLLOW support"
+        )
 
 
 @dataclass(frozen=True)
@@ -126,6 +140,7 @@ def _open_managed_parent(
     *,
     create_directories: bool,
 ) -> tuple[int, str]:
+    _require_secure_managed_artifact_io()
     parts = _artifact_relative_parts(path)
     root = managed_artifact_dir(session_id)
     if create_directories:
