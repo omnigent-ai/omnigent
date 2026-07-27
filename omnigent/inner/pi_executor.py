@@ -592,36 +592,6 @@ _DATABRICKS_RESPONSES_MODELS = [
         "maxTokens": 128000,
         "input": ["text", "image"],
     },
-    # Kimi and inkling don't send finish_reason via /chat/completions; use
-    # system.ai.* ids which work via the Responses API at /ai-gateway/codex/v1.
-    {
-        "id": "system.ai.kimi-k2-7-code",
-        "name": "Kimi K2.7 Code",
-        "contextWindow": 131072,
-        "maxTokens": 8192,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "system.ai.inkling",
-        "name": "Inkling",
-        "contextWindow": 131072,
-        "maxTokens": 8192,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "system.ai.qwen3-next-80b-a3b-instruct",
-        "name": "Qwen3 Next 80B",
-        "contextWindow": 131072,
-        "maxTokens": 8192,
-        "input": ["text", "image"],
-    },
-    {
-        "id": "system.ai.qwen35-122b-a10b",
-        "name": "Qwen3.5 122B",
-        "contextWindow": 131072,
-        "maxTokens": 8192,
-        "input": ["text", "image"],
-    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [
