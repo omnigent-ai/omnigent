@@ -98,6 +98,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   type Conversation,
+  type PinnedConversationsResult,
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
@@ -305,6 +306,10 @@ function showArchivedToast() {
   showToast(<ArchivedToast />);
 }
 
+/** Stable empty array for the pinned-conversations fallback (referential
+    equality keeps dependent memos from re-firing while the query loads). */
+const EMPTY_CONVERSATIONS: Conversation[] = [];
+
 /**
  * One-time migration of localStorage pins to server-side labels.
  *
@@ -312,24 +317,44 @@ function showArchivedToast() {
  * `PINNED_CONVERSATION_IDS_STORAGE_KEY`. Now they're an `omnigent.pinned`
  * session label so they follow the user across devices. On the first mount
  * after this ships, push any still-local pins the server doesn't already know
- * about (as the label) so no one loses their existing pins, then clear the
- * legacy key so this runs at most once.
+ * about (as the label) so no one loses their existing pins.
  *
- * Waits for the server pinned set to load (`pinnedLoaded`) so an id the server
- * already has isn't needlessly re-PATCHed. Runs the writes directly rather than
- * through the mutation hook: this fires once before any user interaction, and it
- * patches the pinned-list cache itself with the confirmed rows (below) — the
- * same cache-patch (not invalidate) strategy `useTogglePinnedConversation` uses,
- * since the `?pinned=true` index lags these writes.
+ * Runs only when `filterHonored` is true — i.e. the server actually applied
+ * `?pinned=true`, so it can store server-side pins. A pre-upgrade server that
+ * predates this feature ignores the param and returns an unfiltered page;
+ * migrating against it would PATCH pins under a key that server can't
+ * per-user-scope AND clear the legacy key, so after the eventual server upgrade
+ * every pin would read as unpinned. Gating on `filterHonored` keeps the
+ * migration inert (localStorage untouched, pins still render via the union in
+ * the caller) until the server can honor it — so a UI-before-server upgrade is
+ * safe.
+ *
+ * A legacy id is only dropped from localStorage once its server write is
+ * confirmed; anything unwritten (failed, offline, or not-yet-run because the
+ * server can't store pins) stays so the next load retries. Runs the writes
+ * directly rather than through the mutation hook: this fires once before any
+ * user interaction, and it patches the pinned-list cache itself with the
+ * confirmed rows — the same cache-patch (not invalidate) strategy
+ * `useTogglePinnedConversation` uses, since the `?pinned=true` index lags these
+ * writes.
  *
  * @param serverPinnedIds - Ids the server already reports as pinned.
  * @param pinnedLoaded - Whether the server pinned query has settled.
+ * @param filterHonored - Whether the server applied the `?pinned=true` filter.
  */
-function useMigrateLocalPinsToServer(serverPinnedIds: Set<string>, pinnedLoaded: boolean): void {
+export function useMigrateLocalPinsToServer(
+  serverPinnedIds: Set<string>,
+  pinnedLoaded: boolean,
+  filterHonored: boolean,
+): void {
   const queryClient = useQueryClient();
   const migratedRef = useRef(false);
   useEffect(() => {
-    if (!pinnedLoaded || migratedRef.current) return;
+    // Don't migrate until the query settled AND the server proved it honors the
+    // pinned filter — an old server ignores it, and migrating there wipes local
+    // pins. Leave `migratedRef` false so a later load (post server upgrade)
+    // still runs the migration.
+    if (!pinnedLoaded || !filterHonored || migratedRef.current) return;
     migratedRef.current = true;
     const legacyIds = readPinnedConversationIds();
     const toMigrate = legacyIds.filter((id) => !serverPinnedIds.has(id));
@@ -363,16 +388,20 @@ function useMigrateLocalPinsToServer(serverPinnedIds: Set<string>, pinnedLoaded:
       // here would momentarily drop the just-migrated pins.
       const rows = results.map((r) => r.conv).filter((c): c is Conversation => c != null);
       if (rows.length > 0) {
-        queryClient.setQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY, (old) => {
+        queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) => {
           const ids = new Set(rows.map((c) => c.id));
-          return [...(old ?? []).filter((c) => !ids.has(c.id)), ...rows];
+          const prev = old ?? { conversations: [], filterHonored: true };
+          return {
+            ...prev,
+            conversations: [...prev.conversations.filter((c) => !ids.has(c.id)), ...rows],
+          };
         });
       }
     })();
-    // Run once after the pinned set loads; serverPinnedIds is captured at that
-    // point and the ref guard prevents re-entry.
+    // Re-run when the query settles or the filter starts being honored (post
+    // server upgrade); the ref guard prevents re-entry once it actually runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pinnedLoaded]);
+  }, [pinnedLoaded, filterHonored]);
 }
 
 export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
@@ -485,13 +514,38 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // they follow the user across devices. `usePinnedConversations` is the
   // authoritative pinned set (independent of the paginated window); the toggle
   // mutation flips the label and refreshes that query.
-  const { data: pinnedConversations = [], isSuccess: pinnedLoaded } = usePinnedConversations();
-  const pinnedConversationIds = useMemo(
-    () => pinnedConversations.map((c) => c.id),
-    [pinnedConversations],
+  const { data: pinnedData, isSuccess: pinnedLoaded } = usePinnedConversations();
+  // Stable empty fallback so downstream memos don't re-fire on every render
+  // while the query is still loading (`pinnedData` undefined).
+  const pinnedConversations = useMemo(
+    () => pinnedData?.conversations ?? EMPTY_CONVERSATIONS,
+    [pinnedData],
   );
+  const pinnedFilterHonored = pinnedData?.filterHonored ?? false;
+  // Membership is the union of the server's pinned rows and any pins still in
+  // the legacy localStorage key — so a not-yet-migrated pin (server too old, or
+  // a migration write that hasn't landed) keeps showing in the Pinned section
+  // instead of vanishing. The union collapses to just the server set once the
+  // migration clears the legacy key. Ordering/rows still come from
+  // `pinnedConversations` where available; a legacy-only id renders from the
+  // loaded list rows the grouping already has.
+  const pinnedConversationIds = useMemo(() => {
+    const ids = pinnedConversations.map((c) => c.id);
+    const seen = new Set(ids);
+    for (const id of readPinnedConversationIds()) if (!seen.has(id)) ids.push(id);
+    return ids;
+    // `pinnedLoaded` isn't read but is a dep on purpose: it re-reads the legacy
+    // key after the migration (gated on the query settling) mutates it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pinnedConversations, pinnedLoaded]);
   const togglePinnedMutation = useTogglePinnedConversation();
   const pinnedIdSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
+  // The migration compares the legacy key against what the SERVER already owns
+  // (not the union — a legacy-only id must still count as "to migrate").
+  const serverPinnedIdSet = useMemo(
+    () => new Set(pinnedConversations.map((c) => c.id)),
+    [pinnedConversations],
+  );
   const togglePinnedConversation = useCallback(
     (conversationId: string) => {
       togglePinnedMutation.mutate({
@@ -506,7 +560,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // still-local pins up to the server (as the `omnigent.pinned` label) the
   // first time this build runs, so no one loses their existing pins, then
   // clear the legacy key so this runs at most once.
-  useMigrateLocalPinsToServer(pinnedIdSet, pinnedLoaded);
+  useMigrateLocalPinsToServer(serverPinnedIdSet, pinnedLoaded, pinnedFilterHonored);
 
   // Desktop-only drag-to-resize, mirroring the right rail. The width is
   // exposed as a CSS variable consumed by the ``md:w-[var(--sidebar-width)]``

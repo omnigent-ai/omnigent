@@ -72,7 +72,13 @@ vi.mock("@/hooks/useConversations", () => ({
   // `seedPins` exercise the Pinned section without a separate fixture.
   usePinnedConversations: () => {
     const idSet = new Set(pinnedIdsRef.current);
-    return { data: conversationsRef.current.filter((c) => idSet.has(c.id)), isSuccess: true };
+    return {
+      data: {
+        conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
+        filterHonored: true,
+      },
+      isSuccess: true,
+    };
   },
   // Reflect the toggle into the seeded ref so a test that clicks quick-pin then
   // re-renders sees the updated Pinned set.

@@ -779,14 +779,39 @@ export { PINNED_LABEL_KEY };
 export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
 
 /**
+ * Result of the pinned-session query. `conversations` is the viewer's pinned
+ * sessions; `filterHonored` says whether the server actually applied the
+ * `?pinned=true` filter (see {@link fetchPinnedConversations}).
+ */
+export interface PinnedConversationsResult {
+  conversations: Conversation[];
+  /**
+   * False when the server ignored the `pinned` query param — i.e. a
+   * pre-upgrade server that predates server-side pins. Such a server returns
+   * an ordinary (unfiltered) session page whose rows carry no `omnigent.pinned`
+   * label. The sidebar reads this to keep the one-time localStorage→server pin
+   * migration inert until the server can actually store pins, so a
+   * UI-before-server upgrade can't wipe local pins.
+   */
+  filterHonored: boolean;
+}
+
+/**
  * Fetch every pinned session (the `omnigent.pinned` label) via
  * `GET /v1/sessions?pinned=true`, independent of the sidebar's paginated
  * window. Pins now live on the server (a session label) so they follow the
  * user across devices; this query is the source of truth for which sessions
  * are pinned and supplies the rows for any pin that sits outside the loaded
  * list. A generous single page (100) covers realistic pin counts.
+ *
+ * A pre-upgrade server doesn't know the `pinned` param and silently ignores
+ * it (FastAPI drops unknown query params), returning an ordinary session page.
+ * We defend against that by keeping only rows that actually carry the
+ * `omnigent.pinned` label and reporting `filterHonored: false` whenever the
+ * server handed back rows that aren't pinned — the signal the sidebar uses to
+ * skip the destructive localStorage migration against an old server.
  */
-export async function fetchPinnedConversations(): Promise<Conversation[]> {
+export async function fetchPinnedConversations(): Promise<PinnedConversationsResult> {
   const params = new URLSearchParams({
     order: "desc",
     sort_by: "updated_at",
@@ -795,12 +820,18 @@ export async function fetchPinnedConversations(): Promise<Conversation[]> {
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return ((await res.json()) as ConversationsPage).data;
+  const rows = ((await res.json()) as ConversationsPage).data;
+  const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
+  // Honored iff the server returned nothing, or everything it returned is
+  // actually pinned. An old server returns unfiltered rows (none pinned), so a
+  // non-empty raw page with fewer pinned rows means the filter was ignored.
+  const filterHonored = rows.length === 0 || conversations.length === rows.length;
+  return { conversations, filterHonored };
 }
 
 /** Server-authoritative list of the viewer's pinned sessions. */
 export function usePinnedConversations() {
-  return useQuery<Conversation[]>({
+  return useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
     queryFn: fetchPinnedConversations,
     staleTime: 30_000,
@@ -858,7 +889,9 @@ export function useTogglePinnedConversation() {
   // window, so that cache is searched too — otherwise its pinned row would be
   // built from the timestamp-less snapshot.
   const findRow = (id: string): Conversation | undefined =>
-    queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY)?.find((c) => c.id === id) ??
+    queryClient
+      .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+      ?.conversations.find((c) => c.id === id) ??
     queryClient
       .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
       .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
@@ -894,9 +927,13 @@ export function useTogglePinnedConversation() {
     queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
     // Add the row on pin (its label carries the pin timestamp the sidebar sorts
     // by) built from the existing row + labels; drop it on unpin.
-    queryClient.setQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY, (old) => {
-      const rest = (old ?? []).filter((c) => c.id !== id);
-      if (!pinned) return rest;
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) => {
+      // Preserve the query's `filterHonored` flag; the toggle only mutates the
+      // list. If the query hasn't loaded yet, an optimistic patch implies the
+      // server can store pins, so treat it as honored.
+      const prev = old ?? { conversations: [], filterHonored: true };
+      const rest = prev.conversations.filter((c) => c.id !== id);
+      if (!pinned) return { ...prev, conversations: rest };
       // Prefer the full cached row (keeps title/updated_at); fall back to a
       // minimal row when the session isn't in any loaded cache (rare — the pin
       // affordance lives on a visible row). The pinned query refetch fills the
@@ -904,7 +941,7 @@ export function useTogglePinnedConversation() {
       const row: Conversation = existing
         ? { ...existing, labels }
         : ({ id, object: "conversation", labels } as Conversation);
-      return [...rest, row];
+      return { ...prev, conversations: [...rest, row] };
     });
   };
 
@@ -916,7 +953,8 @@ export function useTogglePinnedConversation() {
     // network resolves, which reads as lag. Snapshot the pinned cache so a
     // failed PATCH rolls back.
     onMutate: ({ id, pinned }) => {
-      const prevPinned = queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY);
+      const prevPinned =
+        queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
       const base = findRow(id)?.labels ?? {};
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(Date.now()) }

@@ -59,7 +59,10 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({ data: [], isSuccess: true }),
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
   useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
