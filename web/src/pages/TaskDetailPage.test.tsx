@@ -472,7 +472,7 @@ describe("run history", () => {
     expect(within(row).queryByTestId("run-duration")).toBeNull();
   });
 
-  it("renders a RUNNING run with a pulsing grey dot and a 'Running' tooltip", async () => {
+  it("renders a RUNNING run with a spinning loader icon and a 'Running' tooltip", async () => {
     setTask(task());
     setRuns([
       run({
@@ -485,15 +485,32 @@ describe("run history", () => {
     ]);
     renderPage();
     const row = screen.getByTestId("task-detail-run");
-    const dot = within(row).getByTestId("run-status-dot");
-    expect(dot).toHaveAttribute("data-run-icon", "running");
-    expect(dot.className).toContain("animate-pulse");
-    expect(dot.className).toContain("bg-muted-foreground/40");
-    // No status ICON — running uses the dot slot, not an svg icon.
-    expect(within(row).queryByTestId("run-status-icon")).toBeNull();
+    const icon = within(row).getByTestId("run-status-icon");
+    expect(icon).toHaveAttribute("data-run-icon", "running");
+    expect(icon.getAttribute("class") ?? "").toContain("animate-spin");
+    // It is an svg icon, not the dot span.
+    expect(within(row).queryByTestId("run-status-dot")).toBeNull();
     // Tooltip reads "Running".
-    fireEvent.focus(dot);
+    fireEvent.focus(icon);
     await waitFor(() => expect(screen.getAllByText("Running").length).toBeGreaterThan(0));
+  });
+
+  it("a RUNNING run with a conversationId renders a clickable link", () => {
+    setTask(task());
+    setRuns([
+      run({
+        id: "run_running_linked",
+        status: "running",
+        conversationId: "c_run",
+        firedAt: 1_700_000_000,
+        finishedAt: null,
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    const link = within(row).getByTestId("run-open");
+    expect(link).toHaveAttribute("href", "/c/c_run");
+    expect(link.tagName).toBe("A");
   });
 
   it("renders an error message when run history fails to load", () => {

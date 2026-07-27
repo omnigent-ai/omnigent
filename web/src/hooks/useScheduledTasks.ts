@@ -133,11 +133,24 @@ export function useDeleteScheduledTask() {
   });
 }
 
+// Max attempts and interval for the post-run-now accelerated poll. The poll
+// stops as soon as a new run row appears, or after the cap (~10s ceiling).
+const RUN_NOW_POLL_MAX = 10;
+const RUN_NOW_POLL_INTERVAL_MS = 1_000;
+
+// Guard against stacking pollers when Run now is clicked rapidly. One active
+// poller per task id at a time — the timer id is stored here and cleared when
+// the poll finishes or yields to a newer one.
+const runNowPollers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
 /**
  * Trigger an immediate ("run now") fire of a task, then refresh the list and
- * that task's run history so the completion badge (last-run status) reflects
- * the new run. The server launches the run in the background (202), so the
- * badge lands on the next list poll / invalidation rather than synchronously.
+ * that task's run history. The server returns 202 (fire-and-forget) and writes
+ * the run row in the background, so a single invalidate would miss it until the
+ * 60s background poll. To make the new run appear within ~1-2s, we kick off a
+ * bounded accelerated poll of the runs query after success: refetch every 1s
+ * until a new run row lands or after 10 attempts (~10s ceiling), then do a
+ * final invalidate and stop.
  */
 export function useRunScheduledTaskNow() {
   const queryClient = useQueryClient();
@@ -146,7 +159,39 @@ export function useRunScheduledTaskNow() {
     onSuccess: (_data, id) => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
       void queryClient.invalidateQueries({ queryKey: scheduledTaskKey(id) });
+
+      // Immediate invalidate so callers not on the detail page still see a fast
+      // refresh (mirrors the old behaviour; the poll below is additive).
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(id) });
+
+      // Snapshot the pre-fire run count so we know when a new row has landed.
+      const pre = queryClient.getQueryData<ScheduledTaskRun[]>(scheduledTaskRunsKey(id));
+      const preCount = pre?.length ?? 0;
+
+      // Cancel any in-flight poller for this task (double-click guard).
+      const existing = runNowPollers.get(id);
+      if (existing != null) clearTimeout(existing);
+
+      let attempts = 0;
+
+      function poll() {
+        attempts += 1;
+        void queryClient.refetchQueries({ queryKey: scheduledTaskRunsKey(id) }).then(() => {
+          const current = queryClient.getQueryData<ScheduledTaskRun[]>(scheduledTaskRunsKey(id));
+          const currentCount = current?.length ?? 0;
+          if (currentCount > preCount || attempts >= RUN_NOW_POLL_MAX) {
+            // New row appeared (or cap reached) — do a final broad invalidate and stop.
+            runNowPollers.delete(id);
+            void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(id) });
+          } else {
+            const timer = setTimeout(poll, RUN_NOW_POLL_INTERVAL_MS);
+            runNowPollers.set(id, timer);
+          }
+        });
+      }
+
+      const timer = setTimeout(poll, RUN_NOW_POLL_INTERVAL_MS);
+      runNowPollers.set(id, timer);
     },
   });
 }

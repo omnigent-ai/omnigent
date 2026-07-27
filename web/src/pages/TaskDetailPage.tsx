@@ -359,7 +359,7 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="flex items-baseline gap-2">
-          <span className="text-sm font-semibold">{timestamp ?? "—"}</span>
+          <span className="text-sm font-normal">{timestamp ?? "—"}</span>
           {duration && (
             <span className="text-xs text-muted-foreground" data-testid="run-duration">
               {duration}
@@ -410,7 +410,7 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
  * The leading LEFT status icon for a run. Exactly one renders, by priority:
  *   1. failed              → amber warning triangle, tooltip = errorCode message.
  *   2. skipped             → muted calendar-off icon, tooltip = skip reason.
- *   3. running             → pulsing grey dot, tooltip = "Running".
+ *   3. running             → spinning loader icon, tooltip = "Running".
  *   4. succeeded + UNREAD  → blue filled dot, tooltip = "Unread".
  *   5. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
  *   6. scheduled/incomplete → muted grey dot, no tooltip (not terminal).
@@ -441,11 +441,10 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
   if (run.status === "running") {
     return (
       <IndicatorWithTooltip tooltip="Running">
-        <span
-          aria-hidden
-          data-testid="run-status-dot"
+        <Loader2Icon
+          data-testid="run-status-icon"
           data-run-icon="running"
-          className="size-2.5 shrink-0 animate-pulse rounded-full bg-muted-foreground/40"
+          className="size-3 shrink-0 animate-spin text-muted-foreground"
         />
       </IndicatorWithTooltip>
     );
