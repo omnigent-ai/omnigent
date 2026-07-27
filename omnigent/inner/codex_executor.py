@@ -993,8 +993,8 @@ def _merge_codex_hook_trust_back(
     for key, value in translated.items():
         state_table[key] = value
 
+    tmp = global_config.with_suffix(".toml.tmp")
     try:
-        tmp = global_config.with_suffix(".toml.tmp")
         tmp.write_text(tomlkit.dumps(global_doc), encoding="utf-8")
         os.replace(tmp, global_config)
     except OSError:
