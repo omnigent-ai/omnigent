@@ -4474,6 +4474,61 @@ async def test_relay_flushes_final_text_on_fenced_response_completed(
 
 
 @pytest.mark.asyncio
+async def test_relay_accumulates_usage_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Usage accumulation is dispatched off the event loop.
+
+    ``_accumulate_session_usage`` runs a synchronous pricing lookup whose
+    live fallback can block on a network fetch up to the socket timeout on
+    a cold cache miss. Running it on the loop thread stalls turn relay for
+    every session on that loop, so the relay must offload it
+    (``asyncio.to_thread``). Without the offload this test fails: the spy
+    records the loop's own thread id.
+    """
+    import threading
+
+    import omnigent.server.routes._sessions.orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    loop_thread = threading.get_ident()
+    calls: list[tuple[int, tuple[Any, ...]]] = []
+
+    def _spy(*args: Any) -> None:
+        calls.append((threading.get_ident(), args))
+
+    monkeypatch.setattr(orchestration_module, "_accumulate_session_usage", _spy)
+
+    sid = "79b22ebd2309e48fdeb450c65611d51b"
+    usage = {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7}
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_usage", "model": "m", "usage": usage},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+    assert len(calls) == 1, f"expected one accumulation call, got {calls}"
+    worker_thread, args = calls[0]
+    assert worker_thread != loop_thread, (
+        "_accumulate_session_usage ran on the event-loop thread; a cold pricing "
+        "fetch would stall turn relay for every session on the loop"
+    )
+    # Same call shape as before the offload: response dict, session id, store.
+    assert args[0]["usage"] == usage
+    assert args[1] == sid
+    assert args[2] is store
+
+
+@pytest.mark.asyncio
 async def test_relay_persists_pre_stop_narration_on_fenced_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
