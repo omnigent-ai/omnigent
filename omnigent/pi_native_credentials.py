@@ -71,16 +71,33 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 
-# Mapping from databricks-* serving-endpoint ids to system.ai.* ids for models
-# that require the Responses API. These models don't send finish_reason via
-# /chat/completions, but work correctly via /ai-gateway/codex/v1/responses.
-_DATABRICKS_TO_SYSTEM_AI: dict[str, str] = {
-    "databricks-kimi-k2-7-code": "system.ai.kimi-k2-7-code",
-    "databricks-inkling": "system.ai.inkling",
-    "databricks-glm-5-2": "system.ai.glm-5-2",
-    "databricks-qwen3-next-80b-a3b-instruct": "system.ai.qwen3-next-80b-a3b-instruct",
-    "databricks-qwen35-122b-a10b": "system.ai.qwen35-122b-a10b",
-}
+# Keyword fragments that identify Databricks serving-endpoint models which
+# require the Responses API. These models don't send finish_reason via
+# /chat/completions but work correctly via /ai-gateway/codex/v1/responses
+# using their system.ai.* alias (derived by stripping "databricks-" prefix).
+# Use specific enough fragments to avoid false-positives (e.g. "glm" would
+# match "zai-org-glm-4-7" which has no system.ai.* alias).
+_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "glm-5", "qwen3", "qwen35")
+
+
+def _databricks_to_system_ai(model_id: str) -> str | None:
+    """Return the system.ai.* alias for a databricks-* model that requires Responses API.
+
+    Detects by keyword so new model variants (renamed, versioned) are handled
+    automatically without updating an exact-id map.
+
+    :param model_id: Serving-endpoint id, e.g. ``"databricks-kimi-k2-7-code"``.
+    :returns: ``"system.ai.<suffix>"`` when the model needs the Responses API,
+        ``None`` otherwise.
+    """
+    lower = model_id.lower()
+    if not lower.startswith("databricks-"):
+        return None
+    suffix = lower[len("databricks-") :]
+    if any(kw in suffix for kw in _SYSTEM_AI_MODEL_KEYWORDS):
+        return f"system.ai.{suffix}"
+    return None
+
 
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
@@ -531,7 +548,7 @@ def _fetch_pi_model_lists(
             continue
         # Kimi and inkling don't send finish_reason via /chat/completions but
         # work correctly via the Responses API using system.ai.* ids.
-        system_ai_id = _DATABRICKS_TO_SYSTEM_AI.get(name)
+        system_ai_id = _databricks_to_system_ai(name)
         entry: dict[str, Any] = {"id": system_ai_id or name, "input": ["text", "image"]}
         # GLM/DeepSeek/kimi/inkling stream on reasoning_content channel → need
         # reasoning:true. Substring matching guards unnamed variants (renamed,

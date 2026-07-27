@@ -901,10 +901,13 @@ def _pi_needs_responses_api(model: str) -> bool:
     - system.ai.* models (Kimi, inkling) that need the Responses API to avoid
       the missing finish_reason issue.
     """
-    from omnigent.pi_native_credentials import _needs_responses_api
+    from omnigent.pi_native_credentials import _databricks_to_system_ai, _needs_responses_api
 
     lower = model.lower()
     if lower.startswith("system.ai."):
+        return True
+    # databricks-* models with system.ai.* aliases also use Responses API
+    if _databricks_to_system_ai(model) is not None:
         return True
     return _needs_responses_api(lower)
 
@@ -1965,13 +1968,12 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
-            from omnigent.pi_native_credentials import _DATABRICKS_TO_SYSTEM_AI
+            from omnigent.pi_native_credentials import _databricks_to_system_ai
 
-            # Translate databricks-* model ids that work via system.ai.* to their
-            # system.ai.* alias so _build_models_json routes them to the Responses
-            # API provider (avoids the missing finish_reason issue on kimi/inkling).
+            # Translate databricks-* model ids to system.ai.* aliases for models
+            # that require the Responses API (kimi, inkling, glm, qwen3, etc.).
             effective_model = (
-                _DATABRICKS_TO_SYSTEM_AI.get(model, model) if model is not None else model
+                (_databricks_to_system_ai(model) or model) if model is not None else model
             )
             models_json = _build_models_json(
                 self._databricks_host,

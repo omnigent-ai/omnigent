@@ -910,7 +910,12 @@ def _fetch_databricks_listing(
         # state field stays included (the API may omit it).
         if isinstance(ready, str) and ready and ready.upper() != "READY":
             continue
-        models.append(ModelEntry(id=name, family=model_family_token(name)))
+        # Surface system.ai.* alias when available so sys_list_models returns
+        # the id that Pi can actually use (Responses API-routed models).
+        from omnigent.pi_native_credentials import _databricks_to_system_ai
+
+        display_id = _databricks_to_system_ai(name) or name
+        models.append(ModelEntry(id=display_id, family=model_family_token(display_id)))
     return ModelListing(
         source="gateway",
         verified=True,
