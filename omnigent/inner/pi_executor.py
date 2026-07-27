@@ -610,14 +610,6 @@ _DATABRICKS_RESPONSES_MODELS = [
         "input": ["text", "image"],
         "reasoning": True,
     },
-    {
-        "id": "system.ai.glm-5-2",
-        "name": "GLM-5.2",
-        "contextWindow": 131072,
-        "maxTokens": 8192,
-        "input": ["text", "image"],
-        "reasoning": True,
-    },
     # Qwen3 returns array content with tool calls via /chat/completions, causing
     # [object Object] errors. Responses API via system.ai.* avoids this.
     {
@@ -2069,12 +2061,20 @@ class PiExecutor(Executor):
         """Get or create a Pi RPC subprocess for the given session."""
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
+        # Normalize to system.ai.* before any comparison or selector construction
+        # so models.json and the provider/model selector always agree.
+        from omnigent.pi_native_credentials import _databricks_to_system_ai
+
+        effective_model = (
+            (_databricks_to_system_ai(model) or model) if model is not None else model
+        )
+
         if (
             state.rpc is not None
             and state.rpc.process is not None
             and state.rpc.process.returncode is None
             and state.system_prompt == system_prompt
-            and state.model == model
+            and state.model == effective_model
         ):
             return state.rpc
 
@@ -2084,7 +2084,7 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, model
+            tools, tool_server_port, tool_server_token, effective_model
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -2096,11 +2096,11 @@ class PiExecutor(Executor):
         # For Databricks models, prefix with the provider name so Pi resolves
         # the model from our custom provider in models.json.
         pi_model: str | None
-        if self._gateway and model:
-            provider = _pi_provider_for_model(model)
-            pi_model = f"{provider}/{model}"
+        if self._gateway and effective_model:
+            provider = _pi_provider_for_model(effective_model)
+            pi_model = f"{provider}/{effective_model}"
         else:
-            pi_model = model
+            pi_model = effective_model
 
         await rpc.start(
             self._pi_launch_path,
@@ -2112,7 +2112,7 @@ class PiExecutor(Executor):
         )
         state.rpc = rpc
         state.system_prompt = system_prompt
-        state.model = model
+        state.model = effective_model
         state._has_sent_prompt = False
         return rpc
 
