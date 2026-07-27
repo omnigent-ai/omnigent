@@ -771,7 +771,7 @@ def _listing_for_provider(
         return cached
     try:
         if provider.kind == DATABRICKS_KIND:
-            listing = _fetch_databricks_listing(provider, transport=transport)
+            listing = _fetch_databricks_uc_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
             listing = _fetch_anthropic_listing(provider, transport=transport)
         else:
@@ -910,18 +910,67 @@ def _fetch_databricks_listing(
         # state field stays included (the API may omit it).
         if isinstance(ready, str) and ready and ready.upper() != "READY":
             continue
-        # Surface system.ai.* alias when available so sys_list_models returns
-        # the id that Pi can actually use (Responses API-routed models).
-        from omnigent.pi_native_credentials import _databricks_to_system_ai
-
-        display_id = _databricks_to_system_ai(name) or name
-        models.append(ModelEntry(id=display_id, family=model_family_token(display_id)))
+        models.append(ModelEntry(id=name, family=model_family_token(name)))
     return ModelListing(
         source="gateway",
         verified=True,
         models=tuple(models),
         note=(
             "LLM serving endpoints on the Databricks workspace gateway "
+            f"(profile {provider.profile or 'DEFAULT'!r})"
+        ),
+    )
+
+
+def _fetch_databricks_uc_listing(
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> ModelListing:
+    """List LLM model services via the Unity Catalog model-services API.
+
+    Returns ``system.ai.*`` model ids directly — the ids that work with the
+    AI Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
+
+    :param provider: A ``kind="databricks"`` provider descriptor.
+    :param transport: Optional httpx transport override for tests.
+    :returns: A ``source="gateway"`` listing of model service names.
+    :raises httpx.HTTPError: On transport/HTTP failures.
+    :raises OSError: When the profile resolves no credentials.
+    """
+    creds = resolve_databricks_workspace(provider.profile)
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        resp = client.get(
+            f"{creds.host}/api/2.1/unity-catalog/model-services",
+            headers={"Authorization": f"Bearer {creds.token}"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    services = payload.get("model_services") if isinstance(payload, dict) else None
+    models: list[ModelEntry] = []
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict):
+            continue
+        raw_name = service.get("name", "")
+        name = (
+            raw_name.replace("model-services/", "")
+            if raw_name.startswith("model-services/")
+            else raw_name
+        )
+        if not name:
+            continue
+        api_types = service.get("supported_api_types", [])
+        has_chat = any("chat" in t for t in api_types)
+        has_embed = any("embed" in t.lower() for t in api_types)
+        if not has_chat or has_embed:
+            continue
+        models.append(ModelEntry(id=name, family=model_family_token(name)))
+    return ModelListing(
+        source="gateway",
+        verified=True,
+        models=tuple(models),
+        note=(
+            "LLM model services on the Databricks workspace "
             f"(profile {provider.profile or 'DEFAULT'!r})"
         ),
     )

@@ -987,48 +987,42 @@ def test_cli_config_databricks_registers_gpt_provider(
 
 
 def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
-    """_fetch_pi_model_lists splits live endpoints into claude/openai lists."""
+    """_fetch_pi_model_lists uses Unity Catalog model-services API for model ids."""
     import json
     import unittest.mock
 
     import httpx
 
+    def _make_service(name: str, api_types: list[str]) -> dict:
+        return {
+            "name": f"model-services/{name}",
+            "supported_api_types": api_types,
+        }
+
     payload = {
-        "endpoints": [
-            {
-                "name": "databricks-claude-sonnet-4-6",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            },
-            {
-                "name": "databricks-claude-opus-4-8",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            },
-            {"name": "databricks-gpt-5-4", "task": "llm/v1/chat", "state": {"ready": "READY"}},
-            {"name": "databricks-llama-3-70b", "task": "llm/v1/chat", "state": {"ready": "READY"}},
-            # GLM endpoint — task-based detection (no name token needed)
-            {
-                "name": "databricks-zai-org-glm-4-7",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            },
-            # GLM without task field — falls back to name token "glm"
-            {"name": "databricks-glm-4-7", "state": {"ready": "READY"}},
-            {"name": "my-embedding-model", "task": "llm/v1/embeddings"},
-            {"name": "databricks-gpt-5-5", "task": "llm/v1/chat", "state": {"ready": "READY"}},
-            # NOT_READY — excluded regardless of API type
-            {
-                "name": "databricks-gpt-5-5-pro",
-                "task": "llm/v1/chat",
-                "state": {"ready": "NOT_READY"},
-            },
+        "model_services": [
+            _make_service("system.ai.claude-sonnet-4-6", ["mlflow/v1/chat/completions"]),
+            _make_service("system.ai.claude-opus-4-8", ["mlflow/v1/chat/completions"]),
+            # GPT with Responses API support
+            _make_service(
+                "system.ai.gpt-5-5", ["mlflow/v1/chat/completions", "openai/v1/responses"]
+            ),
+            # GPT completions only (older)
+            _make_service(
+                "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
+            ),
+            # Llama - chat only
+            _make_service("system.ai.llama-4-maverick", ["mlflow/v1/chat/completions"]),
+            # Kimi - chat only (no Responses API per UC metadata)
+            _make_service("system.ai.kimi-k2-7-code", ["mlflow/v1/chat/completions"]),
+            # Embedding model - should be excluded
+            _make_service("system.ai.qwen3-embedding", ["mlflow/v1/embeddings"]),
         ]
     }
 
     class _MockTransport(httpx.BaseTransport):
         def handle_request(self, request: httpx.Request) -> httpx.Response:
-            assert "/api/2.0/serving-endpoints" in str(request.url)
+            assert "/api/2.1/unity-catalog/model-services" in str(request.url)
             assert request.headers["authorization"].startswith("Bearer ")
             return httpx.Response(200, content=json.dumps(payload).encode())
 
@@ -1039,22 +1033,23 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     ):
         claude, gpt, completions = creds._fetch_pi_model_lists("https://wkspc.example.com", "tok")
 
-    assert [m["id"] for m in claude] == [
-        "databricks-claude-sonnet-4-6",
-        "databricks-claude-opus-4-8",
-    ]
-    # Newer GPT needing Responses API
+    # Claude models
+    claude_ids = [m["id"] for m in claude]
+    assert "system.ai.claude-sonnet-4-6" in claude_ids
+    assert "system.ai.claude-opus-4-8" in claude_ids
+    # GPT with openai/v1/responses → gpt_responses
     gpt_ids = [m["id"] for m in gpt]
-    assert "databricks-gpt-5-5" in gpt_ids  # needs responses API
-    assert "databricks-gpt-5-4" not in gpt_ids  # works with completions
-    # Llama and GLM go to completions (work with /chat/completions + tools)
+    assert "system.ai.gpt-5-5" in gpt_ids
+    assert "system.ai.gpt-5-4" in gpt_ids
+    # Llama and Kimi → completions (chat only, no Responses API in UC)
     completions_ids = [m["id"] for m in completions]
-    assert "databricks-gpt-5-4" in completions_ids
-    assert "databricks-llama-3-70b" in completions_ids
-    assert "databricks-zai-org-glm-4-7" in completions_ids
-    assert "databricks-glm-4-7" in completions_ids
-    # Embeddings and not-ready endpoints excluded
-    assert "my-embedding-model" not in gpt_ids + completions_ids
+    assert "system.ai.llama-4-maverick" in completions_ids
+    assert "system.ai.kimi-k2-7-code" in completions_ids
+    # Kimi gets reasoning:true
+    kimi_entry = next(m for m in completions if m["id"] == "system.ai.kimi-k2-7-code")
+    assert kimi_entry.get("reasoning") is True
+    # Embedding excluded
+    assert "system.ai.qwen3-embedding" not in gpt_ids + completions_ids + claude_ids
     assert all(m.get("input") == ["text", "image"] for m in claude + gpt + completions)
 
 

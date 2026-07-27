@@ -464,18 +464,19 @@ def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Fetch live model lists from the Databricks serving-endpoints API.
+    """Fetch live model lists from the Unity Catalog model-services API.
 
-    Calls ``GET <workspace>/api/2.0/serving-endpoints``, filters for READY LLM
-    endpoints, and splits them into two Pi model entry dict lists:
+    Calls ``GET <workspace>/api/2.1/unity-catalog/model-services``, which
+    returns ``system.ai.*`` model ids with their supported API types:
 
+    * ``openai/v1/responses`` in supported_api_types → ``openai-responses``
+      provider at the AI Gateway codex surface.
+    * Chat-capable models without Responses API support → ``openai-completions``
+      provider at the serving-endpoints surface.
     * Claude models → ``anthropic-messages`` provider.
-    * Newer GPT models (gpt-5.5, gpt-5.6-*, gpt-5.3-codex, …) that reject
-      function tools via ``/chat/completions`` → ``openai-responses`` provider
-      at the AI Gateway codex surface.
-    * Other LLMs (Kimi, Llama, GLM, Gemini, older GPT …) that work with
-      function tools via ``/chat/completions`` → ``openai-completions`` provider
-      at the serving-endpoints surface.
+
+    Using this API avoids the ``databricks-*`` → ``system.ai.*`` translation
+    and gives authoritative API capability information per model.
 
     Falls back to empty lists on any HTTP or auth failure so a network blip
     never breaks Pi session launch.
@@ -491,7 +492,7 @@ def _fetch_pi_model_lists(
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(
-                f"{workspace_url.rstrip('/')}/api/2.0/serving-endpoints",
+                f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/model-services",
                 headers={"Authorization": f"Bearer {token}"},
             )
             resp.raise_for_status()
@@ -504,72 +505,49 @@ def _fetch_pi_model_lists(
         )
         return [], [], []
 
-    endpoints = payload.get("endpoints") if isinstance(payload, dict) else None
+    services = payload.get("model_services") if isinstance(payload, dict) else None
     claude: list[dict[str, Any]] = []
-    # Newer GPT models (gpt-5.5, gpt-5.6-*, gpt-5.3-codex) reject function tools
-    # via /chat/completions; they need the Responses API at the AI Gateway.
     gpt_responses: list[dict[str, Any]] = []
-    # Non-GPT models (Kimi, Llama, GLM, Gemini) and older GPT models work fine
-    # with function tools via /chat/completions at serving-endpoints.
     completions: list[dict[str, Any]] = []
 
-    for endpoint in endpoints if isinstance(endpoints, list) else []:
-        if not isinstance(endpoint, dict):
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict):
             continue
-        name = endpoint.get("name")
-        if not isinstance(name, str) or not name:
+        raw_name = service.get("name", "")
+        # Name format: "model-services/system.ai.<model>"
+        name = (
+            raw_name.replace("model-services/", "")
+            if raw_name.startswith("model-services/")
+            else raw_name
+        )
+        if not name:
             continue
-        # Filter to chat/completion LLM endpoints (exclude embeddings/rerankers).
-        task = endpoint.get("task", "")
-        task_lower = task.lower() if isinstance(task, str) else ""
         name_lower = name.lower()
-        if task_lower:
-            is_llm = any(t in task_lower for t in ("chat", "completion"))
-        else:
-            is_llm = any(
-                t in name_lower
-                for t in (
-                    "claude",
-                    "gpt",
-                    "codex",
-                    "gemini",
-                    "llama",
-                    "qwen",
-                    "kimi",
-                    "glm",
-                    "inkling",
-                )
-            )
-        if not is_llm:
+        # Filter to chat-capable LLM endpoints (exclude embeddings/rerankers).
+        api_types = service.get("supported_api_types", [])
+        has_chat = any("chat" in t for t in api_types)
+        has_embedding = any("embed" in t.lower() for t in api_types)
+        if not has_chat or has_embedding:
             continue
-        state = endpoint.get("state")
-        ready = state.get("ready") if isinstance(state, dict) else None
-        if isinstance(ready, str) and ready and ready.upper() != "READY":
-            continue
-        # Kimi and inkling don't send finish_reason via /chat/completions but
-        # work correctly via the Responses API using system.ai.* ids.
-        system_ai_id = _databricks_to_system_ai(name)
-        entry: dict[str, Any] = {"id": system_ai_id or name, "input": ["text", "image"]}
-        # GLM/DeepSeek/kimi/inkling stream on reasoning_content channel → need
-        # reasoning:true. Substring matching guards unnamed variants (renamed,
-        # versioned, or newly-added endpoints not yet in _DATABRICKS_TO_SYSTEM_AI).
+        # Models that support the Responses API use it directly.
+        has_responses = "openai/v1/responses" in api_types
+        entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
+        # Models that stream on reasoning_content need reasoning:true so Pi
+        # reads from that channel.
         if any(frag in name_lower for frag in ("glm", "deepseek", "kimi", "inkling")):
             entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
-        elif _needs_responses_api(name_lower) or system_ai_id is not None:
-            # Mapped kimi/inkling use system.ai.* ids + openai-responses at
-            # /ai-gateway/codex/v1. Unmapped kimi/inkling variants without a
-            # system.ai.* alias still land here via substring, keeping reasoning:true
-            # so Pi reads reasoning_content — but they'll still hit the missing
-            # finish_reason issue until the upstream Pi fix lands.
+        elif has_responses or _needs_responses_api(name_lower):
+            # Models advertising openai/v1/responses support, or GPT models
+            # known to reject tools via /chat/completions → Responses API.
             gpt_responses.append(entry)
         elif not _unsupported_in_pi(name_lower):
             completions.append(entry)
 
     if not claude and not gpt_responses and not completions:
         _LOGGER.info(
-            "pi-native: Databricks serving-endpoints returned no LLM models; "
+            "pi-native: Unity Catalog model-services returned no LLM models; "
             "Pi will show only the selected model"
         )
 
