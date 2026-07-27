@@ -415,6 +415,45 @@ async def test_delete_host_unbinds_bound_sessions(
     assert unbound.host_id is None, "a deleted host must not leave sessions bound to a dead row"
 
 
+async def test_delete_host_fully_unbinds_runner_bound_session(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Deleting a host clears the whole binding of a runner-bound session,
+    not just ``host_id``.
+
+    The realistic decommission case: the daemon is gone (so the host
+    reads offline) but the session it launched still carries a
+    ``runner_id``, ``workspace``, and ``git_branch``. Leaving any of
+    those set wedges the session for good — it cannot relaunch (gated on
+    ``host_id``), cannot rebind (the atomic bind matches only
+    ``runner_id IS NULL``), and cannot be stopped (needs both ids).
+    """
+    app, _reg, host_store, conv_store = host_api_app
+    host_store.upsert_on_connect(_HOST_ID, "retired-vm", "local")
+    host_store.set_offline(_HOST_ID)
+    conv = conv_store.create_conversation(agent_id=None)
+    conv_store.set_host_id(conv.id, _HOST_ID, workspace="/tmp/ws", git_branch="feature/x")
+    assert conv_store.set_runner_id(conv.id, "runner_token_deadbeef")
+    bound = conv_store.get_conversation(conv.id)
+    assert bound.runner_id == "runner_token_deadbeef"
+    assert bound.workspace == "/tmp/ws"
+    assert bound.git_branch == "feature/x"
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+
+    assert resp.status_code == 204
+    unbound = conv_store.get_conversation(conv.id)
+    assert unbound.host_id is None
+    assert unbound.runner_id is None, "a stale runner_id blocks every future rebind"
+    assert unbound.workspace is None
+    assert unbound.git_branch is None
+    # The proof that the unbind is complete: the session can be re-pinned
+    # to a fresh runner on another host.
+    assert conv_store.set_runner_id(conv.id, "runner_token_feedface")
+
+
 async def test_list_and_get_host_report_online_from_other_replica(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     db_uri: str,
