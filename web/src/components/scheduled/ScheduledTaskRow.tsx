@@ -36,6 +36,7 @@ import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
   task,
+  now,
   onEdit,
   onPauseToggle,
   onRunNow,
@@ -43,6 +44,11 @@ export function ScheduledTaskRow({
   busy,
 }: {
   task: ScheduledTask;
+  // The current wall-clock time, supplied by the parent's shared `useNow` ticker
+  // so the relative next-run label ("in 3 hours") re-renders and stays fresh as
+  // time passes. Passed in (not read here) to keep the row a pure function of
+  // props — one ticker for the whole list, and deterministic in tests.
+  now: Date;
   onEdit: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
@@ -53,9 +59,10 @@ export function ScheduledTaskRow({
   const paused = task.state === "paused";
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
-  // server value; we never recompute next-run on the client.
+  // delta from the server value against the ticking `now`; we never recompute
+  // WHICH instant is next on the client.
   const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
-  const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt), [task.nextRunAt]);
+  const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt, now), [task.nextRunAt, now]);
 
   return (
     <div
