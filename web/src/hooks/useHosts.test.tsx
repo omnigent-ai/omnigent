@@ -200,9 +200,10 @@ describe("useHosts", () => {
     // terminal to run the command, then tab back. If the hosts_changed WS push
     // is missed (reconnect gap, or the interval poll paused while the tab was
     // hidden), the badge would sit on a stale "needs setup" until a manual
-    // reload. useHosts overrides the app-wide `refetchOnWindowFocus: false` so
-    // returning to the tab refetches and the badge clears. The wrapper mirrors
-    // that global default to prove the per-query override is what refires.
+    // reload. With `refetchOnFocus: true` (the setup flow's opt-in) useHosts
+    // overrides the app-wide `refetchOnWindowFocus: false` so returning to the
+    // tab refetches and the badge clears. The wrapper mirrors that global
+    // default to prove the per-query override is what refires.
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
     });
@@ -222,7 +223,9 @@ describe("useHosts", () => {
     };
     fetchMock.mockResolvedValue(mockResponse(hostsBody));
 
-    const { result } = renderHook(() => useHosts(), { wrapper: focusWrapper });
+    const { result } = renderHook(() => useHosts({ refetchOnFocus: true }), {
+      wrapper: focusWrapper,
+    });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(fetchMock).toHaveBeenCalledTimes(1);
 
@@ -233,6 +236,30 @@ describe("useHosts", () => {
     focusManager.setFocused(false);
     focusManager.setFocused(true);
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    focusManager.setFocused(undefined);
+  });
+
+  it("does NOT refetch on focus by default so non-setup consumers aren't taxed", async () => {
+    // The aggressive refocus refetch is opt-in (refetchOnFocus). The ~8 other
+    // useHosts consumers (Sidebar, HostBadge, …) keep the 30 s stale window, so
+    // a tab refocus must not refire their /v1/hosts query.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+    });
+    function focusWrapper({ children }: { children: ReactNode }) {
+      return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    }
+    fetchMock.mockResolvedValue(mockResponse({ hosts: [] }));
+
+    const { result } = renderHook(() => useHosts(), { wrapper: focusWrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+    // Give any (unwanted) refetch a chance to fire, then assert it didn't.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     focusManager.setFocused(undefined);
   });
 

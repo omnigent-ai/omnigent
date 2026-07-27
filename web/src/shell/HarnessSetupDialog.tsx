@@ -60,7 +60,7 @@ export function HarnessSetupDialog({
   // patches the ["hosts"] cache, and the dialog must reflect that (flip ✓)
   // without being closed and reopened. Falls back to the snapshot while the
   // query is loading.
-  const { data: hosts } = useHosts();
+  const { data: hosts } = useHosts({ refetchOnFocus: true });
   const host = hosts?.find((h) => h.host_id === hostProp?.host_id) ?? hostProp;
   const install = useInstallHarness(host?.host_id ?? "");
   const steps = resolveSetupSteps(

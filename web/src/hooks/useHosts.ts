@@ -43,11 +43,17 @@ async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
 interface UseHostsOptions {
   enabled?: boolean;
   includeSandbox?: boolean;
+  /** Refetch on every window refocus (paired with `staleTime: 0`) so returning
+   *  to the tab is a guaranteed readiness recovery. Only the setup flow needs
+   *  this; other consumers keep the 30 s stale window to avoid an app-wide bump
+   *  in `/v1/hosts` volume on refocus. */
+  refetchOnFocus?: boolean;
 }
 
 export function useHosts(options: UseHostsOptions = {}) {
   const enabled = options.enabled ?? true;
   const includeSandbox = options.includeSandbox ?? false;
+  const refetchOnFocus = options.refetchOnFocus ?? false;
   return useQuery({
     // Distinct cache key per filtering mode so the picker's filtered
     // list and the header's unfiltered list don't overwrite each other.
@@ -57,15 +63,16 @@ export function useHosts(options: UseHostsOptions = {}) {
     enabled,
     // Readiness is pushed live via WS (hosts_changed → invalidate in
     // SessionUpdatesProvider), so the badge normally clears within seconds of
-    // `omni setup` finishing. These two settle the case that push misses: a
-    // user typically runs setup in a terminal with the tab backgrounded, which
-    // pauses the interval poll AND is when a reconnect gap can drop the frame.
-    // Refetching on refocus makes returning to the tab a guaranteed recovery —
-    // paired with staleTime 0 so that refocus always refires rather than
-    // serving a stale "needs setup" from cache. The 60 s interval remains the
-    // in-tab fallback.
-    staleTime: 0,
-    refetchOnWindowFocus: true,
+    // `omni setup` finishing. The refocus recovery settles the case that push
+    // misses: a user typically runs setup in a terminal with the tab
+    // backgrounded, which pauses the interval poll AND is when a reconnect gap
+    // can drop the frame. Refetching on refocus makes returning to the tab a
+    // guaranteed recovery — paired with staleTime 0 so refocus always refires
+    // rather than serving a stale "needs setup" from cache. Scoped to the setup
+    // flow via `refetchOnFocus` so the other ~8 consumers don't pay it. The 60 s
+    // interval remains the in-tab fallback.
+    staleTime: refetchOnFocus ? 0 : 30_000,
+    refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
   });
 }

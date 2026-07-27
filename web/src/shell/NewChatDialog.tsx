@@ -1622,7 +1622,9 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
-  const { data: hosts, isLoading: hostsLoading } = useHosts();
+  // refetchOnFocus: returning from a terminal `omni setup` must clear the
+  // readiness badge even if the live push was missed while the tab was hidden.
+  const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
 
   const agentList = useMemo(
     () =>
