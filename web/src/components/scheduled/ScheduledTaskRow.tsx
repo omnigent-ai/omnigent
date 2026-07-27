@@ -105,7 +105,7 @@ export function ScheduledTaskRow({
         data-testid="task-row-open"
         onClick={handleNavigate}
         aria-label={`Open ${task.name}`}
-        className="flex min-w-0 flex-1 flex-col text-left after:absolute after:inset-0 after:content-['']"
+        className="flex min-w-0 flex-1 cursor-pointer flex-col text-left after:absolute after:inset-0 after:content-['']"
       >
         <span className="flex min-w-0 items-center gap-2">
           <span className="truncate text-[15px] font-semibold">{task.name}</span>
