@@ -56,6 +56,7 @@ from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -529,6 +530,7 @@ def create_hosts_router(
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -549,6 +551,11 @@ def create_hosts_router(
         :func:`omnigent.server.app.create_app` always supplies it.
     :param agent_cache: Agent-spec cache used to read the agent's
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
+    :param scheduled_task_store: Store backing recurring tasks, read by
+        host deregistration to refuse deleting a host that tasks still
+        pin. ``None`` (deployments without the scheduler, and minimal
+        test wirings) skips that check — no task can be pinned when no
+        task can exist.
     :returns: A FastAPI router with host endpoints.
     """
     router = APIRouter()
@@ -657,22 +664,35 @@ def create_hosts_router(
         """Deregister (delete) a host the caller owns.
 
         Removes a retired self-registered host so it stops appearing in
-        session-creation pickers forever. Any sessions still bound to it
-        are unbound by the store (their ``host_id`` is nulled) and the
-        row is deleted, which also revokes the host's launch token.
+        session-creation pickers. Any session still bound to it is fully
+        unbound by the store — ``host_id``, ``runner_id``, ``workspace``,
+        and ``git_branch`` are nulled together, leaving a session that
+        can be rebound to another host rather than one wedged against a
+        row that no longer exists.
+
+        Deregistration is not permanent on its own: an external host
+        keeps its ``host_id`` in its local config and no server-side
+        credential is destroyed here (only server-managed hosts ever
+        hold a launch token, and those are refused below), so a daemon
+        that dials again simply recreates the row. Stop the daemon
+        first.
 
         Refuses a host that is currently online (409): retire it after it
         goes offline so an active machine is not pulled out from under
         running work. Server-managed sandbox hosts are likewise refused
         (409) — their lifecycle belongs to the server that created them,
-        and deleting only the row would orphan the live sandbox.
+        and deleting only the row would orphan the live sandbox. A host
+        that scheduled tasks pin is refused too (409): the pin is a soft
+        reference, so deleting the host would leave each task failing on
+        every fire. Re-point those tasks at another host (or delete
+        them) first.
 
         :param request: The incoming request (for auth).
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :returns: 204 No Content on success.
         :raises HTTPException: 404 if the host does not exist, 403 if the
-            caller is not the owner, 409 if the host is online or
-            server-managed.
+            caller is not the owner, 409 if the host is online,
+            server-managed, or pinned by a scheduled task.
         """
         # Same auth shape as get_host: require_user 401s unauthenticated
         # callers when auth is configured; a None user_id means auth is
@@ -693,6 +713,21 @@ def create_hosts_router(
                 status_code=409,
                 detail="host is online; retire it after it goes offline",
             )
+        if scheduled_task_store is not None:
+            pinned = await asyncio.to_thread(scheduled_task_store.list_by_host_id, host_id)
+            if pinned:
+                # Refuse rather than silently unpin: an unpinned task falls
+                # back to whichever host of the owner's is online at fire
+                # time, so clearing the pin here would relocate the work
+                # instead of surfacing the choice. PATCH can re-point a task
+                # at another host, which is the repair.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{len(pinned)} scheduled task(s) are pinned to this host; "
+                        "re-point or delete them first: " + ", ".join(task.id for task in pinned)
+                    ),
+                )
         await asyncio.to_thread(host_store.delete_host, host_id)
         return Response(status_code=204)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+    SqlAlchemyScheduledTaskStore,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -118,6 +122,35 @@ def _build_host_api_app(
         prefix="/v1",
     )
     return app, registry, host_store, conv_store
+
+
+@pytest.fixture()
+def host_api_app_with_tasks(
+    db_uri: str,
+) -> tuple[FastAPI, HostStore, SqlAlchemyScheduledTaskStore]:
+    """Host REST app wired to a scheduled-task store.
+
+    Separate from :func:`host_api_app` because only the deregistration
+    tests need the scheduler wiring.
+
+    :param db_uri: SQLite URI from the shared fixture.
+    :returns: Tuple of (app, host_store, scheduled_task_store).
+    """
+    registry = HostRegistry()
+    host_store = HostStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            scheduled_task_store=task_store,
+        ),
+        prefix="/v1",
+    )
+    return app, host_store, task_store
 
 
 async def _connect_host(
@@ -595,6 +628,128 @@ async def test_delete_host_fully_unbinds_runner_bound_session(
     # The proof that the unbind is complete: the session can be re-pinned
     # to a fresh runner on another host.
     assert conv_store.set_runner_id(conv.id, "runner_token_feedface")
+
+
+def _pin_task(
+    task_store: SqlAlchemyScheduledTaskStore,
+    task_id: str,
+    host_id: str | None,
+    *,
+    state: str = "active",
+) -> str:
+    """Create a scheduled task pinned to *host_id*.
+
+    :param task_store: Store to create the task in.
+    :param task_id: Readable seed for the task's hex id.
+    :param host_id: Host to pin to, or ``None`` for an unpinned task.
+    :param state: Lifecycle state, e.g. ``"paused"``.
+    :returns: The created task's id.
+    """
+    return task_store.create(
+        scheduled_task_id=uuid.uuid5(uuid.NAMESPACE_DNS, task_id).hex,
+        name=task_id,
+        prompt="Triage the inbox",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="local",
+        agent_id=uuid.uuid5(uuid.NAMESPACE_DNS, "agent").hex,
+        timezone="UTC",
+        workspace="/tmp/ws",
+        host_id=host_id,
+        state=state,
+    ).id
+
+
+async def test_delete_host_409_when_scheduled_task_pinned(
+    host_api_app_with_tasks: tuple[FastAPI, HostStore, SqlAlchemyScheduledTaskStore],
+) -> None:
+    """
+    DELETE refuses a host that scheduled tasks pin, and names them.
+
+    ``scheduled_tasks.host_id`` is a soft reference with no FK, so
+    deleting the host would leave every fire failing with
+    ``host_not_found`` — and the PATCH surface cannot null a pin, so the
+    task could only be recovered by recreating it.
+    """
+    app, host_store, task_store = host_api_app_with_tasks
+    host_store.upsert_on_connect(_HOST_ID, "retired-vm", "local")
+    host_store.set_offline(_HOST_ID)
+    pinned_id = _pin_task(task_store, "st_pinned", _HOST_ID)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+
+    assert resp.status_code == 409, f"expected 409 for a pinned host, got {resp.status_code}"
+    assert pinned_id in resp.json()["detail"], "the 409 must name the tasks blocking the delete"
+    # The host survives so the pinned task keeps working.
+    assert host_store.get_host(_HOST_ID) is not None
+
+
+async def test_delete_host_409_counts_paused_pinned_tasks(
+    host_api_app_with_tasks: tuple[FastAPI, HostStore, SqlAlchemyScheduledTaskStore],
+) -> None:
+    """
+    A paused task still blocks the delete: it breaks the same way the
+    moment it is resumed, and resuming is a single PATCH away.
+    """
+    app, host_store, task_store = host_api_app_with_tasks
+    host_store.upsert_on_connect(_HOST_ID, "retired-vm", "local")
+    host_store.set_offline(_HOST_ID)
+    _pin_task(task_store, "st_paused", _HOST_ID, state="paused")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+
+    assert resp.status_code == 409
+    assert host_store.get_host(_HOST_ID) is not None
+
+
+async def test_delete_host_ignores_tasks_pinned_elsewhere(
+    host_api_app_with_tasks: tuple[FastAPI, HostStore, SqlAlchemyScheduledTaskStore],
+) -> None:
+    """
+    Only tasks pinned to *this* host block it. An unpinned task resolves
+    its host at fire time and a task pinned to another host is
+    unaffected, so neither should stop the delete.
+    """
+    app, host_store, task_store = host_api_app_with_tasks
+    host_store.upsert_on_connect(_HOST_ID, "retired-vm", "local")
+    host_store.set_offline(_HOST_ID)
+    other_host = uuid.uuid5(uuid.NAMESPACE_DNS, "other-host").hex
+    _pin_task(task_store, "st_unpinned", None)
+    _pin_task(task_store, "st_other", other_host)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.delete(f"/v1/hosts/{_HOST_ID}")
+
+    assert resp.status_code == 204, f"expected 204, got {resp.status_code}: {resp.text}"
+    assert host_store.get_host(_HOST_ID) is None
+
+
+async def test_delete_host_succeeds_after_task_repointed(
+    host_api_app_with_tasks: tuple[FastAPI, HostStore, SqlAlchemyScheduledTaskStore],
+) -> None:
+    """
+    The 409 is recoverable with the existing PATCH surface: re-point the
+    task at another host and the delete goes through. This is the whole
+    reason refusing beats silently unpinning — the user chooses where the
+    task runs next.
+    """
+    app, host_store, task_store = host_api_app_with_tasks
+    host_store.upsert_on_connect(_HOST_ID, "retired-vm", "local")
+    host_store.set_offline(_HOST_ID)
+    replacement = uuid.uuid5(uuid.NAMESPACE_DNS, "replacement-host").hex
+    host_store.upsert_on_connect(replacement, "new-vm", "local")
+    task_id = _pin_task(task_store, "st_repoint", _HOST_ID)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        blocked = await client.delete(f"/v1/hosts/{_HOST_ID}")
+        task_store.update(task_id, host_id=replacement)
+        allowed = await client.delete(f"/v1/hosts/{_HOST_ID}")
+
+    assert blocked.status_code == 409
+    assert allowed.status_code == 204, f"expected 204, got {allowed.status_code}: {allowed.text}"
+    assert host_store.get_host(_HOST_ID) is None
+    assert task_store.get(task_id).host_id == replacement
 
 
 async def test_list_and_get_host_report_online_from_other_replica(
