@@ -87,34 +87,19 @@ _DATABRICKS_DEFAULT_CONFIG = (
     "providers:\n  workspace:\n    kind: databricks\n    profile: prof-a\n    default: true\n"
 )
 
-# A realistic serving-endpoints page: two chat LLMs per family, one
-# non-claude/gpt LLM, and one embeddings endpoint that must be excluded.
+
+# A realistic Unity Catalog model-services page: two chat LLMs per family,
+# one non-claude/gpt LLM, and one embeddings endpoint that must be excluded.
+def _uc_service(name: str, api_types: list[str]) -> dict:
+    return {"name": f"model-services/{name}", "supported_api_types": api_types}
+
+
 _SERVING_ENDPOINTS_PAGE = {
-    "endpoints": [
-        {
-            "name": "databricks-claude-sonnet-4-6",
-            "creator": "system",
-            "task": "llm/v1/chat",
-            "state": {"ready": "READY"},
-        },
-        {
-            "name": "databricks-gpt-5-4",
-            "creator": "system",
-            "task": "llm/v1/chat",
-            "state": {"ready": "READY"},
-        },
-        {
-            "name": "databricks-meta-llama-3-3-70b-instruct",
-            "creator": "system",
-            "task": "llm/v1/chat",
-            "state": {"ready": "READY"},
-        },
-        {
-            "name": "databricks-bge-large-en",
-            "creator": "system",
-            "task": "llm/v1/embeddings",
-            "state": {"ready": "READY"},
-        },
+    "model_services": [
+        _uc_service("databricks-claude-sonnet-4-6", ["mlflow/v1/chat/completions"]),
+        _uc_service("databricks-gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]),
+        _uc_service("databricks-meta-llama-3-3-70b-instruct", ["mlflow/v1/chat/completions"]),
+        _uc_service("databricks-bge-large-en", ["mlflow/v1/embeddings"]),
     ]
 }
 
@@ -477,9 +462,9 @@ def _databricks_transport(
     """
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve ``GET /api/2.0/serving-endpoints``."""
+        """Serve ``GET /api/2.1/unity-catalog/model-services``."""
         requests_seen.append(request)
-        if request.url.path == "/api/2.0/serving-endpoints":
+        if request.url.path == "/api/2.1/unity-catalog/model-services":
             return httpx.Response(200, json=_SERVING_ENDPOINTS_PAGE)
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -549,36 +534,23 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
     """
     _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
     _stub_workspace_creds(monkeypatch)
+    # Unity Catalog model-services API returns only available services;
+    # there is no ready/not-ready state — all listed services are accessible.
     page = {
-        "endpoints": [
-            {
-                "name": "databricks-claude-ready",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            },
-            {
-                "name": "databricks-claude-provisioning",
-                "task": "llm/v1/chat",
-                "state": {"ready": "NOT_READY"},
-            },
-            {
-                "name": "databricks-claude-stateless",
-                "task": "llm/v1/chat",
-            },
+        "model_services": [
+            _uc_service("databricks-claude-ready", ["mlflow/v1/chat/completions"]),
+            _uc_service("databricks-claude-stateless", ["mlflow/v1/chat/completions"]),
         ]
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve the mixed-readiness serving-endpoints page."""
+        """Serve the model-services page."""
         return httpx.Response(200, json=page)
 
     listing = list_models_for_worker(
         _worker_spec("pi"), "pi", transport=httpx.MockTransport(_handler)
     )
 
-    # READY and state-less endpoints survive; the explicit NOT_READY one
-    # is excluded. If "provisioning" appears, the readiness filter is
-    # gone; if "stateless" is missing, absent state is being over-pruned.
     assert {m.id for m in listing.models} == {
         "databricks-claude-ready",
         "databricks-claude-stateless",
