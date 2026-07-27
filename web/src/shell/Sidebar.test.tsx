@@ -319,6 +319,51 @@ describe("Sidebar session list", () => {
     expect(onOpenSearch).toHaveBeenCalledTimes(1);
   });
 
+  it("filters the session list by status via the header dropdown", () => {
+    mockConversations([
+      conv("conv_running", "Codex", { status: "running" }),
+      conv("conv_awaiting", "Codex", { pending_elicitations_count: 1 }),
+      conv("conv_idle", "Claude Code"),
+      conv("conv_closed_but_running", "Codex", {
+        status: "running",
+        labels: { "omnigent.closed": "true" },
+      }),
+    ]);
+    renderSidebar();
+
+    // Unfiltered by default: every row shows.
+    expect(screen.getByText("conv_running")).toBeInTheDocument();
+    expect(screen.getByText("conv_awaiting")).toBeInTheDocument();
+    expect(screen.getByText("conv_idle")).toBeInTheDocument();
+    expect(screen.getByText("conv_closed_but_running")).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("sidebar-status-filter-button"), { button: 0 });
+    fireEvent.click(screen.getByTestId("sidebar-status-filter-active"));
+
+    // Active: running/awaiting and not closed.
+    expect(screen.getByText("conv_running")).toBeInTheDocument();
+    expect(screen.getByText("conv_awaiting")).toBeInTheDocument();
+    expect(screen.queryByText("conv_idle")).toBeNull();
+    // Closed always reads completed, even if its live status is "running".
+    expect(screen.queryByText("conv_closed_but_running")).toBeNull();
+
+    fireEvent.pointerDown(screen.getByTestId("sidebar-status-filter-button"), { button: 0 });
+    fireEvent.click(screen.getByTestId("sidebar-status-filter-completed"));
+
+    // Completed: idle/failed/never-observed, plus closed regardless of status.
+    expect(screen.queryByText("conv_running")).toBeNull();
+    expect(screen.queryByText("conv_awaiting")).toBeNull();
+    expect(screen.getByText("conv_idle")).toBeInTheDocument();
+    expect(screen.getByText("conv_closed_but_running")).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("sidebar-status-filter-button"), { button: 0 });
+    fireEvent.click(screen.getByTestId("sidebar-status-filter-all"));
+
+    // Back to unfiltered.
+    expect(screen.getByText("conv_running")).toBeInTheDocument();
+    expect(screen.getByText("conv_idle")).toBeInTheDocument();
+  });
+
   it("swaps the card content to the settings section nav on /settings", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar(true, "/settings");

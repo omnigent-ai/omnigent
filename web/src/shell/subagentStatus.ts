@@ -22,6 +22,33 @@ export interface AgentStatus {
   details?: string;
 }
 
+/** The Subagents panel's status filter — mirrors the sidebar's active/completed
+ * split (see `matchesSessionStatusFilter` in `useSessionState.ts`), applied to
+ * the finer-grained `AgentActivity` vocabulary this panel already tracks. */
+export type SubagentStatusFilter = "all" | "active" | "completed";
+
+// "Active" = still doing something the user might want to watch: launching,
+// actively working, or parked on an approval prompt. Everything else (done,
+// failed, disconnected, idle, other) is settled — matching the issue's
+// "completed" bucket (finished, one way or another).
+const ACTIVE_ACTIVITIES: ReadonlySet<AgentActivity> = new Set(["launching", "working", "awaiting"]);
+
+/**
+ * Whether an agent row's activity belongs in the given status bucket.
+ *
+ * @param activity - The row's resolved activity, from {@link childStatus} /
+ *   {@link sessionStatus}.
+ * @param filter - The panel's current status filter.
+ */
+export function matchesStatusFilter(
+  activity: AgentActivity,
+  filter: SubagentStatusFilter,
+): boolean {
+  if (filter === "all") return true;
+  const active = ACTIVE_ACTIVITIES.has(activity);
+  return filter === "active" ? active : !active;
+}
+
 // Error codes that mean "the runner went away", not "the task failed".
 // ``runner_disconnected`` is published when the SSE relay's tunnel drops
 // mid-stream; ``runner_failed_to_start`` when a bound runner reports an

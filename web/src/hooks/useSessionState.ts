@@ -31,3 +31,34 @@ export function getSessionState(
   if (conversation?.status === "running") return { kind: "running" };
   return null;
 }
+
+/** The sidebar's status filter — mirrors the server's `GET /v1/sessions?status=`
+ * vocabulary (see `omnigent/server/routes/sessions/routes_core.py`). */
+export type SessionStatusFilter = "all" | "active" | "completed";
+
+/** Mirrors the server's `omnigent.closed` label (see
+ * `omnigent.session_lifecycle.CLOSED_LABEL_KEY`); the server always
+ * synthesizes this label onto every session response, including the legacy
+ * title-marker rows, so the client only ever needs to read the label. */
+const CLOSED_LABEL_KEY = "omnigent.closed";
+
+/**
+ * Whether a session belongs in the given status bucket.
+ *
+ * "active" = an agent is currently running/awaiting a response on it (same
+ * signal as {@link getSessionState}) and it isn't closed. "completed" is
+ * everything else — idle/failed/never-observed, or any closed session
+ * regardless of its live status.
+ *
+ * @param conversation - The session row to classify.
+ * @param filter - The sidebar's current status filter.
+ */
+export function matchesSessionStatusFilter(
+  conversation: Pick<Conversation, "status" | "pending_elicitations_count" | "labels">,
+  filter: SessionStatusFilter,
+): boolean {
+  if (filter === "all") return true;
+  const closed = conversation.labels?.[CLOSED_LABEL_KEY] === "true";
+  const active = !closed && getSessionState(conversation) !== null;
+  return filter === "active" ? active : !active;
+}

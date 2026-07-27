@@ -31,6 +31,7 @@ import {
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
+  ListFilterIcon,
   LaptopIcon,
   Loader2Icon,
   MailIcon,
@@ -92,6 +93,8 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -137,7 +140,12 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { getSessionState, type SessionState } from "@/hooks/useSessionState";
+import {
+  getSessionState,
+  matchesSessionStatusFilter,
+  type SessionState,
+  type SessionStatusFilter,
+} from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -434,6 +442,10 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // Projects / Chats structure; "shared" is a flat list of sessions others
   // shared with the viewer.
   const [activeTab, setActiveTab] = useState<SidebarTab>("mine");
+  // Client-side status filter (all/active/completed) applied to the already-
+  // loaded conversation list — see ConversationList's `sections` useMemo,
+  // which is where it's actually applied (same spot "archived" is peeled off).
+  const [statusFilter, setStatusFilter] = useState<SessionStatusFilter>("all");
   // The "Shared with me" tab only makes sense when sessions can be shared with
   // other people at all — i.e. a multi-user server. A loopback-only local
   // server has just the one user (mirrors the disabled Share affordance; see
@@ -710,6 +722,47 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Search</TooltipContent>
               </Tooltip>
+              <DropdownMenu>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        variant={statusFilter !== "all" ? "secondary" : "ghost"}
+                        size="icon-xs"
+                        aria-label="Filter sessions by status"
+                        className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+                        data-testid="sidebar-status-filter-button"
+                      >
+                        <ListFilterIcon className="size-4" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom">Filter by status</TooltipContent>
+                </Tooltip>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuRadioGroup
+                    value={statusFilter}
+                    onValueChange={(value) => setStatusFilter(value as SessionStatusFilter)}
+                  >
+                    <DropdownMenuRadioItem value="all" data-testid="sidebar-status-filter-all">
+                      All sessions
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem
+                      value="active"
+                      data-testid="sidebar-status-filter-active"
+                    >
+                      Active
+                    </DropdownMenuRadioItem>
+                    <DropdownMenuRadioItem
+                      value="completed"
+                      data-testid="sidebar-status-filter-completed"
+                    >
+                      Completed
+                    </DropdownMenuRadioItem>
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
@@ -877,6 +930,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               onRowClick={onNavClick}
               searchQuery=""
               activeTab={multiUser ? activeTab : "mine"}
+              statusFilter={statusFilter}
               pinnedConversationIds={pinnedConversationIds}
               pinnedConversations={pinnedConversations}
               onTogglePinned={togglePinnedConversation}
@@ -1099,6 +1153,9 @@ interface ConversationListProps {
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   searchQuery: string;
   activeTab: SidebarTab;
+  /** Client-side status filter, applied to `allConversations` before it
+   *  feeds into `sections` (see the `sections` useMemo below). */
+  statusFilter: SessionStatusFilter;
   pinnedConversationIds: string[];
   // The server-authoritative pinned sessions, so a pinned session that sits
   // outside the loaded pagination window still renders in the Pinned section.
@@ -1164,6 +1221,7 @@ function ConversationList({
   onRowClick,
   searchQuery,
   activeTab,
+  statusFilter,
   pinnedConversationIds,
   pinnedConversations,
   onTogglePinned,
@@ -1253,7 +1311,12 @@ function ConversationList({
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
     const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
-    const notArchived = allWithPinned.filter((c) => c.archived !== true);
+    const notArchived = allWithPinned
+      .filter((c) => c.archived !== true)
+      // Status filter applies uniformly across Pinned / Projects / Chats —
+      // "Active only" hides a pinned-but-idle session just like an unpinned
+      // one, matching the single filter control's plain-language meaning.
+      .filter((c) => matchesSessionStatusFilter(c, statusFilter));
     // Each tab shows a disjoint slice — "mine" is the sessions the viewer owns,
     // "shared" is the ones others shared with them. The Pinned / Projects /
     // Sessions structure is then built from that slice, so both tabs reuse the
@@ -1324,6 +1387,7 @@ function ConversationList({
     projects,
     activeTab,
     viewerId,
+    statusFilter,
   ]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes

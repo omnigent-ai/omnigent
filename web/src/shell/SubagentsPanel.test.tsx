@@ -1481,4 +1481,67 @@ describe("SubagentsPanel", () => {
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
   });
+
+  it("filters agent rows by status via the toolbar dropdown", () => {
+    mockChildTree({
+      conv_parent: [
+        childInfo({ id: "c_working", tool: "researcher", busy: true }),
+        childInfo({
+          id: "c_awaiting",
+          tool: "researcher",
+          pending_elicitations_count: 1,
+        }),
+        childInfo({ id: "c_done", tool: "researcher", current_task_status: "completed" }),
+        childInfo({ id: "c_idle", tool: "researcher" }),
+      ],
+    });
+
+    const { container } = renderPanel();
+
+    // Unfiltered by default: every row shows.
+    expect(childRow(container, "c_working")).toBeInTheDocument();
+    expect(childRow(container, "c_awaiting")).toBeInTheDocument();
+    expect(childRow(container, "c_done")).toBeInTheDocument();
+    expect(childRow(container, "c_idle")).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("subagents-status-filter-button"), { button: 0 });
+    fireEvent.click(screen.getByTestId("subagents-status-filter-active"));
+
+    // Active: launching/working/awaiting.
+    expect(childRow(container, "c_working")).toBeInTheDocument();
+    expect(childRow(container, "c_awaiting")).toBeInTheDocument();
+    expect(() => childRow(container, "c_done")).toThrow();
+    expect(() => childRow(container, "c_idle")).toThrow();
+
+    fireEvent.pointerDown(screen.getByTestId("subagents-status-filter-button"), { button: 0 });
+    fireEvent.click(screen.getByTestId("subagents-status-filter-completed"));
+
+    // Completed: everything settled (done/idle/failed/disconnected/other).
+    expect(() => childRow(container, "c_working")).toThrow();
+    expect(() => childRow(container, "c_awaiting")).toThrow();
+    expect(childRow(container, "c_done")).toBeInTheDocument();
+    expect(childRow(container, "c_idle")).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByTestId("subagents-status-filter-button"), { button: 0 });
+    fireEvent.click(screen.getByTestId("subagents-status-filter-all"));
+
+    // Back to unfiltered.
+    expect(childRow(container, "c_working")).toBeInTheDocument();
+    expect(childRow(container, "c_idle")).toBeInTheDocument();
+  });
+
+  it("always shows the main row regardless of the status filter", () => {
+    mockChildTree({
+      conv_parent: [childInfo({ id: "c_idle", tool: "researcher" })],
+    });
+
+    renderPanel();
+
+    fireEvent.pointerDown(screen.getByTestId("subagents-status-filter-button"), { button: 0 });
+    fireEvent.click(screen.getByTestId("subagents-status-filter-active"));
+
+    // The idle child is filtered out, but "main" is always present.
+    expect(screen.getByTestId("subagent-main-row")).toBeInTheDocument();
+    expect(screen.queryByTestId("subagent-row")).toBeNull();
+  });
 });
