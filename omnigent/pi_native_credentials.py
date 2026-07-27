@@ -538,9 +538,14 @@ def _fetch_pi_model_lists(
             entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
-        elif has_responses or _needs_responses_api(name_lower):
-            # Models advertising openai/v1/responses support, or GPT models
-            # known to reject tools via /chat/completions → Responses API.
+        elif (
+            name_lower.startswith("system.ai.")
+            or has_responses
+            or _needs_responses_api(name_lower)
+        ):
+            # All system.ai.* models use the AI Gateway (/ai-gateway/codex/v1).
+            # system.ai.* ids are not valid at /serving-endpoints — they need the
+            # Gateway regardless of whether UC lists openai/v1/responses support.
             gpt_responses.append(entry)
         elif not _unsupported_in_pi(name_lower):
             completions.append(entry)
