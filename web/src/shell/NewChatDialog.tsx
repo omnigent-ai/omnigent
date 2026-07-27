@@ -12,7 +12,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   MonitorIcon,
   MonitorCloudIcon,
-  CheckIcon,
   CircleHelpIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -25,10 +24,8 @@ import {
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
-  SearchIcon,
   SettingsIcon,
   ShuffleIcon,
-  TagIcon,
   TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
@@ -782,139 +779,6 @@ export function deriveHomeDir(entries: HostFilesystemEntry[]): string | null {
   const slash = first.path.lastIndexOf("/");
   if (slash < 0) return null;
   return slash === 0 ? "/" : first.path.slice(0, slash);
-}
-
-/**
- * The composer's "Project" chip — files the to-be-created session under a
- * named project (an implicit collection stored as a ``conversation_labels``
- * row with the reserved key ``omni_project``). Mirrors the sidebar kebab's
- * project picker: a search box, the existing projects, a "No project" reset,
- * and an inline "New project…" input. Selection is local state on the landing
- * composer; the label is applied right after the session is created.
- */
-function LandingProjectPicker({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (project: string) => void;
-}) {
-  const { data: projects = [] } = useProjects();
-  const [open, setOpen] = useState(false);
-  const [search, setSearch] = useState("");
-  const [creatingNew, setCreatingNew] = useState(false);
-  const [newName, setNewName] = useState("");
-  const newRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => {
-    if (creatingNew) newRef.current?.focus();
-  }, [creatingNew]);
-
-  const filtered = search
-    ? projects.filter((p) => p.name.toLowerCase().includes(search.toLowerCase()))
-    : projects;
-
-  function pick(project: string) {
-    onChange(project);
-    setOpen(false);
-    setSearch("");
-    setCreatingNew(false);
-    setNewName("");
-  }
-
-  function commitNew() {
-    const name = newName.trim();
-    if (name) pick(name);
-  }
-
-  const itemClass =
-    "flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground";
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
-          data-testid="new-chat-landing-project-chip"
-        >
-          <TagIcon className="size-4 shrink-0" />
-          {/* Label collapses to icon-only on narrow viewports (mobile),
-              matching the host/workspace/worktree chips. */}
-          <span className={`hidden max-w-32 truncate sm:block ${value ? "text-foreground" : ""}`}>
-            {value || "No project"}
-          </span>
-          <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        align="start"
-        className="w-56 p-1"
-        // Don't snap focus back to the chip when the popover closes after a
-        // pick — that programmatic refocus paints the browser's focus outline
-        // on the chip. Keyboard users still get the ring when they tab to it.
-        onCloseAutoFocus={(e) => e.preventDefault()}
-      >
-        {/* Combobox-style search: a leading magnifier inside a borderless
-            input, with a divider beneath separating it from the results. */}
-        <div className="flex items-center gap-2 border-b px-2 py-1.5">
-          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          <input
-            className="w-full bg-transparent text-xs outline-none placeholder:text-muted-foreground"
-            placeholder="Search projects"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-        </div>
-        <div className="max-h-48 overflow-y-auto">
-          <button type="button" className={itemClass} onClick={() => pick("")}>
-            <span className="flex-1 truncate">No project</span>
-            {value === "" && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
-          </button>
-          {filtered.map((p) => (
-            <button key={p.name} type="button" className={itemClass} onClick={() => pick(p.name)}>
-              <span className="flex-1 truncate">{p.name}</span>
-              {value === p.name && <CheckIcon className="size-3.5 shrink-0 text-primary" />}
-            </button>
-          ))}
-          {filtered.length === 0 && !creatingNew && (
-            <p className="px-2 py-1.5 text-xs text-muted-foreground">No projects yet.</p>
-          )}
-        </div>
-        <div className="border-t pt-1">
-          {creatingNew ? (
-            <div className="flex items-center gap-1 px-2 py-1">
-              <input
-                ref={newRef}
-                className="flex-1 bg-transparent text-xs outline-none"
-                placeholder="Project name…"
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => {
-                  // Don't commit while an IME composition Enter is being
-                  // confirmed (e.g. Japanese conversion). Mirrors #132/#243.
-                  if (isImeCompositionKeyEvent(e)) return;
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitNew();
-                  }
-                  if (e.key === "Escape") {
-                    setCreatingNew(false);
-                    setNewName("");
-                  }
-                }}
-              />
-            </div>
-          ) : (
-            <button type="button" className={itemClass} onClick={() => setCreatingNew(true)}>
-              <PlusIcon className="size-3.5 shrink-0" />
-              New project…
-            </button>
-          )}
-        </div>
-      </PopoverContent>
-    </Popover>
-  );
 }
 
 /**
@@ -3163,9 +3027,19 @@ export function NewChatLandingScreen() {
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
-          <OttoEyes className="h-18 w-auto shrink-0" />
+          {selectedProject ? (
+            // Landing inside a project: swap Otto's eyes for the same folder
+            // icon the sidebar uses for a project, and name the project. Sized
+            // to Otto's h-18 box so the centered composer doesn't shift when
+            // toggling between the two landings.
+            <span className="flex h-18 shrink-0 items-center">
+              <FolderIcon className="size-12 text-muted-foreground" />
+            </span>
+          ) : (
+            <OttoEyes className="h-18 w-auto shrink-0" />
+          )}
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
-            What should we do?
+            {selectedProject || "What should we do?"}
           </h1>
         </div>
         <div className="relative flex w-full flex-col gap-3">
@@ -4019,14 +3893,9 @@ export function NewChatLandingScreen() {
                 </Popover>
               )}
 
-              {/* Project chip — files the session under a named project on
-                create. Sits after the worktree chip. Only shown when a project
-                is already selected (e.g. quick-starting from an existing
-                project's "new session" pencil, which passes `?project=`);
-                otherwise the new-session flow stays unfiled. */}
-              {selectedProject && (
-                <LandingProjectPicker value={selectedProject} onChange={setSelectedProject} />
-              )}
+              {/* The session's project membership (from a `?project=` landing)
+                is shown in the hero heading instead of a tray chip; filing on
+                create still uses `selectedProject`. */}
             </div>
             {/* The agent / harness picker moved out of the tray and into the
                 composer's right action cluster (next to Send) — see
