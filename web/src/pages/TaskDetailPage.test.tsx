@@ -433,7 +433,7 @@ describe("run history", () => {
     fireEvent.focus(icon);
     await waitFor(() =>
       expect(
-        screen.getAllByText("Host was offline at fire time — run skipped").length,
+        screen.getAllByText("Host was offline at fire time. Run skipped.").length,
       ).toBeGreaterThan(0),
     );
     // No conversation → NOT a clickable row (no anchor, no hover/pointer), and

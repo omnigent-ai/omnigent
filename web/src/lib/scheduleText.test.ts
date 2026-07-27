@@ -504,10 +504,10 @@ describe("formatRunTimestamp", () => {
 describe("describeRunError", () => {
   it("maps known fire-path error codes to human copy", () => {
     expect(describeRunError("no_online_host", "skipped")).toBe(
-      "Host was offline at fire time — run skipped",
+      "Host was offline at fire time. Run skipped.",
     );
     expect(describeRunError("incomplete", "failed")).toBe(
-      "The host went away mid-run — run left incomplete",
+      "The host went away mid-run. Run left incomplete.",
     );
     expect(describeRunError("launch_failed", "failed")).toBe("The agent session failed to launch");
   });

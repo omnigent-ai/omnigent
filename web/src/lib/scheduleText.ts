@@ -214,17 +214,17 @@ export function describeRunError(
 ): string {
   switch (errorCode) {
     case "no_online_host":
-      return "Host was offline at fire time — run skipped";
+      return "Host was offline at fire time. Run skipped.";
     case "host_offline":
-      return "The pinned host was offline — run skipped";
+      return "The pinned host was offline. Run skipped.";
     case "host_not_found":
-      return "The pinned host no longer exists — run skipped";
+      return "The pinned host no longer exists. Run skipped.";
     case "host_not_owned":
-      return "The pinned host isn't available to you — run skipped";
+      return "The pinned host isn't available to you. Run skipped.";
     case "host_registry_unavailable":
-      return "No host was reachable at fire time — run skipped";
+      return "No host was reachable at fire time. Run skipped.";
     case "default_workspace_unresolved":
-      return "Couldn't resolve a workspace on the host — run skipped";
+      return "Couldn't resolve a workspace on the host. Run skipped.";
     case "unsupported_target":
       return "This task's target can't be run automatically";
     case "session_create_failed":
@@ -234,7 +234,7 @@ export function describeRunError(
     case "launch_failed":
       return "The agent session failed to launch";
     case "incomplete":
-      return "The host went away mid-run — run left incomplete";
+      return "The host went away mid-run. Run left incomplete.";
     default:
       return status === "skipped" ? "Run skipped" : "Run failed";
   }
