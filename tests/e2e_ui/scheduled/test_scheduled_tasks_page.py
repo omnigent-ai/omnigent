@@ -18,6 +18,8 @@ never exercised.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 import httpx
 from playwright.sync_api import Page, expect
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -182,6 +184,59 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     # (The forbidden thing was a client recompute of WHICH instant is next; a
     # delta off the server value is fine.)
     expect(daily.get_by_test_id("task-next-run")).to_contain_text("Next run in", timeout=30_000)
+
+
+def _parse_iso(ts: str) -> datetime:
+    """Parse an ISO-8601 timestamp (tolerating a trailing ``Z``) as aware UTC."""
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def test_scheduled_task_next_run_label_live_ticks_without_navigation(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The relative next-run label re-renders on its own as time passes.
+
+    The label is a delta (``next_run_at − now``); ``now`` comes from the shared
+    ``useNow()`` ticker (a 30s ``setInterval`` behind ``useSyncExternalStore``),
+    so the displayed value must advance WITHOUT any navigation or reload as real
+    time passes. A regression to the frozen-at-first-render ``now`` (the bug this
+    guards) would leave the label stuck until remount.
+
+    Determinism comes from Playwright's clock mocking. We pin the browser clock a
+    known distance BEFORE the server's authoritative ``next_run_at`` (so the
+    initial label is a fixed "in 40 mins"), then fast-forward the clock past many
+    30s ticks and assert the SAME row's label changed to "in 5 mins" — no reload
+    between the two assertions. LLM-free: the row is pure UI state, no agent turn.
+    """
+    agent_id = _builtin_agent_id(live_server, "hello_world")
+    task_id = _create_task(live_server, agent_id, "Ticking task", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+
+    # The server armed the task; read its authoritative next fire so the delta is
+    # anchored to real server state rather than a hand-picked absolute time.
+    created = httpx.get(f"{live_server}/v1/scheduled-tasks/{task_id}", timeout=10.0).json()
+    next_run_at = created["next_run_at"]
+    assert next_run_at, "seeded active task should have an armed next_run_at"
+    fire = _parse_iso(next_run_at).replace(microsecond=0)
+
+    # Pin the browser clock to 40 minutes BEFORE the fire, so the delta the label
+    # formats is exactly 40 minutes → "Next run in 40 mins". Installed before
+    # navigation so the SPA's first `Date.now()` (and every `useNow` read) is faked.
+    page.clock.install(time=fire - timedelta(minutes=40))
+
+    page.goto(f"{live_server}/tasks")
+
+    row = _row_by_name(page, "Ticking task")
+    expect(row).to_be_visible(timeout=30_000)
+    next_run = row.get_by_test_id("task-next-run")
+    expect(next_run).to_have_text("Next run in 40 mins", timeout=30_000)
+
+    # Advance the clock 35 minutes — past 70 of the 30s ticks — WITHOUT touching
+    # navigation. The useNow() interval fires and the same element re-renders to
+    # the new delta (40 − 35 = 5 minutes). If the ticker were dead, this stays
+    # "in 40 mins" and the assertion fails.
+    page.clock.fast_forward("35:00")
+    expect(next_run).to_have_text("Next run in 5 mins", timeout=30_000)
 
 
 def test_scheduled_task_create_edit_modal_and_time_picker(
