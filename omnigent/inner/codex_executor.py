@@ -742,8 +742,11 @@ def _populate_codex_home_config(
     symlink_files = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
-    # Always symlink hooks.json so hook-trust keys rewritten below resolve.
-    symlink_files += (_CODEX_HOOKS_JSON,)
+        # Symlink hooks.json so hook-trust keys rewritten below resolve.
+        # Skipped in minimal_config mode: the minimal config.toml is rebuilt
+        # from scratch with no [hooks.state] entries, so symlinked hooks with
+        # no trust state would re-introduce the interactive trust prompt.
+        symlink_files += (_CODEX_HOOKS_JSON,)
     for filename in symlink_files:
         source_file = source_dir / filename
         if not source_file.is_file():
@@ -902,10 +905,8 @@ def _retarget_codex_hook_trust_keys(
     # We only rewrite lines where the quoted path starts with source_prefix so
     # unrelated trust entries (e.g. from a different machine's config that was
     # synced in) are left untouched.
-    import re as _re
-
-    pattern = _re.compile(
-        r'(\[hooks\.state\.")' + _re.escape(source_prefix) + r'((?:/[^":]*)*:[^"]*"\])'
+    pattern = re.compile(
+        r'(\[hooks\.state\.")' + re.escape(source_prefix) + r'((?:/[^":]*)*:[^"]*"\])'
     )
     rewritten, count = pattern.subn(r"\g<1>" + target_prefix + r"\g<2>", text)
     if count == 0:

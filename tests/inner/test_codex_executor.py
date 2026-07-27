@@ -2385,6 +2385,10 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
 
     assert (target / "auth.json").is_symlink()
     assert not (target / "AGENTS.md").exists()
+    # hooks.json must NOT be symlinked in minimal mode: the rebuilt config.toml
+    # carries no [hooks.state] entries, so a symlinked hooks.json with no trust
+    # state would re-introduce the interactive trust prompt.
+    assert not (target / "hooks.json").exists()
     config_text = (target / "config.toml").read_text()
     assert 'model_provider = "Databricks"' in config_text
     assert "[model_providers.Databricks]" in config_text
