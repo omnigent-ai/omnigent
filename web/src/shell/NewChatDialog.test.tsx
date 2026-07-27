@@ -22,7 +22,13 @@ import {
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
-import { useHostModelOptions, useHosts, useInstallHarness, type Host } from "@/hooks/useHosts";
+import {
+  useHostModelOptions,
+  useHosts,
+  useInstallHarness,
+  useInstallingHarnesses,
+  type Host,
+} from "@/hooks/useHosts";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -43,9 +49,12 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(),
-  // The setup dialog mounts these; default to an inert mutation + not-installing
-  // so tests that don't exercise install don't need to wire them up.
+  // The setup dialog mounts these; default to inert so tests that don't
+  // exercise install / credential-write don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useInstallingHarnesses: vi.fn(() => new Set<string>()),
+  useStoreCredential: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useDetectedCredentials: vi.fn(() => ({ data: [] })),
 }));
 // The setup dialog's copyable command rows call copyText; stub it so a click
 // can be asserted without touching the real clipboard.
@@ -109,9 +118,9 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
       },
       {
         kind: "auth",
-        title: "Sign in to Codex",
-        detail: "Uses your ChatGPT subscription — sign in on the host.",
-        action: "command",
+        title: "Set up authentication",
+        detail: "Sign in with your ChatGPT subscription, an API key, or a gateway.",
+        action: "auth",
         command: "codex login",
         status_key: "authed",
       },
@@ -604,6 +613,15 @@ function setupLandingMocks() {
   useHostWorktreesMock.mockReset();
   useDirectorySessionsMock.mockReset();
   useRunnerHealthMock.mockReset();
+  // Reset the install hooks to their inert defaults: per-test overrides
+  // (a pending install set, a callback-firing mutate) must not leak into the
+  // next test — a stale pending set would disable the Install button and make
+  // a later click a silent no-op.
+  vi.mocked(useInstallHarness).mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+  } as unknown as ReturnType<typeof useInstallHarness>);
+  vi.mocked(useInstallingHarnesses).mockReturnValue(new Set<string>());
   setOmnigentHostConfig({});
   resetLandingDraft();
   localStorage.clear();
@@ -1177,15 +1195,54 @@ describe("NewChatLandingScreen", () => {
     expect(installMutate).toHaveBeenCalledWith("codex-native", expect.anything());
   });
 
+  it("gates Set up auth until the harness is installed (no auth-before-install)", () => {
+    // codex-native not installed: the credential form must NOT be available
+    // yet — the auth row shows a DISABLED "Set up auth" (install first).
+    // Clicking it does nothing / the form doesn't expand, so an auth-first write
+    // (which would leave the dot red) can't happen.
+    mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectUnconfiguredAgent("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+
+    // Install is offered; the auth row's control is present but disabled.
+    expect(screen.getByTestId("harness-setup-install")).toBeTruthy();
+    const setUpAuth = screen.getByTestId("harness-setup-add-credential") as HTMLButtonElement;
+    expect(setUpAuth.textContent).toBe("Set up auth");
+    expect(setUpAuth.disabled).toBe(true);
+    fireEvent.click(setUpAuth);
+    expect(screen.queryByTestId("harness-credential-form")).toBeNull();
+  });
+
+  it("enables Set up auth once the harness is installed (needs-auth)", () => {
+    // Installed but no credential → the auth row's "Set up auth" is enabled and
+    // expands the credential form.
+    mockHosts([
+      { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
+    ]);
+    renderLanding({
+      harness_install_enabled: true,
+      installable_harnesses: ["codex", "codex-native"],
+    });
+    selectUnconfiguredAgent("a2");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+
+    const setUpAuth = screen.getByTestId("harness-setup-add-credential") as HTMLButtonElement;
+    expect(setUpAuth.textContent).toBe("Set up auth");
+    expect(setUpAuth.disabled).toBe(false);
+    fireEvent.click(setUpAuth);
+    expect(screen.getByTestId("harness-credential-form")).toBeTruthy();
+  });
+
   it("marks its Install button loading while THIS harness's install is pending", () => {
-    // The dialog tracks in-flight installs in a local set driven by mutate()'s
-    // onSettled. Hold the mutation pending (never settle) → clicking Install
-    // flips this harness's button to the loading/disabled state.
-    vi.mocked(useInstallHarness).mockReturnValue({
-      // mutate never invokes its options callbacks → install stays in flight.
-      mutate: vi.fn(),
-      isPending: false,
-    } as unknown as ReturnType<typeof useInstallHarness>);
+    // The dialog derives the in-flight indicator from React Query's mutation
+    // state via useInstallingHarnesses (observer-independent, so a concurrent
+    // install can't strand it). When that reports codex-native pending, the
+    // button shows the loading/disabled state.
+    vi.mocked(useInstallingHarnesses).mockReturnValue(new Set(["codex-native"]));
     mockHosts([{ ...host("online"), configured_harnesses: { "codex-native": false } } as Host]);
     renderLanding({
       harness_install_enabled: true,
@@ -1194,18 +1251,19 @@ describe("NewChatLandingScreen", () => {
     selectUnconfiguredAgent("a2");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
-    const button = screen.getByTestId("harness-setup-install") as HTMLButtonElement;
-    expect(button.disabled).toBe(false);
-    // Clicking starts the install; the button shows the pending state (disabled)
-    // because codex-native was added to the dialog's installing set.
-    fireEvent.click(button);
     expect((screen.getByTestId("harness-setup-install") as HTMLButtonElement).disabled).toBe(true);
+    // The "Installing…" caption sits INSIDE the install step row (next to what
+    // it describes), not stranded at the dialog footer.
+    const installStep = screen.getByTestId("harness-setup-step-install");
+    const installingCaption = screen.getByTestId("harness-setup-installing");
+    expect(installStep.contains(installingCaption)).toBe(true);
   });
 
-  it("copies the login command (no Install) for a codex needs-auth state", async () => {
-    // Binary present, just not logged in → dialog shows the `codex login`
-    // instruction as a click-to-copy command, never an Install button (a
-    // reinstall wouldn't add the login).
+  it("offers the inline credential form (not an install) for codex needs-auth", async () => {
+    // Binary present, just not authed → the auth step offers "Set up auth",
+    // which expands the inline credential form. Never an Install button (a
+    // reinstall wouldn't add the credential). The subscription `codex login` is
+    // one option inside the form (the UI can't drive browser OAuth).
     copyTextMock.mockClear();
     mockHosts([
       { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
@@ -1217,11 +1275,15 @@ describe("NewChatLandingScreen", () => {
     selectUnconfiguredAgent("a2");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
-    const command = screen.getByTestId("harness-setup-command");
-    expect(command.textContent).toContain("codex login");
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
-
-    fireEvent.click(command);
+    // Open the inline form.
+    fireEvent.click(screen.getByTestId("harness-setup-add-credential"));
+    expect(screen.getByTestId("harness-credential-form")).toBeTruthy();
+    expect(screen.getByTestId("harness-credential-key")).toBeTruthy();
+    // The subscription login is a copy signpost inside the form.
+    const loginCopy = screen.getByTestId("harness-credential-login-copy");
+    expect(loginCopy.textContent).toContain("codex login");
+    fireEvent.click(loginCopy);
     await waitFor(() => expect(copyTextMock).toHaveBeenCalledWith("codex login"));
   });
 
@@ -1306,13 +1368,13 @@ describe("NewChatLandingScreen", () => {
     selectAgent("a1");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
-    expect(screen.getByTestId("harness-setup-empty").textContent).toContain("omnigent setup");
+    expect(screen.getByTestId("harness-setup-empty").textContent).toContain("omni setup");
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
   });
 
   it("falls back to the original setup guidance when the feature is off", () => {
     // Flag OFF (renderLanding default) → the pre-feature UI: the warning shows
-    // the descriptive "run omnigent setup" message, NOT the "Set up" action or
+    // the descriptive "run omni setup" message, NOT the "Set up" action or
     // dialog. This is the no-op-when-disabled contract.
     mockHosts([
       { ...host("online"), configured_harnesses: { "codex-native": "needs-auth" } } as Host,
