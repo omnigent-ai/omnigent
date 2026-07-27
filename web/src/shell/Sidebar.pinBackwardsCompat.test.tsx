@@ -15,7 +15,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { usePinnedConversations } from "@/hooks/useConversations";
+import { usePinnedConversations, useTogglePinnedConversation } from "@/hooks/useConversations";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { useMigrateLocalPinsToServer } from "./Sidebar";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
@@ -32,8 +32,12 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 //         clears the per-user pin.
 const server = {
   mode: "old" as "old" | "new",
-  // ids the server currently reports as pinned (new mode only).
-  pins: new Set<string>(),
+  // Per-user pins the NEW server stores + surfaces (omnigent.pinned.<user>).
+  perUserPins: new Set<string>(),
+  // Bare-key pins an OLD server stores from a PATCH. Faithful to the bug: the
+  // new server drops any bare `omnigent.pinned` key on read (only its per-user
+  // key is surfaced), so a bare-key pin written pre-upgrade is LOST on upgrade.
+  barePins: new Set<string>(),
   // every session that exists (what an old server returns unfiltered).
   allSessions: ["chat_1", "chat_2"],
   patchCount: 0,
@@ -56,23 +60,29 @@ function jsonResponse(body: unknown): Response {
 
 const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
   const url = input.toString();
-  // PATCH /v1/sessions/{id} — pin/unpin.
+  // PATCH /v1/sessions/{id} — pin/unpin. Both servers accept it; they differ in
+  // how they store it (per-user on new, bare on old).
   if (init?.method === "PATCH") {
     server.patchCount += 1;
     const id = decodeURIComponent(url.split("/v1/sessions/")[1]);
     const body = JSON.parse(init.body as string) as { labels?: Record<string, string> };
     const val = body.labels?.[PINNED_LABEL_KEY];
-    // An old server never gets here: the migration is gated off against it.
-    if (val === "" || val == null) server.pins.delete(id);
-    else server.pins.add(id);
-    return Promise.resolve(jsonResponse(row(id, server.pins.has(id))));
+    const store = server.mode === "new" ? server.perUserPins : server.barePins;
+    if (val === "" || val == null) store.delete(id);
+    else store.add(id);
+    return Promise.resolve(jsonResponse(row(id, store.has(id))));
   }
   // GET /v1/sessions?...&pinned=true — the pinned list.
   if (server.mode === "old") {
-    // Old server drops the unknown `pinned` param and returns everything.
+    // Old server drops the unknown `pinned` param and returns everything,
+    // WITHOUT any pin label (a bare-key pin isn't surfaced as omnigent.pinned
+    // on the pre-feature read path).
     return Promise.resolve(jsonResponse({ data: server.allSessions.map((id) => row(id, false)) }));
   }
-  return Promise.resolve(jsonResponse({ data: [...server.pins].map((id) => row(id, true)) }));
+  // New server: only per-user pins are surfaced (bare pins are dropped on read).
+  return Promise.resolve(
+    jsonResponse({ data: [...server.perUserPins].map((id) => row(id, true)) }),
+  );
 });
 
 // The union the sidebar renders: server pins ∪ leftover localStorage pins.
@@ -81,12 +91,19 @@ function readLegacyPins(): string[] {
   return raw ? (JSON.parse(raw) as string[]) : [];
 }
 
+// Captures the live toggle mutation so a test can pin/unpin through the REAL
+// `useTogglePinnedConversation` (including its old-server localStorage fallback)
+// while the harness is mounted.
+let toggle: ((args: { id: string; pinned: boolean }) => void) | null = null;
+
 // Minimal harness wiring the real hooks exactly as the Sidebar does, exposing
 // the union pinned set so assertions read "what the user sees as pinned".
 function Harness() {
   const { data, isSuccess } = usePinnedConversations();
   const serverIds = (data?.conversations ?? []).map((c) => c.id);
   useMigrateLocalPinsToServer(new Set(serverIds), isSuccess, data?.filterHonored ?? false);
+  const toggleMutation = useTogglePinnedConversation();
+  toggle = toggleMutation.mutate;
   const union = new Set(serverIds);
   for (const id of readLegacyPins()) union.add(id);
   return createElement("div", { "data-testid": "pinned" }, [...union].sort().join(","));
@@ -103,8 +120,10 @@ function loadPage() {
 
 beforeEach(() => {
   server.mode = "old";
-  server.pins = new Set();
+  server.perUserPins = new Set();
+  server.barePins = new Set();
   server.patchCount = 0;
+  toggle = null;
   vi.stubGlobal("fetch", fetchMock);
   localStorage.clear();
 });
@@ -133,7 +152,7 @@ describe("pin survives a UI-before-server upgrade", () => {
     server.mode = "new"; // now honors ?pinned=true (currently no server pins)
     const stage2 = loadPage();
     // Migration fires and pushes the local pin to the server.
-    await waitFor(() => expect(server.pins.has("chat_1")).toBe(true));
+    await waitFor(() => expect(server.perUserPins.has("chat_1")).toBe(true));
     expect(server.patchCount).toBe(1);
     // Legacy key is cleared once the write is confirmed.
     await waitFor(() =>
@@ -170,7 +189,41 @@ describe("pin survives a UI-before-server upgrade", () => {
     // Finally the server catches up.
     server.mode = "new";
     const final = loadPage();
-    await waitFor(() => expect(server.pins.has("chat_1")).toBe(true));
+    await waitFor(() => expect(server.perUserPins.has("chat_1")).toBe(true));
     await waitFor(() => expect(final.getByTestId("pinned").textContent).toBe("chat_1"));
+  });
+
+  it("keeps a pin created DURING the UI-before-server window (toggle falls back to localStorage)", async () => {
+    // No pre-existing pin. The user pins a session in the NEW UI while the
+    // server is still OLD — the reported failure: the pin was PATCHed as a bare
+    // key the upgraded server dropped, so it vanished on the server upgrade.
+
+    // ── Stage 1: pin in the new UI, old server ────────────────────────────
+    const stage1 = loadPage();
+    await waitFor(() => expect(stage1.getByTestId("pinned").textContent).toBe(""));
+    toggle!({ id: "chat_2", pinned: true });
+    // The pin shows immediately (optimistic patch + localStorage union)...
+    await waitFor(() => expect(stage1.getByTestId("pinned").textContent).toBe("chat_2"));
+    // ...and crucially was NOT PATCHed to the old server (which would store a
+    // bare key the upgraded server discards). It went to localStorage instead.
+    expect(server.patchCount).toBe(0);
+    expect(server.barePins.has("chat_2")).toBe(false);
+    await waitFor(() => expect(readLegacyPins()).toEqual(["chat_2"]));
+    stage1.unmount();
+
+    // ── Stage 2: reload, still old server — pin persists ──────────────────
+    const stage2 = loadPage();
+    await waitFor(() => expect(stage2.getByTestId("pinned").textContent).toBe("chat_2"));
+    expect(readLegacyPins()).toEqual(["chat_2"]);
+    stage2.unmount();
+
+    // ── Stage 3: server upgraded — the pin migrates instead of vanishing ──
+    server.mode = "new";
+    const stage3 = loadPage();
+    await waitFor(() => expect(server.perUserPins.has("chat_2")).toBe(true));
+    await waitFor(() =>
+      expect(localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY)).toBeNull(),
+    );
+    await waitFor(() => expect(stage3.getByTestId("pinned").textContent).toBe("chat_2"));
   });
 });

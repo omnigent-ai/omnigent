@@ -152,17 +152,18 @@ import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
   type ActiveChatOverride,
+  clearLegacyPinnedConversationIds,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
-  migratePinnedConversationIds,
   orderByPinnedTimestamp,
-  PINNED_CONVERSATION_IDS_STORAGE_KEY,
+  readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
+  writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
 
 // Positioning for a row's trailing session-state badge. On desktop the badge
@@ -4088,52 +4089,6 @@ function BulkActionBar({
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined") return false;
   return !window.matchMedia("(min-width: 768px)").matches;
-}
-
-function readPinnedConversationIds(): string[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    // Migrate legacy prefixed ids (``conv_<hex>``) to the bare-hex form the API
-    // returns post id-to-binary migration; the write-back effect re-persists
-    // the migrated ids, so this one-time rewrite is durable across reloads.
-    return migratePinnedConversationIds(
-      parsed.filter((value): value is string => typeof value === "string"),
-    );
-  } catch {
-    // Browser storage is user-editable and can contain stale/corrupt values.
-    // Treat bad pin state as "no pins" instead of breaking navigation.
-    return [];
-  }
-}
-
-function clearLegacyPinnedConversationIds() {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
-  } catch {
-    // Best-effort cleanup — leaving the stale key is harmless (the migration
-    // guard skips already-pinned ids), so a failure here needn't surface.
-  }
-}
-
-// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Used by the
-// migration to retain only the pins whose server write failed, so a transient
-// failure retries on the next load instead of dropping the pin.
-function writeLegacyPinnedConversationIds(ids: string[]) {
-  if (typeof window === "undefined") return;
-  try {
-    if (ids.length === 0) {
-      window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
-    } else {
-      window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
-    }
-  } catch {
-    // Best-effort — a write failure just means the migration retries next load.
-  }
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)

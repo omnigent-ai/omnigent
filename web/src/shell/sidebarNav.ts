@@ -4,6 +4,75 @@ import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
+// ── Legacy localStorage pin helpers ───────────────────────────────────────
+//
+// Pins are server-authoritative now, but two paths still touch the legacy
+// localStorage key: the one-time server migration, and the pin toggle's
+// fallback when the server can't yet store pins (`filterHonored === false` — a
+// pre-upgrade server that ignores `?pinned=true`). Kept in this leaf module so
+// both the Sidebar and the `useConversations` toggle hook can use them without
+// an import cycle.
+
+/** Read the legacy pin ids, migrated to bare-hex form. Corrupt/absent ⇒ []. */
+export function readPinnedConversationIds(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Migrate legacy prefixed ids (``conv_<hex>``) to the bare-hex form the API
+    // returns post id-to-binary migration; callers re-persist so the one-time
+    // rewrite is durable across reloads.
+    return migratePinnedConversationIds(
+      parsed.filter((value): value is string => typeof value === "string"),
+    );
+  } catch {
+    // Browser storage is user-editable and can contain stale/corrupt values.
+    // Treat bad pin state as "no pins" instead of breaking navigation.
+    return [];
+  }
+}
+
+/** Remove the legacy pin key entirely (migration complete). */
+export function clearLegacyPinnedConversationIds(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+  } catch {
+    // Best-effort cleanup — a stale key is harmless (dedup + migration guard
+    // skip already-known ids), so a failure here needn't surface.
+  }
+}
+
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Used by the
+// migration to retain only the pins whose server write failed, and by the
+// old-server toggle fallback to add/remove a single pin.
+export function writeLegacyPinnedConversationIds(ids: readonly string[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (ids.length === 0) {
+      window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
+    }
+  } catch {
+    // Best-effort — a write failure just means the pin isn't persisted locally.
+  }
+}
+
+/**
+ * Add or remove a single id in the legacy localStorage pin list, most-recently-
+ * pinned-first (matching the pre-server ordering the migration relies on).
+ * Used by the pin toggle's old-server fallback so a pin created before the
+ * server upgrade survives in localStorage and later migrates like any other
+ * pre-upgrade pin.
+ */
+export function setLegacyPinnedConversationId(id: string, pinned: boolean): void {
+  const rest = readPinnedConversationIds().filter((x) => x !== id);
+  writeLegacyPinnedConversationIds(pinned ? [id, ...rest] : rest);
+}
+
 // Titles of sidebar sections the user has collapsed, e.g. ["Archived"].
 // Keyed by display title — stable identifiers for these fixed groups.
 export const COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY = "omnigent:collapsed-sidebar-sections";
