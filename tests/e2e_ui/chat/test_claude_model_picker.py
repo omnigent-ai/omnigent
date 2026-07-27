@@ -294,20 +294,17 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
     )
     _screenshot(page, "unpinned-gateway-composer")
 
-    gear = page.get_by_test_id("composer-config-gear")
-    expect(gear).to_be_visible(timeout=15_000)
-    gear.click()
+    page.get_by_test_id("composer-config-gear").click()
     page.get_by_test_id("composer-config-model").click()
 
-    # Exactly one row: the provider's routable default, pre-selected. Picking
+    # Exactly one row — the provider's routable default, pre-selected — so no
+    # alias row exists to canonicalize into an id the gateway rejects. Picking
     # it can only ever PATCH the concrete gateway id, which the launch
-    # resolver passes through verbatim — never a bare family alias.
+    # resolver passes through verbatim.
     rows = page.locator('[role="option"][data-model-id]')
     expect(rows).to_have_count(1)
     expect(rows.first).to_have_attribute("data-model-id", default_model)
     expect(rows.first).to_have_attribute("data-active", "true")
-    for alias in ("fable", "opus", "sonnet", "sonnet_5", "haiku"):
-        expect(page.locator(f'[role="option"][data-model-id="{alias}"]')).to_have_count(0)
     _screenshot(page, "unpinned-gateway-picker")
 
 

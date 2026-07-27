@@ -324,10 +324,8 @@ def resolve_claude_native_model_selection(
     Direct Claude logins have no provider config, so they use the canonical
     Anthropic model id.
 
-    On a provider config, a family alias whose tier has no
-    ``ANTHROPIC_DEFAULT_*_MODEL`` pin would be canonicalized by Claude Code
-    to an Anthropic id (e.g. ``claude-opus-4-8``) the gateway rejects, so it
-    resolves to the provider's default model instead.
+    Unpinned family aliases on a provider config resolve to the provider's
+    default model — Claude Code would canonicalize them to ids gateways reject.
 
     :param model: Persisted picker id, built-in alias, or concrete model id.
     :param claude_config: Resolved provider config for the terminal.
@@ -442,19 +440,12 @@ def claude_native_model_options(
     if options:
         return options
     if claude_config is not None:
-        # A provider config with no tier pins routes through a gateway that
-        # rejects the subscription aliases below; offer the one model the
-        # config is known to route.
-        if not claude_config.model:
+        # No tier pins: the gateway rejects the subscription aliases below,
+        # so offer the one model the config is known to route.
+        model_id = claude_config.model
+        if not model_id:
             return []
-        return [
-            {
-                "id": claude_config.model,
-                "model": claude_config.model,
-                "displayName": claude_config.model,
-                "isDefault": True,
-            }
-        ]
+        return [{"id": model_id, "model": model_id, "displayName": model_id, "isDefault": True}]
     return [
         {
             "id": model_id,
