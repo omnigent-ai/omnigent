@@ -159,7 +159,7 @@ async def wait_for_runner_online(
     message = f"Runner {runner_id!r} did not connect within {timeout_s:.0f}s."
     if last_error is not None:
         message += f" Last connection error: {last_error!r}."
-    message += " Check the host-runner logs under ~/.omnigent/logs/host-runner/."
+    message += " Check the runner logs under ~/.omnigent/logs/runner/."
     raise click.ClickException(message)
 
 

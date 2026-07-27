@@ -1,4 +1,5 @@
-"""Tests for the server-lifecycle CLI: ``server start/stop/status`` and top-level ``stop``."""
+"""Tests for the server-lifecycle CLI: ``server`` (``--background``,
+``stop``, ``status``) and top-level ``stop``."""
 
 from __future__ import annotations
 
@@ -82,7 +83,7 @@ def test_server_status_json(monkeypatch: pytest.MonkeyPatch) -> None:
             pid=4321,
             port=8123,
             url="http://127.0.0.1:8123",
-            log_path=Path("/tmp/.omnigent/logs/server/local-server-ab12.log"),
+            log_path=Path("/tmp/.omnigent/logs/server/server-ab12.log"),
         ),
     )
     monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
@@ -99,7 +100,7 @@ def test_server_status_json(monkeypatch: pytest.MonkeyPatch) -> None:
         "pid": 4321,
         "port": 8123,
         "url": "http://127.0.0.1:8123",
-        "log_path": "/tmp/.omnigent/logs/server/local-server-ab12.log",
+        "log_path": "/tmp/.omnigent/logs/server/server-ab12.log",
         "live_sessions": 0,
         "daemon_attached": False,
     }
@@ -114,7 +115,7 @@ def test_server_status_text_reports_log_path(monkeypatch: pytest.MonkeyPatch) ->
             pid=4321,
             port=8123,
             url="http://127.0.0.1:8123",
-            log_path=Path.home() / ".omnigent" / "logs" / "server" / "local-server-ab12.log",
+            log_path=Path.home() / ".omnigent" / "logs" / "server" / "server-ab12.log",
         ),
     )
     monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
@@ -127,7 +128,7 @@ def test_server_status_text_reports_log_path(monkeypatch: pytest.MonkeyPatch) ->
 
     assert result.exit_code == 0, result.output
     assert "running at http://127.0.0.1:8123" in result.output
-    assert "log: ~/.omnigent/logs/server/local-server-ab12.log" in result.output
+    assert "log: ~/.omnigent/logs/server/server-ab12.log" in result.output
 
 
 def test_server_status_session_count_failure_is_graceful(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,62 +151,62 @@ def test_server_status_session_count_failure_is_graceful(monkeypatch: pytest.Mon
     assert "live sessions:" not in result.output  # count omitted on fetch failure
 
 
-# ── server start ───────────────────────────────────────────────────
+# ── server --background ────────────────────────────────────────────
 
 
-def test_server_start_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``server start`` reports the URL and exact log file of a spawned server."""
+def test_server_background_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``server --background`` reports the URL and exact log file of a spawned server."""
     monkeypatch.setattr(
         "omnigent.cli.ensure_local_omnigent_server",
         lambda: LocalServerStartup(
             url="http://127.0.0.1:8123",
             spawned=True,
-            log_path=Path.home() / ".omnigent" / "logs" / "server" / "local-server-ab12.log",
+            log_path=Path.home() / ".omnigent" / "logs" / "server" / "server-ab12.log",
         ),
     )
 
-    result = CliRunner().invoke(cli, ["server", "start"])
+    result = CliRunner().invoke(cli, ["server", "--background"])
 
     assert result.exit_code == 0, result.output
     assert "Started background server at http://127.0.0.1:8123" in result.output
     # The exact captured-log file is surfaced so the detached server isn't a
     # black box — collapsed to ``~`` for readability.
-    assert "log: ~/.omnigent/logs/server/local-server-ab12.log" in result.output
+    assert "log: ~/.omnigent/logs/server/server-ab12.log" in result.output
 
 
-def test_server_start_reuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``server start`` reports reuse and the reused server's log file."""
+def test_server_background_reuses(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``server --background`` reports reuse and the reused server's log file."""
     monkeypatch.setattr(
         "omnigent.cli.ensure_local_omnigent_server",
         lambda: LocalServerStartup(
             url="http://127.0.0.1:8123",
             spawned=False,
-            log_path=Path.home() / ".omnigent" / "logs" / "server" / "local-server-cd34.log",
+            log_path=Path.home() / ".omnigent" / "logs" / "server" / "server-cd34.log",
         ),
     )
 
-    result = CliRunner().invoke(cli, ["server", "start"])
+    result = CliRunner().invoke(cli, ["server", "--background"])
 
     assert result.exit_code == 0, result.output
     assert "already running at http://127.0.0.1:8123" in result.output
     # Even a reused server (one this invocation didn't spawn) names its log,
     # read back from the sidecar.
-    assert "log: ~/.omnigent/logs/server/local-server-cd34.log" in result.output
+    assert "log: ~/.omnigent/logs/server/server-cd34.log" in result.output
 
 
-def test_server_start_omits_log_when_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_server_background_omits_log_when_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     """No log line when the running server has no captured-log file.
 
     A foreground ``omnigent server`` streams logs to its terminal, so a
-    reuse of it carries ``log_path=None`` and ``server start`` must not print
-    a bogus or empty ``log:`` line.
+    reuse of it carries ``log_path=None`` and ``server --background`` must not
+    print a bogus or empty ``log:`` line.
     """
     monkeypatch.setattr(
         "omnigent.cli.ensure_local_omnigent_server",
         lambda: LocalServerStartup(url="http://127.0.0.1:8123", spawned=False, log_path=None),
     )
 
-    result = CliRunner().invoke(cli, ["server", "start"])
+    result = CliRunner().invoke(cli, ["server", "--background"])
 
     assert result.exit_code == 0, result.output
     assert "log:" not in result.output

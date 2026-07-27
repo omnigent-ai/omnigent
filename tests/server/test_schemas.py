@@ -40,6 +40,7 @@ from omnigent.server.schemas import (
     ResponseObject,
     ServerStreamEvent,
     SessionHeartbeatEvent,
+    ToolOutputDeltaEvent,
 )
 
 # ── Round-trip serialization ──────────────────────────────────
@@ -270,6 +271,14 @@ def test_response_envelope_event_carries_real_response_object(
             {"type": "response.output_text.delta", "delta": "x"},
             OutputTextDeltaEvent,
         ),
+        (
+            {
+                "type": "response.function_call_output.delta",
+                "call_id": "call_123",
+                "delta": "x",
+            },
+            ToolOutputDeltaEvent,
+        ),
         ({"type": "response.reasoning.started"}, ReasoningStartedEvent),
         (
             {"type": "response.reasoning_text.delta", "delta": "x"},
@@ -390,6 +399,10 @@ def test_response_stream_event_rejects_unknown_type() -> None:
         # producing one of these without text means the producer is
         # broken; fail loud at parse time.
         (OutputTextDeltaEvent, {"type": "response.output_text.delta"}),
+        (
+            ToolOutputDeltaEvent,
+            {"type": "response.function_call_output.delta", "call_id": "call_123"},
+        ),
         (
             ReasoningTextDeltaEvent,
             {"type": "response.reasoning_text.delta"},

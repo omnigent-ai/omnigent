@@ -94,6 +94,8 @@ _ENV_OPENCODE_CONFIG_DENYLIST = frozenset(
 )
 
 _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
+# Strip ANSI escape sequences from ``opencode models`` output.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 # Escape hatch: set truthy to bypass the OpenCode CLI version gate (e.g. to
 # try an as-yet-unvalidated 1.18+/v2 release). Mirrors OMNIGENT_NO_UPDATE_CHECK.
@@ -193,6 +195,72 @@ def resolve_opencode_version(opencode_path: str) -> str:
     if version is None:
         raise OpenCodeVersionError(f"Could not parse OpenCode version from: {output!r}")
     return version
+
+
+def list_opencode_cli_model_options(
+    *,
+    opencode_path: str | None = None,
+    refresh: bool = True,
+    timeout: float = 30.0,
+    env: Mapping[str, str] | None = None,
+) -> list[dict[str, object]]:
+    """
+    List OpenCode models using the CLI catalog command.
+
+    ``opencode serve`` currently exposes only the public/free subset from
+    ``GET /api/model`` on some installs, while ``opencode models`` returns the
+    logged-in, refreshed catalog users see in the native TUI. Use this for the
+    Omnigent picker and fall back to the server API if it fails.
+
+    :param opencode_path: Optional explicit executable path.
+    :param refresh: Whether to pass ``--refresh`` so newly released models
+        appear without waiting for OpenCode's cache TTL.
+    :param timeout: Maximum command duration in seconds.
+    :param env: Environment for the subprocess. Pass the same ``XDG_DATA_HOME``
+        / ``XDG_CONFIG_HOME`` the bound ``opencode serve`` uses so model
+        discovery sees the per-session auth/catalog as the native TUI.
+    :returns: Model option dicts with full ``provider/model`` ids.
+    """
+    cli = find_opencode_cli(opencode_path)
+    args = [cli, "models"]
+    if refresh:
+        args.append("--refresh")
+    try:
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"Could not run 'opencode models': {exc}") from exc
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"'opencode models' failed with code {completed.returncode}: {completed.stderr[:500]}"
+        )
+    options: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for raw_line in completed.stdout.splitlines():
+        line = _ANSI_RE.sub("", raw_line).strip()
+        if not line or "/" not in line or line.lower().startswith("models cache "):
+            continue
+        provider_id, model_id = line.split("/", 1)
+        if not provider_id or not model_id or line in seen:
+            continue
+        seen.add(line)
+        options.append(
+            {
+                "id": line,
+                "model": model_id,
+                "providerID": provider_id,
+                "displayName": line,
+                "name": model_id,
+                "isDefault": False,
+            }
+        )
+    return options
 
 
 def allocate_loopback_port() -> int:

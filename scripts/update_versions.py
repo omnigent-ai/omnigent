@@ -1,15 +1,18 @@
 """
 Bump the omnigent project version across all packages in lockstep.
 
-The three distributions in this repo release together at a single
+The four distributions in this repo release together at a single
 version:
 
 - ``omnigent``         — root ``pyproject.toml``
 - ``omnigent-client``  — ``sdks/python-client/pyproject.toml``
 - ``omnigent-ui-sdk``  — ``sdks/ui/pyproject.toml``
+- ``omnigent-slack``   — ``integrations/slack/pyproject.toml``
 
-Each declares its own ``[project].version`` and ``==``-pins its
-siblings — the lockstep contract that
+Each declares its own ``[project].version``. The first three ``==``-pin
+their siblings in ``[project].dependencies``; the root ``omnigent``
+package also ``==``-pins ``omnigent-slack`` in the ``slack`` optional
+dependency extra — the lockstep contract that
 ``.github/workflows/release-omnigent.yml`` verifies at tag time. This
 script rewrites every one of those locations at once so they never
 drift.
@@ -18,7 +21,7 @@ It edits ONLY the ``[project].version`` line and the sibling ``==``
 pins, matched by package name — never a blind version-string replace —
 so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
-``databricks-mcp>=0.1.0``) are left untouched.
+``databricks-mcp>=0.9.0``) are left untouched.
 
 ``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
 ``web/electron/package.json`` (the desktop app's independent
@@ -83,13 +86,13 @@ def packages(root: Path) -> list[Package]:
     Return the lockstep packages with their paths rooted at *root*.
 
     :param root: Repo root, e.g. ``Path("/repo")``.
-    :returns: The three :class:`Package` entries.
+    :returns: The four :class:`Package` entries.
     """
     return [
         Package(
             "omnigent",
             root / "pyproject.toml",
-            ("omnigent-client", "omnigent-ui-sdk"),
+            ("omnigent-client", "omnigent-ui-sdk", "omnigent-slack"),
         ),
         Package(
             "omnigent-client",
@@ -100,6 +103,17 @@ def packages(root: Path) -> list[Package]:
             "omnigent-ui-sdk",
             root / "sdks" / "ui" / "pyproject.toml",
             ("omnigent-client",),
+        ),
+        # omnigent-slack is deliberately decoupled from omnigent core (it
+        # drives the server over HTTP, never imports ``omnigent``), so it
+        # pins no siblings. The root ``omnigent`` package ``==``-pins it in
+        # the ``slack`` optional-dependency extra; the pin lives in
+        # [project.optional-dependencies] rather than [project.dependencies],
+        # so check() scans both sections for it.
+        Package(
+            "omnigent-slack",
+            root / "integrations" / "slack" / "pyproject.toml",
+            (),
         ),
     ]
 
@@ -214,14 +228,17 @@ def next_dev_version(released: str) -> str:
     """
     Compute the next development version after releasing *released*.
 
-    Mirrors MLflow's post-release convention: bump the patch component
-    and append ``.dev0`` (e.g. ``0.1.2`` -> ``0.1.3.dev0``).
+    ``main`` carries the next MINOR as ``.dev0`` (the 0.5 cycle left main at
+    ``0.6.0.dev0``), and post-release runs only when a new ``branch-X.Y``
+    cycle is cut — patches never move main — so bump the minor, not the
+    micro. A micro bump would re-freeze main on the released line and make
+    doc-sync stage to the docs branch the release already owns.
 
-    :param released: The just-released version, e.g. ``"0.1.2"``.
-    :returns: The next dev version, e.g. ``"0.1.3.dev0"``.
+    :param released: The just-released version, e.g. ``"0.6.0rc1"``.
+    :returns: The next dev version, e.g. ``"0.7.0.dev0"``.
     """
     v = Version(released)
-    return f"{v.major}.{v.minor}.{v.micro + 1}.dev0"
+    return f"{v.major}.{v.minor + 1}.0.dev0"
 
 
 def _read_version_constant(root: Path) -> str:
@@ -261,7 +278,13 @@ def check(root: Path, expect: str | None = None) -> str:
     for pkg in packages(root):
         project = tomllib.loads(pkg.pyproject.read_text())["project"]
         versions[pkg.name] = project["version"]
-        deps = project.get("dependencies", [])
+        # Sibling == pins may live in [project.dependencies] (the three
+        # SDK packages) or in [project.optional-dependencies] extras (the
+        # root ``omnigent`` package pins ``omnigent-slack`` in the ``slack``
+        # extra). Collect both so the check covers every pin location.
+        deps = list(project.get("dependencies", []))
+        for extra_deps in project.get("optional-dependencies", {}).values():
+            deps.extend(extra_deps)
         for sibling in pkg.sibling_pins:
             pin = f"{sibling}=={project['version']}"
             if pin not in deps:

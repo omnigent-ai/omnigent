@@ -6,21 +6,18 @@ import android.net.Uri
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.webkit.WebViewFeature
 
 /**
- * Injects the [NativeBridgeScript] facade on the pinned origin, signals
- * [onPageReady] once a pinned-origin page finishes loading, and routes the OIDC
- * login flow to the system browser via [onLoginRequired].
+ * Signals [onPageReady] once a pinned-origin page finishes loading and routes
+ * the OIDC login flow to the system browser via [onLoginRequired].
  *
- * Unlike iOS's `WKUserScript(.atDocumentStart)`, Android has no pre-JS injection
- * hook; `onPageStarted` fires after the first response byte — in practice before
- * the SPA's bundle evaluates, so `window.omnigentNative` is present by the time
- * React mounts. Anything depending on the injected emit-callbacks (notification
- * replay, inset push) waits for [onPageReady].
+ * The facade is normally registered with `addDocumentStartJavaScript` in
+ * `MainActivity`. Older WebViews that support the message listener but not
+ * document-start scripts inject it after the pinned page finishes.
  */
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
+    private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
 ) : WebViewClient() {
@@ -52,15 +49,6 @@ class OmnigentWebViewClient(
             onLoginRequired()
             return
         }
-
-        // Inject the facade ONLY on the pinned origin and only when the web
-        // message listener is supported — otherwise the web would see a dead
-        // bridge and suppress its own Web Notifications / fallbacks.
-        if (origin == pinnedOrigin() &&
-            WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)
-        ) {
-            view.evaluateJavascript(NativeBridgeScript.source, null)
-        }
     }
 
     override fun onPageFinished(
@@ -68,6 +56,10 @@ class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageFinished(view, url)
+        if (originOf(url) == pinnedOrigin() && shouldInjectBridgeAtPageReady()) {
+            view.evaluateJavascript(NativeBridgeScript.source) { onPageReady(url) }
+            return
+        }
         onPageReady(url)
     }
 

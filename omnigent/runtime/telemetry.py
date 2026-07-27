@@ -328,10 +328,12 @@ def _fastapi_instrumentation_enabled() -> bool:
     return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip())
 
 
-# Session id as it appears in a request path: ``/v1/sessions/<conv_…>/...``
-# (runner-internal conversations use the ``agy_conv_`` prefix). Used to stamp
-# ``session.id`` onto the auto-created FastAPI server span.
-_SESSION_ID_IN_PATH = re.compile(r"/sessions/((?:agy_)?conv_[0-9a-f]+)")
+# Session id as it appears in a request path (``/v1/sessions/<id>/…``), used to
+# stamp ``session.id`` onto the FastAPI server span. Matches bare 32-char hex
+# plus the legacy ``conv_``/``agy_conv_`` forms so old links keep tagging spans.
+_SESSION_ID_IN_PATH = re.compile(
+    r"/sessions/((?:agy_)?(?:conv_)?[0-9a-f]{32}|(?:agy_)?conv_[0-9a-f]+)"
+)
 
 
 def _fastapi_session_id_hook(span: Any, scope: Mapping[str, Any]) -> None:

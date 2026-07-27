@@ -90,7 +90,7 @@ async def test_get_session(
 
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
     """Getting a nonexistent session returns 404."""
-    resp = await client.get("/v1/sessions/conv_nonexistent_12345")
+    resp = await client.get("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
     assert resp.status_code == 404
 
 
@@ -110,7 +110,7 @@ async def test_delete_session(
 
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
-    resp = await client.delete("/v1/sessions/conv_nonexistent_12345")
+    resp = await client.delete("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
     assert resp.status_code == 404
 
 
@@ -129,6 +129,85 @@ async def test_delete_running_session_attempts_stop(
         mock_stop.assert_awaited_once()
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_delete_idle_parent_stops_running_child(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Deleting an idle parent with a running child stops the child.
+
+    Regression test: ``_best_effort_stop`` previously used the child
+    rollup only to decide whether to act, then always issued the stop
+    against the parent's own session id. A parent that has already gone
+    idle while its sub-agent child keeps running would get a no-op stop,
+    then the recursive subtree delete would remove the child's row while
+    its runner process kept running, orphaning it.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=session_id,
+    )
+
+    mock_stop = AsyncMock(return_value=True)
+    sessions_module._session_status_cache[child.id] = "running"
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+        # The child must be the one stopped, not the (idle) parent.
+        mock_stop.assert_awaited_once()
+        assert mock_stop.await_args is not None
+        assert mock_stop.await_args.args[0] == child.id
+    finally:
+        sessions_module._session_status_cache.pop(child.id, None)
+
+
+async def test_delete_idle_parent_stops_running_grandchild(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Deleting an idle parent stops a running grandchild too.
+
+    Regression test: ``_best_effort_stop`` used to walk only direct
+    children, one level down. A sub-agent that itself spawns a sub-agent
+    (parent -> child -> grandchild) with the child now idle but the
+    grandchild still running was invisible to that one-level check, so
+    the grandchild kept running unstopped -- the same bug as the direct-
+    child case, just one generation deeper. ``delete_conversation``'s
+    recursive subtree delete has no such depth limit, so the stop logic
+    must match it.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:auth",
+        parent_conversation_id=session_id,
+    )
+    grandchild = conv_store.create_conversation(
+        kind="sub_agent",
+        title="researcher:citations",
+        parent_conversation_id=child.id,
+    )
+
+    mock_stop = AsyncMock(return_value=True)
+    sessions_module._session_status_cache[grandchild.id] = "running"
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+        # The grandchild must be the one stopped, not the idle parent/child.
+        mock_stop.assert_awaited_once()
+        assert mock_stop.await_args is not None
+        assert mock_stop.await_args.args[0] == grandchild.id
+    finally:
+        sessions_module._session_status_cache.pop(grandchild.id, None)
 
 
 async def test_delete_proceeds_when_stop_fails(
@@ -166,7 +245,7 @@ async def test_patch_session_title(
 async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
     """Patching a nonexistent session returns 404."""
     resp = await client.patch(
-        "/v1/sessions/conv_nonexistent_12345",
+        "/v1/sessions/4fe12335002377c209e501c3fe3bcffc",
         json={"title": "New Title"},
         headers={"Content-Type": "application/json"},
     )
@@ -196,7 +275,11 @@ async def test_list_projects_returns_names_sorted(
 
     resp = await client.get("/v1/sessions/projects")
     assert resp.status_code == 200
-    assert resp.json() == ["Customer X", "Sprint 42"]
+    # Label-only projects (no first-class row) list with id=None, sorted by name.
+    assert resp.json() == [
+        {"id": None, "name": "Customer X"},
+        {"id": None, "name": "Sprint 42"},
+    ]
 
 
 # ── GET /v1/sessions?project= (filter) ───────────────────────────────
@@ -285,3 +368,99 @@ async def test_patch_session_empty_project_removes_label(
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
     assert "omni_project" not in conv.labels
+
+
+# ── Pinned session label (omnigent.pinned) ───────────────────────────
+
+
+async def test_patch_session_pins_and_unpins(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """PATCH with the canonical ``labels: {"omnigent.pinned": <pin-time>}`` pins
+    the session for the CALLER: the server rewrites it to the per-user key
+    ``omnigent.pinned.<user>`` in storage (so it doesn't pin for others), and an
+    empty value deletes that per-user key (unpin)."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    # No auth header on this client ⇒ the single-user ``local`` identity.
+    user_key = pinned_label_key(None)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.pinned": "1721760000000"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    # Stored under the per-user key, NOT the bare canonical key.
+    assert conv.labels.get(user_key) == "1721760000000"
+    assert "omnigent.pinned" not in conv.labels
+    # …but the response collapses it back to the canonical key for the caller.
+    assert resp.json()["labels"].get("omnigent.pinned") == "1721760000000"
+
+    # Unpin: empty string clears the per-user key.
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.pinned": ""}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert user_key not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_per_user_pin_key(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """A client may only write the bare canonical ``omnigent.pinned`` key. A
+    suffixed ``omnigent.pinned.<user>`` is server-derived — accepting one would
+    let a caller pin/unpin a shared session for another user. It must be
+    rejected, and nothing persisted."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    for value in ("1721760000000", ""):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {"omnigent.pinned.bob@example.com": value}},
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "omnigent.pinned.bob@example.com" not in conv.labels
+
+
+async def test_list_sessions_pinned_filter(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?pinned=true`` returns only sessions the CALLER pinned — matched by
+    their per-user key. Another user's pin on a session does not surface."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="pin-agent", bundle_location="test:///bundle")
+    pinned = conv_store.create_conversation(agent_id=agent_id)
+    plain = conv_store.create_conversation(agent_id=agent_id)
+    other_user_pin = conv_store.create_conversation(agent_id=agent_id)
+    # This client is unauthenticated ⇒ the ``local`` identity. Pin one session
+    # under the caller's key and one under a different user's key.
+    conv_store.set_labels(pinned.id, {pinned_label_key(None): "1721760000000"})
+    conv_store.set_labels(other_user_pin.id, {pinned_label_key("someone-else"): "1721760000000"})
+
+    resp = await client.get("/v1/sessions?pinned=true")
+    assert resp.status_code == 200
+    ids = [s["id"] for s in resp.json()["data"]]
+    assert pinned.id in ids
+    assert plain.id not in ids
+    # A pin belonging to another user must not appear for the caller.
+    assert other_user_pin.id not in ids

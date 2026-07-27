@@ -1,12 +1,13 @@
 """Unit tests for native-worker YOLO ``terminal_launch_args`` derivation.
 
-Nessie's native sub-agent workers (claude-native / codex-native) launch
-in a headless pane where no human can answer an approval prompt. The
-server translates a worker's bypass stance into the per-session
-``terminal_launch_args`` the runner appends to the claude / codex argv:
-claude-native opts in via ``permission_mode``, while codex-native
-defaults to full bypass (issue #171) because the headless seam has no
-safe non-bypass default, with ``yolo: false`` as the opt-out.
+Nessie's native sub-agent workers (claude-native / codex-native /
+cursor-native) launch in a headless pane where no human can answer an
+approval prompt. The server translates a worker's bypass stance into the
+per-session ``terminal_launch_args`` the runner appends to the native
+CLI argv: claude-native opts in via ``permission_mode``, while
+codex-native and cursor-native default to full bypass (issue #171 /
+cursor ``--yolo``) because the headless seam has no safe non-bypass
+default, with ``yolo: false`` as the opt-out.
 
 These tests exercise the pure translation helper
 ``_derive_terminal_launch_args_from_spec`` directly with real
@@ -139,20 +140,57 @@ def test_codex_native_yolo_false_string_opts_out_of_bypass() -> None:
     assert _derive_terminal_launch_args_from_spec(spec) is None
 
 
+def test_cursor_native_defaults_to_yolo_flag() -> None:
+    """
+    A headless cursor-native sub-agent defaults to ``--yolo``.
+
+    Polly's cursor worker launches in a pane where no human answers
+    cursor-agent's in-terminal approval prompts (also mirrored as web
+    elicitation cards). Without ``--yolo`` the worker stalls on the first
+    gated tool call — the same headless seam that forced codex's default
+    bypass (issue #171).
+    """
+    cursor = _spec_with_config({"harness": "cursor-native"})
+    assert _derive_terminal_launch_args_from_spec(cursor) == ["--yolo"]
+
+
+def test_cursor_native_yolo_true_translates_to_yolo_flag() -> None:
+    """cursor-native + ``yolo: true`` (string ``"True"``) -> ``--yolo``."""
+    spec = _spec_with_config({"harness": "cursor-native", "yolo": "True"})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--yolo"]
+
+
+def test_cursor_native_yolo_false_opts_out() -> None:
+    """``yolo: false`` keeps cursor-native prompting (no launch args)."""
+    spec = _spec_with_config({"harness": "cursor-native", "yolo": "False"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_cursor_native_permission_mode_auto_uses_auto_review() -> None:
+    """
+    cursor-native + ``permission_mode: auto`` -> ``--auto-review``.
+
+    Mirrors Claude's ``permission_mode: auto`` for bundles that want Smart
+    Auto rather than full don't-ask YOLO.
+    """
+    spec = _spec_with_config({"harness": "cursor-native", "permission_mode": "auto"})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--auto-review"]
+
+
 @pytest.mark.parametrize(
     "harness",
-    ["claude-sdk", "codex", "openai-agents"],
+    ["claude-sdk", "codex", "openai-agents", "cursor"],
 )
 def test_non_native_harness_with_bypass_fields_is_ignored(harness: str) -> None:
     """
     Non-native harnesses never get terminal args, even with bypass fields.
 
-    ``terminal_launch_args`` is a native-terminal (claude/codex TUI)
-    concept; a claude-sdk worker sets bypass via the SDK ``permissionMode``
-    spawn env, not a CLI flag. Translating these fields for a non-native
-    harness would emit a flag the runner has no terminal to apply it to.
-    A failure means the harness gate leaked. Both bypass fields are set to
-    prove neither branch fires for a non-native harness.
+    ``terminal_launch_args`` is a native-terminal (claude/codex/cursor TUI)
+    concept; a claude-sdk / cursor-sdk worker sets bypass via the SDK
+    permission mode spawn env, not a CLI flag. Translating these fields for
+    a non-native harness would emit a flag the runner has no terminal to
+    apply it to. A failure means the harness gate leaked. Both bypass
+    fields are set to prove neither branch fires for a non-native harness.
     """
     spec = _spec_with_config(
         {"harness": harness, "permission_mode": "bypassPermissions", "yolo": "True"}

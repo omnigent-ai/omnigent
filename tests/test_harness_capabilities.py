@@ -10,6 +10,7 @@ drift.
 from __future__ import annotations
 
 from omnigent import harness_plugins as hp
+from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
     EffortFamily,
@@ -23,13 +24,13 @@ from omnigent.harness_plugins import (
     HarnessContribution,
     harness_capabilities,
     harness_catalog,
+    harness_setup_steps_by_spelling,
     native_agents,
     valid_harnesses,
 )
 from omnigent.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
-    _CODEX_FAMILY_HARNESSES,
 )
 
 _NATIVE_MODES = frozenset({IntegrationMode.NATIVE_TUI, IntegrationMode.NATIVE_SERVER})
@@ -61,7 +62,7 @@ def test_model_family_matches_model_override_sets() -> None:
         family = capability.model_family
         if harness in _CLAUDE_FAMILY_HARNESSES:
             assert family is ModelFamily.CLAUDE, harness
-        elif harness in _CODEX_FAMILY_HARNESSES:
+        elif harness in CODEX_CANONICAL_HARNESSES:
             assert family is ModelFamily.GPT, harness
         elif harness in _ANTIGRAVITY_FAMILY_HARNESSES:
             assert family is ModelFamily.GEMINI, harness
@@ -93,6 +94,40 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
     for harness in ("claude-sdk", "codex", "pi", "openai-agents"):
         assert caps[harness].interrupt is True, harness
         assert caps[harness].streaming is True, harness
+
+
+def test_optional_bench_capabilities_default_to_unknown() -> None:
+    capability = HarnessCapabilities(
+        IntegrationMode.SDK_IN_PROCESS,
+        Elicitation.NONE,
+        Resume.COLD_ONLY,
+        EffortFamily.NONE,
+        ModelFamily.MULTI,
+        AuthModel.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+    )
+
+    assert capability.steering is None
+    assert capability.live_queue is None
+    assert capability.images is None
+    assert capability.compaction is None
+    assert capability.as_dict() == {
+        "integration_mode": "sdk-in-process",
+        "elicitation": "none",
+        "resume": "cold-only",
+        "effort": "none",
+        "model_family": "multi",
+        "auth": "own-auth",
+        "subagents": False,
+        "interrupt": True,
+        "streaming": True,
+        "steering": None,
+        "live_queue": None,
+        "images": None,
+        "compaction": None,
+    }
 
 
 def test_community_capabilities_cannot_override_builtin() -> None:
@@ -128,6 +163,39 @@ def test_catalog_rows_include_capabilities() -> None:
     for row in rows:
         if row["id"] in caps:
             assert "capabilities" in row, row["id"]
-            # JSON-serializable: values are str/bool, not enums.
+            # JSON-serializable: values are primitives, not enums.
             for value in row["capabilities"].values():
-                assert isinstance(value, (str, bool))
+                assert value is None or isinstance(value, (str, bool))
+
+
+def test_catalog_rows_carry_setup_steps() -> None:
+    """Every row exposes an ordered, JSON-serializable setup checklist."""
+    rows = {row["id"]: row for row in harness_catalog()}
+    for row in rows.values():
+        assert "setup_steps" in row, row["id"]
+        assert len(row["setup_steps"]) >= 1
+        for step in row["setup_steps"]:
+            assert step["kind"] in ("install", "auth")
+            assert step["action"] in ("install", "command", "setup", "auth")
+            # JSON-serializable primitives only.
+            for value in step.values():
+                assert value is None or isinstance(value, str)
+    # Codex is a first-class harness: install (one-click) then a login command.
+    codex = rows["codex"]["setup_steps"]
+    assert [s["action"] for s in codex] == ["install", "command"]
+    assert codex[1]["command"] == "codex login"
+
+
+def test_setup_steps_by_spelling_covers_native_and_installable_ids() -> None:
+    """The by-spelling map resolves the ids a session declares, not just picker
+    rows — native wrappers and installable non-picker ids included."""
+    by_spelling = harness_setup_steps_by_spelling()
+    # Native wrappers (what a session actually declares) resolve to steps...
+    for native in ("codex-native", "claude-native", "opencode-native", "qwen-native"):
+        assert native in by_spelling, native
+        assert len(by_spelling[native]) >= 1
+    # ...and match their bare-id counterpart's steps (same ui_setup_steps source).
+    assert by_spelling["codex-native"] == by_spelling["codex"]
+    # Installable ids that are NOT picker rows still resolve.
+    assert "opencode" in by_spelling
+    assert "qwen" in by_spelling

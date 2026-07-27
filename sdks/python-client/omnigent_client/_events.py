@@ -271,6 +271,11 @@ class CompactionInProgress:
 class CompactionCompleted:
     """``response.compaction.completed`` — compaction finished successfully."""
 
+    total_tokens: int | None = None
+    summary: str | None = None
+    summary_model: str | None = None
+    compacted_messages: list[dict[str, object]] | None = None
+
 
 @dataclass
 class CompactionFailed:

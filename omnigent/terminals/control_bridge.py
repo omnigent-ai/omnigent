@@ -312,6 +312,8 @@ async def bridge_tmux_control_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    reader_done: asyncio.Event | None = None,
+    forward_done: asyncio.Event | None = None,
 ) -> None:
     """Bridge a tmux control-mode client to an already-accepted *websocket*.
 
@@ -330,6 +332,13 @@ async def bridge_tmux_control_to_websocket(
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints. See the PTY bridge
         for the full rationale.
+    :param reader_done: Optional test-only event set once the reader has queued
+        the full backlog and the ``None`` EOF sentinel, letting a test await the
+        reader draining tmux instead of sleeping. Inert (never awaited) when
+        ``None``, which is the only case real callers hit.
+    :param forward_done: Optional test-only event set once the forwarder task
+        returns (normal completion or cancellation), letting a test await the
+        backlog fully flushing to the browser. Inert when ``None``.
     """
     # Attaching reflows the pane to this client's size — stamp it as a client
     # interaction so the idle watcher discounts the resulting repaint.
@@ -455,6 +464,8 @@ async def bridge_tmux_control_to_websocket(
                         return
         finally:
             output_chunks.put_nowait(None)
+            if reader_done is not None:
+                reader_done.set()
 
     async def _ws_to_control() -> None:
         """Read browser frames; resize via refresh-client -C, input via -H hex."""
@@ -508,6 +519,8 @@ async def bridge_tmux_control_to_websocket(
         ),
         name="tmux-control-forward",
     )
+    if forward_done is not None:
+        forward_task.add_done_callback(lambda _task: forward_done.set())
     ws_task = asyncio.create_task(_ws_to_control(), name="tmux-ws-to-control")
     # "Control side ended" == the reader finished (session gone / %exit /
     # window-close) — the signal the close-code logic keys on. The forwarder

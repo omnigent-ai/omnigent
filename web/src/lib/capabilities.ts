@@ -35,6 +35,16 @@ const _SHARING_MODES: readonly SharingMode[] = ["on", "read_only", "restricted_r
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   accounts_enabled: boolean;
+  /**
+   * True only on an explicit single-user local runtime
+   * (``OMNIGENT_LOCAL_SINGLE_USER=1``). This is the sole signal that
+   * separates a genuine one-user server from a multi-user header-auth
+   * deploy (e.g. an SSO proxy injecting ``X-Forwarded-Email``) — both
+   * report ``accounts_enabled: false`` / ``login_url: null``. Gates
+   * account/sharing chrome that's meaningless without other users.
+   * Fails to ``false`` (multi-user) so a failed probe never hides it.
+   */
+  single_user: boolean;
   login_url: string | null;
   /**
    * True when accounts mode is on but no admin has been claimed yet —
@@ -89,15 +99,40 @@ export interface ServerInfo {
    */
   server_version: string | null;
   /**
-   * True when the server has a routing client configured
-   * (``OMNIGENT_SMART_ROUTING=1`` + ``llm:`` config). Hidden by default.
+   * True when the server has a routing client configured — a server ``llm:``
+   * block, or a ``routing.provider=external`` block.
    */
   smart_routing_enabled: boolean;
+  /**
+   * True when the server accepts UI-driven harness installs
+   * (``OMNIGENT_HARNESS_INSTALL_ENABLED=1``). Gates the New Chat dialog's
+   * one-click "Install" action for a missing harness. Fails to ``false`` so a
+   * failed probe never offers an install the server would reject.
+   */
+  harness_install_enabled: boolean;
+  /**
+   * Harness ids the install route accepts (bare ids + native spellings that
+   * resolve to an npm-installable family, e.g. ``"codex"``, ``"codex-native"``).
+   * The dialog offers the one-click install only for a harness in this set, so
+   * it never shows an Install button the server would reject. Empty when
+   * ``harness_install_enabled`` is false (or on a failed probe).
+   */
+  installable_harnesses: string[];
+  /**
+   * True when the server can transcribe dictation audio
+   * (``WS /v1/dictation/stream``; the ``dictation`` extra plus models
+   * are installed). Gates the composer mic button's server
+   * speech-to-text fallback where the browser Web Speech API has no
+   * backend (Electron, Firefox/Chromium).
+   */
+  dictation_available: boolean;
 }
 
 /** Sentinel used when the probe fails — accounts is off, no login URL. */
 const _OFF: ServerInfo = {
   accounts_enabled: false,
+  // Fail to multi-user: a failed probe must not hide account/sharing chrome.
+  single_user: false,
   login_url: null,
   needs_setup: false,
   databricks_features: false,
@@ -109,6 +144,9 @@ const _OFF: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  harness_install_enabled: false,
+  installable_harnesses: [],
+  dictation_available: false,
 };
 
 let _cached: ServerInfo | null = null;
@@ -135,6 +173,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const data = (await res.json()) as Partial<ServerInfo>;
         _cached = {
           accounts_enabled: data.accounts_enabled === true,
+          single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,
           needs_setup: data.needs_setup === true,
           databricks_features: data.databricks_features === true,
@@ -148,6 +187,11 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           public_sharing_enabled: data.public_sharing_enabled !== false,
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: data.smart_routing_enabled === true,
+          harness_install_enabled: data.harness_install_enabled === true,
+          installable_harnesses: Array.isArray(data.installable_harnesses)
+            ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
+            : [],
+          dictation_available: data.dictation_available === true,
         };
         return _cached;
       }
@@ -171,6 +215,19 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
  */
 export function getCachedServerInfo(): ServerInfo | null {
   return _cached;
+}
+
+/**
+ * Whether the server is an explicit single-user local runtime, per the
+ * server's ``single_user`` signal (``OMNIGENT_LOCAL_SINGLE_USER=1``). This
+ * is NOT the same as "no accounts / no login" — a multi-user header-auth
+ * deploy (SSO proxy injecting ``X-Forwarded-Email``) also reports
+ * ``accounts_enabled: false`` / ``login_url: null`` but is genuinely
+ * multi-user, so it must keep its account/sharing chrome. Returns ``false``
+ * while the probe is still loading (and on the failed-probe sentinel).
+ */
+export function isSingleUserMode(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.single_user;
 }
 
 /**

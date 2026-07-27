@@ -41,14 +41,33 @@ class HostIdentity:
     """Identity of a host machine.
 
     :param host_id: Stable identifier, e.g.
-        ``"host_a1b2c3d4e5f67890abcdef1234567890"``.
-        Format: ``host_{uuid4_hex}`` (32-char hex portion).
+        ``"a1b2c3d4e5f67890abcdef1234567890"``.
+        Format: bare 32-char uuid4 hex.
     :param name: Human-readable name displayed in the Web UI
         host picker, e.g. ``"corey-laptop"``.
     """
 
     host_id: str
     name: str
+
+
+# Legacy host-id prefix; older installs persist ``host_<hex>`` in config.yaml.
+_LEGACY_HOST_ID_PREFIX = "host_"
+
+
+def _normalize_host_id(host_id: str) -> str:
+    """Strip the legacy ``host_`` prefix from *host_id* if present.
+
+    Older installs persisted ``host_<hex>`` in config.yaml (or the launch env
+    var); return the prefix-less form so a re-presented legacy id matches the
+    migrated, now prefix-less server-side host row.
+
+    :param host_id: A host id, possibly carrying the legacy prefix.
+    :returns: The bare 32-char hex host id.
+    """
+    if host_id.startswith(_LEGACY_HOST_ID_PREFIX):
+        return host_id[len(_LEGACY_HOST_ID_PREFIX) :]
+    return host_id
 
 
 def load_or_create_host_identity(
@@ -82,7 +101,7 @@ def load_or_create_host_identity(
             "(managed-host launch sets both)"
         )
     if env_host_id is not None and env_name is not None:
-        return HostIdentity(host_id=env_host_id, name=env_name)
+        return HostIdentity(host_id=_normalize_host_id(env_host_id), name=env_name)
 
     cfg: dict[str, object] = {}
     if path.exists():
@@ -92,11 +111,11 @@ def load_or_create_host_identity(
     host_section = cfg.get("host")
     if isinstance(host_section, dict) and "host_id" in host_section and "name" in host_section:
         return HostIdentity(
-            host_id=host_section["host_id"],
+            host_id=_normalize_host_id(host_section["host_id"]),
             name=host_section["name"],
         )
 
-    host_id = f"host_{uuid.uuid4().hex}"
+    host_id = uuid.uuid4().hex
     name = socket.gethostname()
     identity = HostIdentity(host_id=host_id, name=name)
 

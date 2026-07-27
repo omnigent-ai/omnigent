@@ -187,14 +187,14 @@ def _create_child_session(
     Create a child conversation under a parent session.
 
     :param db_uri: Test database URI.
-    :param parent_id: Parent session id, e.g. ``"conv_parent"``.
+    :param parent_id: Parent session id, e.g. ``"ead6d59a6b650d19dbdf61ec32426f4e"``.
     :param agent_id: Agent id inherited by the child.
     :param title: Sub-agent title in ``"<agent>:<name>"`` form, e.g.
         ``"codex-child:approval"``. Must be unique per parent — the DB
         enforces ``(parent_conversation_id, title)`` uniqueness, so a
         fan-out test creating multiple children under one parent must
         pass distinct titles.
-    :returns: Child session id, e.g. ``"conv_child"``.
+    :returns: Child session id, e.g. ``"ff5cac23d0beb79fad914046049f32ff"``.
     """
     store = SqlAlchemyConversationStore(db_uri)
     child = store.create_conversation(
@@ -973,7 +973,7 @@ class _InputRequiredRunnerClient:
         Record the execute payload and return the scripted response.
 
         :param url: Runner path, e.g.
-            ``"/v1/sessions/conv_child/mcp/execute"``.
+            ``"/v1/sessions/ff5cac23d0beb79fad914046049f32ff/mcp/execute"``.
         :param json: The request body.
         :param timeout: Forward timeout (ignored by the stub).
         :returns: A real ``httpx.Response`` with the scripted JSON.
@@ -1268,7 +1268,7 @@ async def test_resolve_url_unknown_session_returns_404(
     URL fails loud rather than silently no-op'ing.
     """
     resp = await client.post(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope/resolve",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope/resolve",
         json={"action": "accept"},
     )
     assert resp.status_code == 404, resp.text
@@ -1417,7 +1417,7 @@ async def test_elicitation_page_unknown_session_returns_404(
     Requesting the page for a nonexistent session returns 404.
     """
     resp = await client.get(
-        "/v1/sessions/conv_does_not_exist/elicitations/elicit_nope",
+        "/v1/sessions/1d0b12236c77f69f5073a53583de1a3f/elicitations/elicit_nope",
     )
     assert resp.status_code == 404, resp.text
 
@@ -1456,13 +1456,13 @@ def test_mrtr_response_url_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         rpc_id=1,
         elicitation_id="elicit_abc",
         message="Approve?",
-        request_state='{"elicitation_id":"elicit_abc","session_id":"conv_123"}',
-        session_id="conv_123",
+        request_state='{"elicitation_id":"elicit_abc","session_id":"0099dc8be6d82871e2e450424d46d1b7"}',
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]
     assert params["mode"] == "url"
-    assert params["url"] == "/approve/conv_123/elicit_abc"
+    assert params["url"] == "/approve/0099dc8be6d82871e2e450424d46d1b7/elicit_abc"
     assert params["message"] == "Approve?"
 
 
@@ -1481,7 +1481,7 @@ def test_mrtr_response_form_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         elicitation_id="elicit_abc",
         message="Approve?",
         request_state="{}",
-        session_id="conv_123",
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
     )
     body = json.loads(resp.body)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]

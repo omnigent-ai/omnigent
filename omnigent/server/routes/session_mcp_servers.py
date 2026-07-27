@@ -24,6 +24,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     MCPServerSummary,
     SessionAgentChangedEvent,
@@ -79,7 +80,7 @@ def create_session_mcp_servers_router(
         )
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
-            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+            raise session_not_found()
         if conv.agent_id is None:
             raise OmnigentError("Session has no agent binding", code=ErrorCode.INVALID_INPUT)
         agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
@@ -245,7 +246,9 @@ def create_session_mcp_servers_router(
                 )
 
         new_location = bundle_location(agent.id, new_bundle)
-        if new_location != agent.bundle_location:
+        # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
+        # segment (physical artifact key); only the sha encodes content.
+        if new_location.rsplit("/", 1)[-1] != agent.bundle_location.rsplit("/", 1)[-1]:
             artifact_store.put(new_location, new_bundle)
             updated = agent_store.update(agent.id, new_location)
             if updated is None:
@@ -310,6 +313,7 @@ def _summary_from_config(server: MCPServerConfig) -> MCPServerSummary:
         transport=server.transport,
         description=server.description,
         url=server.url,
+        headers=dict.fromkeys(server.headers, "[REDACTED]") if server.headers else {},
         command=server.command,
         args=server.args,
     )
@@ -428,7 +432,8 @@ def _body_to_file_yaml(
     _copy_description(result, body)
     if body.transport == "http":
         result["url"] = body.url
-        _preserve_keys(result, existing, ("headers", "auth", "timeout", "retry"))
+        _apply_headers(result, body, existing)
+        _preserve_keys(result, existing, ("auth", "timeout", "retry"))
     else:
         result["command"] = body.command
         if body.args:
@@ -446,13 +451,46 @@ def _body_to_inline_yaml(
     _copy_description(result, body)
     if body.transport == "http":
         result["url"] = body.url
-        _preserve_keys(result, existing, ("headers", "auth", "timeout", "retry"))
+        _apply_headers(result, body, existing)
+        _preserve_keys(result, existing, ("auth", "timeout", "retry"))
     else:
         result["command"] = body.command
         if body.args:
             result["args"] = body.args
         _preserve_keys(result, existing, ("env", "timeout", "retry"))
     return result
+
+
+_REDACTED_SENTINEL = "[REDACTED]"
+
+
+def _apply_headers(
+    result: dict[str, Any],
+    body: UpsertMCPServerRequest,
+    existing: dict[str, Any],
+) -> None:
+    """Write headers into the YAML result.
+
+    Uses body.headers when provided; falls back to preserving the existing
+    bundle's headers so a URL-only edit doesn't wipe configured auth tokens.
+    Omits the key entirely when neither is present.
+
+    Values equal to ``"[REDACTED]"`` are treated as the UI's sentinel for
+    "this header exists but I didn't change it" — those values are restored
+    from the existing bundle rather than written as the literal string.
+    """
+    if body.headers is not None:
+        if not body.headers:
+            # Explicitly cleared — omit the key entirely.
+            return
+        existing_headers: dict[str, Any] = existing.get("headers") or {}
+        merged = {
+            k: (existing_headers.get(k, v) if v == _REDACTED_SENTINEL else v)
+            for k, v in body.headers.items()
+        }
+        result["headers"] = merged
+    elif "headers" in existing:
+        result["headers"] = existing["headers"]
 
 
 def _copy_description(result: dict[str, Any], body: UpsertMCPServerRequest) -> None:

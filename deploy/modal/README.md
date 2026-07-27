@@ -50,22 +50,25 @@ the secret and redeploy.
 
 The first boot runs DB migrations over the network (~1 minute on Neon).
 
-**Get the admin password:** the first boot prints it to the app log:
+**Create the first admin.** No credentials are auto-generated. First boot
+prints a "No admin yet" line pointing at your `*.modal.run` URL:
 
 ```bash
 modal app logs omnigent
 ```
 
-```
-✓ Created initial admin account (accounts auth provider).
-    password: <generated>
-```
+Open that URL and use the web Create-admin form to pick your own username +
+password, then invite teammates from **Members** in the web UI.
 
-Log in as the admin and invite teammates from **Members** in the web UI.
-
-> To set a known admin password instead, add
-> `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<password>` to the
+> To create the admin directly instead of claiming it through the web form,
+> add `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<password>` to the
 > `omnigent-deploy` secret before the first deploy.
+
+> **Security note for public deployments:** `POST /auth/setup` is
+> unauthenticated while no password-bearing account exists, so an instance
+> exposed before you reach the Create-admin form can be claimed by the first
+> visitor. Pre-seed `OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD`, or complete setup
+> promptly after the deploy goes live.
 
 ### Modal-specific caveats
 
@@ -301,6 +304,18 @@ sandbox:
     image: docker.io/<you>/omnigent-host:latest   # default: official image
     secrets: [omnigent-llm]                       # Modal secrets to inject
 ```
+
+A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
+in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
+block routing a harness through a self-hosted gateway — installed into
+the sandbox before `omnigent host` starts. The block is server-managed:
+entries injected by a previous launch are replaced or removed on the
+next launch/resume, while config created inside the sandbox survives.
+Keep secrets out via
+`api_key_ref: env:VAR` (resolved in the sandbox against the injected
+env). See the [sandbox-runners config
+table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-configyaml)
+for the shape.
 
 ### LLM credentials for managed sandboxes
 

@@ -19,6 +19,7 @@
 import type React from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
+  CalendarClockIcon,
   InboxIcon,
   type LucideIcon,
   PanelLeftIcon,
@@ -135,6 +136,13 @@ export function CommandPalette({
         run: () => navigate("/inbox"),
       },
       {
+        id: "go-tasks",
+        label: "Go to Automations",
+        icon: CalendarClockIcon,
+        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
+        run: () => navigate("/tasks"),
+      },
+      {
         id: "go-settings",
         label: "Go to Settings",
         icon: SettingsIcon,
@@ -168,16 +176,16 @@ export function CommandPalette({
     );
   }, [actions, query]);
 
-  // Archived excluded (matches the sidebar default). With an empty query this
-  // shares AppShell's existing `useConversations()` cache entry, so an idle
-  // palette costs no extra fetch; a search keys its own entry.
-  const { data, isFetching } = useConversations(debouncedQuery, false);
+  // includeArchived=true shares the sidebar's cache key; archived rows are
+  // filtered out below so the palette only lists active sessions.
+  const { data, isFetching } = useConversations(debouncedQuery, true);
 
   const sessions = useMemo(() => {
     const seen = new Set<string>();
     const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
     for (const page of data?.pages ?? []) {
       for (const c of page.data) {
+        if (c.archived) continue;
         if (seen.has(c.id)) continue;
         seen.add(c.id);
         out.push({

@@ -871,6 +871,67 @@ def test_read_databrickscfg_host_missing_named_profile_does_not_fallback(
     assert _read_databrickscfg_host("missing-profile") is None
 
 
+def test_databricks_gateway_host_ignores_env_override_for_explicit_profile(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """An explicit profile's gateway host must match its ``--profile`` token.
+
+    ``databricks auth token --profile P`` mints a bearer for P's own workspace
+    and ignores ``DATABRICKS_HOST``. If the gateway base URL were resolved via
+    the SDK (which lets ``DATABRICKS_HOST`` override the profile host), the base
+    URL and the token would target different workspaces and the gateway rejects
+    the token. So the host must come from the profile section directly.
+    """
+    from omnigent.inner.databricks_executor import _databricks_gateway_host
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        textwrap.dedent(
+            """
+        [oss]
+        host = https://profile-workspace.cloud.databricks.com
+        auth_type = databricks-cli
+        """
+        ).lstrip()
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://other-workspace.cloud.databricks.com")
+
+    assert _databricks_gateway_host("oss") == "https://profile-workspace.cloud.databricks.com"
+
+
+def test_databricks_gateway_host_missing_profile_falls_back_to_ambient(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """A profile absent from the file falls back to the ambient/env chain.
+
+    Mirrors a spec authored with ``profile: P`` that now runs on a Databricks
+    App container with no matching section: there is no profile-pinned token to
+    diverge from, so ambient ``DATABRICKS_HOST`` is the right host.
+    """
+    from omnigent.inner.databricks_executor import _databricks_gateway_host
+
+    # Stub the SDK's host-metadata probe (a real HTTP GET with retries) so the
+    # ambient-credential resolution stays offline and fast.
+    monkeypatch.setattr(
+        "databricks.sdk.config.get_host_metadata",
+        _raise_offline_host_metadata,
+    )
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text("# no matching profile\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("DATABRICKS_HOST", "https://ambient-workspace.cloud.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-ambient-token")
+
+    assert _databricks_gateway_host("missing-profile") == (
+        "https://ambient-workspace.cloud.databricks.com"
+    )
+
+
 def test_codex_executor_gateway_uses_host_only_oauth_profile(
     tmp_path: _Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -894,10 +955,6 @@ def test_codex_executor_gateway_uses_host_only_oauth_profile(
         ).lstrip()
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
-    monkeypatch.setattr(
-        "omnigent.inner.codex_executor._read_databrickscfg",
-        lambda _profile: None,
-    )
 
     from omnigent.inner.codex_executor import CodexExecutor
 
@@ -1530,17 +1587,10 @@ def test_codex_executor_uses_cli_auth_command_not_env_token(
     def _counting_read(profile=None):
         nonlocal call_count
         call_count += 1
-        return type(
-            "Creds",
-            (),
-            {
-                "host": "https://host",
-                "token": f"tok-{call_count}",
-            },
-        )()
+        return "https://host"
 
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._read_databrickscfg",
+        "omnigent.inner.codex_executor._databricks_gateway_host",
         _counting_read,
     )
 

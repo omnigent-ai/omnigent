@@ -64,6 +64,18 @@ final class WebViewModel: ObservableObject {
     webView?.evaluateJavaScript(script)
   }
 
+  /// Push a deep-link in-app path (`/c/<id>`) to the SPA so it routes to it
+  /// in-place, without a reload — the deep-link analog of
+  /// `emitNotificationActivation`, kept on a separate JS channel so a deep
+  /// link isn't mislabeled as a notification. Only the main process / app
+  /// shell invokes this for a window currently on its pinned server, so the
+  /// SPA's `onOpenPath` subscriber (mounted once the SPA loads) is the receiver.
+  func emitOpenPath(_ path: String) {
+    guard path.starts(with: "/") else { return }
+    let script = "window.__omnigentNativeEmitOpenPath?.(\(Self.javascriptString(path)));"
+    webView?.evaluateJavaScript(script)
+  }
+
   /// Push the footprint (in CSS px, excluding the OS safe area which the web
   /// layer adds via `env()`) of the native floating bars to the web app. The
   /// web side folds these into its `--omnigent-inset-*` variables so page

@@ -32,13 +32,13 @@ def route_client(db_uri: str) -> Iterator[tuple[TestClient, str]]:
     conversation_store = SqlAlchemyConversationStore(db_uri)
     agent_store = SqlAlchemyAgentStore(db_uri)
     agent_store.create(
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         name="test-agent",
-        bundle_location="ag_test/bundle",
+        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
     )
     conv = conversation_store.create_conversation(
         title="policy session",
-        agent_id="ag_test",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
     )
 
     app = FastAPI()

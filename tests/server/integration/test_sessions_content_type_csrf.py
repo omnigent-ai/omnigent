@@ -47,35 +47,35 @@ _VALID_JSON_BODY = {"hello": "world"}
 # exists. ``term_x`` / ``env_x`` are likewise never resolved.
 _JSON_ONLY_ENDPOINTS = [
     pytest.param(
-        "/v1/sessions/conv_missing/hooks/permission-request",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/permission-request",
         id="claude_permission_request_hook",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/hooks/codex-elicitation-request",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/codex-elicitation-request",
         id="codex_elicitation_request_hook",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/hooks/antigravity-elicitation-request",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/antigravity-elicitation-request",
         id="antigravity_elicitation_request_hook",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/policies/evaluate",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/policies/evaluate",
         id="evaluate_policy",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/resources/terminals",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/terminals",
         id="create_session_terminal",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/resources/terminals/term_x/transfer",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/terminals/term_x/transfer",
         id="transfer_session_terminal",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/resources/environments/env_x/shell",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/environments/env_x/shell",
         id="run_environment_shell",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/mcp",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/mcp",
         id="mcp_proxy",
     ),
 ]
@@ -176,11 +176,11 @@ async def test_json_only_endpoint_rejects_missing_content_type(
     "url",
     [
         pytest.param(
-            "/v1/sessions/conv_missing/hooks/permission-request",
+            "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/permission-request",
             id="claude_permission_request_hook",
         ),
         pytest.param(
-            "/v1/sessions/conv_missing/hooks/codex-elicitation-request",
+            "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/codex-elicitation-request",
             id="codex_elicitation_request_hook",
         ),
     ],
@@ -249,7 +249,7 @@ async def test_create_terminal_reached_with_application_json(
     415 would mean the guard wrongly blocked a correct JSON request.
     """
     resp = await client.post(
-        "/v1/sessions/conv_missing/resources/terminals",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/terminals",
         json={"terminal": "shell", "session_key": "main"},
     )
     assert resp.status_code == 404, (
@@ -269,7 +269,7 @@ async def test_mcp_proxy_reached_with_application_json(
     here would mean the guard blocked a valid MCP request.
     """
     resp = await client.post(
-        "/v1/sessions/conv_missing/mcp",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/mcp",
         json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
     )
     assert resp.status_code == 200, resp.text
@@ -324,7 +324,7 @@ async def test_create_session_accepts_application_json(
     resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert resp.status_code == 201, resp.text
     # Real session id returned → JSON create reached the handler and succeeded.
-    assert resp.json()["id"].startswith("conv_")
+    assert len(resp.json()["id"]) == 32
 
 
 async def test_create_session_accepts_multipart_bundled_create(

@@ -409,14 +409,33 @@ class BwrapSandboxBackend(SandboxBackend):
         # the host's ``.aws/`` content. Emitting the mask last keeps
         # the deny-wins guarantee on Linux regardless of how many
         # broader binds the policy stacks underneath.
-        bwrap_args.extend(
-            _dotfile_and_symlink_mask_args(
-                cwd_resolved,
-                policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else [],
-                policy,
-                argv=argv,
-            )
+        mask_args = _dotfile_and_symlink_mask_args(
+            cwd_resolved,
+            policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else [],
+            policy,
+            argv=argv,
         )
+        bwrap_args.extend(mask_args)
+
+        # Re-expose the helper interpreter (and target) if the dotfile
+        # mask above hid it. This happens when cwd is an ancestor of an
+        # interpreter that lives under a hidden dir (e.g. a uv-tool
+        # install under ``~/.local``): the cwd bind nominally covers it
+        # so no explicit bind was emitted, but the ``--tmpfs`` mask —
+        # emitted last to win over broad binds — then hides it. These
+        # binds come AFTER the mask so they win right back, scoped to
+        # exactly the interpreter subtree.
+        masked_dirs = _tmpfs_mask_dirs(mask_args)
+        reexpose = _interpreter_reexpose_after_mask(argv, masked_dirs)
+        if target is not None:
+            reexpose += _interpreter_reexpose_after_mask([target], masked_dirs)
+        seen_reexpose: set[tuple[str, str]] = set()
+        for i in range(0, len(reexpose) - 2, 3):
+            key = (reexpose[i + 1], reexpose[i + 2])
+            if key in seen_reexpose:
+                continue
+            seen_reexpose.add(key)
+            bwrap_args.extend(reexpose[i : i + 3])
 
         # AF_UNIX control-socket masks. A denied socket
         # (e.g. the managed tmux control socket) lives inside a bound
@@ -744,11 +763,32 @@ def _ensure_executable_visible(argv: list[str], cwd: Path) -> list[str]:
         cwd bind. Never includes a destination already covered by
         :data:`_DEFAULT_RO_DIRS` or by *cwd*.
     """
+    return _interpreter_chain_binds(argv, [Path(p) for p in _DEFAULT_RO_DIRS] + [cwd])
+
+
+def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) -> list[str]:
+    """
+    Walk ``argv[0]``'s symlink chain and return the ``--ro-bind-try``
+    args needed to reach each hop, skipping destinations already
+    covered by *covered_prefixes*.
+
+    Factored out of :func:`_ensure_executable_visible` so the post-mask
+    interpreter re-expose (:func:`_interpreter_reexpose_after_mask`) can
+    reuse the exact same walk with a NARROWER covered set — the default
+    mounts only, without cwd. cwd "covers" the interpreter only until
+    the dotfile masker ``--tmpfs``-masks a hidden ancestor dir under it
+    (e.g. a uv-tool install at ``~/.local/share/uv/tools/.../python``);
+    re-running the walk against the default mounts alone yields the
+    binds needed to punch the interpreter back through that mask.
+
+    :param argv: Helper argv. Only ``argv[0]`` is inspected.
+    :param covered_prefixes: Paths whose descendants need no explicit
+        bind (already visible inside the sandbox).
+    :returns: Extra bwrap args (possibly empty), as ``--ro-bind-try
+        <src> <dst>`` triples.
+    """
     if not argv:
         return []
-
-    covered_prefixes = [Path(p) for p in _DEFAULT_RO_DIRS]
-    covered_prefixes.append(cwd)
 
     extra: list[str] = []
     seen_dest: set[Path] = set()
@@ -797,6 +837,79 @@ def _ensure_executable_visible(argv: list[str], cwd: Path) -> list[str]:
             current = Path(os.path.normpath(str(current.parent / link)))
 
     return extra
+
+
+def _tmpfs_mask_dirs(mask_args: Sequence[str]) -> list[Path]:
+    """
+    Extract the directory destinations from dotfile-mask args.
+
+    The masker emits directory masks as ``--tmpfs <dir>`` and
+    file/symlink masks as ``--bind-try /dev/null <file>``. Only the
+    ``--tmpfs`` dirs can be an ancestor that hides the interpreter, so
+    those are what the re-expose pass needs to reason about.
+
+    :param mask_args: The bwrap args produced by
+        :func:`_dotfile_and_symlink_mask_args`.
+    :returns: The ``--tmpfs`` destination paths, in emit order.
+    """
+    dirs: list[Path] = []
+    i = 0
+    while i < len(mask_args):
+        token = mask_args[i]
+        if token == "--tmpfs" and i + 1 < len(mask_args):
+            dirs.append(Path(mask_args[i + 1]))
+            i += 2
+        elif token == "--bind-try":
+            i += 3
+        else:
+            i += 1
+    return dirs
+
+
+def _interpreter_reexpose_after_mask(
+    argv: Sequence[str], masked_dirs: Sequence[Path]
+) -> list[str]:
+    """
+    Re-expose the helper interpreter chain ON TOP of dotfile masks.
+
+    :func:`_ensure_executable_visible` skips explicit binds for an
+    interpreter that cwd nominally covers. When cwd is an ancestor of
+    the interpreter and the interpreter lives under a hidden dir (e.g. a
+    ``uv tool``-installed omnigent at
+    ``~/.local/share/uv/tools/omnigent/bin/python``), the dotfile masker
+    ``--tmpfs``-masks that dir — and, being emitted last, the mask wins
+    over the cwd bind, so the interpreter vanishes and bwrap's
+    ``execvp`` fails with ``ENOENT``.
+
+    This recomputes the interpreter binds WITHOUT the cwd-coverage skip
+    (only the always-present default mounts count as covered) and keeps
+    only the ones that land STRICTLY inside a masked dir. Emitted after
+    the mask, they layer over it and reach exactly the interpreter
+    subtree — never the masked dir itself (which would re-expose the
+    whole ``.local`` and defeat the mask) and never paths the mask never
+    touched (which would be redundant with the cwd bind).
+
+    :param argv: Helper argv; only ``argv[0]`` is inspected.
+    :param masked_dirs: Directory paths the dotfile masker ``--tmpfs``-ed
+        (from :func:`_tmpfs_mask_dirs`).
+    :returns: Extra ``--ro-bind-try`` triples, or empty when nothing the
+        interpreter needs was masked.
+    """
+    if not argv or not masked_dirs:
+        return []
+    binds = _interpreter_chain_binds(argv, [Path(p) for p in _DEFAULT_RO_DIRS])
+    out: list[str] = []
+    for i in range(0, len(binds) - 2, 3):
+        flag, src, dst = binds[i], binds[i + 1], binds[i + 2]
+        dst_path = Path(dst)
+        # Strictly inside a masked dir: within it, but not the dir
+        # itself (equal would re-expose the whole masked dotdir).
+        if any(
+            _is_within(dst_path, m, resolve=False) and not _is_within(m, dst_path, resolve=False)
+            for m in masked_dirs
+        ):
+            out.extend([flag, src, dst])
+    return out
 
 
 def _is_within(path: Path, root: Path, *, resolve: bool = True) -> bool:

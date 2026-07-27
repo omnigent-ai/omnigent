@@ -92,7 +92,7 @@ async def test_create_session_policy(client: httpx.AsyncClient, session_id: str)
     assert body["type"] == "url"
     assert body["object"] == "session.policy"
     assert body["source"] == "session"
-    assert body["id"].startswith("pol_")
+    assert len(body["id"]) == 32
 
 
 async def test_create_session_policy_duplicate_name(
@@ -111,7 +111,7 @@ async def test_create_session_policy_nonexistent_session(
 ) -> None:
     """Creating a policy for a nonexistent session returns 404."""
     resp = await client.post(
-        "/v1/sessions/conv_nonexistent/policies",
+        "/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/policies",
         json=_policy_payload(),
     )
     assert resp.status_code == 404
@@ -165,7 +165,7 @@ async def test_list_session_policies_nonexistent_session(
     client: httpx.AsyncClient,
 ) -> None:
     """Listing policies for a nonexistent session returns 404."""
-    resp = await client.get("/v1/sessions/conv_nonexistent/policies")
+    resp = await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/policies")
     assert resp.status_code == 404
 
 
@@ -187,7 +187,7 @@ async def test_get_session_policy(client: httpx.AsyncClient, session_id: str) ->
 
 async def test_get_session_policy_not_found(client: httpx.AsyncClient, session_id: str) -> None:
     """Getting a nonexistent policy returns 404."""
-    resp = await client.get(f"/v1/sessions/{session_id}/policies/pol_nonexistent")
+    resp = await client.get(f"/v1/sessions/{session_id}/policies/087a5ba1a5c50583fc5bd2e3f035d3df")
     assert resp.status_code == 404
 
 
@@ -213,7 +213,7 @@ async def test_update_session_policy(client: httpx.AsyncClient, session_id: str)
 async def test_update_session_policy_not_found(client: httpx.AsyncClient, session_id: str) -> None:
     """Patching a nonexistent policy returns 404."""
     resp = await client.patch(
-        f"/v1/sessions/{session_id}/policies/pol_nonexistent",
+        f"/v1/sessions/{session_id}/policies/087a5ba1a5c50583fc5bd2e3f035d3df",
         json={"name": "new_name"},
     )
     assert resp.status_code == 404

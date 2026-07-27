@@ -1,0 +1,30 @@
+{
+  "_readme": [
+    "Discord-watch roster: the name -> Slack member ID + timezone mapping.",
+    "Read by .github/scripts/rotation.py; the day-to-day schedule lives",
+    "separately in rotation_schedule.json (a flat list of {date, name}).",
+    "",
+    "Fields per person (keyed by display name, which the schedule references):",
+    "  slack_id - Slack member ID (profile -> More -> Copy member ID), e.g.",
+    "             'U01ABC2DEF'. NOT the @display-name; only the member ID",
+    "             actually notifies the person.",
+    "  tz       - IANA timezone; the person is pinged on the morning of this",
+    "             zone. Currently 'America/Los_Angeles' or 'Asia/Singapore'.",
+    "",
+    "It is .json (not .yaml) on purpose: the CI runner has no PyYAML, so JSON",
+    "is read natively by the stdlib (matches .github/areas.json)."
+  ],
+  "people": {
+    "Aravind Segu": { "slack_id": "U01A12R8NUR", "tz": "America/Los_Angeles" },
+    "Bryan Qiu": { "slack_id": "U05KA5T983Y", "tz": "America/Los_Angeles" },
+    "Daniel Lok": { "slack_id": "U060CNWNHSQ", "tz": "Asia/Singapore" },
+    "Dhruv Gupta": { "slack_id": "U0A76097E1F", "tz": "America/Los_Angeles" },
+    "Edwin He": { "slack_id": "U077B1V6WQJ", "tz": "America/Los_Angeles" },
+    "Pat Sukprasert": { "slack_id": "U05HRKWFY81", "tz": "Asia/Singapore" },
+    "Sabhya Chhabria": { "slack_id": "U07A1KQDXAB", "tz": "America/Los_Angeles" },
+    "Serena Ruan": { "slack_id": "U0571L5KNLR", "tz": "Asia/Singapore" },
+    "Shivam Mittal": { "slack_id": "U09FZKX9S6B", "tz": "America/Los_Angeles" },
+    "Tomu Hirata": { "slack_id": "U07TX4PR5MZ", "tz": "Asia/Singapore" },
+    "Zeyi (Rice) Fan": { "slack_id": "U09L5HT4CH0", "tz": "America/Los_Angeles" }
+  }
+}

@@ -62,7 +62,7 @@ def _register_builtin_agent(
 
     :param agent_store: Store the agent row is written to.
     :param artifact_store: Store the bundle bytes are written to.
-    :param agent_id: Agent id, e.g. ``"ag_codex"``.
+    :param agent_id: Agent id, e.g. ``"12c8c7631b209d1027416b4bf7604999"``.
     :param name: Agent name, e.g. ``"codex-native-ui"``.
     :param bundle: Gzipped agent bundle bytes from
         :func:`build_agent_bundle`.
@@ -109,14 +109,25 @@ async def test_list_builtin_agents_returns_registered_templates(
     against a built-in. ``mcp_servers`` is empty here because the test
     agents have no real bundle (the spec load fails gracefully).
     """
-    agent_store.create("ag_builtin_1", "claude-native-ui", "ag_builtin_1/bundle")
-    agent_store.create("ag_builtin_2", "research-agent", "ag_builtin_2/bundle")
+    agent_store.create(
+        "2d2cd1e48ffdf8a4c7195e954e2e912c",
+        "claude-native-ui",
+        "2d2cd1e48ffdf8a4c7195e954e2e912c/bundle",
+    )
+    agent_store.create(
+        "01bda0a6f702a638bbee8d871441e659",
+        "research-agent",
+        "01bda0a6f702a638bbee8d871441e659/bundle",
+    )
 
     resp = await agents_client.get("/v1/agents")
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert {a["id"] for a in body["data"]} == {"ag_builtin_1", "ag_builtin_2"}
+    assert {a["id"] for a in body["data"]} == {
+        "2d2cd1e48ffdf8a4c7195e954e2e912c",
+        "01bda0a6f702a638bbee8d871441e659",
+    }
     assert {a["name"] for a in body["data"]} == {"claude-native-ui", "research-agent"}
     assert body["has_more"] is False
     # No loadable bundle → harness degrades to None rather than failing
@@ -156,7 +167,7 @@ async def test_list_builtin_agents_exposes_harness_from_spec(
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_harness",
+        agent_id="67914bd6ac8bd25239a14ef060e99e70",
         name="custom-reviewer",
         bundle=bundle,
     )
@@ -164,7 +175,7 @@ async def test_list_builtin_agents_exposes_harness_from_spec(
     resp = await agents_client.get("/v1/agents")
 
     assert resp.status_code == 200, resp.text
-    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_harness")
+    entry = next(a for a in resp.json()["data"] if a["id"] == "67914bd6ac8bd25239a14ef060e99e70")
     # Proves the spec's harness traversed the load → AgentObject path.
     # A None here means the bundle failed to load; a different value
     # means the route read the wrong spec field.
@@ -191,7 +202,7 @@ async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_terminals",
+        agent_id="5668ffcb1258cd047cfd400e190ed38c",
         name="terminal-agent",
         bundle=bundle,
     )
@@ -199,7 +210,7 @@ async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     resp = await agents_client.get("/v1/agents")
 
     assert resp.status_code == 200, resp.text
-    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_terminals")
+    entry = next(a for a in resp.json()["data"] if a["id"] == "5668ffcb1258cd047cfd400e190ed38c")
     # Both declared names in spec order — proves the spec's terminals
     # block traversed the load → AgentObject path verbatim.
     assert entry["terminals"] == ["shell", "py"]
@@ -240,7 +251,7 @@ async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_skilled",
+        agent_id="66614758344e352ba3d265401d826803",
         name="skilled-agent",
         bundle=bundle,
     )
@@ -248,7 +259,7 @@ async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
     resp = await agents_client.get("/v1/agents")
 
     assert resp.status_code == 200, resp.text
-    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_skilled")
+    entry = next(a for a in resp.json()["data"] if a["id"] == "66614758344e352ba3d265401d826803")
     # Both bundled skills traversed the load → AgentObject path with the
     # exact name + description the composer menu renders. A missing or
     # renamed entry means the landing "/" menu regressed to empty.
@@ -283,7 +294,7 @@ async def test_catalog_keeps_custom_agent_distinct_from_builtin_claude_and_codex
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_claude",
+        agent_id="3a9725fd4de1720e83e53a632da41da8",
         name="claude-native-ui",
         bundle=build_agent_bundle(
             name="claude-native-ui",
@@ -293,7 +304,7 @@ async def test_catalog_keeps_custom_agent_distinct_from_builtin_claude_and_codex
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_codex",
+        agent_id="12c8c7631b209d1027416b4bf7604999",
         name="codex-native-ui",
         bundle=build_agent_bundle(
             name="codex-native-ui",
@@ -303,7 +314,7 @@ async def test_catalog_keeps_custom_agent_distinct_from_builtin_claude_and_codex
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_custom",
+        agent_id="f157d3110ddee6bc0f8e1b893270c8a6",
         name="databricks-coding-agent",
         description="Custom coding agent",
         bundle=build_agent_bundle(
@@ -317,17 +328,21 @@ async def test_catalog_keeps_custom_agent_distinct_from_builtin_claude_and_codex
     assert resp.status_code == 200, resp.text
     by_id = {a["id"]: a for a in resp.json()["data"]}
     # All three discoverable in the one catalog the picker reads.
-    assert by_id.keys() >= {"ag_claude", "ag_codex", "ag_custom"}
+    assert by_id.keys() >= {
+        "3a9725fd4de1720e83e53a632da41da8",
+        "12c8c7631b209d1027416b4bf7604999",
+        "f157d3110ddee6bc0f8e1b893270c8a6",
+    }
     # Each carries its own harness — the custom agent is neither the
     # Claude nor the Codex kind. A shared/wrong value here is exactly the
     # mis-badging this contract guards against.
-    assert by_id["ag_claude"]["harness"] == "claude-sdk"
-    assert by_id["ag_codex"]["harness"] == "codex"
-    assert by_id["ag_custom"]["harness"] == "openai-agents"
+    assert by_id["3a9725fd4de1720e83e53a632da41da8"]["harness"] == "claude-sdk"
+    assert by_id["12c8c7631b209d1027416b4bf7604999"]["harness"] == "codex"
+    assert by_id["f157d3110ddee6bc0f8e1b893270c8a6"]["harness"] == "openai-agents"
     # The custom agent keeps its registered name and description (the
     # picker's label), distinct from both built-ins.
-    assert by_id["ag_custom"]["name"] == "databricks-coding-agent"
-    assert by_id["ag_custom"]["description"] == "Custom coding agent"
+    assert by_id["f157d3110ddee6bc0f8e1b893270c8a6"]["name"] == "databricks-coding-agent"
+    assert by_id["f157d3110ddee6bc0f8e1b893270c8a6"]["description"] == "Custom coding agent"
 
 
 async def test_list_builtin_agents_empty_when_none_registered(
@@ -378,7 +393,7 @@ async def test_catalog_entry_exposes_availability_and_reason(
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_avail",
+        agent_id="77b35426aef3c1495c2912cecb232108",
         name="codex-reviewer",
         bundle=bundle,
     )
@@ -386,7 +401,7 @@ async def test_catalog_entry_exposes_availability_and_reason(
     resp = await agents_client.get("/v1/agents")
 
     assert resp.status_code == 200, resp.text
-    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_avail")
+    entry = next(a for a in resp.json()["data"] if a["id"] == "77b35426aef3c1495c2912cecb232108")
     # availability gates whether the picker can launch the entry;
     # unavailable_reason explains a disabled one. Both absent from the
     # AgentObject schema today, so these key lookups fail (the xfail).
@@ -417,7 +432,7 @@ async def test_catalog_description_falls_back_to_spec_when_row_unset(
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_specdesc",
+        agent_id="7152784735902dd2219239e9577daf2d",
         name="hoverable-agent",
         bundle=bundle,
         description=None,
@@ -426,7 +441,7 @@ async def test_catalog_description_falls_back_to_spec_when_row_unset(
     resp = await agents_client.get("/v1/agents")
 
     assert resp.status_code == 200, resp.text
-    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_specdesc")
+    entry = next(a for a in resp.json()["data"] if a["id"] == "7152784735902dd2219239e9577daf2d")
     # The stored column is None, so a non-None value here can only have
     # come from the spec via the load → AgentObject fallback path.
     assert entry["description"] == "Planned and split across sub-agents."
@@ -454,7 +469,7 @@ async def test_catalog_description_prefers_stored_row_over_spec(
     _register_builtin_agent(
         agent_store,
         artifact_store,
-        agent_id="ag_storeddesc",
+        agent_id="92b7d16d5c148ea2cfc43786bb1c696e",
         name="relabelled-agent",
         bundle=bundle,
         description="Curated catalog label.",
@@ -463,7 +478,7 @@ async def test_catalog_description_prefers_stored_row_over_spec(
     resp = await agents_client.get("/v1/agents")
 
     assert resp.status_code == 200, resp.text
-    entry = next(a for a in resp.json()["data"] if a["id"] == "ag_storeddesc")
+    entry = next(a for a in resp.json()["data"] if a["id"] == "92b7d16d5c148ea2cfc43786bb1c696e")
     # Stored value present → it wins; the differing spec description
     # proves the route didn't blindly overwrite with the bundle's.
     assert entry["description"] == "Curated catalog label."

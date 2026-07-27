@@ -82,6 +82,19 @@ def _seed_function_call(
     resp.raise_for_status()
 
 
+def _publish_tool_output(base_url: str, session_id: str, call_id: str, delta: str) -> None:
+    """Publish live output for an in-flight native tool call."""
+    resp = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_tool_output_delta",
+            "data": {"call_id": call_id, "delta": delta},
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+
+
 def _snapshot_active_response_id(base_url: str, session_id: str) -> str | None:
     """Return ``active_response_id`` from the session snapshot.
 
@@ -179,3 +192,39 @@ def test_running_empty_session_reload_keeps_working_indicator(
         expect(page.get_by_text("What should we work on?")).to_have_count(0)
     finally:
         _publish_status(base_url, session_id, "idle")
+
+
+def test_live_tool_output_updates_running_card(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A native command output delta appears before the command completes."""
+    base_url, session_id = seeded_session
+    response_id = "resp_live_output_1"
+    call_id = "call_live_output_1"
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=20_000)
+
+        _publish_status(base_url, session_id, "running", response_id=response_id)
+        expect(page.locator('[data-testid="working-indicator"]')).to_be_visible(timeout=10_000)
+        _seed_function_call(
+            base_url,
+            session_id,
+            response_id=response_id,
+            call_id=call_id,
+            name="shell",
+            arguments='{"command": "pytest -q"}',
+        )
+
+        trigger = page.locator('button[title^="shell"]').first
+        expect(trigger).to_be_visible(timeout=10_000)
+        expect(trigger.locator(".animate-spin")).to_be_visible(timeout=10_000)
+
+        _publish_tool_output(base_url, session_id, call_id, "collecting tests...")
+
+        trigger.click()
+        expect(page.get_by_text("collecting tests...", exact=True)).to_be_visible(timeout=10_000)
+    finally:
+        _publish_status(base_url, session_id, "idle", response_id=response_id)

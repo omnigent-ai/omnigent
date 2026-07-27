@@ -44,7 +44,12 @@ import type { ElicitationBlock } from "@/lib/blocks";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, shouldQueueSend } from "./ChatPage";
 import type { QueuedMessage } from "@/store/chatStore";
-import { SlashCommandMenu } from "@/components/SlashCommandMenu";
+import {
+  BUILTIN_SLASH_COMMANDS,
+  rankedSlashCommandNames,
+  SlashCommandMenu,
+  slashCommandMatches,
+} from "@/components/SlashCommandMenu";
 
 // These tests pin the slash-command suggestions menu UX in the composer:
 // (1) the first match is highlighted as soon as the menu opens, so Tab/Enter
@@ -62,9 +67,7 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     onSend: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
-    agentsLoading: false,
     selectedAgentId: null,
-    onSelectAgent: vi.fn(),
     permissionLevel: null,
     readOnlyReason: null,
     replyQuotes: [],
@@ -80,6 +83,14 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
   };
 }
 
+const CLAUDE_MODEL_OPTIONS = [
+  { id: "fable", displayName: "Fable" },
+  { id: "opus", displayName: "Opus" },
+  { id: "sonnet", displayName: "Sonnet 4.6" },
+  { id: "sonnet_5", displayName: "Sonnet 5" },
+  { id: "haiku", displayName: "Haiku" },
+];
+
 /** The composer textarea, located by its aria-label. */
 function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
@@ -93,6 +104,51 @@ function activeRow(): HTMLElement | null {
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
+
+describe("Composer Claude goal control", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("sends the completion condition as a Claude /goal command", () => {
+    const onSend = vi.fn();
+    useChatStore.setState({ conversationId: "conv_polly" });
+    renderWithTooltips(<Composer {...composerProps({ onSend, showClaudeGoalControl: true })} />);
+
+    fireEvent.click(screen.getByTestId("goal-toggle"));
+    fireEvent.change(screen.getByTestId("goal-condition"), {
+      target: { value: "  Finish the implementation and pass tests  " },
+    });
+    fireEvent.click(screen.getByTestId("goal-start"));
+
+    expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
+
+describe("Composer Codex goal control", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("sends the completion condition as a Codex /goal command", () => {
+    const onSend = vi.fn();
+    useChatStore.setState({ conversationId: "conv_polly" });
+    renderWithTooltips(
+      <Composer {...composerProps({ onSend, showPollyCodexGoalControl: true })} />,
+    );
+
+    fireEvent.click(screen.getByTestId("goal-toggle"));
+    expect(screen.getByText(/Codex keeps working until this condition is met/)).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("goal-condition"), {
+      target: { value: "  Finish the implementation and pass tests  " },
+    });
+    fireEvent.click(screen.getByTestId("goal-start"));
+
+    expect(onSend).toHaveBeenCalledWith("/goal Finish the implementation and pass tests");
+  });
+});
 
 describe("Composer slash-command menu", () => {
   beforeEach(() => {
@@ -134,6 +190,33 @@ describe("Composer slash-command menu", () => {
     fireEvent.keyDown(ta, { key: "Tab" });
     // Skills fill "/name " and keep focus so the user can append args.
     expect(ta.value).toBe("/deslop ");
+  });
+
+  it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // "slop" is a substring of "deslop" but a prefix of no command. The menu
+    // render filter would show the row either way; Tab-completion reads
+    // menuMatches[menuIndex], so this only completes if the keyboard-nav
+    // filter is substring-based. Guards menuMatches from silently reverting
+    // to prefix matching and diverging from the rendered list.
+    fireEvent.change(ta, { target: { value: "/slop" } });
+    expect(activeRow()?.textContent).toContain("/deslop");
+    fireEvent.keyDown(ta, { key: "Tab" });
+    expect(ta.value).toBe("/deslop ");
+  });
+
+  it("ranks a prefix built-in ahead of mid-string matches so a short query can't execute the wrong command", () => {
+    render(<Composer {...composerProps()} />);
+    const ta = textarea();
+    // "/e": /effort is a prefix match; /context and /help merely contain "e".
+    // Before prefix-priority ranking, /context (a no-arg builtin) was
+    // highlighted first and Tab/Enter executed it — a side-effecting
+    // regression. /effort must win and Tab fills it (it takes an argument).
+    fireEvent.change(ta, { target: { value: "/e" } });
+    expect(activeRow()?.textContent).toContain("/effort");
+    fireEvent.keyDown(ta, { key: "Tab" });
+    expect(ta.value).toBe("/effort ");
   });
 
   it("Enter completes the highlighted command instead of sending", () => {
@@ -376,11 +459,12 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).toHaveBeenCalledWith("/model databricks-gpt-5-4", undefined);
   });
 
-  it("opens the model picker for bare /model when the picker is available", () => {
+  it("opens the config modal for bare /model when the picker is available", async () => {
     // claude-native (showModels): a plaintext "/model" would open Claude's
     // interactive selector inside the vendor TUI, which the web UI can't
     // render — the session just blocks. The composer must intercept the
-    // bare command and open its own picker dropdown instead of sending.
+    // bare command and open the config gear modal (which owns the Model
+    // dropdown) instead of sending.
     const onSend = vi.fn();
     render(
       <Composer
@@ -390,6 +474,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -399,20 +484,41 @@ describe("Composer slash-command submit routing", () => {
 
     expect(onSend).not.toHaveBeenCalled();
     expect(ta.value).toBe("");
-    // The AgentPicker dropdown is open with the Models rows to choose from.
-    expect(screen.getAllByTestId("model-picker-item").length).toBeGreaterThan(0);
+    // The config modal is open with the Model control to choose from.
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
   });
 
-  it("shows the read-only model hint for bare /model on opencode-native", () => {
-    // opencode surfaces showModels (its pill mirrors the live TUI model) but
-    // has no web model options to populate a dropdown. The bare-/model intercept
-    // must NOT fire — opening an empty picker and swallowing the command was the
-    // regression. Instead it falls through to the builtin /model handler, which
-    // surfaces the current model as a read-only hint. ("/model <name>" still
-    // routes to setModel below — opencode reads model_override on the next turn,
-    // so a web switch is functional even though the picker list is empty.)
+  it("does not open an empty Claude config modal while the live catalog loads", () => {
+    const onSend = vi.fn();
+    render(
+      <Composer
+        {...composerProps({
+          onSend,
+          isTerminalFirst: true,
+          isNativeWrapper: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/model " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(onSend).not.toHaveBeenCalled();
+    // No catalog yet → fall through to the read-only hint, not an empty modal.
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+    expect(screen.getByText(/Usage: \/model <name>/)).toBeVisible();
+  });
+
+  it("opens the config modal for bare /model on opencode-native", async () => {
     const setModel = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel, llmModel: "openrouter/nemotron" });
+    useChatStore.setState({
+      setModel,
+      llmModel: "opencode-go/glm-5.2",
+    });
     const onSend = vi.fn();
     render(
       <Composer
@@ -422,6 +528,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "opencode",
+          codexModelOptions: [{ id: "opencode-go/glm-5.2", displayName: "opencode-go/glm-5.2" }],
         })}
       />,
     );
@@ -429,12 +536,11 @@ describe("Composer slash-command submit routing", () => {
     fireEvent.change(ta, { target: { value: "/model " } });
     fireEvent.keyDown(ta, { key: "Enter" });
 
-    // Not sent as plaintext, not a switch, and the (empty) web picker stays shut.
+    // Bare /model opens the modal without sending text or changing the model.
     expect(onSend).not.toHaveBeenCalled();
     expect(setModel).not.toHaveBeenCalled();
-    expect(screen.queryAllByTestId("model-picker-item")).toHaveLength(0);
-    // The builtin handler surfaced the current model as a read-only hint.
-    expect(screen.getByText(/openrouter\/nemotron/)).toBeTruthy();
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
   });
 
   it("routes /model <name> to setModel on opencode-native (functional switch)", () => {
@@ -480,6 +586,7 @@ describe("Composer slash-command submit routing", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -489,8 +596,8 @@ describe("Composer slash-command submit routing", () => {
 
     expect(setModel).toHaveBeenCalledWith("fable");
     expect(onSend).not.toHaveBeenCalled();
-    // The picker only opens for the bare command, not the argument form.
-    expect(screen.queryByTestId("model-picker-item")).toBeNull();
+    // The config modal only opens for the bare command, not the argument form.
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
   });
 
   it("routes /model <name> to setModel on codex-native sessions", () => {
@@ -520,7 +627,7 @@ describe("Composer slash-command submit routing", () => {
   });
 });
 
-describe("AgentPicker trigger label", () => {
+describe("Composer model/effort label", () => {
   beforeEach(() => {
     useChatStore.setState({
       conversationId: "conv_test",
@@ -540,7 +647,9 @@ describe("AgentPicker trigger label", () => {
     vi.restoreAllMocks();
   });
 
-  it("shows the model in the foreground and effort muted (model/effort swapped into the trigger)", () => {
+  const label = () => screen.getByTestId("composer-model-effort-label");
+
+  it("shows the model in the foreground and effort muted", () => {
     useChatStore.setState({ selectedModel: "opus", selectedEffort: "high" });
     renderWithTooltips(
       <Composer
@@ -549,18 +658,41 @@ describe("AgentPicker trigger label", () => {
           selectedAgentId: "a1",
           modelPickerKind: "claude",
           showModels: true,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
-    const trigger = screen.getByTestId("agent-picker-trigger");
-    expect(trigger).toHaveTextContent("Opus");
-    expect(trigger).toHaveTextContent("High");
-    // The harness identity ("Claude") is NOT in the trigger anymore — it
-    // moved to the status tray below.
-    expect(trigger).not.toHaveTextContent("Claude");
+    expect(label()).toHaveTextContent("Opus");
+    expect(label()).toHaveTextContent("High");
+    // The harness identity ("Claude") is NOT in the label — it lives in the gear tooltip.
+    expect(label()).not.toHaveTextContent("Claude");
     // Model black, effort grey.
-    expect(within(trigger).getByText("Opus")).toHaveClass("text-foreground");
-    expect(within(trigger).getByText("High")).toHaveClass("text-muted-foreground");
+    expect(within(label()).getByText("Opus")).toHaveClass("text-foreground");
+    expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
+  });
+
+  it("reads 'Smart Routing' with no model/effort when routing is on", () => {
+    // The router picks model + effort per turn, so the label must not surface a
+    // stale pinned model/effort — it reads "Smart Routing" instead.
+    useChatStore.setState({
+      selectedModel: "opus",
+      selectedEffort: "high",
+      costControlModeOverride: "on",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Smart Routing");
+    expect(label()).not.toHaveTextContent("Opus");
+    expect(label()).not.toHaveTextContent("High");
   });
 
   it("prefers a claude session override over the cross-session sticky model", () => {
@@ -578,38 +710,51 @@ describe("AgentPicker trigger label", () => {
           modelPickerKind: "claude",
           showModels: true,
           showEffort: false,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    // The applied session override ("sonnet") wins over the cross-session sticky ("opus").
+    expect(label()).toHaveTextContent("Sonnet 4.6");
+    expect(label()).not.toHaveTextContent("Opus");
+  });
+
+  const CLAUDE_LIVE_OPTIONS = [
+    { id: "opus", model: "system.ai.claude-opus-4-10", displayName: "Opus 4.10", isDefault: false },
+    { id: "sonnet", model: "system.ai.claude-sonnet-5", displayName: "Sonnet 5", isDefault: true },
+  ];
+
+  it("maps a Claude concrete model to its friendly alias in the read-only label", () => {
+    useChatStore.setState({
+      selectedModel: null,
+      sessionModelOverride: null,
+      llmModel: "system.ai.claude-sonnet-5",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: CLAUDE_LIVE_OPTIONS,
         })}
       />,
     );
 
-    const trigger = screen.getByTestId("agent-picker-trigger");
-    expect(trigger).toHaveTextContent("Sonnet 4.6");
-    expect(trigger).not.toHaveTextContent("Opus");
-
-    // Open the picker via the bare-"/model" intercept — a synthetic click on the
-    // Radix trigger doesn't open the menu under jsdom, so the rows never mount.
-    fireEvent.change(textarea(), { target: { value: "/model " } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-
-    const sonnetRow = document.querySelector<HTMLElement>(
-      '[data-testid="model-picker-item"][data-model-id="sonnet"]',
-    );
-    const opusRow = document.querySelector<HTMLElement>(
-      '[data-testid="model-picker-item"][data-model-id="opus"]',
-    );
-    // The applied session override ("sonnet") is the active row, not the
-    // cross-session sticky ("opus").
-    expect(sonnetRow).toHaveAttribute("data-active", "true");
-    expect(opusRow).not.toHaveAttribute("data-active", "true");
+    // The read-only label maps the concrete bound model to its friendly alias.
+    expect(label()).toHaveTextContent("Sonnet 5");
+    expect(label()).not.toHaveTextContent("system.ai.claude-sonnet-5");
+    // The modal's catalog-default fallback (isDefault row when no concrete
+    // model) is exercised in the real browser by the claude model-picker e2e
+    // tests, where the Radix Select actually mounts its option rows.
   });
 
-  it("still renders an enabled trigger when the model/effort label is unresolved", () => {
-    // Regression guard: a claude-native session before the snapshot fills
-    // llmModel/selectedEffort has no model label, no effort label, and no
-    // agent switcher — but CLAUDE_NATIVE_MODELS still gives the dropdown
-    // model rows to switch (hasPickerActions). The trigger must NOT vanish
-    // (which would also take the model dropdown and the bare-`/model` path
-    // with it); it falls back to a stable identity label and stays enabled.
+  it("hides the label when the model/effort is unresolved (nothing to show yet)", () => {
+    // A claude-native session before the snapshot fills llmModel/selectedEffort
+    // has no model label and no effort label. The read-only label renders
+    // nothing rather than a placeholder — the gear still owns the config path.
     useChatStore.setState({ selectedModel: null, selectedEffort: null, llmModel: null });
     renderWithTooltips(
       <Composer
@@ -619,26 +764,66 @@ describe("AgentPicker trigger label", () => {
           modelPickerKind: "claude",
           showModels: true,
           showEffort: false,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
-    const trigger = screen.getByTestId("agent-picker-trigger");
-    expect(trigger).toBeVisible();
-    // Enabled because there are still model rows to switch — so the dropdown
-    // (and the bare-`/model` open path) stays reachable.
-    expect(trigger).toBeEnabled();
-    // Falls back to the bound agent's display label rather than rendering empty.
-    expect(trigger).toHaveTextContent("Claude");
+    expect(screen.queryByTestId("composer-model-effort-label")).toBeNull();
+    // The gear is still present so the user can open the config modal.
+    expect(screen.getByTestId("composer-config-gear")).toBeTruthy();
+  });
+
+  it("falls back to the harness identity for an SDK/bundle agent with no model/effort", () => {
+    // Polly (claude-sdk/pi bundle) surfaces no model or effort, so the label
+    // would be empty. It falls back to the harness identity ("Polly (Pi)") so
+    // the slot isn't blank.
+    useChatStore.setState({
+      selectedModel: null,
+      selectedEffort: null,
+      llmModel: null,
+      sessionHarness: "pi",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "polly" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("does NOT fall back to the bare vendor name for a native wrapper with no model", () => {
+    // A native wrapper's harnessLabel is the bare vendor name ("Claude"), which
+    // the gear tooltip owns now — the label must stay empty when unresolved
+    // rather than resurrecting it. Only SDK/bundle agents get the fallback.
+    useChatStore.setState({ selectedModel: null, selectedEffort: null, llmModel: null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "claude" }],
+          selectedAgentId: "a1",
+          modelPickerKind: "claude",
+          showModels: true,
+          showEffort: false,
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
+        })}
+      />,
+    );
+    expect(screen.queryByTestId("composer-model-effort-label")).toBeNull();
   });
 
   it("surfaces a cursor-native session's model from the override, not the cross-session sticky", () => {
     // cursor-native is a vendor-owns-model wrapper, so `nativeVendorOwnsModel`
     // is true and the bound `llmModel` is a meaningless default. Its live model
     // is mirrored into the session override (`sessionModelOverride`), NOT the
-    // cross-session sticky `selectedModel`. The trigger must read the real
+    // cross-session sticky `selectedModel`. The label must read the real
     // session model ("Composer 2.5"), not the stale sticky pick carried over
-    // from another session. Effort is NOT shown — cursor effort control is
-    // dropped for now (showEffort=false), so the pill is model-only.
+    // from another session.
     useChatStore.setState({
       nativeVendorOwnsModel: true,
       selectedModel: "opus-4.5", // stale cross-session sticky — must be ignored
@@ -661,19 +846,18 @@ describe("AgentPicker trigger label", () => {
         })}
       />,
     );
-    const trigger = screen.getByTestId("agent-picker-trigger");
-    expect(trigger).toHaveTextContent("Composer 2.5");
+    expect(label()).toHaveTextContent("Composer 2.5");
     // Neither the stale sticky, the meaningless vendor default, nor any effort leaks in.
-    expect(trigger).not.toHaveTextContent("Opus 4.5");
-    expect(trigger).not.toHaveTextContent("fable");
-    expect(trigger).not.toHaveTextContent("Low");
-    expect(within(trigger).getByText("Composer 2.5")).toHaveClass("text-foreground");
+    expect(label()).not.toHaveTextContent("Opus 4.5");
+    expect(label()).not.toHaveTextContent("fable");
+    expect(label()).not.toHaveTextContent("Low");
+    expect(within(label()).getByText("Composer 2.5")).toHaveClass("text-foreground");
   });
 
   it("surfaces an SDK/bundle session's model from the override, not the cross-session sticky", () => {
     // Polly/Debby (claude-sdk) repro: a model picked in some other (Codex)
     // session lingers in the global sticky `selectedModel`. SDK/bundle sessions
-    // (modelPickerKind === null) never have the sticky applied, so the trigger
+    // (modelPickerKind === null) never have the sticky applied, so the label
     // must read the session's own applied model (`sessionModelOverride`), never
     // the stale sticky — the "gpt-5.5 on a Claude-SDK Polly" report.
     useChatStore.setState({
@@ -691,9 +875,8 @@ describe("AgentPicker trigger label", () => {
         })}
       />,
     );
-    const trigger = screen.getByTestId("agent-picker-trigger");
-    expect(trigger).toHaveTextContent("claude-opus-4-8");
-    expect(trigger).not.toHaveTextContent("gpt-5.5");
+    expect(label()).toHaveTextContent("claude-opus-4-8");
+    expect(label()).not.toHaveTextContent("gpt-5.5");
   });
 
   it("does not leak the cross-session sticky model on an SDK/bundle session with no applied model", () => {
@@ -715,11 +898,10 @@ describe("AgentPicker trigger label", () => {
         })}
       />,
     );
-    const trigger = screen.getByTestId("agent-picker-trigger");
-    expect(trigger).not.toHaveTextContent("gpt-5.5");
-    // The real effort still renders — proving the trigger is present and only
+    expect(label()).not.toHaveTextContent("gpt-5.5");
+    // The real effort still renders — proving the label is present and only
     // the leaked model was suppressed.
-    expect(trigger).toHaveTextContent("High");
+    expect(label()).toHaveTextContent("High");
   });
 });
 
@@ -781,6 +963,7 @@ describe("Composer effort slash-command visibility", () => {
           isNativeWrapper: true,
           showModels: true,
           modelPickerKind: "claude",
+          codexModelOptions: CLAUDE_MODEL_OPTIONS,
         })}
       />,
     );
@@ -843,6 +1026,67 @@ describe("Composer Codex Plan-mode control", () => {
   it("hides the control when the session is not Codex-native", () => {
     render(<Composer {...composerProps({ showCodexPlanMode: false })} />);
     expect(screen.queryByTestId("codex-plan-mode-toggle")).toBeNull();
+  });
+});
+
+describe("slashCommandMatches", () => {
+  it("matches the leaf segment after a namespace prefix", () => {
+    expect(slashCommandMatches("/superpowers:using-superpowers", "using-superpowers")).toBe(true);
+  });
+
+  it("matches a substring in the middle of the name", () => {
+    expect(slashCommandMatches("/cross-review", "rev")).toBe(true);
+  });
+
+  it("does not match a word that only appears in the description", () => {
+    // Matching is name-only — the web menu never shows descriptions inline,
+    // so a description-driven hit would look unexplained. "window" is in this
+    // command's blurb but not its name, so it must NOT match.
+    expect(slashCommandMatches("/context", "window")).toBe(false);
+  });
+
+  it("is case-insensitive on both name and query", () => {
+    expect(slashCommandMatches("/Superpowers:Using", "USING")).toBe(true);
+  });
+
+  it("returns false when the query is nowhere in the name", () => {
+    expect(slashCommandMatches("/context", "zzz")).toBe(false);
+  });
+});
+
+describe("rankedSlashCommandNames", () => {
+  it("ranks a prefix match ahead of commands that merely contain the query", () => {
+    // "/e": /effort is a prefix; /context, /model, /help only contain "e".
+    // Prefix-priority keeps /effort first so its auto-highlight + Enter can't
+    // execute an unrelated no-arg builtin (/context) as a side effect.
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "e")[0]).toBe("/effort");
+  });
+
+  it("ranks /model ahead of commands that merely contain 'm'", () => {
+    // "/m": /model is a prefix; /compact contains "m". Was /compact first.
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "m")[0]).toBe("/model");
+  });
+
+  it("keeps built-ins ahead of skills so the Commands section stays on top", () => {
+    const commands = { ...BUILTIN_SLASH_COMMANDS, "/superpowers:effort-helper": "x" };
+    const ranked = rankedSlashCommandNames(commands, "effort");
+    // Both /effort (builtin, prefix) and the skill (mid-string) match; the
+    // builtin must rank first so the render partition stays contiguous.
+    expect(ranked[0]).toBe("/effort");
+    expect(ranked.indexOf("/effort")).toBeLessThan(ranked.indexOf("/superpowers:effort-helper"));
+  });
+
+  it("ranks a prefix skill ahead of a mid-string skill, stably", () => {
+    // Insertion order is deep-research, research; ranking promotes the prefix
+    // match (research) above the mid-string one (deep-research contains "res").
+    const commands = { "/deep-research": "a", "/research": "b" };
+    expect(rankedSlashCommandNames(commands, "res")).toEqual(["/research", "/deep-research"]);
+  });
+
+  it("returns everything in insertion order for an empty query (lone '/')", () => {
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "")).toEqual(
+      Object.keys(BUILTIN_SLASH_COMMANDS),
+    );
   });
 });
 
@@ -910,6 +1154,18 @@ describe("SlashCommandMenu", () => {
     expect(detail.textContent).toContain("/beta");
     expect(detail.textContent).toContain("Second");
     expect(detail.textContent).not.toContain("First");
+  });
+
+  it("surfaces a namespaced skill by its leaf name", () => {
+    render(
+      <SlashCommandMenu
+        query="using-superpowers"
+        activeIndex={0}
+        onSelect={vi.fn()}
+        commands={{ "/superpowers:using-superpowers": "Establishes how to find and use skills" }}
+      />,
+    );
+    expect(screen.getByTestId("slash-menu-item-superpowers:using-superpowers")).toBeDefined();
   });
 });
 
@@ -1267,6 +1523,412 @@ describe("Composer — queued-message flush gating", () => {
   });
 });
 
+describe("Composer config gear", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_test",
+      skills: [],
+      selectedModel: null,
+      sessionModelOverride: null,
+      llmModel: null,
+      nativeVendorOwnsModel: false,
+      selectedEffort: null,
+      costControlModeOverride: null,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const gear = () => document.querySelector('[data-testid="composer-config-gear"]');
+
+  it("renders when the session has a switchable knob (effort)", () => {
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
+    expect(gear()).not.toBeNull();
+  });
+
+  it("does not render when there is nothing to configure", () => {
+    // No models, no effort, not routable → nothing to configure.
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ showEffort: false, showModels: false, costRoutingEligible: false })}
+      />,
+    );
+    expect(gear()).toBeNull();
+  });
+
+  it("soft-disables the gear on a read-only session (aria-disabled, click no-ops)", () => {
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true, permissionLevel: 1 })} />);
+    expect(gear()).toHaveAttribute("aria-disabled", "true");
+    // Soft-disable, not native `disabled`: the click is guarded but the button
+    // stays hover-able so its config tooltip still shows.
+    expect(gear()).toHaveProperty("disabled", false);
+    fireEvent.click(gear()!);
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("soft-disables the gear when the session isn't live (asleep/stranded/unknown — no runner to configure)", () => {
+    // A config change can't wake a sleeping runner (unlike a message) and
+    // those states never load the model catalog, so the gear is inert
+    // whenever the session isn't online — not just the two unreachable kinds.
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true, sessionLive: false })} />);
+    expect(gear()).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(gear()!);
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("keeps the gear live (not aria-disabled) on an online session", () => {
+    renderWithTooltips(<Composer {...composerProps({ showEffort: true, sessionLive: true })} />);
+    expect(gear()).toHaveAttribute("aria-disabled", "false");
+  });
+
+  it("still shows the config tooltip on a disabled gear (soft-disable preserves hover)", async () => {
+    useChatStore.setState({ selectedEffort: "high", sessionHarness: "claude-sdk" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          sessionLive: false,
+        })}
+      />,
+    );
+    // Even soft-disabled, the read-only summary must remain visible on hover.
+    fireEvent.focus(gear()!);
+    const tip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tip.textContent).toContain("Model:");
+  });
+
+  it("shows a hover summary with Harness/Model/Effort rows and no Permissions row", async () => {
+    useChatStore.setState({ selectedEffort: "high", sessionHarness: "claude-sdk" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: true,
+          showModels: true,
+          modelPickerKind: "claude",
+          selectedAgentId: "a1",
+          agents: [{ id: "a1", name: "claude-native-ui" } as never],
+        })}
+      />,
+    );
+    // Radix tooltips open on focus; focusing the trigger reveals the content.
+    fireEvent.focus(gear()!);
+    const tip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tip.textContent).toContain("Harness:");
+    expect(tip.textContent).toContain("Model:");
+    expect(tip.textContent).toContain("Effort:");
+    // Effort is switchable in-session; permission mode is not, so it must be absent.
+    expect(tip.textContent).not.toContain("Permissions");
+  });
+
+  it("reflects Smart Routing in the Model row of the summary when routing is on", async () => {
+    useChatStore.setState({ costControlModeOverride: "on" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.focus(gear()!);
+    const tip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tip.textContent).toContain("Model: Smart Routing");
+  });
+
+  it("omits the Effort row from the summary when routing is on (router owns effort)", async () => {
+    useChatStore.setState({ costControlModeOverride: "on", selectedEffort: "high" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: true,
+          modelPickerKind: "claude",
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.focus(gear()!);
+    const tip = await screen.findByTestId("composer-config-gear-tooltip");
+    expect(tip.textContent).toContain("Model: Smart Routing");
+    // The router picks effort per turn, so a pinned effort must not show.
+    expect(tip.textContent).not.toContain("Effort:");
+  });
+
+  it("opens the config modal on click", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    expect(await screen.findByTestId("composer-config-modal")).toBeTruthy();
+    // Claude native → Model + Effort selects present.
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
+    expect(screen.getByTestId("composer-config-effort")).toBeTruthy();
+  });
+
+  it("does not open the modal via bare /model when the gear is disabled (not live)", async () => {
+    // Bare /model bumps the open nonce; on a non-live session the gear is
+    // inert, so the nonce must NOT open a modal that can't apply a change.
+    const options = [{ id: "opus", model: "opus", displayName: "Opus" }] as never;
+    useChatStore.setState({ codexModelOptions: options });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          sessionLive: false,
+          codexModelOptions: options,
+        })}
+      />,
+    );
+    const textarea = document.querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "/model" } });
+    fireEvent.keyDown(textarea, { key: "Enter", code: "Enter" });
+    // Give the nonce effect a tick; the modal must stay closed.
+    await waitFor(() => expect(gear()).toHaveAttribute("aria-disabled", "true"));
+    expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+  });
+
+  it("offers a standalone Smart Routing switch for routable agents with no Model dropdown (applied on Save)", async () => {
+    // An SDK/bundle agent (Polly) has no Model dropdown, so Smart Routing gets a
+    // standalone switch. Agents WITH a dropdown (Claude, Codex) fold it in — see
+    // the fold-in test below.
+    const setCostControlMode = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setCostControlMode });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: false,
+          modelPickerKind: null,
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    const toggle = await screen.findByTestId("composer-config-smart-routing");
+    fireEvent.click(toggle);
+    // The modal drafts changes — nothing commits until Save.
+    expect(setCostControlMode).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(setCostControlMode).toHaveBeenCalledWith("on"));
+  });
+
+  it("folds Smart Routing into the Codex Model dropdown (no standalone switch)", async () => {
+    // Regression: Codex has a Model dropdown, so Smart Routing must be an option
+    // inside it (like Claude) — NOT a separate switch alongside the dropdown.
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "codex",
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
+  });
+
+  it("applies drafted model + effort only on Save, model before effort", async () => {
+    // Claude-native types /model and /effort as separate terminal commands, so
+    // Save must await the model PATCH before firing effort — otherwise the two
+    // injections interleave into one bad line. This pins that ordering.
+    const calls: string[] = [];
+    let resolveModel: () => void = () => {};
+    const setModel = vi.fn().mockImplementation(() => {
+      calls.push("model");
+      return new Promise<void>((r) => {
+        resolveModel = r;
+      });
+    });
+    const setEffort = vi.fn().mockImplementation(() => {
+      calls.push("effort");
+      return Promise.resolve();
+    });
+    const options = [
+      { id: "opus", model: "opus", displayName: "Opus" },
+      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+    ] as never;
+    useChatStore.setState({
+      setModel,
+      setEffort,
+      selectedEffort: "high",
+      codexModelOptions: options,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    // Draft a new model and a new effort.
+    fireEvent.click(document.querySelector('[data-testid="composer-config-model"]') as Element);
+    fireEvent.click(document.querySelector('[data-model-id="sonnet"]') as Element);
+    fireEvent.click(document.querySelector('[data-testid="composer-config-effort"]') as Element);
+    fireEvent.click(document.querySelector('[data-effort-level="low"]') as Element);
+    // Draft only — no live commit yet.
+    expect(setModel).not.toHaveBeenCalled();
+    expect(setEffort).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    // Model fires first and effort waits for its promise to resolve.
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith("sonnet"));
+    expect(setEffort).not.toHaveBeenCalled();
+    resolveModel();
+    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
+    expect(calls).toEqual(["model", "effort"]);
+  });
+
+  it("skips unchanged knobs on Save (no spurious slash-command injection)", async () => {
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const setEffort = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel, setEffort, selectedEffort: "medium" });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({ showEffort: true, showModels: true, modelPickerKind: "claude" })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    // Save with nothing changed — no setter should fire.
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(screen.queryByTestId("composer-config-modal")).toBeNull());
+    expect(setModel).not.toHaveBeenCalled();
+    expect(setEffort).not.toHaveBeenCalled();
+  });
+
+  it("re-pins the model when turning Smart Routing off, even if the shown model is unchanged", async () => {
+    // Routing-on clears the applied override but keeps the cross-session sticky
+    // (selectedModel), so the modal shows that model as "resolved". Turning
+    // routing off by re-picking that same model must still PATCH setModel —
+    // otherwise the pin is silently dropped and the session falls back to
+    // default. Regression for the resolvedModelId short-circuit false-negative.
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const setCostControlMode = vi.fn().mockResolvedValue(undefined);
+    const options = [
+      { id: "opus", model: "opus", displayName: "Opus" },
+      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+    ] as never;
+    useChatStore.setState({
+      setModel,
+      setCostControlMode,
+      // Routing on + leftover sticky "opus", no applied override.
+      costControlModeOverride: "on",
+      selectedModel: "opus",
+      sessionModelOverride: null,
+      codexModelOptions: options,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          costRoutingEligible: true,
+          codexModelOptions: options,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    // Turn routing off by picking the same model the modal already shows.
+    fireEvent.click(document.querySelector('[data-testid="composer-config-model"]') as Element);
+    fireEvent.click(document.querySelector('[data-model-id="opus"]') as Element);
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    // The pin must be re-applied AND routing cleared.
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith("opus"));
+    expect(setCostControlMode).toHaveBeenCalledWith("off");
+  });
+
+  it("does not re-pin a leaked sticky model when turning routing off on a no-dropdown agent", async () => {
+    // An SDK/bundle agent (Polly) has no Model dropdown, so the user can't have
+    // chosen a model. Turning routing off must NOT re-pin the seeded
+    // resolvedModelId (which could be a leaked cross-session sticky) — it should
+    // clear via setModel(null). Only the routing PATCH carries the intent.
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const setCostControlMode = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      setModel,
+      setCostControlMode,
+      costControlModeOverride: "on",
+      // A leftover cross-session sticky that must NOT get pinned.
+      selectedModel: "gpt-5.5",
+      sessionModelOverride: null,
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          // No Model dropdown (SDK/bundle) but routing-eligible → standalone switch.
+          showModels: false,
+          modelPickerKind: null,
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    const toggle = await screen.findByTestId("composer-config-smart-routing");
+    fireEvent.click(toggle); // turn routing off
+    fireEvent.click(screen.getByTestId("composer-config-save"));
+    await waitFor(() => expect(setCostControlMode).toHaveBeenCalledWith("off"));
+    // Must clear, never pin the leaked "gpt-5.5" sticky.
+    expect(setModel).not.toHaveBeenCalledWith("gpt-5.5");
+  });
+
+  it("discards drafted changes on Cancel", async () => {
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const setCostControlMode = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ setModel, setCostControlMode });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          // SDK/bundle agent (no Model dropdown) so the standalone routing
+          // switch renders — the knob toggled here.
+          showModels: false,
+          modelPickerKind: null,
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    const toggle = await screen.findByTestId("composer-config-smart-routing");
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("composer-config-cancel"));
+    expect(setCostControlMode).not.toHaveBeenCalled();
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("folds Smart Routing into the Claude Model dropdown (no standalone switch)", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          costRoutingEligible: true,
+        })}
+      />,
+    );
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    // Claude gets the Model select instead of a standalone routing switch.
+    expect(screen.getByTestId("composer-config-model")).toBeTruthy();
+    expect(screen.queryByTestId("composer-config-smart-routing")).toBeNull();
+  });
+});
+
 describe("shouldQueueSend", () => {
   const q = (conversationId: string): QueuedMessage => ({
     queueId: `q_${conversationId}`,
@@ -1278,14 +1940,20 @@ describe("shouldQueueSend", () => {
     expect(shouldQueueSend(null, "streaming", "running", [])).toBe(false);
   });
 
-  it("queues while the session is busy (streaming or running/waiting)", () => {
+  it("queues while the session is busy (streaming or running)", () => {
     expect(shouldQueueSend("conv_a", "streaming", "idle", [])).toBe(true);
     expect(shouldQueueSend("conv_a", "idle", "running", [])).toBe(true);
-    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(true);
   });
 
   it("sends directly when idle and nothing is queued for this conversation", () => {
     expect(shouldQueueSend("conv_a", "idle", "idle", [])).toBe(false);
+  });
+
+  it("sends directly on `waiting` (turn ended, only background work remains)", () => {
+    // A background shell / still-running sub-agent keeps the session in
+    // `waiting`, but the server's turn gate is already free — a new message
+    // must start a fresh turn rather than stalling in the client queue.
+    expect(shouldQueueSend("conv_a", "idle", "waiting", [])).toBe(false);
   });
 
   it("queues when idle but this conversation already has a queued message", () => {

@@ -64,8 +64,7 @@ prompt: You are a deterministic test assistant.
 
 executor:
   model: gpt-4o-mini
-  config:
-    harness: openai-agents
+  harness: openai-agents
 
 os_env:
   type: caller_process
