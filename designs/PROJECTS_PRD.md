@@ -518,15 +518,10 @@ folder), carrying the first-class `id` when one exists.
 - ✅ Tests: `projectsApi` unit tests; reworked hook tests (resolve→file,
   create-on-demand, archive+unfile+delete); sidebar/composer suites updated;
   server union test. Empty folders read "No sessions".
-- ⬜ **Deferred (kept on the name/label path via dual-read):** the new-session
-  prefill state machine and the Settings archived-only project picker still read
-  the `omni_project` label; retiring label reads from the UI is gated on the
-  Phase 4 backfill. TS client types are not codegen-regenerated (hand-written
-  `projectsApi`).
 
-### TODO
-- ✅ **Benchmark (#3094).** Added `list_projects` (sidebar project list,
-  dual-read union) and `list_project_sessions` (`?project=` folder fetch)
+### Done (Benchmark — #3094)
+- ✅ **Latency journeys + corpus seeder.** Added `list_projects` (sidebar project
+  list, dual-read union) and `list_project_sessions` (`?project=` folder fetch)
   latency journeys to `dev/benchmarks/omnigent`, mirroring the `list_sessions`
   hot read path. The corpus seeder now also seeds first-class `projects` rows
   and files a configurable fraction of sessions into them (`--projects`,
@@ -534,7 +529,10 @@ folder), carrying the first-class `id` when one exists.
   empty project set, and the PR benchmark regression check runs on
   `dev/benchmarks/**` changes. CRUD writes remain unbenchmarked (infrequent
   single-row ops).
-- 🚧 **Phase 2 — project defaults (P4a).** In progress, split across PRs:
+
+### Done (Phase 2 — project defaults, P4a)
+Complete, shipped across several PRs: default host/workspace/agent + an opt-in
+worktree stored on the project and seeded into the new-chat composer.
   - ✅ **Backend `config` column.** Added a nullable `config` column to
     `projects` (migration `b3c4d5e6f7a8`, additive with a clean downgrade) and
     plumbed it through the store/entity/API. `config` is an **opaque JSON
@@ -583,21 +581,38 @@ folder), carrying the first-class `id` when one exists.
     `["project-newest-session"]` cache invalidations) is removed. Stored config
     is the single source of truth for a project's defaults; a project with no
     config prefills nothing project-specific (just the generic defaults).
-- ⬜ **Phase 3 — memory & context (P4b/P4c)** — new `project_memory` /
-  `project_context` tables + agent read/write + injection (§8.2/§8.3).
-- ⬜ **Phase 4 — label consolidation (deferred; not required for the feature).**
+
+### TODO
+**Postponed.** Phases 1–2 (first-class projects + defaults) are shipped. Phases 3
+and 4 below are **not scheduled**, each on a different trigger: Phase 3 waits for
+customer evidence that project memory/context is wanted; Phase 4 waits until
+telemetry shows most clients have migrated to a version that writes `project_id`
+(so retiring the label path is safe). Both are additive and independent, so either
+can start whenever its trigger lands.
+
+- ⏸️ **Phase 3 — memory & context (P4b/P4c)** — new `project_memory` /
+  `project_context` tables + agent read/write + injection (§8.2/§8.3). Postponed:
+  the largest remaining chunk and the one with open design questions (§14 Q5/Q6);
+  wait for customer evidence that cross-session project memory/context is wanted
+  before committing to a storage + agent-surface design.
+- ⏸️ **Phase 4 — label consolidation (postponed; not required for the feature).**
   Because the server dual-reads (a session is "in project X" if it has *either* a
   `project_id` *or* the `omni_project` label — see §13), the first-class feature
   works end-to-end without touching the label path, so this whole phase is
-  deferred and may never be needed. Two steps, both optional:
+  deferred and may never be needed. Postponed until telemetry shows most clients
+  have migrated to a version that writes `project_id` — retiring the label path is
+  only safe once old label-writing clients are gone. Two steps, both optional:
   - **Label → `project_id` backfill** — a **separate one-off command/migration**
     converting existing `omni_project` label-projects (real production data) into
     `projects` rows. Gives a clean single source of truth, but dual-read means it
     is **not mandatory** — only needed if/when we decide to retire the label path.
   - **Retire the label path** — remove the `omni_project` reads/writes and the
-    `?project=<name>` filter. Last step, if ever; do only after the backfill has
-    run and telemetry shows no client still writes labels. Keeping the label path
-    is cheap, so treat retirement as opportunistic cleanup, not a milestone.
+    `?project=<name>` filter. This includes the one UI reader still on the label
+    path: the Settings archived-only project picker
+    (`fetchAllArchivedProjectNames`) derives its options from the `omni_project`
+    label. Last step, if ever; do only after the backfill has run and telemetry
+    shows no client still writes labels. Keeping the label path is cheap, so
+    treat retirement as opportunistic cleanup, not a milestone.
 
 ## 13. Backwards compatibility (mixed server / client versions)
 
