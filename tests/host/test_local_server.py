@@ -504,6 +504,22 @@ def test_refuse_real_home_spawn_under_pytest_allows_omnigent_data_dir(
     local_server._refuse_real_home_spawn_under_pytest(local_server._local_data_dir())
 
 
+def test_refuse_real_home_spawn_under_pytest_rejects_real_home_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A symlink to the real data directory is still unisolated."""
+    real_home = tmp_path / "real-home"
+    real_data_dir = real_home / ".omnigent"
+    real_data_dir.mkdir(parents=True)
+    alias = tmp_path / "claimed-isolated"
+    alias.symlink_to(real_data_dir, target_is_directory=True)
+    monkeypatch.setattr(local_server, "_real_home_dir", lambda: real_home)
+
+    with pytest.raises(click.ClickException, match="Refused to spawn"):
+        local_server._refuse_real_home_spawn_under_pytest(alias)
+
+
 def test_refuse_real_home_spawn_under_pytest_allows_home_override(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -152,14 +152,11 @@ def _refuse_real_home_spawn_under_pytest(data_dir: Path) -> None:
     """
     if not os.environ.get("PYTEST_CURRENT_TEST"):
         return
-    # Plain path equality, deliberately NOT ``.resolve()``: resolving symlinks
-    # would stat the real ``~/.omnigent`` to compare against, and this
-    # function must never touch that path even read-only. ``_real_home_dir``
-    # and ``_local_data_dir`` both already return absolute, expanduser'd
-    # paths, so a textual comparison is exact for the HOME/OMNIGENT_DATA_DIR
-    # overrides this guards against.
+    # Canonicalize both paths so an OMNIGENT_DATA_DIR symlink cannot bypass the
+    # guard. Resolution is read-only and happens before any target directory is
+    # created or opened.
     real_home_omnigent = _real_home_dir() / ".omnigent"
-    if data_dir.expanduser() != real_home_omnigent:
+    if data_dir.expanduser().resolve(strict=False) != real_home_omnigent.resolve(strict=False):
         return
     raise click.ClickException(
         f"Refused to spawn the local Omnigent server against the real "
