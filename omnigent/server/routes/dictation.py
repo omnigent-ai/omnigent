@@ -149,8 +149,16 @@ def create_dictation_router(
                 # leak the take (the remote engine holds a worker slot until
                 # close). Shield it so cleanup always completes.
                 with anyio.CancelScope(shield=True):
-                    with contextlib.suppress(Exception):
+                    try:
                         await asyncio.to_thread(handle.close)
+                    except Exception:  # noqa: BLE001 - fall back to a direct close
+                        # During teardown the loop's thread-pool executor may
+                        # already be shutting down, so offloading raises rather
+                        # than running close() — which would leak the take.
+                        # close() is a quick, non-blocking free for every
+                        # engine, so fall back to a direct call on the loop.
+                        with contextlib.suppress(Exception):
+                            handle.close()
 
     return router
 

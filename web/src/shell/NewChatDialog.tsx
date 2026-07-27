@@ -97,6 +97,7 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl } from "@/lib/host";
@@ -144,11 +145,7 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
-import {
-  useNewestProjectSession,
-  useProjects,
-  moveConversationToProject,
-} from "@/hooks/useConversations";
+import { useProjectConfig, useProjects, moveConversationToProject } from "@/hooks/useConversations";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -973,6 +970,7 @@ export function AgentHarnessPicker({
   onSelectPending,
   onCreateCustomAgent,
   sandboxSelected,
+  allowCreateCustomAgent = true,
   onOpenChange,
   dropdownModal = true,
   contentClassName,
@@ -992,6 +990,10 @@ export function AgentHarnessPicker({
   onSelectPending: () => void;
   onCreateCustomAgent: () => void;
   sandboxSelected: boolean;
+  /** Whether to offer the "Create custom agent" action. Defaults true; an
+   *  embedder that only picks an existing agent (e.g. project settings) can
+   *  hide it since it has no interactive create flow. */
+  allowCreateCustomAgent?: boolean;
   // ── Optional reuse hooks (all default-undefined) ─────────────────────────
   // These let a host OTHER than the composer footer embed the picker without
   // changing its default behavior. The interactive New Chat call site passes
@@ -1118,8 +1120,9 @@ export function AgentHarnessPicker({
   // least one custom / pending agent to group.
   const hasCustomAgents = customEntries.length > 0 || pendingAgent != null;
   // "Create custom agent" is reachable on any non-sandbox target (a managed
-  // sandbox has no create path for an uploaded bundle).
-  const canCreateAgent = !sandboxSelected;
+  // sandbox has no create path for an uploaded bundle), unless the embedder
+  // opts out (it has no create flow to route the action to).
+  const canCreateAgent = !sandboxSelected && allowCreateCustomAgent;
   const createAgentItem = canCreateAgent ? (
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
@@ -2111,35 +2114,50 @@ export function NewChatLandingScreen() {
     };
   }, []);
 
-  // Project prefill: a project-driven visit reuses the project's newest
-  // session — its host, source repo, and agent — so the composer is ready
-  // to send without re-picking anything.
-  const { data: projectNewest, isError: projectNewestFailed } = useNewestProjectSession(
-    projectParam !== "" ? projectParam : null,
+  // Project prefill: a project-driven visit seeds the composer from the
+  // project's stored defaults (host / working directory / agent / worktree).
+  // `?project=` carries the project NAME, so resolve it to the first-class id
+  // the config endpoint needs; a label-only folder (id null) or plain visit
+  // has no config to read.
+  const { data: projectList, isLoading: projectListLoading } = useProjects();
+  const configProjectId = useMemo(
+    () =>
+      projectParam !== ""
+        ? ((projectList ?? []).find((p) => p.name === projectParam)?.id ?? null)
+        : null,
+    [projectList, projectParam],
   );
-  // That session may have run in a linked worktree (git_branch set), where
-  // its workspace is the worktree dir, not the repo. Listing that path's
-  // worktrees returns the whole set, including the `is_main` source repo.
-  const needsSourceRepoResolve =
-    projectNewest != null &&
-    projectNewest.git_branch != null &&
-    projectNewest.workspace != null &&
-    projectNewest.host_id != null;
-  const {
-    data: sourceWorktreesData,
-    isError: projectSourceWorktreesFailed,
-    isPlaceholderData: sourceWorktreesArePlaceholder,
-  } = useHostWorktrees(
-    needsSourceRepoResolve ? (projectNewest.host_id ?? null) : null,
-    needsSourceRepoResolve ? (projectNewest.workspace ?? null) : null,
-  );
-  // The hook serves the previous query's data as a placeholder while a new
-  // fetch is in flight — that would be another repo's worktrees here.
-  const projectSourceWorktrees = sourceWorktreesArePlaceholder ? undefined : sourceWorktreesData;
-  // State machine driving the project prefill: a location track (host →
-  // workspace → branch → settled) plus an independent agent seed. The
-  // generic host/workspace defaults below hold off until the location
-  // track settles so they can't win the race against the project's values.
+  const { data: storedProjectConfig, isLoading: projectConfigLoading } =
+    useProjectConfig(configProjectId);
+  // Normalize into the machine's shape. `undefined` = still loading (the machine
+  // waits so a generic default can't win the race); `{}` = nothing to wait for
+  // (plain visit / label-only folder / genuinely empty config), so it settles
+  // immediately and the generic defaults take over.
+  const prefillConfig = useMemo<ProjectPrefillConfig | undefined>(() => {
+    // A project-scoped visit must resolve name → id via the projects list
+    // before we know whether there's a config to read — until it loads, the id
+    // is falsely null, so wait rather than settle prematurely.
+    if (projectParam !== "" && projectListLoading) return undefined;
+    if (configProjectId !== null && projectConfigLoading) return undefined;
+    const c = storedProjectConfig;
+    if (!c) return {};
+    return {
+      hostId: c.host_id,
+      workspace: c.workspace,
+      agentId: c.agent_id,
+      useWorktree: c.use_worktree,
+    };
+  }, [
+    projectParam,
+    projectListLoading,
+    configProjectId,
+    projectConfigLoading,
+    storedProjectConfig,
+  ]);
+  // State machine driving the project prefill: a location seed (host +
+  // workspace from config) plus an independent agent seed. The generic
+  // host/workspace defaults below hold off until it settles so they can't win
+  // the race against the project's stored values.
   const [prefill, setPrefill] = useState<ProjectPrefillState>(() =>
     initialPrefillState(projectParam),
   );
@@ -2149,6 +2167,9 @@ export function NewChatLandingScreen() {
   // Host whose workspace was already seeded once, so a host re-pick doesn't
   // clobber the field (used by the per-host seeding effect below).
   const seededHostRef = useRef<string | null>(null);
+  // Workspace the opt-in worktree effect already acted on, so it fires at most
+  // once per settled workspace (and can't loop once it sets a branch name).
+  const worktreeSeededForRef = useRef<string | null>(null);
 
   // The landing screen stays mounted while `?project=` changes (clicking
   // another project's pencil), so re-create a fresh visit by hand: clear
@@ -2162,6 +2183,7 @@ export function NewChatLandingScreen() {
     setWorkspace("");
     setBranchName("");
     seededHostRef.current = null;
+    worktreeSeededForRef.current = null;
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project]);
 
@@ -2487,11 +2509,7 @@ export function NewChatLandingScreen() {
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
   const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
-  const {
-    data: hostWorktrees,
-    isPlaceholderData: hostWorktreesArePlaceholder,
-    isError: hostWorktreesFailed,
-  } = useHostWorktrees(
+  const { data: hostWorktrees, isPlaceholderData: hostWorktreesArePlaceholder } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
@@ -2571,33 +2589,26 @@ export function NewChatLandingScreen() {
     const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
     setBranchName(`worktree-${suffix}`);
   }, []);
-  // Project prefill: advance the machine one step per render as its data
-  // arrives. It steps rather than loops in one pass because the "branch"
-  // phase needs `hostWorktrees` for the workspace the "workspace" phase
-  // just wrote, and that listing only reflects the seeded repo one render
-  // after the write applies.
+  // Project prefill: seed host / workspace / agent from the project's stored
+  // config, then settle so the generic defaults fill any slot the config left
+  // unset. An opt-in worktree is generated by the dedicated effect below once
+  // the workspace is in place.
   useEffect(() => {
     if (prefill.project !== projectParam || prefillDone(prefill)) return;
     const step = projectPrefillStep(prefill, {
-      newest: projectNewest,
-      newestFailed: projectNewestFailed,
       hosts,
       // The pickable list, not the raw one — a hidden agent's id would seed
       // a pick that effectiveAgentId rejects. Raw undefined = still loading.
       agents: agents === undefined ? undefined : agentList,
       sandboxSelected,
+      managedSandboxesEnabled,
       selectedHostId,
       lastAgentId: readLastAgentId(),
-      sourceWorktrees: projectSourceWorktrees,
-      sourceWorktreesFailed: projectSourceWorktreesFailed,
-      workspaceTrimmed,
-      branchName,
-      prefilledBranch,
-      hostWorktrees: hostWorktreesArePlaceholder ? undefined : hostWorktrees,
-      hostWorktreesFailed,
+      config: prefillConfig,
     });
     if (step === null) return;
     const { writes } = step;
+    if (writes.selectSandbox) setSandboxSelected(true);
     if (writes.hostId !== undefined) setSelectedHostId((cur) => cur ?? writes.hostId!);
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
@@ -2606,31 +2617,50 @@ export function NewChatLandingScreen() {
     if (writes.workspace !== undefined) {
       setWorkspace((cur) => (cur === "" ? writes.workspace! : cur));
     }
-    if (writes.branch !== undefined && prefilledBranch === "") {
-      // Functional fill-empty-only, like the other slots: a branch typed
-      // between the qualifying render and this effect must not be clobbered.
-      setBranchName((cur) => (cur === "" ? writes.branch! : cur));
-    }
     setPrefill(step.state);
   }, [
     prefill,
     projectParam,
-    projectNewest,
-    projectNewestFailed,
     hosts,
     agents,
     agentList,
     sandboxSelected,
+    managedSandboxesEnabled,
     selectedHostId,
-    projectSourceWorktrees,
-    projectSourceWorktreesFailed,
+    pickedAgentId,
+    prefillConfig,
+  ]);
+
+  // Opt-in worktree from the project's stored config. The inference machine
+  // settles a config-driven location without touching the branch, so this
+  // effect creates the fresh worktree once the workspace is fully in place —
+  // whether it came from the config's own workspace or the composer's
+  // home-fallback (which runs after the machine settles). Fires at most once
+  // per settled workspace (ref-guarded) and only into an empty branch, so a
+  // typed branch / existing-worktree prefill is never clobbered.
+  useEffect(() => {
+    if (prefillConfig?.useWorktree !== true) return;
+    if (prefill.project !== projectParam || !prefillDone(prefill)) return;
+    if (sandboxSelected || selectedHostId === null || workspaceTrimmed === "") return;
+    if (branchName !== "" || prefilledBranch !== "") return;
+    if (worktreeSeededForRef.current === workspaceTrimmed) return;
+    // Need the git-ness probe for the CURRENT workspace resolved (not the
+    // anti-flicker placeholder from a previous path).
+    if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
+    worktreeSeededForRef.current = workspaceTrimmed;
+    if (hostWorktrees.some((w) => w.is_main)) generateBranchName();
+  }, [
+    prefillConfig,
+    prefill,
+    projectParam,
+    sandboxSelected,
+    selectedHostId,
     workspaceTrimmed,
     branchName,
     prefilledBranch,
     hostWorktrees,
     hostWorktreesArePlaceholder,
-    hostWorktreesFailed,
-    pickedAgentId,
+    generateBranchName,
   ]);
 
   // Sandbox repo inputs are valid when blank (empty workspace), or when
@@ -3049,9 +3079,6 @@ export function NewChatLandingScreen() {
           // session shows up immediately (the folder fetches via
           // useProjectSessions, separate from the global conversations list).
           void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-          // The just-created session is now the project's newest; without this
-          // a pencil click within staleTime prefills from the previous one.
-          void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
         } catch {
           // Leave the session unfiled; the user can file it from the sidebar.
         }

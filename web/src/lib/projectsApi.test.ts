@@ -3,7 +3,14 @@
 // that surfaces the server's structured `{error: {message}}` shape.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createProject, deleteProject, listProjects, renameProject } from "./projectsApi";
+import {
+  createProject,
+  deleteProject,
+  getProject,
+  listProjects,
+  renameProject,
+  updateProjectConfig,
+} from "./projectsApi";
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -58,6 +65,47 @@ describe("createProject", () => {
       ),
     );
     await expect(createProject("New")).rejects.toThrow("already exists");
+  });
+
+  it("includes config in the body when provided", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "p_1", name: "New" }));
+    await createProject("New", { host_id: "h1", agent_id: "ag_1" });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      name: "New",
+      config: { host_id: "h1", agent_id: "ag_1" },
+    });
+  });
+});
+
+describe("getProject", () => {
+  it("GETs /v1/projects/{id} and returns the project with config", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "p_1", name: "A", config: { workspace: "/w" } }),
+    );
+    const result = await getProject("p_1");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects/p_1");
+    expect(result.config).toEqual({ workspace: "/w" });
+  });
+});
+
+describe("updateProjectConfig", () => {
+  it("PATCHes only the config field (url-encoded id)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "p a", name: "A", config: { agent_id: "ag_1" } }),
+    );
+    await updateProjectConfig("p a", { agent_id: "ag_1" });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/projects/p%20a");
+    expect(init.method).toBe("PATCH");
+    expect(JSON.parse(init.body as string)).toEqual({ config: { agent_id: "ag_1" } });
+  });
+
+  it("sends config:{} to clear stored defaults", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "p_1", name: "A", config: {} }));
+    await updateProjectConfig("p_1", {});
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ config: {} });
   });
 });
 

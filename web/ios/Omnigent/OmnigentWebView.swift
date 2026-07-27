@@ -184,6 +184,13 @@ struct OmnigentWebView: UIViewRepresentable {
       });
       window.omnigentNative = Object.freeze({
         kind: "ios",
+        setColorScheme(scheme) {
+          if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
+          window.webkit.messageHandlers.omnigentNative.postMessage({
+            method: "setColorScheme",
+            scheme,
+          });
+        },
         setBadgeCount(count) {
           window.webkit.messageHandlers.omnigentNative.postMessage({
             method: "setBadgeCount",
@@ -335,6 +342,11 @@ struct OmnigentWebView: UIViewRepresentable {
       else { return }
 
       switch method {
+      case "setColorScheme":
+        guard let scheme = body["scheme"] as? String,
+          let source = ThemeSource(rawValue: scheme)
+        else { return }
+        ThemeController.shared.apply(source)
       case "setBadgeCount":
         let count = (body["count"] as? NSNumber)?.intValue ?? 0
         NativeNotificationManager.shared.setBadgeCount(count)
@@ -600,5 +612,57 @@ extension UIViewController {
       return selected.omnigentTopViewController
     }
     return self
+  }
+}
+
+/// The user-selected theme source. Mirrors the value space the web app sends
+/// through the bridge via `setColorScheme`.
+enum ThemeSource: String, Equatable, CaseIterable {
+  case system
+  case light
+  case dark
+
+  /// UIKit interface style override used for windows and WKWebView.
+  var userInterfaceStyle: UIUserInterfaceStyle {
+    switch self {
+    case .system:
+      return .unspecified
+    case .light:
+      return .light
+    case .dark:
+      return .dark
+    }
+  }
+
+  /// SwiftUI's equivalent for `.preferredColorScheme`. `nil` means "follow the system".
+  var colorScheme: ColorScheme? {
+    switch self {
+    case .system:
+      return nil
+    case .light:
+      return .light
+    case .dark:
+      return .dark
+    }
+  }
+}
+
+/// App-wide theme override. The web layer drives this through the bridge so
+/// native chrome and the WebView track the in-app theme switcher.
+@MainActor
+final class ThemeController: ObservableObject {
+  static let shared = ThemeController()
+
+  @Published private(set) var source: ThemeSource = .system
+
+  private init() {}
+
+  func apply(_ source: ThemeSource) {
+    self.source = source
+    for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+      for window in scene.windows {
+        window.overrideUserInterfaceStyle = source.userInterfaceStyle
+      }
+    }
   }
 }

@@ -6,12 +6,18 @@ import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.codex_native_app_server import NativeCodexLaunch
+from omnigent.harness_plugins import BackgroundTitleGeneratorSpec
 from omnigent.runner import create_runner_app
+from omnigent.runner.background_titles import BackgroundTitleContext
+from omnigent.runner.background_titles import claude_native as claude_native_titles
+from omnigent.runner.background_titles import codex_native as codex_native_titles
 from tests.runner.helpers import NullServerClient
 
 
@@ -147,6 +153,167 @@ async def test_background_title_uses_isolated_codex_process(
     assert "please investigate the authentication timeout" in body["content"]
 
 
+@pytest.mark.parametrize(
+    ("phase", "expected_action"),
+    [
+        ("PHASE_LLM_REQUEST", "POLICY_ACTION_ALLOW"),
+        ("PHASE_TOOL_CALL", "POLICY_ACTION_DENY"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_background_title_resolves_synthetic_claude_policy_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    expected_action: str,
+) -> None:
+    verdict_received = asyncio.Event()
+
+    class PolicyStream(_FakeHarnessStream):
+        async def aiter_lines(self):
+            yield "data: " + json.dumps(
+                {
+                    "type": "policy_evaluation.requested",
+                    "evaluation_id": "poleval_title",
+                    "phase": phase,
+                    "data": {},
+                }
+            )
+            yield ""
+            await verdict_received.wait()
+            yield "data: " + json.dumps(
+                {
+                    "type": "response.output_text.delta",
+                    "delta": "Debug authentication timeout",
+                }
+            )
+            yield ""
+            yield "data: " + json.dumps({"type": "response.completed"})
+            yield ""
+
+    class PolicyClient(_FakeHarnessClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.verdicts: list[tuple[str, dict[str, Any]]] = []
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float | None,
+        ) -> _FakeHarnessStream:
+            assert method == "POST"
+            assert timeout is None
+            self.requests.append((url, json))
+            return PolicyStream([])
+
+        async def post(self, url: str, *, json: dict[str, Any]) -> None:
+            self.verdicts.append((url, json))
+            verdict_received.set()
+
+    harness_client = PolicyClient()
+    process_manager = _FakeProcessManager(harness_client)
+
+    async def resolve_harness_config(**_kwargs: Any) -> tuple[str, None]:
+        return "claude-sdk", None
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._resolve_harness_config",
+        resolve_harness_config,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.sdk.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
+        0.05,
+    )
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/background-title",
+            json={"prompt": "please investigate the authentication timeout"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "generated",
+        "title": "Debug authentication timeout",
+    }
+    [(process_key, harness, _env)] = process_manager.get_client_calls
+    assert harness == "claude-sdk"
+    assert harness_client.verdicts == [
+        (
+            f"/v1/sessions/{process_key}/events",
+            {
+                "type": "policy_verdict",
+                "evaluation_id": "poleval_title",
+                "action": expected_action,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("evaluation_id", [None, ""])
+@pytest.mark.asyncio
+async def test_background_title_rejects_policy_gate_without_evaluation_id(
+    monkeypatch: pytest.MonkeyPatch,
+    evaluation_id: str | None,
+) -> None:
+    class InvalidPolicyClient(_FakeHarnessClient):
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float | None,
+        ) -> _FakeHarnessStream:
+            assert method == "POST"
+            assert timeout is None
+            self.requests.append((url, json))
+            return _FakeHarnessStream(
+                [
+                    {
+                        "type": "policy_evaluation.requested",
+                        "evaluation_id": evaluation_id,
+                        "phase": "PHASE_LLM_REQUEST",
+                    }
+                ]
+            )
+
+    harness_client = InvalidPolicyClient()
+    process_manager = _FakeProcessManager(harness_client)
+
+    async def resolve_harness_config(**_kwargs: Any) -> tuple[str, None]:
+        return "claude-sdk", None
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._resolve_harness_config",
+        resolve_harness_config,
+    )
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/background-title",
+            json={"prompt": "please investigate the authentication timeout"},
+        )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "error": "title_harness_failed",
+        "detail": "Harness requested policy evaluation without an id.",
+    }
+    [process_key] = process_manager.released
+    assert uuid.UUID(process_key).hex == process_key
+
+
 @pytest.mark.asyncio
 async def test_background_title_maps_claude_native_to_claude_cli(
     monkeypatch: pytest.MonkeyPatch,
@@ -154,7 +321,7 @@ async def test_background_title_maps_claude_native_to_claude_cli(
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
     resolver_calls: list[tuple[str | None, str | None]] = []
-    cli_calls: list[tuple[str, Any, str | None]] = []
+    cli_calls: list[tuple[str, str | None]] = []
 
     async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str] | None]:
         override = kwargs["harness_override"]
@@ -163,8 +330,8 @@ async def test_background_title_maps_claude_native_to_claude_cli(
             return "claude-sdk", {"HARNESS_CLAUDE_SDK_MODEL": "claude-sonnet-4-6"}
         return "claude-native", None
 
-    async def generate_claude_title(prompt: str, *, cwd: Any, model: str | None) -> str:
-        cli_calls.append((prompt, cwd, model))
+    async def generate_claude_title(context: BackgroundTitleContext) -> str:
+        cli_calls.append((context.prompt, context.cwd, context.model_override))
         return "Debug authentication timeout"
 
     monkeypatch.setattr(
@@ -172,7 +339,7 @@ async def test_background_title_maps_claude_native_to_claude_cli(
         resolve_harness_config,
     )
     monkeypatch.setattr(
-        "omnigent.runner.app._generate_claude_native_background_title",
+        "omnigent.runner.background_titles.claude_native.generate_background_title",
         generate_claude_title,
     )
     app = create_runner_app(
@@ -214,8 +381,6 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from omnigent.runner import app as runner_app
-
     captured: dict[str, Any] = {}
 
     class FakeProcess:
@@ -238,10 +403,15 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
 
-    title = await runner_app._generate_claude_native_background_title(
-        "please investigate the authentication timeout",
-        cwd=tmp_path,
-        model="claude-sonnet-4-6",
+    title = await claude_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="claude-native",
+            spawn_env={},
+            process_manager=None,
+            cwd=tmp_path,
+            model_override="claude-sonnet-4-6",
+        )
     )
 
     assert title == "Debug authentication timeout"
@@ -261,8 +431,6 @@ async def test_claude_native_title_kills_process_when_cancelled(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from omnigent.runner import app as runner_app
-
     communicate_started = asyncio.Event()
 
     class FakeProcess:
@@ -300,10 +468,15 @@ async def test_claude_native_title_kills_process_when_cancelled(
     )
 
     task = asyncio.create_task(
-        runner_app._generate_claude_native_background_title(
-            "please investigate the authentication timeout",
-            cwd=tmp_path,
-            model="claude-sonnet-4-6",
+        claude_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="claude-native",
+                spawn_env={},
+                process_manager=None,
+                cwd=tmp_path,
+                model_override="claude-sonnet-4-6",
+            )
         )
     )
     await communicate_started.wait()
@@ -316,21 +489,29 @@ async def test_claude_native_title_kills_process_when_cancelled(
 
 
 @pytest.mark.asyncio
-async def test_background_title_skips_codex_native_without_spawning(
+async def test_background_title_uses_native_codex_without_spawning_headless_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     harness_client = _FakeHarnessClient()
     process_manager = _FakeProcessManager(harness_client)
-    calls: list[tuple[str | None, str | None]] = []
+    resolver_calls: list[tuple[str | None, str | None]] = []
+    cli_calls: list[tuple[str, Any, str | None]] = []
 
     async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str] | None]:
-        override = kwargs["harness_override"]
-        calls.append((override, kwargs["model_override"]))
+        resolver_calls.append((kwargs["harness_override"], kwargs["model_override"]))
         return "codex-native", None
+
+    async def generate_codex_title(context: BackgroundTitleContext) -> str:
+        cli_calls.append((context.prompt, context.model_override))
+        return "Debug authentication timeout"
 
     monkeypatch.setattr(
         "omnigent.runner.app._resolve_harness_config",
         resolve_harness_config,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.codex_native.generate_background_title",
+        generate_codex_title,
     )
     app = create_runner_app(
         process_manager=process_manager,  # type: ignore[arg-type]
@@ -347,11 +528,235 @@ async def test_background_title_skips_codex_native_without_spawning(
         )
 
     assert response.status_code == 200
-    assert response.json() == {"status": "unsupported", "title": None}
-    assert calls == [(None, "gpt-5.4-mini")]
+    assert response.json() == {
+        "status": "generated",
+        "title": "Debug authentication timeout",
+    }
+    assert resolver_calls == [(None, "gpt-5.4-mini")]
+    assert cli_calls == [
+        (
+            "please investigate the authentication timeout",
+            "gpt-5.4-mini",
+        )
+    ]
     assert process_manager.get_client_calls == []
     assert process_manager.released == []
     assert harness_client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_codex_native_title_uses_ephemeral_tool_free_exec(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            args = captured["args"]
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
+            captured["auth_text"] = (codex_home / "auth.json").read_text()
+            captured["config_text"] = (codex_home / "config.toml").read_text()
+            captured["agents_exists"] = (codex_home / "AGENTS.md").exists()
+            output_path.write_text("Debug authentication timeout\n")
+            return b"", b"ignored warning"
+
+    async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> FakeProcess:
+        captured.update(command=command, args=list(args), kwargs=kwargs)
+        return FakeProcess()
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"auth_mode": "oauth"}')
+    (source_home / "config.toml").write_text(
+        'model_provider = "custom"\n'
+        'unrelated_top_level = "drop"\n'
+        "\n"
+        "[model_providers.custom]\n"
+        'name = "Custom Provider"\n'
+        'base_url = "https://example.test/v1"\n'
+        "\n"
+        "[profiles.team]\n"
+        'model_provider = "custom"\n'
+        'model = "gpt-5.4-mini"\n'
+        "\n"
+        "[mcp_servers.unrelated]\n"
+        'command = "echo"\n'
+        "\n"
+        "[features]\n"
+        "multi_agent = true\n"
+    )
+    (source_home / "AGENTS.md").write_text("Do unrelated work")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.resolve_native_codex_launch",
+        lambda *, model: NativeCodexLaunch([], model, None),
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: "codex",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: source_home,
+    )
+
+    title = await codex_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="please investigate the authentication timeout",
+            harness="codex-native",
+            spawn_env={},
+            process_manager=None,
+            model_override="gpt-5.4-mini",
+        )
+    )
+
+    assert title == "Debug authentication timeout"
+    assert captured["command"] == "codex"
+    args = captured["args"]
+    assert args[0] == "exec"
+    assert "--ephemeral" in args
+    assert "--ignore-rules" in args
+    assert "--skip-git-repo-check" in args
+    assert args[args.index("--model") + 1] == "gpt-5.4-mini"
+    assert "features.shell_tool=false" in args
+    assert 'web_search="disabled"' in args
+    assert "omnigent-codex-title-" in captured["kwargs"]["cwd"]
+    codex_home = Path(captured["kwargs"]["env"]["CODEX_HOME"])
+    assert codex_home != source_home
+    assert captured["auth_text"] == '{"auth_mode": "oauth"}'
+    config_text = captured["config_text"]
+    assert 'model_provider = "custom"' in config_text
+    assert "[model_providers.custom]" in config_text
+    assert "[profiles.team]" in config_text
+    assert "unrelated_top_level" not in config_text
+    assert "mcp_servers" not in config_text
+    assert "[features]" not in config_text
+    assert captured["agents_exists"] is False
+
+
+@pytest.mark.asyncio
+async def test_codex_native_title_kills_process_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    communicate_started = asyncio.Event()
+    killed: list[Any] = []
+
+    class FakeProcess:
+        returncode: int | None = None
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            communicate_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def wait(self) -> int:
+            self.waited = True
+            self.returncode = -9
+            return self.returncode
+
+    process = FakeProcess()
+
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.resolve_native_codex_launch",
+        lambda *, model: NativeCodexLaunch([], model, None),
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server._find_codex_cli",
+        lambda: "codex",
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        lambda *args, **kwargs: asyncio.sleep(0, result=process),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner._proc.kill_tree",
+        lambda candidate: killed.append(candidate),
+    )
+
+    task = asyncio.create_task(
+        codex_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="codex-native",
+                spawn_env={},
+                process_manager=None,
+                model_override="gpt-5.4-mini",
+            )
+        )
+    )
+    await communicate_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert killed == [process]
+    assert process.waited is True
+
+
+@pytest.mark.asyncio
+async def test_background_title_dispatches_any_registered_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness_client = _FakeHarnessClient()
+    process_manager = _FakeProcessManager(harness_client)
+    captured: list[BackgroundTitleContext] = []
+
+    async def resolve_harness_config(**_kwargs: Any) -> tuple[str, dict[str, str]]:
+        return "community-example", {"EXAMPLE_MODEL": "example-model"}
+
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        captured.append(context)
+        return "Review generic dispatch"
+
+    monkeypatch.setattr(
+        "omnigent.runner.app._resolve_harness_config",
+        resolve_harness_config,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.service.background_title_generators",
+        lambda: {
+            "community-example": BackgroundTitleGeneratorSpec(
+                "omnigent.community.harness.example.background_titles:generate"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.service.load_object",
+        lambda _path: generate_title,
+    )
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/background-title",
+            json={
+                "prompt": "please review the generic dispatch path",
+                "model_override": "example-model",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "generated",
+        "title": "Review generic dispatch",
+    }
+    [context] = captured
+    assert context.harness == "community-example"
+    assert context.spawn_env == {"EXAMPLE_MODEL": "example-model"}
+    assert context.model_override == "example-model"
+    assert process_manager.get_client_calls == []
+    assert process_manager.released == []
 
 
 @pytest.mark.asyncio
@@ -479,7 +884,7 @@ async def test_background_title_timeout_releases_process(
         resolve_harness_config,
     )
     monkeypatch.setattr(
-        "omnigent.runner.app._BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
+        "omnigent.runner.background_titles.sdk.BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS",
         0.01,
     )
     app = create_runner_app(
