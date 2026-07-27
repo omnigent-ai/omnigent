@@ -58,7 +58,8 @@ in-memory in the runner process (`_active_turns`, `_session_message_buffers` in
 
 Dropped in migration `b9c1d2e3f4a5_drop_tasks_table` — see the note at the top
 of this doc. `conversation_items.response_id` still exists as a plain
-app-generated grouping id (see below); it no longer references any table.
+turn/response grouping id (harness- or app-generated; see below); it no longer
+references any table.
 
 ---
 
@@ -70,8 +71,8 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 | Column | Type | Notes |
 |---|---|---|
 | id | String(64) PK | Prefixed by type: msg_, fc_, fco_, rs_ |
-| conversation_id | String(64) NOT NULL | FK → conversations.id |
-| response_id | String(64) NOT NULL | App-generated id grouping items produced by one turn; no matching table since `tasks` was dropped |
+| conversation_id | String(64) NOT NULL | References conversations.id (by convention — no DB FK; see Foreign key strategy) |
+| response_id | String(64) NOT NULL | Turn/response grouping id (harness- or app-generated); no matching table since `tasks` was dropped |
 | created_at | Integer NOT NULL | |
 | status | String(32) NOT NULL | Default "completed" |
 | position | Integer NOT NULL | Ordering within conversation |
@@ -98,14 +99,23 @@ Single table with a `type` discriminator and a JSON `data` blob for type-specifi
 
 ### Foreign key strategy
 
-`conversation_items.conversation_id` has a FK to `conversations.id` (`ON DELETE
-CASCADE`), so deleting a conversation removes its items automatically — no
-separate deletion-order step is needed. The FK acts as a safety net against
-orphaned rows.
+There are no database-enforced foreign keys anywhere in the schema. Migration
+`p1a2b3c4d5e6_remove_all_fks` dropped every FK constraint (per internal DB
+standard Rule R032, which forbids DB-enforced foreign keys); the application
+is solely responsible for cascading deletes and referential cleanup.
+`conversation_items.conversation_id` references `conversations.id` by
+convention only.
 
-No FK for `conversation_items.response_id` — it's an app-generated grouping id
-with no backing table (see the `tasks (removed)` note above), so there's
-nothing to reference.
+Deletion order is therefore an explicit application-code responsibility:
+`ConversationStore.delete_conversation` collects the conversation's full
+subtree, then deletes items, labels, comments, policies, and FTS rows before
+deleting the conversation rows themselves — children before parent. Do not
+remove that cleanup logic on the assumption a DB cascade covers it; none
+does.
+
+`conversation_items.response_id` references no table at all — it's a
+turn/response grouping id (see the `tasks (removed)` note above) with no
+backing table since `tasks` was dropped.
 
 ### Single conversation_items table with JSON data column
 
