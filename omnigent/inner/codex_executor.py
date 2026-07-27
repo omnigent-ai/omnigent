@@ -30,6 +30,7 @@ from omnigent.spec.types import RetryPolicy
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
+from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .databricks_executor import (
     _databricks_gateway_host,
 )
@@ -1208,25 +1209,6 @@ def _extract_latest_user_content(
                 return content
             return json.dumps(content)
     return ""
-
-
-def _goal_objective_from_content(content: str | list[dict[str, Any]]) -> str | None:
-    """Return the objective from a standalone ``/goal`` user command."""
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for block in content:
-            if block.get("type") not in {"input_text", "text"}:
-                return None
-            text = block.get("text")
-            if not isinstance(text, str):
-                return None
-            text_parts.append(text)
-        content = "".join(text_parts)
-    command, separator, objective = content.strip().partition(" ")
-    if command != "/goal" or not separator:
-        return None
-    objective = objective.strip()
-    return objective or None
 
 
 def _build_initial_prompt(
