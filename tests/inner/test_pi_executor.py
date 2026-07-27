@@ -446,18 +446,18 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertEqual(entry.get("input"), ["text", "image"])
 
     def test_dynamic_reasoning_model_gets_reasoning_flag(self):
-        # GLM/DeepSeek stream their output on ``reasoning_content``;
-        # without ``reasoning: true`` Pi's openai-completions parser never
-        # consumes that channel and the turn dies with "Stream ended without
-        # finish_reason".
-        for model in ("databricks-glm-5-2", "databricks-deepseek-r1"):
-            result = _build_models_json("https://host.example.com", "tok", model=model)
-            provider = result["providers"][_pi_provider_for_model(model)]
-            entry = next(e for e in provider["models"] if e["id"] == model)
-            self.assertIs(entry.get("reasoning"), True, model)
+        # DeepSeek streams output on ``reasoning_content``; without
+        # ``reasoning: true`` Pi's openai-completions parser never consumes
+        # that channel and the turn dies with "Stream ended without finish_reason".
+        # GLM now uses the Responses API so it no longer needs this flag.
+        model = "databricks-deepseek-r1"
+        result = _build_models_json("https://host.example.com", "tok", model=model)
+        provider = result["providers"][_pi_provider_for_model(model)]
+        entry = next(e for e in provider["models"] if e["id"] == model)
+        self.assertIs(entry.get("reasoning"), True, model)
 
     def test_dynamic_non_reasoning_model_has_no_reasoning_flag(self):
-        model = "databricks-gemini-2-5-pro"
+        model = "databricks-mlflow-2-5-pro"
         result = _build_models_json("https://host.example.com", "tok", model=model)
         provider = result["providers"][_pi_provider_for_model(model)]
         entry = next(e for e in provider["models"] if e["id"] == model)
@@ -521,19 +521,18 @@ class TestBuildModelsJson(unittest.TestCase):
             self.assertNotIn("/ai-gateway/codex", base_url)
             self.assertEqual(base_url, "https://host.example.com/serving-endpoints")
 
-    def test_gemini_model_routed_off_codex_gateway(self):
-        # Gemini falls to the databricks-completions catch-all; it must land on
-        # serving-endpoints, not the codex URL it used to inherit (#241).
+    def test_gemini_model_routed_to_mlflow_gateway(self):
+        # Gemini uses /ai-gateway/mlflow/v1 — system.ai.* ids 404 at serving-endpoints
+        # and the Responses API returns 400 for Gemini.
         result = _build_models_json(
             "https://host.example.com",
             "tok",
-            {"openai": "https://host.example.com/ai-gateway/codex/v1"},
-            model="databricks-gemini-2-5-pro",
+            model="system.ai.gemini-3-flash",
         )
-        provider = result["providers"][_pi_provider_for_model("databricks-gemini-2-5-pro")]
-        self.assertEqual(provider["baseUrl"], "https://host.example.com/serving-endpoints")
+        provider = result["providers"][_pi_provider_for_model("system.ai.gemini-3-flash")]
+        self.assertEqual(provider["baseUrl"], "https://host.example.com/ai-gateway/mlflow/v1")
         self.assertIn(
-            "databricks-gemini-2-5-pro",
+            "system.ai.gemini-3-flash",
             [entry.get("id") for entry in provider["models"]],
         )
 
@@ -2977,7 +2976,7 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
     ]
-    # Newer GPT models (reject tools via /chat/completions) → responses API.
+    # Newer GPT → responses API. Kimi/inkling/Qwen3 registered dynamically only.
     openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
     assert openai_responses_ids == [
         "databricks-gpt-5-5",
@@ -3027,8 +3026,8 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
     # _pi_provider_for_model routes it to, advertising image input so Pi
     # doesn't strip attached images (#515).
     entry = next((e for e in completions["models"] if e["id"] == "moonshotai/kimi-k2.6"), None)
-    # kimi models use reasoning_content channel → need reasoning:true flag
-    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"], "reasoning": True}
+    # Non-Databricks kimi on OpenRouter uses completions path (no reasoning flag needed).
+    assert entry == {"id": "moonshotai/kimi-k2.6", "input": ["text", "image"]}
     # …and that provider points at the generic gateway with the
     # Chat-Completions dialect OpenRouter speaks.
     assert completions["baseUrl"] == "https://openrouter.ai/api/v1"

@@ -72,7 +72,13 @@ vi.mock("@/hooks/useConversations", () => ({
   // `seedPins` exercise the Pinned section without a separate fixture.
   usePinnedConversations: () => {
     const idSet = new Set(pinnedIdsRef.current);
-    return { data: conversationsRef.current.filter((c) => idSet.has(c.id)), isSuccess: true };
+    return {
+      data: {
+        conversations: conversationsRef.current.filter((c) => idSet.has(c.id)),
+        filterHonored: true,
+      },
+      isSuccess: true,
+    };
   },
   // Reflect the toggle into the seeded ref so a test that clicks quick-pin then
   // re-renders sees the updated Pinned set.
@@ -316,6 +322,7 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
+    expect(headerActions.parentElement).toHaveClass("h-8");
     const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
 
@@ -338,6 +345,8 @@ describe("Sidebar session list", () => {
     const primaryNav = screen.getByTestId("sidebar-primary-nav");
     const inbox = within(primaryNav).getByTestId("inbox-button");
 
+    expect(primaryNav).toHaveClass("px-2", "pt-0", "pb-3");
+    expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
     expect(inbox).toHaveClass("h-7", "w-full", "justify-start");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();

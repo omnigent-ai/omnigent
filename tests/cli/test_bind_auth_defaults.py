@@ -21,7 +21,6 @@ from omnigent.cli import _apply_bind_auth_defaults
 _AUTH_ENVS = (
     "OMNIGENT_AUTH_PROVIDER",
     "OMNIGENT_AUTH_ENABLED",
-    "OMNIGENT_ACCOUNTS_ENABLED",
     "OMNIGENT_LOCAL_SINGLE_USER",
     "OMNIGENT_OIDC_ISSUER",
 )
@@ -124,20 +123,6 @@ def test_non_loopback_respects_explicit_auth_enabled_zero(
 
     # Stays "0", not overwritten by setdefault.
     assert os.environ.get("OMNIGENT_AUTH_ENABLED") == "0"
-    assert _stderr(capsys) == ""
-
-
-def test_non_loopback_respects_deprecated_accounts_enabled(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The deprecated OMNIGENT_ACCOUNTS_ENABLED alias also counts as explicit.
-
-    An operator who set the old var name should not be auto-overridden.
-    """
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "0")
-    _apply_bind_auth_defaults("0.0.0.0")
-
-    assert os.environ.get("OMNIGENT_AUTH_ENABLED") is None
     assert _stderr(capsys) == ""
 
 

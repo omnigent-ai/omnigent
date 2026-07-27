@@ -188,6 +188,11 @@ def canonical_model_spelling(model: str) -> str:
         bare = model[len(_DATABRICKS_MODEL_PREFIX) :]
         if _MECHANICAL_VENDOR_ID_RE.fullmatch(bare):
             return bare
+    _SYSTEM_AI_PREFIX = "system.ai."
+    if model.startswith(_SYSTEM_AI_PREFIX):
+        bare = model[len(_SYSTEM_AI_PREFIX) :]
+        if _MECHANICAL_VENDOR_ID_RE.fullmatch(bare):
+            return bare
     return model
 
 
