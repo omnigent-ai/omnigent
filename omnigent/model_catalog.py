@@ -622,7 +622,30 @@ def list_models_for_worker(
     :returns: The worker's :class:`ModelListing`.
     """
     provider = resolve_model_provider(spec, harness)
-    listing = _listing_for_provider(provider, transport=transport)
+    # Pi harnesses use system.ai.* ids (via the Unity Catalog model-services API)
+    # so supervisors see the ids Pi can actually route. Other harnesses use the
+    # serving-endpoints listing which returns databricks-* ids.
+    _pi_harnesses = frozenset({"pi", "pi-native", "native-pi"})
+    canonical = (harness or "").lower().replace("-", "").replace("_", "")
+    use_uc = canonical in {h.replace("-", "").replace("_", "") for h in _pi_harnesses}
+    if use_uc and provider.kind == DATABRICKS_KIND:
+        uc_key = ("uc",) + _listing_cache_key(provider)
+        with _listing_cache_lock:
+            cached = _listing_cache.get(uc_key)
+        if cached is not None:
+            listing = cached
+        else:
+            try:
+                listing = _fetch_databricks_uc_listing(provider, transport=transport)
+                with _listing_cache_lock:
+                    _listing_cache[uc_key] = listing
+            except (httpx.HTTPError, OSError):
+                _logger.debug(
+                    "UC model listing failed for pi harness, falling back", exc_info=True
+                )
+                listing = _listing_for_provider(provider, transport=transport)
+    else:
+        listing = _listing_for_provider(provider, transport=transport)
     if harness is None:
         return listing
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
