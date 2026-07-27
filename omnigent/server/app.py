@@ -2237,6 +2237,7 @@ def create_app(
             "harness_install_enabled": harness_install_enabled,
             "installable_harnesses": installable_harnesses,
             "dictation_available": dictation_available,
+            "artifact_preview_origin": configured_preview_origin or None,
         }
 
     @app.get("/v1/me", response_model=None)  # Union return type (dict | JSONResponse)
