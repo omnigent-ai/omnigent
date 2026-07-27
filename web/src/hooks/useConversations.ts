@@ -973,6 +973,9 @@ export function useTogglePinnedConversation() {
       // Against an old server, persist the pin locally instead of PATCHing a
       // bare key it would store but the upgraded server would drop on read.
       if (!serverCanStorePins()) {
+        // Throws if the local write fails (e.g. storage full) — a sync throw
+        // here rejects the mutation, so `onError` rolls back the optimistic
+        // patch rather than reporting a success that won't survive a reload.
         setLegacyPinnedConversationId(id, pinned);
         // Resolve with a minimal snapshot; the optimistic patch already moved
         // the row and there's no server row to reconcile.

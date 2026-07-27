@@ -45,19 +45,26 @@ export function clearLegacyPinnedConversationIds(): void {
   }
 }
 
-// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Used by the
-// migration to retain only the pins whose server write failed, and by the
-// old-server toggle fallback to add/remove a single pin.
-export function writeLegacyPinnedConversationIds(ids: readonly string[]): void {
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Throws if the
+// browser rejects the write (e.g. storage quota exceeded); no window ⇒ no-op.
+function writeLegacyPinnedConversationIdsOrThrow(ids: readonly string[]): void {
   if (typeof window === "undefined") return;
+  if (ids.length === 0) {
+    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
+  } else {
+    window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
+  }
+}
+
+// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Best-effort:
+// swallows write errors. Used by the migration to retain only the pins whose
+// server write failed — a failure here just means the migration retries on the
+// next load, so it must not surface.
+export function writeLegacyPinnedConversationIds(ids: readonly string[]): void {
   try {
-    if (ids.length === 0) {
-      window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
-    } else {
-      window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
-    }
+    writeLegacyPinnedConversationIdsOrThrow(ids);
   } catch {
-    // Best-effort — a write failure just means the pin isn't persisted locally.
+    // Best-effort — a failed write is retried on the next load.
   }
 }
 
@@ -67,10 +74,16 @@ export function writeLegacyPinnedConversationIds(ids: readonly string[]): void {
  * Used by the pin toggle's old-server fallback so a pin created before the
  * server upgrade survives in localStorage and later migrates like any other
  * pre-upgrade pin.
+ *
+ * Throws if the write fails (unlike the migration's best-effort write): this is
+ * the fallback's ONLY persistence, so a swallowed failure would let the toggle
+ * report success while the pin silently vanishes on reload. Throwing rejects
+ * the mutation instead, so its optimistic patch rolls back and the UI honestly
+ * shows the pin didn't take — matching the server PATCH path's failure handling.
  */
 export function setLegacyPinnedConversationId(id: string, pinned: boolean): void {
   const rest = readPinnedConversationIds().filter((x) => x !== id);
-  writeLegacyPinnedConversationIds(pinned ? [id, ...rest] : rest);
+  writeLegacyPinnedConversationIdsOrThrow(pinned ? [id, ...rest] : rest);
 }
 
 // Titles of sidebar sections the user has collapsed, e.g. ["Archived"].

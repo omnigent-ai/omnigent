@@ -1009,6 +1009,32 @@ describe("useTogglePinnedConversation old-server fallback", () => {
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
     expect(localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY)).toBeNull();
   });
+
+  it("rolls back the optimistic pin when the local write fails (e.g. storage full)", async () => {
+    // The fallback's localStorage write is the pin's ONLY persistence, so a
+    // swallowed failure would report success while the pin vanishes on reload.
+    // It must throw → reject the mutation → roll back the optimistic patch.
+    const { queryClient, rendered } = seedOldServer();
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("QuotaExceededError");
+    });
+
+    try {
+      rendered.result.current.mutate({ id: "conv_x", pinned: true });
+      await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+      // No network write, nothing persisted locally, and the optimistic row was
+      // rolled back — the pinned section is empty again, honestly reflecting
+      // that the pin didn't take.
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(
+        queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations,
+      ).toEqual([]);
+    } finally {
+      setItemSpy.mockRestore();
+    }
+  });
 });
 
 describe("fetchPinnedConversations filter-honored detection", () => {
