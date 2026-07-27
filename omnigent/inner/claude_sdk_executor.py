@@ -266,6 +266,7 @@ class _ResultMessageObj(Protocol):
     """Structural view of ``claude_agent_sdk.ResultMessage``."""
 
     result: str | None
+    is_error: bool | None
     usage: dict[str, Any] | None  # type: ignore[explicit-any]
 
 
@@ -2649,7 +2650,16 @@ class ClaudeSDKExecutor(Executor):
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
-                        if not response_text and result_msg.result:
+                        if result_msg.is_error and result_msg.result:
+                            # Harness-level failure (e.g. expired login). Surface
+                            # as an executor error rather than assistant content.
+                            logger.error(
+                                "claude-sdk ResultMessage is_error=True for agent %r: %s",
+                                self._agent_name,
+                                result_msg.result,
+                            )
+                            terminal_error = result_msg.result
+                        elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
                         if isinstance(raw_usage, dict) and raw_usage:
