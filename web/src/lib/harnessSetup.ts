@@ -142,6 +142,25 @@ export function harnessCredentialFamily(harness: string | null | undefined): str
 }
 
 /**
+ * The provider families whose detected credentials a harness can *adopt*.
+ *
+ * Usually the harness's own family (Claude → anthropic, Codex → openai). Pi is
+ * the exception: it consumes BOTH anthropic and openai (it has no CLI login and
+ * routes through either), and the daemon adopts a detected credential under its
+ * OWN detected family — so a host with only ``$OPENAI_API_KEY`` can still back
+ * Pi. Scoping the adopt filter to this set (not the single write-default family)
+ * surfaces that affordance while still keeping a cross-family key off a harness
+ * that can't use it (e.g. an Anthropic key for Codex). Empty when the harness
+ * isn't UI-authable.
+ */
+export function harnessCredentialAdoptFamilies(harness: string | null | undefined): string[] {
+  const family = harnessCredentialFamily(harness);
+  if (family === null) return [];
+  if (["pi", "pi-native", "native-pi"].includes(harness as string)) return ["anthropic", "openai"];
+  return [family];
+}
+
+/**
  * Whether the UI can write a credential for *harness* on *host* (the M3 auth
  * form vs. a copy-command signpost). True only when the feature is on, the host
  * is online, and the harness is one whose credential omnigent owns (Claude /

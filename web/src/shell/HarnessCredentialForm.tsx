@@ -27,7 +27,7 @@ import {
   type Host,
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
-import { harnessCredentialFamily } from "@/lib/harnessSetup";
+import { harnessCredentialAdoptFamilies } from "@/lib/harnessSetup";
 
 export function HarnessCredentialForm({
   harness,
@@ -53,10 +53,11 @@ export function HarnessCredentialForm({
   // Detection is only meaningful for a live host and this open form.
   const { data: detected } = useDetectedCredentials(host?.host_id, !!host);
   // The detect endpoint is host-wide (both families), so scope the adopt
-  // affordance to THIS harness's family — otherwise we could offer (and
-  // persist) a cross-family key, e.g. an Anthropic key for Codex.
-  const family = harnessCredentialFamily(harness);
-  const adoptable = (detected ?? []).find((d) => d.env_var && d.family === family);
+  // affordance to the families THIS harness can adopt — otherwise we could offer
+  // (and persist) a cross-family key, e.g. an Anthropic key for Codex. Pi
+  // consumes both families, so it can adopt an openai OR an anthropic key.
+  const adoptFamilies = harnessCredentialAdoptFamilies(harness);
+  const adoptable = (detected ?? []).find((d) => d.env_var && adoptFamilies.includes(d.family));
 
   const [apiKey, setApiKey] = useState("");
   const [gatewayUrl, setGatewayUrl] = useState("");

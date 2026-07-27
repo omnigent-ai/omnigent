@@ -113,6 +113,21 @@ describe("HarnessCredentialForm", () => {
     );
   });
 
+  it("offers Pi an openai-family credential too (Pi consumes both families)", () => {
+    // Pi has no CLI login and routes through anthropic OR openai; the daemon
+    // adopts under the detected family, so a host with only $OPENAI_API_KEY can
+    // still back Pi. The adopt filter must not narrow Pi to anthropic-only.
+    detected = [{ family: "openai", source: "$OPENAI_API_KEY", env_var: "OPENAI_API_KEY" }];
+    render(<HarnessCredentialForm harness="pi" host={HOST} command={null} onDone={vi.fn()} />);
+    const adopt = screen.getByTestId("harness-credential-adopt");
+    expect(adopt.textContent).toContain("$OPENAI_API_KEY");
+    fireEvent.click(adopt.querySelector("button")!);
+    expect(mutateMock).toHaveBeenCalledWith(
+      { harness: "pi", kind: "adopt", env_var: "OPENAI_API_KEY" },
+      expect.anything(),
+    );
+  });
+
   it("shows no adopt row when nothing is detected", () => {
     detected = [];
     render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);

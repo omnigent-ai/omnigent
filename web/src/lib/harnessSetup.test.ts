@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   harnessAuthableOnHost,
+  harnessCredentialAdoptFamilies,
   harnessCredentialFamily,
   harnessInstallableOnHost,
   harnessUnavailableReasonOnHost,
@@ -162,6 +163,25 @@ describe("harnessCredentialFamily", () => {
     expect(harnessCredentialFamily("cursor-native")).toBe(null);
     expect(harnessCredentialFamily(null)).toBe(null);
     expect(harnessCredentialFamily(undefined)).toBe(null);
+  });
+});
+
+describe("harnessCredentialAdoptFamilies", () => {
+  it("returns the single own family for Claude/Codex", () => {
+    expect(harnessCredentialAdoptFamilies("claude-native")).toEqual(["anthropic"]);
+    expect(harnessCredentialAdoptFamilies("codex")).toEqual(["openai"]);
+    expect(harnessCredentialAdoptFamilies("codex-native")).toEqual(["openai"]);
+  });
+
+  it("returns BOTH families for Pi (it consumes anthropic + openai)", () => {
+    expect(harnessCredentialAdoptFamilies("pi")).toEqual(["anthropic", "openai"]);
+    expect(harnessCredentialAdoptFamilies("pi-native")).toEqual(["anthropic", "openai"]);
+  });
+
+  it("returns an empty list for harnesses the UI can't authenticate", () => {
+    expect(harnessCredentialAdoptFamilies("opencode-native")).toEqual([]);
+    expect(harnessCredentialAdoptFamilies(null)).toEqual([]);
+    expect(harnessCredentialAdoptFamilies(undefined)).toEqual([]);
   });
 });
 
