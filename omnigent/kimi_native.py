@@ -110,10 +110,16 @@ class PreparedKimiTerminal:
     cold_resumed: bool = False
 
 
-def _configured_kimi_command(env: Mapping[str, str]) -> str:
-    """Return the configured kimi executable name/path from *env*."""
-    value = env.get(_KIMI_PATH_ENV, "").strip()
-    return value or _DEFAULT_KIMI_COMMAND
+def _kimi_command_candidates(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Return kimi executable candidates in preference order."""
+    configured = env.get(_KIMI_PATH_ENV, "").strip()
+    if configured:
+        return (configured,)
+
+    home = env.get("HOME", "").strip()
+    official_home = Path(home) if home else Path.home()
+    official = official_home / ".kimi-code" / "bin" / "kimi"
+    return (str(official), _DEFAULT_KIMI_COMMAND)
 
 
 def resolve_kimi_executable(
@@ -131,15 +137,15 @@ def resolve_kimi_executable(
     """
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
-    command = _configured_kimi_command(env)
-    resolved = which(command)
-    if resolved is None:
-        raise click.ClickException(
-            "Native Kimi requires the 'kimi' CLI on PATH. Install it with: "
-            "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash, then "
-            f"run 'kimi login'. You can also set {_KIMI_PATH_ENV}=/path/to/kimi."
-        )
-    return resolved
+    for command in _kimi_command_candidates(env):
+        resolved = which(command)
+        if resolved is not None:
+            return resolved
+    raise click.ClickException(
+        "Native Kimi requires the official Kimi Code install or a 'kimi' CLI on PATH. "
+        "Install it with: curl -fsSL https://code.kimi.com/kimi-code/install.sh | "
+        f"bash, then run 'kimi login'. You can also set {_KIMI_PATH_ENV}=/path/to/kimi."
+    )
 
 
 def build_kimi_launch(

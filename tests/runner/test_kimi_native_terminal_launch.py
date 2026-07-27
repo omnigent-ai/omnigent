@@ -22,6 +22,79 @@ from omnigent.runner.resource_registry import KIMI_NATIVE_TERMINAL_ROLE
 from tests.runner.helpers import NullServerClient
 
 
+def test_kimi_executable_prefers_official_install_over_legacy_path(
+    tmp_path: Path,
+) -> None:
+    """The current Kimi Code install wins when PATH still exposes kimi-cli."""
+    import omnigent.kimi_native as kimi_native
+
+    official = tmp_path / ".kimi-code" / "bin" / "kimi"
+    legacy = "/Users/test/.local/bin/kimi"
+    resolutions = {
+        str(official): str(official),
+        "kimi": legacy,
+    }
+    looked_up: list[str] = []
+
+    def _which(command: str) -> str | None:
+        looked_up.append(command)
+        return resolutions.get(command)
+
+    resolved = kimi_native.resolve_kimi_executable(
+        env={"HOME": str(tmp_path)},
+        which=_which,
+    )
+
+    assert resolved == str(official)
+    assert looked_up == [str(official)]
+
+
+def test_kimi_executable_falls_back_to_path_when_official_install_is_absent(
+    tmp_path: Path,
+) -> None:
+    """PATH remains compatible for hosts without the current Kimi install."""
+    import omnigent.kimi_native as kimi_native
+
+    official = tmp_path / ".kimi-code" / "bin" / "kimi"
+    looked_up: list[str] = []
+
+    def _which(command: str) -> str | None:
+        looked_up.append(command)
+        return "/opt/bin/kimi" if command == "kimi" else None
+
+    resolved = kimi_native.resolve_kimi_executable(
+        env={"HOME": str(tmp_path)},
+        which=_which,
+    )
+
+    assert resolved == "/opt/bin/kimi"
+    assert looked_up == [str(official), "kimi"]
+
+
+def test_kimi_executable_honors_explicit_override_before_official_install(
+    tmp_path: Path,
+) -> None:
+    """An explicit operator path remains authoritative."""
+    import omnigent.kimi_native as kimi_native
+
+    looked_up: list[str] = []
+
+    def _which(command: str) -> str | None:
+        looked_up.append(command)
+        return command
+
+    resolved = kimi_native.resolve_kimi_executable(
+        env={
+            "HOME": str(tmp_path),
+            "OMNIGENT_KIMI_PATH": "/opt/custom/kimi",
+        },
+        which=_which,
+    )
+
+    assert resolved == "/opt/custom/kimi"
+    assert looked_up == ["/opt/custom/kimi"]
+
+
 @pytest.mark.asyncio
 async def test_kimi_launch_wires_current_state_and_approval_runtime(
     tmp_path: Path,
