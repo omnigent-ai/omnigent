@@ -4955,6 +4955,95 @@ def test_forwarder_posts_user_message_on_assistant_item_started(tmp_path: Path) 
     assert forwarder_state.has_posted_user_message("turn_123")
 
 
+def test_forwarder_posts_user_message_on_reasoning_item_started(tmp_path: Path) -> None:
+    """A reasoning item recovers the user before its first delta streams."""
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    resume_response = {
+        "result": {
+            "thread": {
+                "id": "thread_123",
+                "turns": [
+                    {
+                        "id": "turn_123",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "item-1",
+                                "content": [{"type": "text", "text": "hello codex"}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+    }
+    fake_client = _FakeCodexAppServerClient(response=resume_response)
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_123",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                event={
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": {"type": "reasoning", "id": "reasoning_1"},
+                    },
+                },
+                expected_thread_id="thread_123",
+                forwarder_state=forwarder_state,
+            )
+            await codex_native_forwarder._handle_event(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                usage_coalescer=_usage_coalescer(client),
+                elicitation_tracker=_elicitation_tracker(),
+                event={
+                    "method": "item/reasoning/summaryTextDelta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "reasoning_1",
+                        "delta": "Planning repository inspection",
+                    },
+                },
+                expected_thread_id="thread_123",
+                forwarder_state=forwarder_state,
+            )
+
+    asyncio.run(run())
+
+    assert [event["type"] for event in posted] == [
+        "external_conversation_item",
+        "external_output_reasoning_delta",
+    ]
+    assert posted[0]["data"]["item_data"]["role"] == "user"
+    assert posted[1]["data"] == {
+        "delta": "Planning repository inspection",
+        "started": True,
+    }
+    assert [method for method, _ in fake_client.requests] == ["thread/resume"]
+    assert forwarder_state.has_posted_user_message("turn_123")
+
+
 def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
     """
     Codex app-server completed message items are translated into

@@ -7534,6 +7534,36 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     controller.abort();
   });
 
+  it("flushes buffered reasoning before inserting a native text preview", async () => {
+    useChatStore.setState({
+      conversationId: "conv_reasoning_preview",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_reasoning_preview");
+
+    sink.push(sse("response.created", { id: "resp_l", status: "in_progress", output: [] }));
+    sink.push(sse("response.reasoning.started", {}));
+    sink.push(
+      sse("response.reasoning_summary_text.delta", {
+        delta: "Inspecting repository files",
+      }),
+    );
+    sink.push(nativeDelta("m1", 0, "I’ll inspect the repository.", false));
+    await tick();
+
+    const blocks = useChatStore.getState().blocks;
+    const reasoningIdx = blocks.findIndex(
+      (block) => block.type === "reasoning_chunk" && block.text === "Inspecting repository files",
+    );
+    const previewIdx = blocks.findIndex((block) => block.ctx.itemId === "live:m1");
+    expect(reasoningIdx).toBeGreaterThanOrEqual(0);
+    expect(previewIdx).toBeGreaterThan(reasoningIdx);
+    expect(blocks.filter((block) => block.type === "text_chunk")).toEqual([]);
+
+    controller.abort();
+  });
+
   it("replaces the provisional in place with the authoritative item", async () => {
     useChatStore.setState({
       conversationId: "conv_live2",

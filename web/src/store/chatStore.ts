@@ -3458,13 +3458,11 @@ function applyLiveToolOutputDelta(set: Setter, callId: string, delta: string): v
 /**
  * Wrap a parsed event stream, diverting terminal-observed live deltas.
  *
- * A `text_delta` carrying a `messageId` is claude-native live streaming:
- * it is folded into its provisional preview block in `blocks` (see
- * `applyLiveDelta`) and NOT yielded downstream, because the `BlockStream`
- * reducer's response-scoped text path would otherwise emit a stray bubble
- * (these deltas carry no response id and their authoritative text arrives
- * as a separate committed item). Every other event passes through
- * untouched.
+ * A `text_delta` carrying a `messageId` is terminal-native live streaming.
+ * It first passes through `BlockStream` as an ordering fence so buffered
+ * reasoning/tool output closes, then folds into its provisional preview block
+ * in `blocks` (see `applyLiveDelta`). `BlockStream` suppresses native delta
+ * text itself because the authoritative item arrives separately.
  *
  * Deltas whose `messageId` has been retired (its preview already
  * superseded by the authoritative `text_done`) are dropped: a message's
@@ -3489,11 +3487,16 @@ async function* tapLiveDeltas(
   id: string,
   retired: Set<string>,
   lastIndex: Map<string, number>,
+  flushBeforePreview: () => void,
   set: Setter,
   get: Getter,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
+      // Let BlockStream flush reasoning/tool boundaries before the direct
+      // store mutation inserts the provisional assistant preview.
+      yield ev;
+      flushBeforePreview();
       if (get().conversationId === id && !retired.has(ev.messageId)) {
         applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
       }
@@ -3555,15 +3558,6 @@ export async function pumpStreamEvents(
   const retiredLiveMessages = new Set<string>();
   // Per-message high-water chunk index, for delta duplicate suppression.
   const liveLastIndex = new Map<string, number>();
-  const events = tapLiveDeltas(
-    tapSessionEvents(rawEvents),
-    id,
-    retiredLiveMessages,
-    liveLastIndex,
-    set,
-    get,
-  );
-
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
   // (one SSE connection); bounded by item count like `blocks` itself.
@@ -3617,6 +3611,16 @@ export async function pumpStreamEvents(
       return { ...(extra ?? {}), blocks: [...s.blocks, ...fresh] };
     });
   };
+
+  const events = tapLiveDeltas(
+    tapSessionEvents(rawEvents),
+    id,
+    retiredLiveMessages,
+    liveLastIndex,
+    flush,
+    set,
+    get,
+  );
 
   try {
     for await (const block of stream.reduce(events)) {

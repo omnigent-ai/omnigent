@@ -462,6 +462,11 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       }
       state.pendingTools.clear();
 
+      // Terminal-native deltas render through the chat store's provisional
+      // preview path. This reducer still receives them as ordering fences so
+      // buffered reasoning/tool output closes before that preview is inserted.
+      if (event.messageId !== undefined) return;
+
       state.inText = true;
       state.accumulated += event.delta;
       state.fullText += event.delta;

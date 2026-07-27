@@ -2404,18 +2404,10 @@ async def _handle_event(
             await _post_compaction_status(
                 client, route_session_id, "in_progress", forwarder_state=forwarder_state
             )
-        elif isinstance(item, dict) and item.get("type") == "agentMessage":
-            # Post the turn's user message NOW — before the assistant's text
-            # deltas start streaming. The live ``userMessage`` event can be
-            # missed on a fresh thread (subscription lands after it fires);
-            # if recovery waited until the assistant's ``item/completed``,
-            # the deltas would stream into a transient assistant bubble that
-            # renders ABOVE the still-pending user bubble until the turn
-            # reconciles. Recovering at assistant-start commits the user
-            # message first (it has already materialized in the rollout by
-            # now), so the web UI renders the question above the reply. The
-            # ``item/completed`` guard below remains the backstop for the
-            # resume-backfill path, which replays only ``item/completed``.
+        elif isinstance(item, dict) and item.get("type") in {"reasoning", "agentMessage"}:
+            # Recover before the turn's first visible reasoning/text delta.
+            # The live userMessage can be missed when a fresh subscription
+            # lands after it fires, but it has materialized by item/started.
             await _ensure_user_message_posted(client, route_session_id, params, forwarder_state)
         elif isinstance(item, dict) and item.get("type") == "commandExecution":
             call_id = await _post_tool_call_item(client, route_session_id, params, item)
@@ -5018,8 +5010,8 @@ async def _ensure_user_message_posted(
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
-    :param params: Codex ``item/completed`` params for the assistant
-        message whose turn's user message must already be posted.
+    :param params: Codex item params for output whose turn's user message
+        must already be posted.
     :param forwarder_state: Mutable forwarder state tracking posted user
         turns and holding the Codex app-server client.
     :returns: None.
