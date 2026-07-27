@@ -70,7 +70,7 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # Provider id for the tertiary OpenAI Completions provider (non-GPT models that
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
-_PI_GEMINI_PROVIDER_ID = "omnigent-gemini"
+_PI_MLFLOW_PROVIDER_ID = "omnigent-mlflow"
 
 # Keyword fragments that identify Databricks serving-endpoint models which
 # require the Responses API. These models don't send finish_reason via
@@ -286,7 +286,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             api_key, f"{host}/serving-endpoints", completions_models, api_type="openai-completions"
         )
     if gemini_models:
-        additional[_PI_GEMINI_PROVIDER_ID] = _databricks_openai_provider(
+        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
             api_key, f"{host}/ai-gateway/mlflow/v1", gemini_models, api_type="openai-completions"
         )
     return PiProviderConfig(
@@ -515,23 +515,23 @@ def _fetch_pi_model_lists(
         # from that channel. GLM/kimi/inkling now use Responses API, not needed.
         if "deepseek" in name_lower:
             entry["reasoning"] = True
+        needs_responses = (
+            has_responses
+            or _needs_responses_api(name_lower)
+            or any(kw in name_lower for kw in _SYSTEM_AI_MODEL_KEYWORDS)
+        )
         if "claude" in name_lower:
             claude.append(entry)
-        elif "gemini" in name_lower:
-            # Gemini uses AI Gateway mlflow/v1/chat/completions; system.ai.* ids
-            # don't work at serving-endpoints and Responses API returns 400.
-            if not _unsupported_in_pi(name_lower):
-                gemini.append(entry)
-        elif (
-            name_lower.startswith("system.ai.")
-            or has_responses
-            or _needs_responses_api(name_lower)
-        ):
-            # All system.ai.* models use the AI Gateway (/ai-gateway/codex/v1).
-            # system.ai.* ids are not valid at /serving-endpoints — they need the
-            # Gateway regardless of whether UC lists openai/v1/responses support.
+        elif _unsupported_in_pi(name_lower):
+            pass  # exclude (e.g. gemini-2-5 thinking models)
+        elif needs_responses:
+            # Responses API: GPT models that need it + kimi/inkling/qwen3/glm keywords.
             gpt_responses.append(entry)
-        elif not _unsupported_in_pi(name_lower):
+        elif name_lower.startswith("system.ai."):
+            # Other system.ai.* ids (Gemini, Llama) → mlflow gateway;
+            # system.ai.* ids are not valid at /serving-endpoints.
+            gemini.append(entry)
+        else:
             completions.append(entry)
 
     if not claude and not gpt_responses and not completions:
@@ -779,7 +779,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
             api_key, workspace_completions_url, completions_models, api_type="openai-completions"
         )
     if gemini_models and workspace_mlflow_url:
-        additional[_PI_GEMINI_PROVIDER_ID] = _databricks_openai_provider(
+        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
             api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
         )
     return PiProviderConfig(

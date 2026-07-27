@@ -797,8 +797,8 @@ def _build_models_json(
                 "authHeader": True,
                 "models": _DATABRICKS_ANTHROPIC_MODELS,
             },
-            # Gemini models → AI Gateway mlflow/v1/chat/completions using system.ai.* ids.
-            "databricks-gemini": {
+            # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
+            "databricks-mlflow": {
                 "baseUrl": mlflow_gateway_url,
                 "apiKey": token,
                 "api": "openai-completions",
@@ -891,10 +891,11 @@ def _pi_provider_for_model(model: str) -> str:
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
-    if "gemini" in lower:
-        return "databricks-gemini"
-    if "gpt" in lower or "system.ai." in lower:
+    if "gpt" in lower:
         return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
+    if lower.startswith("system.ai."):
+        # system.ai.* ids: kimi/inkling/qwen3/glm → Responses API; others → mlflow gateway.
+        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks-mlflow"
     return "databricks-completions"
 
 

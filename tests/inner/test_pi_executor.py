@@ -457,7 +457,7 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIs(entry.get("reasoning"), True, model)
 
     def test_dynamic_non_reasoning_model_has_no_reasoning_flag(self):
-        model = "databricks-gemini-2-5-pro"
+        model = "databricks-mlflow-2-5-pro"
         result = _build_models_json("https://host.example.com", "tok", model=model)
         provider = result["providers"][_pi_provider_for_model(model)]
         entry = next(e for e in provider["models"] if e["id"] == model)
