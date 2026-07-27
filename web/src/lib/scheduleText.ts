@@ -64,7 +64,8 @@ export function formatClockTime(hour: number, minute: number): string {
 
 /**
  * Format the time until the SERVER's authoritative next-run instant as a
- * compact relative delta, e.g. `in 30m`, `in 15h`, `in 6d`, or `soon`.
+ * relative delta in full words, e.g. `in 8 mins`, `in 3 hours`, `in 2 days`,
+ * or `soon`. This is the user-facing next-run label in the Tasks list.
  *
  * `iso` is the server's `next_run_at` (the live scheduler's authoritative next
  * fire). We compute ONLY the delta (`nextRunAt − now`) and format how far away
@@ -74,8 +75,10 @@ export function formatClockTime(hour: number, minute: number): string {
  * INTERVAL>1 rules); here the instant comes from the server and only the
  * "how far away" is derived, so the removal rule is not violated.
  *
- * Buckets (floor of the chosen unit — standard time-remaining convention):
- *   < 60 min → `in Xm` (minimum `in 1m`), < 24 h → `in Xh`, else `in Xd`.
+ * Buckets (floor of the chosen unit — standard time-remaining convention),
+ * with a singular noun when the value is exactly 1:
+ *   < 60 min → `in N min(s)` (minimum `in 1 min`), < 24 h → `in N hour(s)`,
+ *   else `in N day(s)`.
  * A delta at or below ~0 (imminent / just passed due to clock skew) → `soon`.
  * Returns `null` for a null / unparseable `iso` so the caller renders nothing.
  *
@@ -91,104 +94,16 @@ export function formatNextRunAt(
   if (Number.isNaN(instant.getTime())) return null;
 
   const deltaMs = instant.getTime() - now.getTime();
-  // Imminent or just-passed (timing skew): don't render a "0m" / negative delta.
+  // Imminent or just-passed (timing skew): don't render a "0 mins" / negative delta.
   if (deltaMs < MIN_MS) return "soon";
-  if (deltaMs < HOUR_MS) return `in ${Math.floor(deltaMs / MIN_MS)}m`;
-  if (deltaMs < DAY_MS) return `in ${Math.floor(deltaMs / HOUR_MS)}h`;
-  return `in ${Math.floor(deltaMs / DAY_MS)}d`;
+  if (deltaMs < HOUR_MS) return `in ${pluralize(Math.floor(deltaMs / MIN_MS), "min")}`;
+  if (deltaMs < DAY_MS) return `in ${pluralize(Math.floor(deltaMs / HOUR_MS), "hour")}`;
+  return `in ${pluralize(Math.floor(deltaMs / DAY_MS), "day")}`;
 }
 
-/**
- * Format the SERVER's authoritative next-run instant as an ABSOLUTE wall-clock
- * time, e.g. `Today at 2:30 PM`, `Tomorrow at 8:00 AM`, or `Jul 26, 8:00 AM`
- * for anything further out. This is the user-facing next-run label (replacing
- * the relative `formatNextRunAt` delta in the Tasks list).
- *
- * Like `formatNextRunAt`, this only FORMATS the server value (`next_run_at`) —
- * it never recomputes WHICH instant is next on the client (a client-recomputed
- * instant can't match the server anchor for INTERVAL>1 rules). The instant is
- * server-authoritative; we only choose how to render it.
- *
- * The instant is rendered in the task's IANA `timezone` when supplied (so
- * "8:00 AM America/New_York" reads as 8:00 AM regardless of the viewer's zone),
- * falling back to the viewer's local zone when `timezone` is undefined. The
- * Today/Tomorrow bucketing is likewise computed in that same zone, so the
- * calendar-day label agrees with the rendered time.
- *
- * Returns `null` for a null / unparseable `iso` so the caller renders nothing
- * (paused / unarmed tasks have a null `next_run_at`).
- *
- * @param iso The server's `next_run_at` ISO string, or `null`.
- * @param timezone The task's IANA timezone; falls back to local when omitted.
- * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
- */
-export function formatNextRunAtAbsolute(
-  iso: string | null | undefined,
-  timezone?: string,
-  now: Date = new Date(),
-): string | null {
-  if (!iso) return null;
-  const instant = new Date(iso);
-  if (Number.isNaN(instant.getTime())) return null;
-
-  const timeStr = safeFormat(instant, timezone, {
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  });
-
-  const dayDelta = civilDayInZone(instant, timezone) - civilDayInZone(now, timezone);
-  if (dayDelta === 0) return `Today at ${timeStr}`;
-  if (dayDelta === 1) return `Tomorrow at ${timeStr}`;
-
-  const dateStr = safeFormat(instant, timezone, { month: "short", day: "numeric" });
-  return `${dateStr}, ${timeStr}`;
-}
-
-/** `Intl.DateTimeFormat` in en-US, tolerating an invalid `timeZone` by
- * falling back to the viewer's local zone rather than throwing. */
-function safeFormat(
-  date: Date,
-  timezone: string | undefined,
-  options: Intl.DateTimeFormatOptions,
-): string {
-  try {
-    return new Intl.DateTimeFormat("en-US", { timeZone: timezone, ...options }).format(date);
-  } catch {
-    return new Intl.DateTimeFormat("en-US", options).format(date);
-  }
-}
-
-/**
- * The calendar day `date` falls on in `timezone` (local when omitted), as a
- * whole day-number since the epoch. Subtracting two of these gives the count of
- * calendar days between them in that zone, which drives the Today/Tomorrow
- * bucketing independent of the instant's absolute delta.
- */
-function civilDayInZone(date: Date, timezone: string | undefined): number {
-  let y: number;
-  let m: number;
-  let d: number;
-  try {
-    const parts = new Intl.DateTimeFormat("en-CA", {
-      timeZone: timezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    }).formatToParts(date);
-    const map: Record<string, number> = {};
-    for (const p of parts) {
-      if (p.type !== "literal") map[p.type] = Number(p.value);
-    }
-    y = map.year!;
-    m = map.month!;
-    d = map.day!;
-  } catch {
-    y = date.getFullYear();
-    m = date.getMonth() + 1;
-    d = date.getDate();
-  }
-  return Math.floor(Date.UTC(y, m - 1, d) / DAY_MS);
+/** `1 min` / `8 mins` — singular noun only when the count is exactly 1. */
+function pluralize(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */

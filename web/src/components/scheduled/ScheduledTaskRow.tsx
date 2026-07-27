@@ -2,17 +2,17 @@
 // rounded corners + internal padding; the list stacks these with a gap). Layout:
 // bold task title on line 1 (+ a small "Paused" pill when paused), a single
 // muted subline on line 2 with the human-readable schedule summary ("Weekdays
-// at 8:00 AM") followed by the next-run time ("· Next run Tomorrow at 8:00 AM")
-// when armed.
+// at 8:00 AM") followed by the next-run time ("· Next run in 3 hours") when
+// armed.
 //
 // The next-run time is derived from the scheduler's authoritative `nextRunAt`
-// (an ISO string the server computes): we only FORMAT that instant as an
-// absolute wall-clock time, never recompute WHICH instant is next on the client
-// — so the "no client countdown" rule (a client-recomputed instant can't match
-// the server anchor for INTERVAL>1 rules) is not violated. Paused rows are NOT
-// dimmed — the title stays fully legible and the pill is the sole paused
-// signal. A hover-revealed ellipsis (⋯) action menu (Run now / Pause /
-// Resume / Edit / Delete) sits on the right.
+// (an ISO string the server computes): we only FORMAT the delta from that
+// instant (a full-words "in N hours / days" label), never recompute WHICH
+// instant is next on the client — so the "no client countdown" rule (a
+// client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
+// is not violated. Paused rows are NOT dimmed — the title stays fully legible
+// and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
+// menu (Run now / Pause / Resume / Edit / Delete) sits on the right.
 
 import { useMemo, useState } from "react";
 import {
@@ -31,7 +31,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { describeSchedule, formatNextRunAtAbsolute } from "@/lib/scheduleText";
+import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
@@ -55,10 +55,7 @@ export function ScheduledTaskRow({
   // (active tasks only — a paused task has null nextRunAt). We only format the
   // server value; we never recompute next-run on the client.
   const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
-  const nextRun = useMemo(
-    () => formatNextRunAtAbsolute(task.nextRunAt, task.timezone),
-    [task.nextRunAt, task.timezone],
-  );
+  const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt), [task.nextRunAt]);
 
   return (
     <div

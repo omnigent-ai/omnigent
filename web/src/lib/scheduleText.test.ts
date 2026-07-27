@@ -6,13 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 import { RRule, rrulestr } from "rrule";
-import {
-  describeSchedule,
-  formatClockTime,
-  formatNextRunAt,
-  formatNextRunAtAbsolute,
-  nextRunAtMs,
-} from "./scheduleText";
+import { describeSchedule, formatClockTime, formatNextRunAt, nextRunAtMs } from "./scheduleText";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
@@ -359,7 +353,7 @@ describe("nextRunAtMs", () => {
   });
 });
 
-describe("formatNextRunAt (compact relative delta from the server's next-run)", () => {
+describe("formatNextRunAt (relative delta from the server's next-run, full words)", () => {
   // A fixed "now" so the delta buckets are deterministic.
   const NOW = new Date("2026-03-10T12:00:00Z"); // Tue 2026-03-10, 12:00 UTC
   const iso = (ms: number) => new Date(NOW.getTime() + ms).toISOString();
@@ -374,26 +368,29 @@ describe("formatNextRunAt (compact relative delta from the server's next-run)", 
     expect(formatNextRunAt("not-a-date", NOW)).toBeNull();
   });
 
-  it("formats a sub-hour delta in minutes (floor)", () => {
-    expect(formatNextRunAt(iso(30 * MIN), NOW)).toBe("in 30m");
-    // Floor: 59m59s → "in 59m".
-    expect(formatNextRunAt(iso(59 * MIN + 59_000), NOW)).toBe("in 59m");
-    // Minimum bucket is 1m (just over the 'soon' threshold).
-    expect(formatNextRunAt(iso(MIN), NOW)).toBe("in 1m");
+  it("formats a sub-hour delta in minutes (floor), pluralizing", () => {
+    expect(formatNextRunAt(iso(8 * MIN), NOW)).toBe("in 8 mins");
+    expect(formatNextRunAt(iso(30 * MIN), NOW)).toBe("in 30 mins");
+    // Floor: 59m59s → "in 59 mins".
+    expect(formatNextRunAt(iso(59 * MIN + 59_000), NOW)).toBe("in 59 mins");
+    // Minimum bucket is 1 min (just over the 'soon' threshold), singular.
+    expect(formatNextRunAt(iso(MIN), NOW)).toBe("in 1 min");
   });
 
-  it("formats a sub-day delta in hours (floor)", () => {
-    expect(formatNextRunAt(iso(HR), NOW)).toBe("in 1h");
-    expect(formatNextRunAt(iso(15 * HR), NOW)).toBe("in 15h");
-    // Floor: 23h59m → "in 23h".
-    expect(formatNextRunAt(iso(23 * HR + 59 * MIN), NOW)).toBe("in 23h");
+  it("formats a sub-day delta in hours (floor), pluralizing", () => {
+    expect(formatNextRunAt(iso(HR), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(3 * HR), NOW)).toBe("in 3 hours");
+    expect(formatNextRunAt(iso(15 * HR), NOW)).toBe("in 15 hours");
+    // Floor: 23h59m → "in 23 hours".
+    expect(formatNextRunAt(iso(23 * HR + 59 * MIN), NOW)).toBe("in 23 hours");
   });
 
-  it("formats a multi-day delta in days (floor)", () => {
-    expect(formatNextRunAt(iso(DAY), NOW)).toBe("in 1d");
-    expect(formatNextRunAt(iso(6 * DAY), NOW)).toBe("in 6d");
-    // Floor: 6d23h → "in 6d".
-    expect(formatNextRunAt(iso(6 * DAY + 23 * HR), NOW)).toBe("in 6d");
+  it("formats a multi-day delta in days (floor), pluralizing", () => {
+    expect(formatNextRunAt(iso(DAY), NOW)).toBe("in 1 day");
+    expect(formatNextRunAt(iso(2 * DAY), NOW)).toBe("in 2 days");
+    expect(formatNextRunAt(iso(6 * DAY), NOW)).toBe("in 6 days");
+    // Floor: 6d23h → "in 6 days".
+    expect(formatNextRunAt(iso(6 * DAY + 23 * HR), NOW)).toBe("in 6 days");
   });
 
   it("returns 'soon' for an imminent or just-passed delta (< 1 minute)", () => {
@@ -403,54 +400,7 @@ describe("formatNextRunAt (compact relative delta from the server's next-run)", 
   });
 
   it("bucket boundaries: 60m → hours, 24h → days", () => {
-    expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1h");
-    expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1d");
-  });
-});
-
-describe("formatNextRunAtAbsolute (absolute wall-clock from the server's next-run)", () => {
-  // A fixed "now" so the Today/Tomorrow bucketing is deterministic. We pin the
-  // task timezone to UTC so the rendered clock time equals the ISO wall time.
-  const NOW = new Date("2026-03-10T12:00:00Z"); // Tue 2026-03-10, 12:00 UTC
-  const TZ = "UTC";
-
-  it("returns null for null / empty / unparseable input", () => {
-    expect(formatNextRunAtAbsolute(null, TZ, NOW)).toBeNull();
-    expect(formatNextRunAtAbsolute(undefined, TZ, NOW)).toBeNull();
-    expect(formatNextRunAtAbsolute("", TZ, NOW)).toBeNull();
-    expect(formatNextRunAtAbsolute("not-a-date", TZ, NOW)).toBeNull();
-  });
-
-  it("formats an instant later TODAY as 'Today at H:MM AM/PM'", () => {
-    expect(formatNextRunAtAbsolute("2026-03-10T14:30:00Z", TZ, NOW)).toBe("Today at 2:30 PM");
-    // Earlier same calendar day (before `now`) is still labelled Today.
-    expect(formatNextRunAtAbsolute("2026-03-10T08:00:00Z", TZ, NOW)).toBe("Today at 8:00 AM");
-  });
-
-  it("formats an instant on the NEXT calendar day as 'Tomorrow at H:MM AM/PM'", () => {
-    expect(formatNextRunAtAbsolute("2026-03-11T08:00:00Z", TZ, NOW)).toBe("Tomorrow at 8:00 AM");
-    // Just after midnight the next day is still Tomorrow (calendar-day based,
-    // not a 24h delta).
-    expect(formatNextRunAtAbsolute("2026-03-11T00:15:00Z", TZ, NOW)).toBe("Tomorrow at 12:15 AM");
-  });
-
-  it("formats an instant further out as 'Mon D, H:MM AM/PM'", () => {
-    expect(formatNextRunAtAbsolute("2026-03-15T08:00:00Z", TZ, NOW)).toBe("Mar 15, 8:00 AM");
-    expect(formatNextRunAtAbsolute("2026-07-26T20:00:00Z", TZ, NOW)).toBe("Jul 26, 8:00 PM");
-  });
-
-  it("renders in the task timezone, not the viewer's", () => {
-    // Mar 11 2026 is EDT (UTC-4, DST began Mar 8), so 8:00 AM America/New_York
-    // is 12:00 UTC. Formatted in the task's NY zone it reads 8:00 AM; the
-    // Tomorrow bucket is computed in that zone too.
-    expect(formatNextRunAtAbsolute("2026-03-11T12:00:00Z", "America/New_York", NOW)).toBe(
-      "Tomorrow at 8:00 AM",
-    );
-  });
-
-  it("falls back to a legal render when timezone is omitted or invalid", () => {
-    // No throw; produces a non-null label using the viewer's local zone.
-    expect(formatNextRunAtAbsolute("2026-03-11T08:00:00Z", undefined, NOW)).not.toBeNull();
-    expect(formatNextRunAtAbsolute("2026-03-11T08:00:00Z", "Not/AZone", NOW)).not.toBeNull();
+    expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1 day");
   });
 });
