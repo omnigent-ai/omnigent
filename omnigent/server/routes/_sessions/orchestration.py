@@ -3167,6 +3167,7 @@ async def _forward_native_subagent_terminal_failure(
 def _build_native_terminal_message_event(
     conv: Conversation,
     body: SessionEventInput,
+    model_override: str | None = None,
 ) -> dict[str, Any]:
     """
     Build the runner event that delivers a web message to a native TUI.
@@ -3175,6 +3176,11 @@ def _build_native_terminal_message_event(
     :param body: Validated Sessions API message event, e.g.
         ``{"type": "message", "data": {"role": "user",
         "content": [{"type": "input_text", "text": "Hi"}]}}``.
+    :param model_override: Routed model to apply for THIS turn, e.g.
+        ``"databricks-claude-sonnet-5"``. Carried in-band on the message
+        so the claude-native executor applies ``/model`` and injects the
+        message under one lock (no separate racing ``model_change``
+        event). ``None`` when routing did not pick a model.
     :returns: Harness ``MessageEvent`` body for the runner-local
         native terminal harness, including ``agent_id`` so the runner
         can resolve the harness spec on the first message.
@@ -3187,7 +3193,7 @@ def _build_native_terminal_message_event(
             f"{display_name} terminal sessions accept only user message events",
             code=ErrorCode.INVALID_INPUT,
         )
-    return {
+    event: dict[str, Any] = {
         "type": "message",
         "role": "user",
         "content": data.content,
@@ -3202,6 +3208,13 @@ def _build_native_terminal_message_event(
         # which always includes it.
         "agent_id": conv.agent_id,
     }
+    # Ride the routed model in-band as ``model_override`` (extra field the
+    # harness MessageEvent forwards into ExecutorConfig.model). The
+    # claude-native executor applies the ``/model`` switch and the message
+    # inject as ONE locked step, so the switch can't race the message.
+    if model_override is not None:
+        event["model_override"] = model_override
+    return event
 
 
 async def _forward_native_terminal_message(
@@ -3211,6 +3224,7 @@ async def _forward_native_terminal_message(
     body: SessionEventInput,
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    model_override: str | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -3230,12 +3244,16 @@ async def _forward_native_terminal_message(
         content blocks.
     :param artifact_store: Optional binary content store for
         fetching file bytes during resolution.
+    :param model_override: Routed model to apply for this turn, carried
+        in-band on the message so the executor applies ``/model`` and the
+        inject under one lock (no separate racing ``model_change``).
+        ``None`` when routing did not pick a model.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
     display_name, _, _ = _native_terminal_runtime(conv)
-    event = _build_native_terminal_message_event(conv, body)
+    event = _build_native_terminal_message_event(conv, body, model_override=model_override)
     _logger.info(
         "%s terminal message forward starting: session=%s block_types=%s",
         display_name,
@@ -3938,22 +3956,14 @@ async def _dispatch_session_event_to_runner_impl(
                             session_id,
                             exc_info=True,
                         )
-                    # For claude-native: inject /model into the running
-                    # terminal so the change takes effect immediately
-                    # (model_override alone is only applied at spawn).
-                    try:
-                        await runner_client.post(
-                            f"/v1/sessions/{session_id}/events",
-                            json={"type": "model_change", "model": _native_routed_model},
-                            timeout=5.0,
-                        )
-                    except httpx.HTTPError:
-                        _logger.debug(
-                            "smart_routing: model_change forward failed for session=%s "
-                            "(runner may not support it yet)",
-                            session_id,
-                        )
         # ────────────────────────────────────────────────────────────
+        # Forward the message, carrying any routed model in-band. The
+        # executor applies ``/model`` and injects the message as ONE step
+        # under its pane lock, so the switch can't race the message inject
+        # on the tmux pane (the earlier separate ``model_change`` POST did,
+        # dropping the first message). model_override alone is applied only
+        # at spawn, so the in-band switch is what makes routing take on an
+        # already-running pane.
         forwarded = False
         try:
             await _forward_native_terminal_message(
@@ -3963,6 +3973,7 @@ async def _dispatch_session_event_to_runner_impl(
                 body,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                model_override=_native_routed_model,
             )
             forwarded = True
         finally:
