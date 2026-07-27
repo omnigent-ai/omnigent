@@ -75,9 +75,9 @@ _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 # require the Responses API. These models don't send finish_reason via
 # /chat/completions but work correctly via /ai-gateway/codex/v1/responses
 # using their system.ai.* alias (derived by stripping "databricks-" prefix).
-# Use specific enough fragments to avoid false-positives (e.g. "glm" would
-# match "zai-org-glm-4-7" which has no system.ai.* alias).
-_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "qwen35")
+# Use specific enough fragments to avoid false-positives (e.g. bare "glm" would
+# match "zai-org-glm-4-7" which has no system.ai.* alias; "glm-" avoids that).
+_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "qwen35", "glm-")
 
 
 def _databricks_to_system_ai(model_id: str) -> str | None:
@@ -532,9 +532,9 @@ def _fetch_pi_model_lists(
         # Models that support the Responses API use it directly.
         has_responses = "openai/v1/responses" in api_types
         entry: dict[str, Any] = {"id": name, "input": ["text", "image"]}
-        # Models that stream on reasoning_content need reasoning:true so Pi
-        # reads from that channel.
-        if any(frag in name_lower for frag in ("glm", "deepseek", "kimi", "inkling")):
+        # DeepSeek streams on reasoning_content; needs reasoning:true so Pi reads
+        # from that channel. GLM/kimi/inkling now use Responses API, not needed.
+        if "deepseek" in name_lower:
             entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)

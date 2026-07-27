@@ -1044,9 +1044,9 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     # All system.ai.* models go to gpt_responses (use AI Gateway, not /serving-endpoints)
     assert "system.ai.llama-4-maverick" in gpt_ids
     assert "system.ai.kimi-k2-7-code" in gpt_ids
-    # Kimi gets reasoning:true
+    # Kimi uses Responses API — no reasoning:true needed (that's completions-path only).
     kimi_entry = next(m for m in gpt if m["id"] == "system.ai.kimi-k2-7-code")
-    assert kimi_entry.get("reasoning") is True
+    assert kimi_entry.get("reasoning") is None
     completions_ids = [m["id"] for m in completions]
     assert not completions_ids  # no completions-only models in this test payload
     # Embedding excluded

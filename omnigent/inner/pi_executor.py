@@ -869,12 +869,13 @@ def _build_models_json(
 
 
 # Model-id fragments of completions-gateway models that stream their output on
-# the ``reasoning_content`` channel (GLM, DeepSeek-R1, ...). Pi's
-# openai-completions parser only consumes that channel when the model entry
-# declares ``reasoning: true``; without it the stream carries no ``content``
-# and the turn dies with "Stream ended without finish_reason". Extend this
-# tuple when the gateway grows another reasoning-first model family.
-_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("glm", "deepseek", "kimi", "inkling")
+# the ``reasoning_content`` channel (DeepSeek-R1, ...). Pi's openai-completions
+# parser only consumes that channel when the model entry declares
+# ``reasoning: true``; without it the stream carries no ``content`` and the
+# turn dies with "Stream ended without finish_reason".
+# Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
+# so they no longer need this flag.
+_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
 
 def _pi_model_is_reasoning(model: str) -> bool:
