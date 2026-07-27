@@ -88,18 +88,39 @@ _DATABRICKS_DEFAULT_CONFIG = (
 )
 
 
-# A realistic Unity Catalog model-services page: two chat LLMs per family,
-# one non-claude/gpt LLM, and one embeddings endpoint that must be excluded.
+# Helper for Unity Catalog model-services fixtures (pi path only).
 def _uc_service(name: str, api_types: list[str]) -> dict:
     return {"name": f"model-services/{name}", "supported_api_types": api_types}
 
 
+# Realistic serving-endpoints page (non-pi harnesses use /api/2.0/serving-endpoints
+# which returns databricks-* ids, not system.ai.* ids).
 _SERVING_ENDPOINTS_PAGE = {
-    "model_services": [
-        _uc_service("databricks-claude-sonnet-4-6", ["mlflow/v1/chat/completions"]),
-        _uc_service("databricks-gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]),
-        _uc_service("databricks-meta-llama-3-3-70b-instruct", ["mlflow/v1/chat/completions"]),
-        _uc_service("databricks-bge-large-en", ["mlflow/v1/embeddings"]),
+    "endpoints": [
+        {
+            "name": "databricks-claude-sonnet-4-6",
+            "creator": "system",
+            "task": "llm/v1/chat",
+            "state": {"ready": "READY"},
+        },
+        {
+            "name": "databricks-gpt-5-4",
+            "creator": "system",
+            "task": "llm/v1/chat",
+            "state": {"ready": "READY"},
+        },
+        {
+            "name": "databricks-meta-llama-3-3-70b-instruct",
+            "creator": "system",
+            "task": "llm/v1/chat",
+            "state": {"ready": "READY"},
+        },
+        {
+            "name": "databricks-bge-large-en",
+            "creator": "system",
+            "task": "llm/v1/embeddings",
+            "state": {"ready": "READY"},
+        },
     ]
 }
 
@@ -462,9 +483,9 @@ def _databricks_transport(
     """
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve ``GET /api/2.1/unity-catalog/model-services``."""
+        """Serve ``GET /api/2.0/serving-endpoints``."""
         requests_seen.append(request)
-        if request.url.path == "/api/2.1/unity-catalog/model-services":
+        if request.url.path == "/api/2.0/serving-endpoints":
             return httpx.Response(200, json=_SERVING_ENDPOINTS_PAGE)
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -534,17 +555,24 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
     """
     _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
     _stub_workspace_creds(monkeypatch)
-    # Unity Catalog model-services API returns only available services;
-    # there is no ready/not-ready state — all listed services are accessible.
     page = {
-        "model_services": [
-            _uc_service("databricks-claude-ready", ["mlflow/v1/chat/completions"]),
-            _uc_service("databricks-claude-stateless", ["mlflow/v1/chat/completions"]),
+        "endpoints": [
+            {
+                "name": "databricks-claude-ready",
+                "task": "llm/v1/chat",
+                "state": {"ready": "READY"},
+            },
+            {
+                "name": "databricks-claude-provisioning",
+                "task": "llm/v1/chat",
+                "state": {"ready": "NOT_READY"},
+            },
+            {"name": "databricks-claude-stateless", "task": "llm/v1/chat"},
         ]
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve the model-services page."""
+        """Serve the mixed-readiness serving-endpoints page."""
         return httpx.Response(200, json=page)
 
     listing = list_models_for_worker(

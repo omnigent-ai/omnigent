@@ -771,7 +771,7 @@ def _listing_for_provider(
         return cached
     try:
         if provider.kind == DATABRICKS_KIND:
-            listing = _fetch_databricks_uc_listing(provider, transport=transport)
+            listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
             listing = _fetch_anthropic_listing(provider, transport=transport)
         else:
