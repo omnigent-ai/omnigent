@@ -896,11 +896,12 @@ def _pi_provider_for_model(model: str) -> str:
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
+    if lower.startswith("system.ai."):
+        # system.ai.* ids never work at serving-endpoints — always use a gateway path.
+        # kimi/inkling/qwen3/glm → Responses API; others (Llama, Gemini, GPT) → mlflow.
+        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks-mlflow"
     if "gpt" in lower:
         return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
-    if lower.startswith("system.ai."):
-        # system.ai.* ids: kimi/inkling/qwen3/glm → Responses API; others → mlflow gateway.
-        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks-mlflow"
     return "databricks-completions"
 
 

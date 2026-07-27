@@ -428,20 +428,22 @@ def _needs_responses_api(model_id_lower: str) -> bool:
 def _unsupported_in_pi(model_id_lower: str) -> bool:
     """Return True for models Pi can't handle at all.
 
-    Gemini 2.5 thinking models return ``content`` as a typed array with
-    ``thoughtSignature`` that Pi's openai-completions handler can't parse,
-    and the Responses API returns 400 for Gemini. Other Gemini variants route
-    via /ai-gateway/mlflow/v1/chat/completions using system.ai.* ids.
+    - gemini-2-5: returns ``content`` as a typed array with ``thoughtSignature``
+      that Pi's completions handler mangles; Responses API returns 400 for it.
+    - gpt-oss: returns typed-array content that Pi's openai-completions handler
+      can't parse (same ``[object Object]`` issue as gemini-2-5).
+
+    Other Gemini variants route via /ai-gateway/mlflow/v1/chat/completions.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini-2-5" in model_id_lower
+    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
 
 
 def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Fetch live model lists from the Unity Catalog model-services API.
 
     Calls ``GET <workspace>/api/2.1/unity-catalog/model-services``, which
@@ -534,7 +536,7 @@ def _fetch_pi_model_lists(
         else:
             completions.append(entry)
 
-    if not claude and not gpt_responses and not completions:
+    if not claude and not gpt_responses and not completions and not gemini:
         _LOGGER.info(
             "pi-native: Unity Catalog model-services returned no LLM models; "
             "Pi will show only the selected model"

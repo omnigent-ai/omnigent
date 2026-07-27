@@ -987,6 +987,10 @@ def _fetch_databricks_uc_listing(
         has_embed = any("embed" in t.lower() for t in api_types)
         if not has_chat or has_embed:
             continue
+        from omnigent.pi_native_credentials import _unsupported_in_pi
+
+        if _unsupported_in_pi(name.lower()):
+            continue
         models.append(ModelEntry(id=name, family=model_family_token(name)))
     return ModelListing(
         source="gateway",
