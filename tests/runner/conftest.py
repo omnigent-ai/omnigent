@@ -62,7 +62,7 @@ class _FakeMcpManager:
     def __init__(self, *, tool_name: str = "jira_search_issues") -> None:
         """Schema set is a single-tool jira fixture."""
         self._tool_name = tool_name
-        self.call_tool_invocations: list[tuple[str, dict[str, Any]]] = []
+        self.call_tool_invocations: list[tuple[str, dict[str, Any], str | None]] = []
 
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
         """Return one MCP schema with the configured tool name."""
@@ -80,11 +80,11 @@ class _FakeMcpManager:
         spec: AgentSpec,
         tool_name: str,
         arguments: dict[str, Any],
-        **_kwargs: Any,
+        session_id: str | None = None,
     ) -> str:
         """Record the dispatch + return a fixed reply."""
         del spec
-        self.call_tool_invocations.append((tool_name, arguments))
+        self.call_tool_invocations.append((tool_name, arguments, session_id))
         return f"called {tool_name}"
 
 
