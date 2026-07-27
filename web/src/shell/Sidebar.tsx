@@ -529,6 +529,12 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
   // migration clears the legacy key. Ordering/rows still come from
   // `pinnedConversations` where available; a legacy-only id renders from the
   // loaded list rows the grouping already has.
+  //
+  // Caveat: a legacy-only id whose session is OUTSIDE the currently-loaded
+  // paginated window has no backing row, so the id is in the pinned set but may
+  // not render a row until it's loaded. This is window-scoped and transient —
+  // against a new server the migration promotes the id to a real server pinned
+  // row (which carries its own row) on the same or next load.
   const pinnedConversationIds = useMemo(() => {
     const ids = pinnedConversations.map((c) => c.id);
     const seen = new Set(ids);

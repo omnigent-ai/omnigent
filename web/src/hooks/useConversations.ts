@@ -825,6 +825,17 @@ export async function fetchPinnedConversations(): Promise<PinnedConversationsRes
   // Honored iff the server returned nothing, or everything it returned is
   // actually pinned. An old server returns unfiltered rows (none pinned), so a
   // non-empty raw page with fewer pinned rows means the filter was ignored.
+  //
+  // Ambiguity: an EMPTY page is treated as honored, but "new server, no pins"
+  // and "old server, zero sessions" are indistinguishable here — we infer
+  // honored-ness from row contents rather than an explicit capability marker.
+  // This is safe in practice: an old server returns an empty page only when the
+  // account has no sessions at all, so any leftover localStorage pin ids point
+  // at sessions that no longer exist. The migration's PATCH to those ids 404s,
+  // the write is recorded as failed, and the id is RETAINED in localStorage
+  // (not cleared) — so no pin is lost even in this corner. Closing the window
+  // fully would need a server capability flag; deferred since pins haven't
+  // shipped yet.
   const filterHonored = rows.length === 0 || conversations.length === rows.length;
   return { conversations, filterHonored };
 }

@@ -199,4 +199,28 @@ describe("localStorage → server pin migration gate", () => {
       expect(localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY)).toBeNull(),
     );
   });
+
+  it("retains the legacy pin when its migration write fails (e.g. a 404 for a deleted session)", async () => {
+    // Guards the empty-page ambiguity in `filterHonored`: an old server with
+    // zero sessions returns an empty page (read as honored), so migration may
+    // fire — but its PATCH to a now-deleted session 404s. The failed write must
+    // leave the id in localStorage so no pin is silently lost.
+    filterHonoredRef.current = true;
+    pinnedRef.current = [];
+    setPinnedSpy.mockRejectedValueOnce(new Error("404 Not Found"));
+    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["chat_gone"]));
+    mockConversations([]);
+
+    renderSidebar();
+
+    await waitFor(() =>
+      expect(setPinnedSpy).toHaveBeenCalledWith("chat_gone", true, expect.any(Number)),
+    );
+    // The write failed, so the id is kept for a later retry — not cleared.
+    await waitFor(() =>
+      expect(localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY)).toBe(
+        JSON.stringify(["chat_gone"]),
+      ),
+    );
+  });
 });
