@@ -111,9 +111,9 @@ publish_design_artifact(
 )
 ```
 
-Publishing is the explicit signal that the artifact rendered successfully and
-passed review. A successful result creates the specialized transcript card and
-makes the entry available through Omnigent's artifact UI.
+Publishing is the explicit signal that the source preflight passed. A successful
+result creates the specialized transcript card and makes the entry available for
+rendered inspection through Omnigent's artifact UI.
 
 Never claim an artifact is ready before `publish_design_artifact` returns a
 validated success result. If publishing fails, report the failure accurately,
@@ -127,7 +127,7 @@ Artifacts are file-native and path-identified:
 - Use `operation="updated"` for an existing artifact.
 - Use a new path only when the user asks for a distinct artifact.
 - Keep the entry HTML and all relative resources within the same artifact root.
-- Re-render and review after every substantial change before publishing again.
+- Repeat the source preflight after every substantial change before publishing again.
 
 ## Response behavior
 
