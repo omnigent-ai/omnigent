@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.policies.registry import is_registered_handler
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
 
 
@@ -52,6 +53,42 @@ def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
             )
     for sub in spec.sub_agents:
         _reject_uploaded_callable_tools(sub)
+
+
+def _reject_uploaded_context_providers(spec: AgentSpec) -> None:
+    """Reject non-registry ``context_providers:`` in an untrusted upload.
+
+    A context provider is a dotted import path that the runner resolves
+    with ``importlib`` and **calls on every turn**
+    (``omnigent.runtime.context_providers``) — the same runner-RCE sink as
+    a ``callable:`` tool and a ``type: function`` policy handler, so an
+    uploaded ``path: subprocess.Popen`` is authenticated code execution on
+    shared runner infrastructure. Providers are therefore held to the
+    policy registry, the shared allowlist of dotted paths a tenant may
+    name; an operator ships custom providers by adding the module that
+    declares them to the server config's ``policy_modules``.
+
+    Recurses into sub-agents, mirroring the callable-tool and
+    handler-allowlist guards: the omnigent-compat path re-parses the
+    parent's raw YAML for every cloned child, so a single declaration
+    reaches each one.
+
+    :param spec: The parsed (sub-)agent spec to scan.
+    :raises OmnigentError: If any (sub-)agent declares a context provider
+        whose path is not a registered handler.
+    """
+    for ref in spec.context_providers or []:
+        if not is_registered_handler(ref.path):
+            raise OmnigentError(
+                "uploaded agent bundle may not declare a context provider "
+                f"outside the handler registry (got {ref.path!r}); the runner "
+                "imports the dotted path and calls it on every turn, so it is "
+                "rejected from untrusted uploads. A server admin must add the "
+                "module that declares it via the 'policy_modules' config.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    for sub in spec.sub_agents:
+        _reject_uploaded_context_providers(sub)
 
 
 def _cwd_escapes_workspace(spec_cwd: str) -> bool:
@@ -102,7 +139,8 @@ def validate_agent_bundle(
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
         names an unregistered handler, ``os_env.cwd`` is an absolute or
-        escaping path, or a tool declares a server-side Python ``callable:``.
+        escaping path, a tool declares a server-side Python ``callable:``,
+        or a ``context_providers:`` entry is not a registered handler.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -161,6 +199,13 @@ def validate_agent_bundle(
         # *files* (``tools/python/*.py``) are unaffected: they ship the agent's
         # own code, not an arbitrary server-installed module.
         _reject_uploaded_callable_tools(spec)
+
+        # Untrusted uploads may not name a context provider outside the
+        # handler registry: the runner imports the dotted path and calls it
+        # on every turn, so an uploaded ``path: subprocess.Popen`` is the
+        # same authenticated-RCE shape as a ``callable:`` tool. Operator
+        # providers stay available through ``policy_modules``.
+        _reject_uploaded_context_providers(spec)
 
     return spec
 

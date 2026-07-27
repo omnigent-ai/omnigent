@@ -442,3 +442,128 @@ def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
     root.sub_agents = [sub]
     with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
         _reject_uploaded_callable_tools(root)
+
+
+# ── no unregistered `context_providers:` on the upload path ──
+
+
+# A context provider whose ``path`` is a dotted import path the runner
+# resolves with ``importlib`` and calls on every turn — the RCE gadget.
+_CONTEXT_PROVIDER_YAML = (
+    "name: {name}\n"
+    "prompt: hi\n"
+    "executor:\n"
+    "  harness: claude-sdk\n"
+    "context_providers:\n"
+    "  - path: subprocess.Popen\n"
+    "    arguments:\n"
+    "      args: [touch, {marker}]\n"
+)
+
+
+def test_validate_bundle_rejects_context_provider_rce_gadget(tmp_path: Path) -> None:
+    """An uploaded bundle may not name an arbitrary context provider.
+
+    The runner imports the provider's dotted path and calls it on the
+    first turn, so a tenant-uploaded ``path: subprocess.Popen`` is
+    authenticated RCE on the shared runner — the same sink the
+    ``callable:`` tool and policy-handler guards already close. The
+    upload boundary must refuse it, and must do so without evaluating
+    the gadget: the marker file must not exist afterwards.
+
+    :param tmp_path: Pytest temp dir; the marker path the payload would
+        create if the gadget executed.
+    """
+    marker = tmp_path / "pwned"
+    bundle = _single_file_yaml_bundle(
+        _CONTEXT_PROVIDER_YAML.format(name="rce_provider_agent", marker=marker)
+    )
+    with pytest.raises(OmnigentError, match=r"may not declare a context provider"):
+        validate_agent_bundle(bundle)
+    assert not marker.exists(), "context provider executed during bundle validation"
+
+
+def test_validate_bundle_rejects_context_provider_in_config_dir_bundle() -> None:
+    """The directory (``config.yaml``) upload shape is gated identically.
+
+    The canonical parser reads the same top-level ``context_providers:``
+    block, so both bundle shapes must hit the guard — otherwise the
+    single-file check alone would leave the AGENTSPEC path open.
+    """
+    bundle = _make_bundle_bytes(
+        {
+            "config.yaml": (
+                _MIN_CONFIG.format(name="root_agent") + "context_providers:\n" + "  - os.system\n"
+            ),
+        }
+    )
+    with pytest.raises(OmnigentError, match=r"may not declare a context provider"):
+        validate_agent_bundle(bundle)
+
+
+def test_validate_bundle_allows_context_provider_when_not_enforced(tmp_path: Path) -> None:
+    """``enforce_handler_allowlist=False`` accepts a custom context provider.
+
+    The trusted single-user / local-server path uploads the operator's own
+    bundle through this same function, and a custom memory provider is the
+    intended feature there (the operator already has code execution), so
+    the guard must not block it — mirroring the handler-allowlist and
+    callable-tool exemptions.
+
+    :param tmp_path: Pytest temp dir; only supplies an unused marker path.
+    """
+    spec = validate_agent_bundle(
+        _single_file_yaml_bundle(
+            "name: local_provider_agent\n"
+            "prompt: hi\n"
+            "executor:\n"
+            "  harness: claude-sdk\n"
+            "context_providers:\n"
+            "  - my.org.memory.recall\n"
+        ),
+        enforce_handler_allowlist=False,
+    )
+    assert spec.name == "local_provider_agent"
+    assert spec.context_providers is not None
+    assert [ref.path for ref in spec.context_providers] == ["my.org.memory.recall"]
+
+
+def test_validate_bundle_accepts_registered_context_provider() -> None:
+    """A provider path that IS in the handler registry passes the guard.
+
+    The registry — built-ins plus the admin's ``policy_modules`` — is the
+    escape hatch: an operator who wants tenants to declare a provider
+    registers the module that exports it. Proves the guard does not
+    over-block, using a built-in registry entry as the stand-in.
+    """
+    spec = validate_agent_bundle(
+        _single_file_yaml_bundle(
+            "name: registered_provider_agent\n"
+            "prompt: hi\n"
+            "executor:\n"
+            "  harness: claude-sdk\n"
+            "context_providers:\n"
+            "  - omnigent.policies.builtins.safety.ask_on_os_tools\n"
+        ),
+    )
+    assert spec.name == "registered_provider_agent"
+
+
+def test_reject_uploaded_context_providers_recurses_into_sub_agents() -> None:
+    """The provider guard catches a provider hidden in a sub-agent.
+
+    The omnigent-compat path re-parses the parent's raw YAML for every
+    cloned child, so a single ``context_providers:`` declaration lands on
+    each sub-agent spec too. Exercised directly to guard the recursion
+    itself, matching the callable-tool guard's sub-agent coverage.
+    """
+    from omnigent.server.bundles import _reject_uploaded_context_providers
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import FunctionRef
+
+    sub = AgentSpec(name="evil_sub", spec_version=1)
+    sub.context_providers = [FunctionRef(path="subprocess.Popen", arguments={"args": ["id"]})]
+    root = AgentSpec(name="root", spec_version=1)
+    root.sub_agents = [sub]
+    with pytest.raises(OmnigentError, match=r"may not declare a context provider"):
+        _reject_uploaded_context_providers(root)
