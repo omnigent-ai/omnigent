@@ -169,9 +169,20 @@ def test_note_resume_response_records_model_without_seeding_baseline() -> None:
     """
     state = fwd._CodexForwarderState()
 
-    state.note_resume_response({"result": {"model": "gpt-5.4-mini"}})
+    state.note_resume_response(
+        {
+            "result": {
+                "model": "gpt-5.4-mini",
+                "activePermissionProfile": {
+                    "id": ":workspace",
+                    "extends": None,
+                },
+            }
+        }
+    )
 
     assert state.model == "gpt-5.4-mini"
+    assert state.permission_profile == ":workspace"
     # Baseline NOT seeded → the spawn model will be mirrored on the next sync.
     assert state.posted_model is None
 
@@ -201,14 +212,14 @@ async def test_sync_after_resume_posts_spawn_model() -> None:
     assert state.posted_model == "gpt-5.4-mini"
 
 
-def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None:
+def test_thread_settings_updated_records_effort_modes_and_permission_profile() -> None:
     """
-    ``thread/settings/updated`` records Codex's live thinking settings.
+    ``thread/settings/updated`` records Codex's live thread settings.
 
     App-server sends the public ``ThreadSettings`` shape with ``effort`` and
-    ``collaborationMode``. If this parser regresses, the later sync helpers have
-    no state to mirror, so Omnigent would keep stale ``reasoning_effort`` and
-    mode metadata even though Codex changed them.
+    both mode fields. If this parser regresses, the later sync helpers have no
+    state to mirror, so Omnigent would keep stale metadata even though Codex
+    changed it.
     """
     state = fwd._CodexForwarderState()
 
@@ -217,6 +228,10 @@ def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None
             "threadSettings": {
                 "model": "gpt-5.4-codex",
                 "effort": "medium",
+                "activePermissionProfile": {
+                    "id": ":read-only",
+                    "extends": None,
+                },
                 "collaborationMode": {
                     "mode": "plan",
                     "settings": {
@@ -232,6 +247,7 @@ def test_thread_settings_updated_records_effort_and_collaboration_mode() -> None
     assert state.model == "gpt-5.4-codex"
     assert state.effort == "medium"
     assert state.collaboration_mode == "plan"
+    assert state.permission_profile == ":read-only"
 
 
 @pytest.mark.asyncio
@@ -341,6 +357,35 @@ async def test_sync_codex_collaboration_mode_change_posts_and_dedupes() -> None:
         )
     ]
     assert state.posted_collaboration_mode == "plan"
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_permission_profile_change_posts_and_dedupes() -> None:
+    """Codex permission-profile changes mirror to Omnigent once."""
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(permission_profile=":danger-full-access")
+
+    await fwd._sync_codex_permission_profile_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+    await fwd._sync_codex_permission_profile_change(
+        client,
+        session_id="conv_x",
+        forwarder_state=state,
+    )
+
+    assert client.posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_codex_permission_profile_change",
+                "data": {"permission_profile": ":danger-full-access"},
+            },
+        )
+    ]
+    assert state.posted_permission_profile == ":danger-full-access"
 
 
 @pytest.mark.parametrize(

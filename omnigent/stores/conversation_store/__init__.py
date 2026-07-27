@@ -77,6 +77,18 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Last collaboration mode selected in Codex.
+CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+CODEX_NATIVE_COLLABORATION_MODES = frozenset({"default", "plan"})
+
+# Last permission profile selected in Codex's ``/permissions`` picker.
+# Codex does not recover this thread setting after an app-server restart, so
+# native launchers reapply it on ``thread/resume``.
+CODEX_NATIVE_PERMISSION_PROFILE_LABEL_KEY = "omnigent.codex_native.permission_profile"
+CODEX_NATIVE_PERMISSION_PROFILE_IDS = frozenset(
+    {":read-only", ":workspace", ":danger-full-access"}
+)
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other

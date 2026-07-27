@@ -666,7 +666,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         async def close(self) -> None:
             """:returns: None."""
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(transport: str, loaded_thread_id: str, **_: Any) -> None:
         """
         No-op thread preload.
 

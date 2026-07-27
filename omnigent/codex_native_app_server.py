@@ -1617,7 +1617,13 @@ def client_for_transport(
     return CodexAppServerClient(Path(transport), client_name=client_name)
 
 
-async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> None:
+async def preload_codex_thread_for_resume(
+    transport: str,
+    thread_id: str,
+    *,
+    collaboration_mode: str | None = None,
+    permission_profile: str | None = None,
+) -> None:
     """
     Load an existing Codex thread into a freshly started app-server.
 
@@ -1631,6 +1637,10 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
         or ``"/tmp/app-server.sock"``.
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
+    :param collaboration_mode: Collaboration mode to restore, e.g.
+        ``"plan"``. Omitted keeps Codex's configured default.
+    :param permission_profile: Named permission profile to restore, e.g.
+        ``":read-only"``. Omitted keeps Codex's configured default.
     :returns: None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -1640,10 +1650,30 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
     )
     await client.connect()
     try:
-        await client.request(
-            "thread/resume",
-            {"threadId": thread_id, "excludeTurns": True},
-        )
+        params = {"threadId": thread_id, "excludeTurns": True}
+        if permission_profile is not None:
+            params["permissions"] = permission_profile
+        response = await client.request("thread/resume", params)
+        if collaboration_mode is not None:
+            result = response.get("result")
+            model = result.get("model") if isinstance(result, dict) else None
+            effort = result.get("reasoningEffort") if isinstance(result, dict) else None
+            if not isinstance(model, str) or not model:
+                raise RuntimeError("Codex resume response did not include a model.")
+            await client.request(
+                "thread/settings/update",
+                {
+                    "threadId": thread_id,
+                    "collaborationMode": {
+                        "mode": collaboration_mode,
+                        "settings": {
+                            "model": model,
+                            "reasoning_effort": effort,
+                            "developer_instructions": None,
+                        },
+                    },
+                },
+            )
     finally:
         await client.close()
 

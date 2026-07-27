@@ -430,6 +430,53 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
     assert fake_client.closed is True
 
 
+def test_preload_codex_thread_for_resume_restores_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preloading reapplies Codex modes that do not survive an app-server restart."""
+    fake_client = _FakeCodexAppServerClient(
+        response={"result": {"model": "gpt-5.6-sol", "reasoningEffort": "high"}}
+    )
+    monkeypatch.setattr(
+        "omnigent.codex_native_app_server.CodexAppServerClient",
+        lambda *_args, **_kwargs: fake_client,
+    )
+
+    asyncio.run(
+        codex_native_app_server.preload_codex_thread_for_resume(
+            "ws://127.0.0.1:1234",
+            "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            collaboration_mode="plan",
+            permission_profile=":read-only",
+        )
+    )
+
+    assert fake_client.requests == [
+        (
+            "thread/resume",
+            {
+                "threadId": "019e96aa-0be2-7343-8d3b-6f914d60936b",
+                "excludeTurns": True,
+                "permissions": ":read-only",
+            },
+        ),
+        (
+            "thread/settings/update",
+            {
+                "threadId": "019e96aa-0be2-7343-8d3b-6f914d60936b",
+                "collaborationMode": {
+                    "mode": "plan",
+                    "settings": {
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "high",
+                        "developer_instructions": None,
+                    },
+                },
+            },
+        ),
+    ]
+
+
 def _started_event(turn_id: str) -> dict[str, Any]:
     """
     Build a Codex ``turn/started`` notification.

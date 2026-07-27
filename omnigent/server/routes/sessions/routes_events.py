@@ -178,6 +178,8 @@ def register_events_routes(
         - ``"external_codex_collaboration_mode_change"`` persists the
           Codex app-server collaboration mode kind as an internal session label
           (``omnigent.codex_native.collaboration_mode``).
+        - ``"external_codex_permission_profile_change"`` persists the profile
+          selected in Codex's permissions picker for cold resume.
         - ``"stop_session"`` terminates the live session without
           deleting the conversation (owner-only). Forwarded
           harness-agnostically to the runner, which hard-kills the
@@ -259,6 +261,7 @@ def register_events_routes(
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+            _EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE,
         ):
             try:
                 parse_item_data(body.type, {"type": body.type, **body.data})
@@ -877,6 +880,14 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE:
             await _persist_external_codex_collaboration_mode_change(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            return {"queued": False}
+        if body.type == _EXTERNAL_CODEX_PERMISSION_PROFILE_CHANGE_TYPE:
+            await _persist_external_codex_permission_profile_change(
                 session_id,
                 conv,
                 body,
