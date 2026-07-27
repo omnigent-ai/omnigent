@@ -27,6 +27,7 @@ import { Link, useNavigate, useParams } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import {
@@ -132,7 +133,10 @@ export function TaskDetailPage() {
   }
 
   function handleRunNow() {
-    runNowMutation.mutate(task!.id);
+    runNowMutation.mutate(task!.id, {
+      onSuccess: () => showToast("Run started"),
+      onError: () => showToast("Couldn't start the run"),
+    });
   }
 
   function handleDelete() {
@@ -405,10 +409,11 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
 /**
  * The leading LEFT status icon for a run. Exactly one renders, by priority:
  *   1. failed              → amber warning triangle, tooltip = errorCode message.
- *   2. skipped             → muted circle-slash, tooltip = skip reason.
- *   3. succeeded + UNREAD  → blue filled dot, tooltip = "Unread".
- *   4. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
- *   5. scheduled/running/incomplete → muted grey dot, no tooltip (not terminal).
+ *   2. skipped             → muted calendar-off icon, tooltip = skip reason.
+ *   3. running             → pulsing grey dot, tooltip = "Running".
+ *   4. succeeded + UNREAD  → blue filled dot, tooltip = "Unread".
+ *   5. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
+ *   6. scheduled/incomplete → muted grey dot, no tooltip (not terminal).
  */
 function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean }) {
   if (run.status === "failed") {
@@ -417,7 +422,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
         <TriangleAlertIcon
           data-testid="run-status-icon"
           data-run-icon="failed"
-          className="size-4 shrink-0 text-amber-500"
+          className="size-3 shrink-0 text-amber-500"
         />
       </IndicatorWithTooltip>
     );
@@ -428,7 +433,19 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
         <CalendarOffIcon
           data-testid="run-status-icon"
           data-run-icon="skipped"
-          className="size-4 shrink-0 text-muted-foreground"
+          className="size-3 shrink-0 text-muted-foreground"
+        />
+      </IndicatorWithTooltip>
+    );
+  }
+  if (run.status === "running") {
+    return (
+      <IndicatorWithTooltip tooltip="Running">
+        <span
+          aria-hidden
+          data-testid="run-status-dot"
+          data-run-icon="running"
+          className="size-2.5 shrink-0 animate-pulse rounded-full bg-muted-foreground/40"
         />
       </IndicatorWithTooltip>
     );

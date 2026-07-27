@@ -1,8 +1,8 @@
 // Tests for the scheduled-task DETAIL page (`/tasks/:taskId`): header + prompt
 // + configuration + run-history rendering from mocked hooks, the header actions
-// (Run now fires the mutation, delete navigates back, edit opens the dialog),
+// (Run now fires the mutation + shows a toast, delete navigates back, edit opens the dialog),
 // and the run-row rendering rules: the LEFT status-icon column (failed triangle
-// > skipped calendar-off > succeeded-unread blue dot > succeeded-read grey dot),
+// > skipped calendar-off > running pulsing dot > succeeded-unread blue dot > succeeded-read grey dot),
 // duration, errorCode messages, and the whole-row click affordance (a run with a
 // conversation is a link; a skipped run is not) — never a fabricated summary.
 //
@@ -35,6 +35,9 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
 }));
+
+const showToast = vi.fn();
+vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => showToast(...args) }));
 
 // Agent / host catalogs — return simple lists so labels resolve.
 vi.mock("@/hooks/useAvailableAgents", () => ({
@@ -152,6 +155,7 @@ beforeEach(() => {
   updateMutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
+  showToast.mockReset();
   fetchConversationById.mockClear();
   fetchConversationById.mockResolvedValue({
     id: "c_9",
@@ -267,11 +271,37 @@ describe("loading / not-found states", () => {
 });
 
 describe("header actions", () => {
-  it("Run now fires the run mutation", () => {
+  it("Run now fires the run mutation with toast callbacks", () => {
     setTask(task());
     renderPage();
     fireEvent.click(screen.getByTestId("task-detail-run-now"));
-    expect(runNowMutate).toHaveBeenCalledWith("st_1");
+    expect(runNowMutate).toHaveBeenCalledWith(
+      "st_1",
+      expect.objectContaining({
+        onSuccess: expect.any(Function),
+        onError: expect.any(Function),
+      }),
+    );
+  });
+
+  it("Run now shows 'Run started' toast on success", () => {
+    runNowMutate.mockImplementation(
+      (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onSuccess?.(),
+    );
+    setTask(task());
+    renderPage();
+    fireEvent.click(screen.getByTestId("task-detail-run-now"));
+    expect(showToast).toHaveBeenCalledWith("Run started");
+  });
+
+  it("Run now shows error toast on failure", () => {
+    runNowMutate.mockImplementation(
+      (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onError?.(),
+    );
+    setTask(task());
+    renderPage();
+    fireEvent.click(screen.getByTestId("task-detail-run-now"));
+    expect(showToast).toHaveBeenCalledWith("Couldn't start the run");
   });
 
   it("toggling the Switch off pauses an active task (update to paused)", () => {
@@ -440,6 +470,30 @@ describe("run history", () => {
     // no finished timestamps → no duration.
     expect(within(row).queryByTestId("run-open")).toBeNull();
     expect(within(row).queryByTestId("run-duration")).toBeNull();
+  });
+
+  it("renders a RUNNING run with a pulsing grey dot and a 'Running' tooltip", async () => {
+    setTask(task());
+    setRuns([
+      run({
+        id: "run_running",
+        status: "running",
+        conversationId: null,
+        firedAt: 1_700_000_000,
+        finishedAt: null,
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    const dot = within(row).getByTestId("run-status-dot");
+    expect(dot).toHaveAttribute("data-run-icon", "running");
+    expect(dot.className).toContain("animate-pulse");
+    expect(dot.className).toContain("bg-muted-foreground/40");
+    // No status ICON — running uses the dot slot, not an svg icon.
+    expect(within(row).queryByTestId("run-status-icon")).toBeNull();
+    // Tooltip reads "Running".
+    fireEvent.focus(dot);
+    await waitFor(() => expect(screen.getAllByText("Running").length).toBeGreaterThan(0));
   });
 
   it("renders an error message when run history fails to load", () => {
