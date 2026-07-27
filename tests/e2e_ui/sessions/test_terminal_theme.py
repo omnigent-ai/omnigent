@@ -72,10 +72,16 @@ def _open_new_shell(page: Page) -> None:
 
 
 def _connected_main_terminal(page: Page):
-    """Wait for a freshly opened shell's xterm to mount + connect in the main view."""
-    main_terminal = page.get_by_test_id("main-terminal-view")
-    expect(main_terminal).to_be_visible(timeout=60_000)
-    terminal_view = main_terminal.get_by_test_id("terminal-view").last
+    """Wait for a freshly opened shell's xterm to mount + connect in the rail.
+
+    The shell now opens as a tab in the workspace rail (not the main
+    column), so its xterm lives inside the "Workspace" complementary region.
+    """
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_role("button", name=re.compile(r"^Close zsh · u-"))).to_be_visible(
+        timeout=60_000
+    )
+    terminal_view = rail.get_by_test_id("terminal-view").last
     expect(terminal_view).to_be_visible(timeout=20_000)
     expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
     return terminal_view
