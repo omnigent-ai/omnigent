@@ -18,6 +18,7 @@ from omnigent.inner.nessie.policies import (
     headless_subagent_purpose_guard,
     read_only_os,
     spawn_bounds,
+    team_bounds,
     worktree_guard,
 )
 
@@ -317,6 +318,62 @@ def test_spawn_bounds_only_counts_configured_dispatch_tools() -> None:
     assert _result(evaluate(_tool_call("sys_session_send", agent="claude_code"))) == "ALLOW"
     assert _result(evaluate(_tool_call("sys_session_send", agent="codex"))) == "ALLOW"
     assert _result(evaluate(_tool_call("sys_session_send", agent="claude_code"))) == "DENY"
+
+
+def test_team_bounds_caps_peer_sends_per_turn() -> None:
+    """
+    team_bounds allows up to N peer sends per turn, DENIES the (N+1)th, and
+    reset_turn clears the per-turn count.
+
+    A peer send is a ``sys_session_send`` by ``session_id``. If the DENY
+    never fires, the per-turn peer-messaging wave bound regressed.
+    """
+    evaluate = team_bounds(max_peer_sends_per_turn=2, max_team_peers=100)
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="a", args="hi"))) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="b", args="hi"))) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="c", args="hi"))) == "DENY"
+    evaluate.reset_turn()
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="d", args="hi"))) == "ALLOW"
+
+
+def test_team_bounds_ignores_named_child_sends() -> None:
+    """
+    Only by-session-id sends count as peer sends; named ``(agent, title)``
+    child dispatches are bounded by ``spawn_bounds`` and must pass through
+    ``team_bounds`` untouched. A regression here would double-count child
+    dispatches against the team budget.
+    """
+    evaluate = team_bounds(max_peer_sends_per_turn=1, max_team_peers=1)
+    # Named child send: no session_id — not a peer send.
+    named = _tool_call("sys_session_send", agent="claude_code", title="t", args="hi")
+    assert _result(evaluate(named)) == "ALLOW"
+    assert (
+        _result(evaluate(_tool_call("sys_session_send", agent="codex", title="u", args="hi")))
+        == "ALLOW"
+    )
+    # Non-dispatch tool: untouched.
+    assert _result(evaluate(_tool_call("sys_os_shell", command="ls"))) == "ALLOW"
+
+
+def test_team_bounds_caps_distinct_peers_cumulatively() -> None:
+    """
+    team_bounds caps the number of DISTINCT peers a session may message over
+    the run, and the cap survives turn resets (unlike the per-turn count).
+    Re-messaging an already-contacted peer stays allowed.
+
+    If the distinct-peer DENY never fires, transitive peer contact could
+    expand the effective team without limit.
+    """
+    evaluate = team_bounds(max_peer_sends_per_turn=100, max_team_peers=2)
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="a", args="hi"))) == "ALLOW"
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="b", args="hi"))) == "ALLOW"
+    # Third DISTINCT peer exceeds the cumulative cap.
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="c", args="hi"))) == "DENY"
+    # A known peer is still reachable (not a new distinct peer).
+    evaluate.reset_turn()
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="a", args="hi"))) == "ALLOW"
+    # ...but the distinct cap persists across the reset.
+    assert _result(evaluate(_tool_call("sys_session_send", session_id="d", args="hi"))) == "DENY"
 
 
 @pytest.mark.parametrize(

@@ -993,6 +993,12 @@ class _SubagentWorkEntry:
 
     :param parent_session_id: Parent session id that invoked
         ``sys_session_send``, e.g. ``"conv_parent123"``.
+    :param awaiter_session_id: Session that receives this turn's
+        completion in its inbox and is woken on delivery. Equals
+        ``parent_session_id`` for a normal child send (no behavior
+        change); for an agent-team PEER send it is the SENDER, so a
+        teammate that messaged a sibling gets the result even though the
+        sibling's structural parent is the lead.
     :param child_session_id: Child session id used as the work handle,
         e.g. ``"conv_child456"``.
     :param work_id: Unique id for this dispatch to the child session,
@@ -1021,6 +1027,7 @@ class _SubagentWorkEntry:
     work_id: str
     agent: str
     title: str
+    awaiter_session_id: str | None = None
     wrapper_label: str | None = None
     created_by: str | None = None
     status: str = "launching"
@@ -1028,6 +1035,19 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+
+    @property
+    def awaiter(self) -> str:
+        """
+        Session that owns this work's completion (inbox + wake target).
+
+        ``awaiter_session_id`` when set (an agent-team peer send routes to
+        the sender), else ``parent_session_id`` — so the normal child-send
+        path is unchanged.
+
+        :returns: The awaiting session id.
+        """
+        return self.awaiter_session_id or self.parent_session_id
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1065,6 +1085,7 @@ def register_subagent_work(
     title: str,
     wrapper_label: str | None = None,
     created_by: str | None = None,
+    awaiter_session_id: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -1082,15 +1103,19 @@ def register_subagent_work(
         label, e.g. ``"claude-code-native-ui"``.
     :param created_by: Human actor that dispatched this child turn, if
         known from the parent turn context.
+    :param awaiter_session_id: Session to deliver this turn's completion
+        to and wake on delivery. Defaults to ``parent_session_id`` (the
+        normal child send). For an agent-team peer send, pass the SENDER
+        so it — not the target's structural parent — receives the result.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
     if prior is not None:
-        children = _subagent_work_by_parent.get(prior.parent_session_id)
+        children = _subagent_work_by_parent.get(prior.awaiter)
         if children is not None:
             children.discard(child_session_id)
             if not children:
-                _subagent_work_by_parent.pop(prior.parent_session_id, None)
+                _subagent_work_by_parent.pop(prior.awaiter, None)
 
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
@@ -1098,12 +1123,16 @@ def register_subagent_work(
         work_id=f"subagent_{uuid.uuid4().hex[:12]}",
         agent=agent,
         title=title,
+        awaiter_session_id=awaiter_session_id,
         wrapper_label=wrapper_label,
         created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
-    _subagent_work_by_parent.setdefault(parent_session_id, set()).add(child_session_id)
+    # Group by the awaiter (inbox owner), not the structural parent: for a
+    # peer send the sender awaits, and list_subagent_work is queried by the
+    # awaiting session when recovering a stranded wake.
+    _subagent_work_by_parent.setdefault(entry.awaiter, set()).add(child_session_id)
     return entry
 
 
@@ -1165,12 +1194,12 @@ def unregister_subagent_work(
     if remember_drained_delivery and entry.delivered:
         _drained_delivered_subagent_children.add(child_session_id)
     _subagent_work_by_child.pop(child_session_id, None)
-    children = _subagent_work_by_parent.get(entry.parent_session_id)
+    children = _subagent_work_by_parent.get(entry.awaiter)
     if children is None:
         return
     children.discard(child_session_id)
     if not children:
-        _subagent_work_by_parent.pop(entry.parent_session_id, None)
+        _subagent_work_by_parent.pop(entry.awaiter, None)
 
 
 def unregister_subagent_work_for_session(session_id: str) -> None:
@@ -1270,11 +1299,14 @@ def mark_subagent_work_terminal(
 
 def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDeliveryAck:
     """
-    Push a terminal sub-agent payload into the parent session inbox.
+    Push a terminal sub-agent payload into the awaiting session's inbox.
+
+    The awaiter is the structural parent for a normal child send, or the
+    sender for an agent-team peer send.
 
     :param entry: Terminal sub-agent work entry to deliver.
     :returns: Delivery acknowledgement describing whether the payload is
-        confirmed in the parent inbox.
+        confirmed in the awaiting session's inbox.
     """
     if entry.delivered:
         return _SubagentDeliveryAck(
@@ -1283,11 +1315,11 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
             delivered_now=False,
             reason=_SUBAGENT_DELIVERY_ALREADY_DELIVERED,
         )
-    inbox = _session_inboxes_ref.get(entry.parent_session_id)
+    inbox = _session_inboxes_ref.get(entry.awaiter)
     if inbox is None:
         _logger.warning(
-            "Sub-agent work completed but parent inbox is missing; parent=%s child=%s",
-            entry.parent_session_id,
+            "Sub-agent work completed but awaiter inbox is missing; awaiter=%s child=%s",
+            entry.awaiter,
             entry.child_session_id,
         )
         return _SubagentDeliveryAck(
@@ -4937,18 +4969,41 @@ def create_runner_app(
             )
 
     def _schedule_subagent_wake(entry: _SubagentWorkEntry) -> None:
-        if entry.parent_session_id == entry.child_session_id:
+        """
+        Schedule a wake POST after a child completion lands in the parent inbox.
+
+        Called by ``_mark_subagent_terminal_and_wake`` once per delivery (it
+        gates on the not-delivered → delivered transition), and a parent is
+        never its own child, so a parent's own turn-end never re-wakes it.
+
+        Debounced per parent: while a wake is outstanding (posted, not yet
+        consumed by the parent's next turn start), further completions skip
+        posting — a fan-out's results all queue in the one inbox, which a
+        single wake turn drains via ``sys_read_inbox``. This prevents the
+        wake storm (one /events message per completion) that churns turns and
+        trips the executor's per-turn tool-context guard.
+
+        :param entry: The just-delivered terminal sub-agent work entry.
+        :returns: None.
+        """
+        # Wake the AWAITER (structural parent for a child send, the sender
+        # for an agent-team peer send) — that's whose inbox got the payload.
+        awaiter = entry.awaiter
+        # A session is never its own sub-agent; never wake on self.
+        if awaiter == entry.child_session_id:
             return
-        inbox = _session_inboxes.get(entry.parent_session_id)
+        inbox = _session_inboxes.get(awaiter)
         if inbox is None:
             return
-        if entry.parent_session_id in _subagent_wake_pending:
+        # Debounce: one outstanding wake per awaiter (cleared at turn start).
+        if awaiter in _subagent_wake_pending:
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        _subagent_wake_pending.add(entry.parent_session_id)
+        _subagent_wake_pending.add(awaiter)
+        # qsize counts the item just delivered by put_nowait (>= 1).
         notice = _format_subagent_wake_notice(
             agent=entry.agent,
             title=entry.title,
@@ -4957,7 +5012,7 @@ def create_runner_app(
         )
         _wake_task = loop.create_task(
             _post_subagent_wake_notice(
-                entry.parent_session_id,
+                awaiter,
                 notice,
                 entry.child_session_id,
                 entry.created_by,

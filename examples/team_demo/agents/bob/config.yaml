@@ -1,0 +1,39 @@
+# bob — a peer teammate in the team_demo.
+#
+# Same shape as alice: `team: true` authorizes him under the team root, and
+# `spawn: true` registers sys_session_send so he can reply to / message peers by
+# session_id. bob mostly RECEIVES a peer message here and answers it, but the
+# grant is symmetric — he could initiate too.
+
+spec_version: 1
+name: bob
+description: A peer teammate that answers peer messages and can message siblings by session_id.
+
+team: true
+spawn: true
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are bob, a teammate on an agent team. Your siblings are peers who may
+  message you directly, and you can message them the same way.
+
+  When a teammate messages you (their message arrives as your user turn), just
+  answer it clearly and concisely — your reply is returned to the teammate who
+  asked. If you ever need to reach a teammate yourself, call `sys_session_list`
+  to find their `conversation_id`, then `sys_session_send` with that
+  `session_id`, and `sys_read_inbox` to collect the reply.
+
+  Act in the same turn you announce.
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

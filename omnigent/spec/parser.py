@@ -265,6 +265,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # the specified sub-agent types. Defaults to False — session
     # reads stay always-on, but every write grant is explicit.
     spawn = bool(raw.get("spawn", False))
+    # Top-level ``team:`` flag marks this session's spawn tree as an agent
+    # team: sessions sharing its root may peer-message each other via
+    # ``sys_session_send`` by session_id, not only their structural parent.
+    # Defaults to False — the child-only write scope is preserved unless a
+    # lead explicitly opts its tree into peer messaging.
+    team = bool(raw.get("team", False))
     # Top-level ``agent_session_sharing:`` flag is the SOLE enabler of
     # the ``sys_session_share`` tool, independent of ``spawn`` /
     # ``tools.agents`` (and unrelated to server-API / CLI sharing).
@@ -308,6 +314,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         terminals=terminals,
         timers=timers,
         spawn=spawn,
+        team=team,
         agent_session_sharing=agent_session_sharing,
     )
 

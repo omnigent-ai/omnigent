@@ -1725,6 +1725,45 @@ def _resolve_harness_impl(conv: Conversation | None) -> str | None:
         return None
 
 
+def _resolve_team(conv: Conversation | None) -> bool | None:
+    """
+    Resolve whether a conversation's bound agent opted into agent teams.
+
+    Mirrors :func:`_resolve_harness_impl`: loads the parsed spec via the agent
+    cache and returns the top-level ``team`` flag. Surfacing it on
+    :class:`SessionResponse` lets the runner's peer-send authorization
+    decide whether sessions under a shared team root may message each
+    other directly.
+
+    The flag is read from the session's OWN bundle top-level spec. Declared
+    sub-agent sessions share the parent bundle's ``agent_id`` (they are part
+    of the same bundle, not separately registered), so both a lead and its
+    teammates resolve the same team flag — which is exactly the team-root
+    semantics we want, without a separate root lookup here.
+
+    :param conv: The conversation entity, or ``None``.
+    :returns: ``True`` / ``False`` from the spec, or ``None`` when the
+        agent cannot be looked up.
+    """
+    if conv is None or conv.agent_id is None:
+        return None
+    try:
+        from omnigent.runtime import get_agent_cache
+        from omnigent.runtime._globals import _agent_store
+
+        if _agent_store is None:
+            return None
+        agent = _agent_store.get(conv.agent_id)
+        if agent is None:
+            return None
+        loaded = get_agent_cache().load(
+            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        )
+        return bool(loaded.spec.team)
+    except (KeyError, AttributeError, ValueError, ImportError, OSError):
+        return None
+
+
 def _validated_harness_override(value: str | None, agent: Agent) -> str | None:
     """
     Validate + canonicalize a session-create ``harness_override``.
@@ -9141,6 +9180,7 @@ __all__ = [
     "_resolve_llm_model",
     "_resolve_skill_meta_text_via_runner",
     "_resolve_subagent_spec",
+    "_resolve_team",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
     "_run_compact_locked",

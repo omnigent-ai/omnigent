@@ -1,0 +1,112 @@
+# Team Demo — the smallest agent-team that exercises PEER messaging.
+#
+# Claude Code's "agent teams" let long-lived teammates message each OTHER
+# directly, not only their lead. Omnigent models this with the top-level
+# `team:` flag: sessions sharing a spawn-tree root, all opted into `team`, may
+# `sys_session_send` each other by session_id — and the reply lands in the
+# SENDER's inbox, not the lead's.
+#
+# This demo is a lead (`coordinator`) with two teammates (`alice`, `bob`).
+# Both teammates set `team: true` AND `spawn: true` — `spawn` is what registers
+# `sys_session_send` on a leaf teammate so it can reach a sibling; `team` is
+# what authorizes the peer target. The point of the demo is step 3 below:
+# alice messages bob directly and gets his answer back herself.
+#
+# Usage:
+#   omnigent run examples/team_demo
+#
+# Then drive it (the coordinator will walk the team through this, or you can
+# instruct it explicitly):
+#   1. Coordinator spawns alice and bob (sys_session_send by (agent, title)).
+#   2. Ask alice to sys_session_list, find bob's conversation_id.
+#   3. Ask alice to sys_session_send bob by session_id with a question, then
+#      sys_read_inbox — bob's answer arrives in ALICE's inbox (peer routing).
+#
+# Minimal setup: one Claude provider (both teammates run claude-sdk). Run
+# `omnigent setup` or export ANTHROPIC_API_KEY.
+
+spec_version: 1
+name: team_demo
+description: >-
+  A minimal agent-team lead that spawns two peer teammates (alice, bob) and
+  demonstrates direct teammate-to-teammate messaging: a teammate messages a
+  sibling by session_id and receives the reply in its own inbox.
+
+# Mark this session tree as an agent team. Every session under this root that
+# also sets `team: true` may peer-message the others.
+team: true
+
+# The coordinator orchestrates on the Claude Agent SDK. It spawns the teammates
+# and relays instructions; it does not need to write code.
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are the coordinator of a small agent TEAM with two teammates, `alice` and
+  `bob` (see agents/<name>/). This team demonstrates PEER messaging: teammates
+  can message each OTHER directly, not only you.
+
+  Your job is to set the demo up and then get out of the way:
+
+  1. Spawn both teammates in ONE turn: emit two `sys_session_send` calls with
+     `(agent, title)` — e.g. agent `alice` title `alice`, agent `bob` title
+     `bob` — each with a short `args` telling them their name and that they are
+     on a team where they can message each other by session_id.
+
+  2. Once both are up, instruct `alice` (via `sys_session_send` continuing her
+     session) to:
+       - call `sys_session_list` to discover her teammates and note bob's
+         `conversation_id`, then
+       - call `sys_session_send` with `session_id` = bob's id, asking bob a
+         concrete question (e.g. "what's your favorite data structure and why?"),
+         then
+       - call `sys_read_inbox` to collect bob's reply and report it back to you.
+
+  3. Report to the human what alice received from bob, and explicitly note that
+     bob's answer arrived in ALICE's inbox — proving the peer-to-peer path (the
+     reply did NOT route through you, the lead).
+
+  Supervise via the inbox: after you dispatch, END YOUR TURN and you are woken
+  when a teammate finishes. Do not busy-poll. Act in the same turn you announce —
+  never end a turn on an intent sentence with no tool call.
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+# Bound the team fan-out. team_bounds caps peer sends per turn and distinct
+# peers per session; spawn_bounds caps child dispatches per turn.
+guardrails:
+  policies:
+    blast_radius:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.inner.nessie.policies.blast_radius
+        arguments:
+          gate_pushes: false
+    spawn_bounds:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.spawn_bounds
+        arguments:
+          max_dispatches_per_turn: 4
+    team_bounds:
+      type: function
+      function:
+        path: omnigent.inner.nessie.policies.team_bounds
+        arguments:
+          max_peer_sends_per_turn: 3
+          max_team_peers: 5
+
+tools:
+  agents:
+    - alice
+    - bob

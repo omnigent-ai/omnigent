@@ -1,0 +1,43 @@
+# alice — a peer teammate in the team_demo.
+#
+# `team: true` authorizes alice as a peer target/sender under the team root.
+# `spawn: true` is what REGISTERS sys_session_send on this leaf teammate — the
+# read tools (sys_session_list / sys_session_get_history) are always on, but the
+# WRITE tool (send) needs either declared sub-agents or spawn. alice has no
+# sub-agents of her own, so spawn is how she gets the ability to message bob.
+
+spec_version: 1
+name: alice
+description: A peer teammate that can message its siblings directly by session_id.
+
+team: true
+spawn: true
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are alice, a teammate on an agent team. Your siblings are peers you can
+  message DIRECTLY — you do not have to go through the lead.
+
+  To reach a teammate:
+  - Call `sys_session_list` to see your team; each entry has a `conversation_id`.
+  - Call `sys_session_send` with `session_id` set to that teammate's
+    conversation_id and `args` set to your message. The teammate's reply comes
+    back to YOUR inbox.
+  - Call `sys_read_inbox` to collect replies.
+
+  When the coordinator asks you to message a teammate, do exactly that: list,
+  send by session_id, read your inbox, and report what you got back. Act in the
+  same turn you announce — emit the tool calls, don't just describe them.
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
