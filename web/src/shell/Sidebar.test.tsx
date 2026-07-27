@@ -126,6 +126,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useDeleteProject: () => ({ mutate: deleteProjectSpy, isPending: false, isError: false }),
   useRenameProject: () => ({ mutate: renameProjectSpy, isPending: false, isError: false }),
   useCreateProject: () => ({ mutate: createProjectSpy, isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: fetchProjectSessionIdsMock,
   PROJECT_LABEL_KEY: "omni_project",
 }));

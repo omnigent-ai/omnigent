@@ -56,6 +56,7 @@ import {
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isModelFile,
   isNotebookPath,
   isPdfFile,
   lineOverlapsSelection,
@@ -78,6 +79,11 @@ const MonacoCodeEditor = lazy(() =>
 // react-pdf + pdf.js (worker) is heavy; load it only when a PDF is actually
 // viewed so it never enters the initial bundle.
 const PdfViewer = lazy(() => import("./PdfViewer").then((m) => ({ default: m.PdfViewer })));
+
+// three.js (+ its loaders) is heavy; load the 3D model viewer only when a
+// model file is actually opened so it stays out of the main bundle (same
+// lazy strategy as Monaco).
+const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m.ModelViewer })));
 
 // ---------------------------------------------------------------------------
 // MarkdownPreview — read-only render of Markdown content via react-markdown + GFM
@@ -645,6 +651,19 @@ export function CodeViewer({
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
         />
+      </Suspense>
+    );
+  }
+  if (fileQuery.data && isModelFile(path, fileQuery.data.content_type)) {
+    return (
+      <Suspense
+        fallback={
+          <div className="flex items-center justify-center p-8 text-muted-foreground text-sm">
+            Loading 3D preview…
+          </div>
+        }
+      >
+        <ModelViewer data={fileQuery.data} path={path} />
       </Suspense>
     );
   }

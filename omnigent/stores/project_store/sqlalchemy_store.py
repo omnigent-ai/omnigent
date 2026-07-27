@@ -18,6 +18,13 @@ from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.project_store import ProjectStore
 
+# Max serialized length of a project's config blob. The value is persisted
+# verbatim and reflected back on every read, so an unbounded blob is a mild
+# storage/response-size amplifier on an otherwise cheap CRUD row. 64 KiB is far
+# above any realistic set of default-session hints (a few short keys) while
+# still capping abuse.
+_CONFIG_MAX_SERIALIZED_LEN = 64 * 1024
+
 
 def _encode_config(config: dict[str, Any] | None) -> str | None:
     """Pack a project's config dict into a compact JSON blob for storage.
@@ -27,19 +34,35 @@ def _encode_config(config: dict[str, Any] | None) -> str | None:
 
     :param config: The config object, or ``None``.
     :returns: Compact JSON object string, or ``None`` when empty.
+    :raises OmnigentError: ``INVALID_INPUT`` if the serialized config exceeds
+        :data:`_CONFIG_MAX_SERIALIZED_LEN`.
     """
     if not config:
         return None
-    return json.dumps(config, separators=(",", ":"))
+    blob = json.dumps(config, separators=(",", ":"))
+    if len(blob) > _CONFIG_MAX_SERIALIZED_LEN:
+        raise OmnigentError(
+            f"project config too large ({len(blob)} bytes; max {_CONFIG_MAX_SERIALIZED_LEN})",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return blob
 
 
 def _decode_config(raw: str | None) -> dict[str, Any]:
     """Unpack the stored ``config`` blob to a dict (``{}`` when unset).
 
+    Defensive against a non-object blob: the encode path only ever writes JSON
+    objects, but a future writer or a manual DB edit could store a scalar/array,
+    which would otherwise flow back as a non-dict. Coerce anything that isn't a
+    dict to ``{}`` so callers can always treat config as a mapping.
+
     :param raw: The stored JSON blob, or ``None``.
-    :returns: The decoded object, or an empty dict when ``NULL`` / empty.
+    :returns: The decoded object, or an empty dict when ``NULL`` / empty / non-object.
     """
-    return json.loads(raw) if raw else {}
+    if not raw:
+        return {}
+    decoded = json.loads(raw)
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _is_name_conflict(exc: IntegrityError) -> bool:

@@ -79,10 +79,9 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // the create-POST call-count / call-order assertions below).
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/hooks/useConversations")>()),
+  // Empty projects list → no ?project= name resolves to an id, so the project
+  // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
-  // "No newest session" keeps the project prefill inert so the generic
-  // host/workspace defaults under test still apply on ?project= visits.
-  useNewestProjectSession: () => ({ data: null, isError: false }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.

@@ -31,6 +31,11 @@ import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useSched
 import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import {
+  isBackdropOverlay,
+  isInsidePopper,
+  shouldGuardDialogDismiss,
+} from "@/lib/dialogDismissGuard";
+import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
   parseRRuleToScheduleModel,
@@ -493,52 +498,7 @@ export function CreateScheduledTaskDialog({
 /** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
 const UNSET_HOST = "__unset_host__";
 
-/**
- * True when an event target lives inside a Radix popper / Select portal (which
- * renders outside the DialogContent subtree). Used to distinguish a click that
- * merely closes a nested Select from a genuine outside-click on the backdrop, so
- * the former doesn't dismiss the whole Dialog.
- *
- * Exported for unit testing (the full portal outside-click is hard to reproduce
- * faithfully in jsdom — see the dialog test).
- */
-export function isInsidePopper(target: EventTarget | null): boolean {
-  return (
-    target instanceof Element &&
-    target.closest(
-      [
-        "[data-radix-popper-content-wrapper]",
-        '[data-slot="dropdown-menu-content"]',
-        '[data-slot="popover-content"]',
-        '[data-slot="select-content"]',
-        '[role="listbox"]',
-      ].join(", "),
-    ) !== null
-  );
-}
-
-/** True when the event target is the Dialog's backdrop overlay itself. A real
- *  backdrop click must always dismiss, so the guard lets it through. */
-export function isBackdropOverlay(target: EventTarget | null): boolean {
-  return target instanceof Element && target.closest('[data-slot="dialog-overlay"]') !== null;
-}
-
-/**
- * Pure decision for whether to SWALLOW the Dialog's outside-dismiss. Returns
- * true → preventDefault (dialog stays open); false → let it dismiss.
- *
- * A genuine backdrop-overlay click ALWAYS dismisses (returns false), even during
- * the grace window — this is the fix for backdrop-click-to-close being swallowed.
- * Otherwise we swallow only the narrow nested-dropdown cases: a dropdown
- * currently open, the trailing focus-outside within `graceMs` of a dropdown
- * closing, or a click that landed inside portalled dropdown content. Exported
- * pure so it's unit-testable without Radix's portal machinery.
- */
-export function shouldGuardDialogDismiss(
-  target: EventTarget | null,
-  opts: { selectOpen: boolean; msSinceSelectClose: number; graceMs?: number },
-): boolean {
-  if (isBackdropOverlay(target)) return false;
-  const graceMs = opts.graceMs ?? 150;
-  return opts.selectOpen || opts.msSinceSelectClose < graceMs || isInsidePopper(target);
-}
+// The nested-dropdown dismiss guard now lives in a dependency-free module so
+// other dialogs (project settings) can reuse it without pulling this file's
+// module graph. Re-exported here to keep existing imports and tests stable.
+export { isBackdropOverlay, isInsidePopper, shouldGuardDialogDismiss };

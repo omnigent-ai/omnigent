@@ -19,8 +19,9 @@ import {
   useConversations,
   useDeleteProject,
   useProjects,
-  useNewestProjectSession,
+  useProjectConfig,
   useProjectSessions,
+  useUpdateProjectConfig,
   useMoveToProject,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -1147,6 +1148,57 @@ describe("useProjects", () => {
   });
 });
 
+describe("useUpdateProjectConfig cache seeding", () => {
+  it("seeds the fresh config + upserts the projects list on success (no stale read)", async () => {
+    // The composer prefill settles once from the cache, so a save must write
+    // the fresh value in — not merely invalidate — or the next visit within the
+    // staleTime window reads the old config and drops the just-saved defaults.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Pre-seed both caches with a STALE snapshot: a label-only folder (id=null)
+    // and its (empty) config.
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Work" }]);
+    queryClient.setQueryData(["project-config", "p_new"], {});
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    // The PATCH (label-only folder → promoted, so a create precedes it) returns
+    // the fresh first-class project with its stored config.
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", name: "Work" })) // apiCreateProject
+      .mockResolvedValueOnce(
+        mockResponse({ id: "p_new", name: "Work", config: { agent_id: "ag_x" } }),
+      );
+
+    const { result } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+    result.current.mutate({ id: null, name: "Work", config: { agent_id: "ag_x" } });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The config cache holds the fresh value keyed by the NEW id.
+    expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
+    // The projects list now resolves "Work" → the promoted first-class id.
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
+  });
+});
+
+describe("useProjectConfig", () => {
+  it("does not fetch for a label-only folder (null id)", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useProjectConfig(null), { wrapper });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("surfaces isError on a failed GET (so the dialog can block a clearing save)", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useProjectConfig("p_1"), { wrapper });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+  });
+});
+
 describe("useProjectSessions", () => {
   it("does not fetch while disabled (collapsed folder)", () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -1180,54 +1232,6 @@ describe("useProjectSessions", () => {
     // Folders show active sessions only — archived ones leave the sidebar.
     expect(url).not.toContain("include_archived");
     expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
-  });
-});
-
-describe("useNewestProjectSession", () => {
-  it("does not fetch without a project", () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    renderHook(() => useNewestProjectSession(null), { wrapper });
-    renderHook(() => useNewestProjectSession(""), { wrapper });
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("fetches one newest session and unwraps it from the page", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
-        first_id: "conv_a",
-        last_id: "conv_a",
-        has_more: true,
-      }),
-    );
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useNewestProjectSession("Sprint 42"), { wrapper });
-
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const url = fetchMock.mock.calls[0][0] as string;
-    expect(url).toContain("/v1/sessions?");
-    expect(url).toContain("project=Sprint+42");
-    expect(url).toContain("order=desc");
-    expect(url).toContain("sort_by=updated_at");
-    expect(url).toContain("limit=1");
-    expect(result.current.data?.id).toBe("conv_a");
-  });
-
-  it("resolves null for a project with no sessions", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
-    );
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useNewestProjectSession("Empty"), { wrapper });
-
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(result.current.data).toBeNull();
   });
 });
 

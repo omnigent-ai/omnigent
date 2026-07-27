@@ -32,8 +32,11 @@ import { stopSession } from "@/lib/sessionsApi";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
+  getProject as apiGetProject,
   listProjects as apiListProjects,
+  type ProjectConfig,
   renameProject as apiRenameProject,
+  updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
@@ -512,10 +515,6 @@ export function useArchiveConversation() {
       // or drops it from that project folder's own paginated list.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      // Archiving can change (or empty) a project's newest member, which the
-      // composer prefill reuses — refresh it so prefill never anchors on a
-      // session that just left the active list.
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       // Archive membership just changed, so the archived-view picker's option
       // set may have gained/lost a project.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
@@ -589,9 +588,6 @@ export function useStopAndDeleteConversation() {
       // list, /v1/sessions/projects reads the DB directly (no search-index
       // lag), so this can't resurrect the deleted row.
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      // The deleted session may have been a project's newest member, which
-      // the composer prefill anchors on — refresh it too.
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       // Deleting an archived session may empty its project of archived members.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
@@ -654,7 +650,6 @@ export function useBulkArchiveConversations() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
   });
@@ -710,7 +705,6 @@ export function useBulkDeleteConversations() {
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
     onError: (err: any) => {
@@ -729,7 +723,6 @@ export function useBulkDeleteConversations() {
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
-        void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
         void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
       }
     },
@@ -1121,10 +1114,8 @@ export function useMoveToProject() {
       markConversationSeen(updated.id, updated.updated_at);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
-      // Moving into/out of a project changes both folders' paginated lists,
-      // and can change either project's newest member the prefill anchors on.
+      // Moving into/out of a project changes both folders' paginated lists.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       // Moving an archived session relabels which project owns it, shifting the
       // archived-view picker's option set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
@@ -1223,24 +1214,6 @@ export function useProjectSessions(project: string, enabled: boolean) {
   });
 }
 
-/**
- * The newest (non-archived) session filed under a project, or `null` when
- * the project has no session the caller can read. Powers the new-session
- * landing screen's project prefill: starting another session in a project
- * reuses its most recent session's host, repo, and agent.
- */
-export function useNewestProjectSession(project: string | null) {
-  return useQuery({
-    queryKey: ["project-newest-session", project],
-    queryFn: async () => {
-      const page = await fetchProjectSessionsPage(project as string, undefined, 1);
-      return page.data[0] ?? null;
-    },
-    enabled: project !== null && project !== "",
-    staleTime: 30_000,
-  });
-}
-
 /** Archive a session AND detach it from its project (clear project_id + the
  * legacy omni_project label) in a single PATCH — used by "Delete project". */
 async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
@@ -1297,7 +1270,6 @@ export function useDeleteProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       // Deleting a project archives its members, growing the archived set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
@@ -1379,8 +1351,67 @@ export function useRenameProject() {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      void queryClient.invalidateQueries({ queryKey: ["project-newest-session"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+    },
+  });
+}
+
+/**
+ * Fetch one project's full record (including its `config`) from
+ * `GET /v1/projects/{id}`. Used by the settings editor to seed its fields, and
+ * by the composer to read a project's stored session defaults. Disabled when
+ * `id` is `null` (a label-only folder has no first-class row to read).
+ */
+export function useProjectConfig(id: string | null) {
+  return useQuery<ProjectConfig>({
+    queryKey: ["project-config", id],
+    queryFn: async () => (await apiGetProject(id as string)).config ?? {},
+    enabled: id !== null,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * Replace a project's stored `config` defaults (`PATCH /v1/projects/{id}`).
+ * A label-only folder (`id === null`) is promoted on demand — a row created
+ * under its name — so its defaults can be stored, mirroring `useRenameProject`.
+ * Passing `config: {}` clears the stored defaults.
+ */
+export function useUpdateProjectConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      name,
+      config,
+    }: {
+      id: string | null;
+      name: string;
+      config: ProjectConfig;
+    }) => {
+      const projectId = id ?? (await apiCreateProject(name)).id;
+      return apiUpdateProjectConfig(projectId, config);
+    },
+    onSuccess: (project) => {
+      // Seed the fresh config into the cache (not just invalidate) so the
+      // composer's prefill reads the just-saved defaults on the very next visit
+      // — the prefill settles once and would otherwise latch onto the stale
+      // cached value during the 30s staleTime window while a refetch is still
+      // in flight.
+      queryClient.setQueryData<ProjectConfig>(["project-config", project.id], project.config ?? {});
+      // Upsert the projects list too, so a just-promoted label-only folder
+      // resolves to its NEW first-class id immediately (name → id is how the
+      // composer keys the config lookup); a stale `id: null` would resolve the
+      // config to `{}` and drop the saved defaults on that first visit.
+      queryClient.setQueryData<ProjectSummary[]>(["projects"], (prev) => {
+        if (!prev) return prev;
+        const summary = { id: project.id, name: project.name };
+        return prev.some((p) => p.name === project.name)
+          ? prev.map((p) => (p.name === project.name ? summary : p))
+          : [...prev, summary];
+      });
+      void queryClient.invalidateQueries({ queryKey: ["project-config"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 }

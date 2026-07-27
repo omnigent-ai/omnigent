@@ -254,7 +254,7 @@
   --sidebar-accent-foreground: #04355d;
   --sidebar-border: #e8ecf0;
   --sidebar-ring: #2272b4;
-  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 5%, transparent);
+  --sidebar-hover: color-mix(in srgb, var(--sidebar-foreground) 3%, transparent);
   --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
   --sidebar-active-foreground: var(--sidebar-foreground);
 }
