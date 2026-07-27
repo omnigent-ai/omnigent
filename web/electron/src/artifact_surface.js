@@ -2,6 +2,8 @@
 
 const { randomUUID } = require("node:crypto");
 
+const MAX_ARTIFACT_CAPTURE_PIXELS = 4_000_000;
+
 const ARTIFACT_INSPECTOR_SCRIPT = `(() => {
   window.__omnigentCancelArtifactInspector?.();
   return new Promise((resolve) => {
@@ -240,13 +242,28 @@ function consoleLevelName(level) {
   return ["debug", "info", "warning", "error"][level] || "info";
 }
 
-function parseArtifactPreviewUrl(value) {
+function artifactPreviewOriginForServer(serverUrl) {
+  const server = new URL(serverUrl);
+  if (server.protocol !== "http:" && server.protocol !== "https:") {
+    throw new Error("artifact preview servers require an HTTP(S) URL");
+  }
+  const loopback = new Set(["localhost", "127.0.0.1", "::1"]);
+  const hostname = loopback.has(server.hostname)
+    ? "preview.localhost"
+    : `preview.${server.hostname}`;
+  return `${server.protocol}//${hostname}${server.port ? `:${server.port}` : ""}`;
+}
+
+function parseArtifactPreviewUrl(value, expectedOrigin = null) {
   const url = new URL(value);
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("artifact previews require an HTTP(S) URL");
   }
   const match = url.pathname.match(/^\/p\/([^/]+)\//);
   if (!match) throw new Error("artifact previews require a capability-scoped URL");
+  if (expectedOrigin !== null && url.origin !== expectedOrigin) {
+    throw new Error("artifact preview URL does not match the connected server");
+  }
   return {
     url,
     origin: url.origin,
@@ -278,6 +295,30 @@ function normalizeArtifactBounds(bounds, contentBounds) {
   };
 }
 
+function normalizeArtifactCaptureRect(rect, viewport) {
+  const values = [
+    rect?.x,
+    rect?.y,
+    rect?.width,
+    rect?.height,
+    viewport?.width,
+    viewport?.height,
+  ].map(Number);
+  if (!values.every(Number.isFinite)) return null;
+  const [rawX, rawY, rawWidth, rawHeight, rawViewportWidth, rawViewportHeight] = values;
+  if (rawWidth <= 0 || rawHeight <= 0 || rawViewportWidth <= 0 || rawViewportHeight <= 0) {
+    return null;
+  }
+  const viewportWidth = Math.round(rawViewportWidth);
+  const viewportHeight = Math.round(rawViewportHeight);
+  const x = Math.min(viewportWidth, Math.max(0, Math.round(rawX)));
+  const y = Math.min(viewportHeight, Math.max(0, Math.round(rawY)));
+  const width = Math.min(Math.round(rawWidth), viewportWidth - x);
+  const height = Math.min(Math.round(rawHeight), viewportHeight - y);
+  if (width <= 0 || height <= 0 || width * height > MAX_ARTIFACT_CAPTURE_PIXELS) return null;
+  return { x, y, width, height };
+}
+
 function denyPermissions(ses) {
   if (!ses) return;
   ses.setPermissionCheckHandler?.(() => false);
@@ -295,17 +336,15 @@ class ArtifactSurfaceManager {
     if (!params || typeof params.id !== "string" || params.id.length === 0) {
       throw new Error("artifact surface id is required");
     }
-    const policy = parseArtifactPreviewUrl(params.url);
+    const policy = parseArtifactPreviewUrl(params.url, params.expectedOrigin ?? null);
     let surface = this.surfaces.get(win);
     if (surface) {
       const policyChanged =
         surface.policy.origin !== policy.origin ||
         surface.policy.capabilityPrefix !== policy.capabilityPrefix;
-      surface.id = params.id;
-      surface.policy = policy;
-      if (policyChanged) {
-        surface.consoleMessages.length = 0;
-        surface.loadErrors.length = 0;
+      if (surface.id !== params.id || policyChanged) {
+        this._destroySurface(win, surface);
+        surface = null;
       }
     }
 
@@ -386,9 +425,13 @@ class ArtifactSurfaceManager {
         surface.view.webContents.enableDeviceEmulation(deviceEmulation);
         surface.deviceEmulation = signature;
       }
+      surface.captureViewport = { width, height };
     } else if (surface.deviceEmulation !== null) {
       surface.view.webContents.disableDeviceEmulation();
       surface.deviceEmulation = null;
+      surface.captureViewport = { width: bounds.width, height: bounds.height };
+    } else {
+      surface.captureViewport = { width: bounds.width, height: bounds.height };
     }
     surface.view.setVisible(Boolean(params.visible && bounds.width > 0 && bounds.height > 0));
     if (surface.url !== policy.url.href) {
@@ -401,6 +444,10 @@ class ArtifactSurfaceManager {
   destroy(win, id) {
     const surface = this.surfaces.get(win);
     if (!surface || surface.id !== id) return;
+    this._destroySurface(win, surface);
+  }
+
+  _destroySurface(win, surface) {
     this.surfaces.delete(win);
     win.contentView.removeChildView(surface.view);
     if (!surface.view.webContents.isDestroyed?.()) surface.view.webContents.close();
@@ -422,10 +469,12 @@ class ArtifactSurfaceManager {
       ARTIFACT_SELECTION_SCRIPT,
       true,
     );
-    if (!selection?.rect) return null;
-    const screenshot = await surface.view.webContents.capturePage(selection.rect);
+    const captureRect = normalizeArtifactCaptureRect(selection?.rect, surface.captureViewport);
+    if (!captureRect) return null;
+    const screenshot = await surface.view.webContents.capturePage(captureRect);
     return {
       ...selection,
+      rect: captureRect,
       screenshotDataUrl: screenshot.toDataURL(),
     };
   }
@@ -460,7 +509,9 @@ module.exports = {
   ARTIFACT_SELECTION_SCRIPT,
   ARTIFACT_REVIEW_SCRIPT,
   denyPermissions,
+  artifactPreviewOriginForServer,
   navigationAllowed,
   normalizeArtifactBounds,
+  normalizeArtifactCaptureRect,
   parseArtifactPreviewUrl,
 };

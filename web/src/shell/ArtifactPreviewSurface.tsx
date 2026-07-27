@@ -37,6 +37,7 @@ export function ArtifactPreviewSurface({
 
     let cancelled = false;
     let observer: ResizeObserver | null = null;
+    let animationFrame: number | null = null;
     const sync = () => {
       if (cancelled) return;
       const previewState = previewStateRef.current;
@@ -59,21 +60,29 @@ export function ArtifactPreviewSurface({
         },
       });
     };
+    const scheduleSync = () => {
+      if (cancelled || animationFrame !== null) return;
+      animationFrame = window.requestAnimationFrame(() => {
+        animationFrame = null;
+        sync();
+      });
+    };
     queueMicrotask(() => {
       if (cancelled) return;
-      syncRef.current = sync;
-      observer = new ResizeObserver(sync);
+      syncRef.current = scheduleSync;
+      observer = new ResizeObserver(scheduleSync);
       observer.observe(element);
-      window.addEventListener("resize", sync);
-      window.addEventListener("scroll", sync, true);
+      window.addEventListener("resize", scheduleSync);
+      window.addEventListener("scroll", scheduleSync, true);
       sync();
     });
     return () => {
       cancelled = true;
       syncRef.current = () => undefined;
+      if (animationFrame !== null) window.cancelAnimationFrame(animationFrame);
       observer?.disconnect();
-      window.removeEventListener("resize", sync);
-      window.removeEventListener("scroll", sync, true);
+      window.removeEventListener("resize", scheduleSync);
+      window.removeEventListener("scroll", scheduleSync, true);
     };
   }, [nativeSurface, surfaceId]);
 

@@ -3,8 +3,10 @@ const assert = require("node:assert/strict");
 
 const {
   ArtifactSurfaceManager,
+  artifactPreviewOriginForServer,
   navigationAllowed,
   normalizeArtifactBounds,
+  normalizeArtifactCaptureRect,
   parseArtifactPreviewUrl,
 } = require("../src/artifact_surface");
 
@@ -39,9 +41,12 @@ function fakeViewFactory(created) {
       on: (event, handler) => listeners.set(event, handler),
       loadURL: async (url) => webContents.loaded.push(url),
       executeJavaScript: async () => webContents.executeResult ?? { x: 42, y: 84 },
-      capturePage: async () => ({
-        toDataURL: () => "data:image/png;base64,c2VsZWN0aW9u",
-      }),
+      capturePage: async (rect) => {
+        webContents.capturedRect = rect;
+        return {
+          toDataURL: () => "data:image/png;base64,c2VsZWN0aW9u",
+        };
+      },
       inspectElement: (x, y) => {
         webContents.inspected = { x, y };
       },
@@ -79,6 +84,17 @@ function fakeViewFactory(created) {
 }
 
 describe("artifact preview URL policy", () => {
+  it("derives the dedicated preview origin from the connected server", () => {
+    assert.equal(
+      artifactPreviewOriginForServer("http://localhost:6767/workspace"),
+      "http://preview.localhost:6767",
+    );
+    assert.equal(
+      artifactPreviewOriginForServer("https://app.example.com"),
+      "https://preview.app.example.com",
+    );
+  });
+
   it("accepts capability-scoped HTTP URLs", () => {
     expectPreview(
       parseArtifactPreviewUrl("http://preview.localhost:6767/p/token-1/artifacts/a/index.html"),
@@ -92,6 +108,15 @@ describe("artifact preview URL policy", () => {
   it("rejects non-capability and non-http URLs", () => {
     assert.throws(() => parseArtifactPreviewUrl("http://preview.localhost:6767/artifacts/a"));
     assert.throws(() => parseArtifactPreviewUrl("file:///tmp/index.html"));
+  });
+
+  it("rejects capability URLs outside the connected server preview origin", () => {
+    assert.throws(() =>
+      parseArtifactPreviewUrl(
+        "https://attacker.example/p/token-1/artifacts/a/index.html",
+        "https://preview.app.example.com",
+      ),
+    );
   });
 
   it("allows only the original origin and capability prefix", () => {
@@ -121,6 +146,32 @@ describe("artifact bounds", () => {
         { width: 900, height: 700 },
       ),
       { x: 0, y: 20, width: 900, height: 680 },
+    );
+  });
+});
+
+describe("artifact capture bounds", () => {
+  it("clamps a finite rectangle to the trusted viewport", () => {
+    assert.deepEqual(
+      normalizeArtifactCaptureRect(
+        { x: -20, y: 30, width: 800, height: 500 },
+        { width: 500, height: 400 },
+      ),
+      { x: 0, y: 30, width: 500, height: 370 },
+    );
+  });
+
+  it("rejects malformed, non-finite, empty, and excessive rectangles", () => {
+    const viewport = { width: 5000, height: 5000 };
+    assert.equal(normalizeArtifactCaptureRect(null, viewport), null);
+    assert.equal(
+      normalizeArtifactCaptureRect({ x: 0, y: 0, width: Infinity, height: 1 }, viewport),
+      null,
+    );
+    assert.equal(normalizeArtifactCaptureRect({ x: 0, y: 0, width: 0, height: 1 }, viewport), null);
+    assert.equal(
+      normalizeArtifactCaptureRect({ x: 0, y: 0, width: 5000, height: 5000 }, viewport),
+      null,
     );
   });
 });
@@ -188,7 +239,7 @@ describe("ArtifactSurfaceManager", () => {
     assert.equal(win.children.length, 0);
   });
 
-  it("reuses the native view across surface and capability changes", async () => {
+  it("creates a fresh partition across surface and capability changes", async () => {
     const win = fakeWindow();
     const created = [];
     const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
@@ -205,16 +256,22 @@ describe("ArtifactSurfaceManager", () => {
       bounds: { x: 0, y: 0, width: 120, height: 120 },
     });
 
-    assert.equal(created.length, 1);
-    assert.equal(created[0].webContents.closed, false);
+    assert.equal(created.length, 2);
+    assert.equal(created[0].webContents.closed, true);
+    assert.notEqual(
+      created[0].webContents.options.webPreferences.partition,
+      created[1].webContents.options.webPreferences.partition,
+    );
     assert.deepEqual(created[0].webContents.loaded, [
       "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+    ]);
+    assert.deepEqual(created[1].webContents.loaded, [
       "http://preview.localhost:6767/p/grant-b/artifacts/b/index.html",
     ]);
     manager.destroy(win, "session-a");
-    assert.equal(created[0].webContents.closed, false);
+    assert.equal(created[1].webContents.closed, false);
     manager.destroy(win, "session-b");
-    assert.equal(created[0].webContents.closed, true);
+    assert.equal(created[1].webContents.closed, true);
   });
 
   it("fits a fixed viewport inside the native artifact pane", async () => {
@@ -324,6 +381,29 @@ describe("ArtifactSurfaceManager", () => {
       styles: { color: "rgb(0, 0, 0)", display: "inline-flex" },
       screenshotDataUrl: "data:image/png;base64,c2VsZWN0aW9u",
     });
+    assert.deepEqual(created[0].webContents.capturedRect, { x: 12, y: 24, width: 120, height: 40 });
+  });
+
+  it("rejects page-controlled capture rectangles outside safe bounds", async () => {
+    const win = fakeWindow();
+    const created = [];
+    const manager = new ArtifactSurfaceManager({ createView: fakeViewFactory(created) });
+    await manager.sync(win, {
+      id: "current",
+      url: "http://preview.localhost:6767/p/grant-a/artifacts/a/index.html",
+      visible: true,
+      bounds: { x: 0, y: 0, width: 500, height: 400 },
+    });
+
+    for (const rect of [
+      { x: 0, y: 0, width: Infinity, height: 1 },
+      { x: 0, y: 0, width: -1, height: 1 },
+      { x: "bad", y: 0, width: 1, height: 1 },
+    ]) {
+      created[0].webContents.executeResult = { rect };
+      assert.equal(await manager.select(win, "current"), null);
+    }
+    assert.equal(created[0].webContents.capturedRect, undefined);
   });
 
   it("reloads the surface and reports console, load, and accessibility diagnostics", async () => {

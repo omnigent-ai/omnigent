@@ -64,6 +64,7 @@ describe("artifact surface wiring (src/main.js)", () => {
     assert.match(liveCode, /omnigent:artifact-surface-select/);
     assert.match(liveCode, /omnigent:artifact-surface-reload/);
     assert.match(liveCode, /omnigent:artifact-surface-review/);
+    assert.match(liveCode, /expectedOrigin:\s*artifactPreviewOriginForServer\(serverUrl\)/);
     assert.match(
       liveCode,
       /win\.on\("close"[\s\S]{0,120}artifactSurfaceManager\.destroyWindow\(win\)/,

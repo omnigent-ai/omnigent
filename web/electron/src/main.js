@@ -45,7 +45,7 @@ const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
-const { ArtifactSurfaceManager } = require("./artifact_surface");
+const { ArtifactSurfaceManager, artifactPreviewOriginForServer } = require("./artifact_surface");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
 
@@ -2047,7 +2047,12 @@ function registerIpc() {
       throw new Error("artifact surfaces are only available to a connected server page");
     }
     const win = BrowserWindow.fromWebContents(event.sender);
-    return artifactSurfaceManager.sync(win, params);
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) throw new Error("artifact surfaces require a connected server");
+    return artifactSurfaceManager.sync(win, {
+      ...params,
+      expectedOrigin: artifactPreviewOriginForServer(serverUrl),
+    });
   });
 
   ipcMain.handle("omnigent:artifact-surface-destroy", (event, id) => {

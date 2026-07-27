@@ -138,4 +138,50 @@ describe("ArtifactPreviewSurface", () => {
     act(() => unmount());
     expect(destroyArtifactSurface).toHaveBeenCalled();
   });
+
+  it("coalesces native surface updates within an animation frame", async () => {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      syncArtifactSurface,
+      destroyArtifactSurface,
+    };
+    vi.stubGlobal("ResizeObserver", ResizeObserverMock);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 12,
+      y: 34,
+      width: 500,
+      height: 360,
+      top: 34,
+      right: 512,
+      bottom: 394,
+      left: 12,
+      toJSON: () => ({}),
+    });
+    let scheduled: FrameRequestCallback | null = null;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      scheduled = callback;
+      return 1;
+    });
+
+    render(
+      <ArtifactPreviewSurface
+        surfaceId="surface"
+        title="Revenue"
+        url="http://preview.localhost/p/grant/a"
+        visible
+      />,
+    );
+
+    await waitFor(() => expect(syncArtifactSurface).toHaveBeenCalledTimes(1));
+    window.dispatchEvent(new Event("scroll"));
+    window.dispatchEvent(new Event("scroll"));
+    window.dispatchEvent(new Event("resize"));
+    expect(window.requestAnimationFrame).toHaveBeenCalledTimes(1);
+    expect(syncArtifactSurface).toHaveBeenCalledTimes(1);
+
+    act(() => scheduled?.(0));
+    expect(syncArtifactSurface).toHaveBeenCalledTimes(2);
+  });
 });

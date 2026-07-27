@@ -19,6 +19,7 @@ import {
   onNativeSidebarDrag,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
+  setThemeSource,
   supportsBrowser,
 } from "./nativeBridge";
 
@@ -27,6 +28,7 @@ const electronSetBadge = vi.fn();
 const electronNotify = vi.fn().mockResolvedValue(true);
 const electronUnsubscribe = vi.fn();
 const electronOnNotificationActivated = vi.fn().mockReturnValue(electronUnsubscribe);
+const electronSetColorScheme = vi.fn();
 
 // The iOS WKWebView bridge mock, installed on window.omnigentNative.
 const iosSetBadge = vi.fn();
@@ -45,6 +47,7 @@ const androidSetBadge = vi.fn();
 const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
+const androidSetColorScheme = vi.fn();
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -59,6 +62,7 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
       setBadgeCount: (...args: unknown[]) => electronSetBadge(...args),
+      setColorScheme: (...args: unknown[]) => electronSetColorScheme(...args),
       notify: (...args: unknown[]) => electronNotify(...args),
       ...(withClickRouting
         ? {
@@ -100,6 +104,7 @@ function setAndroid(on: boolean, withClickRouting = true): void {
     (window as unknown as Record<string, unknown>).omnigentNative = {
       kind: "android",
       setBadgeCount: (...args: unknown[]) => androidSetBadge(...args),
+      setColorScheme: (...args: unknown[]) => androidSetColorScheme(...args),
       notify: (...args: unknown[]) => androidNotify(...args),
       ...(withClickRouting
         ? {
@@ -293,6 +298,35 @@ describe("artifact surface bridge", () => {
     await expect(selectNativeArtifactElement("surface")).resolves.toBeNull();
     await expect(reloadNativeArtifactSurface("surface")).resolves.toBe(false);
     await expect(reviewNativeArtifactSurface("surface")).resolves.toBeNull();
+  });
+});
+
+describe("setThemeSource", () => {
+  it("routes the selected system theme through the Electron bridge", () => {
+    setElectron(true);
+    setThemeSource("system");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("system");
+  });
+
+  it("routes an explicit selected theme through the Electron bridge", () => {
+    setElectron(true);
+    setThemeSource("dark");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("dark");
+  });
+
+  it("routes the selected theme through the Android bridge", () => {
+    setAndroid(true);
+    setThemeSource("light");
+    expect(androidSetColorScheme).toHaveBeenCalledWith("light");
+  });
+
+  it("routes the selected theme through the Android bridge over Electron legacy", () => {
+    setElectron(true);
+    (
+      window as unknown as { omnigentNative?: { kind: string; setColorScheme?: unknown } }
+    ).omnigentNative = undefined;
+    setThemeSource("system");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("system");
   });
 });
 
