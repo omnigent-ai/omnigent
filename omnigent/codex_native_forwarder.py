@@ -1075,14 +1075,23 @@ class _OutputTextDeltaCoalescer:
         """
         Flush all deltas queued before this call.
 
-        :returns: None after all earlier deltas have been posted.
+        Callers use this as an ordering fence before posting a boundary
+        event, so a stopped worker drops its undelivered deltas rather
+        than letting a replacement post them after the boundary.
+
+        :returns: None after all earlier deltas have been posted or
+            dropped.
         """
-        if self._worker_task is None:
+        worker = self._worker_task
+        if worker is None or self._release_stopped_worker(worker):
             return
         loop = asyncio.get_running_loop()
         done: asyncio.Future[None] = loop.create_future()
         self._queue.put_nowait(_DeltaFlushBarrier(done=done))
-        await done
+        # Wait on the worker too. Only the worker resolves the barrier, so
+        # awaiting the barrier alone never returns once the worker stops.
+        await asyncio.wait({done, worker}, return_when=asyncio.FIRST_COMPLETED)
+        self._release_stopped_worker(worker)
 
     async def close(self) -> None:
         """
@@ -1090,14 +1099,62 @@ class _OutputTextDeltaCoalescer:
 
         :returns: None after the worker has stopped.
         """
-        if self._worker_task is None:
+        worker = self._worker_task
+        if worker is None:
             return
-        loop = asyncio.get_running_loop()
-        done: asyncio.Future[None] = loop.create_future()
-        self._queue.put_nowait(_DeltaFlushStop(done=done))
-        await done
-        await self._worker_task
-        self._worker_task = None
+        if not worker.done():
+            loop = asyncio.get_running_loop()
+            done: asyncio.Future[None] = loop.create_future()
+            self._queue.put_nowait(_DeltaFlushStop(done=done))
+            # Wait for the worker itself: it exits right after acknowledging
+            # the stop marker, and a worker cancelled by interpreter shutdown
+            # never drains the queue at all.
+            await asyncio.wait({worker})
+        self._release_stopped_worker(worker)
+
+    def _release_stopped_worker(self, worker: asyncio.Task[None]) -> bool:
+        """
+        Drop and report a worker that stopped without draining its queue.
+
+        Clearing the slot lets the next :meth:`append` start a replacement,
+        so later deltas still reach AP; keeping a dead worker would buffer
+        them forever.
+
+        :param worker: Background delta worker.
+        :returns: ``True`` when the worker had stopped.
+        """
+        if not worker.done():
+            return False
+        if not worker.cancelled() and worker.exception() is not None:
+            _logger.warning(
+                "Codex forwarder delta worker stopped early",
+                exc_info=worker.exception(),
+            )
+        if self._worker_task is worker:
+            self._worker_task = None
+            self._discard_queued()
+        return True
+
+    def _discard_queued(self) -> None:
+        """
+        Drop the queue a stopped worker left behind.
+
+        These deltas are already past the ordering fence their flush
+        promised, so a replacement worker must not post them after the
+        boundary event that followed.
+
+        :returns: None.
+        """
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if isinstance(item, _DeltaChunk):
+                continue
+            # Release any concurrent waiter parked on a dropped barrier.
+            if not item.done.done():
+                item.done.set_result(None)
 
     def _ensure_worker(self) -> None:
         """

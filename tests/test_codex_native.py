@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -9891,3 +9894,374 @@ def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> Non
     )
     types = [r["type"] for r in records]
     assert "compacted" not in types
+
+
+_COALESCER_SHUTDOWN_SCRIPT = '''\
+"""Drive a forwarder-shaped task through asyncio.run()'s shutdown cancellation."""
+
+import asyncio
+
+import omnigent.codex_native_forwarder as fwd
+
+
+async def _noop_post(*args, **kwargs):
+    """Swallow event posts so the coalescer needs no HTTP client."""
+    return None
+
+
+async def _forwarder_like(coalescer):
+    """Mirror supervise_forwarder: block, then clean up in a finally."""
+    try:
+        await asyncio.sleep(3600)
+    finally:
+        __CLEANUP__
+
+
+async def _main():
+    """Start a coalescer worker, then return so asyncio.run() cancels it."""
+    fwd._post_output_text_delta = _noop_post
+    coalescer = fwd._OutputTextDeltaCoalescer(None, "conv_repro")
+    await coalescer.append("hello\\n")
+    asyncio.create_task(_forwarder_like(coalescer), name="codex-forwarder-repro")
+    await asyncio.sleep(0.2)
+
+
+asyncio.run(_main())
+'''
+
+
+def _run_coalescer_shutdown_script(tmp_path: Path, cleanup: str) -> None:
+    """
+    Run the shutdown repro in a subprocess and require a clean exit.
+
+    :param tmp_path: Directory for the generated script.
+    :param cleanup: Cleanup statement placed in the task's ``finally``,
+        e.g. ``"await coalescer.close()"``.
+    :returns: None.
+    """
+    script = tmp_path / "coalescer_shutdown.py"
+    script.write_text(_COALESCER_SHUTDOWN_SCRIPT.replace("__CLEANUP__", cleanup), encoding="utf-8")
+    repo_root = Path(codex_native_forwarder.__file__).resolve().parents[1]
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=repo_root,
+            env={**os.environ, "PYTHONPATH": str(repo_root)},
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"interpreter shutdown hung with cleanup {cleanup!r}")
+    assert result.returncode == 0, result.stderr
+
+
+def test_interpreter_shutdown_completes_with_coalescer_close(tmp_path: Path) -> None:
+    """
+    A forwarder closing its delta coalescer on shutdown still exits.
+
+    ``asyncio.run()`` cancels the coalescer worker along with every other
+    task, so a ``close()`` that waits for the worker to acknowledge a stop
+    marker waits forever and the runner process never exits.
+    """
+    _run_coalescer_shutdown_script(tmp_path, "await coalescer.close()")
+
+
+def test_interpreter_shutdown_completes_with_coalescer_flush(tmp_path: Path) -> None:
+    """A forwarder flushing its delta coalescer on shutdown still exits."""
+    _run_coalescer_shutdown_script(tmp_path, "await coalescer.flush()")
+
+
+def test_interpreter_shutdown_completes_without_coalescer(tmp_path: Path) -> None:
+    """Control: the same task shape without the coalescer exits cleanly."""
+    _run_coalescer_shutdown_script(tmp_path, "await asyncio.sleep(0)")
+
+
+class _BlockingDeltaPost:
+    """Delta post that parks in flight until the test releases it."""
+
+    def __init__(self) -> None:
+        """
+        Initialize the post stub.
+
+        :returns: None.
+        """
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.posted: list[str] = []
+
+    async def __call__(self, client: Any, session_id: str, delta: str, **kwargs: Any) -> None:
+        """
+        Park the worker mid-post, then record the delivered delta.
+
+        :param client: Unused HTTP client.
+        :param session_id: Unused conversation id.
+        :param delta: Assistant text fragment, e.g. ``"hello\\n"``.
+        :param kwargs: Remaining stream-id keyword arguments.
+        :returns: None.
+        """
+        self.entered.set()
+        await self.release.wait()
+        self.posted.append(delta)
+
+
+def _new_coalescer() -> Any:
+    """
+    Build a client-less delta coalescer for direct lifecycle tests.
+
+    :returns: Coalescer bound to ``"conv_123"``.
+    """
+    return codex_native_forwarder._OutputTextDeltaCoalescer(
+        None,  # type: ignore[arg-type]
+        "conv_123",
+    )
+
+
+async def _coalescer_with_blocked_worker(
+    post: _BlockingDeltaPost,
+) -> tuple[Any, asyncio.Task[None]]:
+    """
+    Start a coalescer whose worker is parked inside a delta post.
+
+    :param post: Blocking post stub installed on the module.
+    :returns: The coalescer and its live worker task.
+    """
+    coalescer = _new_coalescer()
+    await coalescer.append("hello\n")
+    await post.entered.wait()
+    worker = coalescer._worker_task
+    assert worker is not None
+    assert not worker.done()
+    return coalescer, worker
+
+
+def _live_worker_coalescer_run(
+    monkeypatch: pytest.MonkeyPatch,
+    call: Callable[[Any], Any],
+) -> None:
+    """
+    Cancel a live worker mid-wait and require the caller to return.
+
+    Exercises the wait itself rather than the already-stopped guard: the
+    call is in flight, with the worker still running, before the cancel.
+
+    :param monkeypatch: Fixture used to stub the delta post.
+    :param call: Coalescer method to await, e.g. ``lambda c: c.close()``.
+    :returns: None.
+    """
+    post = _BlockingDeltaPost()
+    monkeypatch.setattr(codex_native_forwarder, "_post_output_text_delta", post)
+
+    async def run() -> None:
+        """
+        Start the call, then cancel the worker under it.
+
+        :returns: None.
+        """
+        coalescer, worker = await _coalescer_with_blocked_worker(post)
+        waiter = asyncio.ensure_future(call(coalescer))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert not waiter.done(), "call returned before the worker stopped"
+        worker.cancel()
+        await asyncio.wait_for(waiter, 5)
+        assert coalescer._worker_task is None
+
+    asyncio.run(run())
+
+
+def test_delta_coalescer_close_returns_when_live_worker_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``close()`` returns when the worker is cancelled while it waits."""
+    _live_worker_coalescer_run(monkeypatch, lambda coalescer: coalescer.close())
+
+
+def test_delta_coalescer_flush_returns_when_live_worker_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``flush()`` returns when the worker is cancelled while it waits."""
+    _live_worker_coalescer_run(monkeypatch, lambda coalescer: coalescer.flush())
+
+
+def _stopped_worker_coalescer_run(
+    monkeypatch: pytest.MonkeyPatch,
+    call: Callable[[Any], Any],
+) -> None:
+    """
+    Require the given call to return against an already-stopped worker.
+
+    :param monkeypatch: Fixture used to stub the delta post.
+    :param call: Coalescer method to await, e.g. ``lambda c: c.close()``.
+    :returns: None.
+    """
+
+    async def _noop_post(*args: Any, **kwargs: Any) -> None:
+        """Swallow delta posts."""
+        return
+
+    monkeypatch.setattr(codex_native_forwarder, "_post_output_text_delta", _noop_post)
+
+    async def run() -> None:
+        """
+        Cancel the worker behind the coalescer's back and clean up.
+
+        :returns: None.
+        """
+        coalescer = _new_coalescer()
+        await coalescer.append("hello\n")
+        await asyncio.sleep(0)
+        worker = coalescer._worker_task
+        assert worker is not None
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        await asyncio.wait_for(call(coalescer), 5)
+        assert coalescer._worker_task is None
+
+    asyncio.run(run())
+
+
+def test_delta_coalescer_close_returns_when_worker_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``close()`` returns once the worker is gone instead of deadlocking."""
+    _stopped_worker_coalescer_run(monkeypatch, lambda coalescer: coalescer.close())
+
+
+def test_delta_coalescer_flush_returns_when_worker_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``flush()`` returns once the worker is gone instead of deadlocking."""
+    _stopped_worker_coalescer_run(monkeypatch, lambda coalescer: coalescer.flush())
+
+
+def test_delta_coalescer_restarts_worker_after_it_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Deltas queued after a worker dies are still delivered.
+
+    A stopped worker leaves nothing draining the queue, so the coalescer
+    has to drop it and let the next append start a replacement.
+    """
+    posted: list[str] = []
+
+    async def _record_post(client: Any, session_id: str, delta: str, **kwargs: Any) -> None:
+        """Record a delivered delta."""
+        posted.append(delta)
+
+    monkeypatch.setattr(codex_native_forwarder, "_post_output_text_delta", _record_post)
+
+    async def run() -> None:
+        """
+        Kill the worker, then keep using the coalescer.
+
+        :returns: None.
+        """
+        coalescer = _new_coalescer()
+        await coalescer.append("first\n")
+        await asyncio.sleep(0)
+        worker = coalescer._worker_task
+        assert worker is not None
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        await asyncio.wait_for(coalescer.flush(), 5)
+        await coalescer.append("second\n")
+        assert coalescer._worker_task is not worker
+        await asyncio.wait_for(coalescer.close(), 5)
+
+    asyncio.run(run())
+
+    assert "second\n" in posted
+
+
+def test_delta_coalescer_flush_fences_deltas_a_stopped_worker_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Deltas stranded by a stopped worker never cross their flush.
+
+    Callers flush before posting a boundary event. If the coalescer kept
+    the stranded queue, the replacement worker would post that text after
+    the boundary and the transcript would read out of order.
+    """
+    events: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocking_first_post(
+        client: Any,
+        session_id: str,
+        delta: str,
+        **kwargs: Any,
+    ) -> None:
+        """Park the first post forever, record every later one."""
+        if not entered.is_set():
+            entered.set()
+            await release.wait()
+        events.append(delta)
+
+    monkeypatch.setattr(codex_native_forwarder, "_post_output_text_delta", _blocking_first_post)
+
+    async def run() -> None:
+        """
+        Strand a queued delta, fence it, then keep streaming.
+
+        :returns: None.
+        """
+        coalescer = _new_coalescer()
+        await coalescer.append("in flight\n")
+        await entered.wait()
+        worker = coalescer._worker_task
+        assert worker is not None
+        await coalescer.append("stranded\n")
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        await asyncio.wait_for(coalescer.flush(), 5)
+        events.append("boundary")
+        await coalescer.append("after boundary\n")
+        await asyncio.wait_for(coalescer.close(), 5)
+
+    asyncio.run(run())
+
+    assert events == ["boundary", "after boundary\n"]
+
+
+def test_delta_coalescer_survives_cancelled_flush_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Cancelling a caller mid-flush leaves the worker able to finish.
+
+    The worker resolves the flush barrier after the caller is gone, so the
+    barrier future must still be pending rather than cancelled underneath
+    it — otherwise the worker dies on ``set_result`` and leaks its Codex
+    app-server.
+    """
+    post = _BlockingDeltaPost()
+    monkeypatch.setattr(codex_native_forwarder, "_post_output_text_delta", post)
+
+    async def run() -> None:
+        """
+        Cancel a flush waiter, release the worker, then close.
+
+        :returns: None.
+        """
+        coalescer, worker = await _coalescer_with_blocked_worker(post)
+        waiter = asyncio.ensure_future(coalescer.flush())
+        for _ in range(3):
+            await asyncio.sleep(0)
+        waiter.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiter
+        post.release.set()
+        await asyncio.wait_for(coalescer.close(), 5)
+        assert not worker.cancelled()
+        assert worker.exception() is None
+
+    asyncio.run(run())
+
+    assert post.posted == ["hello\n"]
