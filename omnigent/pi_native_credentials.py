@@ -218,7 +218,7 @@ class PiProviderConfig:
                 any(m.get("id") == self.model for m in prov.get("models", []))
                 for prov in self.additional_providers.values()
             )
-            # Skip models excluded from Pi entirely (e.g. gemini-2-5 thinking
+            # Skip models excluded from Pi entirely (e.g. Gemini — no Responses API
             # models) — don't register them under the Anthropic provider either.
             if (
                 not any(m.get("id") == self.model for m in models)
@@ -429,7 +429,7 @@ def _needs_responses_api(model_id_lower: str) -> bool:
     to the Responses API — safer for new models we haven't tested.
 
     Non-GPT models are handled separately (Kimi/inkling/Qwen3 routed via
-    system.ai.* Responses API; Gemini-2-5 excluded via _unsupported_in_pi).
+    system.ai.* Responses API; Gemini excluded via _unsupported_in_pi).
 
     Expects a pre-lowercased model id.
     """
@@ -441,14 +441,13 @@ def _needs_responses_api(model_id_lower: str) -> bool:
 def _unsupported_in_pi(model_id_lower: str) -> bool:
     """Return True for models Pi can't handle via openai-completions or responses.
 
-    Gemini 2.5 thinking models return ``content`` as an array
-    (``[{"type":"text","text":"...","thoughtSignature":"..."}]``) in streaming
-    responses when tools are present. The Responses API doesn't support Gemini
-    at all, so these models are excluded from both providers.
+    Gemini models return ``content`` as an array with ``thoughtSignature`` in
+    streaming responses when tools are present, and the Responses API doesn't
+    support Gemini at all. Exclude all Gemini models from both providers.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini-2-5" in model_id_lower
+    return "gemini" in model_id_lower
 
 
 def _fetch_pi_model_lists(
