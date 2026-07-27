@@ -917,6 +917,92 @@ def _retarget_codex_hook_trust_keys(
         logger.warning("could not retarget hook-trust keys in %s", config_path)
 
 
+def _merge_codex_hook_trust_back(
+    private_config: Path,
+    source_dir: Path,
+    target_dir: Path,
+) -> None:
+    """Merge ``[hooks.state]`` trust entries from a private session config back
+    into the global ``CODEX_HOME`` ``config.toml``.
+
+    When a user accepts the hook-trust prompt inside a session, Codex writes
+    ``[hooks.state.*]`` entries into the private per-session ``config.toml``
+    with path keys referencing *target_dir* (the private home). Those entries
+    are discarded when the session ends because the private home is ephemeral.
+
+    This function reads the accumulated trust state from the private copy,
+    translates the path keys back from *target_dir* → *source_dir*, and
+    upserts them into the global ``source_dir/config.toml`` so the next
+    session's copy starts with them already present — and
+    :func:`_retarget_codex_hook_trust_keys` can carry them forward again.
+
+    All writes are atomic (temp-file + rename) and best-effort: any failure
+    is logged as a warning rather than raised, since the session has already
+    ended and blocking on a trust-state flush would be unhelpful.
+
+    :param private_config: The per-session private ``config.toml``.
+    :param source_dir: Original ``CODEX_HOME``, e.g. ``Path("~/.codex")``.
+    :param target_dir: Per-session private ``CODEX_HOME`` whose path appears
+        in the private trust keys.
+    """
+    source_prefix = str(source_dir)
+    target_prefix = str(target_dir)
+    if source_prefix == target_prefix:
+        return
+    try:
+        import tomlkit
+
+        private_text = private_config.read_text(encoding="utf-8")
+        private_doc = tomlkit.parse(private_text)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read private config for hook-trust merge: %s", private_config)
+        return
+
+    private_state: dict = (
+        private_doc.get("hooks", {}).get("state", {})  # type: ignore[union-attr]
+    )
+    if not private_state:
+        return
+
+    # Translate keys: target_dir prefix → source_dir prefix.
+    translated: dict[str, object] = {}
+    for key, value in private_state.items():
+        if key.startswith(target_prefix):
+            translated[source_prefix + key[len(target_prefix) :]] = value
+        else:
+            translated[key] = value
+
+    global_config = source_dir / "config.toml"
+    try:
+        if global_config.is_file():
+            global_text = global_config.read_text(encoding="utf-8")
+            global_doc = tomlkit.parse(global_text)
+        else:
+            global_doc = tomlkit.document()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read global config for hook-trust merge: %s", global_config)
+        return
+
+    # Upsert into global [hooks.state], creating the tables if absent.
+    if "hooks" not in global_doc:
+        global_doc.add("hooks", tomlkit.table())
+    hooks_table = global_doc["hooks"]
+    if "state" not in hooks_table:
+        hooks_table.add("state", tomlkit.table())
+    state_table = hooks_table["state"]
+    for key, value in translated.items():
+        state_table[key] = value
+
+    try:
+        tmp = global_config.with_suffix(".toml.tmp")
+        tmp.write_text(tomlkit.dumps(global_doc), encoding="utf-8")
+        os.replace(tmp, global_config)
+    except OSError:
+        logger.warning("could not write hook-trust merge back to %s", global_config)
+        with suppress(FileNotFoundError):
+            tmp.unlink()
+
+
 def _databricks_codex_base_url(host: str) -> str:
     """Return the Unity AI Gateway Codex Responses base URL for *host*."""
     return f"{host.rstrip('/')}/ai-gateway/codex/v1"

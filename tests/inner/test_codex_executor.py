@@ -2652,6 +2652,124 @@ def test_populate_codex_home_config_preserves_unrelated_trust_keys(tmp_path: Pat
     assert 'trusted_hash = "sha256:mine"' in copied
 
 
+# ---------------------------------------------------------------------------
+# _merge_codex_hook_trust_back tests
+# ---------------------------------------------------------------------------
+
+
+def test_merge_codex_hook_trust_back_writes_to_global(tmp_path: Path) -> None:
+    """Trust accepted in a session is flushed back to the global config.toml.
+
+    After close(), the next session's copy of config.toml will contain the
+    translated trust entries so _retarget_codex_hook_trust_keys can carry
+    them forward and Codex won't prompt again.
+    """
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('model = "gpt-5.5"\n')
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    target_config_path = str(target / "config.toml")
+    private_config = target / "config.toml"
+    private_config.write_text(
+        'model = "gpt-5.5"\n'
+        f'[hooks.state."{target_config_path}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:abc123"\n'
+    )
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    import tomllib
+
+    with open(source / "config.toml", "rb") as f:
+        global_doc = tomllib.load(f)
+    state = global_doc["hooks"]["state"]
+    source_config_path = str(source / "config.toml")
+    assert f"{source_config_path}:pre_tool_use:0:0" in state
+    assert state[f"{source_config_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:abc123"
+    # Private path must not appear in global config.
+    assert target_config_path not in str(global_doc)
+
+
+def test_merge_codex_hook_trust_back_merges_into_existing_state(tmp_path: Path) -> None:
+    """Existing [hooks.state] entries in the global config are preserved."""
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config_path = str(source / "config.toml")
+    (source / "config.toml").write_text(
+        'model = "gpt-5.5"\n'
+        f'[hooks.state."{source_config_path}:post_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:existing"\n'
+    )
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    target_config_path = str(target / "config.toml")
+    private_config = target / "config.toml"
+    private_config.write_text(
+        f'[hooks.state."{target_config_path}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:new"\n'
+    )
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    import tomllib
+
+    with open(source / "config.toml", "rb") as f:
+        global_doc = tomllib.load(f)
+    state = global_doc["hooks"]["state"]
+    assert f"{source_config_path}:post_tool_use:0:0" in state
+    assert state[f"{source_config_path}:post_tool_use:0:0"]["trusted_hash"] == "sha256:existing"
+    assert f"{source_config_path}:pre_tool_use:0:0" in state
+    assert state[f"{source_config_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:new"
+
+
+def test_merge_codex_hook_trust_back_noop_when_no_state(tmp_path: Path) -> None:
+    """No-op when the private config has no [hooks.state] entries."""
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = 'model = "gpt-5.5"\n'
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    private_config = target / "config.toml"
+    private_config.write_text('model = "gpt-5.5"\n')
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    assert (source / "config.toml").read_text() == original
+
+
+def test_merge_codex_hook_trust_back_preserves_unrelated_keys(tmp_path: Path) -> None:
+    """Trust entries keyed to unrelated paths are carried through unchanged."""
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('model = "gpt-5.5"\n')
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    other_path = "/some/other/machine/hooks.json"
+    private_config = target / "config.toml"
+    private_config.write_text(
+        f'[hooks.state."{other_path}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:other"\n'
+    )
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    import tomllib
+
+    with open(source / "config.toml", "rb") as f:
+        global_doc = tomllib.load(f)
+    state = global_doc["hooks"]["state"]
+    assert f"{other_path}:pre_tool_use:0:0" in state
+    assert state[f"{other_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:other"
+
+
 def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
     """When only some config files exist, only those are symlinked.
 
