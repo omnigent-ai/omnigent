@@ -177,6 +177,18 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
+    def list_by_host_id(self, host_id: str) -> list[ScheduledTask]:
+        """List every task pinned to *host_id*, in any state."""
+        with self._session() as session:
+            stmt = (
+                select(SqlScheduledTask)
+                .where(SqlScheduledTask.workspace_id == current_workspace_id())
+                .where(SqlScheduledTask.host_id == host_id)
+                .order_by(asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id))
+            )
+            rows = session.execute(stmt).scalars().all()
+            return [_to_entity(r) for r in rows]
+
     def list_active(self) -> list[ScheduledTask]:
         """List active scheduled tasks ordered by ``created_at ASC, id ASC``."""
         with self._session() as session:
