@@ -1,17 +1,26 @@
 # Database Schema Design
 
-Four tables in the default schema: agents, files, conversations, conversation_items.
+This doc covers four core tables: agents, files, conversations,
+conversation_items. They are part of a larger schema — 17 tables in all, also
+including conversation labels, comments, policies, session permissions,
+conversation metadata, projects, hosts, users, and scheduled tasks. No model
+sets an explicit schema, so every table lives in the default one.
 
 Schema is managed by Alembic migrations in `alembic/`. SQLAlchemy models live
-in `omnigent/db/db_models.py`.
+in `omnigent/db/db_models.py`, which is the source of truth for the full table
+list.
 
 A `tasks` table existed in an earlier design — DBOS-backed workflow execution,
 with a `try_deliver`/`close_inbox` steering handshake requiring transactional
 atomicity with `conversation_items`. It was never populated by production code
 and was dropped in migration `b9c1d2e3f4a5_drop_tasks_table`; DBOS itself has
-been removed as a dependency. Turn/steering state today lives entirely
+been removed as a dependency. The authoritative turn/steering state today lives
 in-memory in the runner process (`_active_turns`, `_session_message_buffers` in
-`omnigent/runner/app.py`) and is not persisted to this schema at all.
+`omnigent/runner/app.py`) and is never written to the DB. Only a coarse mirror
+is persisted — `omnigent_conversation_metadata.live_status` /
+`pending_elicitation_count`, written by the relay via
+`session_live_state.persist_live_status` so any replica can render session
+status.
 
 ---
 
@@ -106,12 +115,15 @@ is solely responsible for cascading deletes and referential cleanup.
 `conversation_items.conversation_id` references `conversations.id` by
 convention only.
 
-Deletion order is therefore an explicit application-code responsibility:
+Deletion order is therefore an explicit application-code responsibility.
 `ConversationStore.delete_conversation` collects the conversation's full
-subtree, then deletes items, labels, comments, policies, and FTS rows before
-deleting the conversation rows themselves — children before parent. Do not
-remove that cleanup logic on the assumption a DB cascade covers it; none
-does.
+subtree, then in one transaction deletes FTS rows, items, and labels before the
+conversation rows themselves — children before parent. A second transaction
+then cleans up the Omnigent-side rows: comments, policies, session permissions,
+conversation metadata, and session-scoped agents. That transaction runs after
+the conversation is already gone and is best-effort — if it fails, orphaned
+Omnigent rows survive a conversation that no longer exists. Do not remove any
+of this cleanup logic on the assumption a DB cascade covers it; none does.
 
 `conversation_items.response_id` references no table at all — it's a
 turn/response grouping id (see the `tasks (removed)` note above) with no
@@ -126,8 +138,10 @@ schema changes.
 
 ### position for item ordering
 
-App-managed integer, assigned via `SELECT MAX(position) + 1` within the same
-transaction as the INSERT. Guarantees strict, gapless ordering within each conversation.
+App-managed integer, allocated from the `conversations.next_position` counter,
+read and advanced under `_lock_conversation` in the same transaction as the
+INSERT (a one-time `MAX(position)` scan backfills the counter for conversations
+created before it existed). Guarantees strict, gapless ordering within each conversation.
 
 Why not alternatives:
 - **Autoincrement**: global, not per-conversation — creates gaps and arbitrary numbers across conversations.
@@ -135,8 +149,8 @@ Why not alternatives:
 - **Time-sortable IDs (ULID/UUIDv7)**: our type-prefixed IDs (`msg_`, `fc_`) break lexicographic sorting.
 - **Compute on read** (`ROW_NUMBER()`): slower reads, makes cursor pagination ugly.
 
-The SELECT + INSERT already runs inside `ConversationStore.append()`'s own
-transaction, so the extra cost is negligible. Cursor pagination is clean:
+Allocation is O(1) under the conversation row lock `ConversationStore.append()`
+already holds, so it costs nothing extra. Cursor pagination is clean:
 `WHERE conversation_id = ? AND position > ?`.
 
 ### TEXT for JSON, Integer for booleans
@@ -250,7 +264,7 @@ in `omnigent/runner/app.py`; none of it is a DB operation.
 | `get_conversation_id(response_id)` | SELECT conversation_id FROM conversation_items WHERE response_id = ? LIMIT 1 |
 | `get_latest_response_id(conversation_id)` | SELECT response_id FROM conversation_items WHERE conversation_id = ? ORDER BY position DESC LIMIT 1 |
 | `search_messages(conversation_id, after, ...)` | SELECT FROM conversation_items WHERE conversation_id = ? [AND position > ?] ORDER BY position LIMIT ? |
-| `append(conversation_id, messages)` | **Txn:** SELECT MAX(position); INSERT conversation_items (with search_text extracted from data) with incrementing position |
+| `append(conversation_id, messages)` | **Txn:** lock conversation, allocate from `next_position`; INSERT conversation_items (with search_text extracted from data) with incrementing position |
 | `search(query, conversation_id?, limit)` | FTS query against search_vector (Postgres) or conversation_items_fts (SQLite), optionally scoped to a conversation |
 
 ### API-Level (not in runtime stores)
@@ -260,7 +274,7 @@ in `omnigent/runner/app.py`; none of it is a DB operation.
 | List conversations | SELECT FROM conversations ORDER BY created_at with cursor pagination |
 | Delete conversation | Cancel any in-flight turn on the runner, DELETE conversation_items, DELETE conversation |
 | List agents | SELECT FROM agents ORDER BY created_at with cursor pagination |
-| Delete agent | Cancel any in-flight turns for the agent's live sessions, DELETE FROM agents |
+| Delete agent | `AgentStore.delete` → DELETE FROM agents. No API endpoint exposes this today; session-scoped agent rows are removed by `delete_conversation` |
 | CRUD files | TBD — may be backed by artifact store instead of DB |
 
 ---
