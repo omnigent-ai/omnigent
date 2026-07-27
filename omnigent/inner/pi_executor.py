@@ -888,13 +888,19 @@ def _pi_needs_responses_api(model: str) -> bool:
 
     Covers two cases:
     - Newer GPT models that reject function tools via /chat/completions.
-    - system.ai.* models (Kimi, inkling) that need the Responses API to avoid
-      the missing finish_reason issue.
+    - Kimi/inkling/qwen3 (via system.ai.* ids or databricks-* ids) that need
+      the Responses API to avoid the missing finish_reason issue on /chat/completions.
     """
-    from omnigent.pi_native_credentials import _databricks_to_system_ai, _needs_responses_api
+    from omnigent.pi_native_credentials import (
+        _SYSTEM_AI_MODEL_KEYWORDS,
+        _databricks_to_system_ai,
+        _needs_responses_api,
+    )
 
     lower = model.lower()
-    if lower.startswith("system.ai."):
+    # system.ai.* ids: only kimi/inkling/qwen3 variants need Responses API.
+    # Claude/llama system.ai.* ids route to their own providers (Anthropic, completions).
+    if lower.startswith("system.ai.") and any(kw in lower for kw in _SYSTEM_AI_MODEL_KEYWORDS):
         return True
     # databricks-* models with system.ai.* aliases also use Responses API
     if _databricks_to_system_ai(model) is not None:
@@ -907,7 +913,7 @@ def _pi_provider_for_model(model: str) -> str:
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
-    if "gpt" in lower or lower.startswith("system.ai."):
+    if "gpt" in lower or "system.ai." in lower:
         return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
     return "databricks-completions"
 

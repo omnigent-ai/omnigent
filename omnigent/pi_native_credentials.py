@@ -428,8 +428,8 @@ def _needs_responses_api(model_id_lower: str) -> bool:
     known to work with completions. Any GPT model not in the allowlist defaults
     to the Responses API — safer for new models we haven't tested.
 
-    Non-GPT models are handled separately (Kimi/inkling via reasoning:true,
-    Gemini/Qwen3/gpt-oss excluded via _unsupported_in_pi).
+    Non-GPT models are handled separately (Kimi/inkling/Qwen3 routed via
+    system.ai.* Responses API; Gemini/gpt-oss excluded via _unsupported_in_pi).
 
     Expects a pre-lowercased model id.
     """
@@ -450,10 +450,10 @@ def _unsupported_in_pi(model_id_lower: str) -> bool:
     Exclude these models from both providers so the picker can show them but
     Pi doesn't try to call them with tools.
 
-    Also includes gpt-oss and qwen3 models which return content as a typed
-    array ``[{type:'reasoning',...},{type:'text',...}]`` when tools are present.
-    Pi's openai-completions streaming handler does ``block.text += content``
-    where content is an array, producing ``[object Object],[object Object]``.
+    Also includes gpt-oss which returns content as a typed array when tools
+    are present. Pi's openai-completions streaming handler does
+    ``block.text += content`` where content is an array, producing
+    ``[object Object],[object Object]``.
 
     Expects a pre-lowercased model id.
     """
