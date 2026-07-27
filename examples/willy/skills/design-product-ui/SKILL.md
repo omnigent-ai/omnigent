@@ -36,9 +36,9 @@ or dashboard artifact.
 7. Make interactions functional. Controls must have visible hover, focus,
    active, selected, and disabled states; keyboard navigation must remain
    usable; charts and dense tables must have readable labels and summaries.
-8. Render the entry HTML in a browser and inspect at desktop and narrow widths.
-   Fix overflow, clipping, weak contrast, inconsistent alignment, and broken
-   relative resources before review.
+8. Inspect the HTML, CSS, scripts, and relative resource references for desktop
+   and narrow-width behavior. Fix source-level overflow, clipping, weak contrast,
+   inconsistent alignment, and broken-resource risks before review.
 
 ## Product UI principles
 

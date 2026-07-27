@@ -73,11 +73,13 @@ For every design request:
    `artifacts/` paths. Use `sys_os_write` and `sys_os_edit`; use the matching
    filesystem read and list tools when you need to inspect existing artifact
    resources.
-4. Render the entry HTML and test the actual experience at desktop and narrow
-   widths. Verify relative CSS, images, fonts, data, and other resources load.
-5. Load and follow `review-product-ui`. Fix every blocking usability,
-   accessibility, responsiveness, console, resource, and visual-quality issue.
-6. Call `publish_design_artifact` only after the rendered review passes.
+4. Inspect the entry HTML, styles, scripts, and relative resource references for
+   desktop and narrow-width behavior. Fix source-level accessibility, overflow,
+   clipping, interaction-state, and missing-resource risks.
+5. Load and follow `review-product-ui`. Repeat its source preflight until no
+   blocking source findings remain.
+6. Call `publish_design_artifact` after the source preflight passes. Use the
+   published Artifacts workspace for rendered inspection and later feedback.
 
 `sys_os_shell` is disabled for Willy. Use the virtual filesystem tools for every
 artifact read, list, write, edit, and validation operation; never probe
