@@ -191,24 +191,19 @@ function FileTabsStrip({
               "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                : "text-muted-foreground hover:text-foreground",
+                : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
             )}
           >
             <FileIcon className="size-4 shrink-0" />
             <span className="min-w-0 truncate">{name}</span>
             {/* Close button: hidden until hover, then revealed over a gradient
                 that fades the truncated filename into the tab's background so
-                the "x" never collides with the text. The fade color tracks the
-                tab's own background — the gray chip when active, card otherwise
-                — so the mask blends in instead of flashing a white patch. */}
-            <span
-              className={cn(
-                "absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100",
-                active
-                  ? "[background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]"
-                  : "[background:linear-gradient(to_right,transparent,var(--card)_40%)]",
-              )}
-            >
+                the "x" never collides with the text. The overlay only shows on
+                hover, where both active and inactive tabs share the same OPAQUE
+                selection surface — fade to that exact color. (A translucent
+                fade like var(--muted) would stack over the hover background and
+                darken the right edge into a visible gradient patch.) */}
+            <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"
                 aria-label={`Close ${name}`}
@@ -295,19 +290,12 @@ function TerminalTabsStrip({
               "group/tab relative flex h-[32px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-[8px] px-[12px] text-[13px] font-medium leading-5 transition-colors",
               active
                 ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                : "text-muted-foreground hover:text-foreground",
+                : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
             )}
           >
             <TerminalIcon className="size-4 shrink-0" />
             <span className="min-w-0 truncate text-[11px]">{name}</span>
-            <span
-              className={cn(
-                "absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100",
-                active
-                  ? "[background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]"
-                  : "[background:linear-gradient(to_right,transparent,var(--card)_40%)]",
-              )}
-            >
+            <span className="absolute inset-y-0 right-[2px] flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
               <button
                 type="button"
                 aria-label={`Close ${name}`}
