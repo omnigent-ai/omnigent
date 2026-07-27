@@ -153,6 +153,11 @@ class PiProviderConfig:
         request time, used for short-lived gateway tokens).
     :param auth_header: When ``True``, Pi sends ``Authorization: Bearer
         <apiKey>`` (gateways) instead of a provider-native key header.
+    :param credential_warning: A user-facing notice set when the provider was
+        rendered but its credentials could not be resolved (e.g. an expired
+        Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
+        recover at request time — but the caller surfaces this so a session that
+        would otherwise fail silently tells the user how to re-authenticate.
     """
 
     provider_id: str
@@ -161,6 +166,7 @@ class PiProviderConfig:
     model: str
     api_key: str
     auth_header: bool
+    credential_warning: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
     # dataclass stays hashable even though list[dict] is not hashable.
@@ -230,20 +236,35 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     # exactly the endpoints available on this workspace. Falls back to the
     # bundled static lists when credentials can't be resolved or the API call
     # fails (e.g. network blip, new workspace with no endpoints yet).
+    #
+    # Distinguish two failure modes so the caller can surface the fatal one:
+    #   * credential resolution fails (expired OAuth token) — Pi's per-request
+    #     ``!command`` apiKey will also fail, so the session dies silently. Carry
+    #     a ``credential_warning`` so the caller can tell the user to re-auth.
+    #   * model-list fetch fails after creds resolved (network blip, empty
+    #     workspace) — benign; just show the single default model.
+    credential_warning: str | None = None
+    claude_models: list[dict[str, Any]] = []
+    gpt_models: list[dict[str, Any]] = []
+    completions_models: list[dict[str, Any]] = []
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
         creds = resolve_databricks_workspace(entry.profile)
-        claude_models, gpt_models, completions_models = _fetch_pi_model_lists(
-            creds.host, creds.token
-        )
-    except Exception:  # noqa: BLE001 — credential/network failure must not break launch
+    except Exception:  # noqa: BLE001 — credential failure must not break launch
         _LOGGER.info(
             "pi-native: falling back to single-model display (could not resolve credentials)"
         )
-        claude_models = []
-        gpt_models = []
-        completions_models = []
+        credential_warning = _databricks_credential_warning(entry.profile)
+    else:
+        try:
+            claude_models, gpt_models, completions_models = _fetch_pi_model_lists(
+                creds.host, creds.token
+            )
+        except Exception:  # noqa: BLE001 — network failure must not break launch
+            _LOGGER.info(
+                "pi-native: could not fetch workspace model list; showing default model only"
+            )
     additional: dict[str, Any] = {}
     if gpt_models:
         additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
@@ -265,6 +286,22 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         auth_header=True,
         extra_models=claude_models,
         additional_providers=additional,
+        credential_warning=credential_warning,
+    )
+
+
+def _databricks_credential_warning(profile: str | None) -> str:
+    """User-facing notice for an unresolvable Databricks profile.
+
+    :param profile: The Databricks config profile that failed to authenticate.
+    :returns: A short message naming the profile and the re-auth command.
+    """
+    profile_name = profile or "DEFAULT"
+    return (
+        f"Couldn't authenticate to the Databricks profile '{profile_name}' — "
+        "your login has likely expired, so this Pi session can't reach the model "
+        "and won't reply. Re-authenticate by running "
+        f"`databricks auth login --profile {profile_name}`, then start a new Pi session."
     )
 
 

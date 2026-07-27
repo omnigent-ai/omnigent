@@ -1848,6 +1848,7 @@ async def _auto_create_pi_terminal(
     # terminal_launch_args, or when no usable provider is configured (Pi then
     # falls back to its own login). Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
+    credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
             pi_native_provider_launch,
@@ -1867,6 +1868,7 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
+            credential_warning = provider.credential_warning
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -1904,7 +1906,63 @@ async def _auto_create_pi_terminal(
         session_id,
         pi_extension,
     )
+    # Surface an unresolved-credential warning to the session. Without it, a Pi
+    # session whose Databricks token can't be refreshed launches fine but every
+    # message silently fails to reach the model — the user sees no reply and no
+    # reason. Best-effort: a delivery failure must not fail the launch.
+    if credential_warning is not None:
+        await _post_pi_native_credential_warning(
+            session_id=session_id,
+            server_client=server_client,
+            warning=credential_warning,
+        )
     return terminal_view
+
+
+async def _post_pi_native_credential_warning(
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient | None,
+    warning: str,
+) -> None:
+    """Surface a credential warning into the session as an error banner.
+
+    Posts an ``error`` item via ``external_conversation_item`` so the notice
+    renders as the web UI's distinct destructive banner (not a misleading
+    assistant bubble), persists across reload, and — because ``error`` is a
+    non-content item type — never enters the next turn's model context. The
+    event persists without queuing an agent turn, so it's safe on a session
+    whose model is unreachable.
+
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client (``None`` in tests).
+    :param warning: The user-facing warning text to surface.
+    """
+    if server_client is None:
+        return
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "execution",
+                        "code": "pi_credentials_unresolved",
+                        "message": warning,
+                    },
+                },
+            },
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "pi-native: failed to surface credential warning for session %s",
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _auto_create_cursor_terminal(

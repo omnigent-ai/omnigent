@@ -58,6 +58,67 @@ def test_databricks_unresolvable_host_returns_none(monkeypatch: pytest.MonkeyPat
     assert creds.resolve_pi_native_provider(config_loader=_databricks_config) is None
 
 
+def test_databricks_unresolvable_credentials_sets_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired token → provider still resolves but carries a re-auth warning.
+
+    Pi launches fine (its ``!command`` apiKey may recover), but a silent dead
+    session is worse than a visible notice — so the resolver flags it.
+    """
+    from omnigent.inner import databricks_executor
+    from omnigent.runtime.credentials import databricks as rt_databricks
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _boom(profile: str | None):
+        raise OSError("refresh token is invalid")
+
+    monkeypatch.setattr(rt_databricks, "resolve_databricks_workspace", _boom)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is not None
+    assert "demo-staging" in provider.credential_warning
+    assert "databricks auth login" in provider.credential_warning
+
+
+def test_databricks_model_list_failure_has_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Creds resolve but the model-list fetch fails → benign, no warning."""
+    from omnigent.inner import databricks_executor
+    from omnigent.runtime.credentials import databricks as rt_databricks
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+    monkeypatch.setattr(
+        rt_databricks,
+        "resolve_databricks_workspace",
+        lambda profile: rt_databricks.WorkspaceCreds(
+            host="https://wkspc.example.com", token="tok"
+        ),
+    )
+
+    def _fetch_boom(host: str, token: str):
+        raise RuntimeError("network blip")
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch_boom)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+
+
 def test_key_provider_resolves_to_inline_family() -> None:
     """A key-kind provider with an anthropic family → inline Pi provider."""
     config = {
