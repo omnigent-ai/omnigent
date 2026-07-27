@@ -22,9 +22,9 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import android.widget.PopupMenu
 import android.widget.TextView
-import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
@@ -45,7 +45,7 @@ import androidx.webkit.WebViewFeature
  * Server URL comes from [ServerStore]; when none is set yet, launch routes to
  * [ConnectActivity] first. Sidebar edge-swipe is intentionally absent (README).
  */
-class MainActivity : ComponentActivity() {
+class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var notifications: NativeNotificationManager
     private lateinit var blobSaver: BlobSaver
@@ -139,9 +139,6 @@ class MainActivity : ComponentActivity() {
                 webViewClient =
                     OmnigentWebViewClient(
                         pinnedOrigin = { pinnedOrigin },
-                        // Full page loads briefly use OS-derived bar polarity until the SPA
-                        // reports its resolved scheme; capable SPAs override it immediately.
-                        onTopLevelNavigation = ::resetColorSchemeToSystem,
                         shouldInjectBridgeAtPageReady = {
                             bridgeTransportInstalled && bridgeScriptHandler == null
                         },
@@ -189,6 +186,7 @@ class MainActivity : ComponentActivity() {
                 }
         container.addView(switchButton)
         setContentView(container)
+        applySystemBarContrast()
         installBridge()
 
         // Measure the OS safe area and push it into the page as CSS custom
@@ -284,6 +282,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
+        applySystemBarContrast()
         if (::webView.isInitialized) {
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
@@ -309,7 +308,6 @@ class MainActivity : ComponentActivity() {
                 OmnigentBridgeListener(
                     notifications = notifications,
                     blobSaver = blobSaver,
-                    onColorScheme = ::applyColorScheme,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -331,19 +329,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun applyColorScheme(scheme: ResolvedColorScheme) {
-        val useDarkIcons = scheme == ResolvedColorScheme.LIGHT
-        WindowInsetsControllerCompat(window, window.decorView).apply {
-            isAppearanceLightStatusBars = useDarkIcons
-            isAppearanceLightNavigationBars = useDarkIcons
-        }
-    }
-
-    private fun resetColorSchemeToSystem() {
+    private fun applySystemBarContrast() {
         val isLightMode =
             resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK !=
                 Configuration.UI_MODE_NIGHT_YES
-        applyColorScheme(if (isLightMode) ResolvedColorScheme.LIGHT else ResolvedColorScheme.DARK)
+        WindowInsetsControllerCompat(window, window.decorView).apply {
+            isAppearanceLightStatusBars = isLightMode
+            isAppearanceLightNavigationBars = isLightMode
+        }
     }
 
     /**

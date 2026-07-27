@@ -3,7 +3,7 @@ package ai.omnigent.android
 import android.app.Application
 import android.app.NotificationManager
 import android.content.Context
-import android.os.Looper
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -25,18 +25,17 @@ class OmnigentBridgeListenerTest {
     private lateinit var context: Application
     private lateinit var listener: OmnigentBridgeListener
     private lateinit var shadow: ShadowNotificationManager
-    private val appliedSchemes = mutableListOf<ResolvedColorScheme>()
 
     private val badgeId = 1
 
     @Before
     fun setUp() {
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM)
         context = ApplicationProvider.getApplicationContext()
         listener =
             OmnigentBridgeListener(
                 notifications = NativeNotificationManager(context),
                 blobSaver = BlobSaver(context),
-                onColorScheme = appliedSchemes::add,
             )
         shadow =
             shadowOf(
@@ -45,33 +44,35 @@ class OmnigentBridgeListenerTest {
     }
 
     @Test
-    fun `setColorScheme applies concrete schemes`() {
+    fun `setColorScheme light sets night mode no`() {
         listener.handle("""{"method":"setColorScheme","scheme":"light"}""")
-        listener.handle("""{"method":"setColorScheme","scheme":"dark"}""")
-        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(AppCompatDelegate.MODE_NIGHT_NO, AppCompatDelegate.getDefaultNightMode())
+    }
 
+    @Test
+    fun `setColorScheme dark sets night mode yes`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"dark"}""")
+        assertEquals(AppCompatDelegate.MODE_NIGHT_YES, AppCompatDelegate.getDefaultNightMode())
+    }
+
+    @Test
+    fun `setColorScheme system follows system`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"system"}""")
         assertEquals(
-            listOf(ResolvedColorScheme.LIGHT, ResolvedColorScheme.DARK),
-            appliedSchemes,
+            AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM,
+            AppCompatDelegate.getDefaultNightMode(),
         )
     }
 
     @Test
     fun `setColorScheme rejects missing and unsupported schemes`() {
-        listener.handle("""{"method":"setColorScheme","scheme":"system"}""")
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_NO)
+
         listener.handle("""{"method":"setColorScheme"}""")
-        shadowOf(Looper.getMainLooper()).idle()
-
-        assertEquals(emptyList<ResolvedColorScheme>(), appliedSchemes)
-    }
-
-    @Test
-    fun `setColorScheme rejects non-string schemes`() {
+        listener.handle("""{"method":"setColorScheme","scheme":"auto"}""")
         listener.handle("""{"method":"setColorScheme","scheme":123}""")
-        listener.handle("""{"method":"setColorScheme","scheme":{"value":"light"}}""")
-        shadowOf(Looper.getMainLooper()).idle()
 
-        assertEquals(emptyList<ResolvedColorScheme>(), appliedSchemes)
+        assertEquals(AppCompatDelegate.MODE_NIGHT_NO, AppCompatDelegate.getDefaultNightMode())
     }
 
     @Test

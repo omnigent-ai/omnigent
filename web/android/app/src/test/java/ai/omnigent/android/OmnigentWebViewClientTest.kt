@@ -45,7 +45,6 @@ class OmnigentWebViewClientTest {
         onPageReady: (String?) -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { PINNED_ORIGIN },
-        onTopLevelNavigation = {},
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
         onPageReady = onPageReady,
         onLoginRequired = {},

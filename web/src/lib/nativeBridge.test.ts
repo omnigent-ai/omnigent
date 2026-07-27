@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -10,9 +8,9 @@ import {
   nativeNotify,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
-  reportColorScheme,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
+  setThemeSource,
   supportsBrowser,
 } from "./nativeBridge";
 
@@ -41,19 +39,6 @@ const androidNotify = vi.fn().mockResolvedValue(true);
 const androidUnsubscribe = vi.fn();
 const androidOnNotificationActivated = vi.fn().mockReturnValue(androidUnsubscribe);
 const androidSetColorScheme = vi.fn();
-
-const androidBridgeScriptSource = readFileSync(
-  resolve("android/app/src/main/java/ai/omnigent/android/NativeBridgeScript.kt"),
-  "utf8",
-);
-
-function androidColorSchemeSyncSource(): string {
-  const match = androidBridgeScriptSource.match(
-    /          const resolvePageColorScheme = \(\) => \{[\s\S]*?          syncPageColorScheme\(\);/,
-  );
-  if (!match) throw new Error("Android color-scheme sync script not found");
-  return match[0].replace(/^ {10}/gm, "");
-}
 
 /**
  * Simulate running inside / outside the Electron shell via the preload key.
@@ -134,8 +119,6 @@ beforeEach(() => {
 afterEach(() => {
   setElectron(false);
   setIOS(false);
-  setAndroid(true);
-  window.dispatchEvent(new Event("omnigent-native-ready"));
   setAndroid(false);
 });
 
@@ -219,67 +202,32 @@ describe("supportsBrowser", () => {
   });
 });
 
-describe("reportColorScheme", () => {
+describe("setThemeSource", () => {
   it("routes the selected system theme through the Electron bridge", () => {
     setElectron(true);
-    reportColorScheme("dark", "system");
+    setThemeSource("system");
     expect(electronSetColorScheme).toHaveBeenCalledWith("system");
   });
 
   it("routes an explicit selected theme through the Electron bridge", () => {
     setElectron(true);
-    reportColorScheme("light", "light");
-    expect(electronSetColorScheme).toHaveBeenCalledWith("light");
+    setThemeSource("dark");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("dark");
   });
 
-  it("routes only resolved concrete schemes through the Android bridge", () => {
+  it("routes the selected theme through the Android bridge", () => {
     setAndroid(true);
-    reportColorScheme("light", "system");
-    reportColorScheme("dark", "system");
-    expect(androidSetColorScheme).toHaveBeenNthCalledWith(1, "light");
-    expect(androidSetColorScheme).toHaveBeenNthCalledWith(2, "dark");
-  });
-
-  it("replays an explicit scheme when Android installs after the first report", () => {
-    setAndroid(false);
-    reportColorScheme("light", "light");
-    expect(androidSetColorScheme).not.toHaveBeenCalled();
-
-    setAndroid(true);
-    window.dispatchEvent(new Event("omnigent-native-ready"));
-
-    expect(androidSetColorScheme).toHaveBeenCalledOnce();
+    setThemeSource("light");
     expect(androidSetColorScheme).toHaveBeenCalledWith("light");
   });
-});
 
-describe("Android injected color scheme sync", () => {
-  it("re-pushes concrete schemes after live root theme changes", async () => {
-    document.documentElement.className = "light";
-    const post = vi.fn();
-    const disconnect = new Function(
-      "post",
-      `${androidColorSchemeSyncSource()}\nreturn () => colorSchemeObserver?.disconnect();`,
-    )(post) as () => void;
-
-    try {
-      expect(post).toHaveBeenLastCalledWith({ method: "setColorScheme", scheme: "light" });
-      post.mockClear();
-
-      document.documentElement.className = "dark";
-      await vi.waitFor(() => {
-        expect(post).toHaveBeenLastCalledWith({ method: "setColorScheme", scheme: "dark" });
-      });
-
-      post.mockClear();
-      document.documentElement.className = "light";
-      await vi.waitFor(() => {
-        expect(post).toHaveBeenLastCalledWith({ method: "setColorScheme", scheme: "light" });
-      });
-    } finally {
-      disconnect();
-      document.documentElement.className = "";
-    }
+  it("routes the selected theme through the Android bridge over Electron legacy", () => {
+    setElectron(true);
+    (
+      window as unknown as { omnigentNative?: { kind: string; setColorScheme?: unknown } }
+    ).omnigentNative = undefined;
+    setThemeSource("system");
+    expect(electronSetColorScheme).toHaveBeenCalledWith("system");
   });
 });
 

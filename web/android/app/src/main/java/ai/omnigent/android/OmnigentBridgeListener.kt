@@ -1,9 +1,8 @@
 package ai.omnigent.android
 
 import android.net.Uri
-import android.os.Handler
-import android.os.Looper
 import android.webkit.WebView
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
@@ -19,16 +18,12 @@ import org.json.JSONObject
  * structural equivalent of the iOS `isMainFrame` + frame-origin check that a
  * raw `addJavascriptInterface` bridge cannot express.
  *
- * Color-scheme updates are posted to the main looper; [BlobSaver] offloads
- * writes to its own worker.
+ * [BlobSaver] offloads writes to its own worker.
  */
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
     private val blobSaver: BlobSaver,
-    private val onColorScheme: (ResolvedColorScheme) -> Unit,
 ) : WebViewCompat.WebMessageListener {
-    private val mainHandler = Handler(Looper.getMainLooper())
-
     override fun onPostMessage(
         view: WebView,
         message: WebMessageCompat,
@@ -52,13 +47,25 @@ class OmnigentBridgeListener(
 
         when (json.optString("method")) {
             "setColorScheme" -> {
-                val scheme =
-                    when (json.optString("scheme")) {
-                        "light" -> ResolvedColorScheme.LIGHT
-                        "dark" -> ResolvedColorScheme.DARK
-                        else -> return
+                when (json.optString("scheme")) {
+                    "light" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_NO,
+                        )
                     }
-                mainHandler.post { onColorScheme(scheme) }
+
+                    "dark" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_YES,
+                        )
+                    }
+
+                    "system" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM,
+                        )
+                    }
+                }
             }
 
             "setBadgeCount" -> {

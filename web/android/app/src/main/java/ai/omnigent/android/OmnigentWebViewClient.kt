@@ -13,12 +13,10 @@ import android.webkit.WebViewClient
  *
  * The facade is normally registered with `addDocumentStartJavaScript` in
  * `MainActivity`. Older WebViews that support the message listener but not
- * document-start scripts inject it after the pinned page finishes; the facade's
- * ready event then replays any color scheme the SPA reported before injection.
+ * document-start scripts inject it after the pinned page finishes.
  */
 class OmnigentWebViewClient(
     private val pinnedOrigin: () -> String?,
-    private val onTopLevelNavigation: () -> Unit,
     private val shouldInjectBridgeAtPageReady: () -> Boolean,
     private val onPageReady: (url: String?) -> Unit,
     private val onLoginRequired: () -> Unit,
@@ -29,7 +27,6 @@ class OmnigentWebViewClient(
         favicon: Bitmap?,
     ) {
         super.onPageStarted(view, url, favicon)
-        onTopLevelNavigation()
 
         val origin = originOf(url)
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }

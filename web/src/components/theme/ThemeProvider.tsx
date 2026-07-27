@@ -1,19 +1,17 @@
 import { type ReactNode, useEffect } from "react";
 import { ThemeProvider as NextThemesProvider, useTheme } from "next-themes";
-import { reportColorScheme } from "@/lib/nativeBridge";
+import { setThemeSource } from "@/lib/nativeBridge";
 
 /**
- * Mirrors the in-app theme onto native shell chrome. Renders nothing.
+ * Mirrors the in-app theme selection onto native shell chrome. Renders nothing.
  */
 function NativeThemeSync() {
-  const { theme, resolvedTheme } = useTheme();
+  const { theme } = useTheme();
   useEffect(() => {
-    if (resolvedTheme === "light" || resolvedTheme === "dark") {
-      const selectedTheme =
-        theme === "light" || theme === "dark" || theme === "system" ? theme : resolvedTheme;
-      reportColorScheme(resolvedTheme, selectedTheme);
+    if (theme === "light" || theme === "dark" || theme === "system") {
+      setThemeSource(theme);
     }
-  }, [theme, resolvedTheme]);
+  }, [theme]);
   return null;
 }
 

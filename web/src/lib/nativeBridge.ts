@@ -59,7 +59,7 @@ interface NativeShellApi {
    * ignore it.
    */
   setBadgeCount: (count: number, activation?: BadgeActivation) => void;
-  /** Electron receives the selected theme; Android receives resolved light/dark, never "system". */
+  /** Tell the shell which theme source the user selected. */
   setColorScheme?: (scheme: "light" | "dark" | "system") => void;
   /** Fire an OS notification; resolves true when it was shown. */
   notify: (params: NativeNotifyParams) => Promise<boolean>;
@@ -117,9 +117,7 @@ interface NativeShellApi {
   onNativeInsets?: (callback: (insets: NativeInsets) => void) => () => void;
 }
 
-const ANDROID_BRIDGE_READY_EVENT = "omnigent-native-ready";
-let pendingAndroidColorScheme: "light" | "dark" | undefined;
-let waitingForAndroidBridge = false;
+export type ThemeSource = "light" | "dark" | "system";
 
 /** Footprints (CSS px) of the native floating bars, reported by the shell. */
 export interface NativeInsets {
@@ -287,33 +285,16 @@ function nativeApi(): NativeShellApi | undefined {
   return electronApi();
 }
 
-function applyAndroidColorScheme(scheme: "light" | "dark"): boolean {
-  const android = nativeApi();
-  if (android?.kind !== "android" || !android.setColorScheme) return false;
+function callSetColorScheme(scheme: ThemeSource): boolean {
+  const native = nativeApi();
+  if (!native?.setColorScheme) return false;
   try {
-    android.setColorScheme(scheme);
+    native.setColorScheme(scheme);
   } catch (err) {
     console.warn("[nativeBridge] setColorScheme failed:", err);
+    return false;
   }
   return true;
-}
-
-function queueAndroidColorScheme(scheme: "light" | "dark"): void {
-  pendingAndroidColorScheme = scheme;
-  if (typeof window === "undefined" || waitingForAndroidBridge) return;
-
-  waitingForAndroidBridge = true;
-  window.addEventListener(
-    ANDROID_BRIDGE_READY_EVENT,
-    () => {
-      waitingForAndroidBridge = false;
-      const pendingScheme = pendingAndroidColorScheme;
-      if (!pendingScheme) return;
-      if (applyAndroidColorScheme(pendingScheme)) pendingAndroidColorScheme = undefined;
-      else queueAndroidColorScheme(pendingScheme);
-    },
-    { once: true },
-  );
 }
 
 /** True when running inside the Electron desktop shell. */
@@ -496,30 +477,12 @@ export function onNativeSidebarDrag(
  * descriptive text. Electron/iOS have a real icon badge and ignore it.
  */
 /**
- * Tell native shell chrome the web app's color scheme. Electron receives the
- * selected theme so system mode keeps following the OS; Android receives the
- * resolved scheme for system-bar icon contrast.
+ * Tell the native shell which theme source the user selected. The shell drives
+ * its own OS-level night mode so that native chrome and the WebView agree.
  * No-op outside supported shells. Fire-and-forget.
  */
-export function reportColorScheme(
-  resolvedScheme: "light" | "dark",
-  selectedScheme: "light" | "dark" | "system",
-): void {
-  const electron = electronApi();
-  if (electron?.setColorScheme) {
-    try {
-      electron.setColorScheme(selectedScheme);
-    } catch (err) {
-      console.warn("[nativeBridge] setColorScheme failed:", err);
-    }
-    return;
-  }
-
-  if (applyAndroidColorScheme(resolvedScheme)) {
-    pendingAndroidColorScheme = undefined;
-    return;
-  }
-  queueAndroidColorScheme(resolvedScheme);
+export function setThemeSource(themeSource: ThemeSource): void {
+  callSetColorScheme(themeSource);
 }
 
 export async function setBadgeCount(count: number, activation?: BadgeActivation): Promise<void> {

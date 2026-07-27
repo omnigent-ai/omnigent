@@ -13,8 +13,6 @@ package ai.omnigent.android
  * frames on the pinned origin. `notify()` resolves `true` optimistically (as on
  * iOS) since the post is fire-and-forget. native -> web is driven by
  * `evaluateJavascript` into the `window.__omnigentNativeEmit*` functions here.
- * Once installed, the facade emits `omnigent-native-ready` so a SPA whose
- * first color-scheme report raced the injection can replay it.
  */
 object NativeBridgeScript {
     val source: String =
@@ -90,29 +88,6 @@ object NativeBridgeScript {
               if (bridge) bridge.postMessage(JSON.stringify(payload));
             } catch (_) {}
           };
-
-          // The SPA owns its resolved theme via the root class. Watch it here so
-          // native bars stay correct even when the server cannot report changes.
-          const resolvePageColorScheme = () => {
-            const root = document.documentElement;
-            if (root?.classList.contains("dark")) return "dark";
-            if (root?.classList.contains("light")) return "light";
-            return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-          };
-          let lastPageColorScheme = null;
-          const syncPageColorScheme = () => {
-            const scheme = resolvePageColorScheme();
-            if (scheme === lastPageColorScheme) return;
-            lastPageColorScheme = scheme;
-            post({ method: "setColorScheme", scheme });
-          };
-          const colorSchemeRoot = document.documentElement;
-          const colorSchemeObserver = colorSchemeRoot ? new MutationObserver(syncPageColorScheme) : null;
-          colorSchemeObserver?.observe(colorSchemeRoot, {
-            attributes: true,
-            attributeFilter: ["class"],
-          });
-          syncPageColorScheme();
 
           const notificationCallbacks = new Set();
           // An activation is a fire-once event, but the native side may emit it
@@ -229,7 +204,7 @@ object NativeBridgeScript {
           window.omnigentNative = Object.freeze({
             kind: "android",
             setColorScheme(scheme) {
-              if (scheme !== "light" && scheme !== "dark") return;
+              if (scheme !== "light" && scheme !== "dark" && scheme !== "system") return;
               post({ method: "setColorScheme", scheme });
             },
             setBadgeCount(count, options) {
@@ -276,7 +251,6 @@ object NativeBridgeScript {
               return () => insetCallbacks.delete(callback);
             },
           });
-          window.dispatchEvent(new Event("omnigent-native-ready"));
         })();
         """.trimIndent()
 }
