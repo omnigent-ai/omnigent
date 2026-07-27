@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -117,15 +119,27 @@ def copilot_launch_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         )
 
     monkeypatch.setattr(orchestration, "_pi_native_launch_config", _fake_launch_config)
-    # The forwarder is exercised by its own tests; keep the launch path offline.
-    monkeypatch.setattr(orchestration, "_register_auto_forwarder_task", lambda *_a, **_k: None)
     return tmp_path
+
+
+@pytest.fixture
+def started_forwarders(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Capture forwarder supervisions instead of running them against a server."""
+    started: list[dict[str, Any]] = []
+
+    async def _fake_supervise(**kwargs: Any) -> None:
+        started.append(kwargs)
+
+    monkeypatch.setattr(
+        "omnigent.copilot_native_forwarder.supervise_copilot_forwarder", _fake_supervise
+    )
+    return started
 
 
 @pytest.mark.asyncio
 async def test_auto_create_copilot_terminal_publishes_tmux_target(
     copilot_launch_env: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    started_forwarders: list[dict[str, Any]],
 ) -> None:
     """The launch publishes a readable ``tmux.json`` carrying the session id.
 
@@ -159,12 +173,26 @@ async def test_auto_create_copilot_terminal_publishes_tmux_target(
     assert info["tmux_target"] == "copilot:0.0"
     assert any(evt.get("type") == "session.resource.created" for evt in published)
     assert registry.closed == []
-    del monkeypatch
+
+    # The pinned ``--session-id`` is what lets the forwarder address this
+    # session's event stream instead of guessing the newest one on disk.
+    args = registry.captured["spec"].args
+    assert args[0] == "--session-id"
+    copilot_uuid = args[1]
+    assert uuid.UUID(copilot_uuid).version == 4
+
+    # Every other native harness supervises a forwarder from here; without one
+    # the web conversation shows a permanently empty assistant turn.
+    await asyncio.sleep(0)
+    assert len(started_forwarders) == 1
+    assert started_forwarders[0]["session_id"] == _SESSION_ID
+    assert started_forwarders[0]["copilot_session_id"] == copilot_uuid
 
 
 @pytest.mark.asyncio
 async def test_auto_create_copilot_terminal_tears_down_on_publish_failure(
     copilot_launch_env: Path,
+    started_forwarders: list[dict[str, Any]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed bridge publication closes the pane instead of orphaning it.

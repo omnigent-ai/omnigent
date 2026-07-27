@@ -4035,7 +4035,23 @@ async def _auto_create_copilot_terminal(
     ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
-    """Auto-create the Copilot TUI terminal for a copilot-native session."""
+    """
+    Auto-create the Copilot TUI terminal for a copilot-native session.
+
+    Launches ``copilot --session-id <uuid>`` in a runner-owned tmux pane. Auth is
+    the CLI's own ``copilot login`` state, so HOME is inherited and Omnigent
+    writes no vendor config (Copilot owns its own tool surface / MCP servers,
+    the same posture as :func:`_auto_create_goose_terminal`). The pinned
+    ``--session-id`` lets the forwarder address *this* session's event stream
+    deterministically.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :param agent_spec: Resolved agent spec, for the pinned model and explicit auth.
+    :returns: Created terminal resource view.
+    """
     del ensure_comment_relay
     from omnigent.copilot_native import resolve_copilot_executable
     from omnigent.copilot_native_bridge import (
@@ -4043,6 +4059,7 @@ async def _auto_create_copilot_terminal(
         inject_model_command,
         write_tmux_target,
     )
+    from omnigent.copilot_native_forwarder import clear_copilot_bridge_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.onboarding.copilot_auth import (
         COPILOT_TOKEN_ENV_VARS,
@@ -4050,14 +4067,33 @@ async def _auto_create_copilot_terminal(
     )
     from omnigent.spec.types import ApiKeyAuth
 
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so old and new tasks can't both mirror (double-posting), and
+    # drop the prior terminal's stale forward cursor.
+    await _cancel_auto_forwarder_task(session_id)
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_copilot_bridge_state(bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args + model_override); reused here, not
+    # Pi-specific.
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
         server_client=server_client,
     )
     workspace = os.path.realpath(str(launch_config.workspace))
-    bridge_dir = bridge_dir_for_session_id(session_id)
     copilot_command = resolve_copilot_executable()
-    launch_args = list(launch_config.terminal_launch_args or [])
+    # Launch-unique Copilot session uuid. ``--session-id`` sets the uuid for a
+    # NEW session (verified, Copilot CLI 1.0.63), which fixes the path of the
+    # events.jsonl the forwarder tails — no recency guessing. Fresh per launch,
+    # like goose's per-launch ``--name``, so a relaunch can never bind to an
+    # older session's stream and replay its transcript.
+    copilot_session_uuid = str(uuid.uuid4())
+    launch_args = [
+        "--session-id",
+        copilot_session_uuid,
+        *(launch_config.terminal_launch_args or []),
+    ]
     model = launch_config.model_override or _copilot_native_model_from_spec(agent_spec)
     env: dict[str, str] = {}
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
@@ -4128,6 +4164,33 @@ async def _auto_create_copilot_terminal(
             "type": "session.resource.created",
             "resource": session_resource_view_to_dict(terminal_view),
         },
+    )
+
+    # Mirror the Copilot TUI's conversation back into the Omnigent session so the
+    # chat view tracks the embedded terminal. Host-spawned sessions have no CLI
+    # client to start this, so the runner owns it — reusing the runner's own
+    # server URL + refresh-capable auth.
+    from omnigent.copilot_native_forwarder import supervise_copilot_forwarder
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _forwarder_task = asyncio.create_task(
+        supervise_copilot_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="copilot-native-ui",
+            copilot_session_id=copilot_session_uuid,
+            auth=_RunnerDatabricksAuth(_make_auth_token_factory()),
+        ),
+        name=f"copilot-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created copilot terminal + forwarder for session %s; task=%s",
+        session_id,
+        _forwarder_task.get_name(),
     )
     return terminal_view
 

@@ -19,6 +19,8 @@ REQUEST_SESSION_ID_ENV_VAR = "HARNESS_COPILOT_NATIVE_REQUEST_SESSION_ID"
 
 _BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "copilot-native"
 _TMUX_FILE = "tmux.json"
+_SESSION_STATE_DIR = "session-state"
+_EVENTS_FILE = "events.jsonl"
 _POLL_INTERVAL_S = 0.2
 _TMUX_SEND_TIMEOUT_S = 10.0
 _PASTE_BUFFER = "omnigent-copilot-paste"
@@ -27,6 +29,24 @@ _PASTE_BUFFER = "omnigent-copilot-paste"
 def bridge_root() -> Path:
     """Return the configured Copilot-native bridge root."""
     return _BRIDGE_ROOT
+
+
+def copilot_home() -> Path:
+    """Return the Copilot CLI's state directory (``COPILOT_HOME`` or ``~/.copilot``)."""
+    raw = os.environ.get("COPILOT_HOME", "").strip()
+    return Path(raw) if raw else Path.home() / ".copilot"
+
+
+def session_events_path(copilot_session_id: str) -> Path:
+    """Return the ``events.jsonl`` the CLI appends for *copilot_session_id*.
+
+    The Copilot CLI records every session under
+    ``<copilot-home>/session-state/<uuid>/`` and appends one JSON event per line
+    to ``events.jsonl``. ``--session-id`` pins that uuid at launch, so the
+    forwarder addresses this session's stream directly instead of guessing from
+    recency (verified against Copilot CLI 1.0.63).
+    """
+    return copilot_home() / _SESSION_STATE_DIR / copilot_session_id / _EVENTS_FILE
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
