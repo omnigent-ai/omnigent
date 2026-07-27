@@ -1006,18 +1006,21 @@ class OpenCodeNativeForwarder:
         web_questions: list[dict[str, Any]] = []
         for index, question in enumerate(questions):
             if not isinstance(question, dict):
-                continue
+                await self._reject_question_quietly(request_id)
+                return
             prompt = question.get("question")
             raw_options = question.get("options")
             if not isinstance(prompt, str) or not prompt or not isinstance(raw_options, list):
-                continue
+                await self._reject_question_quietly(request_id)
+                return
             options = [
                 {"label": opt["label"]}
                 for opt in raw_options
                 if isinstance(opt, dict) and isinstance(opt.get("label"), str) and opt["label"]
             ]
-            if not options:
-                continue
+            if not options or len(options) != len(raw_options):
+                await self._reject_question_quietly(request_id)
+                return
             web_questions.append(
                 {
                     "question": prompt,
@@ -1030,8 +1033,6 @@ class OpenCodeNativeForwarder:
                 }
             )
         if not web_questions:
-            # Nothing renderable → unblock opencode rather than parking a card
-            # the web UI can't show.
             await self._reject_question_quietly(request_id)
             return
         first = questions[0] if isinstance(questions[0], dict) else {}

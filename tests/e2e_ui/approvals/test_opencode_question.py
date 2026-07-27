@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 
 import httpx
@@ -82,15 +83,28 @@ def test_opencode_question_round_trips_through_web(
 
     thread = threading.Thread(target=_run_forwarder, daemon=True)
     thread.start()
-    page.goto(f"{base_url}/c/{session_id}")
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
 
-    form = page.locator(_FORM)
-    expect(form).to_be_visible(timeout=15_000)
-    form.get_by_role("checkbox", name="Tests").check()
-    form.get_by_role("checkbox", name="Lint").check()
-    form.locator(_SUBMIT).click()
+        form = page.locator(_FORM)
+        expect(form).to_be_visible(timeout=15_000)
+        form.get_by_role("checkbox", name="Tests").check()
+        form.get_by_role("checkbox", name="Lint").check()
+        form.locator(_SUBMIT).click()
+    finally:
+        thread.join(timeout=5)
+        if thread.is_alive():
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.post(
+                    f"{base_url}/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "approval",
+                        "data": {"elicitation_id": "que_e2e", "action": "decline"},
+                    },
+                    timeout=10.0,
+                ).raise_for_status()
+            thread.join(timeout=30)
 
-    thread.join(timeout=30)
     assert not thread.is_alive(), "OpenCode question hook did not receive the web verdict"
     if "error" in result:
         raise AssertionError(f"forwarder failed: {result['error']}") from result["error"]

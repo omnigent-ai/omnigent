@@ -1114,6 +1114,27 @@ async def test_question_asked_empty_questions_rejects_without_hook() -> None:
     assert _hook_post(server) is None
 
 
+async def test_question_asked_mixed_valid_and_malformed_rejects_whole_request() -> None:
+    """One malformed question rejects the request instead of sending empty answers."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "question.asked",
+            id="que_1",
+            questions=[
+                {"question": "Valid?", "options": [{"label": "Yes"}]},
+                {"question": "Malformed", "options": [{"label": ""}]},
+            ],
+        )
+    )
+    task = fwd._question_tasks["que_1"]
+    await task
+    assert opencode.question_rejects == ["que_1"]
+    assert opencode.question_replies == []
+    assert _hook_post(server) is None
+
+
 async def test_question_asked_dedupes_concurrent_same_request() -> None:
     """A duplicate ``question.asked`` for the same id spawns only one park task."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
