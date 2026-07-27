@@ -3026,7 +3026,7 @@ export function NewChatLandingScreen() {
           keeps the composer from feeling cramped against the viewport
           edges; widens to the full px-10 at the md breakpoint and up. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-4 pt-8 pb-16 md:select-none md:px-10">
-        <div className="flex flex-col items-center gap-3.5 sm:flex-row">
+        <div className="flex w-full flex-col items-center justify-center gap-3.5 sm:flex-row">
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the same folder
             // icon the sidebar uses for a project, and name the project. Sized
@@ -3038,7 +3038,7 @@ export function NewChatLandingScreen() {
           ) : (
             <OttoEyes className="h-18 w-auto shrink-0" />
           )}
-          <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">
+          <h1 className="min-w-0 break-words text-center text-3xl font-medium tracking-[-0.03em] text-foreground line-clamp-2 sm:text-left">
             {selectedProject || "What should we do?"}
           </h1>
         </div>

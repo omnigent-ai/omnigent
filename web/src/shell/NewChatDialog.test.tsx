@@ -1818,6 +1818,24 @@ describe("NewChatLandingScreen", () => {
     expect(patchBody.project_id).toBe("p_sprint");
   });
 
+  it("clamps a long project name in the hero heading so it can't overflow the row", async () => {
+    // Project names are capped at 100 chars server-side, which at text-3xl is
+    // far wider than the centered container. The heading must wrap + clamp
+    // rather than render at full width on one line (jsdom can't lay out, so we
+    // assert the class contract that guards this — dropping any of these would
+    // regress to the overflow the old max-w-32 chip prevented).
+    const longName = "A".repeat(100);
+    renderLanding({}, `/?project=${encodeURIComponent(longName)}`);
+
+    const heading = await screen.findByRole("heading", { level: 1 });
+    expect(heading.textContent).toBe(longName);
+    // min-w-0 lets the heading shrink inside the flex row; line-clamp-2 +
+    // break-words wrap/ellipsize instead of overflowing.
+    expect(heading.className).toContain("min-w-0");
+    expect(heading.className).toContain("line-clamp-2");
+    expect(heading.className).toContain("break-words");
+  });
+
   it.each([
     {
       name: "not-configured OmnigentError",
