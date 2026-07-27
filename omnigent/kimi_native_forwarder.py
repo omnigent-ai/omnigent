@@ -35,6 +35,7 @@ import contextlib
 import json
 import logging
 from dataclasses import dataclass
+from hashlib import md5
 from pathlib import Path
 
 import httpx
@@ -178,6 +179,57 @@ def _discover_wire(kimi_home: Path, workspace: str, launch_epoch_ms: int) -> Pat
     return best[1] if best is not None else None
 
 
+def _discover_current_wire(
+    kimi_share_dir: Path, workspace: str, launch_epoch_ms: int
+) -> Path | None:
+    """Locate Kimi 1.49's newest launch-scoped wire for *workspace*."""
+    workspace_dir = md5(workspace.encode("utf-8")).hexdigest()
+    sessions_root = kimi_share_dir / "sessions" / workspace_dir
+    if not sessions_root.exists():
+        return None
+    floor_s = (launch_epoch_ms - _DISCOVER_SKEW_MS) / 1000.0
+    best: tuple[float, Path] | None = None
+    for wire in sessions_root.glob("*/wire.jsonl"):
+        try:
+            mtime = wire.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < floor_s:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, wire)
+    return best[1] if best is not None else None
+
+
+def discover_kimi_wire(
+    *,
+    kimi_share_dir: Path | None,
+    legacy_kimi_home: Path | None,
+    workspace: str,
+    launch_epoch_ms: int,
+) -> Path | None:
+    """Choose the newest matching wire from Kimi 1.49 or Kimi 0.27."""
+    candidates = [
+        candidate
+        for candidate in (
+            (
+                _discover_current_wire(kimi_share_dir, workspace, launch_epoch_ms)
+                if kimi_share_dir is not None
+                else None
+            ),
+            (
+                _discover_wire(legacy_kimi_home, workspace, launch_epoch_ms)
+                if legacy_kimi_home is not None
+                else None
+            ),
+        )
+        if candidate is not None
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
 def _input_text(blocks: object) -> str:
     """Concatenate the ``text`` of an ``input`` / ``content`` block list."""
     if not isinstance(blocks, list):
@@ -191,8 +243,8 @@ def _input_text(blocks: object) -> str:
     return "".join(parts)
 
 
-def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
-    """Map one wire-log row to a conversation item, or ``None`` to skip it."""
+def _legacy_row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
+    """Map one Kimi 0.27 wire row to a conversation item."""
     row_type = row.get("type")
     if row_type == "turn.prompt":
         origin = row.get("origin")
@@ -243,6 +295,67 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
             )
         return None
     return None
+
+
+def _current_input_text(value: object) -> str:
+    """Normalize Kimi 1.49's string-or-block-list user input."""
+    if isinstance(value, str):
+        return value
+    return _input_text(value)
+
+
+def _current_row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
+    """Map one Kimi 1.49 typed-envelope row to a conversation item."""
+    message = row.get("message")
+    if not isinstance(message, dict):
+        return None
+    message_type = message.get("type")
+    payload = message.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    response_id = f"kimi:current:line:{line_no}"
+    if message_type in {"TurnBegin", "SteerInput"}:
+        text = _current_input_text(payload.get("user_input"))
+        if not text:
+            return None
+        return KimiWireItem(
+            line_no=line_no,
+            role="user",
+            text=text,
+            response_id=response_id,
+        )
+    if message_type != "ContentPart":
+        return None
+    part_type = payload.get("type")
+    if part_type == "text":
+        text = payload.get("text")
+        if not isinstance(text, str) or not text:
+            return None
+        return KimiWireItem(
+            line_no=line_no,
+            role="assistant",
+            text=text,
+            response_id=response_id,
+        )
+    if part_type == "think":
+        think = payload.get("think")
+        if not isinstance(think, str) or not think:
+            return None
+        return KimiWireItem(
+            line_no=line_no,
+            role="assistant",
+            text=think,
+            response_id=response_id,
+            kind="reasoning",
+        )
+    return None
+
+
+def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
+    """Map one current or legacy wire row to a conversation item."""
+    if isinstance(row.get("message"), dict):
+        return _current_row_to_item(line_no, row)
+    return _legacy_row_to_item(line_no, row)
 
 
 def read_kimi_wire_items(wire_path: Path, last_line: int) -> list[KimiWireItem]:
@@ -334,9 +447,11 @@ async def forward_kimi_wire_to_session(
     headers: dict[str, str],
     session_id: str,
     bridge_dir: Path,
-    kimi_home: Path,
     workspace: str,
     launch_epoch_ms: int,
+    kimi_home: Path | None = None,
+    kimi_share_dir: Path | None = None,
+    legacy_kimi_home: Path | None = None,
     agent_name: str = "kimi-native-ui",
 ) -> None:
     """Poll the kimi session wire log and mirror new turns into the chat.
@@ -345,6 +460,7 @@ async def forward_kimi_wire_to_session(
     first turn), then tails it, POSTing each new user/assistant turn and
     persisting the line offset after every post.
     """
+    legacy_home = legacy_kimi_home or kimi_home
     state = _read_state(bridge_dir)
     wire_path = Path(state.wire_path) if state is not None else None
     last_line = state.last_line if state is not None else 0
@@ -352,7 +468,11 @@ async def forward_kimi_wire_to_session(
         while True:
             if wire_path is None or not wire_path.exists():
                 discovered = await asyncio.to_thread(
-                    _discover_wire, kimi_home, workspace, launch_epoch_ms
+                    discover_kimi_wire,
+                    kimi_share_dir=kimi_share_dir,
+                    legacy_kimi_home=legacy_home,
+                    workspace=workspace,
+                    launch_epoch_ms=launch_epoch_ms,
                 )
                 if discovered is not None and discovered != wire_path:
                     wire_path = discovered
@@ -393,9 +513,11 @@ async def supervise_kimi_forwarder(
     headers: dict[str, str],
     session_id: str,
     bridge_dir: Path,
-    kimi_home: Path,
     workspace: str,
     launch_epoch_ms: int,
+    kimi_home: Path | None = None,
+    kimi_share_dir: Path | None = None,
+    legacy_kimi_home: Path | None = None,
     agent_name: str = "kimi-native-ui",
 ) -> None:
     """Run :func:`forward_kimi_wire_to_session` with restart-on-crash backoff.
@@ -412,9 +534,11 @@ async def supervise_kimi_forwarder(
                 headers=headers,
                 session_id=session_id,
                 bridge_dir=bridge_dir,
-                kimi_home=kimi_home,
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
+                kimi_home=kimi_home,
+                kimi_share_dir=kimi_share_dir,
+                legacy_kimi_home=legacy_kimi_home,
                 agent_name=agent_name,
             )
         except asyncio.CancelledError:

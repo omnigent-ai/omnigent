@@ -9,6 +9,8 @@ by the e2e gate, not here.
 from __future__ import annotations
 
 import json
+import os
+from hashlib import md5
 from pathlib import Path
 
 from omnigent.kimi_native_forwarder import (
@@ -18,11 +20,67 @@ from omnigent.kimi_native_forwarder import (
     _row_to_item,
     _write_state,
     clear_kimi_bridge_state,
+    discover_kimi_wire,
     read_kimi_wire_items,
 )
 
 
 class TestRowToItem:
+    def test_current_turn_begin_is_user(self) -> None:
+        row = {
+            "timestamp": 1784854258.07757,
+            "message": {
+                "type": "TurnBegin",
+                "payload": {"user_input": [{"type": "text", "text": "hi"}]},
+            },
+        }
+        item = _row_to_item(1, row)
+        assert item is not None
+        assert item.role == "user"
+        assert item.text == "hi"
+        assert item.response_id == "kimi:current:line:1"
+
+    def test_current_content_parts_keep_reasoning_and_answer(self) -> None:
+        reasoning = _row_to_item(
+            2,
+            {
+                "message": {
+                    "type": "ContentPart",
+                    "payload": {"type": "think", "think": "Reason carefully."},
+                }
+            },
+        )
+        answer = _row_to_item(
+            3,
+            {
+                "message": {
+                    "type": "ContentPart",
+                    "payload": {"type": "text", "text": "Done."},
+                }
+            },
+        )
+        assert reasoning is not None
+        assert (reasoning.role, reasoning.text, reasoning.kind) == (
+            "assistant",
+            "Reason carefully.",
+            "reasoning",
+        )
+        assert answer is not None
+        assert (answer.role, answer.text, answer.kind) == ("assistant", "Done.", "message")
+
+    def test_current_steer_input_string_is_user(self) -> None:
+        item = _row_to_item(
+            4,
+            {
+                "message": {
+                    "type": "SteerInput",
+                    "payload": {"user_input": "one more thing"},
+                }
+            },
+        )
+        assert item is not None
+        assert (item.role, item.text, item.kind) == ("user", "one more thing", "message")
+
     def test_turn_prompt_is_user(self) -> None:
         row = {
             "type": "turn.prompt",
@@ -176,3 +234,55 @@ class TestDiscoverWire:
         self._make_session(home, "session_stale", "/ws", mtime=1000.0)
         # launch far in the future (ms) → the 1000s-mtime session is below the floor.
         assert _discover_wire(home, "/ws", launch_epoch_ms=9_000_000_000_000) is None
+
+    def test_selects_newest_current_or_legacy_launch_scoped_wire(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = "/tmp/Andrew Project"
+        current_share = tmp_path / "kimi-share"
+        legacy_home = tmp_path / "kimi-code-home"
+        current_wire = (
+            current_share
+            / "sessions"
+            / md5(workspace.encode("utf-8")).hexdigest()
+            / "149-session"
+            / "wire.jsonl"
+        )
+        wrong_workspace_wire = (
+            current_share
+            / "sessions"
+            / md5(b"/tmp/Other Project").hexdigest()
+            / "other-session"
+            / "wire.jsonl"
+        )
+        legacy_wire = self._make_session(
+            legacy_home, "session_027", workspace, mtime=1005.0
+        )
+        for wire, mtime in (
+            (current_wire, 1010.0),
+            (wrong_workspace_wire, 1030.0),
+        ):
+            wire.parent.mkdir(parents=True, exist_ok=True)
+            wire.write_text("{}\n", encoding="utf-8")
+            os.utime(wire, (mtime, mtime))
+
+        assert (
+            discover_kimi_wire(
+                kimi_share_dir=current_share,
+                legacy_kimi_home=legacy_home,
+                workspace=workspace,
+                launch_epoch_ms=1_000_000,
+            )
+            == current_wire
+        )
+
+        os.utime(legacy_wire, (1020.0, 1020.0))
+        assert (
+            discover_kimi_wire(
+                kimi_share_dir=current_share,
+                legacy_kimi_home=legacy_home,
+                workspace=workspace,
+                launch_epoch_ms=1_000_000,
+            )
+            == legacy_wire
+        )

@@ -9,6 +9,7 @@ import tomllib
 
 from omnigent.kimi_native_credentials import (
     KIMI_CODE_HOME_ENV_VAR,
+    KIMI_SHARE_DIR_ENV_VAR,
     build_kimi_session_home,
     render_kimi_hooks_toml,
 )
@@ -95,3 +96,60 @@ def test_build_session_home_without_user_home_writes_hooks_only(
 
     parsed = tomllib.loads((session_home / "config.toml").read_text(encoding="utf-8"))
     assert {h["event"] for h in parsed["hooks"]} == {"PreToolUse", "PermissionRequest"}
+
+
+def test_build_dual_session_homes_renders_generation_specific_hooks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kimi 1.49 gets only its supported hook while Kimi 0.27 stays compatible."""
+    current_user_home = tmp_path / "user-kimi"
+    legacy_user_home = tmp_path / "user-kimi-code"
+    current_user_home.mkdir()
+    legacy_user_home.mkdir()
+    (current_user_home / "config.toml").write_text(
+        'default_model = "kimi"\nhooks = []\n', encoding="utf-8"
+    )
+    (legacy_user_home / "config.toml").write_text(
+        'default_model = "kimi-legacy"\nhooks = []\n', encoding="utf-8"
+    )
+    for entry in ("credentials", "sessions", "logs"):
+        (current_user_home / entry).mkdir()
+    (current_user_home / "device_id").write_text("device", encoding="utf-8")
+    (current_user_home / "kimi.json").write_text("{}", encoding="utf-8")
+    (current_user_home / "mcp.json").write_text("{}", encoding="utf-8")
+    for entry in ("oauth", "sessions"):
+        (legacy_user_home / entry).mkdir()
+    (legacy_user_home / "session_index.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setenv(KIMI_SHARE_DIR_ENV_VAR, str(current_user_home))
+    monkeypatch.setenv(KIMI_CODE_HOME_ENV_VAR, str(legacy_user_home))
+
+    legacy_session_home = tmp_path / "runtime" / "kimi-code-home"
+    env = build_kimi_session_home(
+        legacy_session_home,
+        bridge_dir=tmp_path / "bridge",
+        python_executable="/opt/omnigent/python",
+        include_current=True,
+    )
+    current_session_home = tmp_path / "runtime" / "kimi-share"
+
+    assert env == {
+        KIMI_SHARE_DIR_ENV_VAR: str(current_session_home),
+        KIMI_CODE_HOME_ENV_VAR: str(legacy_session_home),
+    }
+    current_config = (current_session_home / "config.toml").read_text(encoding="utf-8")
+    legacy_config = (legacy_session_home / "config.toml").read_text(encoding="utf-8")
+    current_parsed = tomllib.loads(current_config)
+    legacy_parsed = tomllib.loads(legacy_config)
+    assert [hook["event"] for hook in current_parsed["hooks"]] == ["PreToolUse"]
+    assert [hook["event"] for hook in legacy_parsed["hooks"]] == [
+        "PreToolUse",
+        "PermissionRequest",
+    ]
+    assert (current_session_home / "credentials").is_symlink()
+    assert (current_session_home / "device_id").is_symlink()
+    assert (current_session_home / "mcp.json").is_symlink()
+    assert not (current_session_home / "sessions").exists()
+    assert not (current_session_home / "kimi.json").exists()
+    assert not (current_session_home / "logs").exists()
+    assert (legacy_session_home / "oauth").is_symlink()
+    assert not (legacy_session_home / "sessions").exists()
