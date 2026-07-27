@@ -14,19 +14,17 @@ import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSi
 
 // Default 320px (20rem) — wider than the old fixed ``md:w-64`` (256px) sidebar
 // so conversation titles have more room before truncating. The floor keeps the
-// search box + "New session" button usable; the ceiling (a hard cap and a
-// viewport ratio, whichever is smaller) keeps the sidebar from crowding out the
-// chat on narrow screens.
+// search box + "New session" button usable; the viewport-relative ceiling keeps
+// the sidebar from consuming more than half of the desktop layout.
 const DEFAULT_WIDTH_PX = 320;
 const MIN_WIDTH_PX = 220;
-const MAX_WIDTH_PX = 480;
 const MAX_WIDTH_RATIO = 0.5;
 
 function clamp(w: number): number {
   // No viewport available off the DOM (SSR / node test env) — this runs during
   // render, so guard before reading ``window`` to avoid a hard throw.
-  if (typeof window === "undefined") return Math.max(MIN_WIDTH_PX, Math.min(w, MAX_WIDTH_PX));
-  const ceiling = Math.min(MAX_WIDTH_PX, window.innerWidth * MAX_WIDTH_RATIO);
+  if (typeof window === "undefined") return Math.max(MIN_WIDTH_PX, w);
+  const ceiling = window.innerWidth * MAX_WIDTH_RATIO;
   return Math.max(MIN_WIDTH_PX, Math.min(w, ceiling));
 }
 

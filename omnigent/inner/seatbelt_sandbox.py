@@ -1280,6 +1280,16 @@ def _ensure_executable_visible(
             # ``/Users`` widening that the H1/H2/H3 hardening
             # explicitly closed.
             install_root = _interpreter_install_root(exe)
+            # Two-hop symlink case: the literal path is a tool-venv
+            # proxy (e.g. ``~/.local/share/uv/tools/<pkg>/bin/python``)
+            # whose grandparent lacks CPython layout markers, while the
+            # resolved target (``~/.local/share/uv/python/cpython-.../
+            # bin/python3.12``) does carry them.  Resolve once and retry
+            # before giving up.
+            if install_root is None:
+                exe_resolved_inner = exe.resolve(strict=False)
+                if exe_resolved_inner != exe:
+                    install_root = _interpreter_install_root(exe_resolved_inner)
             if install_root is not None and str(install_root) not in _UNSAFE_WIDEN_ANCESTORS:
                 if any(_is_within_literal(install_root, root) for root in covered_prefixes):
                     return
@@ -1309,12 +1319,12 @@ def _ensure_executable_visible(
                 f"That grants the sandboxed helper read access to every "
                 f"other user's home (or to system runtime state) and is a "
                 f"sandbox-defeating widening. Auto-detection of a narrow "
-                f"Python install root (``<root>/bin/python*`` + "
+                f"CPython install root (``<root>/bin/python*`` + "
                 f"``<root>/lib/python*`` or ``<root>/lib/libpython*``) "
-                f"did not match the layout at this path. Remediate by "
-                f"either: (1) using a Homebrew or system Python interpreter "
-                f"(``/opt/homebrew/...`` or ``/usr/bin/python3``, both "
-                f"covered by default RO subpaths); (2) placing the venv "
+                f"did not match the literal or resolved path at this location. "
+                f"Remediate by either: (1) using a Homebrew or system "
+                f"interpreter (``/opt/homebrew/...`` or ``/usr/bin/python3``, "
+                f"both covered by default RO subpaths); (2) placing the venv "
                 f"under cwd (e.g. ``./.venv/bin/python``); or "
                 f"(3) adding a narrower ``read_paths`` entry covering "
                 f"only the interpreter tree (e.g. "

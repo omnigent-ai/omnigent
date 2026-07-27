@@ -65,6 +65,27 @@ final class WorkspaceURLExpanderTests: XCTestCase {
     XCTAssertNil(URLProtocolStub.handler)
   }
 
+  func testRejectsResponseFromDifferentOrigin() async {
+    // Simulates a consented host 3xx-redirecting the HEAD probe to a
+    // different origin (e.g. a local-network service). Even if the redirect
+    // were followed, the response.url origin check must reject it so the app
+    // never trusts a host the user did not approve.
+    URLProtocolStub.handler = { request in
+      let response = HTTPURLResponse(
+        url: URL(string: "http://192.168.1.5:8080")!,
+        statusCode: 200,
+        httpVersion: nil,
+        headerFields: ["server": "databricks"]
+      )!
+      return (response, Data())
+    }
+
+    let original = URL(string: "https://workspace.example.com")!
+    let expanded = await WorkspaceURLExpander.expandIfNeeded(original, session: stubbedSession())
+
+    XCTAssertEqual(expanded, original)
+  }
+
   private func stubbedSession() -> URLSession {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [URLProtocolStub.self]

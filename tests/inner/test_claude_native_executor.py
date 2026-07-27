@@ -266,7 +266,6 @@ async def test_enqueue_session_message_injects_steering_into_terminal(
         *,
         content: str,
         timeout_s: float = 30.0,
-        verify_delivery: bool = True,
     ) -> None:
         """
         Capture a steering injection.
@@ -274,17 +273,10 @@ async def test_enqueue_session_message_injects_steering_into_terminal(
         :param bridge_dir_arg: Bridge directory passed by the executor.
         :param content: Text typed into the Claude tmux pane.
         :param timeout_s: tmux-target readiness timeout (ignored).
-        :param verify_delivery: Delivery-ack toggle passed by the executor.
         :returns: None.
         """
         del timeout_s
-        sent_messages.append(
-            {
-                "bridge_dir": bridge_dir_arg,
-                "content": content,
-                "verify_delivery": verify_delivery,
-            }
-        )
+        sent_messages.append({"bridge_dir": bridge_dir_arg, "content": content})
 
     monkeypatch.setattr(
         claude_native_executor,
@@ -300,13 +292,10 @@ async def test_enqueue_session_message_injects_steering_into_terminal(
     # session_key is intentionally NOT included since there is one
     # tmux pane per conversation; mixing in routing metadata would
     # cause Claude to see arbitrary key-value pairs as user input.
-    # verify_delivery is False: a queued steering prompt may not fire
-    # UserPromptSubmit promptly, so it keeps the legacy pane-only check.
     assert sent_messages == [
         {
             "bridge_dir": tmp_path,
             "content": "steer me",
-            "verify_delivery": False,
         }
     ]
 
@@ -344,17 +333,15 @@ async def test_concurrent_injections_do_not_overlap_in_terminal(
         *,
         content: str,
         timeout_s: float = 30.0,
-        verify_delivery: bool = True,
     ) -> None:
         """Record peak concurrency, then hold the call open until released.
 
         :param bridge_dir_arg: Bridge directory (ignored).
         :param content: Text that would be typed into tmux (ignored).
         :param timeout_s: tmux-target readiness timeout (ignored).
-        :param verify_delivery: Delivery-ack toggle (ignored).
         :returns: None.
         """
-        del bridge_dir_arg, content, timeout_s, verify_delivery
+        del bridge_dir_arg, content, timeout_s
         with state_lock:
             state["now"] += 1
             state["max"] = max(state["max"], state["now"])
@@ -433,9 +420,8 @@ def _stub_inject(
         *,
         content: str,
         timeout_s: float = 30.0,
-        verify_delivery: bool = True,
     ) -> None:
-        del timeout_s, verify_delivery
+        del timeout_s
         sent.append({"bridge_dir": bridge_dir_arg, "content": content})
 
     return _fake
@@ -559,13 +545,16 @@ async def test_run_turn_image_only_no_text_still_injects(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_unresolved_file_id_skipped_gracefully(
+async def test_run_turn_unresolved_file_id_emits_visible_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
     An ``input_image`` block with only a ``file_id`` (content resolver
-    did not run) is skipped. The text portion is still injected.
+    did not run) injects a visible could-not-load marker with the text.
+
+    Silently skipping the block made the model hallucinate the image;
+    the marker tells both the model and the user the attachment is gone.
     """
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -594,8 +583,8 @@ async def test_run_turn_unresolved_file_id_skipped_gracefully(
 
     assert events == [TurnComplete(response=None)]
     assert len(sent) == 1
-    # The unresolved image block is skipped; only text survives.
-    assert sent[0]["content"] == "analyze this"
+    # The unresolved image block becomes a visible marker, not a silent drop.
+    assert sent[0]["content"] == ("[Attachment file_abc123 could not be loaded]\n\nanalyze this")
     # No uploads directory created — nothing to materialize.
     assert not (tmp_path / "uploads").exists()
 
@@ -606,8 +595,9 @@ async def test_run_turn_dedup_same_filename(
     tmp_path: Path,
 ) -> None:
     """
-    Two image blocks with the same filename produce distinct files
-    (the second gets a unique suffix to avoid overwriting the first).
+    Two different images under the same filename produce distinct files
+    (the second gets a unique suffix instead of overwriting the first).
+    Identical bytes would instead reuse the existing file.
     """
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -616,9 +606,15 @@ async def test_run_turn_dedup_same_filename(
         _stub_inject(sent),
     )
 
+    other_bytes = b"not-the-same-png"
     image_block = {
         "type": "input_image",
         "image_url": _TINY_PNG_DATA_URI,
+        "filename": "dup.png",
+    }
+    other_block = {
+        "type": "input_image",
+        "image_url": "data:image/png;base64," + base64.b64encode(other_bytes).decode(),
         "filename": "dup.png",
     }
     executor = ClaudeNativeExecutor(tmp_path)
@@ -628,7 +624,7 @@ async def test_run_turn_dedup_same_filename(
             messages=[
                 {
                     "role": "user",
-                    "content": [image_block, image_block],
+                    "content": [image_block, other_block],
                 }
             ],
             tools=[],
@@ -644,9 +640,8 @@ async def test_run_turn_dedup_same_filename(
         f"Expected 2 files (dedup suffix), got {len(written)}. "
         "If 1, the second image overwrote the first."
     )
-    # Both contain the same PNG bytes.
-    for f in written:
-        assert f.read_bytes() == _TINY_PNG_BYTES
+    # Both payloads survive, each in its own file.
+    assert {f.read_bytes() for f in written} == {_TINY_PNG_BYTES, other_bytes}
 
 
 @pytest.mark.asyncio
@@ -734,13 +729,13 @@ async def test_enqueue_session_message_materializes_image(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_malformed_data_uri_skipped(
+async def test_run_turn_malformed_data_uri_emits_visible_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    An image block with a malformed data URI is skipped gracefully.
-    The text portion is still injected without error.
+    An image block with a malformed data URI injects a visible
+    could-not-load marker with the text; the turn does not error.
     """
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -770,10 +765,10 @@ async def test_run_turn_malformed_data_uri_skipped(
         )
     ]
 
-    # Turn completes — the bad image is skipped, text is injected.
+    # Turn completes — the bad image becomes a marker, text is injected.
     assert events == [TurnComplete(response=None)]
     assert len(sent) == 1
-    assert sent[0]["content"] == "still send this"
+    assert sent[0]["content"] == ("[Attachment attachment could not be loaded]\n\nstill send this")
     # No file written for the malformed URI.
     assert not (tmp_path / "uploads").exists()
 

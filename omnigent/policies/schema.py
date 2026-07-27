@@ -177,7 +177,13 @@ class PolicyEvent(TypedDict, total=False):
 
     Shape varies by ``type``:
 
-    - ``"request"``: ``data`` is the user message string.
+    - ``"request"``: ``data`` is ``{"user_content": <str>,
+      "attachments": [{"filename", "content_type", "text"}, ...]}``
+      — the user's typed message plus the decoded text of any
+      uploaded text attachments (e.g. a CSV). Read it with
+      :func:`request_user_text` / :func:`request_attachments`
+      rather than assuming a bare string; those helpers also accept
+      a plain string for backward compatibility.
     - ``"tool_call"``: ``data`` is ``{"name": "<tool-name>",
       "arguments": {...}}``. ``target`` is the tool name.
     - ``"tool_result"``: ``data`` is ``{"result": <tool-output>}``.
@@ -338,6 +344,53 @@ class PolicyCallableWithConfig(Protocol):
     def __call__(self, event: PolicyEvent, config: dict[str, str]) -> PolicyResponse | None: ...
 
 
+# ── REQUEST-phase data helpers ───────────────────────────────────────────────
+
+
+def request_user_text(data: Any) -> str:
+    """Extract the user's typed text from a REQUEST-phase ``event["data"]``.
+
+    Request ``data`` is a dict ``{"user_content", "attachments"}`` from the
+    server input gate. Native / opencode hooks may still pass the prompt text
+    directly as a bare string, and legacy multimodal input as a content-block
+    list — normalize all three to the typed text so request-phase policies read
+    it uniformly.
+
+    :param data: The ``event["data"]`` payload at the REQUEST phase.
+    :returns: The user's typed message text, or ``""`` when absent.
+    """
+    if isinstance(data, dict):
+        text = data.get("user_content")
+        return text if isinstance(text, str) else ""
+    if isinstance(data, str):
+        return data
+    if isinstance(data, list):
+        parts = [
+            block.get("text", "")
+            for block in data
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def request_attachments(data: Any) -> list[dict[str, Any]]:
+    """Return the text attachments on a REQUEST-phase ``event["data"]``.
+
+    Each entry is ``{"filename", "content_type", "text"}`` — the decoded text of
+    a text-like uploaded file, added by the server input gate. Empty list when
+    ``data`` is not the structured request dict.
+
+    :param data: The ``event["data"]`` payload at the REQUEST phase.
+    :returns: List of attachment dicts, possibly empty.
+    """
+    if isinstance(data, dict):
+        attachments = data.get("attachments")
+        if isinstance(attachments, list):
+            return [att for att in attachments if isinstance(att, dict)]
+    return []
+
+
 __all__ = [
     "USER_DAILY_ASK_APPROVED_STATE_KEY",
     "ActorContext",
@@ -349,4 +402,6 @@ __all__ = [
     "StateUpdateEntry",
     "UsageContext",
     "UserDailyCostContext",
+    "request_attachments",
+    "request_user_text",
 ]

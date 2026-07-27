@@ -195,6 +195,7 @@ afterEach(() => {
   // don't leak persisted state or the --ui-font-scale variable into each other.
   localStorage.clear();
   document.documentElement.style.removeProperty("--ui-font-scale");
+  document.documentElement.style.removeProperty("--sidebar-font-size");
   // The palette picker sets data-theme on <html>; clear it so a palette
   // selected in one test doesn't leak into the next.
   document.documentElement.removeAttribute("data-theme");
@@ -429,6 +430,69 @@ describe("SettingsPage", () => {
     expect(input.value).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(localStorage.getItem("omnigent:ui-font-family")).toBeNull();
+  });
+
+  it("resets every appearance preference back to product defaults", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+
+    // Tweak a representative set of appearance preferences.
+    mocks.theme = "dark";
+    fireEvent.click(screen.getByTestId("theme-dark"));
+    fireEvent.click(screen.getByTestId("terminal-theme-dark"));
+    fireEvent.change(screen.getByTestId("color-theme-select") as HTMLSelectElement, {
+      target: { value: "github" },
+    });
+    fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
+    fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
+      target: { value: "Inter" },
+    });
+    fireEvent.click(screen.getByTestId("code-font-size-inc"));
+    fireEvent.click(screen.getByTestId("code-font-size-inc"));
+    fireEvent.change(screen.getByTestId("code-font-family-input") as HTMLInputElement, {
+      target: { value: "Fira Code" },
+    });
+
+    // Sanity: the non-default choices were persisted.
+    expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
+    expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("18");
+    expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
+
+    // Open the confirmation dialog and confirm the reset.
+    fireEvent.click(screen.getByTestId("reset-appearance-button"));
+    fireEvent.click(screen.getByTestId("reset-appearance-confirm"));
+
+    // Mode is restored to "system".
+    expect(mocks.setTheme).toHaveBeenCalledWith("system");
+
+    // Fonts are back to their defaults.
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("16");
+    expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
+    expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
+    expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-scale")).toBe("1");
+    expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
+    expect(localStorage.getItem("omnigent:code-font-size")).toBeNull();
+
+    // Color theme is back to Omnigent.
+    expect((screen.getByTestId("color-theme-select") as HTMLSelectElement).value).toBe("omni");
+    expect(document.documentElement.getAttribute("data-theme")).toBeNull();
+
+    // Terminal theme, workspace panel, and harness visibility are restored.
+    expect(screen.getByTestId("terminal-theme-auto")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

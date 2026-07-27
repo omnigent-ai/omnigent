@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
 import { useConversations } from "@/hooks/useConversations";
@@ -15,7 +15,6 @@ import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/fil
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
-  isElectronShell,
   isIOSShell,
   isMacElectronShell,
   onNativeSidebarDrag,
@@ -67,7 +66,6 @@ import { useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { ChatHeader } from "./ChatHeader";
-import { UpdateBanner } from "@/components/UpdateBanner";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
 import { FileViewerContext } from "./FileViewerContext";
@@ -375,17 +373,20 @@ export function AppShell() {
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
   // kebab menu (see Sidebar's ConversationRow).
-  // Read-write or higher can manage sharing; top-level only. Sharing a
+  // Only the owner can manage sharing; top-level only. Sharing a
   // sub-agent is a no-op anyway — children inherit the parent's grants via
   // the server's parent-delegation path — so we hide the affordance.
   // Also hidden in single-user mode: with no other users to grant to, the
   // affordance is meaningless (unlike the local-server / sharing-off cases
   // below, which stay present-but-disabled with an explanatory tooltip).
+  // ``isOwnerLevel`` is permissive on a null level (single-user / still
+  // loading), matching the sidebar's owner-only Share gate and the terminal
+  // ``readOnly`` gate below; the authoritative snapshot level resolves it.
   const serverInfo = useServerInfo();
   const canShare =
     !!conversationId &&
     isKnownTopLevel &&
-    (permissionLevel === null || permissionLevel >= 3) &&
+    isOwnerLevel(permissionLevel) &&
     !isSingleUserMode(serverInfo);
   // Two independent reasons the Share affordance is present-but-disabled: a
   // local server can't produce openable links, and a deployed server whose
@@ -1218,6 +1219,14 @@ export function AppShell() {
     }),
     [canClone],
   );
+  const workspacePanelVisible = Boolean(
+    conversationId &&
+    hasRailContent &&
+    rightPanelOpen &&
+    (terminalFirst || !panelOpen) &&
+    !executionLogsOpen &&
+    !filesPanelOpen,
+  );
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
@@ -1272,6 +1281,13 @@ export function AppShell() {
                   "relative flex min-h-0 min-w-0 flex-1",
                   panelOpen && !terminalFirst && "md:hidden",
                 )}
+                style={
+                  {
+                    "--workspace-panel-offset": workspacePanelVisible
+                      ? `${inlinePanelWidth + 16}px`
+                      : "0px",
+                  } as CSSProperties
+                }
               >
                 <ChatHeader
                   sidebarOpen={sidebarOpen}
@@ -1318,7 +1334,6 @@ export function AppShell() {
                   }}
                 />
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-                  {isElectronShell() && <UpdateBanner />}
                   <Outlet />
                 </main>
 
@@ -1332,46 +1347,41 @@ export function AppShell() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId &&
-                  hasRailContent &&
-                  rightPanelOpen &&
-                  (terminalFirst || !panelOpen) &&
-                  !executionLogsOpen &&
-                  !filesPanelOpen && (
-                    <WorkspacePanel
-                      conversationId={conversationId}
-                      width={inlinePanelWidth}
-                      inert={inlinePanelWidth === 0}
-                      handleProps={inlinePanelHandleProps}
-                      rightRailTab={rightRailTab}
-                      onRightRailTabChange={handleRightRailTabChange}
-                      showFilesPanel={showFilesPanel}
-                      showBrowserTab={railTabsAvailable.browser}
-                      changedCount={changedCount}
-                      showShellsTab={railTabsAvailable.terminals}
-                      terminalsLength={railTerminals.length}
-                      subagentsWorking={subagentsWorking}
-                      agentCount={agentCount}
-                      todosSupported={todosSupported}
-                      todosCompleted={todosCompleted}
-                      todosTotal={todos.length}
-                      rootSessionId={rootSessionId}
-                      selectedFilePath={selectedFilePath}
-                      openFiles={openFiles}
-                      openFileViewer={openFileViewer}
-                      onCloseFile={closeFile}
-                      onShowScopeView={showScopeView}
-                      onCommentsOpenChange={setFileViewerCommentsOpen}
-                      openTerminalsPanel={openTerminalsPanel}
-                      permissionLevel={permissionLevel}
-                      filesPanelSort={filesPanelSort}
-                      onSortChange={handleFilesSortChange}
-                      filesPanelFlatView={filesPanelFlatView}
-                      onFlatViewChange={handleFilesFlatViewChange}
-                      filesPanelShowHidden={filesPanelShowHidden}
-                      onShowHiddenChange={setFilesPanelShowHidden}
-                    />
-                  )}
+                {conversationId && workspacePanelVisible && (
+                  <WorkspacePanel
+                    conversationId={conversationId}
+                    width={inlinePanelWidth}
+                    inert={inlinePanelWidth === 0}
+                    handleProps={inlinePanelHandleProps}
+                    rightRailTab={rightRailTab}
+                    onRightRailTabChange={handleRightRailTabChange}
+                    showFilesPanel={showFilesPanel}
+                    showBrowserTab={railTabsAvailable.browser}
+                    changedCount={changedCount}
+                    showShellsTab={railTabsAvailable.terminals}
+                    terminalsLength={railTerminals.length}
+                    subagentsWorking={subagentsWorking}
+                    agentCount={agentCount}
+                    todosSupported={todosSupported}
+                    todosCompleted={todosCompleted}
+                    todosTotal={todos.length}
+                    rootSessionId={rootSessionId}
+                    selectedFilePath={selectedFilePath}
+                    openFiles={openFiles}
+                    openFileViewer={openFileViewer}
+                    onCloseFile={closeFile}
+                    onShowScopeView={showScopeView}
+                    onCommentsOpenChange={setFileViewerCommentsOpen}
+                    openTerminalsPanel={openTerminalsPanel}
+                    permissionLevel={permissionLevel}
+                    filesPanelSort={filesPanelSort}
+                    onSortChange={handleFilesSortChange}
+                    filesPanelFlatView={filesPanelFlatView}
+                    onFlatViewChange={handleFilesFlatViewChange}
+                    filesPanelShowHidden={filesPanelShowHidden}
+                    onShowHiddenChange={setFilesPanelShowHidden}
+                  />
+                )}
               </div>
 
               {/* Push panels — flex siblings to main, animate width. Only one is open at a time.

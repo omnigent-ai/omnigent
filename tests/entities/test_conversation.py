@@ -121,6 +121,35 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
             [{"type": "input_text", "text": "why does [Attached: x.png] render twice?"}],
             "why does [Attached: x.png] render twice?",
         ),
+        # Failed-attachment marker (native_attachments'
+        # unresolved_attachment_marker) is likewise dropped from titles.
+        (
+            [
+                {
+                    "type": "input_text",
+                    "text": ("[Attachment photo.png could not be loaded]\n\nfix this layout bug"),
+                }
+            ],
+            "fix this layout bug",
+        ),
+        # Failed-attachment-only message: nothing usable remains → no
+        # title, same as the image-only case above.
+        (
+            [{"type": "input_text", "text": "[Attachment file_img could not be loaded]"}],
+            None,
+        ),
+        # Bracketed filenames are sanitized by unresolved_attachment_marker
+        # ("shot [final].png" → "shot _final_.png"), so the marker still
+        # matches and is dropped from the title.
+        (
+            [
+                {
+                    "type": "input_text",
+                    "text": "[Attachment shot _final_.png could not be loaded]\n\nfix this",
+                }
+            ],
+            "fix this",
+        ),
     ],
 )
 def test_synthesize_conversation_title(

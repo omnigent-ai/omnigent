@@ -24,7 +24,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.reasoning_effort import CODEX_EFFORTS, validate_effort
+from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -109,6 +109,11 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
+_CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
+# hooks.json is symlinked so the user's hooks are available in the private home
+# and hook-trust keys in config.toml (which reference source paths) can be
+# translated to point at the private copy instead of the global home.
+_CODEX_HOOKS_JSON = "hooks.json"
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
@@ -116,6 +121,7 @@ _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
 # shared ``~/.codex/config.toml``. This keeps model selection and cost-policy
 # enforcement isolated between concurrent sessions.
 _CODEX_HOME_COPY_FILES = ("config.toml",)
+_CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 
 # Environment variables explicitly excluded from the codex subprocess even
 # when their prefix is in the allowlist. ``OPENAI_API_KEY`` is stripped so
@@ -124,7 +130,7 @@ _CODEX_HOME_COPY_FILES = ("config.toml",)
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
 
-def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
+def _extract_codex_last_turn_usage(params: object, model: str) -> dict[str, Any] | None:
     """Map a ``thread/tokenUsage/updated`` payload's ``last`` breakdown
     onto the wire shape that :class:`TurnComplete` consumes.
 
@@ -135,6 +141,16 @@ def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
     out into ``cache_read_input_tokens`` and keep only the remainder in
     ``input_tokens`` — otherwise cached tokens are billed at the full input
     rate. Mirrors the codex-native forwarder split.
+
+    :param model: The resolved model this turn ran with, e.g.
+        ``"gpt-5.4-mini"`` — the ``run_turn`` argument, which carries the
+        harness/provider's resolved default even when the agent spec pins
+        none. Stamped into the returned usage as ``"model"`` so the
+        server's per-model cost/token attribution (``session_usage.by_model``)
+        can key on it instead of silently falling back to an unresolvable
+        spec model and dropping the turn from the per-model breakdown
+        (mirrors ``claude_sdk_executor``'s ``observed_model`` and every
+        other relay executor, all of which already report ``usage.model``).
     """
     if not isinstance(params, dict):
         return None
@@ -147,13 +163,15 @@ def _extract_codex_last_turn_usage(params: object) -> dict[str, int] | None:
     input_total = int(last.get("inputTokens") or 0)
     # Clamp so a malformed cached > total never makes input_tokens negative.
     cached = min(int(last.get("cachedInputTokens") or 0), input_total)
-    usage = {
+    usage: dict[str, Any] = {
         "input_tokens": input_total - cached,  # non-cached portion
         "output_tokens": int(last.get("outputTokens") or 0),
         "total_tokens": int(last.get("totalTokens") or 0),
     }
     if cached:
         usage["cache_read_input_tokens"] = cached
+    if model:
+        usage["model"] = model
     return usage
 
 
@@ -686,34 +704,62 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
-def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
+def _populate_codex_home_config(
+    target_dir: Path,
+    source_dir: Path,
+    *,
+    minimal_config: bool | None = None,
+) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
 
     The executor overrides ``CODEX_HOME`` to a per-conversation temp
     directory so session data (conversation history, etc.) stays isolated
     from the user's ``~/.codex/``. However, the codex CLI also reads
-    authentication tokens (``auth.json``) and provider configuration
-    (``config.toml``) from ``$CODEX_HOME``. This helper bridges those
-    files into the temp directory:
+    authentication tokens (``auth.json``), provider configuration
+    (``config.toml``) and instructions (``AGENTS.md``, ``AGENTS.override.md``)
+    from ``$CODEX_HOME``. This helper bridges those files into the temp directory:
 
     - ``auth.json`` is **symlinked** so OAuth token refreshes written to
       the real home propagate to running sessions without delay.
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
-      enforcement isolated between concurrent sessions.
+      enforcement isolated between concurrent sessions. Hook-trust keys inside
+      the copy are rewritten to reference the private home's paths so Codex
+      recognises previously-trusted hooks without an interactive prompt.
+    - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
+      available at the same path within the private home that the rewritten
+      trust keys reference.
+    - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
+      are respected.
 
     :param target_dir: The per-conversation temp ``CODEX_HOME``
         directory. Must already exist.
     :param source_dir: The primary ``CODEX_HOME`` directory
         (typically ``$CODEX_HOME`` or ``~/.codex``). Missing files are
         skipped.
+    :param minimal_config: Copy only auth and provider-routing config when
+        ``True``. ``None`` preserves the environment-controlled behavior.
     """
     if not source_dir.is_dir():
         return
 
-    for filename in _CODEX_HOME_SYMLINK_FILES:
+    if minimal_config is None:
+        minimal_config = os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+    symlink_files = _CODEX_HOME_SYMLINK_FILES
+    if not minimal_config:
+        symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
+        # Symlink hooks.json so hook-trust keys rewritten below resolve.
+        # Skipped in minimal_config mode: the minimal config.toml is rebuilt
+        # from scratch with no [hooks.state] entries, so symlinked hooks with
+        # no trust state would re-introduce the interactive trust prompt.
+        symlink_files += (_CODEX_HOOKS_JSON,)
+    for filename in symlink_files:
         source_file = source_dir / filename
         if not source_file.is_file():
             continue
@@ -738,7 +784,235 @@ def _populate_codex_home_config(target_dir: Path, source_dir: Path) -> None:
         dest_path = target_dir / filename
         if dest_path.exists() or dest_path.is_symlink():
             continue
+        if minimal_config and filename == "config.toml":
+            import tomlkit
+
+            # The title worker needs custom-provider routing, but copying the
+            # full user config also starts unrelated MCPs/plugins and can exceed
+            # its timeout. auth.json alone cannot supply these provider tables.
+            source_config = tomlkit.parse(source_file.read_text())
+            minimal_document = tomlkit.document()
+            for key in ("model_provider", "model_providers", "profiles"):
+                if key in source_config:
+                    minimal_document[key] = source_config[key]
+            dest_path.write_text(tomlkit.dumps(minimal_document))
+            continue
         shutil.copy2(source_file, dest_path)
+        if filename == "config.toml":
+            _normalize_copied_codex_effort(dest_path)
+            _retarget_codex_hook_trust_keys(dest_path, source_dir, target_dir)
+
+
+# Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
+# leading whitespace and a trailing comment. Only applied to lines *before*
+# the first table header so keys inside ``[profiles.*]`` etc. are never
+# rewritten (they may target other providers with different ladders).
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
+
+
+def _normalize_copied_codex_effort(config_path: Path) -> None:
+    """Rewrite a deprecated top-level ``model_reasoning_effort`` in the
+    session's private copy of ``config.toml``.
+
+    The ChatGPT desktop app manages ``~/.codex/config.toml`` on machines
+    where it is installed and writes ``model_reasoning_effort = "ultra"`` —
+    a value the codex CLI maps to the retired ``max`` wire value, which the
+    OpenAI Responses API rejects with ``invalid_value: 'max'`` (its ladder
+    tops out at ``xhigh``). Because this executor copies the user's config
+    verbatim into every per-session ``CODEX_HOME``, that one app-written key
+    fails **every** codex turn on such machines.
+
+    Values already in :data:`CODEX_EFFORTS` are left untouched, as are
+    values with no known alias (codex surfaces its own error for those) and
+    anything below the first table header. Only the session's private copy
+    is modified — never the user's real ``~/.codex/config.toml``.
+
+    :param config_path: The copied ``config.toml`` inside the per-session
+        ``CODEX_HOME``. Unreadable/unwritable files are skipped (best
+        effort — the copy already succeeded, so this only degrades back to
+        the pre-normalization behavior).
+    """
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    lines = text.splitlines(keepends=True)
+    changed = False
+    array_depth = 0  # net unclosed '[' from a top-level multiline array value
+    for index, line in enumerate(lines):
+        content = line.rstrip("\r\n")
+        if array_depth == 0:
+            # At top-level statement position a leading '[' is a real table
+            # header ([table] / [[array-of-tables]]) -- top-level keys end here.
+            if content.lstrip().startswith("["):
+                break
+            match = _EFFORT_KEY_RE.match(content)
+            if match is not None:
+                value = match.group(2)
+                if value not in CODEX_EFFORTS:
+                    replacement = EFFORT_ALIASES.get(value)
+                    if replacement is not None:
+                        line_ending = line[len(content) :]
+                        lines[index] = (
+                            f"{match.group(1)}{replacement}{match.group(3)}{line_ending}"
+                        )
+                        changed = True
+                continue  # an effort-key line never opens an array
+        # Track array nesting (this is a bracket-counting heuristic, not a
+        # full TOML parser, but sufficient for this narrow config shape) so
+        # bracketed *array content* (which may start with '[') is not
+        # mistaken for a table header.
+        array_depth += content.count("[") - content.count("]")
+        if array_depth < 0:
+            array_depth = 0
+    if changed:
+        try:
+            config_path.write_text("".join(lines), encoding="utf-8")
+        except OSError:
+            logger.warning("could not normalize model_reasoning_effort in %s", config_path)
+
+
+def _retarget_codex_hook_trust_keys(
+    config_path: Path,
+    source_dir: Path,
+    target_dir: Path,
+) -> None:
+    """Rewrite ``[hooks.state]`` trust keys in a copied ``config.toml``.
+
+    Codex keys hook-trust records by the absolute path of the file that
+    declares the hook, e.g.::
+
+        [hooks.state."/home/user/.codex/hooks.json:pre_tool_use:0:0"]
+        trusted_hash = "sha256:..."
+
+    After copying ``config.toml`` from *source_dir* to *target_dir* the
+    path component still references *source_dir* — but the hooks are now
+    loaded from *target_dir*. Every key therefore misses and Codex
+    classifies all hooks as new, prompting an interactive trust review that
+    headless sub-agents can never satisfy.
+
+    This function rewrites the path prefix in each ``[hooks.state.*]`` key
+    from *source_dir* to *target_dir*, leaving the hash value untouched.
+    Trust is neither widened nor weakened — it is only carried across the
+    copy that Omnigent performs.
+
+    :param config_path: The copied ``config.toml`` inside the per-session
+        ``CODEX_HOME``. Unreadable/unwritable files are skipped (best effort).
+    :param source_dir: Original ``CODEX_HOME`` whose path appears in the
+        trust keys, e.g. ``Path("/home/user/.codex")``.
+    :param target_dir: Per-session private ``CODEX_HOME`` whose path the
+        rewritten keys should reference, e.g.
+        ``Path("/home/user/.omnigent/codex-native/abc/codex-home")``.
+    """
+    source_prefix = str(source_dir)
+    target_prefix = str(target_dir)
+    if source_prefix == target_prefix:
+        return
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    # Match [hooks.state."<path>:<rest>"] table headers.  The path component
+    # is the part before the first colon that follows the opening quote.
+    # We only rewrite lines where the quoted path starts with source_prefix so
+    # unrelated trust entries (e.g. from a different machine's config that was
+    # synced in) are left untouched.
+    pattern = re.compile(
+        r'(\[hooks\.state\.")' + re.escape(source_prefix) + r'((?:/[^":]*)*:[^"]*"\])'
+    )
+    rewritten, count = pattern.subn(r"\g<1>" + target_prefix + r"\g<2>", text)
+    if count == 0:
+        return
+    try:
+        config_path.write_text(rewritten, encoding="utf-8")
+    except OSError:
+        logger.warning("could not retarget hook-trust keys in %s", config_path)
+
+
+def _merge_codex_hook_trust_back(
+    private_config: Path,
+    source_dir: Path,
+    target_dir: Path,
+) -> None:
+    """Merge ``[hooks.state]`` trust entries from a private session config back
+    into the global ``CODEX_HOME`` ``config.toml``.
+
+    When a user accepts the hook-trust prompt inside a session, Codex writes
+    ``[hooks.state.*]`` entries into the private per-session ``config.toml``
+    with path keys referencing *target_dir* (the private home). Those entries
+    are discarded when the session ends because the private home is ephemeral.
+
+    This function reads the accumulated trust state from the private copy,
+    translates the path keys back from *target_dir* → *source_dir*, and
+    upserts them into the global ``source_dir/config.toml`` so the next
+    session's copy starts with them already present — and
+    :func:`_retarget_codex_hook_trust_keys` can carry them forward again.
+
+    All writes are atomic (temp-file + rename) and best-effort: any failure
+    is logged as a warning rather than raised, since the session has already
+    ended and blocking on a trust-state flush would be unhelpful.
+
+    :param private_config: The per-session private ``config.toml``.
+    :param source_dir: Original ``CODEX_HOME``, e.g. ``Path("~/.codex")``.
+    :param target_dir: Per-session private ``CODEX_HOME`` whose path appears
+        in the private trust keys.
+    """
+    source_prefix = str(source_dir)
+    target_prefix = str(target_dir)
+    if source_prefix == target_prefix:
+        return
+    try:
+        import tomlkit
+
+        private_text = private_config.read_text(encoding="utf-8")
+        private_doc = tomlkit.parse(private_text)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read private config for hook-trust merge: %s", private_config)
+        return
+
+    private_state: dict = (
+        private_doc.get("hooks", {}).get("state", {})  # type: ignore[union-attr]
+    )
+    if not private_state:
+        return
+
+    # Translate keys: target_dir prefix → source_dir prefix.
+    translated: dict[str, object] = {}
+    for key, value in private_state.items():
+        if key.startswith(target_prefix):
+            translated[source_prefix + key[len(target_prefix) :]] = value
+        else:
+            translated[key] = value
+
+    global_config = source_dir / "config.toml"
+    try:
+        if global_config.is_file():
+            global_text = global_config.read_text(encoding="utf-8")
+            global_doc = tomlkit.parse(global_text)
+        else:
+            global_doc = tomlkit.document()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read global config for hook-trust merge: %s", global_config)
+        return
+
+    # Upsert into global [hooks.state], creating the tables if absent.
+    if "hooks" not in global_doc:
+        global_doc.add("hooks", tomlkit.table())
+    hooks_table = global_doc["hooks"]
+    if "state" not in hooks_table:
+        hooks_table.add("state", tomlkit.table())
+    state_table = hooks_table["state"]
+    for key, value in translated.items():
+        state_table[key] = value
+
+    tmp = global_config.with_suffix(".toml.tmp")
+    try:
+        tmp.write_text(tomlkit.dumps(global_doc), encoding="utf-8")
+        os.replace(tmp, global_config)
+    except OSError:
+        logger.warning("could not write hook-trust merge back to %s", global_config)
+        with suppress(FileNotFoundError):
+            tmp.unlink()
 
 
 def _databricks_codex_base_url(host: str) -> str:
@@ -946,6 +1220,25 @@ def _extract_latest_user_content(
                 return content
             return json.dumps(content)
     return ""
+
+
+def _goal_objective_from_content(content: str | list[dict[str, Any]]) -> str | None:
+    """Return the objective from a standalone ``/goal`` user command."""
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for block in content:
+            if block.get("type") not in {"input_text", "text"}:
+                return None
+            text = block.get("text")
+            if not isinstance(text, str):
+                return None
+            text_parts.append(text)
+        content = "".join(text_parts)
+    command, separator, objective = content.strip().partition(" ")
+    if command != "/goal" or not separator:
+        return None
+    objective = objective.strip()
+    return objective or None
 
 
 def _build_initial_prompt(
@@ -1477,37 +1770,72 @@ class _CodexAppServerSession:
             self._applied_effort = None
 
         assert self.thread_id is not None
-        prompt = _prompt_for_turn(messages, is_new_thread=is_new_thread)
+        latest_user_content = _extract_latest_user_content(messages)
+        goal_objective = _goal_objective_from_content(latest_user_content)
+        prompt_messages = messages
+        if goal_objective is not None:
+            await self._request(
+                "thread/goal/set",
+                {
+                    "threadId": self.thread_id,
+                    "objective": goal_objective,
+                },
+            )
+            # A reset thread still needs prior history, with the command
+            # replaced by the clean objective sent to Codex.
+            prompt_messages = [message.copy() for message in messages]
+            for message in reversed(prompt_messages):
+                if message.get("role") == "user":
+                    message["content"] = goal_objective
+                    break
+        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
             turn_input = [{"type": "text", "text": prompt}]
-        # Apply reasoning effort via ``thread/settings/update``: Codex's
-        # ``TurnStartParams`` has no ``effort`` field, so an ``effort`` set on
-        # ``turn/start`` is silently dropped by serde and never takes effect.
-        # ``ThreadSettingsUpdateParams`` is where ``model``/``effort`` live —
-        # the same path the TUI ``/model`` picker uses. Request a detailed
-        # summary too; effort controls internal work, while summary controls
-        # whether observable reasoning events are emitted. Deduped against the
-        # last value applied on this thread to avoid a redundant per-turn RPC.
+        # Newer Codex app-server builds apply reasoning effort through
+        # ``thread/settings/update``. Older supported builds reject that RPC but
+        # accept the same ``effort`` / ``summary`` fields on ``turn/start``.
+        # Prefer the persistent thread setting and fall back only for that
+        # explicit protocol-version mismatch.
+        effort_via_turn_start = False
         if reasoning_effort and reasoning_effort != self._applied_effort:
-            await self._request(
-                "thread/settings/update",
-                {
-                    "threadId": self.thread_id,
-                    "effort": reasoning_effort,
-                    "summary": "detailed",
-                },
-            )
-            self._applied_effort = reasoning_effort
+            try:
+                await self._request(
+                    "thread/settings/update",
+                    {
+                        "threadId": self.thread_id,
+                        "effort": reasoning_effort,
+                        "summary": "detailed",
+                    },
+                )
+            except RuntimeError as exc:
+                error_text = str(exc)
+                unsupported_settings_update = (
+                    "thread/settings/update" in error_text and "unknown variant" in error_text
+                )
+                if not unsupported_settings_update:
+                    raise
+                logger.info(
+                    "Codex app-server does not support thread/settings/update; "
+                    "falling back to turn/start effort."
+                )
+                effort_via_turn_start = True
+            else:
+                self._applied_effort = reasoning_effort
         turn_params: CodexParams = {
             "threadId": self.thread_id,
             "input": turn_input,
         }
+        if effort_via_turn_start:
+            turn_params["effort"] = reasoning_effort
+            turn_params["summary"] = "detailed"
         start_response = await self._request(
             "turn/start",
             turn_params,
         )
+        if effort_via_turn_start:
+            self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
         if not isinstance(raw_active_turn_id, str) or not raw_active_turn_id:
             yield ExecutorError(message="Codex App Server did not return a turn id")
@@ -1748,7 +2076,7 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    self._last_turn_usage = _extract_codex_last_turn_usage(params)
+                    self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
                     continue
 
                 if method == "turn/completed":

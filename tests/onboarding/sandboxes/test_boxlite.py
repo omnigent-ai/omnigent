@@ -151,6 +151,7 @@ class _FakeBoxOptions:
         memory_mib: int | None = None,
         env: object = None,
         auto_remove: bool | None = None,
+        detach: bool | None = None,
         **kwargs: object,
     ) -> None:
         self.image = image
@@ -158,6 +159,7 @@ class _FakeBoxOptions:
         self.memory_mib = memory_mib
         self.env = env if env is not None else []
         self.auto_remove = auto_remove
+        self.detach = detach
         self.extra = kwargs
 
 
@@ -357,9 +359,9 @@ def test_provision_defaults_official_image_and_persists(
     fake_boxlite: _FakeBoxliteState,
 ) -> None:
     """
-    A bare provision uses the official host image, is persistent
-    (auto_remove=False so the managed machinery owns teardown), injects
-    no env, sizes like Modal/Daytona, and runs LOCAL by default.
+    A bare provision uses the official host image, stays alive after the SDK
+    handle is dropped, lets managed machinery own teardown, injects no env,
+    sizes like Modal/Daytona, and runs LOCAL by default.
     """
     box_id = BoxliteSandboxLauncher().provision("managed-abc")
 
@@ -367,6 +369,7 @@ def test_provision_defaults_official_image_and_persists(
     [create] = fake_boxlite.create_calls
     assert create.options.image == DEFAULT_HOST_IMAGE
     assert create.options.auto_remove is False
+    assert create.options.detach is True
     assert create.options.cpus == 2
     assert create.options.memory_mib == 4096
     assert create.options.env == []

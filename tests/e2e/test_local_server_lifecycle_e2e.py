@@ -65,9 +65,6 @@ _ENV_TO_CLEAR = (
     "OMNIGENT_DATA_DIR",
     "OMNIGENT_CONFIG_HOME",
     "OMNIGENT_AUTH_ENABLED",
-    # Pre-rename alias for OMNIGENT_AUTH_ENABLED — still honored, so strip
-    # it too or a dev shell that exports it flips the server into accounts mode.
-    "OMNIGENT_ACCOUNTS_ENABLED",
     # An ambient issuer would select oidc once auth is (accidentally) enabled.
     "OMNIGENT_OIDC_ISSUER",
     "OMNIGENT_AUTH_PROVIDER",

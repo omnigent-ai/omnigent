@@ -207,10 +207,22 @@ def test_custom_theme_colors_can_be_randomized(
     """Randomizing accent and tint updates the picker and persisted theme."""
     base_url, _session_id = seeded_session
     _open_appearance(page, base_url)
+    # The color popover animates in and Floating UI repositions it on mount,
+    # which can leave its controls briefly unstable / remounting on a loaded
+    # runner — a click racing that enter transition flakes with "element is not
+    # stable" / "detached from the DOM". Kill transitions/animations so the
+    # popover is clickable the instant it mounts.
+    page.add_style_tag(
+        content="*, *::before, *::after "
+        "{ animation: none !important; transition: none !important; }"
+    )
     page.evaluate("Math.random = () => 0.5")
 
     for test_id in ["custom-theme-accent", "custom-theme-tint"]:
         page.get_by_test_id(f"{test_id}-trigger").click()
+        # Wait for the popover to fully mount (its hex input is visible) before
+        # clicking randomize, so the click can't land on a not-yet-settled node.
+        expect(page.get_by_test_id(f"{test_id}-input")).to_be_visible()
         page.get_by_test_id(f"{test_id}-randomize").click()
         expect(page.get_by_test_id(f"{test_id}-input")).to_have_value("#3AD2D2")
         page.keyboard.press("Escape")

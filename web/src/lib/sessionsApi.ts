@@ -17,8 +17,8 @@ import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import type {
-  CodexModelOption,
   ModelUsage,
+  NativeModelOption,
   NestedSessionItem,
   SandboxStatus,
   Session,
@@ -209,7 +209,8 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
-  model_options?: CodexModelOption[];
+  /** Runner-owned model picker rows for native sessions. */
+  model_options?: NativeModelOption[];
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -649,9 +650,10 @@ export async function updateSession(
     costControlModeOverride?: "on" | "off" | null;
     runnerId?: string;
     silent?: boolean;
+    labels?: Record<string, string>;
   },
 ): Promise<Session> {
-  const body: Record<string, string | boolean | null> = {};
+  const body: Record<string, string | boolean | null | Record<string, string>> = {};
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
@@ -666,6 +668,11 @@ export async function updateSession(
   }
   if (updates.runnerId !== undefined) {
     body.runner_id = updates.runnerId;
+  }
+  if (updates.labels !== undefined) {
+    // Merge-upsert on the server; an empty-string value clears a label
+    // (e.g. the pinned flag on unpin — see PATCH /v1/sessions handler).
+    body.labels = updates.labels;
   }
   if (updates.silent) {
     body.silent = true;

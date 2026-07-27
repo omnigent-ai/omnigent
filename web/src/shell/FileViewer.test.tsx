@@ -1468,3 +1468,47 @@ describe("FileViewer Escape closes the active tab", () => {
     expect(onCloseTab).not.toHaveBeenCalled();
   });
 });
+
+describe("FileViewer 3D model files", () => {
+  // Models render through CodeViewer's <ModelViewer> like images: they always
+  // resolve to the source surface and have no diff representation, so the diff
+  // toggle must be suppressed even when the model is a changed file (Monaco
+  // would otherwise render the base64 payload as garbage).
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  const viewModeOf = () => screen.getByTestId("code-viewer").getAttribute("data-view-mode");
+
+  it("resolves a model file to the source surface", () => {
+    renderViewer({ open: true, path: "widget.stl" });
+    expect(viewModeOf()).toBe("source");
+  });
+
+  it("suppresses the diff toggle for a model file even when it is a changed file", () => {
+    // Report the model as a changed file — an ordinary changed file would get a
+    // "Show diff" button; a model must not.
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [
+          {
+            path: "widget.stl",
+            bytes: 10,
+            modified_at: null,
+            name: "widget.stl",
+            status: "modified",
+          },
+        ],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderViewer({ open: true, path: "widget.stl" });
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+  });
+
+  it("does not offer the markdown/html view-mode controls for a model file", () => {
+    renderViewer({ open: true, path: "mesh.obj" });
+    expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+  });
+});

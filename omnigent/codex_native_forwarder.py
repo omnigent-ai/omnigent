@@ -155,8 +155,9 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE = "external_elicitation_resolved"
 # Sessions event carrying a Codex plan mapped to the todo-list schema so the
 # web TodoPanel renders it like Claude's TodoWrite output.
 _EXTERNAL_SESSION_TODOS_TYPE = "external_session_todos"
-# Codex AgentControl collab-agent spawn event fields.
+# Codex AgentControl child-spawn event fields.
 _CODEX_COLLAB_AGENT_ITEM_TYPE = "collabAgentToolCall"
+_CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
 _CODEX_COLLAB_SPAWN_TOOL = "spawnAgent"
 _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
@@ -2396,6 +2397,8 @@ async def _handle_event(
         item = params.get("item")
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
+        elif isinstance(item, dict) and item.get("type") == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
+            await _handle_subagent_activity(client, params, item, forwarder_state)
         elif isinstance(item, dict) and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE:
             # Compaction started mid-turn — show the spinner.
             await _post_compaction_status(
@@ -3085,13 +3088,12 @@ async def _handle_turn_plan_updated(
     params: dict[str, Any],
 ) -> None:
     """
-    Mirror a Codex plan update in both the transcript and the todo panel.
+    Mirror a Codex plan update in the todo panel.
 
     Codex emits plan changes as app-server notifications rather than
     ordinary assistant text. The forwarder posts the structured plan as an
     ``external_session_todos`` event so the web ``TodoPanel`` renders it like
-    Claude's todo list, and also mirrors it as a compact assistant message so
-    the plan stays visible inline in the transcript.
+    Claude's todo list without duplicating it in the chat transcript.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -3105,20 +3107,6 @@ async def _handle_turn_plan_updated(
             session_id=session_id,
             todos=todos,
         )
-    text = _plan_text_from_update(params)
-    if not text:
-        return
-    await _post_external_item(
-        client,
-        session_id,
-        item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
-        response_id=_response_id(params),
-    )
 
 
 def _handle_turn_diff_updated(
@@ -4152,11 +4140,17 @@ async def _handle_completed_item(
         turn_id,
         item_type,
     )
-    # Collab-agent items register child sessions; they do not append transcript
-    # records and must not go through the dedup gate.
+    # Child-spawn items register sessions; they do not append transcript records
+    # and must not go through the dedup gate.
+    # Completed spawns may run on child routes so nested children attach to the
+    # root parent, matching ``collabAgentToolCall`` behavior.
     if item_type == _CODEX_COLLAB_AGENT_ITEM_TYPE:
         if forwarder_state is not None:
             await _handle_collab_item(client, params, item, forwarder_state)
+        return
+    if item_type == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
+        if forwarder_state is not None:
+            await _handle_subagent_activity(client, params, item, forwarder_state)
         return
     # A context-compaction item is a status edge, not transcript history:
     # clear the compaction spinner. Handled before the dedup gate (it never
@@ -4414,6 +4408,31 @@ async def _handle_collab_item(
     await _post_collab_agent_statuses(client, item=item, forwarder_state=forwarder_state)
 
 
+async def _handle_subagent_activity(
+    client: httpx.AsyncClient,
+    params: dict[str, Any],
+    item: dict[str, Any],
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Register a child announced by Codex's native activity item."""
+    if item.get("kind") != "started":
+        return
+    child_thread_id = item.get("agentThreadId")
+    if not isinstance(child_thread_id, str) or not child_thread_id:
+        return
+    parent_session_id = _parent_session_id_from_forwarder_state(forwarder_state)
+    if parent_session_id is None:
+        return
+    await _ensure_child_session(
+        client,
+        parent_session_id=parent_session_id,
+        parent_thread_id=_thread_id_from_params(params),
+        child_thread_id=child_thread_id,
+        item=item,
+        forwarder_state=forwarder_state,
+    )
+
+
 def _parent_session_id_from_forwarder_state(
     forwarder_state: _CodexForwarderState,
 ) -> str | None:
@@ -4449,7 +4468,7 @@ async def _ensure_child_session(
     :param parent_session_id: Parent Omnigent session id, e.g. ``"conv_parent"``.
     :param parent_thread_id: Parent Codex thread id, or ``None``.
     :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param item: Codex ``collabAgentToolCall`` item with spawn metadata.
+    :param item: Codex child-spawn item.
     :param forwarder_state: Mutable state for child-thread mappings.
     :returns: None.
     """
@@ -4493,7 +4512,7 @@ async def _register_child_session(
     :param parent_session_id: Parent Omnigent session id, e.g. ``"conv_parent"``.
     :param parent_thread_id: Parent Codex thread id, or ``None``.
     :param child_thread_id: Codex child thread id, e.g. ``"thread_child"``.
-    :param item: Codex ``collabAgentToolCall`` item.
+    :param item: Codex child-spawn item.
     :returns: Omnigent child session id, or ``None`` on failure.
     """
     data: dict[str, Any] = {"thread_id": child_thread_id}
@@ -5254,11 +5273,10 @@ async def _post_review_mode_marker(
     Codex ``/review`` brackets a turn with ``enteredReviewMode`` /
     ``exitedReviewMode`` thread items. The web UI has no dedicated review
     affordance, and a review transition is session *state*, not user input —
-    so it is surfaced as a short assistant-message marker (the same visible
-    rail used for plan updates in :func:`_handle_turn_plan_updated`). A
-    user-role ``[System: …]`` note was rejected here because a non-meta
-    user item drains the pending-input FIFO server-side, which would
-    swallow the web user's next real message.
+    so it is surfaced as a short assistant-message marker. A user-role
+    ``[System: …]`` note was rejected here because a non-meta user item drains
+    the pending-input FIFO server-side, which would swallow the web user's next
+    real message.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -6851,37 +6869,6 @@ def _json_string(value: dict[str, Any]) -> str | None:
         return None
 
 
-def _plan_text_from_update(params: dict[str, Any]) -> str | None:
-    """
-    Render a Codex ``turn/plan/updated`` payload as Markdown text.
-
-    :param params: Codex plan update params.
-    :returns: Markdown plan text, or ``None`` when no valid plan steps
-        are present.
-    """
-    plan = params.get("plan")
-    if not isinstance(plan, list) or not plan:
-        return None
-    lines: list[str] = []
-    explanation = params.get("explanation")
-    if isinstance(explanation, str) and explanation:
-        lines.append(explanation)
-        lines.append("")
-    lines.append("Plan:")
-    for entry in plan:
-        if not isinstance(entry, dict):
-            continue
-        step = entry.get("step")
-        if not isinstance(step, str) or not step:
-            continue
-        status = entry.get("status")
-        marker = _plan_status_marker(status)
-        lines.append(f"{marker} {step}")
-    if len(lines) == 1 or (len(lines) == 3 and lines[-1] == "Plan:"):
-        return None
-    return "\n".join(lines)
-
-
 def _plan_todos_from_update(params: dict[str, Any]) -> list[dict[str, Any]] | None:
     """
     Map a Codex ``turn/plan/updated`` payload to the todo-list schema.
@@ -6926,20 +6913,6 @@ def _plan_todo_status(status: Any) -> str:
     if status in {"inProgress", "in_progress"}:
         return "in_progress"
     return "pending"
-
-
-def _plan_status_marker(status: Any) -> str:
-    """
-    Return a readable Markdown marker for a Codex plan step status.
-
-    :param status: Codex step status value.
-    :returns: Markdown list marker.
-    """
-    return {
-        "completed": "- [x]",
-        "in_progress": "- [~]",
-        "pending": "- [ ]",
-    }[_plan_todo_status(status)]
 
 
 def _response_id(params: dict[str, Any]) -> str:

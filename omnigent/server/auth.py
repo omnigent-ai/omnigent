@@ -38,11 +38,8 @@ from starlette.requests import HTTPConnection
 
 logger = logging.getLogger(__name__)
 
-# Opt-in multi-user switch. ``OMNIGENT_AUTH_ENABLED`` is the current
-# name; ``OMNIGENT_ACCOUNTS_ENABLED`` is the pre-rename name, still
-# honored as a deprecated alias (see :func:`_auth_enabled`).
+# Opt-in multi-user switch.
 _AUTH_ENABLED_ENV = "OMNIGENT_AUTH_ENABLED"
-_AUTH_ENABLED_ENV_DEPRECATED = "OMNIGENT_ACCOUNTS_ENABLED"
 
 RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
@@ -257,40 +254,18 @@ def resolve_auth_header_strip_prefix() -> str:
     return os.environ.get(_AUTH_HEADER_STRIP_PREFIX_ENV, "").strip()
 
 
-_auth_enabled_deprecation_warned = False
-
-
 def _auth_enabled() -> bool:
     """Whether multi-user auth is opted in via the enable switch.
 
-    Reads ``OMNIGENT_AUTH_ENABLED``. The pre-rename name
-    ``OMNIGENT_ACCOUNTS_ENABLED`` is still honored as a deprecated
-    alias: when it is set and the current name is not, its value is
-    used and a one-time deprecation warning is logged. The current name
-    always wins when both are set, so a deploy migrating to the new name
-    can leave the old one in place without surprise.
-
-    Both names share the same truthiness rules (see
-    :func:`env_var_is_truthy`) and the same explicit-falsy kill-switch
-    semantics — ``OMNIGENT_AUTH_ENABLED=0`` disables auth even though
-    the var is "set", which is how the Docker entrypoint lets an
+    Reads ``OMNIGENT_AUTH_ENABLED``. The explicit-falsy kill-switch
+    semantics mean ``OMNIGENT_AUTH_ENABLED=0`` disables auth even
+    though the var is "set", which is how the Docker entrypoint lets an
     operator opt back out of the default-on accounts mode.
 
     :returns: ``True`` when multi-user auth should be enabled.
     """
-    global _auth_enabled_deprecation_warned
     if os.environ.get(_AUTH_ENABLED_ENV, "").strip():
         return env_var_is_truthy(_AUTH_ENABLED_ENV, default=False)
-    if os.environ.get(_AUTH_ENABLED_ENV_DEPRECATED, "").strip():
-        if not _auth_enabled_deprecation_warned:
-            logger.warning(
-                "%s is deprecated; rename it to %s. The old name still "
-                "works for now but will be removed in a future release.",
-                _AUTH_ENABLED_ENV_DEPRECATED,
-                _AUTH_ENABLED_ENV,
-            )
-            _auth_enabled_deprecation_warned = True
-        return env_var_is_truthy(_AUTH_ENABLED_ENV_DEPRECATED, default=False)
     return False
 
 
@@ -308,9 +283,8 @@ def resolve_auth_source() -> str:
       wins, e.g. ``"header"`` / ``"oidc"`` / ``"accounts"``. This is the
       low-level escape hatch.
     - Otherwise ``header`` is the default, unless the opt-in switch
-      ``OMNIGENT_AUTH_ENABLED`` is truthy (see :func:`_auth_enabled`,
-      which also honors the deprecated ``OMNIGENT_ACCOUNTS_ENABLED``
-      alias). When enabled, the mode depends on whether OIDC config was
+      ``OMNIGENT_AUTH_ENABLED`` is truthy (see :func:`_auth_enabled`).
+      When enabled, the mode depends on whether OIDC config was
       supplied:
 
       - ``OMNIGENT_OIDC_ISSUER`` is set → ``"oidc"`` (the operator
@@ -677,11 +651,8 @@ def create_auth_provider() -> AuthProvider:
     ``Cf-Access-Authenticated-User-Email`` for Cloudflare Access — see
     :func:`resolve_auth_header`).
 
-    (``OMNIGENT_AUTH_ENABLED`` is the renamed opt-in gate,
-    commit ``b23e886e``, formerly ``OMNIGENT_ACCOUNTS_ENABLED``:
-    header is the shipped default, so the var is an enable switch, not
-    a kill switch. The old name is still honored as a deprecated
-    alias — see :func:`_auth_enabled`.)
+    (``OMNIGENT_AUTH_ENABLED`` is the opt-in gate: header is the
+    shipped default, so the var is an enable switch, not a kill switch.)
 
     Validates the source's required env vars at startup (fail
     loud) — OIDC fetches the discovery document, accounts decodes
