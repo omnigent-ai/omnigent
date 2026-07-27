@@ -496,7 +496,7 @@ def login_app_oauth_in_sandbox(
     # (e.g. Modal) — BEFORE validating flags or touching the sandbox, so
     # the user gets the --no-auth hint instead of a misleading error
     # from a doomed in-sandbox login.
-    if not launcher.supports_local_port_forward:
+    if not launcher.capabilities.local_port_forward:
         raise launcher.forward_capability_error()
     if server_url is None:
         raise click.ClickException(
@@ -722,7 +722,7 @@ def bootstrap_sandbox_host(
     # up front so a misconfigured call fails before the wheel build and
     # ship already ran. (The CLI skips auth automatically for providers
     # without the capability; this backstops programmatic callers.)
-    if not skip_auth and not launcher.supports_local_port_forward:
+    if not skip_auth and not launcher.capabilities.local_port_forward:
         raise launcher.forward_capability_error()
     launcher.prepare()
     if sandbox_id is None:

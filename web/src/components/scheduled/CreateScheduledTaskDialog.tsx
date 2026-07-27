@@ -23,13 +23,19 @@ import {
 } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
+import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { WorkspacePicker } from "@/shell/WorkspacePicker";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
-import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
+import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
+import {
+  isBackdropOverlay,
+  isInsidePopper,
+  shouldGuardDialogDismiss,
+} from "@/lib/dialogDismissGuard";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
@@ -75,14 +81,17 @@ export function CreateScheduledTaskDialog({
   // single `pickedAgentId` covers both cases — for a bare-harness pick it's the
   // `*-native-ui` agent's id, exactly what the interactive dialog sends.
   //
-  // Scheduled tasks currently create sessions from the selected agent. Model,
-  // effort, and permission controls are not offered here; upstream moved those into a separate
-  // gear-icon HarnessConfigModal (NewChatDialog); reusing it is disproportionate
-  // for a scheduled task (26 props, bound to smart-routing / cost-control /
-  // dynamic model loading). A scheduled task only requires `agent_id`; model_override
-  // / reasoning_effort are optional and simply omitted, so the fire path uses the
-  // agent's configured defaults. Model/effort can be a follow-up if wanted.
+  // Scheduled tasks create sessions from the selected agent. Model + effort are
+  // offered for native coding agents that support them (see `showModelEffort`
+  // below), reusing lightweight scheduled-local pickers rather than the
+  // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
+  // cost-control / per-turn model loading — disproportionate for a saved task).
+  // "" = unselected → `model_override` / `reasoning_effort` are omitted so the
+  // fire path uses the agent's configured defaults. Permission/approval/cursor
+  // mode is intentionally NOT offered here.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
+  const [pickedModel, setPickedModel] = useState<string>("");
+  const [pickedEffort, setPickedEffort] = useState<string>("");
 
   const agentList = useMemo(
     () => sortAgentsForDisplay((agents ?? []).filter((a) => !HIDDEN_PICKER_AGENTS.has(a.name))),
@@ -107,6 +116,18 @@ export function CreateScheduledTaskDialog({
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
   }
+
+  // Model + effort are surfaced only for native coding agents that carry the
+  // model/effort surface — the same `permissionMode` capability the interactive
+  // dialog gates its Model/Effort/Permissions block on (Claude Code). Agents
+  // without it (plain SDK agents like Polly, or native harnesses with no
+  // model-picker surface) show no model/effort controls, exactly like
+  // interactive. In edit mode the agent is read-only, so gate on the loaded
+  // task's agent.
+  const modelEffortAgent = isEdit
+    ? agents?.find((a) => a.id === editingTask?.agentId)
+    : selectedAgent;
+  const showModelEffort = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
   // The agent picker and host/schedule Selects portal dropdowns OUTSIDE DialogContent.
@@ -167,6 +188,9 @@ export function CreateScheduledTaskDialog({
         setName(editingTask.name);
         setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
+        // Prefill the model/effort controls from the loaded task; null → "".
+        setPickedModel(editingTask.modelOverride ?? "");
+        setPickedEffort(editingTask.reasoningEffort ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
@@ -175,6 +199,8 @@ export function CreateScheduledTaskDialog({
         setName(initialName ?? "");
         setPrompt(initialPrompt ?? "");
         setPickedAgentId(null);
+        setPickedModel("");
+        setPickedEffort("");
         setSchedule(DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
@@ -219,6 +245,8 @@ export function CreateScheduledTaskDialog({
     setName("");
     setPrompt("");
     setPickedAgentId(null);
+    setPickedModel("");
+    setPickedEffort("");
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
@@ -243,12 +271,30 @@ export function CreateScheduledTaskDialog({
         ...(hostId !== "" && workspace.trim() !== "" ? { workspace: workspace.trim() } : {}),
       };
       if (editingTask) {
-        await updateMutation.mutateAsync({ id: editingTask.id, input });
+        // Thread model/effort ONLY when the agent supports them. Each control's
+        // "" (Default) maps to `null` so an update CLEARS a previously-set
+        // override; a non-default pick sends the value. When the agent has no
+        // model/effort surface we send neither key (left untouched server-side).
+        const overrides = showModelEffort
+          ? {
+              modelOverride: pickedModel === "" ? null : pickedModel,
+              reasoningEffort: pickedEffort === "" ? null : pickedEffort,
+            }
+          : {};
+        await updateMutation.mutateAsync({
+          id: editingTask.id,
+          input: { ...input, ...overrides },
+        });
       } else {
         if (effectiveAgentId === null) return;
         await createMutation.mutateAsync({
           ...input,
           agentId: effectiveAgentId,
+          // Include an override only when the agent supports model/effort AND the
+          // user picked a non-default value; an unselected control is omitted so
+          // the create uses the agent's configured defaults.
+          ...(showModelEffort && pickedModel !== "" ? { modelOverride: pickedModel } : {}),
+          ...(showModelEffort && pickedEffort !== "" ? { reasoningEffort: pickedEffort } : {}),
         });
       }
       handleOpenChange(false);
@@ -259,8 +305,8 @@ export function CreateScheduledTaskDialog({
           : err instanceof Error
             ? err.message
             : isEdit
-              ? "Couldn't update the scheduled task."
-              : "Couldn't create the scheduled task.",
+              ? "Couldn't update the automation."
+              : "Couldn't create the automation.",
       );
     }
   }
@@ -279,7 +325,7 @@ export function CreateScheduledTaskDialog({
         onInteractOutside={guardDialogDismiss}
       >
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
-          <DialogTitle>{isEdit ? "Edit scheduled task" : "New scheduled task"}</DialogTitle>
+          <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
           <DialogDescription>
             {isEdit
               ? "Update this recurring agent session. It fires on a connected host."
@@ -374,10 +420,31 @@ export function CreateScheduledTaskDialog({
                 />
               </div>
             )}
-            <p className="text-[11px] text-muted-foreground">
-              Uses this agent&apos;s default model, effort, and permission settings
-            </p>
+            {!showModelEffort && (
+              <p className="text-[11px] text-muted-foreground">
+                Uses this agent&apos;s default model, effort, and permission settings
+              </p>
+            )}
           </div>
+
+          {/* Model + reasoning effort — only for native coding agents that
+              carry the model/effort surface (Claude Code). Unselected controls
+              fall back to the agent's configured defaults. */}
+          {showModelEffort && (
+            <div data-testid="task-model-effort-field">
+              <ModelEffortFields
+                model={pickedModel}
+                effort={pickedEffort}
+                hostId={hostId}
+                onModelChange={setPickedModel}
+                onEffortChange={setPickedEffort}
+                onSelectOpenChange={handleSelectOpenChange}
+              />
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                Leave on Default to use the agent&apos;s configured model and effort.
+              </p>
+            </div>
+          )}
 
           <ScheduleFields
             model={schedule}
@@ -493,52 +560,7 @@ export function CreateScheduledTaskDialog({
 /** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
 const UNSET_HOST = "__unset_host__";
 
-/**
- * True when an event target lives inside a Radix popper / Select portal (which
- * renders outside the DialogContent subtree). Used to distinguish a click that
- * merely closes a nested Select from a genuine outside-click on the backdrop, so
- * the former doesn't dismiss the whole Dialog.
- *
- * Exported for unit testing (the full portal outside-click is hard to reproduce
- * faithfully in jsdom — see the dialog test).
- */
-export function isInsidePopper(target: EventTarget | null): boolean {
-  return (
-    target instanceof Element &&
-    target.closest(
-      [
-        "[data-radix-popper-content-wrapper]",
-        '[data-slot="dropdown-menu-content"]',
-        '[data-slot="popover-content"]',
-        '[data-slot="select-content"]',
-        '[role="listbox"]',
-      ].join(", "),
-    ) !== null
-  );
-}
-
-/** True when the event target is the Dialog's backdrop overlay itself. A real
- *  backdrop click must always dismiss, so the guard lets it through. */
-export function isBackdropOverlay(target: EventTarget | null): boolean {
-  return target instanceof Element && target.closest('[data-slot="dialog-overlay"]') !== null;
-}
-
-/**
- * Pure decision for whether to SWALLOW the Dialog's outside-dismiss. Returns
- * true → preventDefault (dialog stays open); false → let it dismiss.
- *
- * A genuine backdrop-overlay click ALWAYS dismisses (returns false), even during
- * the grace window — this is the fix for backdrop-click-to-close being swallowed.
- * Otherwise we swallow only the narrow nested-dropdown cases: a dropdown
- * currently open, the trailing focus-outside within `graceMs` of a dropdown
- * closing, or a click that landed inside portalled dropdown content. Exported
- * pure so it's unit-testable without Radix's portal machinery.
- */
-export function shouldGuardDialogDismiss(
-  target: EventTarget | null,
-  opts: { selectOpen: boolean; msSinceSelectClose: number; graceMs?: number },
-): boolean {
-  if (isBackdropOverlay(target)) return false;
-  const graceMs = opts.graceMs ?? 150;
-  return opts.selectOpen || opts.msSinceSelectClose < graceMs || isInsidePopper(target);
-}
+// The nested-dropdown dismiss guard now lives in a dependency-free module so
+// other dialogs (project settings) can reuse it without pulling this file's
+// module graph. Re-exported here to keep existing imports and tests stable.
+export { isBackdropOverlay, isInsidePopper, shouldGuardDialogDismiss };

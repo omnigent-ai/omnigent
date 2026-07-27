@@ -148,7 +148,7 @@ function AddDefaultPolicyDialog({
         onOpenChange(next);
       }}
     >
-      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-md">
+      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Add Global Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply globally to all sessions.</DialogDescription>
@@ -256,7 +256,7 @@ function AddDefaultPolicyDialog({
                       )}
                     </label>
                     {prop?.description && (
-                      <p className="break-all text-[11px] text-muted-foreground">
+                      <p className="break-words text-[11px] text-muted-foreground">
                         {prop.description}
                       </p>
                     )}

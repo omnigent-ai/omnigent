@@ -973,15 +973,18 @@ def test_ui_installable_harnesses_includes_native_spellings() -> None:
     assert "claude-sdk" not in installable
 
 
-def test_ui_setup_steps_install_then_command_auth_for_codex() -> None:
-    """Codex: one-click install, then a status-tracked login command."""
+def test_ui_setup_steps_install_then_ui_auth_for_codex() -> None:
+    """Codex: one-click install, then a UI-authable auth step. The step opens
+    the credential form (action ``"auth"``) whose options include the ``codex
+    login`` subscription; it stays status-tracked (``"authed"``)."""
     steps = hi.ui_setup_steps("codex")
     assert [s.kind for s in steps] == ["install", "auth"]
     install, auth = steps
     assert install.action == "install"
     assert install.status_key == "installed"
     assert install.command is None
-    assert auth.action == "command"
+    assert auth.action == "auth"
+    assert auth.title == "Set up authentication"
     assert auth.command == "codex login"
     assert auth.status_key == "authed"
 

@@ -1,7 +1,7 @@
 import {
   BotIcon,
   FileIcon,
-  FilePenLineIcon,
+  FilesIcon,
   GlobeIcon,
   ListTodoIcon,
   SquareTerminalIcon,
@@ -336,7 +336,7 @@ export function WorkspacePanel({
                   aria-label={changedCount > 0 ? `Files ${changedCount} changed` : "Files"}
                   className="size-8 shrink-0 rounded-md p-0"
                 >
-                  <FilePenLineIcon className="size-4" />
+                  <FilesIcon className="size-4" />
                   <span className="sr-only">Files</span>
                   {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
                 </TabsTrigger>

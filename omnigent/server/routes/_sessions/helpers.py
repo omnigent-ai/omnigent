@@ -6421,9 +6421,18 @@ def _build_evaluation_context(
         text = data.get("text") or data.get("content") or str(data)
     else:
         text = str(data)
+    text_str = text if isinstance(text, str) else json.dumps(text)
+    # REQUEST content is the structured dict ({"user_content", "attachments"}) so
+    # every request reaches policies in one shape, whatever the entry point. This
+    # native/terminal path carries no uploads, so ``attachments`` is always empty;
+    # the web input gate (_evaluate_input_policy) is what populates it. RESPONSE
+    # stays a plain string — attachments are an input-only concern.
+    request_or_response_content: Any = (
+        {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
+    )
     return EvaluationContext(
         phase=phase,
-        content=text if isinstance(text, str) else json.dumps(text),
+        content=request_or_response_content,
         actor=actor,
         model=hook_model,
         harness=hook_harness,

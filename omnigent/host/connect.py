@@ -371,10 +371,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # OMNIGENT_OIDC_* is set); =0 opts back out. Must propagate down the
         # CLI → daemon → local-server chain or `omnigent run`/`connect` would
         # spawn the wrong auth mode while the operator set the switch on the CLI.
-        # Not a secret. OMNIGENT_ACCOUNTS_ENABLED is the deprecated pre-rename
-        # alias, still propagated so existing setups keep working.
+        # Not a secret.
         "OMNIGENT_AUTH_ENABLED",
-        "OMNIGENT_ACCOUNTS_ENABLED",
         # Process logging controls. These are diagnostics knobs, not secrets.
         "OMNIGENT_LOG_LEVEL",
         "OMNIGENT_LOG_TO_STDERR",

@@ -272,6 +272,8 @@ def any_policies_apply(
         return True
     if default_policies:
         return True
+    if _load_default_policy_specs(policy_store):
+        return True
     # Session policies are LRU-cached per (workspace_id, conversation_id) —
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):

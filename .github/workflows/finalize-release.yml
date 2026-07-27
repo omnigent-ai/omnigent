@@ -71,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::${TAG} is not a final vX.Y.Z tag — rc/dev/alpha/beta releases never finalize."
+            echo "::error::${TAG} is not a final vX.Y.Z tag — rc/dev/pre releases never finalize."
             exit 1
           fi
 

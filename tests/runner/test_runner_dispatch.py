@@ -3699,6 +3699,7 @@ async def test_sys_list_models_dispatches_locally_with_static_provider(
     # exact ids an orchestrator may pass back as args.model.
     assert [m["id"] for m in worker["models"]] == [
         "claude-fable-5",
+        "claude-opus-5",
         "claude-opus-4-8",
         "claude-sonnet-5",
         "claude-sonnet-4-6",

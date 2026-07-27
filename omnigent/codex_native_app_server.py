@@ -41,6 +41,7 @@ from omnigent.inner.codex_executor import (
     _databricks_codex_base_url,
     _databricks_codex_config_overrides,
     _find_codex_cli,
+    _merge_codex_hook_trust_back,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
@@ -822,6 +823,14 @@ class CodexNativeAppServer:
             except asyncio.TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
+        # Flush any hook-trust the user accepted this session back into the
+        # global config so the next session's copy inherits it and
+        # _retarget_codex_hook_trust_keys can carry it forward without prompting.
+        _merge_codex_hook_trust_back(
+            self.codex_home / "config.toml",
+            _codex_home_config_source_from_env(),
+            self.codex_home,
+        )
         if self.process_registry_tag is not None:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:

@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest";
 import { RRule, rrulestr } from "rrule";
-import { describeSchedule, formatClockTime, nextRunAtMs } from "./scheduleText";
+import { describeSchedule, formatClockTime, formatNextRunAt, nextRunAtMs } from "./scheduleText";
 import {
   buildRRule,
   DEFAULT_SCHEDULE_MODEL,
@@ -350,5 +350,73 @@ describe("nextRunAtMs", () => {
 
     expect(next).not.toBeNull();
     expect(elapsedMs).toBeLessThan(30);
+  });
+});
+
+describe("formatNextRunAt (relative delta from the server's next-run, full words)", () => {
+  // A fixed "now" so the delta buckets are deterministic.
+  const NOW = new Date("2026-03-10T12:00:00Z"); // Tue 2026-03-10, 12:00 UTC
+  const iso = (ms: number) => new Date(NOW.getTime() + ms).toISOString();
+  const MIN = 60_000;
+  const HR = 60 * MIN;
+  const DAY = 24 * HR;
+
+  it("returns null for null / empty / unparseable input", () => {
+    expect(formatNextRunAt(null, NOW)).toBeNull();
+    expect(formatNextRunAt(undefined, NOW)).toBeNull();
+    expect(formatNextRunAt("", NOW)).toBeNull();
+    expect(formatNextRunAt("not-a-date", NOW)).toBeNull();
+  });
+
+  it("formats a sub-hour delta in minutes, pluralizing", () => {
+    expect(formatNextRunAt(iso(8 * MIN), NOW)).toBe("in 8 mins");
+    expect(formatNextRunAt(iso(30 * MIN), NOW)).toBe("in 30 mins");
+    // Minimum bucket is 1 min (just over the 'soon' threshold), singular.
+    expect(formatNextRunAt(iso(MIN), NOW)).toBe("in 1 min");
+  });
+
+  it("formats a sub-day delta in hours, pluralizing", () => {
+    expect(formatNextRunAt(iso(HR), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(3 * HR), NOW)).toBe("in 3 hours");
+    expect(formatNextRunAt(iso(15 * HR), NOW)).toBe("in 15 hours");
+  });
+
+  it("formats a multi-day delta in days, pluralizing", () => {
+    expect(formatNextRunAt(iso(DAY), NOW)).toBe("in 1 day");
+    expect(formatNextRunAt(iso(2 * DAY), NOW)).toBe("in 2 days");
+    expect(formatNextRunAt(iso(6 * DAY), NOW)).toBe("in 6 days");
+  });
+
+  it("rounds to the nearest unit (not floor)", () => {
+    // The user's exact case: 1h49m away reads "in 2 hours", not "in 1 hour".
+    expect(formatNextRunAt(iso(HR + 49 * MIN), NOW)).toBe("in 2 hours");
+    expect(formatNextRunAt(iso(HR + 20 * MIN), NOW)).toBe("in 1 hour"); // rounds down
+    expect(formatNextRunAt(iso(HR + 30 * MIN), NOW)).toBe("in 2 hours"); // half rounds up
+    expect(formatNextRunAt(iso(8 * MIN + 30_000), NOW)).toBe("in 9 mins");
+    expect(formatNextRunAt(iso(8 * MIN + 29_000), NOW)).toBe("in 8 mins");
+    expect(formatNextRunAt(iso(2 * DAY + 12 * HR), NOW)).toBe("in 3 days");
+    expect(formatNextRunAt(iso(2 * DAY + 11 * HR), NOW)).toBe("in 2 days");
+  });
+
+  it("promotes to the next unit when rounding carries (no 'in 60 mins' / 'in 24 hours')", () => {
+    // Rounds to 60 min → promote to hours as "in 1 hour".
+    expect(formatNextRunAt(iso(59 * MIN + 40_000), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(59 * MIN + 59_000), NOW)).toBe("in 1 hour");
+    // Rounds to 24 h → promote to days as "in 1 day".
+    expect(formatNextRunAt(iso(23 * HR + 40 * MIN), NOW)).toBe("in 1 day");
+    expect(formatNextRunAt(iso(23 * HR + 59 * MIN), NOW)).toBe("in 1 day");
+    // Rounds up within the day bucket (6d23h → 7 days).
+    expect(formatNextRunAt(iso(6 * DAY + 23 * HR), NOW)).toBe("in 7 days");
+  });
+
+  it("returns 'soon' for an imminent or just-passed delta (< 1 minute)", () => {
+    expect(formatNextRunAt(iso(20_000), NOW)).toBe("soon"); // 20s out
+    expect(formatNextRunAt(iso(0), NOW)).toBe("soon"); // exactly now
+    expect(formatNextRunAt(iso(-5 * MIN), NOW)).toBe("soon"); // 5m in the past (skew)
+  });
+
+  it("bucket boundaries: 60m → hours, 24h → days", () => {
+    expect(formatNextRunAt(iso(60 * MIN), NOW)).toBe("in 1 hour");
+    expect(formatNextRunAt(iso(24 * HR), NOW)).toBe("in 1 day");
   });
 });
