@@ -5,28 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.7.0.dev0"
-description = "Omnigent: declarative agent authoring and runtime framework"
-readme = "README.md"
-requires-python = ">=3.12"
-authors = [
-    { name = "Databricks, Inc." },
-]
-keywords = ["agents", "llm", "ai", "databricks", "cli"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-]
-dependencies = [
-    # SDK path-deps, version-locked: the three packages release together at
-    # one version, so a published `omnigent==X` must resolve the SDK wheels
-    # built alongside it (release-omnigent.yml verifies these pins match the
-    # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.7.0.dev0",
+"omnigent-client==0.7.0.dev0",
     "omnigent-ui-sdk==0.7.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",

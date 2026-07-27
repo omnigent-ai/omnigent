@@ -1981,6 +1981,7 @@ async def launch_managed_host(
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -2044,6 +2045,7 @@ async def launch_managed_host(
         sandbox_id=sandbox_id,
         repo=repo,
         on_stage=on_stage,
+        extra_env=extra_env,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
@@ -2055,6 +2057,7 @@ async def relaunch_managed_host(
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
@@ -2121,6 +2124,7 @@ async def relaunch_managed_host(
         repo=repo,
         on_stage=on_stage,
         keep_host_on_failure=True,
+        extra_env=extra_env,
     )
     return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
 
@@ -2137,6 +2141,7 @@ async def _arm_and_start_host(
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -2201,8 +2206,10 @@ async def _arm_and_start_host(
             repo_name=repo.repo_name if repo is not None else None,
             on_stage=on_stage,
             # Omitted entirely when unset: a deployment-injected launcher
-            # predating the host_config parameter must keep launching.
+            # predating the host_config / extra_env parameters must keep
+            # launching.
             **({"host_config": config.host_config} if config.host_config is not None else {}),
+            **({"extra_env": extra_env} if extra_env else {}),
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
