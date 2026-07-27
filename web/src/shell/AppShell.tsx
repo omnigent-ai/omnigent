@@ -196,6 +196,17 @@ export function AppShell() {
   const [openFiles, setOpenFiles] = useState<string[]>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).openFiles ?? []) : [],
   );
+  // Ordered list of open shell tabs (``terminalTabKey`` values) shown in the
+  // right rail's tab strip beside the file tabs. ``selectedTerminalKey`` is the
+  // active one (mutually exclusive with ``selectedFilePath`` — the rail's
+  // content slot shows one thing). Not persisted: terminal keys are
+  // session-scoped and the PTYs don't survive a reload, so a fresh visit starts
+  // with no shell tabs; a prune effect drops keys whose terminal has gone away.
+  const [openTerminals, setOpenTerminals] = useState<string[]>([]);
+  const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(null);
+  // Whether the workspace rail is maximized (covers the full content region,
+  // hiding the chat column). Session-transient — a fresh visit starts docked.
+  const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
   // false = full folder tree ("All"), true = changed-files-only flat list.
   // Surfaced as the Changed | All toggle inside the Files panel. Seeded from
   // the persisted, app-global preference (defaults to "All") so the choice
@@ -752,6 +763,13 @@ export function AppShell() {
     const nextSelected = urlFile ?? persisted.selectedFilePath ?? null;
     setOpenFiles(nextOpenFiles);
     setSelectedFilePath(nextSelected);
+    // Shell tabs are session-scoped and not persisted — a switch starts the
+    // incoming session with no open shell tabs (the prune effect would drop
+    // stale keys anyway once its terminals load).
+    setOpenTerminals([]);
+    setSelectedTerminalKey(null);
+    // A maximized rail is transient too — the incoming session starts docked.
+    setRightPanelMaximized(false);
     // A selected file must be visible in the rail. The Agents/Todos/Terminals
     // tabs don't render the inline viewer, so pull the rail to Files.
     if (nextSelected && nextTab !== "files") {
@@ -835,6 +853,10 @@ export function AppShell() {
   const openFileViewer = useCallback(
     (path: string) => {
       setSelectedFilePath(path);
+      // A file and a shell tab can't both own the rail's content slot —
+      // opening a file deselects any active shell tab (its tab stays in the
+      // strip).
+      setSelectedTerminalKey(null);
       // Add the path to the open tabs if it isn't already open; activating an
       // already-open tab just re-selects it (no duplicate).
       setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
@@ -1034,6 +1056,11 @@ export function AppShell() {
       setFileViewerCommentsOpen(false);
       clearFileViewerUrl();
     }
+    // Clicking a static nav tab deselects any active shell tab (it stays in
+    // the strip) so the picked tab's content shows in the single slot.
+    if (selectedTerminalKey !== null) {
+      setSelectedTerminalKey(null);
+    }
   }
 
   function openTerminalsPanel(key: string) {
@@ -1046,6 +1073,59 @@ export function AppShell() {
     setTodosPanelOpen(false); // close mobile tasks drawer
     setPanelInitialKey(key);
   }
+
+  // Open a shell as a tab in the desktop workspace rail (the mobile path
+  // still uses ``openTerminalsPanel`` → full-screen drawer). Adds the key to
+  // the open-tabs strip if new, activates it, and reveals the rail. Clearing
+  // the selected file keeps the rail's single content slot unambiguous — a
+  // shell tab and a file tab can't both be "active".
+  const openTerminalTab = useCallback(
+    (key: string) => {
+      setOpenTerminals((prev) => (prev.includes(key) ? prev : [...prev, key]));
+      setSelectedTerminalKey(key);
+      setSelectedFilePath(null);
+      setFileViewerCommentsOpen(false);
+      clearFileViewerUrl();
+      setExecutionLogsKey(null);
+      setFilesPanelOpen(false);
+      setSubagentsPanelOpen(false);
+      setShellsPanelOpen(false);
+      setTodosPanelOpen(false);
+      setRightPanelOpen(true);
+      if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
+    },
+    [clearFileViewerUrl, conversationId],
+  );
+
+  // Close a single shell tab. If it was the active one, activate its neighbor
+  // (prefer the previous tab, else the next); when none remain the selection
+  // clears and the rail falls back to the Shells list. Mirrors ``closeFile``.
+  const closeTerminalTab = useCallback((key: string) => {
+    setOpenTerminals((prev) => {
+      const idx = prev.indexOf(key);
+      if (idx === -1) return prev;
+      const next = prev.filter((k) => k !== key);
+      setSelectedTerminalKey((active) => {
+        if (active !== key) return active;
+        if (next.length === 0) return null;
+        return next[idx - 1] ?? next[idx] ?? next[0];
+      });
+      return next;
+    });
+  }, []);
+
+  // Prune shell tabs whose terminal has gone away (closed by the agent, or the
+  // runner went offline and emptied the list). Keeps the strip from pointing at
+  // dead PTYs; the active selection falls back to the Shells list when its tab
+  // is dropped.
+  useEffect(() => {
+    const valid = new Set(terminals.map((t) => terminalTabKey(t)));
+    setOpenTerminals((prev) => {
+      const next = prev.filter((k) => valid.has(k));
+      return next.length === prev.length ? prev : next;
+    });
+    setSelectedTerminalKey((active) => (active !== null && !valid.has(active) ? null : active));
+  }, [terminals]);
 
   function openExecutionLogsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1379,7 +1459,12 @@ export function AppShell() {
                     onCloseFile={closeFile}
                     onShowScopeView={showScopeView}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
-                    openTerminalsPanel={openTerminalsPanel}
+                    openTerminalTab={openTerminalTab}
+                    openTerminals={openTerminals}
+                    selectedTerminalKey={selectedTerminalKey}
+                    onCloseTerminal={closeTerminalTab}
+                    maximized={rightPanelMaximized}
+                    onToggleMaximized={() => setRightPanelMaximized((prev) => !prev)}
                     permissionLevel={permissionLevel}
                     filesPanelSort={filesPanelSort}
                     onSortChange={handleFilesSortChange}

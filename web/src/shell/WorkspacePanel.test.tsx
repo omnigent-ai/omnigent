@@ -1,15 +1,18 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useSessionAgent } from "@/hooks/useAgents";
+import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
-// these tests focus on WorkspacePanel's own logic (the open-file tab strip and
-// the content branch that swaps FileViewer ↔ FilesPanel). Each stub renders a
-// testid (plus, for FileViewer, the path it was asked to show) so we can prove
-// which child mounted without dragging in Monaco / hook stacks.
+// these tests focus on WorkspacePanel's own logic (the open-file/shell tab
+// strips and the content branch that swaps FileViewer ↔ FilesPanel ↔ shell).
+// Each stub renders a testid (plus, for FileViewer, the path it was asked to
+// show) so we can prove which child mounted without dragging in Monaco / hook
+// stacks / xterm.
 vi.mock("./FileViewer", () => ({
   FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
 }));
@@ -30,10 +33,40 @@ vi.mock("@/components/BrowserPane/BrowserPane", () => ({
     <div data-testid="browser-pane-stub">{conversationId}</div>
   ),
 }));
+// The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
+// echoing the terminal id it was asked to attach so we can prove the right
+// shell tab surfaced.
+vi.mock("@/components/blocks/TerminalView", () => ({
+  TerminalView: ({ terminalId }: { terminalId: string }) => (
+    <div data-testid="terminal-view-stub">{terminalId}</div>
+  ),
+}));
+vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/useTerminals")>()),
+  useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
+  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+}));
+// The "+" menu reads the agent's declared terminals to gate the Shell entry.
+vi.mock("@/hooks/useAgents", () => ({
+  useSessionAgent: vi.fn(() => ({ data: undefined })),
+}));
+
+const useTerminalsMock = vi.mocked(useTerminals);
+const useCreateTerminalMock = vi.mocked(useCreateTerminal);
+const useSessionAgentMock = vi.mocked(useSessionAgent);
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
+  useCreateTerminalMock.mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+    isError: false,
+  } as unknown as ReturnType<typeof useCreateTerminal>);
+  useSessionAgentMock.mockReturnValue({ data: undefined } as unknown as ReturnType<
+    typeof useSessionAgent
+  >);
 });
 
 /**
@@ -47,11 +80,18 @@ function renderWorkspace(
     selectedFilePath?: string | null;
     openFiles?: string[];
     showBrowserTab?: boolean;
+    showShellsTab?: boolean;
+    openTerminals?: string[];
+    selectedTerminalKey?: string | null;
+    maximized?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
+  const openTerminalTab = vi.fn();
+  const onCloseTerminal = vi.fn();
+  const onToggleMaximized = vi.fn();
   render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
@@ -63,7 +103,7 @@ function renderWorkspace(
         showFilesPanel
         showBrowserTab={overrides.showBrowserTab ?? false}
         changedCount={0}
-        showShellsTab={false}
+        showShellsTab={overrides.showShellsTab ?? false}
         terminalsLength={0}
         subagentsWorking={0}
         agentCount={1}
@@ -77,7 +117,12 @@ function renderWorkspace(
         onCloseFile={onCloseFile}
         onShowScopeView={vi.fn()}
         onCommentsOpenChange={vi.fn()}
-        openTerminalsPanel={vi.fn()}
+        openTerminalTab={openTerminalTab}
+        openTerminals={overrides.openTerminals ?? []}
+        selectedTerminalKey={overrides.selectedTerminalKey ?? null}
+        onCloseTerminal={onCloseTerminal}
+        maximized={overrides.maximized ?? false}
+        onToggleMaximized={onToggleMaximized}
         permissionLevel={null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
@@ -88,7 +133,14 @@ function renderWorkspace(
       />
     </TooltipProvider>,
   );
-  return { openFileViewer, onCloseFile, onRightRailTabChange };
+  return {
+    openFileViewer,
+    onCloseFile,
+    onRightRailTabChange,
+    openTerminalTab,
+    onCloseTerminal,
+    onToggleMaximized,
+  };
 }
 
 describe("WorkspacePanel surface presentation", () => {
@@ -219,6 +271,162 @@ describe("WorkspacePanel content area", () => {
     // slot and the viewer is unmounted.
     expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+});
+
+describe("WorkspacePanel shell tabs", () => {
+  const term = {
+    id: "terminal_zsh_s1",
+    name: "zsh",
+    session: "u-g9qopr",
+    running: true,
+  };
+  const termKey = "terminal:terminal_zsh_s1";
+
+  it("renders a tab per open shell labeled by name · session", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    renderWorkspace({ showShellsTab: true, openTerminals: [termKey] });
+
+    // The label resolves through the terminals cache (name · session), not the
+    // raw tab key. A failure means the strip didn't render or didn't resolve
+    // the label.
+    expect(screen.getByText("zsh · u-g9qopr")).toBeInTheDocument();
+  });
+
+  it("surfaces the active shell's xterm in the content slot", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    renderWorkspace({
+      showShellsTab: true,
+      openTerminals: [termKey],
+      selectedTerminalKey: termKey,
+    });
+
+    // The selected shell tab owns the single content slot — its terminal id is
+    // attached, and neither the files scope view nor a file viewer mounts.
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+  });
+
+  it("activates a shell via openTerminalTab when its tab body is clicked", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { openTerminalTab } = renderWorkspace({
+      showShellsTab: true,
+      openTerminals: [termKey],
+    });
+
+    fireEvent.click(screen.getByText("zsh · u-g9qopr"));
+
+    expect(openTerminalTab).toHaveBeenCalledWith(termKey);
+  });
+
+  it("closes a shell via onCloseTerminal (and does not also open it) when the x is clicked", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { openTerminalTab, onCloseTerminal } = renderWorkspace({
+      showShellsTab: true,
+      openTerminals: [termKey],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close zsh · u-g9qopr" }));
+
+    expect(onCloseTerminal).toHaveBeenCalledWith(termKey);
+    expect(openTerminalTab).not.toHaveBeenCalled();
+  });
+
+  it("keeps the static nav tabs inactive while a shell tab is active", () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    renderWorkspace({
+      showShellsTab: true,
+      openTerminals: [termKey],
+      selectedTerminalKey: termKey,
+    });
+
+    // The sentinel value must deselect every static trigger so a shell tab and
+    // e.g. the Files tab never look selected at once.
+    expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("data-state", "inactive");
+  });
+});
+
+describe('WorkspacePanel "+" new-tab menu', () => {
+  // The "+" gates purely on shell access — the agent's declared terminals.
+  // (The embedded browser is one view per conversation, reached via its own
+  // pinned tab, so it isn't offered here.)
+  const declaresShell = () =>
+    useSessionAgentMock.mockReturnValue({ data: { terminals: ["zsh"] } } as unknown as ReturnType<
+      typeof useSessionAgent
+    >);
+
+  it("is hidden when the agent has no terminal access", () => {
+    // No declared terminals (default mock: data undefined) → nothing to open.
+    renderWorkspace({ showBrowserTab: true });
+    expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
+  });
+
+  it("renders exactly one '+' — after the nav tabs with no open tabs, trailing the tabs otherwise", () => {
+    declaresShell();
+    // No open tabs → single "+", sitting after the nav tabs.
+    renderWorkspace({ openFiles: [] });
+    expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
+    cleanup();
+
+    // With an open file tab → still exactly one "+", now living in the flexible
+    // open-tabs region so it trails the last tab.
+    declaresShell();
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const plus = screen.getByRole("button", { name: "Open new" });
+    expect(plus).toBeInTheDocument();
+    // Its ancestor open-tabs region also holds the file tab's close button.
+    const region = plus.closest("div.\\@min-\\[500px\\]\\/rail\\:flex-1");
+    expect(region).not.toBeNull();
+    expect(region).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+  });
+
+  it("offers Shell (gated on declared terminals), creating one and opening it as a tab", async () => {
+    // Agent declares a shell; creating it resolves to a terminal whose tab key
+    // is handed to openTerminalTab.
+    declaresShell();
+    const created = { id: "terminal_zsh_s1", name: "zsh", session: "u-1", running: true };
+    const mutate = vi.fn((_name: string, opts?: { onSuccess?: (info: unknown) => void }) =>
+      opts?.onSuccess?.(created),
+    );
+    useCreateTerminalMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      isError: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+
+    const { openTerminalTab } = renderWorkspace({ showBrowserTab: false });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /shell/i }));
+
+    // Launches the first declared shell and opens the created terminal's tab.
+    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:terminal_zsh_s1");
+  });
+});
+
+describe("WorkspacePanel maximize", () => {
+  it("shows a full-screen toggle pinned to the right and fires onToggleMaximized", () => {
+    const { onToggleMaximized } = renderWorkspace();
+
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+
+    expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+  });
+
+  it("swaps to the exit-full-screen affordance and covers the content region when maximized", () => {
+    renderWorkspace({ maximized: true });
+
+    // Label + pressed state flip so the icon reads as a minimize/exit control.
+    const toggle = screen.getByRole("button", { name: "Exit full screen" });
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    // The rail breaks out of the docked flex sizing to cover the region, but
+    // keeps the same card styling (m-2 inset + rounded) so only the width
+    // changes — the height is unaffected.
+    const panel = screen.getByRole("complementary", { name: "Workspace" });
+    expect(panel).toHaveClass("md:absolute", "md:inset-0", "md:m-2", "md:rounded-lg");
+    expect(panel).not.toHaveClass("md:shrink-0");
   });
 });
 

@@ -155,6 +155,13 @@ vi.mock("./SubagentsPanel", () => ({
     <div data-testid="subagents-panel" data-conversation-id={conversationId} />
   ),
 }));
+// The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
+// low-level view to a marker echoing the attached terminal id.
+vi.mock("@/components/blocks/TerminalView", () => ({
+  TerminalView: ({ terminalId }: { terminalId: string }) => (
+    <div data-testid="terminal-view-stub">{terminalId}</div>
+  ),
+}));
 vi.mock("./TodoPanel", () => ({
   TodoPanel: () => <div data-testid="todo-panel" />,
 }));
@@ -977,8 +984,9 @@ describe("Right-rail terminals card", () => {
 });
 
 describe("Chat-mode terminal panel layout", () => {
-  it("hides chat and makes the panel fluid when a terminal is opened from the rail", () => {
-    // Rail click → chat hidden, panel fluid (no split, no resize).
+  it("opens the shell as a rail tab (not the full-width push panel) and keeps chat visible", () => {
+    // Desktop rail click → the shell opens as a tab inside the workspace rail;
+    // the full-width push panel stays closed and chat is not hidden.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -992,22 +1000,82 @@ describe("Chat-mode terminal panel layout", () => {
 
     renderShell("/c/conv_abc");
 
-    // Baseline: closed, push-panel sizing, chat visible. The md:hidden gate
-    // lives on the chat+workspace group (main's parent), not main itself.
+    // Baseline: closed push panel, chat visible. The md:hidden gate lives on
+    // the chat+workspace group (main's parent), not main itself.
     const chatGroup = () => screen.getByRole("main").parentElement as HTMLElement;
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
-    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-fluid", "false");
     expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
 
-    // Switch the rail to the Terminals tab so the inline section mounts.
-    // Radix Tabs activates on mousedown, not click.
+    // Switch the rail to the Shells tab so the inline section mounts, then open
+    // a shell. Radix Tabs activates on mousedown, not click.
     fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
     fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
 
-    // After click: open, fluid, chat hidden.
-    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
-    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-fluid", "true");
-    expect(chatGroup().className.split(" ")).toContain("md:hidden");
+    // After click: the push panel stays closed and chat stays visible — the
+    // shell now lives in a rail tab (its xterm surfaces in the rail's content
+    // slot), so the main column is undisturbed.
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
+    expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
+    // The shell tab's xterm is mounted in the rail.
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+  });
+
+  it("closes a shell tab from the rail — xterm unmounts and the Shells list returns", () => {
+    // Open a shell tab, then close it via the tab's "x". The rail falls back to
+    // the Shells list (no tab selected) and the xterm is gone.
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_abc");
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
+    // The shell tab and its xterm are present.
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+
+    // Close the tab via its "x" (labeled by the resolved name · session).
+    fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
+
+    // The xterm unmounts; with no tab selected the Shells list is shown again.
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
+  });
+});
+
+describe("Workspace rail maximize", () => {
+  it("toggles the rail between docked and full-screen (covering the content region)", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc");
+
+    const rail = () => screen.getByRole("complementary", { name: "Workspace" });
+    // Docked baseline: fixed-width flex child, no absolute-cover classes.
+    expect(rail().className).toContain("md:shrink-0");
+    expect(rail().className).not.toContain("md:absolute");
+
+    // Maximize → the rail breaks out to cover the content region.
+    fireEvent.click(screen.getByRole("button", { name: "Full screen" }));
+    expect(rail().className).toContain("md:absolute");
+    expect(rail().className).toContain("md:inset-0");
+    // Still keeps the docked card inset/rounding — only the width changes.
+    expect(rail().className).toContain("md:m-2");
+
+    // Minimize → back to the docked flex child.
+    fireEvent.click(screen.getByRole("button", { name: "Exit full screen" }));
+    expect(rail().className).toContain("md:shrink-0");
+    expect(rail().className).not.toContain("md:absolute");
   });
 });
 
