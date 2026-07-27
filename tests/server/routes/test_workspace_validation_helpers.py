@@ -6,9 +6,12 @@ connection, so we test only the synchronous helpers here.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.server.routes._workspace_validation import (
     _is_relative_cwd,
     _is_subpath_of,
+    is_absolute_host_path,
 )
 
 
@@ -58,3 +61,23 @@ class TestIsSubpathOf:
 
     def test_trailing_slash_boundary(self) -> None:
         assert _is_subpath_of("/a/b/c", "/a/b/") is True
+
+
+class TestIsAbsoluteHostPath:
+    """Tests for the cross-platform absolute-path check.
+
+    The server and the connected host can run different OSes, so a
+    Windows-style ``C:\\project`` must be recognized as absolute even
+    when the server is POSIX (where ``os.path.isabs`` would say no).
+    """
+
+    @pytest.mark.parametrize(
+        "workspace",
+        ["/home/user/project", "C:\\project", "C:/project", "\\\\unc\\share"],
+    )
+    def test_absolute_paths_accepted(self, workspace: str) -> None:
+        assert is_absolute_host_path(workspace) is True
+
+    @pytest.mark.parametrize("workspace", ["some/relative", "~/projects", "project"])
+    def test_relative_paths_rejected(self, workspace: str) -> None:
+        assert is_absolute_host_path(workspace) is False
