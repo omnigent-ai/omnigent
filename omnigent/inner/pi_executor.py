@@ -769,6 +769,7 @@ def _build_models_json(
     h = host.rstrip("/")
     serving_endpoints_url = f"{h}/serving-endpoints"
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
+    mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     # ucode's ``openai`` gateway is the Codex Responses gateway
     # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
@@ -825,6 +826,21 @@ def _build_models_json(
                 "api": "anthropic-messages",
                 "authHeader": True,
                 "models": _DATABRICKS_ANTHROPIC_MODELS,
+            },
+            # Gemini models → AI Gateway mlflow/v1/chat/completions using system.ai.* ids.
+            "databricks-gemini": {
+                "baseUrl": mlflow_gateway_url,
+                "apiKey": token,
+                "api": "openai-completions",
+                "authHeader": True,
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsStore": False,
+                    "supportsStrictMode": False,
+                    "supportsReasoningEffort": False,
+                    "supportsUsageInStreaming": False,
+                },
+                "models": [],
             },
             # Everything else (Llama, etc.) → same endpoint, same API
             "databricks-completions": {
@@ -905,6 +921,8 @@ def _pi_provider_for_model(model: str) -> str:
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
+    if "gemini" in lower:
+        return "databricks-gemini"
     if "gpt" in lower or "system.ai." in lower:
         return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
     return "databricks-completions"

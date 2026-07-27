@@ -70,6 +70,7 @@ _PI_OPENAI_PROVIDER_ID = "omnigent-openai"
 # Provider id for the tertiary OpenAI Completions provider (non-GPT models that
 # work via /chat/completions: Kimi, Llama, GLM, Gemini, older GPT models).
 _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
+_PI_GEMINI_PROVIDER_ID = "omnigent-gemini"
 
 # Keyword fragments that identify Databricks serving-endpoint models which
 # require the Responses API. These models don't send finish_reason via
@@ -256,6 +257,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     claude_models: list[dict[str, Any]] = []
     gpt_models: list[dict[str, Any]] = []
     completions_models: list[dict[str, Any]] = []
+    gemini_models: list[dict[str, Any]] = []
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
@@ -267,7 +269,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         credential_warning = _databricks_credential_warning(entry.profile)
     else:
         try:
-            claude_models, gpt_models, completions_models = _fetch_pi_model_lists(
+            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
                 creds.host, creds.token
             )
         except Exception:  # noqa: BLE001 — network failure must not break launch
@@ -282,6 +284,10 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if completions_models:
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
             api_key, f"{host}/serving-endpoints", completions_models, api_type="openai-completions"
+        )
+    if gemini_models:
+        additional[_PI_GEMINI_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, f"{host}/ai-gateway/mlflow/v1", gemini_models, api_type="openai-completions"
         )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
@@ -422,13 +428,13 @@ def _needs_responses_api(model_id_lower: str) -> bool:
 def _unsupported_in_pi(model_id_lower: str) -> bool:
     """Return True for models Pi can't handle at all.
 
-    Gemini 2.5 thinking models return ``content`` as an array with
-    ``thoughtSignature`` that Pi's openai-completions handler can't parse.
-    Other Gemini variants route via openai-completions normally.
+    Gemini models return ``content`` as a typed array with ``thoughtSignature``
+    that Pi's openai-completions handler can't parse, and the Responses API
+    returns 400 for Gemini. Exclude all Gemini variants.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini-2-5" in model_id_lower
+    return "gemini" in model_id_lower
 
 
 def _fetch_pi_model_lists(
@@ -455,7 +461,7 @@ def _fetch_pi_model_lists(
     :param workspace_url: Databricks workspace base URL, e.g.
         ``"https://wkspc.example.com"`` — **no** trailing slash or path.
     :param token: Bearer token for the workspace API.
-    :returns: ``(claude_models, gpt_responses_models, completions_models)`` —
+    :returns: ``(claude_models, gpt_responses_models, completions_models, gemini_models)`` —
         Pi model entry dicts ready to write into ``models.json``.
     """
     import httpx
@@ -474,12 +480,13 @@ def _fetch_pi_model_lists(
             "Pi will show only the selected model",
             exc_info=True,
         )
-        return [], [], []
+        return [], [], [], []
 
     services = payload.get("model_services") if isinstance(payload, dict) else None
     claude: list[dict[str, Any]] = []
     gpt_responses: list[dict[str, Any]] = []
     completions: list[dict[str, Any]] = []
+    gemini: list[dict[str, Any]] = []
 
     for service in services if isinstance(services, list) else []:
         if not isinstance(service, dict):
@@ -509,6 +516,11 @@ def _fetch_pi_model_lists(
             entry["reasoning"] = True
         if "claude" in name_lower:
             claude.append(entry)
+        elif "gemini" in name_lower:
+            # Gemini uses AI Gateway mlflow/v1/chat/completions; system.ai.* ids
+            # don't work at serving-endpoints and Responses API returns 400.
+            if not _unsupported_in_pi(name_lower):
+                gemini.append(entry)
         elif (
             name_lower.startswith("system.ai.")
             or has_responses
@@ -527,7 +539,7 @@ def _fetch_pi_model_lists(
             "Pi will show only the selected model"
         )
 
-    return claude, gpt_responses, completions
+    return claude, gpt_responses, completions, gemini
 
 
 def _gateway_anthropic_base_url(codex_base_url: str) -> str:
@@ -704,6 +716,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     claude_models: list[dict[str, Any]] = []
     gpt_models: list[dict[str, Any]] = []
     completions_models: list[dict[str, Any]] = []
+    gemini_models: list[dict[str, Any]] = []
     # Derive the workspace URL for the serving-endpoints API call.
     # For dedicated-subdomain URLs (ai-gateway.cloud.databricks.com), the
     # real workspace hostname must come from ~/.databrickscfg. For
@@ -729,7 +742,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if real_workspace_url and transport.auth_command:
         token = _run_auth_command(transport.auth_command)
         if token:
-            claude_models, gpt_models, completions_models = _fetch_pi_model_lists(
+            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
                 real_workspace_url, token
             )
         else:
@@ -752,6 +765,9 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     workspace_completions_url = (
         real_workspace_url + "/serving-endpoints" if real_workspace_url else None
     )
+    workspace_mlflow_url = (
+        real_workspace_url + "/ai-gateway/mlflow/v1" if real_workspace_url else None
+    )
     additional: dict[str, Any] = {}
     if gpt_models:
         additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
@@ -760,6 +776,10 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     if completions_models and workspace_completions_url:
         additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
             api_key, workspace_completions_url, completions_models, api_type="openai-completions"
+        )
+    if gemini_models and workspace_mlflow_url:
+        additional[_PI_GEMINI_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
         )
     return PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,

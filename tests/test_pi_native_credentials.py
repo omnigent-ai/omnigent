@@ -913,7 +913,7 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
-        lambda *_: (live_claude, live_gpt_responses, live_gpt_completions),
+        lambda *_: (live_claude, live_gpt_responses, live_gpt_completions, []),
     )
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
@@ -966,7 +966,7 @@ def test_cli_config_databricks_registers_gpt_provider(
         # Assert the auth_command token is used, not the SDK token
         assert token == "cmd-tok", f"expected auth_command token, got {token!r}"
         assert "dbc-a5d4177a" in workspace_url
-        return live_claude, live_gpt, []
+        return live_claude, live_gpt, [], []
 
     monkeypatch.setattr(creds, "_fetch_pi_model_lists", _mock_fetch)
 
@@ -1031,7 +1031,9 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_MockTransport()),
     ):
-        claude, gpt, completions = creds._fetch_pi_model_lists("https://wkspc.example.com", "tok")
+        claude, gpt, completions, _gemini = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
 
     # Claude models
     claude_ids = [m["id"] for m in claude]
@@ -1073,10 +1075,11 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
         "httpx.Client",
         lambda **kw: _real_client(transport=_ErrorTransport()),
     ):
-        claude, gpt, completions = creds._fetch_pi_model_lists(
+        claude, gpt, completions, gemini = creds._fetch_pi_model_lists(
             "https://wkspc.example.com", "bad-tok"
         )
 
     assert claude == []
     assert gpt == []
     assert completions == []
+    assert gemini == []
