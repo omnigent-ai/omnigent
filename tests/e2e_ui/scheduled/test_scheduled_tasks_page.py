@@ -56,8 +56,16 @@ def _create_task(
     *,
     host_id: str | None = None,
     workspace: str | None = None,
+    model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """Seed one scheduled task via ``POST /v1/scheduled-tasks``.
+
+    ``model_override`` / ``reasoning_effort`` are optional so a test can seed a
+    task carrying the model/effort overrides the create/edit dialog persists —
+    used by the edit-prefill test, where the dialog must read them back onto the
+    ``task-model-trigger`` / ``task-effort-trigger`` controls. Left ``None`` they
+    are omitted from the body (the row persists null, the agent's own defaults).
 
     :returns: The created task id.
     """
@@ -72,6 +80,10 @@ def _create_task(
         body["host_id"] = host_id
     if workspace is not None:
         body["workspace"] = workspace
+    if model_override is not None:
+        body["model_override"] = model_override
+    if reasoning_effort is not None:
+        body["reasoning_effort"] = reasoning_effort
     resp = httpx.post(
         f"{base_url}/v1/scheduled-tasks",
         json=body,
@@ -371,3 +383,201 @@ def test_scheduled_task_row_run_controls(
         page.wait_for_timeout(200)
         deadline += 1
     assert _has_failed_run(), "Run now did not record a failed run within the timeout"
+
+
+# ── Model + reasoning-effort selectors (PR #3331) ──────────────────────────
+#
+# The create/edit dialog renders a Model|Effort row (ModelEffortFields) that is
+# CAPABILITY-GATED on the selected agent: shown for a native coding agent that
+# carries the model/effort surface (Claude Code — the `permissionMode`
+# capability), hidden for agents without it (Codex, plain-SDK agents). Both
+# controls default to a "Default" sentinel; on CREATE a Default control is
+# omitted from the body (agent defaults apply), and a concrete pick sends
+# `model_override` / `reasoning_effort`. On EDIT the controls prefill from the
+# loaded task. These tests are LLM-free like the sibling ones: they exercise
+# only the create/edit dialog, REST, and the rendered row — no agent turn fires.
+
+
+def _open_create_dialog(page: Page) -> None:
+    """Open the New-automation dialog and confirm Claude Code is the pick.
+
+    The picker auto-selects the first agent (Claude Code, sortRank 10) on open,
+    so the model/effort row's capability gate is satisfied without any explicit
+    selection — this just asserts that default holds before a test reads the
+    row. Mirrors the setup in ``test_scheduled_task_create_edit_modal_and_time_picker``.
+
+    :param page: Playwright page already navigated to ``/tasks``.
+    """
+    page.get_by_test_id("new-task-button").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
+    agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
+        "new-chat-landing-agent-select"
+    )
+    expect(agent_trigger).to_contain_text("Claude Code", timeout=30_000)
+
+
+def _pick_select_option(page: Page, trigger_test_id: str, option_label: str) -> None:
+    """Open a Radix ``Select`` by its trigger test-id and click an option.
+
+    The model/effort Selects portal their listbox OUTSIDE the dialog, but the
+    dialog's dismiss guard (``handleSelectOpenChange``) keeps it open across the
+    open/pick, so this never closes the modal. Radix items expose
+    ``role="option"``; ``exact`` avoids "Sonnet 4.6" matching "Sonnet 5".
+
+    :param page: Playwright page with the create/edit dialog open.
+    :param trigger_test_id: ``"task-model-trigger"`` or ``"task-effort-trigger"``.
+    :param option_label: The exact rendered option label, e.g. ``"Opus"``.
+    """
+    page.get_by_test_id(trigger_test_id).click()
+    page.get_by_role("option", name=option_label, exact=True).click()
+
+
+def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The Model/Effort row shows for Claude Code, both reading 'Default'.
+
+    Claude Code carries the ``permissionMode`` capability the dialog gates the
+    model/effort surface on, so opening the create dialog (which defaults to
+    Claude Code) renders ``task-model-effort-row`` with both the model and
+    effort triggers defaulting to the "Default" sentinel — nothing overridden.
+    """
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+
+    expect(page.get_by_test_id("task-model-effort-row")).to_be_visible(timeout=30_000)
+    model_trigger = page.get_by_test_id("task-model-trigger")
+    effort_trigger = page.get_by_test_id("task-effort-trigger")
+    expect(model_trigger).to_be_visible()
+    expect(effort_trigger).to_be_visible()
+    expect(model_trigger).to_have_text("Default")
+    expect(effort_trigger).to_have_text("Default")
+
+
+def test_scheduled_task_model_effort_controls_hidden_for_incapable_agent(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The Model/Effort row is hidden for a non-capable agent, with the hint.
+
+    The e2e server seeds the built-in ``codex-native-ui`` ("Codex") agent, which
+    carries ``approvalMode`` — NOT the ``permissionMode`` capability the
+    model/effort surface is gated on. Rather than drive the create-dialog agent
+    picker into Codex (it can fold into a hover-only "More" submenu when the host
+    reports it unconfigured, which is fragile to click), we SEED a task against
+    the Codex agent and open its EDIT dialog: edit mode gates the row on the
+    loaded task's agent, so the row must be absent and the "uses defaults" helper
+    hint shown instead. (Chosen because the e2e server does register Codex; the
+    seeded-edit path is the deterministic way to exercise the hidden branch.)
+    """
+    codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
+    _create_task(live_server, codex_agent_id, "Codex daily", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+
+    page.goto(f"{live_server}/tasks")
+    row = _row_by_name(page, "Codex daily")
+    expect(row).to_be_visible(timeout=30_000)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+
+    dialog = page.get_by_test_id("create-scheduled-task-dialog")
+    expect(dialog).to_be_visible(timeout=30_000)
+    # Capability gate off → the row is never rendered, and the "uses defaults"
+    # helper hint stands in for it.
+    expect(page.get_by_test_id("task-model-effort-row")).to_be_hidden()
+    expect(dialog.get_by_text("Uses this agent")).to_be_visible()
+
+
+def test_scheduled_task_create_persists_model_and_effort(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Picking a concrete Model + Effort on create persists both via the API.
+
+    Opens the create dialog on Claude Code, picks Opus + High through the
+    ``task-model-trigger`` / ``task-effort-trigger`` selects, submits, then reads
+    the created row back from ``GET /v1/scheduled-tasks`` and asserts its
+    ``model_override`` / ``reasoning_effort`` are the persisted picks (asserting
+    the server-side values is more robust than re-reading the row text). Opus =
+    the ``"opus"`` model alias, High = the ``"high"`` effort — the shared option
+    vocabulary the dialog renders; a pick sends those verbatim.
+    """
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+
+    page.get_by_test_id("task-name-input").fill("Model effort create")
+    page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    _pick_select_option(page, "task-model-trigger", "Opus")
+    _pick_select_option(page, "task-effort-trigger", "High")
+    expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
+    expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    # The row renders once the create resolves; assert the persisted API values.
+    expect(_row_by_name(page, "Model effort create")).to_be_visible(timeout=30_000)
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    created = next(t for t in tasks if t["name"] == "Model effort create")
+    assert created["model_override"] == "opus", created
+    assert created["reasoning_effort"] == "high", created
+
+
+def test_scheduled_task_create_default_omits_model_and_effort(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Leaving both controls on 'Default' persists null model/effort.
+
+    A create that never touches the model/effort controls must omit both fields
+    so the row inherits the agent's configured model + effort. Confirms the
+    "Default" sentinel maps to a null override (not the literal sentinel string).
+    """
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+
+    page.get_by_test_id("task-name-input").fill("Default model effort")
+    page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
+    # Controls left on their default "Default" sentinel — no pick.
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    expect(_row_by_name(page, "Default model effort")).to_be_visible(timeout=30_000)
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    created = next(t for t in tasks if t["name"] == "Default model effort")
+    assert created["model_override"] is None, created
+    assert created["reasoning_effort"] is None, created
+
+
+def test_scheduled_task_edit_prefills_model_and_effort(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The edit dialog prefills the Model/Effort controls from the loaded task.
+
+    Seeds a Claude Code task carrying ``model_override="opus"`` +
+    ``reasoning_effort="high"``, opens its Edit dialog, and asserts the
+    ``task-model-trigger`` / ``task-effort-trigger`` render the stored picks
+    ("Opus" / "High"), not the "Default" sentinel — the round-trip the create
+    test's persistence feeds into.
+    """
+    claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
+    _create_task(
+        live_server,
+        claude_agent_id,
+        "Prefill target",
+        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        model_override="opus",
+        reasoning_effort="high",
+    )
+
+    page.goto(f"{live_server}/tasks")
+    row = _row_by_name(page, "Prefill target")
+    expect(row).to_be_visible(timeout=30_000)
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+
+    dialog = page.get_by_test_id("create-scheduled-task-dialog")
+    expect(dialog).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("task-model-effort-row")).to_be_visible()
+    expect(page.get_by_test_id("task-model-trigger")).to_have_text("Opus")
+    expect(page.get_by_test_id("task-effort-trigger")).to_have_text("High")
