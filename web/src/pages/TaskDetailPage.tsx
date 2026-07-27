@@ -21,7 +21,6 @@ import {
   PencilIcon,
   PlayIcon,
   Trash2Icon,
-  ZapIcon,
 } from "lucide-react";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
@@ -169,7 +168,7 @@ export function TaskDetailPage() {
             {runNowMutation.isPending ? (
               <Loader2Icon className="size-4 animate-spin" />
             ) : (
-              <ZapIcon className="size-4" />
+              <PlayIcon className="size-4" />
             )}
             Run now
           </Button>
