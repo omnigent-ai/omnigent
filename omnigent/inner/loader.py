@@ -746,21 +746,22 @@ def _parse_terminal_env_spec(data: YamlData | str | bool | None) -> TerminalEnvS
 
 def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandboxSpec:
     if isinstance(data, str):
-        return OSEnvSandboxSpec(type=data)
+        from .sandbox import _resolve_sandbox_type
+
+        return OSEnvSandboxSpec(type=_resolve_sandbox_type(data))
     if data is False:
         return OSEnvSandboxSpec(type="none")
     if not isinstance(data, dict):
         raise TypeError("os_env.sandbox must be a string, false, or mapping")
-    raw_type = data.get("type")
-    if raw_type is None:
-        # No ``type:`` field -- resolve via the platform default
-        # (same behavior as the Omnigent YAML parser, kept in sync so legacy
-        # and Omnigent loaders agree on what an "untyped" sandbox block means).
-        from .sandbox import _default_sandbox_for_platform
+    from .sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
+    if "type" not in data:
         sandbox_type = _default_sandbox_for_platform().type
     else:
-        sandbox_type = raw_type
+        raw_type = data["type"]
+        if raw_type is not None and not isinstance(raw_type, str):
+            raise TypeError("os_env.sandbox.type must be a string or null")
+        sandbox_type = _resolve_sandbox_type(raw_type)
     egress_rules = data.get("egress_rules")
     # Mirror the Omnigent parser's hard reject of ``egress_rules`` paired with
     # a backend that cannot enforce them at spawn time. Without this
