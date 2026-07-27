@@ -68,9 +68,12 @@ from omnigent.server.routes._sessions.helpers import *
 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
 from omnigent.server.routes._sessions.orchestration import *
 from omnigent.server.schemas import (
+    ArtifactPreviewRequest,
+    ArtifactPreviewResponse,
     CopiedFile,
     CopyFilesRequest,
     CopyFilesResponse,
+    ManagedArtifactList,
     SessionResourceObject,
     SessionResourcePaginatedList,
 )
@@ -274,21 +277,19 @@ def register_resources_routes(
     @router.post(
         "/sessions/{session_id}/artifact-previews",
         status_code=201,
+        response_model=ArtifactPreviewResponse,
     )
     async def create_artifact_preview(
         session_id: str,
         request: Request,
-    ) -> dict[str, str | float]:
+        body: ArtifactPreviewRequest,
+    ) -> ArtifactPreviewResponse:
         """Create a short-lived capability URL for an HTML artifact."""
         await _validate_session(session_id, request, LEVEL_READ)
         if artifact_preview_service is None:
             raise HTTPException(status_code=503, detail="artifact previews unavailable")
         try:
-            body = await request.json()
-            entry_path = body.get("entry_path") if isinstance(body, dict) else None
-            if not isinstance(entry_path, str):
-                raise ValueError
-            grant = await artifact_preview_service.create_grant(session_id, entry_path)
+            grant = await artifact_preview_service.create_grant(session_id, body.entry_path)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail="invalid artifact entry path") from exc
         except ArtifactPreviewUnavailable as exc:
@@ -296,9 +297,9 @@ def register_resources_routes(
                 status_code=503,
                 detail="artifact preview runner unavailable",
             ) from exc
-        return {"url": grant.url, "expires_at": grant.expires_at}
+        return ArtifactPreviewResponse(url=grant.url, expires_at=grant.expires_at)
 
-    @router.get("/sessions/{session_id}/artifacts", response_model=None)
+    @router.get("/sessions/{session_id}/artifacts", response_model=ManagedArtifactList)
     async def list_managed_artifacts(
         request: Request,
         session_id: str,

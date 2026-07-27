@@ -205,7 +205,11 @@ class ArtifactPreviewHostMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] in {"http", "websocket"}:
             headers = dict(scope.get("headers", []))
-            host = headers.get(b"host", b"").decode("latin-1").split(":", 1)[0].lower()
+            host_header = headers.get(b"host", b"").decode("latin-1")
+            try:
+                host = (urllib.parse.urlsplit(f"//{host_header}").hostname or "").lower()
+            except ValueError:
+                host = ""
             if host == self.preview_hostname and scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
                 return

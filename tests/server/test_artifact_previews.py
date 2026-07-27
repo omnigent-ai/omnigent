@@ -263,6 +263,71 @@ def test_preview_hostname_cannot_reach_application_routes() -> None:
     )
 
 
+def test_ipv6_preview_hostname_cannot_reach_application_routes() -> None:
+    runner_client = _runner_client()
+
+    async def resolve(_session_id: str) -> httpx.AsyncClient:
+        return runner_client
+
+    service = ArtifactPreviewService(
+        preview_origin="http://[::1]:6767",
+        runner_client_for_session=resolve,
+    )
+    app = FastAPI()
+    app.add_middleware(
+        ArtifactPreviewHostMiddleware,
+        preview_hostname=service.preview_hostname,
+    )
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    reached_websocket = False
+
+    @app.websocket("/ws")
+    async def websocket_route(websocket: WebSocket) -> None:
+        nonlocal reached_websocket
+        reached_websocket = True
+        await websocket.accept()
+
+    client = TestClient(app)
+    assert client.get("/health", headers={"host": "[::1]:6767"}).status_code == 404
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            "/ws",
+            headers={"host": "[::1]:6767", "origin": "http://[::1]:6767"},
+        ):
+            pass
+    assert reached_websocket is False
+
+
+def test_artifact_routes_publish_typed_openapi_contracts() -> None:
+    app = FastAPI()
+    app.include_router(
+        create_sessions_router(
+            conversation_store=object(),  # type: ignore[arg-type]
+            agent_store=object(),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+
+    paths = app.openapi()["paths"]
+    preview = paths["/v1/sessions/{session_id}/artifact-previews"]["post"]
+    assert preview["requestBody"]["required"] is True
+    assert preview["requestBody"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ArtifactPreviewRequest"
+    )
+    assert preview["responses"]["201"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ArtifactPreviewResponse"
+    )
+
+    artifacts = paths["/v1/sessions/{session_id}/artifacts"]["get"]
+    assert artifacts["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "/ManagedArtifactList"
+    )
+
+
 @pytest.mark.asyncio
 async def test_grants_are_bounded_per_session_and_expired_grants_are_purged(
     monkeypatch: pytest.MonkeyPatch,

@@ -595,6 +595,40 @@ class CopyFilesResponse(BaseModel):
     mapping: dict[str, CopiedFile]
 
 
+# ── Managed Artifacts ───────────────────────────────────────────
+
+
+class ArtifactPreviewRequest(BaseModel):
+    """Request a capability-scoped preview URL for one artifact entry."""
+
+    entry_path: str
+
+
+class ArtifactPreviewResponse(BaseModel):
+    """Short-lived preview capability returned for an artifact entry."""
+
+    url: str
+    expires_at: float
+
+
+class ManagedArtifactObject(BaseModel):
+    """Canonical HTML artifact entry discovered for one session."""
+
+    path: str
+    name: str
+    type: Literal["file"] = "file"
+    bytes: int
+    modified_at: float
+
+
+class ManagedArtifactList(BaseModel):
+    """List of canonical managed HTML artifact entries."""
+
+    object: Literal["list"] = "list"
+    data: list[ManagedArtifactObject] = Field(default_factory=list)
+    has_more: bool = False
+
+
 # ── Session Resources ───────────────────────────────────────────
 
 
