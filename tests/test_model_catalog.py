@@ -805,7 +805,14 @@ def test_cli_config_listing_is_static_and_unverified(
     listing = list_models_for_worker(_worker_spec("codex-native"), "codex-native")
     assert listing.source == "static"
     assert listing.verified is False
-    assert [m.id for m in listing.models] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+    assert [m.id for m in listing.models] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+    ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
     assert "resolved by the CLI at launch" in listing.note

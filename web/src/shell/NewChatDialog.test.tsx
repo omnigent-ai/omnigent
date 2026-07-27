@@ -1069,6 +1069,45 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByText("Read only")).toBeTruthy();
   });
 
+  it("offers host Codex models before launch and sends the selected override", async () => {
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        ({
+          data:
+            harness === "codex-native"
+              ? [
+                  {
+                    id: "databricks-gpt-5-6-sol",
+                    displayName: "GPT-5.6 Sol",
+                  },
+                  { id: "databricks-gpt-5-5", displayName: "GPT-5.5" },
+                ]
+              : [],
+          isLoading: false,
+          isError: false,
+        }) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    openAgentConfig("a2");
+    expect(screen.getByTestId("new-chat-landing-config-model")).toBeTruthy();
+    pickSelectOption("new-chat-landing-config-model", "GPT-5.6 Sol");
+    saveConfig();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "upgrade the project" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.model_override).toBe("databricks-gpt-5-6-sol");
+  });
+
   it("arms codex full bypass via the Approval dropdown and shows the warning banner", () => {
     renderLanding();
     // Open Codex's (a2) config modal; bypass is the most-permissive Approval option.

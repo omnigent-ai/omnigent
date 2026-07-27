@@ -103,7 +103,7 @@ _OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
 # generic-provider gateway path never uses this — it requires the Omnigent producer
 # to resolve a concrete model. Used only when constructing the codex config
 # from ~/.databrickscfg credentials with no spec/override model.
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
+_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-6-sol"
 
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate

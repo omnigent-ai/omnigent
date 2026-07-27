@@ -89,7 +89,14 @@ _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
     ),
-    "codex": ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
+    "codex": (
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+    ),
 }
 
 # Harness spellings -> the workflow harness whose provider resolution they

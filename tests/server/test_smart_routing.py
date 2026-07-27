@@ -96,6 +96,11 @@ def test_infer_models_codex() -> None:
     models = infer_models("codex")
     assert models is not None
     assert any("gpt" in m for m in models)
+    assert models[-3:] == [
+        "databricks-gpt-5-6-luna",
+        "databricks-gpt-5-6-terra",
+        "databricks-gpt-5-6-sol",
+    ]
 
 
 def test_infer_models_openai_agents() -> None:

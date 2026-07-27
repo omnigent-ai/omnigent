@@ -1839,13 +1839,37 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        if canonicalize_harness(frame.harness) != "claude-native":
+        harness = canonicalize_harness(frame.harness)
+        if harness not in ("claude-native", "codex-native"):
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"model options are unsupported for harness {frame.harness!r}",
             )
         try:
+            if harness == "codex-native":
+                from omnigent.model_catalog import list_models_for_worker
+                from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+                spec = AgentSpec(
+                    spec_version=1,
+                    name="model-options-preview",
+                    executor=ExecutorSpec(
+                        type="omnigent",
+                        config={"harness": "codex-native"},
+                    ),
+                )
+                listing = await asyncio.to_thread(
+                    list_models_for_worker,
+                    spec,
+                    "codex-native",
+                )
+                models = [{"id": model.id, "displayName": model.id} for model in listing.models]
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=models,
+                )
             from omnigent.claude_native import (
                 claude_native_model_options,
                 resolve_native_claude_config,
@@ -1854,11 +1878,11 @@ class HostProcess:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
             models = await asyncio.to_thread(claude_native_model_options, config)
         except Exception:
-            _logger.exception("Failed to resolve pre-launch Claude model options")
+            _logger.exception("Failed to resolve pre-launch %s model options", harness)
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
-                error="failed to resolve Claude model options",
+                error=f"failed to resolve {harness} model options",
             )
         return HostModelOptionsResultFrame(
             request_id=frame.request_id,
