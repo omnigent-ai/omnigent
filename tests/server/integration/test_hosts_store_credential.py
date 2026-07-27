@@ -38,6 +38,9 @@ from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.host_store import HostStore
 
 pytestmark = [
@@ -96,7 +99,15 @@ def cred_app(
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
     app.include_router(create_host_tunnel_router(registry, host_store), prefix="/v1")
-    app.include_router(create_hosts_router(registry, host_store, conv_store), prefix="/v1")
+    app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
+        ),
+        prefix="/v1",
+    )
     return app, registry, host_store, conv_store
 
 
@@ -432,6 +443,7 @@ async def test_offline_host_returns_409(
 
 async def test_non_owner_returns_403(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
 ) -> None:
     """A host owned by another user returns 403 — not configurable by non-owners."""
     from typing import Any as _Any
@@ -451,7 +463,14 @@ async def test_non_owner_returns_403(
         create_host_tunnel_router(registry, host_store, auth_provider=auth), prefix="/v1"
     )
     auth_app.include_router(
-        create_hosts_router(registry, host_store, conv_store, auth_provider=auth), prefix="/v1"
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            auth_provider=auth,
+            host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
+        ),
+        prefix="/v1",
     )
     host_store.upsert_on_connect(host_id=_HOST_ID, name=_HOST_NAME, user_id="alice@example.com")
 
