@@ -275,3 +275,75 @@ async def test_copilot_native_spawn_env_carries_the_bridge_dir(
     # The SDK harness's vars are not part of the native contract; the token in
     # particular must not be handed to a process that never reads it.
     assert not [key for key in env if key.startswith("HARNESS_COPILOT_GITHUB_TOKEN")]
+
+
+@pytest.mark.asyncio
+async def test_copilot_terminal_env_never_clobbers_github_token(
+    copilot_launch_env: Path,
+    started_forwarders: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit Copilot credential lands in one variable, and is marked secret.
+
+    The pane is interactive and unsandboxed and Copilot runs shell commands in
+    it. Writing GH_TOKEN / GITHUB_TOKEN would additionally re-point ``gh`` and
+    git's credential helpers inside that pane at a token the user did not choose
+    for them, which is enough to push or open a PR under the wrong identity.
+    """
+    from omnigent.spec.types import AgentSpec as SpecAgentSpec
+    from omnigent.spec.types import ApiKeyAuth
+    from omnigent.spec.types import ExecutorSpec as SpecExecutorSpec
+
+    spec = SpecAgentSpec(
+        spec_version=1,
+        name="copilot-native-agent",
+        executor=SpecExecutorSpec(
+            config={"harness": "copilot-native"},
+            auth=ApiKeyAuth(type="api_key", api_key="gho_explicitly_bound"),
+        ),
+    )
+    registry = _FakeResourceRegistry(terminal_registry=None)
+
+    await _auto_create_copilot_terminal(
+        _SESSION_ID,
+        registry,  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    env = registry.captured["spec"].env
+    assert env == {"COPILOT_GITHUB_TOKEN": "gho_explicitly_bound"}
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "--secret-env-vars=COPILOT_GITHUB_TOKEN" in registry.captured["spec"].args
+    del monkeypatch, started_forwarders
+
+
+@pytest.mark.asyncio
+async def test_copilot_terminal_does_not_promote_an_ambient_token(
+    copilot_launch_env: Path,
+    started_forwarders: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambient GITHUB_TOKEN is not adopted as Copilot's credential.
+
+    The pane inherits the runner's environment already, so promoting an ambient
+    token into Copilot's auth slot adds no capability -- it only signs the agent
+    in as whatever identity happened to be exported, over the CLI's own
+    ``copilot login`` state.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_some_unrelated_ci_token")
+    monkeypatch.setenv("GH_TOKEN", "gho_some_unrelated_ci_token")
+    registry = _FakeResourceRegistry(terminal_registry=None)
+
+    await _auto_create_copilot_terminal(
+        _SESSION_ID,
+        registry,  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert registry.captured["spec"].env == {}
+    assert not [a for a in registry.captured["spec"].args if a.startswith("--secret-env-vars")]
+    del started_forwarders

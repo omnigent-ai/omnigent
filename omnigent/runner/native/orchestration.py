@@ -4061,10 +4061,7 @@ async def _auto_create_copilot_terminal(
     )
     from omnigent.copilot_native_forwarder import clear_copilot_bridge_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
-    from omnigent.onboarding.copilot_auth import (
-        COPILOT_TOKEN_ENV_VARS,
-        resolve_copilot_github_token,
-    )
+    from omnigent.onboarding.copilot_auth import resolve_copilot_github_token
     from omnigent.spec.types import ApiKeyAuth
 
     # Tear down any forwarder left from a prior terminal for this session before
@@ -4097,19 +4094,28 @@ async def _auto_create_copilot_terminal(
     model = launch_config.model_override or _copilot_native_model_from_spec(agent_spec)
     env: dict[str, str] = {}
     spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    # Only a credential the user explicitly bound to Copilot is injected: the
+    # spec's own api_key, else the token registered under the `copilot:` config
+    # block. Ambient GH_TOKEN / GITHUB_TOKEN are deliberately NOT promoted --
+    # the pane inherits them already, and copying one into Copilot's auth slot
+    # silently signs the agent in as whatever identity happened to be exported.
+    # With neither, the pane inherits HOME and uses the CLI's own `copilot
+    # login` state, the same posture as cursor-native.
     if spec is not None and isinstance(spec.executor.auth, ApiKeyAuth):
         token = spec.executor.auth.api_key
     else:
         token = resolve_copilot_github_token()
-        if token is None:
-            for var in COPILOT_TOKEN_ENV_VARS:
-                token = os.environ.get(var)
-                if token:
-                    break
     if token:
-        env["GH_TOKEN"] = token
-        env["GITHUB_TOKEN"] = token
+        # COPILOT_GITHUB_TOKEN alone: it is the highest-precedence variable the
+        # CLI reads, and writing GH_TOKEN / GITHUB_TOKEN would re-point `gh` and
+        # git's credential helpers inside this interactive pane at a token the
+        # user did not choose for them -- enough to push or open a PR under the
+        # wrong identity. --secret-env-vars keeps the value out of the
+        # environment of shells and MCP servers Copilot spawns, and redacts it
+        # from pane output; the pane is unsandboxed and the model runs commands
+        # in it, so the credential must not be readable there.
         env["COPILOT_GITHUB_TOKEN"] = token
+        launch_args.append("--secret-env-vars=COPILOT_GITHUB_TOKEN")
 
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
