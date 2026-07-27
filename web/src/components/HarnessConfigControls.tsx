@@ -18,6 +18,21 @@ export const MODEL_SELECT_SMART = "__smart__";
 // Sentinel for the "no explicit effort" (—) choice, same reasoning.
 export const EFFORT_SELECT_NONE = "__none__";
 
+// Claude-native reasoning-effort options for the new-session / scheduled-task
+// model+effort pickers. There is deliberately no hardcoded effort default: an
+// unselected picker omits `reasoning_effort`, so Claude Code falls back to its
+// own configured effort — the same "no override" semantics the in-session
+// picker's `null` state uses. Mirrors ANTHROPIC_EFFORTS server-side. Lives here
+// (a leaf module, no heavy imports) so both NewChatDialog and the scheduled-task
+// dialog can share the single source of truth.
+export const CLAUDE_NATIVE_EFFORTS: { value: string; label: string }[] = [
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "xHigh" },
+  { value: "max", label: "Max" },
+];
+
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
  * the control on the right. Mirrors the "Configure …" modal layout.

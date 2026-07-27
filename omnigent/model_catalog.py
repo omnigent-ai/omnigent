@@ -83,6 +83,7 @@ _LLM_TASK_TOKENS = ("chat", "completion")
 _SUBSCRIPTION_STATIC_MODELS: dict[str, tuple[str, ...]] = {
     "claude": (
         "claude-fable-5",
+        "claude-opus-5",
         "claude-opus-4-8",
         "claude-sonnet-5",
         "claude-sonnet-4-6",
@@ -621,7 +622,30 @@ def list_models_for_worker(
     :returns: The worker's :class:`ModelListing`.
     """
     provider = resolve_model_provider(spec, harness)
-    listing = _listing_for_provider(provider, transport=transport)
+    # Pi harnesses use system.ai.* ids (via the Unity Catalog model-services API)
+    # so supervisors see the ids Pi can actually route. Other harnesses use the
+    # serving-endpoints listing which returns databricks-* ids.
+    _pi_harnesses = frozenset({"pi", "pi-native", "native-pi"})
+    canonical = (harness or "").lower().replace("-", "").replace("_", "")
+    use_uc = canonical in {h.replace("-", "").replace("_", "") for h in _pi_harnesses}
+    if use_uc and provider.kind == DATABRICKS_KIND:
+        uc_key = ("uc", *_listing_cache_key(provider))
+        with _listing_cache_lock:
+            cached = _listing_cache.get(uc_key)
+        if cached is not None:
+            listing = cached
+        else:
+            try:
+                listing = _fetch_databricks_uc_listing(provider, transport=transport)
+                with _listing_cache_lock:
+                    _listing_cache[uc_key] = listing
+            except (httpx.HTTPError, OSError):
+                _logger.debug(
+                    "UC model listing failed for pi harness, falling back", exc_info=True
+                )
+                listing = _listing_for_provider(provider, transport=transport)
+    else:
+        listing = _listing_for_provider(provider, transport=transport)
     if harness is None:
         return listing
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
@@ -916,6 +940,64 @@ def _fetch_databricks_listing(
         models=tuple(models),
         note=(
             "LLM serving endpoints on the Databricks workspace gateway "
+            f"(profile {provider.profile or 'DEFAULT'!r})"
+        ),
+    )
+
+
+def _fetch_databricks_uc_listing(
+    provider: ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None,
+) -> ModelListing:
+    """List LLM model services via the Unity Catalog model-services API.
+
+    Returns ``system.ai.*`` model ids directly — the ids that work with the
+    AI Gateway — avoiding the ``databricks-*`` → ``system.ai.*`` translation.
+
+    :param provider: A ``kind="databricks"`` provider descriptor.
+    :param transport: Optional httpx transport override for tests.
+    :returns: A ``source="gateway"`` listing of model service names.
+    :raises httpx.HTTPError: On transport/HTTP failures.
+    :raises OSError: When the profile resolves no credentials.
+    """
+    creds = resolve_databricks_workspace(provider.profile)
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        resp = client.get(
+            f"{creds.host}/api/2.1/unity-catalog/model-services",
+            headers={"Authorization": f"Bearer {creds.token}"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    services = payload.get("model_services") if isinstance(payload, dict) else None
+    models: list[ModelEntry] = []
+    for service in services if isinstance(services, list) else []:
+        if not isinstance(service, dict):
+            continue
+        raw_name = service.get("name", "")
+        name = (
+            raw_name.replace("model-services/", "")
+            if raw_name.startswith("model-services/")
+            else raw_name
+        )
+        if not name:
+            continue
+        api_types = service.get("supported_api_types", [])
+        has_chat = any("chat" in t for t in api_types)
+        has_embed = any("embed" in t.lower() for t in api_types)
+        if not has_chat or has_embed:
+            continue
+        from omnigent.pi_native_credentials import _unsupported_in_pi
+
+        if _unsupported_in_pi(name.lower()):
+            continue
+        models.append(ModelEntry(id=name, family=model_family_token(name)))
+    return ModelListing(
+        source="gateway",
+        verified=True,
+        models=tuple(models),
+        note=(
+            "LLM model services on the Databricks workspace "
             f"(profile {provider.profile or 'DEFAULT'!r})"
         ),
     )

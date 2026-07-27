@@ -153,5 +153,25 @@ final class DeepLinkTests: XCTestCase {
     // 33rd char not hex
     XCTAssertNotNil(DeepLink.parse(URL(string: "omnigent://localhost:8000/c/host_\(hex)")!))
     // wrong legacy prefix
+    XCTAssertNotNil(DeepLink.parse(URL(string: "omnigent://localhost:8000/c/conv_\(hex)")!))
+  }
+
+  func testThemeSourceMapsToUserInterfaceStyle() {
+    XCTAssertEqual(ThemeSource.system.userInterfaceStyle, .unspecified)
+    XCTAssertEqual(ThemeSource.light.userInterfaceStyle, .light)
+    XCTAssertEqual(ThemeSource.dark.userInterfaceStyle, .dark)
+  }
+
+  func testThemeSourceMapsToColorScheme() {
+    XCTAssertNil(ThemeSource.system.colorScheme)
+    XCTAssertEqual(ThemeSource.light.colorScheme, .light)
+    XCTAssertEqual(ThemeSource.dark.colorScheme, .dark)
+  }
+
+  func testThemeSourceParsesFromRawString() {
+    XCTAssertEqual(ThemeSource(rawValue: "system"), .system)
+    XCTAssertEqual(ThemeSource(rawValue: "light"), .light)
+    XCTAssertEqual(ThemeSource(rawValue: "dark"), .dark)
+    XCTAssertNil(ThemeSource(rawValue: "invalid"))
   }
 }

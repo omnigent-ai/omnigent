@@ -739,16 +739,22 @@ def _build_models_json(
     h = host.rstrip("/")
     serving_endpoints_url = f"{h}/serving-endpoints"
     codex_gateway_url = f"{h}/ai-gateway/codex/v1"
+    mlflow_gateway_url = f"{h}/ai-gateway/mlflow/v1"
     raw_openai_base_url = (base_urls or {}).get("openai")
     # ucode's ``openai`` gateway is the Codex Responses gateway
     # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
     # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
-    # generic providers (no ``/ai-gateway/codex``) pass through. Gemini rides
-    # this path via databricks-completions since pi can't speak generateContent.
+    # generic providers (no ``/ai-gateway/codex``) pass through.
     if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
         openai_base_url = serving_endpoints_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
+    # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
+    # /ai-gateway/* paths don't exist — use the generic base URL for all paths.
+    is_generic_provider = bool(raw_openai_base_url and "/ai-gateway/" not in raw_openai_base_url)
+    if is_generic_provider:
+        codex_gateway_url = openai_base_url
+        mlflow_gateway_url = openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
     _openai_responses_compat: dict[str, Any] = {  # type: ignore[explicit-any]
         "supportsDeveloperRole": False,
@@ -796,6 +802,21 @@ def _build_models_json(
                 "authHeader": True,
                 "models": _DATABRICKS_ANTHROPIC_MODELS,
             },
+            # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
+            "databricks-mlflow": {
+                "baseUrl": mlflow_gateway_url,
+                "apiKey": token,
+                "api": "openai-completions",
+                "authHeader": True,
+                "compat": {
+                    "supportsDeveloperRole": False,
+                    "supportsStore": False,
+                    "supportsStrictMode": False,
+                    "supportsReasoningEffort": False,
+                    "supportsUsageInStreaming": False,
+                },
+                "models": [],
+            },
             # Everything else (Llama, etc.) → same endpoint, same API
             "databricks-completions": {
                 "baseUrl": openai_base_url,
@@ -837,12 +858,13 @@ def _build_models_json(
 
 
 # Model-id fragments of completions-gateway models that stream their output on
-# the ``reasoning_content`` channel (GLM, DeepSeek-R1, ...). Pi's
-# openai-completions parser only consumes that channel when the model entry
-# declares ``reasoning: true``; without it the stream carries no ``content``
-# and the turn dies with "Stream ended without finish_reason". Extend this
-# tuple when the gateway grows another reasoning-first model family.
-_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("glm", "deepseek", "kimi", "inkling")
+# the ``reasoning_content`` channel (DeepSeek-R1, ...). Pi's openai-completions
+# parser only consumes that channel when the model entry declares
+# ``reasoning: true``; without it the stream carries no ``content`` and the
+# turn dies with "Stream ended without finish_reason".
+# Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
+# so they no longer need this flag.
+_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
 
 def _pi_model_is_reasoning(model: str) -> bool:
@@ -852,17 +874,21 @@ def _pi_model_is_reasoning(model: str) -> bool:
 
 
 def _pi_needs_responses_api(model: str) -> bool:
-    """Return True when a GPT model requires the Responses API for tools.
+    """Return True when a model requires the Responses API at /ai-gateway/codex/v1.
 
-    Uses the same allowlist logic as pi_native_credentials._needs_responses_api:
-    GPT models known to work with /chat/completions + tools are allowlisted;
-    everything else (newer models) defaults to the Responses API.
+    Covers two cases:
+    - Newer GPT models that reject function tools via /chat/completions.
+    - Kimi/inkling/qwen3/glm (system.ai.* ids) that need the Responses API to
+      avoid the missing finish_reason issue on /chat/completions.
     """
-    from omnigent.pi_native_credentials import (
-        _needs_responses_api,
-    )
+    from omnigent.pi_native_credentials import _SYSTEM_AI_MODEL_KEYWORDS, _needs_responses_api
 
-    return _needs_responses_api(model.lower())
+    lower = model.lower()
+    # system.ai.* ids: only kimi/inkling/qwen3/glm variants need Responses API.
+    # Claude/llama system.ai.* ids route to their own providers (Anthropic, completions).
+    if lower.startswith("system.ai.") and any(kw in lower for kw in _SYSTEM_AI_MODEL_KEYWORDS):
+        return True
+    return _needs_responses_api(lower)
 
 
 def _pi_provider_for_model(model: str) -> str:
@@ -870,6 +896,10 @@ def _pi_provider_for_model(model: str) -> str:
     lower = model.lower()
     if "claude" in lower:
         return "databricks-anthropic"
+    if lower.startswith("system.ai."):
+        # system.ai.* ids never work at serving-endpoints — always use a gateway path.
+        # kimi/inkling/qwen3/glm → Responses API; others (Llama, Gemini, GPT) → mlflow.
+        return "databricks-openai" if _pi_needs_responses_api(model) else "databricks-mlflow"
     if "gpt" in lower:
         return "databricks-openai" if _pi_needs_responses_api(model) else "databricks"
     return "databricks-completions"
@@ -1921,11 +1951,12 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
+            effective_model = model
             models_json = _build_models_json(
                 self._databricks_host,
                 self._databricks_token,
                 self._base_urls_override,
-                model=model,
+                model=effective_model,
             )
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
@@ -2015,12 +2046,14 @@ class PiExecutor(Executor):
         """Get or create a Pi RPC subprocess for the given session."""
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
+        effective_model = model
+
         if (
             state.rpc is not None
             and state.rpc.process is not None
             and state.rpc.process.returncode is None
             and state.system_prompt == system_prompt
-            and state.model == model
+            and state.model == effective_model
         ):
             return state.rpc
 
@@ -2030,7 +2063,7 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, model
+            tools, tool_server_port, tool_server_token, effective_model
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -2042,11 +2075,11 @@ class PiExecutor(Executor):
         # For Databricks models, prefix with the provider name so Pi resolves
         # the model from our custom provider in models.json.
         pi_model: str | None
-        if self._gateway and model:
-            provider = _pi_provider_for_model(model)
-            pi_model = f"{provider}/{model}"
+        if self._gateway and effective_model:
+            provider = _pi_provider_for_model(effective_model)
+            pi_model = f"{provider}/{effective_model}"
         else:
-            pi_model = model
+            pi_model = effective_model
 
         await rpc.start(
             self._pi_launch_path,
@@ -2058,7 +2091,7 @@ class PiExecutor(Executor):
         )
         state.rpc = rpc
         state.system_prompt = system_prompt
-        state.model = model
+        state.model = effective_model
         state._has_sent_prompt = False
         return rpc
 

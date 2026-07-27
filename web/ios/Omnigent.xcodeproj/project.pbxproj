@@ -29,8 +29,12 @@
 		B20000000000000000000002 /* SettingsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* SettingsStoreTests.swift */; };
 		B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */; };
 		B20000000000000000000004 /* DeepLinkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* DeepLinkTests.swift */; };
+		B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */; };
+		B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
+		B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* MockHTTPServer.swift */; };
 		B40000000000000000000001 /* OmnigentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000001 /* OmnigentUITests.swift */; };
 		B40000000000000000000002 /* SnapshotHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000002 /* SnapshotHelper.swift */; };
+		B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000003 /* RedirectConsentUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -75,9 +79,12 @@
 		A20000000000000000000002 /* SettingsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStoreTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderTests.swift; sourceTree = "<group>"; };
 		A20000000000000000000004 /* DeepLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLinkTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceURLExpanderRedirectTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000006 /* MockHTTPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MockHTTPServer.swift; sourceTree = "<group>"; };
 		A30000000000000000000003 /* OmnigentUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000001 /* OmnigentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmnigentUITests.swift; sourceTree = "<group>"; };
 		A40000000000000000000002 /* SnapshotHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotHelper.swift; sourceTree = "<group>"; };
+		A40000000000000000000003 /* RedirectConsentUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RedirectConsentUITests.swift; sourceTree = "<group>"; };
 		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -161,6 +168,8 @@
 				A20000000000000000000002 /* SettingsStoreTests.swift */,
 				A20000000000000000000003 /* WorkspaceURLExpanderTests.swift */,
 				A20000000000000000000004 /* DeepLinkTests.swift */,
+				A20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift */,
+				A20000000000000000000006 /* MockHTTPServer.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -170,6 +179,7 @@
 			children = (
 				A40000000000000000000001 /* OmnigentUITests.swift */,
 				A40000000000000000000002 /* SnapshotHelper.swift */,
+				A40000000000000000000003 /* RedirectConsentUITests.swift */,
 			);
 			path = OmnigentUITests;
 			sourceTree = "<group>";
@@ -339,6 +349,8 @@
 				B20000000000000000000002 /* SettingsStoreTests.swift in Sources */,
 				B20000000000000000000003 /* WorkspaceURLExpanderTests.swift in Sources */,
 				B20000000000000000000004 /* DeepLinkTests.swift in Sources */,
+				B20000000000000000000005 /* WorkspaceURLExpanderRedirectTests.swift in Sources */,
+				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -348,6 +360,8 @@
 			files = (
 				B40000000000000000000001 /* OmnigentUITests.swift in Sources */,
 				B40000000000000000000002 /* SnapshotHelper.swift in Sources */,
+				B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */,
+				B40000000000000000000004 /* MockHTTPServer.swift in Sources (OmnigentUITests) */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

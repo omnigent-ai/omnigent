@@ -26,6 +26,7 @@ from omnigent.entities import (
     ConversationItem,
     MessageData,
 )
+from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -242,16 +243,19 @@ def _clear_binary_content(
     for i, msg in enumerate(messages):
         if i >= protect_from:
             break
-        content = msg.get("content")
-        if not isinstance(content, list):
+        if "content" not in msg:
             continue
-        for block in content:
-            if (
-                isinstance(block, dict)
-                and block.get("type") in ("image", "file")
-                and "data" in block
-            ):
-                block["data"] = _BINARY_CONTENT_CLEARED
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("image", "file") and "data" in block:
+                    block["data"] = _BINARY_CONTENT_CLEARED
+        msg["content"] = redact_inline_data_uris(
+            content,
+            lambda _media_type, _payload_length: _BINARY_CONTENT_CLEARED,
+        )
     return messages
 
 

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, ClassVar
 import click
 
 from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR
+from omnigent.onboarding.sandboxes import types as _sandbox_types
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -288,7 +289,7 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     return f"python3 -c {shlex.quote(script)}"
 
 
-class SandboxCapabilityError(click.ClickException):
+class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
     """
     Raised when a launcher does not support an optional primitive.
 
@@ -409,6 +410,44 @@ class SandboxLauncher(ABC):
     # of being silently revived onto an empty workspace.
     can_resume: ClassVar[bool] = False
 
+    # Whether this provider supports the server-managed host flow
+    # (``host_type="managed"`` sessions). The server checks this before
+    # launching a sandbox for a managed session. Most providers support both
+    # CLI bootstrap and managed launch; set this to ``False`` for providers
+    # that are CLI-only (e.g. Lakebox) or staged-but-not-yet-launched.
+    supports_managed_launch: ClassVar[bool] = True
+
+    @property
+    def capabilities(self) -> _sandbox_types.SandboxCapabilities:
+        """
+        Feature flags this provider declares.
+
+        The returned object is derived from the provider's class vars and
+        from which optional transport methods it has overridden. It is a
+        transition shim: providers will set an explicit
+        :class:`~omnigent.onboarding.sandboxes.types.SandboxCapabilities`
+        object directly once the refactor is complete.
+        """
+        return _sandbox_types.SandboxCapabilities(
+            cli_bootstrap=self.supports_cli_bootstrap,
+            managed_launch=self.supports_managed_launch,
+            local_port_forward=self.supports_local_port_forward,
+            resume_stopped=self.can_resume,
+            programmatic_terminate=self._is_capability_overridden("terminate"),
+            file_copy=self._is_capability_overridden("put"),
+            streaming_exec=self._is_capability_overridden("stream_exec"),
+            foreground_exec=self._is_capability_overridden("exec_foreground"),
+        )
+
+    def _is_capability_overridden(self, name: str) -> bool:
+        """
+        Return whether this provider overrides the named optional method.
+
+        Used while the refactor is in transition so the capability object
+        can reflect overridden methods without provider authors touching it.
+        """
+        return getattr(type(self), name) is not getattr(SandboxLauncher, name)
+
     @abstractmethod
     def prepare(self) -> None:
         """
@@ -527,7 +566,7 @@ class SandboxLauncher(ABC):
         # host_config the cleanup must run: an operator who removed the block
         # expects previously injected entries gone on the next wake. Fresh
         # sandboxes can't carry a stale marker — skip the extra exec there.
-        if host_config is not None or self.can_resume:
+        if host_config is not None or self.capabilities.resume_stopped:
             self.run(sandbox_id, render_host_config_write_command(host_config or {}))
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}"

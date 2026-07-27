@@ -103,13 +103,13 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          # Final X.Y.Z or a PEP 440 pre-release (a/b/rc). No dev/post here.
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]; then
+          # Final X.Y.Z or a PEP 440 pre-release (rc). No dev/post/alpha/beta here.
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$ ]]; then
             echo "::error::Invalid release version: ${VERSION} (expect 0.6.0 or 0.6.0rc1)"; exit 1
           fi
           major="${VERSION%%.*}"; rest="${VERSION#*.}"; minor="${rest%%.*}"
           prerelease=false
-          case "$VERSION" in *a[0-9]*|*b[0-9]*|*rc[0-9]*) prerelease=true ;; esac
+          case "$VERSION" in *rc[0-9]*) prerelease=true ;; esac
           {
             echo "version=${VERSION}"
             echo "tag=v${VERSION}"
@@ -647,7 +647,7 @@ jobs:
             echo "     -f ref=${TAG} -f destination=pypi -f dry-run=false   # real publish"
             echo '   ```'
             if [ "$PRERELEASE" = "true" ]; then
-              echo "2. Validate the rc from PyPI (see RELEASING.md). The GitHub draft for ${TAG} stays unpublished."
+              echo "2. Validate the rc from PyPI (see RELEASING.md). No GitHub release is created for rc tags (rcs live on PyPI only) — skip straight to the next rc or the final cut."
             else
               echo "2. Merge the CHANGELOG PR, curate the ${TAG} draft notes, then dispatch finalize-release.yml (tag=${TAG})."
             fi

@@ -9,6 +9,17 @@ Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
 let it run on staged files via `git commit`). Fix any issues it reports so the
 commit lands clean — CI runs the same checks.
 
+## Local development shortcuts
+
+Use `just` for common tasks; run `just --list` for grouped recipes.
+
+- `just ensure` — install/check prerequisites
+- `just run-ios` / `just run-android` — build/run mobile apps
+- `just dev` / `just dev-mobile` — start the omnigent dev pod
+- `just electron-dev` / `just electron-build` — Electron desktop shell
+- `just lint` / `just lint-all` — run pre-commit
+- `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
+
 ## Pull requests
 
 When you open a pull request, fill in the repo's PR template at

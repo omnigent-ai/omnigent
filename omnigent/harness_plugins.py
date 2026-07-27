@@ -68,6 +68,14 @@ class NativeCodingAgent:
 
 
 @dataclass(frozen=True)
+class BackgroundTitleGeneratorSpec:
+    """Lazy background-title generator registration for one harness."""
+
+    generator: str
+    resolver_harness: str | None = None
+
+
+@dataclass(frozen=True)
 class HarnessContribution:
     """One package's harness registry contribution."""
 
@@ -81,6 +89,9 @@ class HarnessContribution:
     harness_install_keys: dict[str, str] = field(default_factory=dict)
     model_env_keys: dict[str, str] = field(default_factory=dict)
     spawn_env_builders: dict[str, str] = field(default_factory=dict)
+    background_title_generators: dict[str, BackgroundTitleGeneratorSpec] = field(
+        default_factory=dict
+    )
     missing_install_package: dict[str, str] = field(default_factory=dict)
     harness_labels: dict[str, str] = field(default_factory=dict)
     # Declared feature set per harness id ("what can this harness do?"). Sparse
@@ -630,6 +641,21 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "pi": "HARNESS_PI_MODEL",
         "qwen": "HARNESS_QWEN_MODEL",
     },
+    background_title_generators={
+        "claude-sdk": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.sdk:generate_background_title"
+        ),
+        "claude-native": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.claude_native:generate_background_title",
+            resolver_harness="claude-sdk",
+        ),
+        "codex": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.sdk:generate_background_title"
+        ),
+        "codex-native": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.codex_native:generate_background_title"
+        ),
+    },
     harness_labels={
         "antigravity": "Antigravity",
         "claude-sdk": "Claude SDK",
@@ -662,6 +688,7 @@ def _community_paths(contribution: HarnessContribution) -> list[str]:
     paths: list[str] = []
     paths.extend(contribution.harness_modules.values())
     paths.extend(contribution.spawn_env_builders.values())
+    paths.extend(spec.generator for spec in contribution.background_title_generators.values())
     return paths
 
 
@@ -674,6 +701,7 @@ def _harness_spellings(contribution: HarnessContribution) -> set[str]:
         | set(contribution.native_harnesses)
         | set(contribution.harness_install_keys)
         | set(contribution.model_env_keys)
+        | set(contribution.background_title_generators)
         | set(contribution.missing_install_package)
         | set(contribution.harness_labels)
         | set(contribution.capabilities)
@@ -751,6 +779,17 @@ def _validate_community_contribution(
         )
 
     allowed_targets = set(contribution.valid_harnesses)
+    for harness, spec in contribution.background_title_generators.items():
+        if harness not in allowed_targets:
+            return (
+                f"community harness plugin {entry_point_name!r} registers background "
+                f"titles for undeclared harness {harness!r}"
+            )
+        if spec.resolver_harness is not None and spec.resolver_harness not in allowed_targets:
+            return (
+                f"community harness plugin {entry_point_name!r} background title resolver "
+                f"{spec.resolver_harness!r} is not contributed by the plugin"
+            )
     for alias, target in contribution.aliases.items():
         if target not in allowed_targets:
             return (
@@ -864,6 +903,11 @@ def model_env_keys() -> dict[str, str]:
 def spawn_env_builders() -> dict[str, str]:
     """Return harness-to-spawn-env-builder import paths."""
     return _merge_dict("spawn_env_builders")
+
+
+def background_title_generators() -> dict[str, BackgroundTitleGeneratorSpec]:
+    """Return harness-to-background-title-generator registrations."""
+    return _merge_dict("background_title_generators")
 
 
 def install_specs() -> dict[str, HarnessInstallSpec]:

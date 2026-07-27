@@ -29,6 +29,11 @@ import { RRule, rrulestr } from "rrule";
 const OCCURRENCE_ANCHOR = new Date(Date.UTC(2000, 0, 1, 0, 0, 0));
 const FIXED_PERIOD_SAFETY_MARGIN = 2;
 
+// Millisecond units for the compact relative next-run delta (formatNextRunAt).
+const MIN_MS = 60_000;
+const HOUR_MS = 60 * MIN_MS;
+const DAY_MS = 24 * HOUR_MS;
+
 /** Days-of-week bit set helpers. RRule weekday order is MO..SU (0..6). */
 const WEEKDAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR].map((d) => d.weekday);
 const ALL_DAYS = [RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR, RRule.SA, RRule.SU].map(
@@ -55,6 +60,60 @@ export function formatClockTime(hour: number, minute: number): string {
   const h12 = hour % 12 === 0 ? 12 : hour % 12;
   const mm = minute.toString().padStart(2, "0");
   return `${h12}:${mm} ${period}`;
+}
+
+/**
+ * Format the time until the SERVER's authoritative next-run instant as a
+ * relative delta in full words, e.g. `in 8 mins`, `in 3 hours`, `in 2 days`,
+ * or `soon`. This is the user-facing next-run label in the Tasks list.
+ *
+ * `iso` is the server's `next_run_at` (the live scheduler's authoritative next
+ * fire). We compute ONLY the delta (`nextRunAt − now`) and format how far away
+ * it is — the instant itself stays server-authoritative. This is NOT the old
+ * client-recomputed countdown that was removed: that one recomputed WHICH
+ * instant is next on the client (and couldn't match the server anchor for
+ * INTERVAL>1 rules); here the instant comes from the server and only the
+ * "how far away" is derived, so the removal rule is not violated.
+ *
+ * Buckets (rounded to the nearest of the chosen unit — the closest "about how
+ * long" reading), with a singular noun when the value is exactly 1:
+ *   < 60 min → `in N min(s)` (minimum `in 1 min`), < 24 h → `in N hour(s)`,
+ *   else `in N day(s)`. Each threshold uses the already-rounded value so a delta
+ *   that rounds up to a full unit promotes to the next unit (never `in 60 mins`
+ *   or `in 24 hours`).
+ * A delta at or below ~0 (imminent / just passed due to clock skew) → `soon`.
+ * Returns `null` for a null / unparseable `iso` so the caller renders nothing.
+ *
+ * @param iso The server's `next_run_at` ISO string, or `null`.
+ * @param now Injectable clock for deterministic tests; defaults to `new Date()`.
+ */
+export function formatNextRunAt(
+  iso: string | null | undefined,
+  now: Date = new Date(),
+): string | null {
+  if (!iso) return null;
+  const instant = new Date(iso);
+  if (Number.isNaN(instant.getTime())) return null;
+
+  const deltaMs = instant.getTime() - now.getTime();
+  // Imminent or just-passed (timing skew): don't render a "0 mins" / negative delta.
+  if (deltaMs < MIN_MS) return "soon";
+  // Round to nearest — the closest approximation of "about how long" (a 1h49m
+  // delta reads "in 2 hours", not the floored "in 1 hour"). Each guard tests the
+  // ALREADY-ROUNDED value so a delta that rounds up to a full unit PROMOTES to
+  // the next unit rather than printing "in 60 mins" / "in 24 hours" (e.g. 59m40s
+  // → "in 1 hour", 23h40m → "in 1 day").
+  const mins = Math.round(deltaMs / MIN_MS);
+  if (mins < 60) return `in ${pluralize(mins, "min")}`;
+  const hours = Math.round(deltaMs / HOUR_MS);
+  if (hours < 24) return `in ${pluralize(hours, "hour")}`;
+  const days = Math.round(deltaMs / DAY_MS);
+  return `in ${pluralize(days, "day")}`;
+}
+
+/** `1 min` / `8 mins` — singular noun only when the count is exactly 1. */
+function pluralize(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
 /** Parse an RRULE string into an `RRule`, or `null` if it can't be parsed. */

@@ -3,6 +3,7 @@ import SwiftUI
 struct AppRootView: View {
   @EnvironmentObject private var settings: SettingsStore
   @EnvironmentObject private var router: AppRouter
+  @StateObject private var theme = ThemeController.shared
   @State private var mode: Mode
 
   /// A deep link to a server the user has never connected to, awaiting the
@@ -47,6 +48,8 @@ struct AppRootView: View {
         )
       }
     }
+    .environmentObject(theme)
+    .preferredColorScheme(theme.source.colorScheme)
     .task {
       guard shouldAutoOpenSavedServer else { return }
       // A deep link that arrived before this task ran already moved us off the

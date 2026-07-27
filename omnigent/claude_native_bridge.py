@@ -313,12 +313,21 @@ class ClaudeTranscriptItem:
     :param data: Item payload shaped like ``SessionEventInput.data``.
     :param response_id: Synthetic response id used to group the
         Claude turn in AP/web UI rendering.
+    :param is_compact_summary: ``True`` when this item was parsed from a
+        Claude ``isCompactSummary: true`` user record — the continuation
+        summary Claude writes immediately after it compacts its own
+        context. The forwarder uses this flag to persist a durable
+        Omnigent compaction boundary (see
+        :func:`omnigent.claude_native_forwarder._forward_available_items`)
+        instead of rendering the summary as a user bubble. Defaults to
+        ``False`` for every ordinary transcript item.
     """
 
     source_id: str
     item_type: str
     data: dict[str, Any]
     response_id: str
+    is_compact_summary: bool = False
 
 
 @dataclass(frozen=True)
@@ -2602,6 +2611,11 @@ def inject_user_message(
     # Ctrl-U only clears backwards from cursor.
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-a")
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-k")
+    # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
+    # Claude Code TUI treats them as user text instead of invoking a state
+    # that Omnigent cannot drive. Allowed commands (``/clear``,
+    # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
+    injected_text = _escape_unsupported_slash_command(content)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -2613,7 +2627,7 @@ def inject_user_message(
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(content + "\n"))
+        paste_file.write(_paste_payload_bytes(injected_text + "\n"))
         paste_path = paste_file.name
     try:
         _run_tmux(info["socket_path"], "load-buffer", "-b", "omnigent-paste", paste_path)
@@ -4466,6 +4480,67 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
+# Slash commands that Omnigent lets a user type directly into the native
+# Claude Code terminal. Anything not in this set or not a skill is sent
+# as plain text so Claude Code's TUI does not enter an unsupported state
+# (menu, login prompt, exit, etc.) that Omnigent cannot drive.
+_CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS: frozenset[str] = (
+    _CLAUDE_CLI_SURFACED_COMMANDS | frozenset({"branch", "fork"})
+)
+
+
+def _first_slash_command_name(content: str) -> str | None:
+    """
+    Return the name of a leading ``/<name>`` slash command, if any.
+
+    Leading whitespace is ignored; the command ends at the first
+    whitespace character. Returns ``None`` when the content does not
+    begin with a slash command.
+    """
+    stripped = content.lstrip()
+    if not stripped.startswith("/"):
+        return None
+    remainder = stripped[1:]
+    match = re.match(r"(\S+)", remainder)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _escape_slash_command_text(content: str) -> str:
+    """
+    Return *content* escaped so it is treated as plain user text.
+
+    Inserts a zero-width no-break space (U+FEFF) immediately before the
+    leading slash. Claude Code sees a non-slash first character, so the
+    input is submitted as a regular message, while the user still sees
+    their original slash.
+    """
+    match = re.match(r"^(\s*)(/)(.*)$", content, re.DOTALL)
+    if not match:
+        return content
+    return f"{match.group(1)}\ufeff{match.group(2)}{match.group(3)}"
+
+
+def _escape_unsupported_slash_command(content: str) -> str:
+    """
+    Escape built-in UI slash commands that Omnigent cannot drive.
+
+    If the message starts with a known dropped Claude Code command
+    (e.g. ``/help``, ``/exit``), escapes it so Claude treats it as
+    regular text. Allowed commands (``/clear``, ``/model``, ``/fork``,
+    skills, etc.) pass through unchanged.
+    """
+    name = _first_slash_command_name(content)
+    if name is None:
+        return content
+    if name in _CLAUDE_NATIVE_ALLOWED_USER_SLASH_COMMANDS:
+        return content
+    if name not in _CLAUDE_CLI_DROPPED_COMMANDS:
+        # Unknown name: likely a skill; let Claude Code handle it.
+        return content
+    return _escape_slash_command_text(content)
+
 
 @dataclass(frozen=True)
 class _SlashCommandPayload:
@@ -4654,6 +4729,35 @@ def _user_transcript_items_from_entry(
     content = message.get("content") if isinstance(message, dict) else None
     source_key = _transcript_source_key(entry, line_number, record_offset)
     fallback_response_id = _response_id_from_source(source_key)
+
+    # ``isCompactSummary: true`` is the continuation-summary user record
+    # Claude writes right after it compacts its own context. It is the
+    # reliable, always-present compaction signal (the post-compaction
+    # ``SessionStart source=compact`` hook that normally persists the
+    # boundary is flaky and sometimes never fires). Surface it as a
+    # single flagged ``message`` item carrying the summary text so the
+    # forwarder can persist a durable compaction boundary instead of
+    # rendering the summary verbatim as a user bubble. Only the flag and
+    # text matter downstream — skip the slash/terminal/scaffolding
+    # detection the ordinary user path runs.
+    if entry.get("isCompactSummary") is True:
+        summary_text = content if isinstance(content, str) else _summary_text_from_blocks(content)
+        return (
+            current_response_id,
+            [
+                ClaudeTranscriptItem(
+                    source_id=_source_id(source_key, 0, "compact_summary"),
+                    item_type="message",
+                    data={
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": summary_text}],
+                    },
+                    response_id=fallback_response_id,
+                    is_compact_summary=True,
+                )
+            ],
+        )
+
     items: list[ClaudeTranscriptItem] = []
 
     if isinstance(content, str):
@@ -5092,6 +5196,34 @@ def _source_id(source_key: str, item_index: int, item_type: str) -> str:
     :returns: Stable source id string.
     """
     return f"{source_key}:{item_index}:{item_type}"
+
+
+def _summary_text_from_blocks(content: Any) -> str:
+    """
+    Join the text of a compact-summary record's content blocks.
+
+    A Claude ``isCompactSummary`` record usually carries its summary as
+    a plain string, but the JSONL format may also ship list-form
+    ``[{"type": "text", "text": ...}]`` blocks. This flattens the
+    list case to a single string so the compaction summary is preserved
+    regardless of shape.
+
+    :param content: The record's ``message.content`` — a string, a list
+        of content blocks, or anything else.
+    :returns: The concatenated summary text, or ``""`` when no text is
+        present.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts)
 
 
 def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, Any]:

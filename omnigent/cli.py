@@ -1135,17 +1135,16 @@ def _apply_bind_auth_defaults(host: str) -> None:
         os.environ.setdefault("OMNIGENT_LOCAL_SINGLE_USER", "1")
 
     # Non-loopback + no explicit auth → accounts (login) mode.
-    _raw_auth_enabled = os.environ.get("OMNIGENT_AUTH_ENABLED", "").strip()
-    _auth_enabled_explicit = bool(
-        _raw_auth_enabled or os.environ.get("OMNIGENT_ACCOUNTS_ENABLED", "").strip()
-    )
+    _auth_enabled_explicit = bool(os.environ.get("OMNIGENT_AUTH_ENABLED", "").strip())
     if not _is_loopback_bind and not _auth_provider_explicit and not _auth_enabled_explicit:
         os.environ.setdefault("OMNIGENT_AUTH_ENABLED", "1")
         click.echo(
             f"  ⚠ Binding to non-local interface {host}: enabling accounts "
             "(login) mode to prevent unauthorized access.\n"
             "    Open the server URL in a browser to create the first admin "
-            "account.",
+            "account.\n"
+            "    Set OMNIGENT_AUTH_ENABLED=0 first to override and stay in "
+            "single-user mode.",
             err=True,
         )
 

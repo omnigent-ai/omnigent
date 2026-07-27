@@ -1,28 +1,44 @@
 import type { Host } from "@/hooks/useHosts";
-import type { Conversation } from "@/hooks/useConversations";
-import type { HostWorktree } from "@/hooks/useHostWorktrees";
+import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 
-type ProjectPrefillPhase = "host" | "workspace" | "branch" | "settled";
+type ProjectPrefillPhase = "location" | "settled";
+
+/**
+ * A project's stored session defaults, as the composer consumes them. This is
+ * the ONLY project-driven prefill source: a set field seeds the composer, and
+ * an absent field falls through to the composer's generic defaults (last host /
+ * recent workspace / last-used agent).
+ *
+ * `undefined` means the config is still loading for a project that has one — the
+ * machine WAITS in that case so a generic default can't win the race. Pass an
+ * empty object `{}` for "no config / nothing to wait for" (a label-only folder
+ * with no first-class row, or a genuinely empty config) so the machine settles
+ * immediately and the generic defaults take over.
+ */
+export interface ProjectPrefillConfig {
+  hostId?: string;
+  workspace?: string;
+  agentId?: string;
+  /** Opt-in worktree default; only `true` is meaningful (absent = no worktree). */
+  useWorktree?: boolean;
+}
 
 export interface ProjectPrefillState {
   /** Project this machine is seeding for; "" = plain visit (starts done). */
   project: string;
-  /** Location track: host → workspace → branch → settled. */
+  /** Location track: seed host/workspace from config, then settle. */
   phase: ProjectPrefillPhase;
   /** Agent track, independent so a slow agents fetch can't hold up the
    *  location seeding (or the generic defaults gated on "settled"). */
   agentSeeded: boolean;
-  /** Workspace the machine seeded, so the branch step can confirm it is still in place. */
-  seededWorkspace: string | null;
 }
 
 export function initialPrefillState(project: string): ProjectPrefillState {
   const plain = project === "";
   return {
     project,
-    phase: plain ? "settled" : "host",
+    phase: plain ? "settled" : "location",
     agentSeeded: plain,
-    seededWorkspace: null,
   };
 }
 
@@ -32,43 +48,38 @@ export function prefillDone(state: ProjectPrefillState): boolean {
 }
 
 interface ProjectPrefillInputs {
-  /** Newest-session lookup: undefined = still loading, null = project has no sessions. */
-  newest: Conversation | null | undefined;
-  newestFailed: boolean;
   hosts: Host[] | undefined;
   /** Pickable agents; undefined = still loading. */
   agents: { id: string }[] | undefined;
   sandboxSelected: boolean;
-  /** Live host pick; a mid-flight manual switch aborts the location seeding
-   *  so another host's workspace path can't land in the field. */
+  /** Whether the server offers managed sandbox hosts. Gates seeding a stored
+   *  sandbox default — an OSS server that no longer offers it drops the hint. */
+  managedSandboxesEnabled: boolean;
+  /** Live host pick; a mid-flight manual switch aborts the config host seeding
+   *  so a stored host can't clobber the user's own choice. */
   selectedHostId: string | null;
-  /** Last-used agent id from localStorage (readLastAgentId()). */
+  /** Last-used agent id from localStorage (readLastAgentId()) — the generic
+   *  agent fallback when the config sets none. */
   lastAgentId: string | null;
-  /** Worktree set of the newest session's workspace (resolves a worktree-born
-   *  session to its main repo). undefined = loading or not requested yet. */
-  sourceWorktrees: HostWorktree[] | undefined;
-  sourceWorktreesFailed: boolean;
-  /** Live composer values the branch step checks before generating a name. */
-  workspaceTrimmed: string;
-  branchName: string;
-  prefilledBranch: string;
-  /** Worktree set of the CURRENT workspace (git-ness probe). undefined = loading/placeholder. */
-  hostWorktrees: HostWorktree[] | undefined;
-  hostWorktreesFailed: boolean;
+  /** Stored project defaults (the prefill source). undefined = still loading
+   *  (wait); {} = no config / nothing to wait for (settle to generic defaults). */
+  config: ProjectPrefillConfig | undefined;
 }
 
 interface ProjectPrefillWrites {
   hostId?: string;
   agentId?: string;
   workspace?: string;
-  branch?: string;
+  /** Select the managed sandbox as the target (config.hostId was the sandbox
+   *  sentinel). Distinct from `hostId` — the sandbox is not a real host id. */
+  selectSandbox?: boolean;
 }
 
 /**
  * One transition. null = keep waiting for data; otherwise the next state
  * plus slot writes to apply (fill-empty-only; the component enforces that).
- * The agent seed and the location phases advance independently, mirroring
- * the data they wait on: agents can lag the hosts/session lookups.
+ * The agent seed and the location phase advance independently, mirroring
+ * the data they wait on: agents can lag the host list.
  */
 export function projectPrefillStep(
   state: ProjectPrefillState,
@@ -77,25 +88,21 @@ export function projectPrefillStep(
   const writes: ProjectPrefillWrites = {};
   let next = state;
 
+  // Config still loading for a project that has one — wait so a generic default
+  // can't win the race against a stored default.
+  if (inputs.config === undefined) return null;
+
   if (!state.agentSeeded) {
-    const { newest, newestFailed, agents, hosts, lastAgentId } = inputs;
-    const lookupDone = newest !== undefined || newestFailed;
-    // A session on a gone/offline host is unusable as a template — every
-    // slot falls back to generic, the agent included. Judging that needs
-    // the host list, so wait for it (the location track does too).
-    const needsHosts = newest != null && newest.host_id != null;
-    if (lookupDone && agents !== undefined && (!needsHosts || hosts !== undefined)) {
+    const { agents, lastAgentId, config } = inputs;
+    // Need the pickable agents to judge whether a stored / last-used agent is
+    // still selectable; wait for them.
+    if (agents !== undefined) {
       next = { ...next, agentSeeded: true };
-      const hostId = newest?.host_id;
-      const hostUsable =
-        hostId == null || (hosts ?? []).some((h) => h.host_id === hostId && h.status === "online");
-      const agentId = newest?.agent_id;
-      if (hostUsable && agentId != null && agents.some((a) => a.id === agentId)) {
-        writes.agentId = agentId;
-      } else if (lastAgentId) {
-        // A failed lookup, agent-less/unusable session, or retired agent
-        // still seeds the last-used agent so the composer never sits
-        // without one.
+      if (config?.agentId != null && agents.some((a) => a.id === config.agentId)) {
+        writes.agentId = config.agentId;
+      } else if (lastAgentId && agents.some((a) => a.id === lastAgentId)) {
+        // No configured agent (or it's no longer available) — seed the
+        // last-used agent so the composer never sits without one.
         writes.agentId = lastAgentId;
       }
     }
@@ -113,80 +120,46 @@ function settled(state: ProjectPrefillState): ProjectPrefillState {
   return { ...state, phase: "settled" };
 }
 
-/** Advance the host → workspace → branch → settled track, adding any slot
- *  write to `writes`. null = this track is waiting on data. */
+/** Seed host (+ workspace) from config, then settle. null = waiting on data. */
 function locationStep(
   state: ProjectPrefillState,
   inputs: ProjectPrefillInputs,
   writes: ProjectPrefillWrites,
 ): ProjectPrefillState | null {
-  if (state.phase === "host") {
-    // Just the wait point: the workspace phase writes host and workspace
-    // TOGETHER once the source repo resolves, so a failed resolution can't
-    // leave a host seeded with a generic workspace (half a template).
-    const { newest, newestFailed, hosts } = inputs;
-    if ((newest === undefined && !newestFailed) || hosts === undefined) return null;
-    return { ...state, phase: "workspace" };
-  }
+  if (state.phase !== "location") return null;
+  const { hosts, selectedHostId, config } = inputs;
 
-  if (state.phase === "workspace") {
-    const { newest, hosts, sourceWorktrees, sourceWorktreesFailed, selectedHostId } = inputs;
-    const hostId = newest?.host_id ?? null;
-    const sourceWorkspace = newest?.workspace ?? null;
-    if (
-      newest == null ||
-      hostId === null ||
-      sourceWorkspace === null ||
-      // The user picked the sandbox or a different host while the lookup was
-      // in flight — this workspace belongs to the newest session's host.
-      inputs.sandboxSelected ||
-      (selectedHostId !== null && selectedHostId !== hostId) ||
-      // Online only: the picker disables offline hosts, so seeding one would
-      // set up a create that can only fail instead of falling back.
-      !(hosts ?? []).some((h) => h.host_id === hostId && h.status === "online")
-    ) {
-      // Nothing seedable: empty project, sandbox-origin or host-less
-      // session, or the host is gone or offline.
-      return settled(state);
-    }
-    if (newest.git_branch == null) {
-      writes.hostId = hostId;
-      writes.workspace = sourceWorkspace;
-      return { ...state, phase: "branch", seededWorkspace: sourceWorkspace };
-    }
-    if (sourceWorktreesFailed) return settled(state);
-    if (sourceWorktrees === undefined) return null; // still resolving
-    const main = sourceWorktrees.find((w) => w.is_main);
-    if (main === undefined) return settled(state);
-    writes.hostId = hostId;
-    writes.workspace = main.path;
-    return { ...state, phase: "branch", seededWorkspace: main.path };
-  }
-
-  if (state.phase === "branch") {
-    const { workspaceTrimmed, hostWorktrees, hostWorktreesFailed, branchName, prefilledBranch } =
-      inputs;
-    // A sandbox create ignores workspace and branch, and its disabled
-    // worktree query would leave this phase waiting forever.
-    if (inputs.sandboxSelected) return settled(state);
-    // The seeded repo is no longer in the field — leave the branch alone.
-    if (workspaceTrimmed === "" || workspaceTrimmed !== state.seededWorkspace) {
-      return settled(state);
-    }
-    // Settle on a failed listing rather than wait forever — a stuck machine
-    // would keep the generic defaults gated off.
-    if (hostWorktreesFailed) return settled(state);
-    if (hostWorktrees === undefined) return null;
-    if (!hostWorktrees.some((w) => w.is_main)) {
-      return settled(state); // not a git repo
-    }
-    // Never clobber a typed branch or a worktree prefill.
-    if (branchName === "" && prefilledBranch === "") {
-      const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-      writes.branch = `worktree-${suffix}`;
+  // A stored sandbox default: select the sandbox (gated on the server still
+  // offering it), unless the user already picked a host / the sandbox. The
+  // sandbox sentinel is never a real host id, so it's handled before the
+  // online-host lookup below. Mirrors the composer's last-choice sandbox path.
+  if (config?.hostId === SANDBOX_HOST_CHOICE) {
+    if (inputs.managedSandboxesEnabled && !inputs.sandboxSelected && selectedHostId === null) {
+      writes.selectSandbox = true;
     }
     return settled(state);
   }
 
-  return null; // settled
+  // The online check needs the host list — wait for it.
+  if (hosts === undefined) return null;
+
+  // Seed the configured host only when it's online (silently dropped
+  // otherwise, so an offline default can't set up a create that only fails),
+  // and only when the user hasn't already picked a different host / the sandbox.
+  const configHostOnline =
+    config?.hostId != null &&
+    hosts.some((h) => h.host_id === config.hostId && h.status === "online");
+  const configHostUsable =
+    configHostOnline &&
+    !inputs.sandboxSelected &&
+    (selectedHostId === null || selectedHostId === config!.hostId);
+  if (configHostUsable) {
+    writes.hostId = config!.hostId;
+    // A configured workspace seeds the field; without one, the composer's
+    // home-fallback fills it. Any opt-in worktree (config.useWorktree) is
+    // handled by a dedicated post-settle effect once the workspace is in place
+    // (see NewChatDialog's worktree effect).
+    if (config!.workspace != null) writes.workspace = config!.workspace;
+  }
+  return settled(state);
 }

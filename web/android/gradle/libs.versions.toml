@@ -7,6 +7,7 @@ agp = "8.6.1"
 kotlin = "2.0.20"
 androidxCore = "1.13.1"
 androidxActivity = "1.9.2"
+androidxAppcompat = "1.7.0"
 androidxWebkit = "1.12.1"
 junit = "4.13.2"
 robolectric = "4.14.1"
@@ -18,6 +19,7 @@ playPublisher = "3.12.1"
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "androidxCore" }
 androidx-activity = { group = "androidx.activity", name = "activity-ktx", version.ref = "androidxActivity" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "androidxAppcompat" }
 androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "androidxWebkit" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }

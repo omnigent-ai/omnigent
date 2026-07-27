@@ -220,7 +220,13 @@ memory = ["hindsight-client>=0.4.0"]
 # installs resolve it from `integrations/slack` via [tool.uv.sources] below;
 # publishing `omnigent[slack]` to an index additionally requires publishing
 # `omnigent-slack` there (not yet wired into the release pipeline).
-slack = ["omnigent-slack"]
+# Version-locked (==) with the lockstep cycle — `scripts/update_versions.py`
+# keeps this pin in sync with the other sibling `==` pins
+# (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
+# `[project].version` in `integrations/slack/pyproject.toml`.
+slack = [
+    "omnigent-slack==0.7.0.dev0",
+]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a
     # default dependency (it moved here from `dependencies` above).

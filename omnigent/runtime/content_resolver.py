@@ -521,14 +521,21 @@ def _resolve_content_type(
     :param stored_type: The content_type from file metadata, or
         ``None``.
     :param filename: The original filename, e.g. ``"report.md"``.
+    MIME parameters are stripped and the stored type is lowercased so inline
+    data URIs and upload validation use a canonical bare media type.
+
     :returns: A MIME type string.
     """
     import mimetypes as _mt
     from pathlib import PurePath
 
+    normalized_stored_type = None
+    if stored_type:
+        normalized_stored_type = stored_type.split(";", 1)[0].strip().lower() or None
+
     # Use stored type if it's specific (not the generic fallback).
-    if stored_type and stored_type != "application/octet-stream":
-        return stored_type
+    if normalized_stored_type and normalized_stored_type != "application/octet-stream":
+        return normalized_stored_type
 
     if filename:
         suffix = PurePath(filename).suffix.lower()
@@ -545,4 +552,4 @@ def _resolve_content_type(
         if suffix in {".txt", ".log", ".cfg", ".ini", ".env"}:
             return "text/plain"
 
-    return stored_type or "application/octet-stream"
+    return normalized_stored_type or "application/octet-stream"

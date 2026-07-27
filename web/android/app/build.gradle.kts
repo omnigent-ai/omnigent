@@ -101,8 +101,41 @@ play {
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity)
+    implementation(libs.androidx.appcompat)
     implementation(libs.androidx.webkit)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)
     testImplementation(libs.androidx.test.core)
+}
+
+// Local development helpers — these delegate to adb so they work with physical
+// devices or any running emulator.
+tasks.register<Exec>("listDevices") {
+    description = "List attached Android devices/emulators"
+    group = "install"
+    commandLine("adb", "devices", "-l")
+}
+
+tasks.register("runDebug") {
+    description = "Install and launch the debug APK on a device/emulator"
+    group = "install"
+    dependsOn("installDebug")
+    doLast {
+        exec {
+            commandLine(
+                "adb",
+                "shell",
+                "am",
+                "start",
+                "-n",
+                "ai.omnigent.android/.MainActivity",
+            )
+        }
+    }
+}
+
+tasks.register<Exec>("reverseProxy") {
+    description = "Forward local port 8000 to the Android device/emulator (adb reverse)"
+    group = "install"
+    commandLine("adb", "reverse", "tcp:8000", "tcp:8000")
 }

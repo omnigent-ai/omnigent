@@ -78,7 +78,10 @@ vi.mock("@/hooks/useConversations", () => ({
     const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
     const idSet = new Set(ids);
     return {
-      data: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+      data: {
+        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+        filterHonored: true,
+      },
       isSuccess: true,
     };
   },
@@ -111,6 +114,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+  useProjectConfig: () => ({ data: undefined, isLoading: false }),
+  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   fetchProjectSessionIds: () => Promise.resolve([]),
   PROJECT_LABEL_KEY: "omni_project",
 }));
@@ -259,6 +264,17 @@ describe("quick pin/unpin hover button", () => {
     const rowLink = screen.getByRole("link", { name: "My Session" });
     expect(rowLink).toHaveClass("w-full");
     expect(rowLink).not.toHaveClass("w-[calc(100%+1rem)]");
+  });
+
+  it("holds action padding while the kebab menu is open", () => {
+    renderSidebar();
+
+    const rowLink = screen.getByRole("link", { name: "My Session" });
+    expect(rowLink).not.toHaveClass("md:pr-14");
+
+    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+
+    expect(rowLink).toHaveClass("md:pr-14");
   });
 
   it("sizes the project-folder header controls to match the session-row kebab", () => {
@@ -466,7 +482,13 @@ describe("pinned row project flyout", () => {
     // Seed the pin so the row lifts into the always-expanded Pinned section
     // (a project-owned row otherwise sits inside a collapsed project folder).
     mocks.pinnedStore.set(["conv_1"]);
-    mockConversations([{ ...CONV, labels: { omni_project: "Moonshot" } }]);
+    mockConversations([
+      {
+        ...CONV,
+        labels: { omni_project: "Moonshot" },
+        git_branch: "fix/sidebar-row-height",
+      },
+    ]);
     renderSidebar();
     expect(screen.getByText("Pinned")).toBeInTheDocument();
 
@@ -482,6 +504,9 @@ describe("pinned row project flyout", () => {
     // `text-sm` that scaled with the UI font-size setting.
     expect(flyoutTitle).toHaveClass("sidebar-compact-text");
     expect(flyoutTitle).not.toHaveClass("text-sm");
+    expect(within(flyout).getByTestId("pinned-project-flyout-branch")).toHaveTextContent(
+      "fix/sidebar-row-height",
+    );
   });
 
   it("renders no project flyout for a pinned row with no project", () => {
