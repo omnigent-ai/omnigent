@@ -1014,6 +1014,59 @@ def test_fetch_model_pricing_directly_routed_id_no_openrouter_pricing(
     assert not or_api_called, "OpenRouter API was called for a directly-routed provider id"
 
 
+def test_fetch_model_pricing_known_provider_transient_catalog_failure_no_openrouter_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (#3) A known direct provider's OWN catalog fetch failing transiently
+    (network error -> ``models is None``) must NOT fall through to
+    OpenRouter pricing.
+
+    ``models is None`` is ambiguous between "unrecognized provider" (safe to
+    fall through) and "recognized provider whose catalog fetch just failed"
+    (must not fall through). Gating on ``models is None`` alone -- rather
+    than on whether the provider is one Omnigent routes directly -- would
+    let a one-off timeout fetching openai.json mis-price
+    ``openai/gpt-4o`` at OpenRouter's public rate for up to an hour.
+    """
+    monkeypatch.delenv("OMNIGENT_DISABLE_CATALOG_LOOKUP", raising=False)
+    context_window._live_pricing_cache.clear()
+
+    or_api_called = False
+
+    def _boom(url: str, timeout: int = 3):
+        nonlocal or_api_called
+        or_api_called = True
+        raise AssertionError("OpenRouter API should not be called for a known direct provider")
+
+    def _catalog(provider: str) -> dict[str, Any] | None:
+        # Simulate a transient failure fetching the openai catalog (e.g. a
+        # timeout) -- returns None just like an unrecognized provider would,
+        # but "openai" IS a provider Omnigent routes directly.
+        if provider == "openai":
+            return None
+        if provider == "openrouter":
+            return {
+                "openai/gpt-4o": {
+                    "pricing": {
+                        "input_per_million_tokens": 99.0,
+                        "output_per_million_tokens": 99.0,
+                    }
+                }
+            }
+        return None
+
+    monkeypatch.setattr(context_window, "_fetch_mlflow_provider_catalog", _catalog)
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+
+    pricing = fetch_model_pricing("openai/gpt-4o")
+    assert pricing is None, (
+        "A known direct provider's transient catalog failure must return None, "
+        f"not fall through to OpenRouter pricing. Got {pricing!r}"
+    )
+    assert not or_api_called, "OpenRouter API was called despite a known direct provider"
+
+
 def test_fetch_model_pricing_two_cold_models_single_download(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -54,6 +54,13 @@ _MODEL_PREFIX_TO_PROVIDER: dict[str, str] = {
     "mistral-": "mistral",
 }
 
+# Providers Omnigent routes directly for explicit ``vendor/model`` ids.
+# :func:`fetch_model_pricing` gates its OpenRouter fallbacks on this set so a
+# transient catalog-fetch failure for one of these providers (``models is
+# None``) can't be mistaken for "unrecognized provider" and mis-price e.g.
+# ``openai/gpt-4o`` at OpenRouter's public rate.
+_KNOWN_DIRECT_PROVIDERS: frozenset[str] = frozenset(_MODEL_PREFIX_TO_PROVIDER.values())
+
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
 # Omnigent's authoritative context-window registry, consulted BEFORE litellm
@@ -697,20 +704,14 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
     # design, because the bare form is what pi reports for all OpenRouter
     # dispatches.
     #
-    # (#3) GATE: the OpenRouter fallbacks apply when EITHER:
-    #   (a) an explicit ``openrouter/`` prefix was present (or_model != model), OR
-    #   (b) the head segment is NOT a recognized direct MLflow provider
-    #       (models is None -- the provider catalog does not exist).
-    # BLOCK: when the head IS a recognized provider whose own catalog was
-    # consulted (models is not None), the OpenRouter fallbacks are skipped
-    # so ``openai/gpt-4o`` never silently gets OpenRouter public rates.
-    #
-    # The signal: ``models`` is ``None`` when the provider catalog does not
-    # exist (unknown provider or network error).  It is a (possibly empty)
-    # dict when the provider IS recognized.  A recognized provider with a
-    # missing model returns ``None`` from this function (the caller skips
-    # pricing); an unrecognized provider (e.g. "xiaomi", "z-ai") falls
-    # through to the OpenRouter catalogs below.
+    # (#3) GATE: OpenRouter fallbacks apply only for an explicit
+    # ``openrouter/`` prefix (or_model != model) or a provider outside
+    # _KNOWN_DIRECT_PROVIDERS. Gating on the provider name rather than on
+    # ``models is None`` matters because that signal is ambiguous: it's
+    # ``None`` both for an unrecognized provider (safe to fall through) and
+    # for a known provider's catalog fetch failing transiently (must NOT
+    # fall through, or a one-off timeout mis-prices e.g. ``openai/gpt-4o``
+    # at OpenRouter's rate for up to an hour).
 
     # OpenRouter vendor/model retry.  For bare ``vendor/model`` ids from
     # unrecognized providers (e.g. ``xiaomi/mimo-v2.5-pro``,
@@ -721,9 +722,9 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
     # so ``openrouter/vendor/model`` matches the catalog key
     # ``vendor/model``.
     #
-    # The condition: explicit ``openrouter/`` prefix OR no own-provider
-    # catalog (unrecognized provider).
-    if or_model != model or models is None:
+    # The condition: explicit ``openrouter/`` prefix OR provider is not one
+    # Omnigent routes directly.
+    if or_model != model or provider not in _KNOWN_DIRECT_PROVIDERS:
         or_models = _fetch_mlflow_provider_catalog("openrouter")
         if or_models is not None:
             entry = or_models.get(or_model)
