@@ -3383,7 +3383,8 @@ async def test_result_message_is_error_yields_executor_error() -> None:
     turns = [e for e in events if isinstance(e, TurnComplete)]
     for t in turns:
         assert "Not logged in" not in (t.response or ""), (
-            "Failure text must not appear in TurnComplete.response — it leaked as assistant content."
+            "Failure text must not appear in TurnComplete.response"
+            " — it leaked as assistant content."
         )
 
 
