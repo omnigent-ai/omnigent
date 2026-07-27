@@ -149,6 +149,10 @@ function FileTabsStrip({
   useEffect(() => {
     activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [activeFilePath]);
+  // Render nothing (not an empty flex row) when there are no files — an empty
+  // wrapper would still consume a slot in the parent's gap-0.5 and leave a
+  // phantom gap before the next element.
+  if (openFiles.length === 0) return null;
   return (
     <div className="flex items-center gap-0.5">
       {openFiles.map((path) => {
@@ -255,6 +259,10 @@ function TerminalTabsStrip({
   useEffect(() => {
     activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [activeTerminalKey]);
+  // Render nothing (not an empty flex row) when there are no shells — an empty
+  // wrapper would still consume a slot in the parent's gap-0.5 and leave a
+  // phantom gap before the next element (e.g. the trailing "+").
+  if (openTerminals.length === 0) return null;
   return (
     <div className="flex items-center gap-0.5">
       {openTerminals.map((key) => {
@@ -614,21 +622,23 @@ export function WorkspacePanel({
                 triggerClassName="-ml-0.5"
               />
             </div>
-            {/* 1px divider separating the open tabs from the static tabs.
-                Only meaningful in the ≥500px case where the static tabs are
-                anchored; in the <500px whole-strip-scroll case there's no fixed
-                boundary, so hide it. */}
+            {/* 1px divider separating the open tabs from the static tabs. It's
+                the leftmost element of the right cluster (divider + nav tabs +
+                maximize), so it carries the row's single ml-auto that pushes
+                that whole cluster flush right — keeping the divider glued to the
+                nav group instead of stranded by the auto-gap. */}
             <div
               aria-hidden
-              className="mx-[4px] hidden h-[14px] w-px shrink-0 self-center bg-border-strong @min-[500px]/rail:block"
+              className="mx-[4px] ml-auto h-[14px] w-px shrink-0 self-center bg-border-strong"
             />
           </>
         )}
         <Tabs
           // Static group — never compresses (shrink-0). When open tabs exist
-          // the flexible open-tabs region above pushes this group to the right;
-          // with no open tabs it stays anchored on the left (the maximize
-          // button's ml-auto owns the right edge in that case).
+          // the divider before it owns the row's ml-auto and drags this group
+          // (and the trailing maximize) flush right; with no open tabs there's
+          // no divider, so the maximize button owns ml-auto and this group
+          // stays left. Exactly one ml-auto in the row either way.
           className="shrink-0"
           // When a file or shell tab is active no fixed trigger should
           // highlight, so feed the radix group a sentinel that matches none of
@@ -726,15 +736,14 @@ export function WorkspacePanel({
         {openFiles.length === 0 && openTerminals.length === 0 && (
           <NewTabMenu conversationId={conversationId} onOpenTerminal={openTerminalTab} />
         )}
-        {/* Maximize/minimize toggle, pinned to the rightmost edge. ml-auto
-            claims all leading space so it hugs the right whether or not open
-            tabs (which own their own flexible region) are present. pl-1 keeps a
-            consistent gap from the preceding nav tabs when they sit flush (open
-            tabs present → ml-auto collapses to zero), matching the gap-1 spacing
-            between the nav tab icons themselves. */}
+        {/* Maximize/minimize toggle, at the rightmost edge. It owns the row's
+            single ml-auto ONLY when there are no open tabs (nav group stays
+            left, this pins right). With open tabs the nav group carries ml-auto
+            and this button just trails it — a second ml-auto here would split
+            the free space and strand the nav group mid-strip. */}
         <WorkspaceTabTooltip
           label={maximized ? "Exit full screen" : "Full screen"}
-          className="ml-auto pl-0.5"
+          className={cn(openFiles.length === 0 && openTerminals.length === 0 && "ml-auto")}
         >
           <button
             type="button"

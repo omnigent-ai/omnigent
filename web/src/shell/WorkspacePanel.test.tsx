@@ -430,6 +430,74 @@ describe("WorkspacePanel maximize", () => {
   });
 });
 
+describe("WorkspacePanel tab-strip layout (regression)", () => {
+  const declaresShell = () =>
+    useSessionAgentMock.mockReturnValue({ data: { terminals: ["zsh"] } } as unknown as ReturnType<
+      typeof useSessionAgent
+    >);
+
+  // The row containing the fixed nav tabs — the tab strip.
+  const strip = () => screen.getByRole("tab", { name: /files/i }).closest("div.border-b")!;
+
+  it("keeps exactly one ml-auto in the strip with no open tabs (maximize pins right)", () => {
+    // Two ml-auto siblings split the free space and strand the nav group
+    // mid-strip. With no open tabs the single ml-auto lives on the maximize
+    // button; the nav group must NOT also carry one.
+    renderWorkspace({ openFiles: [], showBrowserTab: true });
+
+    expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
+    // It's the maximize button's wrapper (pins the button right).
+    const fullScreen = screen.getByRole("button", { name: "Full screen" });
+    expect(fullScreen.parentElement).toHaveClass("ml-auto");
+    // The nav tablist stays left — no ml-auto.
+    expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
+  });
+
+  it("keeps exactly one ml-auto in the strip with open tabs (divider pins the right cluster)", () => {
+    // With open tabs the single ml-auto moves to the divider, which drags the
+    // nav group + maximize right together. Neither the nav group nor the
+    // maximize button may add a second ml-auto.
+    renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
+
+    expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
+    // The nav tablist and the maximize button both trail the divider — no
+    // ml-auto of their own.
+    expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
+    expect(screen.getByRole("button", { name: "Full screen" }).parentElement).not.toHaveClass(
+      "ml-auto",
+    );
+    // The divider (aria-hidden, no container-query gate) is present so it shows
+    // at any rail width.
+    const divider = strip().querySelector(".bg-border-strong");
+    expect(divider).not.toBeNull();
+    expect(divider).toHaveClass("ml-auto");
+    expect(divider).not.toHaveClass("@min-[500px]/rail:block");
+  });
+
+  it("does not leave a phantom gap: empty tab strips render nothing, so the '+' hugs the last tab", () => {
+    // FileTabsStrip / TerminalTabsStrip must return null when empty — an empty
+    // wrapper would still occupy a slot in the region's gap and push the "+"
+    // away from the last tab. With a file open (and no shells), the open-tabs
+    // region should hold exactly two children: the file-tabs strip and the "+".
+    declaresShell();
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+
+    const plus = screen.getByRole("button", { name: "Open new" });
+    const region = plus.closest("div.\\@min-\\[500px\\]\\/rail\\:flex-1")!;
+    expect(region.children).toHaveLength(2);
+    // The "+" hugs the last tab by cancelling the region gap.
+    expect(plus.parentElement).toHaveClass("-ml-0.5");
+  });
+
+  it("gives the full-screen button no left padding", () => {
+    // The maximize button must not carry a pl-* gap — it sits flush against the
+    // preceding nav icon like the rest of the strip.
+    renderWorkspace({ openFiles: [] });
+    const fullScreen = screen.getByRole("button", { name: "Full screen" });
+    expect(fullScreen.parentElement).not.toHaveClass("pl-0.5");
+  });
+});
+
 describe("WorkspacePanel browser tab", () => {
   it("renders the Browser tab only when showBrowserTab is set", () => {
     renderWorkspace({ showBrowserTab: true });
