@@ -629,7 +629,7 @@ def list_models_for_worker(
     canonical = (harness or "").lower().replace("-", "").replace("_", "")
     use_uc = canonical in {h.replace("-", "").replace("_", "") for h in _pi_harnesses}
     if use_uc and provider.kind == DATABRICKS_KIND:
-        uc_key = ("uc",) + _listing_cache_key(provider)
+        uc_key = ("uc", *_listing_cache_key(provider))
         with _listing_cache_lock:
             cached = _listing_cache.get(uc_key)
         if cached is not None:

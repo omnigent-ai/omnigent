@@ -494,7 +494,7 @@ def _databricks_transport(
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve both /api/2.0/serving-endpoints (non-pi) and /api/2.1/unity-catalog/model-services (pi)."""
+        """Serve /api/2.0/serving-endpoints (non-pi) and /api/2.1/unity-catalog/model-services (pi)."""
         requests_seen.append(request)
         if request.url.path == "/api/2.0/serving-endpoints":
             return httpx.Response(200, json=_SERVING_ENDPOINTS_PAGE)
