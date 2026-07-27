@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 from pathlib import Path
 from types import ModuleType
 
@@ -24,29 +23,12 @@ def _load_publisher() -> ModuleType:
     return module
 
 
-def test_publisher_resolves_virtual_path_from_managed_artifact_dir(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    artifact_dir = tmp_path / "managed-artifacts"
-    entry = artifact_dir / "revenue" / "index.html"
-    entry.parent.mkdir(parents=True)
-    entry.write_text("<h1>Revenue</h1>")
-    (entry.parent / "app.js").write_text("console.log('ok')")
-    unrelated_cwd = tmp_path / "workspace"
-    unrelated_cwd.mkdir()
-    monkeypatch.chdir(unrelated_cwd)
-    monkeypatch.setenv("OMNIGENT_ARTIFACT_DIR", str(artifact_dir))
-
+def test_publisher_declaration_defers_to_managed_artifact_backend() -> None:
     module = _load_publisher()
-    payload = json.loads(
+
+    with pytest.raises(RuntimeError, match="requires the managed artifact backend"):
         module.publish_design_artifact(
             entry_path="artifacts/revenue/index.html",
             title="Revenue",
             operation="created",
         )
-    )
-
-    assert payload["ok"] is True
-    assert payload["entry_path"] == "artifacts/revenue/index.html"
-    assert payload["resource_count"] == 2

@@ -688,6 +688,7 @@ def test_ensure_default_willy_agent_seeds_design_bundle(seed_stores: _SeedStores
         "review-product-ui",
     ]
     assert [tool.name for tool in loaded.spec.local_tools] == ["publish_design_artifact"]
+    assert loaded.spec.skills_filter == "none"
     artifact_instructions = server_app._WILLY_BUNDLE_SOURCE / "artifacts.md"
     assert loaded.spec.instructions == artifact_instructions.read_text()
     assert "virtual `artifacts/`" in loaded.spec.instructions
@@ -704,9 +705,19 @@ def test_ensure_default_willy_agent_seeds_design_bundle(seed_stores: _SeedStores
     assert deny_shell.function is not None
     assert deny_shell.function.path == "omnigent.inner.nessie.policies.deny_tools"
     assert deny_shell.function.arguments == {
-        "tool_names": ["sys_os_shell"],
+        "tool_names": ["sys_os_shell", "Bash", "bash", "Shell"],
         "deny_reason": "Willy artifacts use virtual filesystem tools; shell access is disabled.",
     }
+    artifact_paths_only = next(
+        policy
+        for policy in loaded.spec.guardrails.policies
+        if policy.name == "artifact_paths_only"
+    )
+    assert artifact_paths_only.function is not None
+    assert (
+        artifact_paths_only.function.path
+        == "omnigent.inner.nessie.policies.require_artifact_paths"
+    )
 
 
 def test_ensure_default_agents_includes_willy(seed_stores: _SeedStores) -> None:

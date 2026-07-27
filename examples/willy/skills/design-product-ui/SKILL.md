@@ -54,4 +54,5 @@ or dashboard artifact.
 ## Output
 
 Leave the artifact as working files under `artifacts/`. Do not publish it yet;
-the `review-product-ui` skill must run first.
+the `review-product-ui` source preflight must run first. Rendered inspection and
+element-level feedback happen after publication in the Artifacts workspace.
