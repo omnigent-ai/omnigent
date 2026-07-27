@@ -76,6 +76,7 @@ import {
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
   isCodexHarness,
+  isNativeCursorHarness,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -549,15 +550,6 @@ function harnessWarningMessage(
   reason: string | null,
   harness: string | null | undefined,
 ): ReactNode {
-  if (reason === "cursor-cli-missing") {
-    return (
-      <>
-        {agentName} needs cursor-agent on {hostName} — install it with{" "}
-        <code>curl https://cursor.com/install -fsS | bash</code>, then run{" "}
-        <code>cursor-agent login</code>.
-      </>
-    );
-  }
   const isCodex = !!harness && isCodexHarness(harness);
   if (reason === "needs-auth" && isCodex) {
     return (
@@ -567,12 +559,22 @@ function harnessWarningMessage(
       </>
     );
   }
-  if (reason === "binary-missing" && isCodex) {
+  if (reason === "needs-auth" && !!harness && isNativeCursorHarness(harness)) {
     return (
       <>
-        {agentName} can&apos;t find the Codex binary on {hostName} — if codex is installed, restart
-        the host with <code>omnigent host</code> so it picks up your PATH, or set{" "}
-        <code>OMNIGENT_CODEX_PATH</code>. Otherwise run <code>omni setup</code>.
+        {agentName} needs Cursor login on {hostName} — run <code>cursor-agent login</code> on that
+        machine.
+      </>
+    );
+  }
+  // ``version-too-low`` is a uniform state across all CLI harnesses now that
+  // the server checks supported version ranges. Keep the message generic so
+  // the user is nudged toward setup rather than being told the CLI is missing.
+  if (reason === "version-too-low") {
+    return (
+      <>
+        {agentName} has an outdated CLI on {hostName} — run <code>omni setup</code>, or upgrade the
+        CLI directly on that machine.
       </>
     );
   }

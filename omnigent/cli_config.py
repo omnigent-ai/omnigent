@@ -1345,6 +1345,7 @@ def _prompt_install_harness(family: str) -> bool:
     """
     from omnigent.onboarding.configure_models import family_label
     from omnigent.onboarding.harness_install import (
+        harness_cli_version,
         harness_install_command,
         install_harness_cli,
     )
@@ -1352,8 +1353,17 @@ def _prompt_install_harness(family: str) -> bool:
 
     label = family_label(family)
     cmd = " ".join(harness_install_command(family))
+    detected_version, range_str = harness_cli_version(family)
+    if detected_version is None:
+        prompt = f"{label}'s CLI is missing. Install it now?"
+    else:
+        prompt = f"{label}'s CLI is installed ({detected_version}) but not supported."
+        if range_str:
+            prompt += f" Required version: {range_str}."
+        prompt += " Upgrade it now?"
+
     choice = select(
-        f"{label}'s CLI isn't installed. Install it now?",
+        prompt,
         [
             f"Yes — install ({cmd})",
             "No — back to harnesses",
@@ -1396,9 +1406,10 @@ def _manage_harness_providers(family: str) -> None:
     from omnigent.onboarding.harness_install import harness_cli_installed
     from omnigent.onboarding.interactive import select
 
-    # If the harness CLI isn't installed, offer to install it before showing
-    # the credential menu. Declining (or copy-the-command) returns to the
-    # harness picker — there's nothing to configure for a harness you can't run.
+    # If the harness CLI is missing or on an unsupported version, offer to
+    # install/upgrade it before showing the credential menu. Declining (or
+    # copy-the-command) returns to the harness picker — there's nothing to
+    # configure for a harness you can't run.
     if not harness_cli_installed(family) and not _prompt_install_harness(family):
         return
 
@@ -1651,17 +1662,20 @@ def _manage_cursor_harness() -> None:
         CURSOR_KEY,
         harness_cli_installed,
         harness_cli_logged_in,
+        harness_install_spec,
     )
     from omnigent.onboarding.interactive import select
 
     while True:
-        cli_status = (
-            "logged in"
-            if harness_cli_logged_in(CURSOR_KEY)
-            else "needs login"
-            if harness_cli_installed(CURSOR_KEY)
-            else "not installed"
-        )
+        from omnigent._platform import resolve_cli_binary
+
+        cli_installed = harness_cli_installed(CURSOR_KEY)
+        if cli_installed:
+            cli_status = "logged in" if harness_cli_logged_in(CURSOR_KEY) else "needs login"
+        elif resolve_cli_binary(harness_install_spec(CURSOR_KEY).binary) is not None:
+            cli_status = "needs upgrade"
+        else:
+            cli_status = "not installed"
         sdk_status = "API key configured" if cursor_api_key_configured() else "not configured"
         rows = [
             _HarnessMenuRow(f"Cursor CLI — {cli_status}", action="cli"),
@@ -3051,8 +3065,8 @@ def _manage_opencode_harness() -> None:
     synthesized into opencode's per-session config instead — set under
     Claude / Codex.)
 
-    OpenCode is npm-installable, so a missing CLI gates the drill-in with an
-    install offer.
+    OpenCode is npm-installable, so a missing or outdated CLI gates the
+    drill-in with an install/upgrade offer.
 
     :returns: None. Side effect: may ``npm install`` the opencode CLI.
     """
@@ -3067,7 +3081,7 @@ def _manage_opencode_harness() -> None:
     if not harness_cli_installed(OPENCODE_KEY):
         cmd = " ".join(harness_install_command(OPENCODE_KEY))
         choice = select(
-            "OpenCode's CLI isn't installed. Install it now?",
+            "OpenCode's CLI is missing or on an unsupported version. Install/upgrade it now?",
             [
                 f"Yes — install ({cmd})",
                 "No — back to harnesses",
@@ -3273,6 +3287,20 @@ def _run_configure_harnesses_interactive() -> None:
         "action": ("", "cyan"),
     }
 
+    def _cli_absence_label(key: str) -> str:
+        """Return a status label that distinguishes "missing" from "outdated".
+
+        When the binary is on PATH but ``harness_cli_installed`` is False, the
+        CLI is installed but on an unsupported version; saying "Not installed"
+        in that case is confusing for a user who knows they have the CLI.
+        """
+        from omnigent._platform import resolve_cli_binary
+
+        spec = harness_install_spec(key)
+        if spec is not None and resolve_cli_binary(spec.binary) is not None:
+            return "Needs upgrade"
+        return "Not installed"
+
     def _install_hint(command: str) -> str:
         # Selection-only tooltip. The command is escaped so a bracketed extra
         # (e.g. ``pip install "omnigent[cursor]"``) renders literally instead of
@@ -3304,7 +3332,7 @@ def _run_configure_harnesses_interactive() -> None:
             return (
                 fam,
                 name,
-                "Not installed",
+                _cli_absence_label(fam),
                 "missing",
                 _install_hint(" ".join(harness_install_command(fam))),
             )
@@ -3376,7 +3404,7 @@ def _run_configure_harnesses_interactive() -> None:
                 (
                     _OPENCODE,
                     "OpenCode",
-                    "Not installed",
+                    _cli_absence_label(OPENCODE_KEY),
                     "missing",
                     _install_hint(" ".join(harness_install_command(OPENCODE_KEY))),
                 ),
@@ -3409,7 +3437,13 @@ def _run_configure_harnesses_interactive() -> None:
                 else "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
             )
             rows.append(
-                (_HERMES, "Hermes", "Not installed", "missing", _install_hint(hermes_hint)),
+                (
+                    _HERMES,
+                    "Hermes",
+                    _cli_absence_label(HERMES_KEY),
+                    "missing",
+                    _install_hint(hermes_hint),
+                ),
             )
         elif hermes.ready:
             rows.append((_HERMES, "Hermes", hermes.describe(), "ready", ""))
@@ -3459,7 +3493,7 @@ def _run_configure_harnesses_interactive() -> None:
                 (
                     _QWEN,
                     "Qwen Code",
-                    "Not installed",
+                    _cli_absence_label(QWEN_KEY),
                     "missing",
                     _install_hint(" ".join(harness_install_command(QWEN_KEY))),
                 ),
@@ -3485,7 +3519,15 @@ def _run_configure_harnesses_interactive() -> None:
                 if goose_spec and goose_spec.install_hint
                 else "brew install block-goose-cli"
             )
-            rows.append((_GOOSE, "Goose", "Not installed", "missing", _install_hint(goose_hint)))
+            rows.append(
+                (
+                    _GOOSE,
+                    "Goose",
+                    _cli_absence_label(GOOSE_KEY),
+                    "missing",
+                    _install_hint(goose_hint),
+                )
+            )
         else:
             goose_summary = goose_config_summary()
             if goose_summary.provider:
@@ -3535,7 +3577,9 @@ def _run_configure_harnesses_interactive() -> None:
                 if kiro_spec and kiro_spec.install_hint
                 else "curl -fsSL https://cli.kiro.dev/install | bash"
             )
-            rows.append((_KIRO, "Kiro", "Not installed", "missing", _install_hint(kiro_hint)))
+            rows.append(
+                (_KIRO, "Kiro", _cli_absence_label(KIRO_KEY), "missing", _install_hint(kiro_hint))
+            )
 
         # Kimi Code — native CLI, own auth via `kimi login`; there is no local
         # login status probe yet. Curl-installed (no npm package), so use its
@@ -3547,7 +3591,15 @@ def _run_configure_harnesses_interactive() -> None:
         else:
             kimi_spec = harness_install_spec(KIMI_KEY)
             kimi_hint = (kimi_spec.install_hint if kimi_spec else None) or "see Kimi Code docs"
-            rows.append((_KIMI, "Kimi Code", "Not installed", "missing", _install_hint(kimi_hint)))
+            rows.append(
+                (
+                    _KIMI,
+                    "Kimi Code",
+                    _cli_absence_label(KIMI_KEY),
+                    "missing",
+                    _install_hint(kimi_hint),
+                )
+            )
 
         # Custom ACP agents — the generic `acp` harness driving any user-configured
         # ACP-agent command. Each configured agent gets its own overview row

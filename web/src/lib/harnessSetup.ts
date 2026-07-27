@@ -43,7 +43,7 @@ export function isCodexHarness(harness: string): boolean {
   return harness === "codex" || harness === "codex-native" || harness === "native-codex";
 }
 
-function isNativeCursorHarness(harness: string): boolean {
+export function isNativeCursorHarness(harness: string): boolean {
   return harness === "cursor-native" || harness === "native-cursor";
 }
 
@@ -61,15 +61,23 @@ export function harnessUnavailableReasonOnHost(
   const availability = host.configured_harnesses[harness];
   if (availability === false) {
     if (isCodexHarness(harness)) return "binary-missing";
-    if (isNativeCursorHarness(harness)) return "cursor-cli-missing";
     return "unconfigured";
   }
   // Auth-aware CLI harnesses (codex, claude, opencode) report a structured
-  // string when installed-but-not-ready.
-  if (availability === "binary-missing" || availability === "needs-auth") {
+  // string when installed-but-not-ready. "version-too-low" can surface for
+  // any CLI-backed harness whose binary is present but too old.
+  if (
+    availability === "binary-missing" ||
+    availability === "needs-auth" ||
+    availability === "version-too-low"
+  ) {
     return availability;
   }
-  // Unknown future reason strings fall through to no warning until the UI knows their copy.
+  // Any other string from a newer/older server still means "not ready";
+  // show a generic warning rather than silently treating it as available.
+  if (typeof availability === "string") {
+    return "unconfigured";
+  }
   return null;
 }
 
@@ -97,7 +105,7 @@ export function harnessWarningBadgeText(reason: string | null, collapsed = false
   if (collapsed) return "needs setup";
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";
-  if (reason === "cursor-cli-missing") return "install & login";
+  if (reason === "version-too-low") return "outdated";
   return "needs setup";
 }
 
@@ -195,7 +203,10 @@ function stepStatus(
   availability: boolean | string | undefined,
 ): SetupStepStatus {
   if (statusKey === null || availability === undefined) return "unknown";
-  const notInstalled = availability === false || availability === "binary-missing";
+  const notInstalled =
+    availability === false ||
+    availability === "binary-missing" ||
+    availability === "version-too-low";
   if (statusKey === "installed") return notInstalled ? "todo" : "done";
   if (statusKey === "authed") return availability === true ? "done" : "todo";
   return "unknown";

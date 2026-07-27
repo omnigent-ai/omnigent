@@ -37,15 +37,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
+from packaging.version import InvalidVersion, Version
+
 from omnigent._platform import resolve_cli_binary
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+from omnigent.opencode_native_client import (
+    OPENCODE_MAX_VERSION_EXCLUSIVE,
+    OPENCODE_MIN_VERSION,
+)
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -68,6 +75,45 @@ KIMI_KEY = "kimi"
 # Kiro authenticates against its own backend and ships as a standalone native
 # installer, not an npm package managed by ``omni setup``.
 KIRO_KEY = "kiro"
+
+# Minimum CLI versions for native harnesses where the runtime has a known
+# feature floor. These are intentionally conservative: the runtime may
+# gracefully degrade on older CLIs, but setup enforces the floor so a user
+# isn't surprised by missing behaviour (e.g. policy hooks, non-interactive
+# approval, forwarder schema) after launching.
+# Sources:
+# - codex: native policy hook requires >= 0.129.0
+#   (`omnigent/codex_native_app_server.py`).
+# - pi: non-interactive ``--approve`` override requires >= 0.79.0
+#   (``omnigent/pi_native.py``).
+# - qwen: ``--input-file`` / ``--json-file`` bridge verified on v0.18.1
+#   (``omnigent/qwen_native_forwarder.py`` / ``docs/QWEN_NATIVE_DESIGN.md``).
+# - goose: SQLite forwarder schema verified on Goose 1.38.0
+#   (``omnigent/goose_native_forwarder.py``).
+# - hermes: parent_session_id schema introduced in v0.17.0
+#   (``omnigent/hermes_native_forwarder.py``).
+# - kiro: MCP config schema (``{"mcpServers": ...}``) verified on kiro-cli 2.10.0
+#   (``omnigent/kiro_native_bridge.py``).
+# - claude: `--mcp-config` (required by the native bridge) introduced long
+#   before 2026-06-01. The first Claude Code release after the cutoff is
+#   2.1.161, so use that as the supported floor.
+# - codex: native policy hook requires >= 0.129.0, but that shipped before
+#   2026-06-01. The first Codex release after the cutoff is 0.137.0.
+# - cursor: Cursor's CLI uses ``YYYY.MM.DD[-build]`` date versions. Default
+#   to the day after 2026-06-01 so we don't support stale pre-June builds.
+# - kimi: first ``kimi-cli`` release after 2026-06-01 is 1.47.0
+#   (https://github.com/MoonshotAI/kimi-cli/blob/main/CHANGELOG.md).
+# - hermes: parent_session_id schema was introduced in v0.17.0, but Hermes now
+#   ships date-tagged releases; the first one after 2026-06-01 is 2026.06.05.
+_CODEX_MIN_VERSION = "0.137.0"
+_PI_MIN_VERSION = "0.79.0"
+_QWEN_MIN_VERSION = "0.18.1"
+_GOOSE_MIN_VERSION = "1.38.0"
+_HERMES_MIN_VERSION = "2026.06.05"
+_KIRO_MIN_VERSION = "2.10.0"
+_CLAUDE_MIN_VERSION = "2.1.161"
+_CURSOR_MIN_VERSION = "2026.06.02"
+_KIMI_MIN_VERSION = "1.47.0"
 
 # OpenCode native harness CLI (``opencode serve`` / ``opencode attach``),
 # installed via the ``opencode-ai`` npm package. No login/logout/status argv
@@ -109,6 +155,9 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         logout_args=("auth", "logout"),
         status_args=("auth", "status"),
         login_status_key="loggedIn",
+        # The native bridge injects Omnigent's MCP relay via `--mcp-config`;
+        # that flag first shipped in Claude Code 0.2.75.
+        min_version=_CLAUDE_MIN_VERSION,
     ),
     OPENAI_FAMILY: HarnessInstallSpec(
         "Codex",
@@ -117,13 +166,33 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         login_args=("login",),
         logout_args=("logout",),
         status_args=("login", "status"),
+        # The native Codex policy hook requires ``codex >= 0.129.0``;
+        # anything older silently disables tool-call enforcement. Setup
+        # enforces the same floor up-front.
+        min_version=_CODEX_MIN_VERSION,
     ),
-    PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    PI_KEY: HarnessInstallSpec(
+        "Pi",
+        "pi",
+        "@earendil-works/pi-coding-agent",
+        # The ``--approve`` / non-interactive trust override requires
+        # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
+        min_version=_PI_MIN_VERSION,
+    ),
     # Pin the install to the supported 1.17.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
     # version the runtime version-check (``check_opencode_version``,
     # >=1.17.7,<1.18.0) then rejects. ``~1.17.7`` mirrors that exact range.
-    OPENCODE_KEY: HarnessInstallSpec("OpenCode", "opencode", "opencode-ai@~1.17.7"),
+    # The same version bounds are enforced in setup via ``min_version`` /
+    # ``max_version_exclusive`` so the install/upgrade prompt fires before
+    # the runtime gate does.
+    OPENCODE_KEY: HarnessInstallSpec(
+        "OpenCode",
+        "opencode",
+        "opencode-ai@~1.17.7",
+        min_version=OPENCODE_MIN_VERSION,
+        max_version_exclusive=OPENCODE_MAX_VERSION_EXCLUSIVE,
+    ),
     QWEN_KEY: HarnessInstallSpec(
         "Qwen Code",
         "qwen",
@@ -136,6 +205,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # vars or the interactive ``/auth`` command; the setup wizard handles
         # that in ``_manage_qwen_harness``. Leaving these None keeps
         # harness_login/logout/cli_logged_in no-ops for qwen.
+        min_version=_QWEN_MIN_VERSION,
     ),
     CURSOR_KEY: HarnessInstallSpec(
         "Cursor",
@@ -146,6 +216,9 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("status", "--format", "json"),
         install_hint="curl https://cursor.com/install -fsS | bash",
         login_status_key="isAuthenticated",
+        # Cursor CLI versions are calendar dates; only support builds from
+        # after 2026-06-01 for the native harness path.
+        min_version=_CURSOR_MIN_VERSION,
     ),
     # Kimi Code CLI ships a single-binary ``kimi`` via a curl installer (no
     # npm). ``kimi login`` is the interactive provider login (OAuth or a
@@ -161,12 +234,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         login_args=("login",),
         logout_args=("logout",),
         install_hint="curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        # First kimi-cli release after 2026-06-01. Older builds may lack
+        # newer TUI/session wiring needed by the native harness.
+        min_version=_KIMI_MIN_VERSION,
     ),
     KIRO_KEY: HarnessInstallSpec(
         "Kiro",
         "kiro-cli",
         package=None,
         install_hint="curl -fsSL https://cli.kiro.dev/install | bash",
+        min_version=_KIRO_MIN_VERSION,
     ),
     # The native Antigravity (agy) TUI bridge wraps the ``agy`` CLI. ``agy`` has
     # no ``login`` / ``logout`` subcommand — the user authenticates via browser
@@ -194,6 +271,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         "goose",
         package=None,
         install_hint="brew install block-goose-cli",
+        min_version=_GOOSE_MIN_VERSION,
     ),
     HERMES_KEY: HarnessInstallSpec(
         "Hermes",
@@ -201,6 +279,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         package=None,
         install_hint=_HERMES_INSTALL_HINT,
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
+        min_version=_HERMES_MIN_VERSION,
     ),
 }
 
@@ -514,26 +593,28 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
 
 
 def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
-    """Return a harness's required CLI spec when that CLI can't be resolved.
+    """Return a harness's required CLI spec when that CLI can't be used.
 
-    Combines :func:`required_cli_for_harness` with the same
-    :func:`resolve_cli_binary` probe :func:`harness_cli_installed` uses, so the
-    verdict matches what the harness's own launch will see (both check ``PATH``
-    plus the common global install dirs the host daemon's frozen ``PATH`` may
-    omit). Used by sub-agent dispatch to fail loud *before* spawning a worker
-    whose harness can never boot here, instead of letting the missing binary
-    surface as a lazy, generic turn failure.
+    Combines :func:`required_cli_for_harness` with the same probe
+    :func:`harness_cli_installed` uses, so the verdict matches what the
+    harness's own launch will see (both check ``PATH`` plus the common global
+    install dirs the host daemon's frozen ``PATH`` may omit, and now also the
+    declared version range). Used by sub-agent dispatch to fail loud *before*
+    spawning a worker whose harness can never boot here, instead of letting
+    the missing or incompatible binary surface as a lazy, generic turn failure.
 
     :param harness: An executor harness identifier, e.g. ``"pi"`` or
         ``"claude-native"``.
     :returns: The :class:`HarnessInstallSpec` for a CLI-backed harness whose
-        ``binary`` is not on ``PATH``; ``None`` when the harness needs no CLI
-        (SDK-based / unknown) or the required binary is present.
+        ``binary`` is not on ``PATH`` or is outside its supported version range;
+        ``None`` when the harness needs no CLI (SDK-based / unknown) or the
+        required binary is present and version-compatible.
     """
     spec = required_cli_for_harness(harness)
     if spec is None:
         return None
-    if resolve_cli_binary(spec.binary) is not None:
+    install_key = _all_harness_name_to_key().get(harness)
+    if install_key is not None and harness_cli_installed(install_key):
         return None
     return spec
 
@@ -569,6 +650,79 @@ def harness_setup_hint(harness: str | None) -> str:
     return "run `omni setup` on that machine to install the CLI and set a default credential"
 
 
+_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z]+)*)")
+
+
+def _normalize_date_version(version: str) -> str:
+    """Trim date-shaped versions (``YYYY.MM.DD[-build]``) to their date part.
+
+    Cursor's CLI reports versions like ``2026.07.01-777f564`` or
+    ``2026.06.19-20-24-33-653a7fb`` on Windows. ``packaging`` rejects those
+    as PEP 440, but the leading ``YYYY.MM.DD`` is enough to compare chronology.
+    Normalizing keeps semver versions intact so existing parsing is unaffected.
+    """
+    parts = re.split(r"[.-]", version.replace("_", "-"))
+    if len(parts) < 3:
+        return version
+    try:
+        year = int(parts[0])
+        month = int(parts[1])
+        day = int(parts[2])
+    except ValueError:
+        return version
+    # Treat plausible calendar dates (year 2000-2199) as date versions.
+    if 2000 <= year <= 2199 and 1 <= month <= 12 and 1 <= day <= 31:
+        return f"{year}.{month:02d}.{day:02d}"
+    return version
+
+
+def _parse_harness_cli_version(text: str) -> str | None:
+    """Extract a semver-ish string from ``<binary> --version`` output.
+
+    Mirrors the OpenCode-specific parser in
+    :func:`omnigent.opencode_native_app_server.parse_opencode_version` but is
+    kept generic so any harness can declare a version range in its install spec.
+    Date-shaped versions (e.g. Cursor's ``2026.06.22`` or
+    ``2026.06.19-20-24-33-653a7fb``) are normalized to ``YYYY.MM.DD``.
+    """
+    match = _VERSION_RE.search(text or "")
+    if match is None:
+        return None
+    return _normalize_date_version(match.group(1))
+
+
+def _harness_cli_version_satisfies(spec: HarnessInstallSpec, binary: str) -> bool:
+    """Check *binary*'s ``--version`` against *spec*'s declared range.
+
+    A missing/unparseable version or a subprocess error is treated as not
+    satisfying the range, so an installed but incompatible CLI is reported
+    as not ready and the setup flow prompts for an upgrade before the
+    runtime gate rejects it.
+    """
+    if spec.min_version is None and spec.max_version_exclusive is None:
+        return True
+    version = _harness_cli_version_string(spec, binary)
+    if version is None:
+        return False
+    try:
+        parsed = Version(version)
+    except InvalidVersion:
+        return False
+    if spec.min_version is not None:
+        try:
+            if parsed < Version(spec.min_version):
+                return False
+        except InvalidVersion:
+            return False
+    if spec.max_version_exclusive is not None:
+        try:
+            if parsed >= Version(spec.max_version_exclusive):
+                return False
+        except InvalidVersion:
+            return False
+    return True
+
+
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     """Return the install spec for a family/harness key, or ``None``.
 
@@ -580,24 +734,102 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key)
 
 
-def harness_cli_installed(key: str) -> bool:
-    """Return whether the harness's CLI binary can be resolved.
+def harness_cli_version_satisfies(key: str) -> bool:
+    """Return whether the installed CLI for *key* satisfies its version range.
 
-    "Installed" is deliberately the CLI binary (:func:`resolve_cli_binary` —
-    ``PATH`` plus the common global install dirs the host daemon's frozen
-    ``PATH`` may omit), matching ucode and the npm install-prompt UX — even
-    though the SDK-based ``claude-sdk`` harness can run without the ``claude``
-    CLI.
+    Only harnesses that declare ``min_version`` / ``max_version_exclusive`` in
+    their install spec are probed. A missing binary, an unparsable version, or
+    a subprocess error is treated as not satisfying the range — the setup flow
+    will then prompt for an upgrade before the runtime gate rejects it.
 
-    :param key: A harness family (``"anthropic"`` / ``"openai"``) or
-        :data:`PI_KEY` / :data:`KIMI_KEY`.
-    :returns: ``True`` when the CLI resolves; ``False`` when it doesn't or
-        the key has no associated CLI.
+    :param key: A harness family key, e.g. :data:`OPENCODE_KEY`.
+    :returns: ``True`` when the binary is present and its version falls inside
+        the declared range, or when the spec has no version bounds.
     """
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    return resolve_cli_binary(spec.binary) is not None
+    binary = resolve_cli_binary(spec.binary)
+    if binary is None:
+        return False
+    return _harness_cli_version_satisfies(spec, binary)
+
+
+def harness_cli_installed(key: str) -> bool:
+    """Return whether the harness's CLI is present and meets its version range.
+
+    "Installed" now means the CLI binary (:func:`resolve_cli_binary`) is
+    resolvable **and**, when the harness declares ``min_version`` /
+    ``max_version_exclusive`` in its install spec, the binary's
+    ``--version`` output satisfies that range. This prevents an outdated
+    native CLI (e.g. an OpenCode release outside the supported 1.17.x band)
+    from being treated as ready during setup.
+
+    :param key: A harness family (``"anthropic"`` / ``"openai"``) or
+        :data:`PI_KEY` / :data:`KIMI_KEY`.
+    :returns: ``True`` when the CLI resolves and is version-compatible;
+        ``False`` when it doesn't resolve, the key has no associated CLI,
+        or its version falls outside the declared range.
+    """
+    spec = harness_install_spec(key)
+    if spec is None:
+        return False
+    binary = resolve_cli_binary(spec.binary)
+    if binary is None:
+        return False
+    return _harness_cli_version_satisfies(spec, binary)
+
+
+def harness_cli_version(key: str) -> tuple[str | None, str | None]:
+    """Return the installed CLI's version string plus the declared range.
+
+    Useful for human-readable status messages when the CLI is present but
+    outside its supported range, so the UI can say "installed vX, required >=Y"
+    instead of just "not installed".
+
+    :param key: A harness family key, e.g. :data:`OPENCODE_KEY`.
+    :returns: ``(version, range_str)``. ``version`` is ``None`` when the binary
+        is missing or its ``--version`` output is unparseable. ``range_str``
+        is a human-readable summary of the declared ``min_version`` /
+        ``max_version_exclusive`` range, or ``None`` when the spec has no
+        version bounds.
+    """
+    spec = harness_install_spec(key)
+    if spec is None:
+        return None, None
+    binary = resolve_cli_binary(spec.binary)
+    if binary is None:
+        return None, None
+    version = _harness_cli_version_string(spec, binary)
+    if version is None:
+        return None, _version_range_str(spec)
+    return version, _version_range_str(spec)
+
+
+def _version_range_str(spec: HarnessInstallSpec) -> str | None:
+    """Human-readable rendering of a spec's version range, or ``None``."""
+    if spec.min_version is None and spec.max_version_exclusive is None:
+        return None
+    if spec.min_version is not None and spec.max_version_exclusive is None:
+        return f">={spec.min_version}"
+    if spec.min_version is None and spec.max_version_exclusive is not None:
+        return f"<{spec.max_version_exclusive}"
+    return f">={spec.min_version}, <{spec.max_version_exclusive}"
+
+
+def _harness_cli_version_string(spec: HarnessInstallSpec, binary: str) -> str | None:
+    """Return the parsed, normalized version string from *binary* ``--version``."""
+    try:
+        completed = subprocess.run(
+            [binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _parse_harness_cli_version((completed.stdout or "") + "\n" + (completed.stderr or ""))
 
 
 def harness_install_command(key: str) -> list[str]:

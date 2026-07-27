@@ -24,6 +24,10 @@ class HarnessInstallSpec:
     login_status_key: str | None = None
     auth_hint: str | None = None
     install_command: tuple[str, ...] | None = None
+    min_version: str | None = None
+    """Minimum supported CLI version (inclusive)."""
+    max_version_exclusive: str | None = None
+    """Maximum supported CLI version (exclusive)."""
 
 
 @dataclass(frozen=True)

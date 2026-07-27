@@ -64,6 +64,14 @@ def _point_codex_auth_check_at(
         "_find_codex_cli",
         lambda: "/tmp/codex" if binary_present else None,
     )
+    if binary_present:
+        # The auth check now also validates the installed version. Treat a
+        # present binary as satisfying the version check so the tests focus
+        # on the auth-path decision.
+        monkeypatch.setattr(
+            "omnigent.onboarding.harness_install.harness_cli_installed",
+            lambda _key: True,
+        )
 
 
 def test_codex_auth_unavailable_reason_binary_missing(
