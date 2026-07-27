@@ -889,22 +889,15 @@ def _pi_needs_responses_api(model: str) -> bool:
 
     Covers two cases:
     - Newer GPT models that reject function tools via /chat/completions.
-    - Kimi/inkling/qwen3 (via system.ai.* ids or databricks-* ids) that need
-      the Responses API to avoid the missing finish_reason issue on /chat/completions.
+    - Kimi/inkling/qwen3/glm (system.ai.* ids) that need the Responses API to
+      avoid the missing finish_reason issue on /chat/completions.
     """
-    from omnigent.pi_native_credentials import (
-        _SYSTEM_AI_MODEL_KEYWORDS,
-        _databricks_to_system_ai,
-        _needs_responses_api,
-    )
+    from omnigent.pi_native_credentials import _SYSTEM_AI_MODEL_KEYWORDS, _needs_responses_api
 
     lower = model.lower()
-    # system.ai.* ids: only kimi/inkling/qwen3 variants need Responses API.
+    # system.ai.* ids: only kimi/inkling/qwen3/glm variants need Responses API.
     # Claude/llama system.ai.* ids route to their own providers (Anthropic, completions).
     if lower.startswith("system.ai.") and any(kw in lower for kw in _SYSTEM_AI_MODEL_KEYWORDS):
-        return True
-    # databricks-* models with system.ai.* aliases also use Responses API
-    if _databricks_to_system_ai(model) is not None:
         return True
     return _needs_responses_api(lower)
 
@@ -1965,13 +1958,7 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
-            from omnigent.pi_native_credentials import _databricks_to_system_ai
-
-            # Translate databricks-* model ids to system.ai.* aliases for models
-            # that require the Responses API (kimi, inkling, glm, qwen3, etc.).
-            effective_model = (
-                (_databricks_to_system_ai(model) or model) if model is not None else model
-            )
+            effective_model = model
             models_json = _build_models_json(
                 self._databricks_host,
                 self._databricks_token,
@@ -2066,13 +2053,7 @@ class PiExecutor(Executor):
         """Get or create a Pi RPC subprocess for the given session."""
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
-        # Normalize to system.ai.* before any comparison or selector construction
-        # so models.json and the provider/model selector always agree.
-        from omnigent.pi_native_credentials import _databricks_to_system_ai
-
-        effective_model = (
-            (_databricks_to_system_ai(model) or model) if model is not None else model
-        )
+        effective_model = model
 
         if (
             state.rpc is not None

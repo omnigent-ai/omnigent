@@ -80,25 +80,6 @@ _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 _SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
 
 
-def _databricks_to_system_ai(model_id: str) -> str | None:
-    """Return the system.ai.* alias for a databricks-* model that requires Responses API.
-
-    Detects by keyword so new model variants (renamed, versioned) are handled
-    automatically without updating an exact-id map.
-
-    :param model_id: Serving-endpoint id, e.g. ``"databricks-kimi-k2-7-code"``.
-    :returns: ``"system.ai.<suffix>"`` when the model needs the Responses API,
-        ``None`` otherwise.
-    """
-    lower = model_id.lower()
-    if not lower.startswith("databricks-"):
-        return None
-    suffix = lower[len("databricks-") :]
-    if any(kw in suffix for kw in _SYSTEM_AI_MODEL_KEYWORDS):
-        return f"system.ai.{suffix}"
-    return None
-
-
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
 # workspace bearer token, so we set ``authHeader`` (Authorization: Bearer).
