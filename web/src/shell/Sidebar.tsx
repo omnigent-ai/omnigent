@@ -93,8 +93,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -431,6 +429,95 @@ export function useMigrateLocalPinsToServer(
   }, [pinnedLoaded, filterHonored]);
 }
 
+const SESSION_STATUS_FILTER_OPTIONS: { value: SessionStatusFilter; label: string }[] = [
+  { value: "all", label: "All sessions" },
+  { value: "active", label: "Active" },
+  { value: "completed", label: "Completed" },
+];
+
+/**
+ * Header-row status filter (All/Active/Completed), opened on hover.
+ *
+ * Built on `HoverCard` — the same primitive (and `openDelay`/`closeDelay`
+ * pairing) the row-level project flyout and Cursor-style agent card already
+ * use elsewhere in this file — rather than hand-rolling hover-open state on
+ * top of `DropdownMenu`. `DropdownMenu` only opens on click/keyboard, so
+ * driving it from raw `onMouseEnter`/`onMouseLeave` meant racing our own
+ * open/close timers against Radix's animated, portaled content; depending on
+ * exactly when the pointer crossed into the content mid-animation, the two
+ * could disagree and the menu would flicker shut under a pointer that never
+ * actually left it. `HoverCard`'s hover tracking is Radix's own internals,
+ * not reimplemented here, so it doesn't have that race — and reusing it
+ * keeps this control's interaction model consistent with the rest of the
+ * sidebar instead of introducing a one-off pattern.
+ *
+ * The content itself is a plain button list (not `DropdownMenuRadioItem`s
+ * inside an ARIA `menu`) since `HoverCard` is a generic hover-content
+ * primitive, not a menu — the checkmark plays the same role as the
+ * `DropdownMenuRadioItem` indicator did.
+ *
+ * @param value - The current filter.
+ * @param onChange - Called with the newly selected filter.
+ */
+function SessionStatusFilterMenu({
+  value,
+  onChange,
+}: {
+  value: SessionStatusFilter;
+  onChange: (filter: SessionStatusFilter) => void;
+}) {
+  return (
+    <HoverCard openDelay={150} closeDelay={100}>
+      <HoverCardTrigger asChild>
+        <Button
+          type="button"
+          variant={value !== "all" ? "secondary" : "ghost"}
+          size="icon-xs"
+          aria-label="Filter sessions by status"
+          className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
+          data-testid="sidebar-status-filter-button"
+        >
+          <ListFilterIcon className="size-4" />
+        </Button>
+      </HoverCardTrigger>
+      {/* align="end": this trigger sits near the sidebar's right edge, so
+          the default left-aligned popup would spill past the sidebar
+          boundary into the main content — anchoring the content's right
+          edge to the trigger's keeps it contained. w-auto min-w-32:
+          HoverCardContent defaults to a fixed w-64 sized for a text
+          preview card; this is a short option list, so it should size to
+          its content like the DropdownMenu-based menus elsewhere instead
+          of leaving a wide empty margin. */}
+      <HoverCardContent align="end" className="w-auto min-w-32 p-1">
+        <div role="menu" aria-label="Filter sessions by status">
+          {SESSION_STATUS_FILTER_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="menuitemradio"
+              aria-checked={value === option.value}
+              data-testid={`sidebar-status-filter-${option.value}`}
+              onClick={() => onChange(option.value)}
+              // sidebar-compact-text + font-normal: matches the nav rows'
+              // own type scale (New session, Automations, Inbox) rather than
+              // the DropdownMenu default `text-sm`, which reads a size larger
+              // next to them.
+              className="sidebar-compact-text relative flex w-full cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-left font-normal outline-hidden select-none hover:bg-accent hover:text-accent-foreground"
+            >
+              {option.label}
+              {value === option.value && (
+                <span className="pointer-events-none absolute right-2 flex items-center justify-center">
+                  <CheckIcon className="size-4" />
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
+
 export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: SidebarProps) {
   const [selectionMode, setSelectionMode] = useState(false);
   // Which rows the current selection targets: the flat "Sessions" list, or the
@@ -722,47 +809,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 </TooltipTrigger>
                 <TooltipContent side="bottom">Search</TooltipContent>
               </Tooltip>
-              <DropdownMenu>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        type="button"
-                        variant={statusFilter !== "all" ? "secondary" : "ghost"}
-                        size="icon-xs"
-                        aria-label="Filter sessions by status"
-                        className="size-6 rounded-sm text-muted-foreground hover:text-foreground"
-                        data-testid="sidebar-status-filter-button"
-                      >
-                        <ListFilterIcon className="size-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">Filter by status</TooltipContent>
-                </Tooltip>
-                <DropdownMenuContent align="start">
-                  <DropdownMenuRadioGroup
-                    value={statusFilter}
-                    onValueChange={(value) => setStatusFilter(value as SessionStatusFilter)}
-                  >
-                    <DropdownMenuRadioItem value="all" data-testid="sidebar-status-filter-all">
-                      All sessions
-                    </DropdownMenuRadioItem>
-                    <DropdownMenuRadioItem
-                      value="active"
-                      data-testid="sidebar-status-filter-active"
-                    >
-                      Active
-                    </DropdownMenuRadioItem>
-                    <DropdownMenuRadioItem
-                      value="completed"
-                      data-testid="sidebar-status-filter-completed"
-                    >
-                      Completed
-                    </DropdownMenuRadioItem>
-                  </DropdownMenuRadioGroup>
-                </DropdownMenuContent>
-              </DropdownMenu>
+              <SessionStatusFilterMenu value={statusFilter} onChange={setStatusFilter} />
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button

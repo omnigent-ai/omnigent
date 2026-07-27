@@ -319,7 +319,7 @@ describe("Sidebar session list", () => {
     expect(onOpenSearch).toHaveBeenCalledTimes(1);
   });
 
-  it("filters the session list by status via the header dropdown", () => {
+  it("filters the session list by status via the header dropdown", async () => {
     mockConversations([
       conv("conv_running", "Codex", { status: "running" }),
       conv("conv_awaiting", "Codex", { pending_elicitations_count: 1 }),
@@ -337,8 +337,9 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("conv_idle")).toBeInTheDocument();
     expect(screen.getByText("conv_closed_but_running")).toBeInTheDocument();
 
-    fireEvent.pointerDown(screen.getByTestId("sidebar-status-filter-button"), { button: 0 });
-    fireEvent.click(screen.getByTestId("sidebar-status-filter-active"));
+    // HoverCard opens after its openDelay, not synchronously on mouseenter.
+    fireEvent.pointerEnter(screen.getByTestId("sidebar-status-filter-button"));
+    fireEvent.click(await screen.findByTestId("sidebar-status-filter-active"));
 
     // Active: running/awaiting and not closed.
     expect(screen.getByText("conv_running")).toBeInTheDocument();
@@ -347,8 +348,8 @@ describe("Sidebar session list", () => {
     // Closed always reads completed, even if its live status is "running".
     expect(screen.queryByText("conv_closed_but_running")).toBeNull();
 
-    fireEvent.pointerDown(screen.getByTestId("sidebar-status-filter-button"), { button: 0 });
-    fireEvent.click(screen.getByTestId("sidebar-status-filter-completed"));
+    fireEvent.pointerEnter(screen.getByTestId("sidebar-status-filter-button"));
+    fireEvent.click(await screen.findByTestId("sidebar-status-filter-completed"));
 
     // Completed: idle/failed/never-observed, plus closed regardless of status.
     expect(screen.queryByText("conv_running")).toBeNull();
@@ -356,12 +357,38 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("conv_idle")).toBeInTheDocument();
     expect(screen.getByText("conv_closed_but_running")).toBeInTheDocument();
 
-    fireEvent.pointerDown(screen.getByTestId("sidebar-status-filter-button"), { button: 0 });
-    fireEvent.click(screen.getByTestId("sidebar-status-filter-all"));
+    fireEvent.pointerEnter(screen.getByTestId("sidebar-status-filter-button"));
+    fireEvent.click(await screen.findByTestId("sidebar-status-filter-all"));
 
     // Back to unfiltered.
     expect(screen.getByText("conv_running")).toBeInTheDocument();
     expect(screen.getByText("conv_idle")).toBeInTheDocument();
+  });
+
+  it("opens the status filter menu on hover, without a click", async () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    const button = screen.getByTestId("sidebar-status-filter-button");
+    expect(screen.queryByTestId("sidebar-status-filter-active")).toBeNull();
+
+    fireEvent.pointerEnter(button);
+    expect(await screen.findByTestId("sidebar-status-filter-active")).toBeInTheDocument();
+  });
+
+  it("anchors the status filter popup to the trigger's right (end) edge so it stays inside the sidebar", async () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    fireEvent.pointerEnter(screen.getByTestId("sidebar-status-filter-button"));
+
+    // Radix stamps the resolved alignment onto the HoverCard content root;
+    // "end" (right edges aligned) extends the popup LEFT into the sidebar,
+    // instead of "start"'s default rightward spill past the sidebar's edge.
+    const content = (await screen.findByTestId("sidebar-status-filter-active")).closest(
+      '[data-slot="hover-card-content"]',
+    );
+    expect(content).toHaveAttribute("data-align", "end");
   });
 
   it("swaps the card content to the settings section nav on /settings", () => {

@@ -19,6 +19,7 @@ import type { ComponentType, SVGProps } from "react";
 import {
   BookOpenIcon,
   BotIcon,
+  CheckIcon,
   Code2Icon,
   CompassIcon,
   ChevronDownIcon,
@@ -35,13 +36,7 @@ import {
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
@@ -210,6 +205,12 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   );
 }
 
+const SUBAGENT_STATUS_FILTER_OPTIONS: { value: SubagentStatusFilter; label: string }[] = [
+  { value: "all", label: "All agents" },
+  { value: "active", label: "Active" },
+  { value: "completed", label: "Completed" },
+];
+
 function ViewModeToggle({
   viewMode,
   onViewModeChange,
@@ -225,8 +226,11 @@ function ViewModeToggle({
   return (
     <div className="flex shrink-0 items-center justify-end gap-0.5 border-b px-2 py-1">
       {statusFilter != null && onStatusFilterChange != null && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
+        // HoverCard (not DropdownMenu) — see SessionStatusFilterMenu in
+        // Sidebar.tsx for why: Radix's own hover-tracking avoids the
+        // trigger/content race a hand-rolled hover-open DropdownMenu hit.
+        <HoverCard openDelay={150} closeDelay={100}>
+          <HoverCardTrigger asChild>
             <Button
               variant={statusFilter !== "all" ? "secondary" : "ghost"}
               size="icon-xs"
@@ -237,27 +241,38 @@ function ViewModeToggle({
             >
               <ListFilterIcon className="size-3.5" />
             </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start">
-            <DropdownMenuRadioGroup
-              value={statusFilter}
-              onValueChange={(value) => onStatusFilterChange(value as SubagentStatusFilter)}
-            >
-              <DropdownMenuRadioItem value="all" data-testid="subagents-status-filter-all">
-                All agents
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem value="active" data-testid="subagents-status-filter-active">
-                Active
-              </DropdownMenuRadioItem>
-              <DropdownMenuRadioItem
-                value="completed"
-                data-testid="subagents-status-filter-completed"
-              >
-                Completed
-              </DropdownMenuRadioItem>
-            </DropdownMenuRadioGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
+          </HoverCardTrigger>
+          {/* This trigger sits at the toolbar's LEFT edge (pushed there by
+              its own mr-auto within a justify-end row), so left-alignment
+              extends the popup rightward into the panel rather than out
+              past its edge — unlike the sidebar's version, no align="end"
+              flip is needed here. */}
+          <HoverCardContent align="start" className="w-auto min-w-32 p-1">
+            <div role="menu" aria-label="Filter agents by status">
+              {SUBAGENT_STATUS_FILTER_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={statusFilter === option.value}
+                  data-testid={`subagents-status-filter-${option.value}`}
+                  onClick={() => onStatusFilterChange(option.value)}
+                  // text-xs: matches this panel's own row label scale (see
+                  // childPrimaryLabel's span) rather than the larger
+                  // DropdownMenu-default text-sm.
+                  className="relative flex w-full cursor-default items-center gap-1.5 rounded-md py-1 pr-8 pl-1.5 text-left text-xs font-normal outline-hidden select-none hover:bg-accent hover:text-accent-foreground"
+                >
+                  {option.label}
+                  {statusFilter === option.value && (
+                    <span className="pointer-events-none absolute right-2 flex items-center justify-center">
+                      <CheckIcon className="size-4" />
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </HoverCardContent>
+        </HoverCard>
       )}
       <Button
         variant={viewMode === "list" ? "secondary" : "ghost"}
