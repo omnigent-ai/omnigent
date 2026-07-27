@@ -6,7 +6,7 @@ from collections.abc import Iterable
 
 from omnigent.llms.errors import PermanentLLMError
 
-EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 EFFORT_CLEAR_VALUES = frozenset({"default", "off", "reset"})
 
 # Deprecated / vendor-written effort values mapped to the canonical value to

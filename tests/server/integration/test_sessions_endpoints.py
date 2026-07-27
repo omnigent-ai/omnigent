@@ -1907,10 +1907,14 @@ async def test_patch_session_archive_hides_from_default_list(
     assert sid in default_ids_after, "unarchived session must reappear in the default list"
 
 
-@pytest.mark.parametrize("reasoning_effort", ["high", "xhigh", "max", "ultra"])
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected"),
+    [("high", "high"), ("xhigh", "xhigh"), ("max", "max"), ("ultra", "xhigh")],
+)
 async def test_patch_session_updates_reasoning_effort(
     client: httpx.AsyncClient,
     reasoning_effort: str,
+    expected: str,
 ) -> None:
     """PATCH sets reasoning_effort on the session."""
     agent = await create_test_agent(client)
@@ -1921,7 +1925,7 @@ async def test_patch_session_updates_reasoning_effort(
         json={"reasoning_effort": reasoning_effort},
     )
     assert resp.status_code == 200
-    assert resp.json()["reasoning_effort"] == reasoning_effort
+    assert resp.json()["reasoning_effort"] == expected
 
 
 async def test_create_session_sets_terminal_launch_args(
@@ -5983,10 +5987,10 @@ async def test_post_external_reasoning_effort_change_publishes_session_effort(
     assert resp.json() == {"queued": False}
     assert [event["type"] for _, event in published] == ["session.reasoning_effort"]
     assert published[0][1]["conversation_id"] == session["id"]
-    assert published[0][1]["reasoning_effort"] == "ultra"
+    assert published[0][1]["reasoning_effort"] == "xhigh"
     # Persisted snapshot proves this was not just a transient SSE update.
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["reasoning_effort"] == "ultra"
+    assert snapshot["reasoning_effort"] == "xhigh"
 
 
 async def test_post_external_reasoning_effort_change_clears_effort(
