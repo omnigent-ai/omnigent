@@ -9,7 +9,10 @@ enum WorkspaceURLExpander {
   /// these hosts.
   static let databricksAppsHostSuffix = "databricksapps.com"
 
-  static func expandIfNeeded(_ url: URL, session: URLSession = .shared) async -> URL {
+  static func expandIfNeeded(
+    _ url: URL,
+    session: URLSession = SameOriginRedirectHandler.session
+  ) async -> URL {
     guard url.scheme?.lowercased() == "https", isBareRoot(url), !isDatabricksAppsHost(url),
       let origin = originURL(for: url)
     else {
@@ -24,6 +27,17 @@ enum WorkspaceURLExpander {
     do {
       let (_, response) = try await session.data(for: request)
       guard let http = response as? HTTPURLResponse else { return url }
+      // Defense in depth: only trust responses that came from the approved
+      // origin. The consent alert promises the app will only talk to the host
+      // the user approved, so a response that landed on a different origin
+      // (e.g. via a cross-origin redirect) must be rejected even if the
+      // redirect delegate is bypassed (such as when a caller supplies a bare
+      // session without a redirect policy).
+      guard let responseURL = http.url, let responseOrigin = originURL(for: responseURL),
+        responseOrigin == origin
+      else {
+        return url
+      }
       guard (http.value(forHTTPHeaderField: "server") ?? "").lowercased() == "databricks" else {
         return url
       }
@@ -53,5 +67,61 @@ enum WorkspaceURLExpander {
     components.port = url.port
     components.path = "/"
     return components.url
+  }
+}
+
+/// URL session delegate that refuses to follow HTTP redirects whose
+/// destination origin differs from the original request's origin.
+///
+/// `WorkspaceURLExpander.expandIfNeeded` probes a server the user just
+/// consented to. Without a redirect policy, a malicious or misconfigured host
+/// could answer the HEAD probe with a 3xx redirect to a different origin —
+/// including a local-network service — causing the app to silently talk to a
+/// host the user never approved. This delegate allows same-origin redirects
+/// (e.g. path or trailing-slash normalization) but blocks anything that would
+/// cross origins. `expandIfNeeded` additionally verifies `response.url` so a
+/// cross-origin response is never trusted even if the caller supplies a
+/// session without this delegate.
+final class SameOriginRedirectHandler: NSObject, URLSessionTaskDelegate {
+  static let session: URLSession = {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 8
+    configuration.httpCookieAcceptPolicy = .never
+    configuration.httpCookieStorage = nil
+    return URLSession(
+      configuration: configuration,
+      delegate: SameOriginRedirectHandler(),
+      delegateQueue: nil
+    )
+  }()
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping @Sendable (URLRequest?) -> Void
+  ) {
+    guard
+      let original = task.originalRequest?.url,
+      let originalOrigin = Self.originKey(for: original),
+      let redirectURL = request.url,
+      let redirectOrigin = Self.originKey(for: redirectURL),
+      originalOrigin == redirectOrigin
+    else {
+      // Block the redirect; URLSession delivers the 3xx response itself as
+      // the task's final response, which `expandIfNeeded` then rejects via the
+      // `response.url` origin check.
+      completionHandler(nil)
+      return
+    }
+    completionHandler(request)
+  }
+
+  private static func originKey(for url: URL) -> String? {
+    guard let scheme = url.scheme?.lowercased(),
+      let host = url.host?.lowercased()
+    else { return nil }
+    return "\(scheme)://\(host)\(url.port.map { ":\($0)" } ?? "")"
   }
 }

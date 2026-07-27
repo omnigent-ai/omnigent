@@ -129,7 +129,7 @@ jobs:
         working-directory: web
         run: npm run type-check
 
-  # The three packages release in lockstep (identical versions + `==` sibling
+  # The four packages release in lockstep (identical versions + `==` sibling
   # pins). Assert agreement on every change so drift from a bad merge or
   # cherry-pick — however it happened — is caught before it reaches a release.
   version-lockstep:

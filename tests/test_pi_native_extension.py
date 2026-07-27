@@ -637,6 +637,50 @@ def test_text_deltas_post_incrementally_with_stable_id() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_thinking_deltas_post_live_reasoning(tmp_path: Path) -> None:
+    """Pi reasoning streams live and persists for history hydration."""
+    script = (
+        _STREAMING_HARNESS
+        + r"""
+(async () => {
+  await handlers.agent_start({}, ctx);
+  await handlers.turn_start({ turnIndex: 1 }, ctx);
+
+  await feed({ type: "thinking_start", contentIndex: 0 });
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "plan " });
+  await feed({ type: "thinking_delta", contentIndex: 0, delta: "step" });
+  await feed({ type: "thinking_end", contentIndex: 0, content: "plan step" });
+
+  const message = {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "plan step", thinkingSignature: "sig-1" },
+      { type: "text", text: "Answer" },
+    ],
+  };
+  await handlers.message_end({ message }, ctx);
+  await handlers.turn_end({ message, toolResults: [] }, ctx);
+
+  const reasoning = posted.filter((e) => e.type === "external_output_reasoning_delta");
+  assert.deepEqual(
+    reasoning.map((e) => e.data),
+    [
+      { delta: "plan ", started: true },
+      { delta: "step", started: false },
+    ],
+  );
+  const completed = items().filter((e) => e.data.item_type === "reasoning");
+  assert.equal(completed.length, 1, JSON.stringify(completed));
+  assert.deepEqual(completed[0].data.item_data.content, [
+    { type: "reasoning_text", text: "plan step" },
+  ]);
+})().catch((e) => { console.error(e && e.stack ? e.stack : e); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_multiple_text_blocks_share_one_message_preview(tmp_path: Path) -> None:
     """Multiple text blocks in one message stream under one message_id.
 

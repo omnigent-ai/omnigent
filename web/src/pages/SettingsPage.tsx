@@ -69,11 +69,13 @@ import {
 } from "@/components/ui/select";
 import {
   Dialog,
+  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
 } from "@/components/ui/dialog";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
@@ -101,6 +103,7 @@ import {
   readUiFontFamily,
   readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
+  UI_FONT_SIZE_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
   UI_FONT_SIZE_STEP,
@@ -110,6 +113,7 @@ import {
 import {
   clampCodeFontSizePx,
   CODE_FONT_FAMILY_DEFAULT,
+  CODE_FONT_SIZE_DEFAULT,
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
   CODE_FONT_SIZE_STEP,
@@ -120,21 +124,25 @@ import {
 } from "@/lib/codeFontPreferences";
 import {
   readTerminalThemeMode,
+  TERMINAL_THEME_DEFAULT,
   writeTerminalThemeMode,
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
   readWorkspacePanelDefault,
+  WORKSPACE_PANEL_DEFAULT,
   writeWorkspacePanelDefault,
   type WorkspacePanelDefault,
 } from "@/lib/workspacePanelPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import {
+  DEFAULT_HIDE_UNCONFIGURED_HARNESSES,
   readHideUnconfiguredHarnesses,
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
   applyThemePalette,
+  DEFAULT_PALETTE,
   isThemeSelection,
   PALETTES,
   type PaletteSwatch,
@@ -146,6 +154,7 @@ import {
   applyCustomTheme,
   createCustomThemeFromPalette,
   customThemeSwatches,
+  DEFAULT_CUSTOM_THEME,
   readCustomTheme,
   type CustomTheme,
   writeCustomTheme,
@@ -807,10 +816,68 @@ function AppearanceSection() {
   // theme and the font controls are per-device prefs that don't conflict with
   // host theming, so they stay visible.
   const isEmbedded = useIsEmbedded();
+  const { setTheme } = useTheme();
+  const [resetKey, setResetKey] = useState(0);
+  const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
+
+  const resetAppearance = () => {
+    // Reset every appearance preference back to the product default.
+    setTheme("system");
+
+    writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
+
+    writeThemePalette(DEFAULT_PALETTE);
+    applyThemePalette(DEFAULT_PALETTE);
+    writeCustomTheme(DEFAULT_CUSTOM_THEME);
+    applyCustomTheme(DEFAULT_CUSTOM_THEME);
+
+    writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
+
+    writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
+
+    applyUiFontScale(UI_FONT_SIZE_DEFAULT);
+    applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
+
+    writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
+    writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
+
+    // Remove the persisted keys so this device has no appearance overrides at
+    // all. Some write helpers already remove the key for the default value;
+    // clearing the list here makes the intent explicit and keeps the reset
+    // behavior consistent even if a helper changes later.
+    if (typeof window !== "undefined") {
+      try {
+        for (const key of [
+          "omnigent:ui-font-size",
+          "omnigent:ui-font-family",
+          "omnigent:code-font-size",
+          "omnigent:code-font-family",
+          "omnigent:terminal-theme",
+          "omnigent:ui-theme-palette",
+          "omnigent:custom-theme",
+          "omnigent:default-workspace-panel",
+          "omnigent:hide-unconfigured-harnesses",
+        ]) {
+          window.localStorage.removeItem(key);
+        }
+      } catch {
+        // localStorage access errors are non-fatal.
+      }
+    }
+
+    // Remount the controls so they re-read the freshly-cleared defaults from
+    // localStorage rather than keeping their stale seeded state.
+    setResetKey((k) => k + 1);
+  };
+
+  const confirmResetAppearance = () => {
+    resetAppearance();
+    setIsResetDialogOpen(false);
+  };
 
   return (
     <Section title="Appearance" description="Choose how Omnigent looks on this device.">
-      <div className="flex flex-col gap-8">
+      <div key={resetKey} className="flex flex-col gap-8">
         {isEmbedded ? (
           <div className="flex flex-col gap-3">
             <span className="text-sm font-medium">Theme</span>
@@ -841,6 +908,39 @@ function AppearanceSection() {
         <UiCodeFontSizeControl />
 
         <UiCodeFontFamilyControl />
+      </div>
+
+      <div className="flex items-center justify-end">
+        <Dialog open={isResetDialogOpen} onOpenChange={setIsResetDialogOpen}>
+          <DialogTrigger asChild>
+            <Button variant="outline" size="sm" data-testid="reset-appearance-button">
+              Reset to defaults
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Reset appearance?</DialogTitle>
+              <DialogDescription>
+                This will reset every appearance choice back to its default.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="outline" size="sm">
+                  Cancel
+                </Button>
+              </DialogClose>
+              <Button
+                variant="default"
+                size="sm"
+                onClick={confirmResetAppearance}
+                data-testid="reset-appearance-confirm"
+              >
+                Reset
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </Section>
   );
@@ -946,23 +1046,23 @@ function UiFontSizeControl() {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <div className="flex flex-col">
-        <span className="text-sm font-medium">Font size</span>
+        <span className="text-sm font-medium">Interface font size</span>
         <span className="text-sm text-muted-foreground">
-          Scale the interface text and spacing on this device.
+          Scale text and spacing across the rest of the interface.
         </span>
       </div>
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
       <div
         role="group"
-        aria-label="Font size"
+        aria-label="Interface font size"
         className={cn(
           "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
         <StepperButton
-          label="Decrease font size"
+          label="Decrease interface font size"
           testId="ui-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - UI_FONT_SIZE_STEP)}
@@ -976,7 +1076,7 @@ function UiFontSizeControl() {
             min={UI_FONT_SIZE_MIN}
             max={UI_FONT_SIZE_MAX}
             step={UI_FONT_SIZE_STEP}
-            aria-label="Font size in pixels"
+            aria-label="Interface font size in pixels"
             data-testid="ui-font-size-input"
             className="w-8 bg-transparent text-center text-sm font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -988,7 +1088,7 @@ function UiFontSizeControl() {
           />
         </div>
         <StepperButton
-          label="Increase font size"
+          label="Increase interface font size"
           testId="ui-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + UI_FONT_SIZE_STEP)}

@@ -39,6 +39,9 @@ function renderHeader(props: {
   isChildSession?: boolean;
   parentSessionId?: string;
   boundAgent?: Agent;
+  canShare?: boolean;
+  shareDisabled?: boolean;
+  shareDisabledReason?: string;
 }) {
   return render(
     <MemoryRouter initialEntries={["/"]}>
@@ -53,7 +56,9 @@ function renderHeader(props: {
           // isolating the left-slot affordances under test.
           conversationId={undefined}
           boundAgent={props.boundAgent}
-          canShare={false}
+          canShare={props.canShare ?? false}
+          shareDisabled={props.shareDisabled}
+          shareDisabledReason={props.shareDisabledReason}
           onShare={() => {}}
           hasAgentInfo={false}
           onAgentInfo={() => {}}
@@ -70,6 +75,57 @@ function renderHeader(props: {
 }
 
 afterEach(cleanup);
+
+describe("ChatHeader — deployed Share presentation", () => {
+  it("matches the compact Vercel action", () => {
+    renderHeader({ sidebarOpen: true, canShare: true });
+
+    const share = screen.getByRole("button", { name: "Share session" });
+    expect(share).toHaveClass(
+      "h-6",
+      "gap-1",
+      "rounded-[6px]",
+      "px-2",
+      "text-[13px]",
+      "share-button-glassy",
+      "md:inline-flex",
+    );
+    expect(share).not.toHaveClass("h-8", "rounded-full", "px-6");
+    expect(share.querySelector(".lucide-user-plus")).not.toBeNull();
+  });
+
+  it("keeps the compact geometry when sharing is disabled", () => {
+    renderHeader({
+      sidebarOpen: true,
+      canShare: true,
+      shareDisabled: true,
+      shareDisabledReason: "Sharing is unavailable",
+    });
+
+    const share = screen.getByRole("button", { name: "Share session" });
+    expect(share).toBeDisabled();
+    expect(share).toHaveAttribute("title", "Sharing is unavailable");
+    expect(share).toHaveClass(
+      "h-6",
+      "gap-1",
+      "rounded-[6px]",
+      "px-2",
+      "text-[13px]",
+      "share-button-glassy",
+    );
+    expect(share.querySelector(".lucide-user-plus")).not.toBeNull();
+  });
+});
+
+describe("ChatHeader — workspace pane alignment", () => {
+  it("uses the desktop workspace offset without changing the mobile inset", () => {
+    const { container } = renderHeader({ sidebarOpen: true });
+    const header = container.querySelector("header");
+
+    expect(header).not.toBeNull();
+    expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+  });
+});
 
 describe("ChatHeader — open-sidebar toggle visibility", () => {
   it("hides the toggle entirely when the sidebar is open", () => {

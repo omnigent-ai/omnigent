@@ -453,7 +453,7 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        from omnigent.inner.native_attachments import materialize_attachment
+        from omnigent.inner.native_attachments import attachment_reference_line
 
         attachment_lines: list[str] = []
         text_parts: list[str] = []
@@ -466,9 +466,7 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
                 if isinstance(text, str) and text:
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                path = materialize_attachment(block, bridge_dir)
-                if path is not None:
-                    attachment_lines.append(f"[Attached: {path}]")
+                attachment_lines.append(attachment_reference_line(block, bridge_dir))
         return "\n".join(attachment_lines + text_parts).strip()
     if content is None:
         return ""

@@ -12,6 +12,34 @@ import Foundation
 /// URL never disagree on scheme. The Databricks workspace mount (`/ml/omnigents`)
 /// is deliberately NOT in the link; it is server-determined and discovered by
 /// `WorkspaceURLExpander` (after consent, for an unknown server).
+///
+/// ## Custom-scheme vs Universal Links
+///
+/// `omnigent://` is a **custom URL scheme** registered via `CFBundleURLSchemes`
+/// in the Info plist. iOS does NOT verify single ownership of a custom scheme:
+/// any other installed app can also declare `omnigent` and win the launch race,
+/// receiving the raw link — and with it the server host and conversation id
+/// (metadata disclosure) — before this app ever sees it. Treat the custom
+/// scheme as untrusted for that reason.
+///
+/// For **managed Databricks domains** (known, HTTPS, operator-controlled hosts
+/// that CAN serve an `apple-app-site-association` file), prefer **Universal
+/// Links** (`applinks:<host>` in the app's Associated Domains Entitlement,
+/// backed by a verified `apple-app-site-association` on the domain). Universal
+/// Links are cryptographically pinned to the domain, cannot be hijacked by a
+/// co-installed app, and open from a plain `https://…/c/<id>` URL with no custom
+/// scheme at all — eliminating the interception risk entirely. Wiring that
+/// up is out of scope for this parser (it concerns the SPA's link emission +
+/// the app's entitlements/AASA serving, not parsing), but any link source that
+/// CAN use a Universal Link should.
+///
+/// The custom scheme is retained for **BYO / OSS self-hosted servers** whose
+/// operators cannot host an `apple-app-site-association` file — loopback hosts,
+/// LAN IPs, and personal domains without verified HTTPS. For those, document
+/// the interception risk to users: assume a malicious co-installed app may read
+/// the server host and conversation id from a clicked `omnigent://` link. The
+/// id carries no secret (it is a server-assigned UUID; access is still gated by
+/// the server's own auth), but the host does reveal which server the user runs.
 struct DeepLink: Equatable {
   /// The inferred http(s) origin with NO trailing slash, e.g. `"http://localhost:8000"`
   /// or `"https://my-workspace.cloud.databricks.com"`. Built manually (not via
@@ -24,6 +52,41 @@ struct DeepLink: Equatable {
   /// no trailing slash — the shape the SPA's react-router matches.
   let path: String
 
+  /// Characters/sequences that must NEVER appear in a conversation id segment
+  /// — because they smuggle URL structure past the intended "/c/<id> only"
+  /// shape, enable path traversal, or signal a malformed percent-escape. This
+  /// is a DENYLIST, not a grammar: it deliberately does NOT assume any specific
+  /// id format (the server's ids are bare 32-hex uuids today, but the SPA's own
+  /// `/c/:id` route accepts any non-slash segment, and a future id scheme —
+  /// ULID, nanoid, base64 — must not be silently rejected by this parser). The
+  /// SPA stays the authority on what a valid id IS; this parser only stops a
+  /// malformed link from reaching it with smuggled structure.
+  ///
+  /// `URL.path` is percent-DECODED, so an encoded separator reappears here as a
+  /// literal and is caught: `%3F`→`?`, `%23`→`#`, `%2F`→`/`, `%2E`→`.`,
+  /// `%00`/`%0A`/`%7F`→control chars. A malformed escape (`%zz`) leaves a stray
+  /// `%` literal, also caught.
+  private static let blockedIdCharacters: Set<Character> = [
+    "?",  // smuggles a query string
+    "#",  // smuggles a fragment
+    "/",  // nested path / encoded path separator
+    ".",  // "."/".." path traversal; not in any current id format
+    "%",  // stray percent from a malformed escape or residual encoding
+  ]
+
+  /// True iff `id` contains no character that smuggles URL structure or
+  /// enables traversal. See `blockedIdCharacters` for why this is a denylist
+  /// (not a format assumption) and `parse` for the smuggling rationale.
+  private static func isValidConversationId(_ id: Substring) -> Bool {
+    // Control characters (U+0000–U+001F, U+007F DEL) — never in an id; an
+    // encoded one (e.g. `%00`, `%0A`) decodes into a literal here.
+    for scalar in id.unicodeScalars {
+      let v = scalar.value
+      if v <= 0x1F || v == 0x7F { return false }
+    }
+    return !id.contains { blockedIdCharacters.contains($0) }
+  }
+
   /// Hostnames that resolve to the local machine — default to `http` for these
   /// (local dev is plain http, and ATS exempts loopback), `https` for everything
   /// else. Mirrors the desktop shell's `LOCAL_HOSTS` / `defaultSchemeFor` so the
@@ -32,22 +95,37 @@ struct DeepLink: Equatable {
 
   /// Parse an `omnigent://` URL. Returns nil for anything that isn't a valid
   /// `omnigent://<host>/c/<id>` link (wrong scheme, no host, non-`/c/` path,
-  /// empty/nested id, unparseable input) — an unrecognized deep link must never
-  /// crash or mis-navigate.
+  /// empty/nested id, an id that isn't a real conversation id, or unparseable
+  /// input) — an unrecognized deep link must never crash or mis-navigate.
   static func parse(_ raw: URL) -> DeepLink? {
     guard raw.scheme?.lowercased() == "omnigent" else { return nil }
     guard let host = raw.host, !host.isEmpty else { return nil }
 
-    // v1 accepts only `/c/<id>`: a single path segment after `/c/`, with no
-    // nested path. Foundation already strips a trailing slash, so `raw.path`
-    // is `/c/<id>`; the manual check also tolerates a trailing slash in case a
-    // future iOS version keeps it. Anything else (other routes, nested paths,
-    // empty id) is dropped — the SPA's own router stays the authority on ids.
+    // v1 accepts only `/c/<id>`. CRUCIALLY, `URL.path` returns the
+    // PERCENT-DECODED path, so a link like `omnigent://host/c/id%3Fview=terminal`
+    // exposes `?` as a LITERAL character in `path` (and `%23` → `#`,
+    // `%2F` → `/`, `%2E` → `.`, `%00`/`%0A`/`%7F` → control chars). The old
+    // check rejected only a literal `/`, so an encoded `?` or `#` rode inside
+    // the id and then acted as a real query/fragment separator once the
+    // rebuilt `/c/<id>` was forwarded to the SPA — smuggling an attacker-chosen
+    // query/fragment past the intended "/c/<id> only" shape.
+    //
+    // The fix is a DENYLIST (see `blockedIdCharacters`), not a grammar: it
+    // rejects characters that smuggle structure (`?`, `#`), enable traversal
+    // (`.`, `..`), or signal a malformed escape (`%`) — plus any control char
+    // — so an encoded separator that `URL.path` decoded into one of those is
+    // dropped. It deliberately does NOT assume the id's exact format (the
+    // server emits 32-hex uuids today, but the SPA's `/c/:id` route accepts any
+    // non-slash segment, and a future id scheme must not be silently rejected);
+    // the SPA's own router stays the authority on what a valid id IS. This
+    // parser only stops a malformed link from reaching it with smuggled
+    // structure.
     let path = raw.path
     guard path.hasPrefix("/c/") else { return nil }
     var id = path.dropFirst(3)
     if id.hasSuffix("/") { id = id.dropLast() }
     guard !id.isEmpty, !id.contains("/") else { return nil }
+    guard isValidConversationId(id) else { return nil }
 
     let scheme = defaultScheme(for: host)
     guard let origin = makeOrigin(scheme: scheme, host: host, port: raw.port) else { return nil }

@@ -76,6 +76,11 @@ def has_pending(conversation_id: str) -> bool:
     return _session_pending.get(conversation_id, 0) > 0
 
 
+def has_any_pending() -> bool:
+    """Return whether any unresolved approval verdict is registered."""
+    return any(not fut.done() for fut in _pending.values())
+
+
 def register(elicitation_id: str) -> asyncio.Future[bool]:
     """
     Create and store a Future for an outstanding ASK verdict.

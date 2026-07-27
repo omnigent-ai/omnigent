@@ -151,6 +151,13 @@ class OpenAICompatibleAdapter(BaseAdapter):
         headers = self._build_headers(
             api_key_override=params.get("api_key"),
         )
+        # Databricks-local divergence (see third_party/sync): merge caller-supplied
+        # headers threaded through connection_params. MAS routes CP serving-endpoint
+        # calls through the Barnacle forward proxy for CP→CP mTLS, which needs a
+        # `host` header + s2s auth headers rather than a bearer token.
+        extra_headers = params.get("extra_headers")
+        if extra_headers:
+            headers = {**headers, **extra_headers}
 
         if stream:
             effective_timeout = timeout if timeout is not None else _STREAM_TIMEOUT
@@ -191,6 +198,13 @@ class OpenAICompatibleAdapter(BaseAdapter):
                 headers=headers,
                 json=payload,
             )
+            # Databricks-local divergence (see third_party/sync): surface the
+            # upstream error body, which raise_for_status() omits — essential for
+            # debugging 4xx from the CP serving/gateway route.
+            if resp.status_code >= 400:
+                _logger.error(
+                    "LLM request to %s failed %d: %s", url, resp.status_code, resp.text[:2000]
+                )
             resp.raise_for_status()
             result: dict[str, Any] = resp.json()
             return result
@@ -223,6 +237,11 @@ class OpenAICompatibleAdapter(BaseAdapter):
         ):
             if resp.status_code >= 400:
                 await resp.aread()
+                # Databricks-local divergence (see third_party/sync): log the
+                # upstream error body for CP serving/gateway 4xx debugging.
+                _logger.error(
+                    "LLM stream to %s failed %d: %s", url, resp.status_code, resp.text[:2000]
+                )
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 parsed = _parse_sse_line(line)

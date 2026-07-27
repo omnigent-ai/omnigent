@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omnigent-slack"
-version = "0.1.0"
+version = "0.7.0.dev0"
 description = "Slack Socket Mode bot that drives Omnigent sessions."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,7 +14,6 @@ dependencies = [
     "cryptography>=42.0.0",
     "httpx>=0.28.0",
     "pydantic-settings>=2.10.0",
-    "python-dotenv>=1.1.0",
     "slack-bolt>=1.29.0",
     "slack-sdk>=3.43.0",
 ]

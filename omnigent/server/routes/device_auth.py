@@ -388,6 +388,38 @@ def create_device_auth_router(
 
     # ── Browser consent page ──────────────────────────────────────
 
+    def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
+        """302 to the login page, returning to this consent URL afterward.
+
+        ``reauth`` adds ``&reauth=1`` so the login page forces a fresh
+        password submit instead of auto-bouncing an already-signed-in user
+        (which would loop back here with the same stale session).
+        """
+        login_url = auth_provider.login_url or "/login"
+        return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
+        query = f"return_to={html.escape(return_to, quote=True)}"
+        if reauth:
+            query += "&reauth=1"
+        return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
+
+    def _session_iat(request: Request) -> int | None:
+        """Return the ``iat`` (issue time) of the caller's session JWT.
+
+        Read from the session cookie (accounts mode mints a fresh ``iat``
+        on every ``/auth/login``, so this is effectively the last-login
+        time). ``None`` when absent/invalid. Used to enforce that consent
+        follows a login started FOR this device flow.
+        """
+        token = request.cookies.get(cookie_config.session_cookie_name)
+        if not token:
+            return None
+        try:
+            payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        iat = payload.get("iat")
+        return iat if isinstance(iat, int) else None
+
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
         """Render the consent page for a ``user_code``.
@@ -397,16 +429,20 @@ def create_device_auth_router(
         ``return_to`` is sanitized by the login route). Shows the exact
         Omnigent identity being delegated and the requesting ``client_id``
         so any mismatch is visible before approval.
+
+        **Re-authentication:** consent requires a login performed AFTER this
+        device flow began (session ``iat`` ≥ the grant's ``created_at``). A
+        pre-existing session — however recent — is bounced back through the
+        login page with ``reauth=1``, so approving a device grant always
+        costs a deliberate, fresh password entry. This closes the
+        reflex-approve phishing case: a victim already signed in can't bind
+        an attacker's grant with one click; they must re-enter their password
+        against a screen naming the exact identity and client.
         """
         user_id = auth_provider.get_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
         if user_id is None:
-            login_url = auth_provider.login_url or "/login"
-            return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
-            return RedirectResponse(
-                url=f"{login_url}?return_to={html.escape(return_to, quote=True)}",
-                status_code=302,
-            )
+            return _bounce_to_login(user_code, reauth=False)
 
         if not user_code:
             return HTMLResponse(_consent_html(prompt_for_code=True), status_code=200)
@@ -418,6 +454,14 @@ def create_device_auth_router(
                 _consent_html(error="This link is invalid or has expired."),
                 status_code=200,
             )
+
+        # Force a fresh login when the current session predates this grant:
+        # only a login started for THIS flow (iat ≥ the grant's created_at)
+        # may approve. Bounce with reauth=1 so the login page re-prompts
+        # rather than auto-returning the stale session (which would loop).
+        session_iat = _session_iat(request)
+        if session_iat is None or session_iat < grant.created_at:
+            return _bounce_to_login(user_code, reauth=True)
 
         return HTMLResponse(
             _consent_html(
@@ -448,6 +492,19 @@ def create_device_auth_router(
         if grant is None or grant.status != "pending" or grant.expires_at <= now:
             return HTMLResponse(
                 _consent_html(error="This link is invalid or has expired."),
+                status_code=200,
+            )
+
+        # Re-auth gate, enforced here too (not just on the consent GET): a
+        # stale session must not approve by POSTing directly. Only a login
+        # started for THIS flow (session iat ≥ the grant's created_at) passes.
+        session_iat = _session_iat(request)
+        if session_iat is None or session_iat < grant.created_at:
+            return HTMLResponse(
+                _consent_html(
+                    error="Your session is too old to approve this login. "
+                    "Start setup again and sign in when prompted."
+                ),
                 status_code=200,
             )
 

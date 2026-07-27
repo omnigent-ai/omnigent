@@ -629,9 +629,9 @@ class MockState:
         Scoped to user-role content deliberately — NOT the system prompt
         (``instructions`` / ``system``) or tool outputs — so a
         content-routing token only ever matches what the test itself
-        typed, never incidental words in a shared system prompt. Content
-        may be a plain string or a list of ``{"type","text"}`` blocks
-        (both the Responses and Messages shapes), so both are walked.
+        typed, never incidental words in a shared system prompt. Responses
+        input may itself be a string, while message content can be a string,
+        mapping, or nested list of text blocks.
 
         :param parsed: The parsed request body.
         :returns: Space-joined user message text (``""`` if none).
@@ -639,20 +639,37 @@ class MockState:
         if not isinstance(parsed, dict):
             return ""
         parts: list[str] = []
-        # ``input`` (Responses API) and ``messages`` (Anthropic / Chat)
-        # are mutually exclusive in practice, but walk both so the helper
-        # is correct for every endpoint that routes through it.
-        for key in ("input", "messages"):
-            for item in parsed.get(key) or []:
-                if not isinstance(item, dict) or item.get("role") != "user":
-                    continue
-                content = item.get("content")
-                if isinstance(content, str):
-                    parts.append(content)
-                elif isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict):
-                            parts.append(str(block.get("text", "")))
+
+        def append_text(content: object) -> None:
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, dict):
+                text = content.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                nested = content.get("content")
+                if nested is not None:
+                    append_text(nested)
+            elif isinstance(content, list):
+                for block in content:
+                    append_text(block)
+
+        response_input = parsed.get("input")
+        if isinstance(response_input, str):
+            append_text(response_input)
+        elif isinstance(response_input, (dict, list)):
+            items = response_input if isinstance(response_input, list) else [response_input]
+            for item in items:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    append_text(item.get("content"))
+
+        messages = parsed.get("messages")
+        if isinstance(messages, dict):
+            messages = [messages]
+        if isinstance(messages, list):
+            for item in messages:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    append_text(item.get("content"))
         return " ".join(parts)
 
     def resolve_queue_for_request(self, parsed: object) -> _ResponseQueue:
@@ -665,11 +682,9 @@ class MockState:
         unaffected.
 
         When several match-queues are live at once (e.g. a sub-agent test
-        with distinct parent/worker queues), the LONGEST matching token
-        wins — deterministic regardless of dict order, and robust if one
-        token is a substring of another. Tests should still pick mutually
-        non-substring tokens; longest-match is a safety net, not a
-        license to overlap.
+        with distinct parent/worker queues), the longest matching token
+        wins. Equal-length matches use the rightmost token, which selects
+        the newest turn when a native client resends its full conversation.
 
         :param parsed: The parsed request body.
         :returns: The selected response queue.
@@ -677,13 +692,15 @@ class MockState:
         user_text = self._user_input_text(parsed)
         if user_text:
             best: _ResponseQueue | None = None
+            best_score = (-1, -1)
             for queue in self.queues.values():
-                if (
-                    queue.match
-                    and queue.match in user_text
-                    and (best is None or len(queue.match) > len(best.match or ""))
-                ):
+                if not queue.match:
+                    continue
+                position = user_text.rfind(queue.match)
+                score = (len(queue.match), position)
+                if position >= 0 and score > best_score:
                     best = queue
+                    best_score = score
             if best is not None:
                 return best
         model = parsed.get("model") if isinstance(parsed, dict) else None

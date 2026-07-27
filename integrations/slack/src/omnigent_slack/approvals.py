@@ -3,12 +3,37 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Protocol
 
 from omnigent_slack.omnigent import ElicitationRequest
-from omnigent_slack.text import truncate_for_slack
+from omnigent_slack.text import truncate_for_slack, truncate_option
 
 _logger = logging.getLogger(__name__)
+
+
+class ElicitationOutcome(str, Enum):
+    """Past-tense label shown on a resolved elicitation card.
+
+    Single source of truth shared by the resolver (which picks the outcome from
+    the verdict) and ``resolved_card_blocks`` (which renders its icon/text) — so
+    the two can't drift on a bare string. Binary approvals use APPROVED/DENIED;
+    forms use ANSWERED/CANCELLED; TIMED_OUT is a no-response decline;
+    ANSWERED_ELSEWHERE covers a web-UI/other-client resolution (accept or reject,
+    unknown which). DELIVERY_FAILED is a click whose verdict POST to the server
+    failed (so the server never got it); ABANDONED is a card left open when the
+    turn ended without a resolution (declined server-side to release the park).
+    """
+
+    APPROVED = "Approved"
+    DENIED = "Denied"
+    ANSWERED = "Answered"
+    CANCELLED = "Cancelled"
+    TIMED_OUT = "Timed out"
+    ANSWERED_ELSEWHERE = "Answered elsewhere"
+    DELIVERY_FAILED = "Couldn't be delivered"
+    ABANDONED = "Not answered"
+
 
 # Block Kit action ids. Binary approve/deny each carry the resolve target in
 # their ``value``; the form Submit does too, while the per-question radio/
@@ -35,6 +60,11 @@ _QUESTION_BLOCK_PREFIX = "omnigent_q::"
 # the cap — an answer via the web UI unblocks immediately (external-resolution poll).
 DEFAULT_ELICITATION_TIMEOUT_SECONDS = 3 * 60
 
+# Returned by ``ElicitationCoordinator.await_verdict`` when the server pushed a
+# ``response.elicitation_resolved`` (answered in the web UI or another client)
+# rather than a Slack click — the caller clears the card but posts no verdict.
+RESOLVED_EXTERNALLY = object()
+
 
 @dataclass(frozen=True, slots=True)
 class Verdict:
@@ -54,58 +84,98 @@ class ElicitationCoordinator:
     """Bridges the turn worker (which blocks awaiting a verdict) and the Slack
     button handler (which delivers it).
 
-    The worker registers a future keyed by ``elicitation_id`` and awaits it;
-    the block-action handler resolves that future when the user answers. Both
-    run on the same asyncio loop (slack_bolt's), so setting the future's result
-    from the handler is safe.
+    The worker registers a future keyed by ``(session_id, elicitation_id)`` and
+    awaits it; the block-action handler resolves that future when the user
+    answers. Both run on the same asyncio loop (slack_bolt's), so setting the
+    future's result from the handler is safe.
+
+    Keying on the *pair* — not the bare ``elicitation_id`` — keeps the
+    authorization boundary self-contained: a verdict can only ever wake the
+    waiter for its own session, even if the server ever reused an
+    ``elicitation_id`` across two concurrently-parked sessions. Without the
+    session in the key, user A's legitimately-owned click could resolve a
+    colliding id now owned by user B's resolver, posting a verdict to B's session.
     """
 
     def __init__(self, timeout_seconds: float = DEFAULT_ELICITATION_TIMEOUT_SECONDS) -> None:
         # All access is on the single slack_bolt event loop (register/await from
         # the turn worker, resolve from the block-action handler), so plain dict
         # ops are safe without a lock.
-        self._pending: dict[str, asyncio.Future[Verdict]] = {}
+        # Future result is a Verdict (Slack click) or RESOLVED_EXTERNALLY.
+        self._pending: dict[tuple[str, str], asyncio.Future[Verdict | object]] = {}
         self._timeout = timeout_seconds
 
-    def register(self, elicitation_id: str) -> None:
-        """Register a waiter for ``elicitation_id`` synchronously.
+    def register(self, session_id: str, elicitation_id: str) -> None:
+        """Register a waiter for ``(session_id, elicitation_id)`` synchronously.
 
         Must be called BEFORE the approval card is posted, so a fast click can't
         arrive at :meth:`resolve` before the future exists (a lost wakeup that
         would silently drop the verdict). :meth:`await_verdict` then awaits it.
+        Refuses to clobber an existing live waiter — a duplicate request for the
+        same key (e.g. a stream-reconnect replay) keeps the original future
+        rather than orphaning the worker already blocked on it.
         """
-        self._pending[elicitation_id] = asyncio.get_running_loop().create_future()
+        key = (session_id, elicitation_id)
+        existing = self._pending.get(key)
+        if existing is not None and not existing.done():
+            return
+        self._pending[key] = asyncio.get_running_loop().create_future()
 
-    async def await_verdict(self, elicitation_id: str) -> Verdict | None:
+    def unregister(self, session_id: str, elicitation_id: str) -> None:
+        """Drop a registered waiter that will never be awaited.
+
+        Used when posting the card fails after :meth:`register` — the future
+        would otherwise be orphaned in ``_pending`` forever. No-op if absent.
+        """
+        self._pending.pop((session_id, elicitation_id), None)
+
+    async def await_verdict(self, session_id: str, elicitation_id: str) -> Verdict | object | None:
         """Block on the pre-:meth:`register`ed future until answered or timeout.
 
-        Returns the :class:`Verdict`, or ``None`` when no one answered within
-        the timeout (the caller then declines so the server doesn't hang).
-        Registers on demand if the caller skipped :meth:`register` (keeps the
-        method usable standalone, e.g. in tests).
+        Returns the :class:`Verdict` (a Slack click), :data:`RESOLVED_EXTERNALLY`
+        (the server pushed ``elicitation_resolved`` — answered in the web UI or
+        another client, so the caller must NOT post its own verdict), or ``None``
+        when no one answered within the timeout (the caller then declines so the
+        server doesn't hang). Registers on demand if the caller skipped
+        :meth:`register` (keeps the method usable standalone, e.g. in tests).
         """
-        future = self._pending.get(elicitation_id)
+        key = (session_id, elicitation_id)
+        future = self._pending.get(key)
         if future is None:
-            self.register(elicitation_id)
-            future = self._pending[elicitation_id]
+            self.register(session_id, elicitation_id)
+            future = self._pending[key]
         try:
             return await asyncio.wait_for(future, timeout=self._timeout)
         except TimeoutError:
             return None
         finally:
-            self._pending.pop(elicitation_id, None)
+            self._pending.pop(key, None)
 
-    def resolve(self, elicitation_id: str, verdict: Verdict) -> bool:
-        """Deliver a verdict for a waiting elicitation.
+    def resolve(self, session_id: str, elicitation_id: str, verdict: Verdict) -> bool:
+        """Deliver a Slack-click verdict to a waiting elicitation.
 
         Returns whether a live waiter was found — ``False`` means the answer
-        arrived after the worker gave up (timeout) or a duplicate click, so the
-        caller can note the request already closed.
+        arrived after the worker gave up (timeout), a duplicate click, or the
+        request was already resolved externally, so the caller can note it closed.
         """
-        future = self._pending.get(elicitation_id)
+        return self._settle(session_id, elicitation_id, verdict)
+
+    def resolve_external(self, session_id: str, elicitation_id: str) -> bool:
+        """Signal that the elicitation was resolved on the server (web UI/other).
+
+        The turn loop keeps reading the stream and calls this when it observes a
+        pushed ``response.elicitation_resolved``. The waiter wakes with
+        :data:`RESOLVED_EXTERNALLY` so it clears the card WITHOUT posting a
+        verdict (the server already has one). No-op if already settled — e.g. our
+        own click won the race and the server is just echoing it back.
+        """
+        return self._settle(session_id, elicitation_id, RESOLVED_EXTERNALLY)
+
+    def _settle(self, session_id: str, elicitation_id: str, result: Verdict | object) -> bool:
+        future = self._pending.get((session_id, elicitation_id))
         if future is None or future.done():
             return False
-        future.set_result(verdict)
+        future.set_result(result)
         return True
 
 
@@ -181,7 +251,7 @@ def _form_card_blocks(request: ElicitationRequest, owner_user_id: str) -> list[d
         # back to the untruncated label at resolve time (`resolve_form_answers`).
         options = [
             {
-                "text": {"type": "plain_text", "text": _plain(opt.label)},
+                "text": {"type": "plain_text", "text": truncate_option(opt.label)},
                 "value": str(index),
             }
             for index, opt in enumerate(question.options)
@@ -191,11 +261,13 @@ def _form_card_blocks(request: ElicitationRequest, owner_user_id: str) -> list[d
             "action_id": ACTION_FORM_ANSWER,
             "options": options,
         }
+        block_key = truncate_option(question.key, limit=200)
+        label = truncate_option(question.question, limit=140)
         blocks.append(
             {
                 "type": "section",
-                "block_id": f"{_QUESTION_BLOCK_PREFIX}{_plain(question.key, limit=200)}",
-                "text": {"type": "mrkdwn", "text": f"*{_plain(question.question, limit=140)}*"},
+                "block_id": f"{_QUESTION_BLOCK_PREFIX}{block_key}",
+                "text": {"type": "mrkdwn", "text": f"*{label}*"},
                 "accessory": element,
             }
         )
@@ -222,32 +294,38 @@ def _form_card_blocks(request: ElicitationRequest, owner_user_id: str) -> list[d
     return blocks
 
 
-def resolved_card_blocks(request: ElicitationRequest, *, outcome: str) -> list[dict[str, Any]]:
-    """Blocks that replace the card once answered (no controls).
-
-    ``outcome`` is a short past-tense label (``"Approved"``, ``"Denied"``,
-    ``"Answered"``, ``"Timed out"``, ``"Cancelled"``).
-    """
+def resolved_card_blocks(
+    request: ElicitationRequest, *, outcome: ElicitationOutcome
+) -> list[dict[str, Any]]:
+    """Blocks that replace the card once answered (no controls)."""
     icon = {
-        "Approved": ":white_check_mark:",
-        "Answered": ":white_check_mark:",
+        ElicitationOutcome.APPROVED: ":white_check_mark:",
+        ElicitationOutcome.ANSWERED: ":white_check_mark:",
         # "Answered elsewhere" covers accept OR reject in the web UI — neutral
         # icon since we don't know which way it went.
-        "Answered elsewhere": ":information_source:",
-        "Denied": ":no_entry:",
-        "Cancelled": ":no_entry:",
+        ElicitationOutcome.ANSWERED_ELSEWHERE: ":information_source:",
+        ElicitationOutcome.DENIED: ":no_entry:",
+        ElicitationOutcome.CANCELLED: ":no_entry:",
+        ElicitationOutcome.DELIVERY_FAILED: ":warning:",
+        ElicitationOutcome.ABANDONED: ":hourglass:",
     }.get(outcome, ":hourglass:")
-    text = f"{icon} *{outcome}*\n{truncate_for_slack(request.message, limit=2000)}"
-    if outcome == "Timed out":
-        # A timeout declines server-side so the thread's queue is freed; tell the
-        # user the request was dropped and that re-sending starts a fresh attempt.
+    text = f"{icon} *{outcome.value}*\n{truncate_for_slack(request.message, limit=2000)}"
+    if outcome is ElicitationOutcome.TIMED_OUT:
+        # A timeout declines server-side so the thread frees; tell the user the
+        # request was dropped and that re-sending starts a fresh attempt.
         text += "\n_No response in time — I declined it. Send your message again to retry._"
+    elif outcome is ElicitationOutcome.DELIVERY_FAILED:
+        # The click never reached the server, so it's still parked on this request
+        # — the turn can't continue. Re-sending starts a fresh attempt.
+        text += "\n_I couldn't deliver your answer to Omnigent. Send your message again to retry._"
+    elif outcome is ElicitationOutcome.ABANDONED:
+        # The turn ended before this was answered; declined server-side to free
+        # the session. Re-sending starts a fresh attempt.
+        text += (
+            "\n_This wasn't answered before the turn ended — I declined it. "
+            "Send your message again to retry._"
+        )
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-
-
-def _plain(text: str, limit: int = 75) -> str:
-    # Slack option text/value are capped (75 chars for option value/text).
-    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,7 +395,7 @@ def resolve_form_answers(
     if not raw:
         return {}
     # Match each answer's (possibly truncated) block key back to its question.
-    by_block_key = {_plain(q.key, limit=200): q for q in request.questions}
+    by_block_key = {truncate_option(q.key, limit=200): q for q in request.questions}
     answers: dict[str, Any] = {}
     for block_key, value in raw.items():
         question = by_block_key.get(block_key)
@@ -347,7 +425,7 @@ def _as_index(value: Any) -> int | None:
 
 class _ElicitationSink(Protocol):
     async def handle_elicitation_action(
-        self, *, elicitation_id: str, verdict: Verdict
+        self, *, session_id: str, elicitation_id: str, verdict: Verdict
     ) -> bool: ...
 
     async def reject_non_owner_click(
@@ -399,7 +477,9 @@ async def route_elicitation_click(
         state_values = (body.get("state") or {}).get("values") or {}
         content = parse_form_answers(state_values) if isinstance(state_values, dict) else None
     delivered = await sink.handle_elicitation_action(
-        elicitation_id=target.elicitation_id, verdict=Verdict(accepted=accepted, content=content)
+        session_id=target.session_id,
+        elicitation_id=target.elicitation_id,
+        verdict=Verdict(accepted=accepted, content=content),
     )
     if not delivered:
         _logger.info("Approval click had no waiter elicitation_id=%s", target.elicitation_id)

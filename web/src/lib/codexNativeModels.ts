@@ -1,19 +1,19 @@
-import type { CodexModelOption } from "./types";
+import type { NativeModelOption } from "./types";
 
 /**
- * Find the Codex option matching a raw Codex model id.
+ * Find a native picker option by its UI alias or provider-facing model id.
  *
- * @param options - Codex model options from the session snapshot.
+ * @param options - Native model options from the session snapshot.
  * @param model - Candidate model id, e.g. ``"gpt-5.5"``.
  * @returns The matching option, or ``null`` when unknown.
  */
-export function findCodexModelOption(
-  options: readonly CodexModelOption[],
+export function findNativeModelOption(
+  options: readonly NativeModelOption[],
   model: string | null | undefined,
-): CodexModelOption | null {
+): NativeModelOption | null {
   const raw = model?.trim();
   if (!raw) return null;
-  return options.find((option) => option.id === raw) ?? null;
+  return options.find((option) => option.id === raw || option.model === raw) ?? null;
 }
 
 /**
@@ -24,10 +24,10 @@ export function findCodexModelOption(
  * @returns True only when the candidate matches a Codex-returned option.
  */
 export function isCodexNativeModel(
-  options: readonly CodexModelOption[],
+  options: readonly NativeModelOption[],
   model: string | null | undefined,
 ): boolean {
-  return findCodexModelOption(options, model) !== null;
+  return findNativeModelOption(options, model) !== null;
 }
 
 /**
@@ -38,12 +38,12 @@ export function isCodexNativeModel(
  * @returns Model-specific effort values from Codex ``model/list``.
  */
 export function codexEffortLevelsForModel(
-  options: readonly CodexModelOption[],
+  options: readonly NativeModelOption[],
   currentModel: string | null | undefined,
 ): readonly string[] {
   if (options.length === 0) return [];
   const selected =
-    findCodexModelOption(options, currentModel) ??
+    findNativeModelOption(options, currentModel) ??
     options.find((option) => option.isDefault === true) ??
     options[0] ??
     null;

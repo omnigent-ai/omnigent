@@ -616,6 +616,18 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
     if isinstance(data, str):
         return ExecutorSpec(model=data)
     if isinstance(data, dict):
+        # ``type:``/``config:`` are the bundle config.yaml nesting — skipped
+        # silently, they'd drop the declared harness and let a different one
+        # be inferred from the model prefix. Only these two are rejected:
+        # other extra keys (``use_responses``, ``extra``, …) are read from
+        # the raw YAML by the compat loader and must keep loading.
+        nested = sorted(key for key in ("config", "type") if key in data)
+        if nested:
+            raise ValueError(
+                f"executor: key(s) {', '.join(nested)} belong to the bundle "
+                "config.yaml format; this format spells the executor flat, "
+                "e.g. executor: {harness: codex-native, model: gpt-5.4-mini}"
+            )
         # ``ExecutorSpec.{model,harness,profile}`` are ``str | None``;
         # missing keys map to ``None`` directly. ``data.get`` happens to
         # already return ``None`` for missing keys, so the assignment

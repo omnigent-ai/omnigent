@@ -112,6 +112,9 @@ const SERVER_INFO_OFFLINE_FALLBACK: ServerInfo = {
   public_sharing_enabled: true,
   server_version: null,
   smart_routing_enabled: false,
+  harness_install_enabled: false,
+  installable_harnesses: [],
+  dictation_available: false,
 };
 
 /**

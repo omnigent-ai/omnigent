@@ -59,7 +59,11 @@ def test_community_harness_contribution_is_merged(monkeypatch: pytest.MonkeyPatc
     assert (
         hp.spawn_env_builders()["foo"] == "omnigent.community.harness.foo.plugin:build_spawn_env"
     )
-    assert {"id": "foo", "label": "Foo"} in hp.harness_catalog()
+    foo_row = next((row for row in hp.harness_catalog() if row["id"] == "foo"), None)
+    assert foo_row is not None
+    assert foo_row["label"] == "Foo"
+    # Every catalog row now also carries a setup_steps checklist.
+    assert "setup_steps" in foo_row
 
 
 def test_community_harness_rejects_non_community_import_path(
@@ -182,13 +186,13 @@ def test_community_harness_readiness_uses_install_metadata(
 
     from omnigent.onboarding import harness_readiness as readiness
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda _binary: None)
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda _binary: None)
     assert readiness.harness_is_configured("foo") is False
     configured = readiness.configured_harness_map()
     assert configured["foo"] is False
     assert configured["foo-code"] is False
 
-    monkeypatch.setattr(readiness.shutil, "which", lambda binary: f"/usr/bin/{binary}")
+    monkeypatch.setattr(readiness, "resolve_cli_binary", lambda binary: f"/usr/bin/{binary}")
     assert readiness.harness_is_configured("foo") is True
 
 
@@ -212,3 +216,39 @@ def test_community_namespace_imports_external_harness_package(
 
     module = importlib.import_module("omnigent.community.harness.foo")
     assert module.VALUE == "ok"
+
+
+def test_builtin_background_title_generators_are_registered() -> None:
+    generators = hp.background_title_generators()
+
+    assert set(generators) >= {
+        "claude-sdk",
+        "claude-native",
+        "codex",
+        "codex-native",
+    }
+    assert generators["claude-sdk"].generator.endswith("sdk:generate_background_title")
+    assert generators["codex"].generator == generators["claude-sdk"].generator
+    assert generators["claude-native"].resolver_harness == "claude-sdk"
+    assert generators["codex-native"].resolver_harness is None
+
+
+def test_community_harness_can_register_background_title_generator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _contribution() -> hp.HarnessContribution:
+        return hp.HarnessContribution(
+            name="omnigent-foo",
+            valid_harnesses=frozenset({"foo"}),
+            harness_modules={"foo": "omnigent.community.harness.foo.inner.foo_harness"},
+            background_title_generators={
+                "foo": hp.BackgroundTitleGeneratorSpec(
+                    "omnigent.community.harness.foo.background_titles:generate"
+                )
+            },
+        )
+
+    _install_entry_points(monkeypatch, _EntryPoint("foo", _contribution))
+
+    generator = hp.background_title_generators()["foo"]
+    assert generator.generator == ("omnigent.community.harness.foo.background_titles:generate")

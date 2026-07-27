@@ -88,6 +88,7 @@ class WorkspaceReader:
         # way the runner chooses it, so git workspaces get git-status
         # semantics and everything else degrades to an empty list.
         self._registry = create_filesystem_registry(self._root)
+        self._registry.start()
 
     # ── Path confinement ──────────────────────────────────────────
 

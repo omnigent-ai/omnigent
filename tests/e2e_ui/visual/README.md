@@ -42,11 +42,11 @@ it.
 
 ## Is this check merge-blocking?
 
-The check **`UI Snapshot (visual baselines)`** blocks merges only if it's listed in
-the repo's required-checks set (branch protection / `.github/scripts/merge-ready`,
-which is generated and synced separately). Until it's added there it's an
-**advisory** red check — visible, but not enforced. Registering it as required is
-a one-line change to that synced config, outside this directory.
+The check **`UI Snapshot (visual baselines)`** is **merge-blocking**: it's listed
+in the repo's required-checks set (`.github/scripts/merge-ready/required.sh`, in
+both `REQUIRED` and `ALLOW_SKIP`). A drift against the committed baseline fails
+the check and blocks the merge until the baseline is regenerated (label the PR —
+see below) or the UI change is reverted.
 
 It's **safe to register as required**: a PR that touches none of the render
 inputs skips the render via the `detect` job's `if` gate, and a job skipped by

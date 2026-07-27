@@ -61,14 +61,14 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           is_final=true
-          # Only final vX.Y.Z tags; exclude rc/dev/alpha/beta and the event's
-          # prerelease flag (homebrew users get stable releases from the tap).
+          # Only final vX.Y.Z tags; exclude rcN/devN/preN pre-releases and
+          # the event's prerelease flag (homebrew users get stable releases).
           case "$tag" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) is_final=false ;;
           esac
           case "$tag" in
-            *rc*|*dev*|*a[0-9]*|*b[0-9]*) is_final=false ;;
+            *rc[0-9]*|*dev[0-9]*|*pre[0-9]*|*a[0-9]*|*b[0-9]*) is_final=false ;;
           esac
           if [ "${PRERELEASE}" = "true" ]; then is_final=false; fi
           echo "is_final=${is_final}" >> "$GITHUB_OUTPUT"
