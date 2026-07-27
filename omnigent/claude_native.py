@@ -35,6 +35,7 @@ from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import IO, TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
@@ -311,6 +312,22 @@ class ClaudeNativeUcodeConfig:
     model: str | None = None
 
 
+def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
+    """Whether the config's endpoint accepts canonical Anthropic ids and aliases.
+
+    Bedrock and custom gateways route their own model ids only; the Anthropic
+    API (and a config with no endpoint override) resolves family aliases
+    natively, so aliases must not be rewritten for it.
+    """
+    if claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
+        return False
+    base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    if not base_url:
+        return True
+    host = (urlparse(base_url).hostname or "").lower()
+    return host == "anthropic.com" or host.endswith(".anthropic.com")
+
+
 def resolve_claude_native_model_selection(
     model: str | None,
     claude_config: ClaudeNativeUcodeConfig | None,
@@ -324,8 +341,9 @@ def resolve_claude_native_model_selection(
     Direct Claude logins have no provider config, so they use the canonical
     Anthropic model id.
 
-    Unpinned family aliases on a provider config resolve to the provider's
-    default model — Claude Code would canonicalize them to ids gateways reject.
+    On a gateway/Bedrock endpoint, a family alias with no tier pin (launch env
+    or managed settings) resolves to the provider's default model — Claude
+    Code would canonicalize it to an Anthropic id the endpoint rejects.
 
     :param model: Persisted picker id, built-in alias, or concrete model id.
     :param claude_config: Resolved provider config for the terminal.
@@ -337,8 +355,11 @@ def resolve_claude_native_model_selection(
             tier_env is not None
             and claude_config is not None
             and not claude_config.env.get(tier_env)
+            and not _serves_canonical_anthropic_ids(claude_config)
         ):
-            return claude_config.model or model
+            managed = _managed_claude_model_config()
+            if managed is None or not managed.env.get(tier_env):
+                return claude_config.model or model
         return model
     if claude_config is not None:
         custom_model = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV)
@@ -439,9 +460,9 @@ def claude_native_model_options(
                     )
     if options:
         return options
-    if claude_config is not None:
-        # No tier pins: the gateway rejects the subscription aliases below,
-        # so offer the one model the config is known to route.
+    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+        # No tier pins on a gateway/Bedrock endpoint: it rejects the
+        # subscription aliases below, so offer the one model it routes.
         model_id = claude_config.model
         if not model_id:
             return []
