@@ -439,15 +439,15 @@ def _needs_responses_api(model_id_lower: str) -> bool:
 
 
 def _unsupported_in_pi(model_id_lower: str) -> bool:
-    """Return True for models Pi can't handle via openai-completions or responses.
+    """Return True for models Pi can't handle at all.
 
-    Gemini models return ``content`` as an array with ``thoughtSignature`` in
-    streaming responses when tools are present, and the Responses API doesn't
-    support Gemini at all. Exclude all Gemini models from both providers.
+    Gemini 2.5 thinking models return ``content`` as an array with
+    ``thoughtSignature`` that Pi's openai-completions handler can't parse.
+    Other Gemini variants route via openai-completions normally.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini" in model_id_lower
+    return "gemini-2-5" in model_id_lower
 
 
 def _fetch_pi_model_lists(
