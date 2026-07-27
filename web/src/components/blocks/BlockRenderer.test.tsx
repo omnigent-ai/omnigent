@@ -493,7 +493,7 @@ function renderMessage(
   );
 }
 
-describe("BlockRenderer inline file-path linkification", () => {
+describe("BlockRenderer file-path linkification", () => {
   const fetchMock = vi.fn();
 
   beforeEach(() => {
@@ -627,6 +627,22 @@ describe("BlockRenderer inline file-path linkification", () => {
     link.click();
     expect(openFile).toHaveBeenCalledWith("src/app.ts");
     expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/src?");
+  });
+
+  it("routes a Markdown workspace link through the file viewer", () => {
+    const openFile = vi.fn();
+    renderMessage("See [notes.ts](/home/u/ws/src/Design%20Notes.ts%3A351) for details.", {
+      openFile,
+      isChangedPath: () => false,
+      conversationId: "conv_1",
+      workspaceRoot: "/home/u/ws",
+      workspaceHome: "/home/u",
+    });
+
+    const link = screen.getByRole("link", { name: "notes.ts" });
+    expect(link.getAttribute("href")).toContain("file=src%2FDesign+Notes.ts");
+    link.click();
+    expect(openFile).toHaveBeenCalledWith("src/Design Notes.ts");
   });
 
   it("leaves an absolute path OUTSIDE the workspace root as plain code (no fetch)", async () => {

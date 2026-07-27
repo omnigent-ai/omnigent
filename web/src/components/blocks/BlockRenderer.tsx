@@ -135,6 +135,71 @@ function WorkspacePathInlineCode({
   );
 }
 
+const FILE_LOCATION_SUFFIX = /:\d+(?::\d+)?$/;
+
+function decodeWorkspacePathReference(href: string): string | null {
+  try {
+    return decodeURIComponent(href).replace(FILE_LOCATION_SUFFIX, "");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Markdown-link renderer that routes absolute workspace paths through the
+ * FileViewer instead of treating them as browser-local URLs.
+ */
+function WorkspacePathMarkdownLink({
+  children,
+  href,
+  onClick,
+  ...linkProps
+}: React.ComponentPropsWithoutRef<"a">) {
+  const openFile = useFileViewer();
+  const { root, home } = useWorkspacePaths();
+  const explicitWorkspacePath =
+    typeof href === "string" && (href.startsWith("/") || href.startsWith("~/"));
+  const rawPath = explicitWorkspacePath ? decodeWorkspacePathReference(href) : null;
+  const linkPath = rawPath ? toWorkspaceRelativePath(rawPath, root, home) : null;
+
+  if (!openFile || !linkPath) {
+    return (
+      <a href={href} onClick={onClick} {...linkProps}>
+        {children}
+      </a>
+    );
+  }
+
+  const fileUrl = new URL(window.location.href);
+  fileUrl.searchParams.set("file", linkPath);
+  fileUrl.searchParams.delete("comment");
+  const fileHref = `${fileUrl.pathname}${fileUrl.search}${fileUrl.hash}`;
+
+  return (
+    <a
+      href={fileHref}
+      onClick={(event) => {
+        onClick?.(event);
+        if (
+          event.defaultPrevented ||
+          event.button !== 0 ||
+          event.metaKey ||
+          event.ctrlKey ||
+          event.shiftKey ||
+          event.altKey
+        ) {
+          return;
+        }
+        event.preventDefault();
+        openFile(linkPath);
+      }}
+      {...linkProps}
+    >
+      {children}
+    </a>
+  );
+}
+
 // Markdown images open in the shared lightbox on click, matching uploaded and
 // generated images. (Remote `src`s are still gated by Streamdown's image
 // security; this only adds the zoom affordance to whatever does render.)
@@ -146,6 +211,7 @@ function ZoomableMarkdownImage({ src, alt, ...props }: React.ComponentProps<"img
 // Stable module-level override map so MessageResponse's memo (which ignores
 // `components` changes) never sees a new identity.
 const FILE_PATH_AWARE_COMPONENTS = {
+  a: WorkspacePathMarkdownLink,
   inlineCode: WorkspacePathInlineCode,
   img: ZoomableMarkdownImage,
 };
