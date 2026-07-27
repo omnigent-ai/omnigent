@@ -130,3 +130,55 @@ describe("index.css bg-card glass rule selector", () => {
     aside.remove();
   });
 });
+
+/* Regression test for the "table link column collapses to ~2ch" bug.
+ *
+ * Streamdown styles links with `wrap-anywhere`, which also drops the
+ * element's min-content width to one character. Inside its auto-layout
+ * table that let a link-only column ("#3090") be squeezed to ~2ch and
+ * stack one character per line. index.css narrows links in table cells
+ * back to `break-word`; this pins the selector so the override keeps
+ * applying to cells only, and never leaks into prose links.
+ */
+describe("index.css table link wrapping rule", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) => block.includes('[data-streamdown="table-cell"]') && /overflow-wrap\s*:/.test(block),
+  );
+
+  // Derived lazily: a missing rule must fail the assertions below with a
+  // readable message, not crash at collection time.
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  it("has the rule this test exists to protect", () => {
+    expect(rule, "the table-cell link wrapping rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/overflow-wrap\s*:\s*break-word/);
+  });
+
+  function makeLink(cellAttr: string | null): HTMLElement {
+    const host = document.createElement("div");
+    if (cellAttr) host.setAttribute("data-streamdown", cellAttr);
+    const link = document.createElement("a");
+    link.setAttribute("data-streamdown", "link");
+    link.className = "wrap-anywhere";
+    host.appendChild(link);
+    document.body.appendChild(host);
+    return link;
+  }
+
+  it.each(["table-cell", "table-header-cell"])("targets links inside a %s", (cellAttr) => {
+    const link = makeLink(cellAttr);
+    expect(link.matches(selector)).toBe(true);
+    link.parentElement?.remove();
+  });
+
+  it("leaves links outside table cells on Streamdown's wrap-anywhere", () => {
+    // Prose links must keep `anywhere` so a bare overlong URL in a
+    // paragraph still breaks mid-token instead of overflowing.
+    const link = makeLink(null);
+    expect(link.matches(selector)).toBe(false);
+    link.parentElement?.remove();
+  });
+});
