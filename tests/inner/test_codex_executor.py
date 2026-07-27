@@ -2523,6 +2523,131 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     assert list(target.iterdir()) == []
 
 
+def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
+    """``hooks.json`` is symlinked into the private home when present.
+
+    The user's hooks must be reachable at the same relative path inside the
+    private home so rewritten hook-trust keys in ``config.toml`` resolve.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "hooks.json").is_symlink()
+    assert (target / "hooks.json").read_text() == '{"hooks": {}}'
+
+
+def test_populate_codex_home_config_no_hooks_json_is_fine(tmp_path: Path) -> None:
+    """No ``hooks.json`` in the source is silently skipped."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / "hooks.json").exists()
+
+
+def test_populate_codex_home_config_retargets_hook_trust_keys(tmp_path: Path) -> None:
+    """``[hooks.state]`` path keys are rewritten from source to target dir.
+
+    Trust entries that reference the global ``CODEX_HOME`` path are rewritten
+    to reference the private session home so Codex recognises previously-trusted
+    hooks without an interactive review prompt.  The hash value is preserved.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_hooks = str(source / "hooks.json")
+    config_text = (
+        f'[hooks.state."{source_hooks}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:abc123"\n'
+        f'[hooks.state."{source_hooks}:post_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:def456"\n'
+    )
+    (source / "config.toml").write_text(config_text)
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    target_hooks = str(target / "hooks.json")
+    assert source_hooks not in copied
+    assert f'[hooks.state."{target_hooks}:pre_tool_use:0:0"]' in copied
+    assert f'[hooks.state."{target_hooks}:post_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:abc123"' in copied
+    assert 'trusted_hash = "sha256:def456"' in copied
+    # Source must be untouched.
+    assert (source / "config.toml").read_text() == config_text
+
+
+def test_populate_codex_home_config_retargets_config_toml_trust_keys(tmp_path: Path) -> None:
+    """Trust keys referencing ``config.toml`` itself are also rewritten."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config = str(source / "config.toml")
+    config_text = (
+        f'[hooks.state."{source_config}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:abc123"\n'
+    )
+    (source / "config.toml").write_text(config_text)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    target_config = str(target / "config.toml")
+    assert source_config not in copied
+    assert f'[hooks.state."{target_config}:pre_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:abc123"' in copied
+
+
+def test_populate_codex_home_config_preserves_unrelated_trust_keys(tmp_path: Path) -> None:
+    """Trust entries referencing other paths are left untouched."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    other_path = "/some/other/machine/hooks.json"
+    source_hooks = str(source / "hooks.json")
+    config_text = (
+        f'[hooks.state."{other_path}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:other"\n'
+        f'[hooks.state."{source_hooks}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:mine"\n'
+    )
+    (source / "config.toml").write_text(config_text)
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    # The unrelated path is untouched.
+    assert f'[hooks.state."{other_path}:pre_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:other"' in copied
+    # The source-home entry is rewritten.
+    target_hooks = str(target / "hooks.json")
+    assert f'[hooks.state."{target_hooks}:pre_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:mine"' in copied
+
+
 def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
     """When only some config files exist, only those are symlinked.
 
