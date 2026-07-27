@@ -77,6 +77,7 @@ _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 _DATABRICKS_TO_SYSTEM_AI: dict[str, str] = {
     "databricks-kimi-k2-7-code": "system.ai.kimi-k2-7-code",
     "databricks-inkling": "system.ai.inkling",
+    "databricks-glm-5-2": "system.ai.glm-5-2",
 }
 
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol

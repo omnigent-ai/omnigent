@@ -610,6 +610,14 @@ _DATABRICKS_RESPONSES_MODELS = [
         "input": ["text", "image"],
         "reasoning": True,
     },
+    {
+        "id": "system.ai.glm-5-2",
+        "name": "GLM-5.2",
+        "contextWindow": 131072,
+        "maxTokens": 8192,
+        "input": ["text", "image"],
+        "reasoning": True,
+    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [
