@@ -428,13 +428,14 @@ def _needs_responses_api(model_id_lower: str) -> bool:
 def _unsupported_in_pi(model_id_lower: str) -> bool:
     """Return True for models Pi can't handle at all.
 
-    Gemini models return ``content`` as a typed array with ``thoughtSignature``
-    that Pi's openai-completions handler can't parse, and the Responses API
-    returns 400 for Gemini. Exclude all Gemini variants.
+    Gemini 2.5 thinking models return ``content`` as a typed array with
+    ``thoughtSignature`` that Pi's openai-completions handler can't parse,
+    and the Responses API returns 400 for Gemini. Other Gemini variants route
+    via /ai-gateway/mlflow/v1/chat/completions using system.ai.* ids.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini" in model_id_lower
+    return "gemini-2-5" in model_id_lower
 
 
 def _fetch_pi_model_lists(
