@@ -194,7 +194,9 @@ async def test_permissions_disabled_returns_empty_access(
     conv_store: SqlAlchemyConversationStore,
 ) -> None:
     """With no permission store, the helper is a no-op (level None, no fetch)."""
-    access = await require_access_and_level(None, "conv_whatever", LEVEL_READ, None, conv_store)
+    access = await require_access_and_level(
+        None, "a42067bcc66e9b4bfaa3215131aefc96", LEVEL_READ, None, conv_store
+    )
 
     assert access.level is None
     assert access.conversation is None
@@ -222,7 +224,7 @@ async def test_missing_conversation_raises_404(
 
     with pytest.raises(OmnigentError) as exc:
         await require_access_and_level(
-            ALICE, "conv_does_not_exist", LEVEL_READ, perm_store, conv_store
+            ALICE, "1d0b12236c77f69f5073a53583de1a3f", LEVEL_READ, perm_store, conv_store
         )
 
     assert exc.value.code == ErrorCode.NOT_FOUND

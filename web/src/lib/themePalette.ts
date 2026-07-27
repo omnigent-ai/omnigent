@@ -22,9 +22,20 @@
 const STORAGE_KEY = "omnigent:ui-theme-palette";
 
 /** Selectable color palettes. The first entry is the default (brand) look. */
-export const themePalettes = ["omni", "dracula", "github", "catppuccin", "gruvbox"] as const;
+export const themePalettes = [
+  "omni",
+  "dracula",
+  "github",
+  "catppuccin",
+  "gruvbox",
+  "nord",
+] as const;
 
 export type ThemePalette = (typeof themePalettes)[number];
+
+/** Built-in palettes plus the user's derived custom configuration. */
+export const themeSelections = [...themePalettes, "custom"] as const;
+export type ThemeSelection = (typeof themeSelections)[number];
 
 /** Default palette: the Omni brand tokens already defined in `:root` / `.dark`. */
 export const DEFAULT_PALETTE: ThemePalette = "omni";
@@ -124,6 +135,19 @@ export const PALETTES: readonly PaletteMeta[] = [
     },
     dark: { bg: "#282828", card: "#3c3836", accent: "#fe8019", border: "#504945", text: "#ebdbb2" },
   },
+  {
+    id: "nord",
+    label: "Nord",
+    blurb: "Arctic frost blues over polar-night neutrals.",
+    light: {
+      bg: "#eceff4",
+      card: "#e5e9f0",
+      accent: "#5e81ac",
+      border: "#d8dee9",
+      text: "#2e3440",
+    },
+    dark: { bg: "#2e3440", card: "#3b4252", accent: "#88c0d0", border: "#4c566a", text: "#eceff4" },
+  },
 ] as const;
 
 /**
@@ -139,6 +163,10 @@ export function isThemePalette(value: unknown): value is ThemePalette {
   return typeof value === "string" && (themePalettes as readonly string[]).includes(value);
 }
 
+export function isThemeSelection(value: unknown): value is ThemeSelection {
+  return typeof value === "string" && (themeSelections as readonly string[]).includes(value);
+}
+
 /**
  * Read the persisted palette.
  *
@@ -146,13 +174,13 @@ export function isThemePalette(value: unknown): value is ThemePalette {
  * or when the stored value is missing/malformed — never throws, so a corrupt
  * entry can't break app boot.
  */
-export function readThemePalette(): ThemePalette {
+export function readThemePalette(): ThemeSelection {
   if (typeof window === "undefined") return DEFAULT_PALETTE;
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULT_PALETTE;
     const parsed: unknown = JSON.parse(raw);
-    return isThemePalette(parsed) ? parsed : DEFAULT_PALETTE;
+    return isThemeSelection(parsed) ? parsed : DEFAULT_PALETTE;
   } catch {
     return DEFAULT_PALETTE;
   }
@@ -163,10 +191,10 @@ export function readThemePalette(): ThemePalette {
  * default) rather than storing garbage. Swallows quota/access errors so a
  * failed write can't break the app.
  */
-export function writeThemePalette(palette: ThemePalette): void {
+export function writeThemePalette(palette: ThemeSelection): void {
   if (typeof window === "undefined") return;
   try {
-    if (!isThemePalette(palette) || palette === DEFAULT_PALETTE) {
+    if (!isThemeSelection(palette) || palette === DEFAULT_PALETTE) {
       window.localStorage.removeItem(STORAGE_KEY);
       return;
     }
@@ -183,9 +211,9 @@ export function writeThemePalette(palette: ThemePalette): void {
  * `:root` / `.dark` tokens take over. This is the single source of the DOM
  * side-effect and composes with next-themes' `.dark` class untouched.
  */
-export function applyThemePalette(palette: ThemePalette): void {
+export function applyThemePalette(palette: ThemeSelection): void {
   if (typeof document === "undefined") return;
-  const next = isThemePalette(palette) ? palette : DEFAULT_PALETTE;
+  const next = isThemeSelection(palette) ? palette : DEFAULT_PALETTE;
   if (next === DEFAULT_PALETTE) {
     document.documentElement.removeAttribute("data-theme");
     return;

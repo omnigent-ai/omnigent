@@ -44,11 +44,14 @@ def _make_spec(
     model: str | None = "gpt-5",
     name: str = "test-cursor",
     auth: ApiKeyAuth | DatabricksAuth | None = None,
+    permission_mode: str | None = None,
 ) -> AgentSpec:
     """Build a minimal cursor :class:`AgentSpec` for the spawn-env tests."""
     config: dict[str, object] = {"harness": "cursor"}
     if model is not None:
         config["model"] = model
+    if permission_mode is not None:
+        config["permission_mode"] = permission_mode
     return AgentSpec(
         spec_version=1,
         name=name,
@@ -123,6 +126,18 @@ def test_skills_filter_always_set() -> None:
     falls back to ``"all"`` and overrides an explicit ``skills: none``."""
     env = _build_cursor_spawn_env(_make_spec())
     assert "HARNESS_CURSOR_SKILLS_FILTER" in env
+
+
+def test_permission_mode_threads_into_env_var() -> None:
+    """``executor.config.permission_mode`` sets ``HARNESS_CURSOR_PERMISSION_MODE``."""
+    env = _build_cursor_spawn_env(_make_spec(permission_mode="default"))
+    assert env["HARNESS_CURSOR_PERMISSION_MODE"] == "default"
+
+
+def test_no_permission_mode_omits_env_var() -> None:
+    """Absent ``permission_mode`` leaves the harness wrap on its ``auto`` default."""
+    env = _build_cursor_spawn_env(_make_spec())
+    assert "HARNESS_CURSOR_PERMISSION_MODE" not in env
 
 
 def test_name_threads_into_agent_name_env_var() -> None:

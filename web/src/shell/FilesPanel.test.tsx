@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -46,6 +46,8 @@ function file(path: string, bytes = 10): WorkspaceFile {
 function changedFile(
   path: string,
   status: WorkspaceChangedFile["status"] = "modified",
+  linesAdded: number | null = null,
+  linesRemoved: number | null = null,
 ): WorkspaceChangedFile {
   return {
     bytes: 10,
@@ -53,6 +55,8 @@ function changedFile(
     name: path.split("/").at(-1) ?? path,
     path,
     status,
+    lines_added: linesAdded,
+    lines_removed: linesRemoved,
   };
 }
 
@@ -327,11 +331,12 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
     );
 
     // Both segments present; All is selected (flatView=false), Changed is not.
-    expect(screen.getByRole("radio", { name: /^changed$/i })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
-    expect(screen.getByRole("radio", { name: /^all$/i })).toHaveAttribute("aria-checked", "true");
+    const changed = screen.getByRole("radio", { name: /^changed$/i });
+    const all = screen.getByRole("radio", { name: /^all$/i });
+    expect(changed).toHaveAttribute("aria-checked", "false");
+    expect(all).toHaveAttribute("aria-checked", "true");
+    expect(changed).not.toHaveClass("bg-muted");
+    expect(all).toHaveClass("bg-muted");
   });
 
   it("shows the scope switch in full-screen drawer mode (onClose)", () => {
@@ -381,6 +386,30 @@ describe("FilesPanel scope switch (Changed | All) visibility", () => {
   });
 });
 
+describe("FilesPanel Changed pill", () => {
+  // The Changed pill shows the file count only — no +/− line totals.
+  function changedPill() {
+    return screen.getByRole("radio", { name: /^changed$/i });
+  }
+
+  it("shows the file count but no +/− line totals", () => {
+    renderPanel({
+      conversationId: "conv_pill_count",
+      flatView: true,
+      files: [],
+      changedFiles: [
+        changedFile("src/a.ts", "modified", 10, 2),
+        changedFile("src/b.ts", "modified", 5, 1),
+      ],
+    });
+
+    const pill = changedPill();
+    expect(within(pill).getByText("2")).toBeInTheDocument(); // file count
+    expect(within(pill).queryByText(/^\+/)).not.toBeInTheDocument();
+    expect(within(pill).queryByText(/^−/)).not.toBeInTheDocument();
+  });
+});
+
 describe("FilesPanel changed files search", () => {
   it("shows the search field only for the Changed view", () => {
     const files = [file("src/App.tsx")];
@@ -426,14 +455,14 @@ describe("FilesPanel changed files search", () => {
     });
 
     expect(screen.getByText((text) => text.includes("Button.tsx"))).toBeInTheDocument();
-    expect(screen.queryByText("docs/Guide.md")).toBeNull();
+    expect(screen.queryByText("Guide.md")).toBeNull();
 
     fireEvent.change(screen.getByRole("searchbox", { name: "Search changed files" }), {
       target: { value: "" },
     });
 
     expect(screen.getByText((text) => text.includes("Button.tsx"))).toBeInTheDocument();
-    expect(screen.getByText("docs/Guide.md")).toBeInTheDocument();
+    expect(screen.getByText("Guide.md")).toBeInTheDocument();
   });
 
   it("clears the search query when switching from Changed to Explore view", () => {

@@ -553,3 +553,80 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
         )
     finally:
         _pending_policy_ask_writes.pop(eid, None)
+
+
+# ---------------------------------------------------------------------------
+# Actor threading tests
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CapturingPolicyEngine:
+    """
+    Policy engine stub that records the :class:`EvaluationContext` it
+    receives and returns ALLOW so execution proceeds.
+
+    :param captured: Mutable list; the first ``evaluate`` call appends
+        the context it received. Using a list avoids ``nonlocal``.
+    """
+
+    captured: list[EvaluationContext]
+
+    async def evaluate(self, ctx: EvaluationContext) -> PolicyResult:
+        """Record ``ctx`` and return ALLOW.
+
+        :param ctx: The evaluation context passed by the handler.
+        :returns: ``ALLOW`` so the handler proceeds past the gate.
+        """
+        self.captured.append(ctx)
+        return PolicyResult(action=PolicyAction.ALLOW)
+
+    def apply_label_writes(self, set_labels: dict[str, str]) -> None:
+        """No-op."""
+
+    def apply_state_updates(self, updates: list[Any]) -> None:
+        """No-op."""
+
+
+@pytest.mark.asyncio
+async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the runner includes ``actor`` in the JSON-RPC body, the policy
+    engine receives that identity in ``EvaluationContext.actor`` rather
+    than ``None`` (the request has no authenticated user in this path).
+
+    Verifies the fix for shared multi-user sessions where the MCP proxy
+    must gate on the human who triggered the turn, not the runner's
+    service-account credential.
+    """
+    captured: list[EvaluationContext] = []
+    engine = _CapturingPolicyEngine(captured=captured)
+
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        lambda spec, session_id, conversation_store: engine,
+    )
+
+    params = {"name": "sys_os_shell", "arguments": {"command": "echo hi"}}
+    await _handle_mcp_tools_call(
+        rpc_id=1,
+        session_id=_SESSION_ID,
+        params=params,
+        conversation_store=_StubConversationStore(_make_conversation()),  # type: ignore[arg-type]
+        agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+        runner_router=None,
+        actor={"run_as": "alice@example.com"},
+    )
+
+    assert captured, "policy engine was not called"
+    assert captured[0].actor == {"run_as": "alice@example.com"}, (
+        f"expected actor from runner body, got: {captured[0].actor!r}"
+    )

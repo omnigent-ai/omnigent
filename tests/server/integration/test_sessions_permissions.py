@@ -246,7 +246,7 @@ def _register_online_host(app: FastAPI, host_id: str, owner: str) -> None:
     exposing ``send_text``/``receive_text``.
 
     :param app: The app whose ``host_store``/``host_registry`` to use.
-    :param host_id: Host id to register, e.g. ``"host_alice"``.
+    :param host_id: Host id to register, e.g. ``"f54bb9272002938a3a934bfcb6bb228a"``.
     :param owner: Owning user, e.g. ``"alice@example.com"``.
     """
     app.state.host_store.upsert_on_connect(host_id, f"{owner}-laptop", owner)
@@ -499,7 +499,7 @@ async def test_full_permission_lifecycle(
         user="bryan",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     # Only bryan (owner) and rice (edit) should remain.
     # corey was revoked in step 5.
@@ -1022,7 +1022,7 @@ async def test_list_permissions_shows_all_grants(
         user="user-a",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     # user-a auto-got owner on creation; user-b and user-c were
     # granted explicitly above.
@@ -1277,7 +1277,7 @@ async def test_session_creator_gets_manage_grant(
         user="owner",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     # Exactly one grant: the creator with owner level.
     assert len(grants) == 1, (
         f"Expected exactly 1 auto-grant on a fresh session, "
@@ -1328,7 +1328,7 @@ async def test_grant_upgrade_via_upsert(
         session_id,
         user="user-a",
     )
-    grant_map = {g["user_id"]: g["level"] for g in resp.json()}
+    grant_map = {g["user_id"]: g["level"] for g in resp.json()["permissions"]}
     assert grant_map["user-b"] == LEVEL_MANAGE, (
         "After upgrade, user-b should have manage level in the store."
     )
@@ -1404,7 +1404,7 @@ async def test_no_header_defaults_to_local_user_in_single_user_mode(
         user=None,
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     assert any(g["user_id"] == "local" and g["level"] == LEVEL_OWNER for g in grants), (
         "The 'local' user (default from missing header) should have "
         "an owner auto-grant on the created session."
@@ -1799,7 +1799,7 @@ async def test_owner_grant_is_immutable(
         user="bryan",
     )
     assert resp.status_code == 200
-    grants = resp.json()
+    grants = resp.json()["permissions"]
     grant_map = {g["user_id"]: g["level"] for g in grants}
     assert grant_map == {"bryan": LEVEL_OWNER, "corey": LEVEL_MANAGE}, (
         f"Expected bryan=owner(4) and corey=manage(3), got {grant_map}."
@@ -2460,8 +2460,8 @@ async def test_create_session_rejects_other_users_host(
     would have enqueued the stat frame to Alice's connection.
     """
     # Alice owns an online host.
-    _register_online_host(host_perm_app, "host_alice", "alice@example.com")
-    alice_conn = host_perm_app.state.host_registry.get("host_alice")
+    _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
+    alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
     # A bindable BUILT-IN (template) agent: session_id IS NULL, so any
@@ -2470,15 +2470,17 @@ async def test_create_session_rejects_other_users_host(
     # check (see designs/BUILTIN_AGENTS.md); creating a template here
     # isolates the host-owner check.
     SqlAlchemyAgentStore(db_uri).create(
-        "ag_builtin_xuser", "builtin-xuser-agent", "ag_builtin_xuser/bundle"
+        "f2b40a7cc3eaec4ee8cbb151e1021c75",
+        "builtin-xuser-agent",
+        "f2b40a7cc3eaec4ee8cbb151e1021c75/bundle",
     )
 
     # Bob targets Alice's host.
     resp = await host_perm_client.post(
         "/v1/sessions",
         json={
-            "agent_id": "ag_builtin_xuser",
-            "host_id": "host_alice",
+            "agent_id": "f2b40a7cc3eaec4ee8cbb151e1021c75",
+            "host_id": "f54bb9272002938a3a934bfcb6bb228a",
             "workspace": "/tmp",
         },
         headers={"X-Forwarded-Email": "bob@example.com"},
@@ -2529,14 +2531,18 @@ async def test_read_only_collaborator_can_fork_and_owns_the_fork(
     # Fork: corey owns it, bryan has no grant on it.
     fork_perms = {
         p["user_id"]: p["level"]
-        for p in (await _list_permissions(auth_client, fork_id, user="corey")).json()
+        for p in (await _list_permissions(auth_client, fork_id, user="corey")).json()[
+            "permissions"
+        ]
     }
     assert fork_perms == {"corey": LEVEL_OWNER}
 
     # Source grants unchanged by the fork.
     src_perms = {
         p["user_id"]: p["level"]
-        for p in (await _list_permissions(auth_client, source_id, user="bryan")).json()
+        for p in (await _list_permissions(auth_client, source_id, user="bryan")).json()[
+            "permissions"
+        ]
     }
     assert src_perms == {"bryan": LEVEL_OWNER, "corey": LEVEL_READ}
 
@@ -2561,8 +2567,8 @@ async def test_bob_cannot_create_worktree_session_on_alice_host(
     reach Alice's host and the empty-queue assertion below would fail —
     a regression the workspace-only test can't catch.
     """
-    _register_online_host(host_perm_app, "host_alice", "alice@example.com")
-    alice_conn = host_perm_app.state.host_registry.get("host_alice")
+    _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
+    alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
     # Bob owns an agent he is allowed to bind (passes the agent
@@ -2575,7 +2581,7 @@ async def test_bob_cannot_create_worktree_session_on_alice_host(
         "/v1/sessions",
         json={
             "agent_id": bob_agent["id"],
-            "host_id": "host_alice",
+            "host_id": "f54bb9272002938a3a934bfcb6bb228a",
             "workspace": "/Users/alice/repo",
             "git": {"branch_name": "feature/x"},
         },
@@ -2609,8 +2615,8 @@ async def test_bob_cannot_clean_up_alice_worktree_via_delete(
     ``host.remove_worktree`` frame reaches Alice's host. Alice's
     session (and its worktree) survive.
     """
-    _register_online_host(host_perm_app, "host_alice", "alice@example.com")
-    alice_conn = host_perm_app.state.host_registry.get("host_alice")
+    _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
+    alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
     # Alice owns a worktree session. Built via the store + an explicit
@@ -2618,7 +2624,7 @@ async def test_bob_cannot_clean_up_alice_worktree_via_delete(
     conv_store = SqlAlchemyConversationStore(db_uri)
     conv = conv_store.create_conversation(
         agent_id=None,
-        host_id="host_alice",
+        host_id="f54bb9272002938a3a934bfcb6bb228a",
         workspace="/Users/alice/repo-worktrees/feature-x",
         git_branch="feature/x",
     )
@@ -2770,7 +2776,7 @@ async def _end_stream_via_close(session_id: str, task: asyncio.Task[Any]) -> htt
     subscribers whose slot is already registered, and the stream task
     may not have subscribed yet — until the request task completes.
 
-    :param session_id: The streamed session, e.g. ``"conv_abc123"``.
+    :param session_id: The streamed session, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     :param task: The background ``client.get(...)`` request task.
     :returns: The completed (fully buffered) SSE response.
     """

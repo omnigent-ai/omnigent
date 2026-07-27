@@ -1,12 +1,15 @@
 # omnidev
 
-Dev tooling for Omnigent, in one binary with two independent capabilities:
+Dev tooling for Omnigent, in one binary with three surfaces:
 
 1. A per-repo dev **pod supervisor** (bare `omnidev`) — the default.
-2. **Install management** (`omnidev install`/`update`/`check`) — install and
-   keep a git-based omnigent up to date. See
+2. **Install management** (`omnidev install`/`update`/`check`) — install
+   and keep a git-based omnigent up to date. See
    [Managing your omnigent install](#managing-your-omnigent-install). These
-   subcommands need no checkout and run anywhere.
+   need no checkout and run anywhere.
+3. **An omnigent passthrough** (`omnidev omnigent …`) — run any omnigent command
+   against the current checkout's pod, with the pod's isolated env applied.
+   See [Running omnigent commands](#running-omnigent-commands).
 
 ## Pod supervisor
 
@@ -20,8 +23,11 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
 - **supervises** the backend server, the host daemon, and the Vite frontend,
   restarting any that crash (with backoff);
 - **reloads the backend** (server → host) when you edit `omnigent/**/*.py`;
-  the frontend self-reloads through Vite HMR;
-- gives you **scrollable per-process log panes** plus a combined view.
+  gitignored files under `omnigent/` (e.g. the build-time `_build_info.py`) are
+  skipped so generated churn doesn't reload; the frontend self-reloads through
+  Vite HMR;
+- gives you **per-process log panes** plus a combined view, each a `less`-style
+  pager with wrap and search (see [Keys](#keys)).
 
 ## Build & run
 
@@ -42,8 +48,8 @@ Run it from anywhere inside the checkout — it walks up to the repo root
 
 | Process | Command | Notes |
 |---|---|---|
-| server | `uv run omnigent server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
-| host   | `uv run omnigent host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
+| server | `uv run omnigent --log-to-stderr server --host 127.0.0.1 --port <p> --database-uri … --artifact-location …` | Waited on via `GET /health`. |
+| host   | `uv run omnigent --log-to-stderr host --server http://127.0.0.1:<p>` | Started once the server is healthy. |
 | vite   | `npm run dev -- --host <host> --port <p> --strictPort` (cwd `web/`) | `OMNIGENT_URL` points its proxy at the pod's server. |
 
 Before Vite starts (and on a manual Vite restart), omnidev runs `npm install`
@@ -85,6 +91,7 @@ canonical checkout path. Per-process logs are written through to
 --pod-dir <PATH>    Use a specific pod dir instead of the per-repo default
 --no-vite           Backend + host only (no frontend)
 --clean             Wipe the pod dir before starting
+--debug             Log each watched file change and whether it reloads
 ```
 
 `--vite-host 0.0.0.0` exposes the Vite dev server on all interfaces for device
@@ -114,16 +121,53 @@ not auto-trusted (add those to `OMNIGENT_WS_ALLOWED_ORIGINS` yourself).
 
 ## Keys
 
+The log pane is a `less`-style pager, so the movement and search keys should
+feel familiar.
+
 | Key | Action |
 |---|---|
 | `1` / `2` / `3` / `0` | Focus server / host / vite / combined pane |
 | `Tab` | Cycle panes |
-| `↑` `↓` `PgUp` `PgDn` | Scroll (detaches from tail) |
-| `f` | Toggle follow-tail |
+| `j` / `k` (or `↓` / `↑`) | Scroll one line |
+| `f` / `Space` / `PgDn` (or `b` / `PgUp`) | Page forward / back one window |
+| `d` / `u` | Half-page forward / back |
+| `g` / `G` | Jump to top / bottom (bottom re-follows the tail) |
+| `F` | Toggle follow-tail (like `less +F`) |
+| `w` | Toggle line wrap (on by default) |
+| `/` `?` | Search forward / back — type, `Enter` to jump, `Esc` to cancel |
+| `n` / `N` | Next / previous match |
 | `r` | Restart the focused process (server/host restart as a pair) |
 | `R` | Restart the backend (server then host) |
 | `c` | Clear the focused pane |
 | `q` / `Ctrl-C` | Quit and tear down all processes |
+
+## Running omnigent commands
+
+`omnidev omnigent …` runs any omnigent command against the current checkout's
+pod, via `uv run omnigent …`, with the pod's isolated env applied
+(`OMNIGENT_DATA_DIR`, `OMNIGENT_DATABASE_URI`, `OMNIGENT_CONFIG_HOME`,
+`OMNIGENT_URL`). It resolves the same repo root and pod dir the supervisor
+uses, so a command talks to the pod's database and config — and `OMNIGENT_URL`
+points at a running supervisor's server when one is up.
+
+```bash
+omnidev omnigent agent run "fix the flaky test"
+omnidev omnigent config show
+omnidev --pod-dir /tmp/x omnigent agent list   # target a specific pod
+```
+
+Everything after the subcommand is forwarded verbatim to omnigent. It runs in
+the foreground (inheriting your stdio) and exits with omnigent's status code.
+It acquires **no** lock, so it coexists with a running supervisor — the common
+case: the server is up and you issue a command against it. Use `--` to pass
+flags that look like omnidev's own:
+
+```bash
+omnidev omnigent -- --verbose agent run …
+```
+
+Supervisor-only flags (`--server-port`, `--clean`, `--no-vite`, …) don't apply
+to the passthrough; only `--pod-dir` is shared.
 
 ## Managing your omnigent install
 
@@ -132,8 +176,8 @@ than develop it. This wraps the fiddly PEP 508 install syntax and adds a daily
 update check — filling a gap, since omnigent's own update notice only works for
 PyPI-wheel installs and skips git installs.
 
-These subcommands manage the global tool and work from **any directory** (no
-checkout needed).
+These subcommands manage the global tool and work from **any directory**
+(no checkout needed).
 
 ```
 omnidev install     # uv tool install omnigent from git (databricks extra, main)
@@ -172,6 +216,6 @@ result (`${XDG_CACHE_HOME:-~/.cache}/omnidev/omnigent-check.json`) and, when
 stale (>24h), refreshes it in a detached background process — so shell startup
 never blocks on the network. When a newer commit is available it prints a notice
 and, on a terminal, prompts `Update omnigent now? [y/N]`; on yes it runs
-`omnidev update` in the foreground. Declining suppresses that same commit until a
-newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
+`omnidev update` in the foreground. Declining suppresses that same commit until
+a newer one lands. Set `OMNIGENT_NO_UPDATE_CHECK` in your environment if you want
 to silence omnigent's own separate notice.

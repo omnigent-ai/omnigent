@@ -1,9 +1,9 @@
 """Harness readiness checks used by the host daemon.
 
-The daemon reports a per-harness readiness map in its hello frame (so the
-web agent picker can warn) and re-checks the session's harness before
-spawning a runner (so an unconfigured launch fails with a clear,
-actionable error instead of dying inside the executor).
+The daemon reports a per-harness readiness map in its hello frame, refreshes
+it while connected (so the web agent picker can warn accurately), and
+re-checks the session's harness before spawning a runner (so an unconfigured
+launch fails clearly instead of dying inside the executor).
 
 "Configured" here is deliberately narrow: the **only** thing the daemon
 can reliably determine locally is whether a harness's wrapped CLI binary
@@ -24,12 +24,17 @@ that would actually work.
 
 from __future__ import annotations
 
+import logging
 import os
-import shutil
 from collections.abc import Callable
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
+from omnigent._platform import resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
+from omnigent.harness_availability import (
+    CODEX_CANONICAL_HARNESSES,
+    HarnessAvailability,
+)
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
@@ -50,9 +55,10 @@ from omnigent.onboarding.provider_config import (
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
+    SUBSCRIPTION_KIND,
+    default_provider_for_harness,
+    load_config,
 )
-
-HarnessAvailability = bool | str
 
 # In-process SDK harnesses: no CLI binary, credentials resolved at runtime
 # from ambient/spec sources the daemon can't see. Never gated. Includes both
@@ -62,6 +68,8 @@ HarnessAvailability = bool | str
 # ``antigravity`` is the in-process Gemini SDK harness (its key resolves at
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
 # harness gated below on its binary plus a file-based OAuth credential.
+_logger = logging.getLogger(__name__)
+
 _SDK_HARNESSES: frozenset[str] = frozenset(
     {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
 )
@@ -269,7 +277,7 @@ def harness_is_configured(harness: str) -> bool:
     ):
         required_cli = required_cli_for_harness(canonical) or required_cli_for_harness(harness)
         if required_cli is not None:
-            return shutil.which(required_cli.binary) is not None
+            return resolve_cli_binary(required_cli.binary) is not None
         # Unknown harness — the daemon has no install metadata for it, so
         # it can't assess readiness. Fail open (custom/newer harnesses,
         # version skew).
@@ -287,16 +295,113 @@ def harness_is_configured(harness: str) -> bool:
     return True
 
 
+# Native CLI harnesses that authenticate via their own login command and can
+# report auth state locally, so the picker map can distinguish "installed but
+# not signed in" (``needs-auth``) from "not installed" (``binary-missing``) —
+# the same two-step signal Codex already provides. This is picker-facing ONLY;
+# the launch gate (:func:`harness_is_configured`) stays binary-only, so a
+# not-signed-in harness is never blocked from launching (its login surfaces at
+# run time). Pi is handled separately in :func:`_harness_availability` (it has
+# no CLI login, so it can't use the login-command path here — its credential is
+# an omnigent-managed provider). Qwen is absent on purpose: its key lives in the
+# harness's own env / interactive ``/auth``, which the daemon can't reduce to a
+# provider check, so it reports binary presence only.
+_AUTH_AWARE_NATIVE_HARNESSES: dict[str, str] = {
+    "claude-native": "anthropic",
+    "native-claude": "anthropic",
+    "opencode-native": OPENCODE_KEY,
+}
+
+
+def _family_provider_configured(harness: str) -> bool:
+    """Whether a non-subscription default provider ENTRY serves *harness*'s family.
+
+    Reads the local ``providers:`` config the same way the ``omnigent setup``
+    overview does (:func:`surface_default_provider` / :func:`default_provider_for_harness`,
+    which resolve the harness's family and — for ``pi`` — its cross-family
+    fallback). A ``subscription``-kind default is NOT counted here: it lives in
+    the harness CLI's own login, judged separately by :func:`harness_cli_logged_in`,
+    so counting it would double-count the CLI-login path and mask a genuine
+    "installed but no key" state.
+
+    This checks that a default provider *entry* exists — not that its secret
+    actually resolves. An entry whose ``api_key_ref`` points at an unset
+    ``env:``/``$VAR`` or a missing keychain secret still reads configured here
+    (matching the secret-blind ``omnigent setup`` overview), so a harness can
+    report ready while a launch would still fail auth; that surfaces as the
+    executor's first-turn error. The launch gate stays binary-only regardless,
+    and the signal only moves toward green (no configured harness regresses).
+
+    Local, synchronous, side-effect free (config file reads only) and never
+    raises: any resolver/config error fails to ``False`` so a broken config
+    reports "needs-auth" rather than crashing the readiness refresh.
+
+    :param harness: A canonical harness spelling, e.g. ``"claude-native"`` or
+        ``"pi"``.
+    :returns: ``True`` when a non-subscription default provider entry is present
+        for the harness's family, else ``False``.
+    """
+    try:
+        provider = default_provider_for_harness(load_config(), harness)
+    except Exception:
+        # Readiness must never raise; a broken/unreadable config fails to
+        # "no credential" (yellow) rather than crashing the refresh.
+        _logger.debug("readiness: provider check failed for %r", harness, exc_info=True)
+        return False
+    return provider is not None and provider.kind != SUBSCRIPTION_KIND
+
+
+def _cli_family_availability(canonical: str, install_key: str) -> HarnessAvailability:
+    """Two-step availability for a login-command CLI harness.
+
+    :returns: ``"binary-missing"`` when the CLI isn't installed,
+        ``"needs-auth"`` when installed but neither a configured provider
+        credential nor a CLI login is present, else ``True``.
+    """
+    if not harness_cli_installed(install_key):
+        return "binary-missing"
+    if install_key == OPENCODE_KEY:
+        from omnigent.onboarding.opencode_auth import opencode_auth_summary
+
+        return True if opencode_auth_summary().has_provider else "needs-auth"
+    # claude: ready when EITHER an omnigent-managed provider serves the family
+    # (an API key / gateway the user set, incl. from the UI) OR the harness's
+    # own subscription login is present (`claude auth status`, a subprocess —
+    # the same probe the setup wizard uses; runs off the event loop on the
+    # throttled readiness refresh). Checking the config first avoids the
+    # subprocess on the common key-configured path.
+    from omnigent.onboarding.harness_install import harness_cli_logged_in
+
+    if _family_provider_configured(canonical):
+        return True
+    return True if harness_cli_logged_in(install_key) else "needs-auth"
+
+
 def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
-    if (
-        canonical in {"codex", "codex-native", "native-codex"}
-        and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
-    ):
+    if _is_codex_family_harness(canonical):
         from omnigent.codex_native import _codex_auth_unavailable_reason
 
         return _codex_auth_unavailable_reason() or True
+    install_key = _AUTH_AWARE_NATIVE_HARNESSES.get(canonical)
+    if install_key is not None:
+        return _cli_family_availability(canonical, install_key)
+    if canonical in _PI_HARNESSES:
+        # pi has no CLI login — its only credential is an omnigent-managed
+        # provider (an API key / gateway, incl. one set from the UI). So the
+        # two-step signal is binary + provider: installed-but-no-provider is
+        # the yellow "needs-auth" state the setup dialog acts on.
+        if not harness_cli_installed(PI_KEY):
+            return "binary-missing"
+        return True if _family_provider_configured(PI_SURFACE) else "needs-auth"
     return harness_is_configured(canonical)
+
+
+def _is_codex_family_harness(canonical: str) -> bool:
+    """Return whether a canonical harness uses Codex readiness semantics."""
+    return (
+        canonical in CODEX_CANONICAL_HARNESSES and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
+    )
 
 
 def configured_harness_map() -> dict[str, HarnessAvailability]:
@@ -331,6 +436,12 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    return {
-        spelling: _harness_availability(_canonical_harness(spelling)) for spelling in spellings
-    }
+    availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
+    result: dict[str, HarnessAvailability] = {}
+    for spelling in spellings:
+        canonical = _canonical_harness(spelling)
+        cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
+        if cache_key not in availability_cache:
+            availability_cache[cache_key] = _harness_availability(canonical)
+        result[spelling] = availability_cache[cache_key]
+    return result

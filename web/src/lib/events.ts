@@ -141,6 +141,13 @@ export interface ToolResult {
   responseId: string;
 }
 
+/** `response.function_call_output.delta` — live output from a running tool. */
+export interface ToolOutputDelta {
+  type: "tool_output_delta";
+  callId: string;
+  delta: string;
+}
+
 /**
  * A server-initiated elicitation, MCP shape.
  *
@@ -451,6 +458,8 @@ export interface SessionStatusEvent {
   status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
   backgroundTaskCount?: number;
+  /** Structured failure detail; only present when `status === "failed"`. */
+  error?: { code: string; message: string };
 }
 
 /**
@@ -778,9 +787,8 @@ export interface SessionSkillsEvent {
 }
 
 /**
- * `session.model_options` — the Codex app-server model catalog just
- * resolved for a session. Consumers refetch the session snapshot and apply
- * its now-populated `codexModelOptions`.
+ * `session.model_options` — a runner-owned native model catalog just resolved.
+ * Consumers refetch the session snapshot and apply its now-populated options.
  */
 export interface SessionModelOptionsEvent {
   type: "session_model_options";
@@ -862,6 +870,7 @@ export type StreamEvent =
   | ReasoningSummaryDelta
   | ToolCall
   | ToolResult
+  | ToolOutputDelta
   | NativeToolCall
   | SlashCommand
   | RoutingDecision

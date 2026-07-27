@@ -9,7 +9,7 @@ from tests.harness_bench.events import (
     ProbeFinished,
     ProbeStarted,
 )
-from tests.harness_bench.probes import ALL_PROBES
+from tests.harness_bench.probes import ALL_PROBES, CapabilityProbe
 from tests.harness_bench.verdict import Verdict
 
 # Cell state → what the table shows. Verdicts reuse the report glyphs; the two
@@ -31,7 +31,7 @@ _RUNNING = "[cyan]…[/cyan]"
 _TRANSPORT_LABEL = {"native-tui": "native"}
 
 
-def rich_sink_or_none(*, force: bool = False):
+def rich_sink_or_none(*, force: bool = False, probes: list[CapabilityProbe] | None = None):
     """Return a rich live sink, or ``None`` if rich/TTY is unavailable.
 
     :param force: Build the sink even if stdout is not a TTY (for tests /
@@ -45,7 +45,7 @@ def rich_sink_or_none(*, force: bool = False):
     console = Console(stderr=True)
     if not force and not console.is_terminal:
         return None
-    return _RichLiveSink(console)
+    return _RichLiveSink(console, probes=probes)
 
 
 class _RichLiveSink:
@@ -60,12 +60,13 @@ class _RichLiveSink:
     # re-printing it in the stdout report (see __main__._grid_already_shown).
     drew_grid = True
 
-    def __init__(self, console) -> None:
+    def __init__(self, console, *, probes: list[CapabilityProbe] | None = None) -> None:
         from rich.live import Live
 
         self._console = console
-        self._dimensions = [p.title for p in ALL_PROBES]
-        self._dim_by_name = {p.name: p.title for p in ALL_PROBES}
+        selected = probes if probes is not None else ALL_PROBES
+        self._dimensions = [p.title for p in selected]
+        self._dim_by_name = {p.name: p.title for p in selected}
         # harness → {dim_title: markup}; insertion order = display order.
         self._rows: dict[str, dict[str, str]] = {}
         self._transport: dict[str, str] = {}  # harness → resolved transport label

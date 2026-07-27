@@ -294,7 +294,9 @@ async def _initialize_codex_goal_runner(
             "Session not found",
             code=ErrorCode.NOT_FOUND,
         )
-    await _ensure_runner_session_initialized(session_id, refreshed_conv, runner_client)
+    await _ensure_runner_session_initialized(
+        session_id, refreshed_conv, runner_client, conversation_store
+    )
 
 
 async def _launch_runner_for_codex_goal(

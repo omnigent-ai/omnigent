@@ -16,6 +16,17 @@ python -m tests.harness_bench --no-live
 # Probe one harness. Credentials are resolved like `omni run`.
 python -m tests.harness_bench --harness codex
 
+# Run only Reasoning (plus its automatic Basic turn prerequisite).
+python -m tests.harness_bench --harness codex --dimension reasoning
+
+# Pin one harness to an exact model for this run.
+python -m tests.harness_bench --harness codex=system.ai.gpt-5-6-sol
+
+# Mix custom and default models in a multi-harness run.
+python -m tests.harness_bench \
+  --harness codex=system.ai.gpt-5-6-sol \
+  --harness claude-sdk
+
 # Override the configured/ambient Databricks profile.
 python -m tests.harness_bench --harness codex --profile my-profile
 
@@ -35,9 +46,17 @@ non-zero exit means at least one `DRIFT` cell was found.
   `--live` requires resolvable gateway credentials.
 - `--profile NAME` -- optional Databricks profile override; it is not required
   when config or ambient `OPENAI_*` already supplies credentials.
-- `--harness NAME` -- probe one harness (repeatable). Accepts an official name
-  or a `module:attr` / `module.ATTR` reference to a community `BenchProfile`.
-  Defaults to every official harness.
+- `--harness NAME[=MODEL]` -- probe one harness (repeatable), optionally
+  replacing that harness profile's model for this run. `NAME` accepts an
+  official name or a `module:attr` / `module.ATTR` community `BenchProfile`.
+  Omitting `=MODEL` keeps the profile default. This is the simple alternative
+  to test model-pool environment variables. Defaults to every official harness.
+- `--dimension NAME[,NAME...]` -- run only selected dimensions. Repeat the flag
+  or pass a comma-separated list. Names use the identifiers shown by
+  `--list-dimensions`; `basic_turn` is added automatically as the
+  exercisability prerequisite.
+- `--list-dimensions` -- list dimension identifiers, display titles, and
+  priorities.
 - `--fast` -- run SDK harnesses on `sdk-inproc` instead of the `full-server`
   default. This skips server startup, but policy ALLOW/ASK/DENY are not
   observable and tool/cost verdicts are limited to what the wrap forwards.
@@ -81,8 +100,11 @@ A profile's `transport` is a harness-family marker. The resolved driver is:
 | Probe | What it verifies | Priority |
 | --- | --- | --- |
 | **Basic turn** | A turn completes and returns assistant text. | P0 |
+| **Fork replay** | A cloned session copies the source history and can use it on its first turn. | P1 |
 | **Streaming** | More than one output-text delta is emitted; a repeated single delta is `PARTIAL`. | P0 |
+| **Reasoning** | A high-effort turn forwards reasoning deltas or persists a reasoning item; no observation is `SKIPPED` because the model may still emit none. | P1 |
 | **Tool calling** | A tool call is surfaced and the turn closes after its result. | P0 |
+| **Omnigent MCP** | A native harness calls the read-only `sys_session_list` relay tool through its generated `omnigent` MCP server. | P1 |
 | **Policy DENY** | A tool-call policy blocks the call. | P0 |
 | **Policy ALLOW** | A tool call proceeds while an explicit allow policy is attached. | P1 |
 | **Policy ASK** | An ask policy raises an approval elicitation. | P1 |
@@ -99,8 +121,10 @@ transport; it does not claim the harness lacks the capability.
 
 | Dimension | `full-server` | `native-tui` | `sdk-inproc` (`--fast`) |
 | --- | --- | --- | --- |
-| Basic turn, Streaming, Model override, Interrupt | End-to-end through server + runner | End-to-end through server + runner + vendor CLI | Wrap boundary only |
+| Basic turn, Streaming, Reasoning, Model override, Interrupt | End-to-end through server + runner | End-to-end through server + runner + vendor CLI | Wrap boundary only |
+| Fork replay | Clone + copied-history replay through server + runner | Clone + copied-history replay through server + runner + vendor CLI | Not observable |
 | Tool calling | Server-dispatched builtin | Vendor tool mirrored as a session item | Request-level wrap tool |
+| Omnigent MCP | Not applicable | Generated `omnigent` MCP relay when supported by the vendor | Not applicable |
 | Policy DENY | Fixed policy in the agent spec | Session CEL policy + native policy hook | Not observable |
 | Policy ALLOW / ASK | Fixed policy; ASK observes and resolves an elicitation | Temporary session CEL policy; ASK observes and resolves an elicitation | Not observable |
 | Cost tracking | Session snapshot | Session snapshot when the vendor forwards usage | Completed-response usage when forwarded |
@@ -150,8 +174,10 @@ open platform item.
 
 Add a `CapabilityProbe` under `probes/`, register it in
 `probes/__init__.py:ALL_PROBES`, add a semantic method to the driver protocol,
-and derive or declare the expected verdict. Keep transport-specific mechanics
-inside drivers so probes remain harness-agnostic.
+and map its `HarnessCapabilities` declaration to the expected verdict. Optional
+capability values remain `UNKNOWN` until a harness makes an explicit claim.
+Keep transport-specific mechanics inside drivers so probes remain
+harness-agnostic.
 
 ## Current gaps
 
@@ -159,5 +185,5 @@ inside drivers so probes remain harness-agnostic.
   the harness registry, which limits community-native end-to-end execution.
 - Some native harnesses require vendor login/provider setup that the bench
   cannot provision and therefore skip cleanly.
-- Steering, live queue, resume/fork, reasoning, images, and compaction do not
+- Steering, live queue, resume, images, and compaction do not
   yet have probes.

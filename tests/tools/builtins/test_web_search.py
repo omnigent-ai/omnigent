@@ -97,6 +97,23 @@ def test_missing_query_returns_error(tool_ctx: ToolContext) -> None:
     assert "query" in result.lower()
 
 
+def test_invalid_arguments_return_error(tool_ctx: ToolContext) -> None:
+    """Malformed and non-object JSON return tool errors instead of raising."""
+    tool = WebSearchTool(llm_provider="anthropic")
+    malformed = tool.invoke("{", tool_ctx)
+    non_object = tool.invoke("[]", tool_ctx)
+    assert "Error" in malformed and "malformed JSON" in malformed
+    assert "Error" in non_object and "JSON object" in non_object
+
+
+@pytest.mark.parametrize("query", [123, True, "  "])
+def test_invalid_query_returns_error(tool_ctx: ToolContext, query: object) -> None:
+    """Invalid queries are rejected before backend selection."""
+    tool = WebSearchTool(llm_provider="anthropic")
+    result = tool.invoke(json.dumps({"query": query}), tool_ctx)
+    assert "Error" in result and "query" in result.lower()
+
+
 # ── search_provider: google ──────────────────────────
 
 

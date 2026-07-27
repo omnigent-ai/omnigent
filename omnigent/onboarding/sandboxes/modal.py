@@ -39,6 +39,9 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxLauncher,
+    foreground_kill_command,
+    foreground_pidfile,
+    foreground_record_prefix,
     host_image_wheel_install_command,
 )
 
@@ -86,12 +89,6 @@ the WORKLOAD's environment. The server's managed-host config
 # enough for a host running one interactive session.
 _SANDBOX_CPU: float = 2.0
 _SANDBOX_MEMORY_MIB: int = 4096
-
-# Where exec_foreground records the remote process's pid so Ctrl-C on
-# the local side can kill it (the SDK has no kill API for exec'd
-# processes). One foreground process per sandbox at a time, by design —
-# it holds the local terminal.
-_FOREGROUND_PIDFILE: str = "/tmp/oa-foreground.pid"
 
 
 def _ensure_sdk() -> None:
@@ -521,16 +518,29 @@ class ModalSandboxLauncher(SandboxLauncher):
             process when the user detaches with Ctrl-C.
         """
         handle = self._resolve(sandbox_id)
-        remote = f"echo $$ > {_FOREGROUND_PIDFILE} && TERM=xterm-256color exec {command}"
+        # Record the pid in a private, unpredictably-named dir under /tmp.
+        # `mkdir -m 700` (no -p) fails closed if the path already exists, so a
+        # co-tenant on the sandbox can't pre-seed a symlink we'd write through,
+        # nor read our pid back, in world-writable /tmp. See
+        # :func:`foreground_pidfile` for the shared rationale.
+        run_dir, pidfile = foreground_pidfile()
+        remote = f"{foreground_record_prefix(pidfile)}TERM=xterm-256color exec {command}"
         process = handle.exec("bash", "-lc", remote, pty=True)
         try:
             for line in process.stdout:
                 click.echo(line, nl=False)
-            return process.wait()
+            rc = process.wait()
         except KeyboardInterrupt:
             click.echo("\n  → detaching; stopping the remote process")
-            handle.exec("bash", "-c", f"kill $(cat {_FOREGROUND_PIDFILE}) 2>/dev/null").wait()
+            # Signal only a numeric pid read back from our own private pidfile,
+            # then drop the dir; never feed unvalidated file contents to kill.
+            handle.exec("bash", "-c", foreground_kill_command(pidfile)).wait()
             raise
+        # Normal exit: drop the run dir so we don't orphan a mode-700
+        # dir in /tmp. The interrupt path already cleans up via
+        # :func:`foreground_kill_command`.
+        handle.exec("bash", "-c", f"rm -rf {run_dir} 2>/dev/null").wait()
+        return rc
 
     def wheel_install_command(self, remote_tgz_path: str) -> str:
         """

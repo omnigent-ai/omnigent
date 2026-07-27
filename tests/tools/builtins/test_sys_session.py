@@ -143,7 +143,7 @@ def session_fixture(
     # reads ctx.conversation_id directly (tasks table removed).
     ctx = ToolContext(
         task_id="task_placeholder",
-        agent_id="ag_parent",
+        agent_id="2759f8a97fd91216cb3e0d7a1f60c7f6",
         conversation_id=parent_conv.id,
     )
 
@@ -567,12 +567,12 @@ def test_peek_unknown_conversation_id_returns_not_found(
     """
     tool = SysSessionGetHistoryTool()
     raw = tool.invoke(
-        json.dumps({"conversation_id": "conv_does_not_exist"}),
+        json.dumps({"conversation_id": "1d0b12236c77f69f5073a53583de1a3f"}),
         session_fixture.ctx,
     )
     payload = json.loads(raw)
     assert payload["error"] == "session_not_found"
-    assert payload["conversation_id"] == "conv_does_not_exist"
+    assert payload["conversation_id"] == "1d0b12236c77f69f5073a53583de1a3f"
 
 
 def test_peek_out_of_tree_conversation_is_rejected(
@@ -811,12 +811,12 @@ def test_close_unknown_conversation_id_returns_not_found(
     ``session_not_found`` (no DB mutation).
     """
     raw = SysSessionCloseTool().invoke(
-        json.dumps({"conversation_id": "conv_ghost"}),
+        json.dumps({"conversation_id": "761ec01d1fb0a45d2e3159d0d47a5e70"}),
         session_fixture.ctx,
     )
     payload = json.loads(raw)
     assert payload["error"] == "session_not_found"
-    assert payload["conversation_id"] == "conv_ghost"
+    assert payload["conversation_id"] == "761ec01d1fb0a45d2e3159d0d47a5e70"
 
 
 def test_close_out_of_tree_conversation_is_rejected(

@@ -18,6 +18,7 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy Playwright suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ['CHANGELOG.md']
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:

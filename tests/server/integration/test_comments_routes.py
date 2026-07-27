@@ -40,7 +40,7 @@ def _seed_session_with_grants(
     :param db_uri: SQLite URI for the per-test database.
     :param grants: Mapping of ``{user_email: level}`` to grant on the new
         session, e.g. ``{"alice@example.com": LEVEL_EDIT}``.
-    :returns: The newly created conversation ID, e.g. ``"conv_abc123"``.
+    :returns: The newly created conversation ID, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     """
     conv_store = SqlAlchemyConversationStore(db_uri)
     conversation = conv_store.create_conversation()
@@ -219,7 +219,7 @@ async def test_admin_cannot_add_comment_to_nonexistent_session(
 ) -> None:
     """Admin bypass must not allow orphan comments on missing sessions."""
     admin = "admin@example.com"
-    missing_session_id = "conv_does_not_exist"
+    missing_session_id = "1d0b12236c77f69f5073a53583de1a3f"
     perm_store = SqlAlchemyPermissionStore(db_uri)
     perm_store.ensure_user(admin, is_admin=True)
 

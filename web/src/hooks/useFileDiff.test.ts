@@ -1,24 +1,27 @@
 // Unit tests for useFileDiff: the enable gate (only fires when a session,
-// a path, an online runner, and a changed-files match all line up), the
+// a path, a serveable workspace, and a changed-files match all line up), the
 // per-segment path encoding of the diff URL, and the throw-on-non-2xx guard.
 //
 // The two source hooks are mocked so we exercise the gate and URL builder
 // directly without standing up the RunnerHealthProvider or the changed-files
-// query.
+// query. `useWorkspaceServeable` is the runner-OR-host serve gate: the diff
+// fires when the runner is online OR (runner offline but) the host can read
+// the workspace from disk.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
-vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({ useWorkspaceChangedFiles: vi.fn() }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
+  useWorkspaceChangedFiles: vi.fn(),
+  useWorkspaceServeable: vi.fn(),
+}));
 
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
-import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
+import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
 import { useFileDiff } from "./useFileDiff";
 
-const runnerOnlineMock = vi.mocked(useSessionRunnerOnline);
+const serveableMock = vi.mocked(useWorkspaceServeable);
 const changedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -32,12 +35,9 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 
 const fetchMock = vi.fn();
 
-/** Wire the two source hooks: runner online state + changed-files paths. */
-function setHooks(opts: {
-  runnerOnline?: boolean | undefined;
-  changedPaths?: string[] | undefined;
-}) {
-  runnerOnlineMock.mockReturnValue(opts.runnerOnline);
+/** Wire the two source hooks: serveable state + changed-files paths. */
+function setHooks(opts: { serveable?: boolean | undefined; changedPaths?: string[] | undefined }) {
+  serveableMock.mockReturnValue(opts.serveable);
   changedFilesMock.mockReturnValue({
     data:
       opts.changedPaths === undefined
@@ -48,7 +48,7 @@ function setHooks(opts: {
 
 beforeEach(() => {
   fetchMock.mockReset();
-  runnerOnlineMock.mockReset();
+  serveableMock.mockReset();
   changedFilesMock.mockReset();
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -67,30 +67,47 @@ function renderDiff(conversationId: string | undefined, path: string | null) {
 describe("useFileDiff — enable gate", () => {
   it("does not fetch when conversationId is missing", () => {
     // No session means there is no diff endpoint to call.
-    setHooks({ runnerOnline: true, changedPaths: ["a.ts"] });
+    setHooks({ serveable: true, changedPaths: ["a.ts"] });
     renderDiff(undefined, "a.ts");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("does not fetch when path is null", () => {
     // Nothing is selected; firing a request would build a malformed URL.
-    setHooks({ runnerOnline: true, changedPaths: ["a.ts"] });
+    setHooks({ serveable: true, changedPaths: ["a.ts"] });
     renderDiff("conv_1", null);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not fetch when the runner is offline", () => {
-    // An offline runner has no live filesystem to diff against; the query
+  it("does not fetch when the workspace is not serveable (runner + host both down)", () => {
+    // Neither the runner nor the host can read the workspace, so the query
     // must stay disabled rather than hammer a dead endpoint.
-    setHooks({ runnerOnline: false, changedPaths: ["a.ts"] });
+    setHooks({ serveable: false, changedPaths: ["a.ts"] });
     renderDiff("conv_1", "a.ts");
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches when the runner is offline but the host can serve the diff", async () => {
+    // Serveable is true when the host holds the workspace even with the
+    // runner asleep; the before/after diff must still load.
+    setHooks({ serveable: true, changedPaths: ["a.ts"] });
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "session.environment.filesystem.file_diff",
+        path: "a.ts",
+        before: "old",
+        after: "new",
+      }),
+    );
+    const { result } = renderDiff("conv_1", "a.ts");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not fetch when the file is not in the changed-files list", () => {
     // Only created/modified/deleted files have diff data; an unchanged file
     // would 404, so the gate keeps it disabled.
-    setHooks({ runnerOnline: true, changedPaths: ["other.ts"] });
+    setHooks({ serveable: true, changedPaths: ["other.ts"] });
     renderDiff("conv_1", "a.ts");
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -98,13 +115,13 @@ describe("useFileDiff — enable gate", () => {
   it("treats an unresolved changed-files list as not-yet-matched (no fetch)", () => {
     // Before the changed-files query resolves, data is undefined; the gate
     // must wait rather than fetch a diff for a file it can't confirm changed.
-    setHooks({ runnerOnline: true, changedPaths: undefined });
+    setHooks({ serveable: true, changedPaths: undefined });
     renderDiff("conv_1", "a.ts");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("fetches when session + path + online runner + changed-file match all hold", async () => {
-    setHooks({ runnerOnline: true, changedPaths: ["a.ts"] });
+    setHooks({ serveable: true, changedPaths: ["a.ts"] });
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         object: "session.environment.filesystem.file_diff",
@@ -122,7 +139,7 @@ describe("useFileDiff — enable gate", () => {
     // The gate only blocks on an explicit `false`; an unknown (undefined)
     // runner state must not stop the diff, or the panel would stay blank
     // during the brief window before health resolves.
-    setHooks({ runnerOnline: undefined, changedPaths: ["a.ts"] });
+    setHooks({ serveable: undefined, changedPaths: ["a.ts"] });
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         object: "session.environment.filesystem.file_diff",
@@ -142,7 +159,7 @@ describe("useFileDiff — request URL", () => {
     // Per-segment encoding keeps "/" as the directory separator while
     // escaping spaces/specials; whole-string encoding would turn slashes
     // into %2F and break the FastAPI {path:path} route.
-    setHooks({ runnerOnline: true, changedPaths: ["src/a b.ts"] });
+    setHooks({ serveable: true, changedPaths: ["src/a b.ts"] });
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         object: "session.environment.filesystem.file_diff",
@@ -161,7 +178,7 @@ describe("useFileDiff — request URL", () => {
 
 describe("useFileDiff — error handling", () => {
   it("surfaces an error on non-2xx", async () => {
-    setHooks({ runnerOnline: true, changedPaths: ["a.ts"] });
+    setHooks({ serveable: true, changedPaths: ["a.ts"] });
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
     const { result } = renderDiff("conv_1", "a.ts");
     await waitFor(() => expect(result.current.isError).toBe(true));
@@ -172,7 +189,7 @@ describe("useFileDiff — error handling", () => {
     // A git_status_failed 500 carries the real cause in error.message; the
     // hook must propagate it so the diff view shows what went wrong rather
     // than a bare status code.
-    setHooks({ runnerOnline: true, changedPaths: ["a.ts"] });
+    setHooks({ serveable: true, changedPaths: ["a.ts"] });
     fetchMock.mockResolvedValueOnce(
       mockResponse(
         { error: { code: "git_status_failed", message: "git status timed out after 5.0s" } },

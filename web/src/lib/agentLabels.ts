@@ -27,11 +27,36 @@ export const BRAIN_HARNESS_LABELS: Record<string, string> = {
   copilot: "Copilot",
 };
 
-interface HarnessCatalogWire {
-  data?: { id?: string; label?: string }[];
+/** One raw setup step from the server's ``/v1/harnesses`` catalog. */
+export interface SetupStepWire {
+  kind: string;
+  title: string;
+  detail: string;
+  action: string;
+  command: string | null;
+  status_key: string | null;
 }
 
-async function fetchHarnessLabels(): Promise<Record<string, string>> {
+interface HarnessCatalogRow {
+  id?: string;
+  label?: string;
+}
+
+interface HarnessCatalogWire {
+  data?: HarnessCatalogRow[];
+  // Setup steps keyed by EVERY harness spelling a session may declare (native
+  // wrappers + installable non-picker ids), not just the picker rows in `data`.
+  setup_steps?: Record<string, SetupStepWire[]>;
+}
+
+interface HarnessCatalog {
+  /** harness id → picker label, merged over the built-in defaults. */
+  labels: Record<string, string>;
+  /** harness spelling → ordered setup steps (install/auth) the server describes. */
+  setupSteps: Record<string, SetupStepWire[]>;
+}
+
+async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   const res = await authenticatedFetch("/v1/harnesses");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HarnessCatalogWire;
@@ -41,16 +66,43 @@ async function fetchHarnessLabels(): Promise<Record<string, string>> {
       labels[row.id] = row.label;
     }
   }
-  return labels;
+  // The server keys setup_steps by every spelling (codex-native, opencode, …)
+  // so the dialog resolves whatever harness the session declares.
+  const setupSteps =
+    body.setup_steps && typeof body.setup_steps === "object" ? body.setup_steps : {};
+  return { labels, setupSteps };
 }
 
-export function useBrainHarnessLabels(): Record<string, string> {
+// Both hooks share one request + cache entry, each selecting its own slice.
+function useHarnessCatalog<T>(select: (c: HarnessCatalog) => T, fallback: T): T {
   const { data } = useQuery({
     queryKey: ["harness-labels"],
-    queryFn: fetchHarnessLabels,
+    queryFn: fetchHarnessCatalog,
     staleTime: 30_000,
+    select,
   });
-  return data ?? BRAIN_HARNESS_LABELS;
+  return data ?? fallback;
+}
+
+/**
+ * Sentinel value sent as ``harness_override`` when the user picks "auto".
+ * The server resolves it to a real harness + model via the intelligent router
+ * and never persists this string literal.
+ */
+export const AUTO_HARNESS_ID = "auto";
+
+export function useBrainHarnessLabels(smartRoutingEnabled = false): Record<string, string> {
+  const base = useHarnessCatalog((c) => c.labels, BRAIN_HARNESS_LABELS);
+  if (!smartRoutingEnabled) return base;
+  // Prepend the "auto" sentinel so it appears first in the picker.
+  return { [AUTO_HARNESS_ID]: "Auto", ...base };
+}
+
+const _NO_SETUP_STEPS: Record<string, SetupStepWire[]> = {};
+
+/** harness id → the server's ordered setup steps (for the setup dialog). */
+export function useHarnessSetupSteps(): Record<string, SetupStepWire[]> {
+  return useHarnessCatalog((c) => c.setupSteps, _NO_SETUP_STEPS);
 }
 
 /**

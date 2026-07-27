@@ -58,6 +58,12 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
 from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.process_logging import (
+    PROCESS_LOG_FILE_ENV_VAR,
+    child_logging_popen_kwargs,
+    logs_root,
+    open_process_log_file,
+)
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
@@ -3223,6 +3229,16 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
         _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
+        # A harness-only override drops any prior model pin so the new
+        # harness resolves its provider default — e.g. ``omnigent run
+        # examples/polly --harness pi`` must not keep Polly's Claude-only
+        # a Claude-only ``executor.model``. An explicit ``--model``
+        # (applied above) wins and is left alone.
+        if overrides.model is None:
+            executor_block.pop("model", None)
+            llm_block = raw.get("llm")
+            if isinstance(llm_block, dict):
+                llm_block.pop("model", None)
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)
@@ -3420,7 +3436,7 @@ def _omnigent_log_dir() -> Path:
 
     :returns: ``~/.omnigent/logs``, created if needed.
     """
-    log_dir = Path.home() / ".omnigent" / "logs"
+    log_dir = logs_root()
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
@@ -3489,11 +3505,7 @@ def _start_local_server(
     :returns: The server handle bundling the subprocess and
         the path to its captured stdout/stderr log file.
     """
-    log_dir = _omnigent_log_dir() / "server"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_fd, log_name = tempfile.mkstemp(prefix="server-", suffix=".log", dir=log_dir)
-    log_path = Path(log_name)
-    log_fh = os.fdopen(log_fd, "wb")
+    log_path, log_fh = open_process_log_file("server", root=_omnigent_log_dir())
     if ephemeral:
         data_tmpdir = tempfile.mkdtemp(prefix="ap-chat-data-")
         db_path = Path(data_tmpdir) / "chat.db"
@@ -3534,6 +3546,7 @@ def _start_local_server(
     child_env = {
         **os.environ,
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
+        PROCESS_LOG_FILE_ENV_VAR: str(log_path),
         # Single-user loopback runtime — see ensure_local_omnigent_server for why
         # this lets the host tunnel re-own this machine's host_id across an
         # auth-mode flip without weakening the deployed multi-user boundary.
@@ -3566,28 +3579,30 @@ def _start_local_server(
             child_env["DATABRICKS_CONFIG_PROFILE"] = _spec.executor.profile
 
     try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{db_path}",
-                "--artifact-location",
-                str(artifact_path),
-                "--agent",
-                str(agent_path),
-            ],
-            env=child_env,
-            stdout=log_fh,
-            stderr=log_fh,
-            **_proc.spawn_kwargs(),
-        )
+        with child_logging_popen_kwargs(child_env) as logging_kwargs:
+            server_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "omnigent.cli",
+                    "server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--database-uri",
+                    f"sqlite:///{db_path}",
+                    "--artifact-location",
+                    str(artifact_path),
+                    "--agent",
+                    str(agent_path),
+                ],
+                env=child_env,
+                stdout=log_fh,
+                stderr=log_fh,
+                **_proc.spawn_kwargs(),
+                **logging_kwargs,
+            )
     finally:
         log_fh.close()
 

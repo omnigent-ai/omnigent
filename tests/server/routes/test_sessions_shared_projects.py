@@ -67,9 +67,15 @@ def _seed_shared_project_session(db_uri: str) -> str:
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     perms = SqlAlchemyPermissionStore(db_uri)
-    if agent_store.get("ag_test") is None:
-        agent_store.create(agent_id="ag_test", name="test-agent", bundle_location="ag_test/bundle")
-    conv = conv_store.create_conversation(title="Bob's session", agent_id="ag_test")
+    if agent_store.get("087b7cb7ac30abf4debfaa578d052ec6") is None:
+        agent_store.create(
+            agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+            name="test-agent",
+            bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
+        )
+    conv = conv_store.create_conversation(
+        title="Bob's session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
+    )
     conv_store.set_labels(conv.id, {PROJECT_LABEL_KEY: "Bob Project"})
     for user in (ALICE, BOB):
         perms.ensure_user(user)
@@ -84,10 +90,11 @@ def test_shared_project_not_listed_as_recipients_own_project(db_uri: str) -> Non
     _seed_shared_project_session(db_uri)
     app = _multi_user_app(db_uri)
 
-    # Bob owns it, so it's his project.
+    # Bob owns it, so it's his project. Label-only (no first-class row here),
+    # so it lists with id=None.
     bob = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": BOB})
     assert bob.status_code == 200
-    assert bob.json() == ["Bob Project"]
+    assert bob.json() == [{"id": None, "name": "Bob Project"}]
 
     # Alice can access the session, but doesn't own it — no folder for her.
     alice = TestClient(app).get("/v1/sessions/projects", headers={"X-Forwarded-Email": ALICE})

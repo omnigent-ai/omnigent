@@ -113,7 +113,7 @@ def test_fork_from_middle_truncates_history(
     # Land in a DIFFERENT session — a URL still on the source means
     # navigation never fired; a visible dialog means the fork call failed.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     expect(dialog).not_to_be_visible()

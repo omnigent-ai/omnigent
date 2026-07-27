@@ -14,23 +14,22 @@ import {
   type AgentActivity,
   type AgentNodeData,
 } from "./subagentGraphLayout";
+import { activityDotClassName, sessionStatus } from "./subagentStatus";
 
 import "@xyflow/react/dist/style.css";
 
-const TREE_POLL_MS = 15_000;
-
-const ACTIVITY_COLORS: Record<AgentActivity, { border: string; bg: string; dot: string }> = {
-  working: { border: "border-brand-accent", bg: "bg-brand-accent/5", dot: "" },
-  awaiting: { border: "border-warning", bg: "bg-warning/5", dot: "" },
-  failed: { border: "border-destructive", bg: "bg-destructive/5", dot: "bg-destructive" },
-  launching: {
-    border: "border-muted-foreground/40",
-    bg: "bg-muted/30",
-    dot: "bg-muted-foreground/70",
-  },
-  done: { border: "border-muted-foreground/30", bg: "bg-card", dot: "bg-muted-foreground/55" },
-  idle: { border: "border-muted-foreground/30", bg: "bg-card", dot: "bg-muted-foreground/55" },
-  other: { border: "border-muted-foreground/30", bg: "bg-card", dot: "bg-muted-foreground/55" },
+// Per-activity node border + background tint. The status DOT color is NOT
+// defined here — it comes from the shared ``activityDotClassName`` so the
+// graph dot always matches the list dot (the source of truth).
+const ACTIVITY_TINT: Record<AgentActivity, { border: string; bg: string }> = {
+  working: { border: "border-brand-accent", bg: "bg-brand-accent/5" },
+  awaiting: { border: "border-warning", bg: "bg-warning/5" },
+  failed: { border: "border-destructive", bg: "bg-destructive/5" },
+  launching: { border: "border-muted-foreground/40", bg: "bg-muted/30" },
+  disconnected: { border: "border-muted-foreground/30", bg: "bg-card" },
+  done: { border: "border-muted-foreground/30", bg: "bg-card" },
+  idle: { border: "border-muted-foreground/30", bg: "bg-card" },
+  other: { border: "border-muted-foreground/30", bg: "bg-card" },
 };
 
 function NodeStatusDot({ activity }: { activity: AgentActivity }) {
@@ -42,13 +41,16 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
       </Badge>
     );
   }
-  const colors = ACTIVITY_COLORS[activity];
-  return <span className={cn("inline-block size-2 shrink-0 rounded-full", colors.dot)} />;
+  return (
+    <span
+      className={cn("inline-block size-2 shrink-0 rounded-full", activityDotClassName(activity))}
+    />
+  );
 }
 
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
   const { label, activity, statusLabel, isActive, preview } = data;
-  const colors = ACTIVITY_COLORS[activity];
+  const tint = ACTIVITY_TINT[activity];
   const location = useLocation();
   const search = useMemo(() => {
     const params = new URLSearchParams(location.search);
@@ -67,8 +69,8 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
       <div
         className={cn(
           "rounded-lg border px-3 py-2 shadow-sm transition-colors hover:shadow-md cursor-pointer",
-          colors.border,
-          colors.bg,
+          tint.border,
+          tint.bg,
           isActive && "ring-2 ring-ring ring-offset-1 ring-offset-background",
         )}
         style={{ width: NODE_WIDTH }}
@@ -105,7 +107,7 @@ function ChildCollector({
   depth: number;
   onCollected: (parentId: string, children: ChildSessionInfo[]) => void;
 }) {
-  const { children } = useChildSessions(depth < MAX_TREE_DEPTH ? parentId : null, TREE_POLL_MS);
+  const { children } = useChildSessions(depth < MAX_TREE_DEPTH ? parentId : null);
 
   useEffect(() => {
     onCollected(parentId, children);
@@ -133,7 +135,7 @@ interface SubagentsGraphViewProps {
 
 export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsGraphViewProps) {
   const { session } = useSession(rootSessionId);
-  const { children: rootChildren } = useChildSessions(rootSessionId, TREE_POLL_MS);
+  const { children: rootChildren } = useChildSessions(rootSessionId);
 
   const [childrenMap, setChildrenMap] = useState<Map<string, ChildSessionInfo[]>>(() => new Map());
 
@@ -159,8 +161,11 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
   const wrapper = session?.labels?.[WRAPPER_LABEL_KEY];
   const nativeAgent = nativeCodingAgentForWrapper(wrapper);
   const rootLabel = nativeAgent?.displayName ?? session?.agentName ?? "main";
-  const rootActivity: AgentActivity =
-    session?.status === "running" ? "working" : session?.status === "failed" ? "failed" : "idle";
+  // Mirror the list view's ``sessionStatus`` so the root node honors
+  // launching / disconnected (not just running / failed / idle).
+  const rootStatus = sessionStatus(session?.status, session?.lastTaskError);
+  const rootActivity = rootStatus.activity;
+  const rootStatusLabel = rootStatus.label;
 
   const { nodes: layoutNodes, edges: layoutEdges } = useMemo(
     () =>
@@ -168,16 +173,19 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
         rootSessionId,
         rootLabel,
         rootActivity,
-        rootActivity === "working" ? "Working" : "Idle",
+        rootStatusLabel,
         null,
         childrenMap,
         conversationId,
       ),
-    [rootSessionId, rootLabel, rootActivity, childrenMap, conversationId],
+    [rootSessionId, rootLabel, rootActivity, rootStatusLabel, childrenMap, conversationId],
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-card">
+    <div
+      data-workspace-panel-surface
+      className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-card"
+    >
       <div className="h-full w-full" style={{ minHeight: 200 }}>
         <ReactFlow
           nodes={layoutNodes}

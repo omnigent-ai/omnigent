@@ -140,7 +140,7 @@ async def test_oidc_admin_can_crud_default_policies(
     create = await oidc_policy_client.post("/v1/policies", json=_policy_payload(), headers=headers)
     assert create.status_code == 200, create.text
     pid = create.json()["id"]
-    assert pid.startswith("pol_")
+    assert len(pid) == 32
 
     # List — the created policy is present.
     listing = await oidc_policy_client.get("/v1/policies", headers=headers)

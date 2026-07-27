@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass, field
 
 import pytest
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
@@ -186,6 +188,69 @@ def test_get_returns_none_for_unknown() -> None:
     assert registry.get("host_nonexistent") is None
 
 
+def test_same_host_id_isolated_across_workspaces() -> None:
+    """
+    The same stable host_id connecting to two workspaces is tracked as
+    two independent connections — neither evicts the other.
+
+    A laptop's config.yaml host_id is stable, so a multi-workspace user
+    presents the same id to workspace A and workspace B. Keyed on
+    host_id alone, the second connect would poison the first's outbound
+    queue and ``send_text`` would route workspace A's frames to
+    workspace B's tunnel. Keyed on (workspace_id, host_id) — mirroring
+    the hosts-table PK — both stay live and isolated.
+    """
+    registry = HostRegistry()
+    host_id = "00112233445566778899aabbccddeeff"
+
+    with workspace_scope(111):
+        conn_a = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+    with workspace_scope(222):
+        conn_b = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+
+    # Distinct connections, neither evicted.
+    assert conn_a is not conn_b
+    assert conn_a.workspace_id == 111
+    assert conn_b.workspace_id == 222
+    with workspace_scope(111):
+        assert registry.get(host_id) is conn_a
+    with workspace_scope(222):
+        assert registry.get(host_id) is conn_b
+
+    # Workspace B's connect did NOT poison workspace A's outbound queue.
+    assert conn_a.outbound_queue.empty()
+
+    # send_text routes to the right workspace's tunnel (no "replaced" error).
+    registry.send_text(conn_a, "a")
+    registry.send_text(conn_b, "b")
+    assert conn_a.outbound_queue.get_nowait() == "a"
+    assert conn_b.outbound_queue.get_nowait() == "b"
+
+    # Deregister is workspace-scoped: removing A leaves B live.
+    with workspace_scope(111):
+        registry.deregister(host_id)
+        assert registry.get(host_id) is None
+    with workspace_scope(222):
+        assert registry.get(host_id) is conn_b
+
+
+def test_online_host_ids_scoped_to_workspace() -> None:
+    """
+    online_host_ids returns only the requesting workspace's hosts, so
+    one tenant never sees another's connected host ids.
+    """
+    registry = HostRegistry()
+    with workspace_scope(111):
+        registry.register("host_a", FakeWebSocket(), _make_hello(), owner="alice")
+    with workspace_scope(222):
+        registry.register("host_b", FakeWebSocket(), _make_hello(), owner="bob")
+
+    with workspace_scope(111):
+        assert registry.online_host_ids() == ["host_a"]
+    with workspace_scope(222):
+        assert registry.online_host_ids() == ["host_b"]
+
+
 # ── RunnerExitReports ───────────────────────────────────
 
 
@@ -256,3 +321,36 @@ def test_exit_reports_get_is_unscoped() -> None:
     assert reports.get("runner_abc") == "runner process exited with code 1"
     # Missing runner still reads None (snapshot then leaves last_task_error unset).
     assert reports.get("runner_unknown") is None
+
+
+def test_legacy_prefixed_id_resolves_to_bare_registration() -> None:
+    """
+    Every ``uuid_to_bytes``-accepted spelling of a host id must key
+    the same registry entry (regression: #2740).
+
+    The tunnel route registers under the bare-hex form, but
+    pre-migration clients still send ``host_<hex>`` in REST paths.
+    Before the fix, ``get`` was exact-string: launches 409'd "host
+    is offline" while ``GET /v1/hosts`` (DB-normalized) reported the
+    host online.
+    """
+    bare = "00112233445566778899aabbccddeeff"
+    prefixed = f"host_{bare}"
+    dashed = str(uuid.UUID(bare))
+
+    registry = HostRegistry()
+    conn = registry.register(bare, FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert registry.get(prefixed) is conn
+    assert registry.get(dashed) is conn
+
+    # Registering under a legacy spelling replaces the same entry, and
+    # the stored connection carries the canonical id (send_text's
+    # replaced-connection check keys on conn.host_id).
+    replacement = registry.register(prefixed, FakeWebSocket(), _make_hello(), owner="alice")
+    assert replacement.host_id == bare
+    assert registry.get(bare) is replacement
+
+    # Deregistering by any spelling removes the entry.
+    registry.deregister(prefixed)
+    assert registry.get(bare) is None

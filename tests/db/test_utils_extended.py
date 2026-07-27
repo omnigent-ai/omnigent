@@ -23,7 +23,7 @@ from sqlalchemy import text
 
 from omnigent.db.db_models import SqlUser
 from omnigent.db.utils import (
-    _ITEM_TYPE_PREFIX,
+    _ITEM_TYPES,
     clear_engine_cache,
     delete_fts_by_conversation,
     ensure_fts_table,
@@ -159,21 +159,22 @@ class TestManagedSessionMaker:
 class TestIdGenerators:
     def test_generate_file_id_format(self) -> None:
         fid = generate_file_id()
-        assert re.fullmatch(r"file_[0-9a-f]{32}", fid)
+        assert re.fullmatch(r"[0-9a-f]{32}", fid)
 
     def test_generate_conversation_id_format(self) -> None:
         cid = generate_conversation_id()
-        assert re.fullmatch(r"conv_[0-9a-f]{32}", cid)
+        assert re.fullmatch(r"[0-9a-f]{32}", cid)
 
     def test_generate_task_id_format(self) -> None:
+        # response ids stay prefixed: the column is a polymorphic harness token,
+        # not a bare uuid, so it is not narrowed to Uuid16.
         tid = generate_task_id()
         assert re.fullmatch(r"resp_[0-9a-f]{32}", tid)
 
     def test_generate_item_id_all_types(self) -> None:
-        for item_type, prefix in _ITEM_TYPE_PREFIX.items():
+        for item_type in _ITEM_TYPES:
             item_id = generate_item_id(item_type)
-            assert item_id.startswith(prefix), f"{item_type} should start with {prefix}"
-            assert len(item_id) == len(prefix) + 32
+            assert re.fullmatch(r"[0-9a-f]{32}", item_id), f"{item_type} -> {item_id}"
 
     def test_generate_item_id_unknown_type_raises(self) -> None:
         with pytest.raises(ValueError, match="unknown item type"):
@@ -202,8 +203,18 @@ class TestFtsHelpers:
         managed = make_managed_session_maker(engine)
 
         with managed() as session:
-            insert_fts(session, "msg_1", "conv_1", "hello world")
-            insert_fts(session, "msg_2", "conv_1", "goodbye world")
+            insert_fts(
+                session,
+                "9980c8a9248139f14f4165e5d53088aa",
+                "8e32600337d08f59ad381caf96a90659",
+                "hello world",
+            )
+            insert_fts(
+                session,
+                "0fd4e86b2daa009cd9929641dbd7dab6",
+                "8e32600337d08f59ad381caf96a90659",
+                "goodbye world",
+            )
 
         with managed() as session:
             rows = session.execute(
@@ -213,7 +224,7 @@ class TestFtsHelpers:
                 )
             ).fetchall()
             assert len(rows) == 1
-            assert rows[0][0] == "msg_1"
+            assert rows[0][0] == "9980c8a9248139f14f4165e5d53088aa"
 
     def test_delete_fts_by_conversation(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
@@ -223,16 +234,27 @@ class TestFtsHelpers:
         managed = make_managed_session_maker(engine)
 
         with managed() as session:
-            insert_fts(session, "msg_a", "conv_del", "searchable text")
-            insert_fts(session, "msg_b", "conv_keep", "also searchable")
+            insert_fts(
+                session,
+                "83cd574b729d39c61cf72d568188531a",
+                "553a265445caf1cdb034abe0b449485d",
+                "searchable text",
+            )
+            insert_fts(
+                session,
+                "0917d69fc9d16f420210e37ed3ef5f31",
+                "aacdf565fffe01a05b5f40d6c4ac83d7",
+                "also searchable",
+            )
 
         with managed() as session:
-            delete_fts_by_conversation(session, "conv_del")
+            delete_fts_by_conversation(session, "553a265445caf1cdb034abe0b449485d")
 
         with managed() as session:
             deleted = session.execute(
                 text(
-                    "SELECT item_id FROM conversation_items_fts WHERE conversation_id = 'conv_del'"
+                    "SELECT item_id FROM conversation_items_fts"
+                    " WHERE conversation_id = '553a265445caf1cdb034abe0b449485d'"
                 )
             ).fetchall()
             assert len(deleted) == 0
@@ -240,7 +262,7 @@ class TestFtsHelpers:
             kept = session.execute(
                 text(
                     "SELECT item_id FROM conversation_items_fts "
-                    "WHERE conversation_id = 'conv_keep'"
+                    "WHERE conversation_id = 'aacdf565fffe01a05b5f40d6c4ac83d7'"
                 )
             ).fetchall()
             assert len(kept) == 1
