@@ -744,12 +744,17 @@ def _build_models_json(
     # ucode's ``openai`` gateway is the Codex Responses gateway
     # (``.../ai-gateway/codex/v1``), which 404s pi's openai-completions
     # ``/chat/completions`` POST. Re-route only that case to serving-endpoints;
-    # generic providers (no ``/ai-gateway/codex``) pass through. Gemini rides
-    # this path via databricks-completions since pi can't speak generateContent.
+    # generic providers (no ``/ai-gateway/codex``) pass through.
     if raw_openai_base_url and "/ai-gateway/codex" in raw_openai_base_url:
         openai_base_url = serving_endpoints_url
     else:
         openai_base_url = raw_openai_base_url or serving_endpoints_url
+    # For non-Databricks providers (e.g. OpenAI API key, LiteLLM) the
+    # /ai-gateway/* paths don't exist — use the generic base URL for all paths.
+    is_generic_provider = bool(raw_openai_base_url and "/ai-gateway/" not in raw_openai_base_url)
+    if is_generic_provider:
+        codex_gateway_url = openai_base_url
+        mlflow_gateway_url = openai_base_url
     claude_base_url = (base_urls or {}).get("claude") or f"{h}/serving-endpoints/anthropic"
     _openai_responses_compat: dict[str, Any] = {  # type: ignore[explicit-any]
         "supportsDeveloperRole": False,
