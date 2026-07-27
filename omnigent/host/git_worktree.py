@@ -428,7 +428,7 @@ def create_worktree(
 
     if branch_exists:
         # Reuse the existing branch — no -b flag.
-        add_args = ["worktree", "add", str(worktree_path), branch_name]
+        add_args = ["worktree", "add", str(worktree_path), f"refs/heads/{branch_name}"]
     else:
         add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
         if base_branch is not None:
