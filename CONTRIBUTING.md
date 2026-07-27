@@ -29,6 +29,7 @@ Install local prerequisites first:
   Claude/Codex/Pi terminals (`apt install bubblewrap` on Debian/Ubuntu). macOS
   uses the built-in `seatbelt` sandbox and needs nothing extra.
 - Node.js 22 LTS or newer with `npm` when working on `web/`.
+- A Rust toolchain for the recommended `omnidev` local development supervisor.
 
 ```bash
 git clone https://github.com/omnigent-ai/omnigent.git
@@ -56,15 +57,64 @@ cd web && npm install && npm run lint && npm run build
 
 ## Running locally
 
-To try your changes, start a local server, register your machine as a host,
-and run the frontend dev server. Use three separate terminals:
+Start with the smallest relevant automated test described in [Tests](#tests).
+For full-stack manual testing, use `omnidev`.
+
+### Recommended: worktree-safe testing with `omnidev`
+
+`omnidev` runs the current checkout's server, host, and Vite frontend in one
+terminal. Each checkout path, including each worktree, gets isolated state,
+configuration, database, artifacts, logs, and automatically allocated ports,
+so it can run alongside your normal Omnigent installation and other worktrees.
+
+Install the supervisor once from an up-to-date checkout:
+
+```bash
+cargo install --path dev/omnidev --force
+```
+
+Then run it from anywhere inside the branch checkout or worktree you want to
+test. A fresh worktree needs its own Python environment first:
+
+```bash
+cd /path/to/omnigent-worktree
+uv sync --extra all --extra dev
+omnidev
+```
+
+Open the exact `ui` URL displayed in the header; do not assume the Vite port is
+`5173`. Python changes under `omnigent/` reload the server and host, while
+frontend changes use Vite HMR.
+
+Run CLI commands against the development pod through the passthrough so they
+use that checkout and its isolated state instead of a globally installed
+`omnigent`:
+
+```bash
+omnidev omnigent config show
+omnidev omnigent agent list
+```
+
+Keep `omnidev` in the foreground and quit with `q` or `Ctrl-C` so it tears down
+all three processes. An interactive terminal inside an existing Omnigent
+session also works; use `git rev-parse --show-toplevel` to confirm that its
+current checkout is the one you intend to test.
+
+See [`dev/omnidev/README.md`](dev/omnidev/README.md) for log controls,
+clean-state testing, backend-only and LAN modes, and other options.
+
+### Manual three-terminal fallback
+
+Use the manual flow when you need to run or debug each component separately.
+Unlike `omnidev`, it does not isolate state or allocate ports. These commands
+assume the default ports are free:
 
 ```bash
 # Terminal 1: local server on :6767
-omnigent server
+uv run omnigent server
 
 # Terminal 2: register your machine as a host
-omnigent host --server http://localhost:6767
+uv run omnigent host --server http://localhost:6767
 
 # Terminal 3: frontend dev server
 cd web
@@ -81,7 +131,7 @@ The host URL can also be passed positionally (`omnigent host
 http://localhost:6767`). See the [README](README.md) for more on hosts,
 harnesses, and credentials.
 
-### Backend-only local development validation
+### Disposable backend-only validation
 
 Use this when you want to validate the Python backend and local API server from
 a source checkout without building the web UI, configuring provider

@@ -1,17 +1,18 @@
-// One row in the Tasks list, rendered as a FLAT list row (no card chrome — no
-// border/background/shadow box, no per-row divider). Layout: bold task title on
-// line 1 (+ a small "Paused" pill when paused), a single muted subline on line 2
-// with the human-readable schedule summary ("Weekdays at 8:00 AM") followed by
-// the next-run delta ("· Next run in 15h") when armed.
+// One row in the Tasks list, rendered as a CARD (border + subtle background +
+// rounded corners + internal padding; the list stacks these with a gap). Layout:
+// bold task title on line 1 (+ a small "Paused" pill when paused), a single
+// muted subline on line 2 with the human-readable schedule summary ("Weekdays
+// at 8:00 AM") followed by the next-run time ("· Next run in 3 hours") when
+// armed.
 //
-// The next-run delta is derived from the scheduler's authoritative `nextRunAt`
-// (an ISO string the server computes): we format only how far away it is
-// (nextRunAt − now), never recompute WHICH instant is next on the client — so
-// the old "no client countdown" rule (a client-recomputed instant can't match
-// the server anchor for INTERVAL>1 rules) is not violated. Paused rows are NOT
-// dimmed — the title stays fully legible and the pill is the sole paused
-// signal. A hover-revealed ellipsis (⋯) action menu (Run now / Pause /
-// Resume / Edit / Delete) sits on the right.
+// The next-run time is derived from the scheduler's authoritative `nextRunAt`
+// (an ISO string the server computes): we only FORMAT the delta from that
+// instant (a full-words "in N hours / days" label), never recompute WHICH
+// instant is next on the client — so the "no client countdown" rule (a
+// client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
+// is not violated. Paused rows are NOT dimmed — the title stays fully legible
+// and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
+// menu (Run now / Pause / Resume / Edit / Delete) sits on the right.
 
 import { useMemo, useState } from "react";
 import {
@@ -35,6 +36,7 @@ import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
   task,
+  now,
   onEdit,
   onPauseToggle,
   onRunNow,
@@ -42,6 +44,11 @@ export function ScheduledTaskRow({
   busy,
 }: {
   task: ScheduledTask;
+  // The current wall-clock time, supplied by the parent's shared `useNow` ticker
+  // so the relative next-run label ("in 3 hours") re-renders and stays fresh as
+  // time passes. Passed in (not read here) to keep the row a pure function of
+  // props — one ticker for the whole list, and deterministic in tests.
+  now: Date;
   onEdit: (task: ScheduledTask) => void;
   onPauseToggle: (task: ScheduledTask) => void;
   onRunNow: (task: ScheduledTask) => void;
@@ -52,26 +59,27 @@ export function ScheduledTaskRow({
   const paused = task.state === "paused";
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
-  // server value; we never recompute next-run on the client.
+  // delta from the server value against the ticking `now`; we never recompute
+  // WHICH instant is next on the client.
   const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
-  const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt), [task.nextRunAt]);
+  const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt, now), [task.nextRunAt, now]);
 
   return (
     <div
       data-testid="scheduled-task-row"
       data-state={task.state}
       className={cn(
-        // Flat row — NO card chrome (no border/bg/shadow box) and no per-row
-        // divider. `group relative` so the absolutely-positioned ⋯ trigger can
-        // hover-reveal; vertical padding gives the flat-list spacing.
-        // `-mx-2 rounded-lg` + `hover:bg-muted/70` gives a subtle FULL-ROW hover
-        // highlight (like the sidebar conversation rows) that extends past the
-        // content while keeping the title aligned with the page. `pl-2` (left
-        // content inset) is mirrored by the ⋯ button's `right-2` inset so the
-        // two edges are symmetric within the highlight; `pr-10` keeps the text
-        // clear of the inset button. Paused rows are NOT dimmed — the title must
-        // stay legible (AA); the "Paused" pill is the sole signal.
-        "group relative -mx-2 flex items-center gap-3 rounded-lg py-[11px] pr-10 pl-2 transition-colors hover:bg-muted/70",
+        // Card chrome — matching the app's card vocabulary (`rounded-xl border
+        // border-border bg-card`, see InboxPage rows / the Card component): a
+        // visible border, subtle card background, rounded corners, and internal
+        // padding. The list container (TasksPage) stacks these with a `gap` so
+        // there is vertical spacing between cards. `group relative` lets the
+        // absolutely-positioned ⋯ trigger hover-reveal; `pr-12` keeps the text
+        // clear of the inset button, whose `right-3` matches the card's `px-4`
+        // inset so the two edges are symmetric. A subtle `hover:bg-muted/40`
+        // keeps the full-card hover affordance. Paused rows are NOT dimmed — the
+        // title must stay legible (AA); the "Paused" pill is the sole signal.
+        "group relative flex items-center gap-3 rounded-xl border border-border bg-card py-3 pr-12 pl-4 transition-colors hover:bg-muted/40",
       )}
     >
       <div className="flex min-w-0 flex-1 flex-col">
@@ -114,7 +122,7 @@ export function ScheduledTaskRow({
             data-testid="task-row-menu"
             disabled={busy}
             className={cn(
-              "-translate-y-1/2 absolute top-1/2 right-2 transition-opacity",
+              "-translate-y-1/2 absolute top-1/2 right-3 transition-opacity",
               "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
               "md:aria-expanded:opacity-100",
             )}

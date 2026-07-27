@@ -78,7 +78,10 @@ vi.mock("@/hooks/useConversations", () => ({
     const ids = useSyncExternalStore(mocks.pinnedStore.subscribe, () => mocks.pinnedStore.ids);
     const idSet = new Set(ids);
     return {
-      data: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+      data: {
+        conversations: (mocks.conversations as { id: string }[]).filter((c) => idSet.has(c.id)),
+        filterHonored: true,
+      },
       isSuccess: true,
     };
   },

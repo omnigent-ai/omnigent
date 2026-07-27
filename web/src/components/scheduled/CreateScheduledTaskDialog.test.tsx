@@ -19,7 +19,13 @@ import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+// useHostModelOptions is consumed by the ModelEffortFields sub-form (model
+// dropdown source). Returning no data makes it fall back to the static Claude
+// alias list, which is what a no-host-pinned scheduled task uses anyway.
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: vi.fn(),
+  useHostModelOptions: vi.fn(() => ({ data: undefined })),
+}));
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useCreateScheduledTask: vi.fn(),
   useUpdateScheduledTask: vi.fn(),
@@ -189,11 +195,17 @@ function scheduledTask(overrides: Partial<import("@/lib/scheduledTasksApi").Sche
 }
 
 describe("agent picker readiness (needs-setup badges)", () => {
-  it("explains that scheduled tasks use the selected agent's runtime defaults", () => {
+  it("shows the model + effort controls for the default (Claude-native) agent", () => {
     renderDialog();
+    // The default effective agent is claude-native-ui (a capable native coding
+    // agent), so the model/effort pickers render and the "uses defaults" hint —
+    // shown only when the controls are hidden — is absent.
+    expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
+    expect(screen.getByTestId("task-model-trigger")).toBeInTheDocument();
+    expect(screen.getByTestId("task-effort-trigger")).toBeInTheDocument();
     expect(
-      screen.getByText("Uses this agent's default model, effort, and permission settings"),
-    ).toBeInTheDocument();
+      screen.queryByText("Uses this agent's default model, effort, and permission settings"),
+    ).not.toBeInTheDocument();
   });
 
   it("feeds the picker a fallback online host so 'needs setup' badges show with no host pinned", () => {
@@ -379,9 +391,9 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(arg.timezone.length).toBeGreaterThan(0);
   });
 
-  // Model/effort controls are not offered, so the create
-  // body carries agent_id and NEVER model_override / reasoning_effort, whether
-  // the pick is a bare harness (claude-native) or a plain agent (polly).
+  // With the model/effort controls left at their Default (unselected) state, the
+  // create body carries agent_id and NO model_override / reasoning_effort,
+  // whether the pick is a bare harness (claude-native) or a plain agent (polly).
   it("maps a bare-harness pick to its agent_id, never sends model/effort", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
@@ -639,6 +651,95 @@ describe("CreateScheduledTaskDialog submit", () => {
     renderDialog();
     expect(screen.queryByTestId("schedule-preview")).toBeNull();
     expect(screen.queryByText(/Reads as:/i)).toBeNull();
+  });
+});
+
+describe("CreateScheduledTaskDialog model + effort controls", () => {
+  it("renders model + effort for a capable (Claude-native) agent, hides them for a plain agent", () => {
+    renderDialog();
+    // Default effective agent is the capable claude-native harness → controls show.
+    expect(screen.getByTestId("task-model-effort-field")).toBeInTheDocument();
+
+    // Switch to Polly (claude-sdk, no permissionMode capability) → controls hide.
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    expect(screen.queryByTestId("task-model-effort-field")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("task-effort-trigger")).not.toBeInTheDocument();
+    // The "uses defaults" hint returns when the controls are hidden.
+    expect(
+      screen.getByText("Uses this agent's default model, effort, and permission settings"),
+    ).toBeInTheDocument();
+  });
+
+  it("sends the selected model + effort on create for a capable agent", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+
+    // Pick a model (keyboard is the reliable jsdom path for Radix Select).
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Opus" }));
+    // Pick an effort.
+    fireEvent.keyDown(screen.getByTestId("task-effort-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "High" }));
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg.modelOverride).toBe("opus");
+    expect(arg.reasoningEffort).toBe("high");
+  });
+
+  it("omits model + effort on create when both are left at Default", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg).not.toHaveProperty("modelOverride");
+    expect(arg).not.toHaveProperty("reasoningEffort");
+  });
+
+  it("prefills model + effort in edit mode from the loaded task", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          modelOverride: "sonnet",
+          reasoningEffort: "medium",
+        })}
+      />,
+    );
+    // Prefilled selections surface as the trigger's shown value.
+    expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Medium");
+  });
+
+  it("threads model + effort through update on edit, nulling a cleared override", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          modelOverride: "opus",
+          reasoningEffort: "high",
+        })}
+      />,
+    );
+    // Reset the model back to Default; leave effort at "high".
+    fireEvent.keyDown(screen.getByTestId("task-model-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    // Cleared model → null; untouched effort → the prefilled value.
+    expect(input.modelOverride).toBeNull();
+    expect(input.reasoningEffort).toBe("high");
   });
 });
 

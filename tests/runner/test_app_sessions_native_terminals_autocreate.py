@@ -208,6 +208,97 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_pi_terminal_surfaces_credential_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider with an unresolved credential posts a visible session notice.
+
+    Without this, a Pi session whose Databricks token can't be refreshed
+    launches but every message silently fails to reach the model — no reply,
+    no reason. The warning is delivered as an ``error`` item (which the web UI
+    renders as a distinct banner) via ``external_conversation_item``.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+
+    provider = pi_native_credentials.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://wkspc.example.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="databricks-claude-sonnet-4-6",
+        api_key="!databricks auth token --profile demo-staging",
+        auth_header=True,
+        credential_warning="⚠️ Couldn't authenticate to `demo-staging`; run databricks auth login.",
+    )
+    monkeypatch.setattr(
+        pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
+    )
+    # Avoid touching the real Pi settings/models writer; the launch env is not
+    # under test here — the credential-warning surfacing is.
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "pi_native_provider_launch",
+        lambda _agent_dir, _provider: ({}, []),
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, terminal_name: str, **_kwargs: Any
+        ) -> SessionResourceView:
+            del terminal_name, _kwargs
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    class _RecordingServerClient(NullServerClient):
+        async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            posts.append((url, kwargs.get("json") or {}))
+            return self._Response()
+
+    await _auto_create_pi_terminal(
+        "47f049b9d13df4db397c7f46859b825f",
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=_RecordingServerClient(),  # type: ignore[arg-type]
+    )
+
+    warning_posts = [
+        body
+        for url, body in posts
+        if "/events" in url and body.get("type") == "external_conversation_item"
+    ]
+    assert len(warning_posts) == 1
+    data = warning_posts[0]["data"]
+    assert data["item_type"] == "error"
+    assert data["item_data"]["code"] == "pi_credentials_unresolved"
+    assert "databricks auth login" in data["item_data"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_auto_create_kiro_terminal_launches_required_terminal_with_isolated_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -34,12 +34,18 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   };
 }
 
+// A fixed `now` so the relative next-run label is deterministic (the real hook
+// supplies a ticking clock; the row just formats the delta against whatever it's
+// given).
+const NOW = new Date("2026-03-10T12:00:00Z");
+
 function renderRow(
   t: ScheduledTask,
   handlers: Partial<Parameters<typeof ScheduledTaskRow>[0]> = {},
 ) {
   const props = {
     task: t,
+    now: NOW,
     onEdit: vi.fn(),
     onPauseToggle: vi.fn(),
     onRunNow: vi.fn(),
@@ -53,14 +59,15 @@ function renderRow(
 
 afterEach(cleanup);
 
-describe("next-run text (server-sourced, relative)", () => {
+describe("next-run text (server-sourced, relative delta)", () => {
   it("renders the relative next-run with a 'Next run' prefix when nextRunAt is set", () => {
-    // ~2h in the future → "in 2h". Delta formatting is covered in
-    // scheduleText.test.ts; here we assert the row surfaces it with the prefix.
-    const future = new Date(Date.now() + 2 * 60 * 60 * 1000 + 60_000).toISOString();
+    // A near-future instant (2h1m past the fixed NOW) → a relative "in 2 hours"
+    // label. Relative formatting is covered in scheduleText.test.ts; here we
+    // assert the row surfaces it with the prefix, using the injected `now`.
+    const future = new Date(NOW.getTime() + 2 * 60 * 60 * 1000 + 60_000).toISOString();
     renderRow(task({ nextRunAt: future }));
     const nextRun = screen.getByTestId("task-next-run");
-    expect(nextRun.textContent).toMatch(/^Next run in \d+h$/);
+    expect(nextRun.textContent).toBe("Next run in 2 hours");
   });
 
   it("renders NO next-run text when nextRunAt is null (paused / unarmed)", () => {

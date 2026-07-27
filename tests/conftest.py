@@ -25,8 +25,7 @@ os.environ.setdefault("OMNIGENT_DISABLE_CATALOG_LOOKUP", "1")
 
 # Pin header mode for the whole suite. Header is the env-unset default,
 # but a developer's shell often has OMNIGENT_AUTH_ENABLED=1 set (the
-# multi-user opt-in they use to test the login flow locally; the
-# pre-rename OMNIGENT_ACCOUNTS_ENABLED is still honored too) — and that
+# multi-user opt-in they use to test the login flow locally) — and that
 # enable switch would flip the env-unset default to accounts (or oidc, if
 # the shell also exports OMNIGENT_OIDC_ISSUER), booting every server in
 # multi-user mode and failing loud with "Missing required environment

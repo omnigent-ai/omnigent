@@ -27,6 +27,7 @@ import {
   useScheduledTasks,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
+import { useNow } from "@/hooks/useNow";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -41,6 +42,10 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 
 export function TasksPage() {
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
+  // A single shared, slowly-ticking clock for the whole list. Passing it down to
+  // each row (rather than each row owning a timer) keeps the relative next-run
+  // labels fresh with ONE interval regardless of how many rows are on screen.
+  const now = useNow();
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
@@ -216,14 +221,15 @@ export function TasksPage() {
           onPickSuggestion={openFromSuggestion}
         />
       ) : (
-        // Flat list — no boxed cards, and NO per-row hairline dividers (the row
-        // padding alone gives the spacing). The only divider on the page is the
-        // one before the Suggestions section (see SuggestionsSection).
-        <div className="flex flex-col" data-testid="tasks-list">
+        // Card list — each row is a bordered card (see ScheduledTaskRow), stacked
+        // with a gap so there's vertical spacing between cards. The only divider
+        // on the page is the one before the Suggestions section.
+        <div className="flex flex-col gap-2" data-testid="tasks-list">
           {filtered.map((task) => (
             <ScheduledTaskRow
               key={task.id}
               task={task}
+              now={now}
               busy={busyId === task.id}
               onEdit={handleEdit}
               onPauseToggle={handlePauseToggle}
