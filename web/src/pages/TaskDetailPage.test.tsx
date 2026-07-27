@@ -9,13 +9,14 @@
 // All data hooks are mocked at their seam; the edit dialog is stubbed so we
 // only assert it opened. useParams/useNavigate come from `@/lib/routing`.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskDetailPage } from "./TaskDetailPage";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
+import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTask, ScheduledTaskRun } from "@/lib/scheduledTasksApi";
 
 const navigate = vi.fn();
@@ -294,14 +295,53 @@ describe("header actions", () => {
     expect(showToast).toHaveBeenCalledWith("Run started");
   });
 
-  it("Run now shows error toast on failure", () => {
+  it("Run now shows error toast on a generic (non-409) failure", () => {
     runNowMutate.mockImplementation(
-      (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onError?.(),
+      (_id: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) =>
+        opts?.onError?.(new ScheduledTaskApiError("server error", 503, null)),
     );
     setTask(task());
     renderPage();
     fireEvent.click(screen.getByTestId("task-detail-run-now"));
     expect(showToast).toHaveBeenCalledWith("Couldn't start the run");
+  });
+
+  it("Run now shows 'already in progress' toast for a 409 (overlap guard hit)", () => {
+    runNowMutate.mockImplementation(
+      (_id: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) =>
+        opts?.onError?.(new ScheduledTaskApiError("conflict", 409, "CONFLICT")),
+    );
+    setTask(task());
+    renderPage();
+    fireEvent.click(screen.getByTestId("task-detail-run-now"));
+    expect(showToast).toHaveBeenCalledWith("This run is already in progress");
+  });
+
+  it("Run now button stays disabled through the 10s justFired window after success", async () => {
+    vi.useFakeTimers();
+    try {
+      runNowMutate.mockImplementation(
+        (_id: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) =>
+          opts?.onSuccess?.(),
+      );
+      setTask(task());
+      renderPage();
+      const btn = screen.getByTestId("task-detail-run-now");
+      expect(btn).not.toBeDisabled();
+      // Wrap in act so the synchronous onSuccess → setJustFired(true) state update flushes.
+      await act(async () => {
+        fireEvent.click(btn);
+      });
+      // After success the button should be disabled (justFired=true).
+      expect(btn).toBeDisabled();
+      // Advance past the 10s window so the timer fires and setJustFired(false) runs.
+      await act(async () => {
+        vi.advanceTimersByTime(10_001);
+      });
+      expect(btn).not.toBeDisabled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("toggling the Switch off pauses an active task (update to paused)", () => {

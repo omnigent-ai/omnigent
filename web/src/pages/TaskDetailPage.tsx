@@ -12,7 +12,7 @@
  * open-conversation link) — never an invented summary line.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   CalendarOffIcon,
@@ -53,6 +53,7 @@ import {
   formatRunDuration,
   formatRunTimestamp,
 } from "@/lib/scheduleText";
+import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
 
@@ -74,6 +75,16 @@ export function TaskDetailPage() {
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
+  // Keeps the Run now button disabled through the ~10s post-fire poll window so
+  // a quick second click can't trigger a 409 "already in flight" from the server.
+  const [justFired, setJustFired] = useState(false);
+  const justFiredTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (justFiredTimerRef.current != null) clearTimeout(justFiredTimerRef.current);
+    };
+  }, []);
 
   // Resolve the agent + host display labels from their catalogs. Both are
   // best-effort: an unknown id falls back to the raw id (agent) or a friendly
@@ -134,8 +145,23 @@ export function TaskDetailPage() {
 
   function handleRunNow() {
     runNowMutation.mutate(task!.id, {
-      onSuccess: () => showToast("Run started"),
-      onError: () => showToast("Couldn't start the run"),
+      onSuccess: () => {
+        showToast("Run started");
+        // Disable Run now for ~10s while the background fire is in flight so a
+        // quick second click doesn't hit the server's overlap guard (409).
+        setJustFired(true);
+        if (justFiredTimerRef.current != null) clearTimeout(justFiredTimerRef.current);
+        justFiredTimerRef.current = setTimeout(() => setJustFired(false), 10_000);
+      },
+      onError: (err) => {
+        // A 409 (CONFLICT) means a run for this task is already in flight — the
+        // run is fine. Show a truthful, non-alarming message.
+        if (err instanceof ScheduledTaskApiError && err.status === 409) {
+          showToast("This run is already in progress");
+        } else {
+          showToast("Couldn't start the run");
+        }
+      },
     });
   }
 
@@ -177,7 +203,11 @@ export function TaskDetailPage() {
           >
             <Trash2Icon className="size-4" />
           </Button>
-          <Button data-testid="task-detail-run-now" disabled={busy} onClick={handleRunNow}>
+          <Button
+            data-testid="task-detail-run-now"
+            disabled={busy || justFired}
+            onClick={handleRunNow}
+          >
             {runNowMutation.isPending ? (
               <Loader2Icon className="size-4 animate-spin" />
             ) : (
