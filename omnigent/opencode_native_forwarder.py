@@ -288,13 +288,15 @@ class OpenCodeNativeForwarder:
         finally:
             # Never leave a parked ``question`` task orphaned when the consume
             # loop exits (cap reached, return, or cancellation): cancel them all.
-            self._cancel_question_tasks()
+            await self._cancel_question_tasks()
 
-    def _cancel_question_tasks(self) -> None:
-        """Cancel every in-flight question park task and clear the registry."""
-        for task in self._question_tasks.values():
+    async def _cancel_question_tasks(self) -> None:
+        """Cancel and await every in-flight question park task."""
+        tasks = list(self._question_tasks.values())
+        for task in tasks:
             if not task.done():
                 task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self._question_tasks.clear()
 
     async def _consume_once(self) -> None:
@@ -1073,17 +1075,17 @@ class OpenCodeNativeForwarder:
                 await self._opencode.reject_question(request_id)
 
     async def _reject_question_quietly(self, request_id: str) -> None:
-        """Reject a question, swallowing a benign NotFound if the TUI beat us.
+        """Best-effort reject a question, swallowing OpenCode client errors.
 
-        If opencode already resolved the question via the TUI, the reject hits a
-        not-found error — benign, since the goal (the tool no longer blocks) is
-        already met.
+        A TUI resolution commonly makes this request return not found. Other
+        client failures are also non-fatal because rejection is only cleanup
+        after the web path can no longer provide an answer.
         """
         try:
             await self._opencode.reject_question(request_id)
         except OpenCodeClientError:
             _logger.debug(
-                "OpenCode question reject for request=%s ignored (already resolved)",
+                "OpenCode question reject for request=%s failed during best-effort cleanup",
                 request_id,
                 exc_info=True,
             )
@@ -1163,6 +1165,7 @@ class OpenCodeNativeForwarder:
         task = self._question_tasks.pop(request_id, None)
         if task is not None and not task.done():
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await self._post_event(_EXTERNAL_ELICITATION_RESOLVED, {"elicitation_id": request_id})
 
 

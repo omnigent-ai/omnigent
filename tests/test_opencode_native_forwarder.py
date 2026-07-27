@@ -1061,6 +1061,29 @@ async def test_question_rejected_clears_card() -> None:
     assert resolved == {"elicitation_id": "que_9"}
 
 
+async def test_run_awaits_cancelled_question_tasks() -> None:
+    """Forwarder shutdown waits for question-task cancellation cleanup."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    cleanup_finished = asyncio.Event()
+
+    async def _pending_question() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+
+    pending = asyncio.create_task(_pending_question())
+    fwd._question_tasks["que_1"] = pending
+    await asyncio.sleep(0)
+    await fwd.run(max_reconnects=0)
+
+    assert cleanup_finished.is_set()
+    assert pending.cancelled()
+    assert fwd._question_tasks == {}
+
+
 async def test_question_asked_no_valid_options_rejects_without_hook() -> None:
     """A question with no renderable options → reject_question, no card parked."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
