@@ -35,15 +35,17 @@ class SetupStep:
     ``omnigent setup`` walks a user through — one row per requirement, in order.
 
     :param kind: Machine id for the requirement, ``"install"`` or ``"auth"``.
-    :param title: Human row label, agent-framed (e.g. ``"Install Codex"``,
-        ``"Sign in to Codex"``).
+    :param title: Human row label (e.g. ``"Install Codex"``,
+        ``"Set up authentication"``).
     :param detail: Optional one-line explanation of what the step means for
-        this harness (e.g. "Uses your ChatGPT subscription").
+        this harness (e.g. "Sign in with your subscription, an API key, or a
+        gateway").
     :param action: How the user resolves it — ``"install"`` (a one-click
-        install the server performs), ``"command"`` (a command the user runs on
-        the host, in :attr:`command`), or ``"setup"`` (run ``omnigent setup`` —
-        the M1 fallback for auth methods the UI can't yet drive, e.g. entering
-        an API key or gateway).
+        install the server performs), ``"auth"`` (the UI opens an inline
+        credential form; the harness's subscription login, if any, is one option
+        inside it via :attr:`command`), ``"command"`` (a command the user runs
+        on the host, in :attr:`command`), or ``"setup"`` (run ``omni setup`` —
+        the fallback for auth methods the UI can't drive).
     :param command: The command for ``action="command"``/``"setup"`` steps
         (e.g. ``"codex login"``); ``None`` for one-click installs.
     :param status_key: Which readiness sub-state marks this step done, or
