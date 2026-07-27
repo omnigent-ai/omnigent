@@ -1,16 +1,13 @@
-"""Per-session ``KIMI_CODE_HOME`` builder that injects Omnigent hooks.
+"""Build isolated current and legacy Kimi homes with Omnigent policy hooks.
 
-Kimi Code reads a single ``config.toml`` at ``$KIMI_CODE_HOME/config.toml``
-(default ``~/.kimi-code``) and stores its auth (``oauth/`` + ``credentials/``)
-relative to the same home — there is no project-level merge for the ``hooks``
-array. To gate a session's tools without mutating the user's global config, the
-runner points the launched ``kimi`` process at a session-scoped home that:
+Kimi 1.49 reads ``$KIMI_SHARE_DIR`` (default ``~/.kimi``); legacy Kimi reads
+``$KIMI_CODE_HOME`` (default ``~/.kimi-code``). Each has one ``config.toml``
+and no project-level hook merge. To apply policy without mutating either global
+home, the runner creates session-scoped equivalents that:
 
-- symlinks every entry of the user's global home (oauth, credentials,
-  sessions, …) so login / providers / history keep working, and
-- carries a ``config.toml`` that is the user's config text with two Omnigent
-  ``[[hooks]]`` appended — a ``PreToolUse`` deny-gate and a ``PermissionRequest``
-  read-only surface, both dispatched to :mod:`omnigent.kimi_native_hook`.
+- link reusable login/provider files while isolating config, logs, and sessions;
+- append a ``PreToolUse`` policy hook to both layouts; and
+- retain the legacy ``PermissionRequest`` hook only where that event exists.
 
 Appending as text (rather than parsing + re-emitting TOML) keeps the user's
 config byte-for-byte and needs no TOML writer: a trailing ``[[hooks]]`` table
@@ -24,8 +21,9 @@ import os
 import re
 import shlex
 import sys
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 #: Env var Kimi CLI 1.49+ reads for config, auth, and session state.
 KIMI_SHARE_DIR_ENV_VAR = "KIMI_SHARE_DIR"
@@ -35,9 +33,7 @@ _CONFIG_FILE = "config.toml"
 _CURRENT_ISOLATED_ENTRIES = frozenset(
     {_CONFIG_FILE, "imported_sessions", "kimi.json", "logs", "sessions", "telemetry"}
 )
-_LEGACY_ISOLATED_ENTRIES = frozenset(
-    {_CONFIG_FILE, "logs", "session_index.jsonl", "sessions"}
-)
+_LEGACY_ISOLATED_ENTRIES = frozenset({_CONFIG_FILE, "logs", "session_index.jsonl", "sessions"})
 _EMPTY_TOP_LEVEL_HOOKS = re.compile(
     r"^[ \t]*hooks[ \t]*=[ \t]*\[[ \t]*\][ \t]*(?:#.*)?(?:\r?\n)?$"
 )
@@ -210,19 +206,18 @@ def build_kimi_session_home(
     python_executable: str | None = None,
     include_current: bool = False,
 ) -> dict[str, str]:
-    """Materialize a session-scoped ``KIMI_CODE_HOME`` with Omnigent hooks.
+    """Materialize session-scoped Kimi homes with Omnigent policy hooks.
 
-    Symlinks every entry of the user's global kimi home (except
-    ``config.toml``) into *session_home*, then writes a ``config.toml`` that is
-    the user's config plus the Omnigent hooks. Best-effort and idempotent:
-    re-running rewrites ``config.toml`` and leaves existing symlinks in place.
+    The legacy home is always built. With ``include_current=True``, a sibling
+    ``kimi-share`` directory is also built for Kimi 1.49+. Best-effort and
+    idempotent: re-running rewrites config and keeps existing support links.
 
     :param session_home: Directory to use as the session's ``KIMI_CODE_HOME``.
     :param bridge_dir: The kimi-native bridge dir the hook commands read.
     :param python_executable: Interpreter for the hook commands (see
         :func:`render_kimi_hooks_toml`).
-    :returns: ``{"KIMI_CODE_HOME": str(session_home)}`` to merge into the
-        launched kimi process env.
+    :param include_current: Also build and export Kimi 1.49's share directory.
+    :returns: Environment variables to merge into the launched process.
     """
     legacy_hooks = render_kimi_hooks_toml(
         bridge_dir=bridge_dir,

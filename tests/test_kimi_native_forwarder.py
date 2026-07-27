@@ -235,9 +235,7 @@ class TestDiscoverWire:
         # launch far in the future (ms) → the 1000s-mtime session is below the floor.
         assert _discover_wire(home, "/ws", launch_epoch_ms=9_000_000_000_000) is None
 
-    def test_selects_newest_current_or_legacy_launch_scoped_wire(
-        self, tmp_path: Path
-    ) -> None:
+    def test_selects_newest_current_or_legacy_launch_scoped_wire(self, tmp_path: Path) -> None:
         workspace = "/tmp/Andrew Project"
         current_share = tmp_path / "kimi-share"
         legacy_home = tmp_path / "kimi-code-home"
@@ -255,9 +253,7 @@ class TestDiscoverWire:
             / "other-session"
             / "wire.jsonl"
         )
-        legacy_wire = self._make_session(
-            legacy_home, "session_027", workspace, mtime=1005.0
-        )
+        legacy_wire = self._make_session(legacy_home, "session_027", workspace, mtime=1005.0)
         for wire, mtime in (
             (current_wire, 1010.0),
             (wrong_workspace_wire, 1030.0),

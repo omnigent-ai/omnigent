@@ -7,12 +7,10 @@ reply renders live in the embedded terminal, but — unlike the SDK ``KimiExecut
 transcript (the chat bubbles). This module closes that gap, the kimi analog of
 :mod:`omnigent.cursor_native_forwarder`.
 
-Data source: kimi persists each session to an append-only JSONL "wire" log at
-``$KIMI_CODE_HOME/sessions/<wd_…>/<session_…>/agents/main/wire.jsonl``. The
-native harness points ``KIMI_CODE_HOME`` at ``<bridge_dir>/kimi-code-home`` whose
-``sessions/`` is symlinked to the user's global store, so several workspaces'
-sessions share the tree; we disambiguate by ``workDir`` (via ``session_index.jsonl``)
-and recency. Relevant wire events:
+Data source: Kimi persists each session to an append-only ``wire.jsonl``.
+Kimi 1.49 writes below the launch-scoped ``$KIMI_SHARE_DIR``; legacy Kimi writes
+below ``$KIMI_CODE_HOME``. Discovery checks both layouts and selects only a
+launch-scoped session for the requested workspace. Relevant wire events include:
 
 - ``{"type": "turn.prompt", "input": [{"type":"text","text":…}], "origin": {"kind":"user"}}``
   → a user message.
@@ -23,9 +21,8 @@ and recency. Relevant wire events:
   ``tool.result`` events are still skipped — the embedded terminal shows them.)
 
 Each mirrored turn is POSTed as an ``external_conversation_item`` to
-``/v1/sessions/{id}/events`` (the same shape :mod:`omnigent.kimi_native_hook`
-uses for its read-only approval surface). A per-session line offset is persisted
-in ``<bridge_dir>/kimi_forwarder.json`` so restarts resume without double-posting.
+``/v1/sessions/{id}/events``. A per-session line offset is persisted in
+``<bridge_dir>/kimi_forwarder.json`` so restarts resume without double-posting.
 """
 
 from __future__ import annotations

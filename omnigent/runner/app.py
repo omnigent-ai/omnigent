@@ -6809,6 +6809,59 @@ def create_runner_app(
                     _ingest_now_serving[conversation_id] = _seq + 1
                     _cond.notify_all()
 
+        if body_type == "approval_wait":
+            data = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(data, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "approval_wait requires a data object",
+                    },
+                )
+            state = data.get("state")
+            elicitation_id = data.get("elicitation_id")
+            if (
+                state not in {"started", "ended"}
+                or not isinstance(elicitation_id, str)
+                or not elicitation_id
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": (
+                            "approval_wait requires state started/ended and a "
+                            "non-empty elicitation_id"
+                        ),
+                    },
+                )
+            if state == "started":
+                ttl_s = data.get("ttl_s")
+                if (
+                    isinstance(ttl_s, bool)
+                    or not isinstance(ttl_s, (int, float))
+                    or not 1.0 <= float(ttl_s) <= 172_800.0
+                ):
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": "invalid_request",
+                            "detail": "approval_wait ttl_s must be between 1 and 172800",
+                        },
+                    )
+                process_manager.mark_approval_pending(
+                    conversation_id,
+                    elicitation_id,
+                    ttl_s=float(ttl_s),
+                )
+            else:
+                process_manager.clear_approval_pending(
+                    conversation_id,
+                    elicitation_id,
+                )
+            return Response(status_code=204)
+
         if body_type == "interrupt":
             _harness = _session_harness_name(conversation_id)
             if _harness == "claude-native":
