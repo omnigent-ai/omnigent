@@ -78,6 +78,8 @@ _DATABRICKS_TO_SYSTEM_AI: dict[str, str] = {
     "databricks-kimi-k2-7-code": "system.ai.kimi-k2-7-code",
     "databricks-inkling": "system.ai.inkling",
     "databricks-glm-5-2": "system.ai.glm-5-2",
+    "databricks-qwen3-next-80b-a3b-instruct": "system.ai.qwen3-next-80b-a3b-instruct",
+    "databricks-qwen35-122b-a10b": "system.ai.qwen35-122b-a10b",
 }
 
 # Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
@@ -438,9 +440,7 @@ def _unsupported_in_pi(model_id_lower: str) -> bool:
 
     Expects a pre-lowercased model id.
     """
-    return (
-        "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower or "qwen3" in model_id_lower
-    )
+    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
 
 
 def _fetch_pi_model_lists(

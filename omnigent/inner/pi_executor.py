@@ -618,6 +618,22 @@ _DATABRICKS_RESPONSES_MODELS = [
         "input": ["text", "image"],
         "reasoning": True,
     },
+    # Qwen3 returns array content with tool calls via /chat/completions, causing
+    # [object Object] errors. Responses API via system.ai.* avoids this.
+    {
+        "id": "system.ai.qwen3-next-80b-a3b-instruct",
+        "name": "Qwen3 Next 80B",
+        "contextWindow": 131072,
+        "maxTokens": 8192,
+        "input": ["text", "image"],
+    },
+    {
+        "id": "system.ai.qwen35-122b-a10b",
+        "name": "Qwen3.5 122B",
+        "contextWindow": 131072,
+        "maxTokens": 8192,
+        "input": ["text", "image"],
+    },
 ]
 
 _DATABRICKS_ANTHROPIC_MODELS = [

@@ -2977,7 +2977,7 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "databricks-gpt-5-4-mini",
         "databricks-gpt-5-4",
     ]
-    # Newer GPT models + Kimi/inkling/GLM (use system.ai.* ids) → responses API.
+    # Newer GPT + Kimi/inkling/GLM/Qwen3 (use system.ai.* ids) → responses API.
     openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
     assert openai_responses_ids == [
         "databricks-gpt-5-5",
@@ -2985,6 +2985,8 @@ def test_models_json_lists_only_gateway_verified_models() -> None:
         "system.ai.kimi-k2-7-code",
         "system.ai.inkling",
         "system.ai.glm-5-2",
+        "system.ai.qwen3-next-80b-a3b-instruct",
+        "system.ai.qwen35-122b-a10b",
     ]
     # The llama serving endpoint no longer exists; the provider stays as
     # the routing home for future non-Claude/GPT endpoints.
