@@ -20,7 +20,10 @@ OpenAI Completions for others) and ``PI_CODING_AGENT_DIR`` is set so Pi
 picks it up.
 
 Requirements:
-    The ``pi`` CLI must be installed and on PATH.
+    The ``pi`` CLI must be installed and on PATH. Pi >= 0.80.4 provides
+    reliable ``agent_settled`` turn boundaries; older or undetectable
+    versions fall back to ``agent_end`` and may end early across retries,
+    compaction, or queued continuations.
 
 Environment (Databricks):
     DATABRICKS_CONFIG_PROFILE — optional Databricks profile selector
@@ -660,6 +663,14 @@ _PI_ENV_ALLOW_EXACT: frozenset[str] = frozenset(
     }
 )
 _STREAM_READ_CHUNK_SIZE = 65536
+_PI_AGENT_SETTLED_MIN_VERSION = (0, 80, 4)
+
+# Maximum silence between Pi frames; long tools and retry backoff need headroom.
+_READ_STALL_TIMEOUT_S = 120.0
+# Error-to-agent_end draining should be immediate, so cap that wait tightly.
+_POST_ERROR_READ_TIMEOUT_S = 10.0
+# Bound abort stdin.drain before force-closing a stalled session.
+_STALL_ABORT_TIMEOUT_S = 10.0
 
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
 # not be written to logs verbatim. The value following these flags is replaced
@@ -1096,11 +1107,13 @@ class _PiRpcSession:
         await self.process.stdin.drain()
 
     async def read_line(self, timeout: float = 120.0) -> str | None:
-        """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
-        try:
-            return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
-            return None
+        """Read the next JSONL line from Pi's stdout.
+
+        :returns: The line, or ``None`` on EOF (the reader's sentinel).
+        :raises asyncio.TimeoutError: No line arrived within ``timeout``.
+            A stall is NOT EOF — callers must handle the two differently.
+        """
+        return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
 
     async def close(self) -> None:
         for task in (self._read_task, self._stderr_task):
@@ -1138,6 +1151,9 @@ class _PiSessionState:
     rpc: _PiRpcSession | None = None
     system_prompt: str | None = None
     model: str | None = None
+    pi_version: tuple[int, int, int] | None = None
+    supports_agent_settled: bool = False
+    _pi_version_checked: bool = False
     _has_sent_prompt: bool = False
 
 
@@ -1587,6 +1603,35 @@ def _aggregate_pi_turn_usage(
     }
 
 
+def _extract_pi_response_text(messages: list[object]) -> str:
+    """Harvest response text from an ``agent_end`` ``messages`` array.
+
+    Used only when no text deltas streamed (e.g. non-streaming models):
+    the last assistant message's text is the loop's answer.
+
+    :param messages: The ``messages`` array from an ``agent_end`` event —
+        may hold the whole conversation. Defensive against non-dict shapes.
+    :returns: The last assistant message's text, or ``""`` when none is found.
+    """
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        content = m.get("content", [])
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if not (isinstance(part, dict) and part.get("type") == "text"):
+                    continue
+                part_text = part.get("text")
+                if isinstance(part_text, str):
+                    text_parts.append(part_text)
+            return "".join(text_parts)
+        break
+    return ""
+
+
 class PiExecutor(Executor):
     """Execute agent turns via the Pi coding agent (``pi --mode rpc``)."""
 
@@ -1666,7 +1711,8 @@ class PiExecutor(Executor):
         if not resolved_pi:
             raise ImportError(
                 "PiExecutor requires the 'pi' CLI on PATH. "
-                "Install it with: npm install -g @earendil-works/pi-coding-agent"
+                "Install it with: npm install -g "
+                "'@earendil-works/pi-coding-agent@>=0.80.4'"
             )
         self._pi_path = resolved_pi
         self._cwd = cwd
@@ -1697,10 +1743,12 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.pi_native import pi_supports_approve
+        from omnigent.pi_native import pi_version
 
         self._extra_args: list[str] = ["--no-tools"]
-        if pi_supports_approve(self._pi_path):
+        # Reuse one bounded probe for --approve and RPC boundary support.
+        self._pi_version = pi_version(self._pi_path)
+        if self._pi_version is not None and self._pi_version >= (0, 79, 0):
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/
             # resources. In a runner-driven session there is nobody at the
@@ -1776,6 +1824,7 @@ class PiExecutor(Executor):
         self._sandboxed = sandboxed.sandboxed
 
         self._session_states: dict[str, _PiSessionState] = {}
+        self._legacy_boundary_warning_emitted = False
         self._tool_server: _ToolServer | None = None
 
     def supports_streaming(self) -> bool:
@@ -1882,6 +1931,30 @@ class PiExecutor(Executor):
         if model is None and self._gateway_uses_databricks_profile:
             return DATABRICKS_CLAUDE_DEFAULT_MODEL
         return model
+
+    def _configure_session_turn_boundary(self, state: _PiSessionState) -> None:
+        """Cache the detected Pi version and terminal-frame capability."""
+        if state._pi_version_checked:
+            return
+        state._pi_version_checked = True
+        state.pi_version = self._pi_version
+        state.supports_agent_settled = (
+            state.pi_version is not None and state.pi_version >= _PI_AGENT_SETTLED_MIN_VERSION
+        )
+        if state.supports_agent_settled or self._legacy_boundary_warning_emitted:
+            return
+        self._legacy_boundary_warning_emitted = True
+        detected = (
+            ".".join(str(part) for part in state.pi_version)
+            if state.pi_version is not None
+            else "undetectable"
+        )
+        logger.warning(
+            "PiExecutor detected Pi version %s; using the legacy agent_end "
+            "turn boundary. Upgrade to Pi >= 0.80.4 for reliable retry, "
+            "compaction, and queued-continuation boundaries.",
+            detected,
+        )
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
         """Start the TCP tool server if there are Omnigent tools to bridge."""
@@ -2048,6 +2121,7 @@ class PiExecutor(Executor):
     ) -> _PiRpcSession:
         """Get or create a Pi RPC subprocess for the given session."""
         state = self._session_states.setdefault(session_key, _PiSessionState())
+        self._configure_session_turn_boundary(state)
 
         effective_model = model
 
@@ -2130,6 +2204,9 @@ class PiExecutor(Executor):
         # context.  On subsequent turns the Pi process already has context,
         # so we only send the latest user message.
         state = self._session_states.get(session_key)
+        # _ensure_rpc always creates state; state-less test adapters model a
+        # current Pi unless they install an explicit compatibility state.
+        supports_agent_settled = state is None or state.supports_agent_settled
         is_first_turn = state is not None and not state._has_sent_prompt
 
         prompt = _build_pi_prompt(messages, is_first_turn=is_first_turn)
@@ -2167,27 +2244,76 @@ class PiExecutor(Executor):
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
-        # Read events until agent_end.
+        # Modern Pi turns end at agent_settled. agent_end closes only one
+        # internal retry/compaction/continuation loop; the compatibility
+        # branch below uses it only when the installed Pi lacks settlement.
         response_text = ""
-        streamed_any = False
+        # Response text harvested from agent_end messages, used only when
+        # nothing streamed. The LATEST agent_end supersedes earlier ones:
+        # on a retry/compaction sequence its last assistant message is the
+        # final answer, not the superseded draft.
+        fallback_response: str | None = None
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
-        # fallback). Summed into a turn-level usage dict at completion so a
+        # fallback). Summed into a turn-level usage dict at settlement so a
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
         message_usages: list[dict[str, Any]] = []  # type: ignore[explicit-any]
-        # Error reported by a ``message_end`` (stopReason=error); surfaced at
-        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        # Error reported by a ``message_end`` (stopReason=error/aborted);
+        # surfaced at ``agent_settled`` so every terminal frame is drained
+        # off the RPC stream before the next turn reads from it.
         pending_error: str | None = None
+        # The short post-error budget applies only until that run's
+        # agent_end. Retry backoff and compaction may legitimately take the
+        # full read budget after agent_end.
+        awaiting_error_agent_end = False
+        # Usage fallback is scoped to one internal agent run. Each
+        # agent.continue() has its own newMessages/agent_end payload.
+        current_run_has_message_usage = False
+        # Recovery is determined by the outcome of the current internal run,
+        # independently of agent_end.willRetry (compaction does not set it).
+        current_run_failed = False
+        # agent_end marks an internal-run boundary; message_start (or another
+        # run event) proves that a continuation actually began.
+        internal_run_ended = False
+        supersede_response_on_next_run = False
 
         while True:
-            # After an errored message the only thing left to drain is the
-            # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            # Bounds silence, not total lifetime: a chatty Pi that never
+            # settles can keep this loop alive.
+            read_timeout = (
+                _POST_ERROR_READ_TIMEOUT_S if awaiting_error_agent_end else _READ_STALL_TIMEOUT_S
+            )
+            try:
+                line = await rpc.read_line(timeout=read_timeout)
+            except asyncio.TimeoutError:
+                # Silence is not settlement. Abort is best-effort and
+                # bounded because stdin.drain() can wedge along with stdout;
+                # recycling in finally is the safety boundary.
+                try:
+                    await asyncio.wait_for(
+                        rpc.send_command({"type": "abort", "id": f"abort_{cmd_id}"}),
+                        timeout=_STALL_ABORT_TIMEOUT_S,
+                    )
+                except Exception:  # noqa: BLE001 — close() below kills the process
+                    logger.debug("PiExecutor: stall abort failed", exc_info=True)
+                finally:
+                    try:
+                        await self.close_session(session_key)
+                    except Exception:  # noqa: BLE001 — state is already popped; report the stall
+                        logger.debug("PiExecutor: stalled session close failed", exc_info=True)
+                yield ExecutorError(
+                    message=(
+                        f"Pi produced no events for {read_timeout:.0f}s; "
+                        "the session was aborted and recycled."
+                    )
+                )
+                return
             if line is None:
+                # EOF: the pi process ended mid-turn (crash/kill).
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
-                elif not streamed_any and not response_text:
+                elif not response_text and fallback_response is None:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                     yield ExecutorError(
@@ -2196,7 +2322,9 @@ class PiExecutor(Executor):
                 else:
                     turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                     _notify_usage_from_dict(model=model, usage=turn_usage)
-                    yield TurnComplete(response=response_text, usage=turn_usage)
+                    yield TurnComplete(
+                        response=response_text or fallback_response or "", usage=turn_usage
+                    )
                 return
 
             try:
@@ -2207,6 +2335,27 @@ class PiExecutor(Executor):
 
             raw_event_type = event.get("type")
             event_type: str | None = raw_event_type if isinstance(raw_event_type, str) else None
+
+            if internal_run_ended and event_type in {
+                "agent_start",
+                "message_start",
+                "message_update",
+                "message_end",
+                "tool_execution_start",
+                "tool_execution_end",
+            }:
+                # Usage fallback starts fresh for every continuation. Failed
+                # retry/overflow output is superseded; ordinary queued
+                # continuations remain part of the logical turn's response.
+                if supersede_response_on_next_run:
+                    response_text = ""
+                    fallback_response = None
+                    # Already-yielded TextChunks remain visible; only the
+                    # final aggregated response drops superseded text.
+                current_run_has_message_usage = False
+                current_run_failed = False
+                internal_run_ended = False
+                supersede_response_on_next_run = False
 
             # Skip the command-ack response.
             if event_type == "response":
@@ -2224,7 +2373,6 @@ class PiExecutor(Executor):
                     if isinstance(raw_delta, str) and raw_delta:
                         yield TextChunk(text=raw_delta)
                         response_text += raw_delta
-                        streamed_any = True
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
                     yield ReasoningChunk(delta="", event_type="reasoning_started")
@@ -2318,41 +2466,72 @@ class PiExecutor(Executor):
                 )
                 continue
 
-            # Agent ended — the turn is complete.
+            # agent_end closes one internal loop. Modern Pi keeps draining to
+            # its single agent_settled; older Pi must finalize here.
             if event_type == "agent_end":
+                end_messages = event.get("messages", [])
+                if isinstance(end_messages, list):
+                    if not response_text:
+                        # Response-text fallback when nothing streamed. The
+                        # LATEST agent_end wins on purpose: after a retry or
+                        # compaction, its last assistant message is the final
+                        # answer, superseding any earlier loop's draft.
+                        extracted = _extract_pi_response_text(end_messages)
+                        if extracted:
+                            fallback_response = extracted
+                    # Fallback usage capture: if no ``message_end`` carried
+                    # usage, pull it from the last assistant message in
+                    # ``messages`` (only the last — ``messages`` may hold the
+                    # whole conversation, so summing it would overcount).
+                    if not current_run_has_message_usage:
+                        for m in reversed(end_messages):
+                            captured = _extract_pi_turn_usage(m, model)
+                            if captured is not None:
+                                message_usages.append(captured)
+                                break
+                    for m in reversed(end_messages):
+                        if not isinstance(m, dict) or m.get("role") != "assistant":
+                            continue
+                        stop = m.get("stopReason")
+                        if stop in {"error", "aborted"}:
+                            current_run_failed = True
+                        elif isinstance(stop, str):
+                            current_run_failed = False
+                        if not current_run_failed:
+                            pending_error = None
+                        break
+                if not current_run_failed:
+                    # A continuation that reached agent_end without another
+                    # error recovered even if its message_end was omitted.
+                    pending_error = None
+                awaiting_error_agent_end = False
+                internal_run_ended = True
+                supersede_response_on_next_run = current_run_failed or bool(event.get("willRetry"))
+                if not supports_agent_settled:
+                    if pending_error is not None:
+                        yield ExecutorError(message=pending_error)
+                        return
+                    turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                    _notify_usage_from_dict(model=model, usage=turn_usage)
+                    yield TurnComplete(
+                        response=response_text or fallback_response or "",
+                        usage=turn_usage,
+                    )
+                    return
+                continue
+
+            # Session settled — THE turn boundary for success, error, and
+            # abort alike: every terminal frame has now been consumed, so
+            # the next turn starts against a clean stream.
+            if event_type == "agent_settled":
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                end_messages = event.get("messages", [])
-                if not response_text:
-                    for m in reversed(end_messages):
-                        if m.get("role") == "assistant":
-                            content = m.get("content", [])
-                            if isinstance(content, str):
-                                response_text = content
-                            elif isinstance(content, list):
-                                text_parts: list[str] = []
-                                for part in content:
-                                    if not (isinstance(part, dict) and part.get("type") == "text"):
-                                        continue
-                                    part_text = part.get("text")
-                                    if isinstance(part_text, str):
-                                        text_parts.append(part_text)
-                                response_text = "".join(text_parts)
-                            break
-                # Fallback usage capture: if no ``message_end`` carried
-                # usage, pull it from the last assistant message in
-                # ``messages`` (only the last — ``messages`` may hold the
-                # whole conversation, so summing it would overcount).
-                if not message_usages and isinstance(end_messages, list):
-                    for m in reversed(end_messages):
-                        captured = _extract_pi_turn_usage(m, model)
-                        if captured is not None:
-                            message_usages.append(captured)
-                            break
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)
-                yield TurnComplete(response=response_text, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text or fallback_response or "", usage=turn_usage
+                )
                 return
 
             # message_end carries one completed assistant message, whose
@@ -2364,19 +2543,28 @@ class PiExecutor(Executor):
                     captured = _extract_pi_turn_usage(msg, model)
                     if captured is not None:
                         message_usages.append(captured)
+                        current_run_has_message_usage = True
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
                     if stop == "aborted":
-                        err = msg.get("errorMessage", stop)
-                        yield ExecutorError(message=str(err))
-                        return
-                    if stop == "error":
-                        # Pi emits the turn-terminal ``agent_end`` after an
-                        # errored LLM call; returning here would leave it
-                        # queued, so the next turn on this RPC session reads
-                        # the stale event as its own end. Record the error
-                        # and keep draining until ``agent_end``.
+                        # Pi still emits agent_end(stopReason=aborted) and
+                        # agent_settled after an abort; returning here would
+                        # leave them queued for the NEXT turn to misread as
+                        # its own terminal frames. Record and keep draining.
                         pending_error = str(msg.get("errorMessage", stop))
+                        current_run_failed = True
+                        awaiting_error_agent_end = True
+                    elif stop == "error":
+                        # Same drain discipline: agent_end (then
+                        # agent_settled) always follows an errored LLM call.
+                        pending_error = str(msg.get("errorMessage", stop))
+                        current_run_failed = True
+                        awaiting_error_agent_end = True
+                    else:
+                        # Pi emits agent_end immediately after an error, so a
+                        # later message_end (even without stopReason) proves recovery.
+                        pending_error = None
+                        current_run_failed = False
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)
