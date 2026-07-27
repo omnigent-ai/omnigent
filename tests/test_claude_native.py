@@ -646,6 +646,60 @@ def test_claude_native_model_options_follow_managed_claude_catalog(
     ]
 
 
+def test_unpinned_family_alias_resolves_to_the_provider_default_model() -> None:
+    """A tier alias with no env pin cannot reach the gateway as a canonical id."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        model="databricks-claude-sonnet-4-5",
+    )
+    assert (
+        claude_native.resolve_claude_native_model_selection("opus", config)
+        == "databricks-claude-sonnet-4-5"
+    )
+
+
+def test_pinned_family_alias_passes_through_for_env_resolution() -> None:
+    """A pinned alias stays an alias; Claude Code resolves it via the env pin."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"},
+        model="databricks-claude-sonnet-4-5",
+    )
+    assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
+
+
+def test_family_alias_passes_through_on_direct_claude_login() -> None:
+    """Without a provider config, Claude Code resolves aliases natively."""
+    assert claude_native.resolve_claude_native_model_selection("opus", None) == "opus"
+
+
+def test_unpinned_family_alias_without_default_model_passes_through() -> None:
+    """No pin and no default model leaves nothing routable to substitute."""
+    config = claude_native.ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": "https://x"})
+    assert claude_native.resolve_claude_native_model_selection("opus", config) == "opus"
+
+
+def test_provider_config_without_pins_offers_only_the_default_model_row() -> None:
+    """Gateway configs never get the subscription alias rows they cannot route."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
+        model="databricks-claude-sonnet-4-5",
+    )
+    assert claude_native.claude_native_model_options(config) == [
+        {
+            "id": "databricks-claude-sonnet-4-5",
+            "model": "databricks-claude-sonnet-4-5",
+            "displayName": "databricks-claude-sonnet-4-5",
+            "isDefault": True,
+        }
+    ]
+    assert (
+        claude_native.claude_native_model_options(
+            claude_native.ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": "https://x"})
+        )
+        == []
+    )
+
+
 def test_sonnet_5_selection_resolves_to_the_configured_custom_model() -> None:
     """The friendly Sonnet 5 row launches the provider's routable model id."""
     config = claude_native.ClaudeNativeUcodeConfig(
