@@ -4,10 +4,12 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  useDetectedCredentials,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
   useInstallingHarnesses,
+  useStoreCredential,
 } from "./useHosts";
 
 const fetchMock = vi.fn();
@@ -388,5 +390,112 @@ describe("useHostModelOptions", () => {
     renderHook(() => useHostModelOptions(null, "claude-native"), { wrapper });
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useStoreCredential", () => {
+  const credResult = (harness: string, readiness: Record<string, boolean | string>) =>
+    mockResponse({ object: "harness_credential", harness, configured_harnesses: readiness });
+
+  it("POSTs the harness in the path and the rest of the input as the body (no secret in the URL)", async () => {
+    fetchMock.mockResolvedValueOnce(credResult("codex-native", { "codex-native": true }));
+    const { result } = renderHook(() => useStoreCredential("host_1"), { wrapper });
+
+    result.current.mutate({ harness: "codex-native", kind: "key", secret: "sk-secret" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/hosts/host_1/harnesses/codex-native/credential");
+    expect(init.method).toBe("POST");
+    // The secret rides in the body, never the URL, and `harness` is stripped
+    // from the body (it's already in the path).
+    expect(url).not.toContain("sk-secret");
+    expect(JSON.parse(init.body)).toEqual({ kind: "key", secret: "sk-secret" });
+  });
+
+  it("surfaces the server's JSON `detail` on a failed write", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ detail: "a gateway base_url must start with http:// or https://" }, 400),
+    );
+    const { result } = renderHook(() => useStoreCredential("host_1"), { wrapper });
+
+    result.current.mutate({ harness: "codex-native", kind: "gateway", base_url: "ftp://nope" });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toBe(
+      "a gateway base_url must start with http:// or https://",
+    );
+  });
+
+  it("falls back to the status line when the error body isn't JSON", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+      json: async () => {
+        throw new Error("not json");
+      },
+    } as unknown as Response);
+    const { result } = renderHook(() => useStoreCredential("host_1"), { wrapper });
+
+    result.current.mutate({ harness: "codex-native", kind: "key", secret: "sk" });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toBe("502 Bad Gateway");
+  });
+
+  it("patches the hosts cache and invalidates the detect query on success", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    function sharedWrapper({ children }: { children: ReactNode }) {
+      return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    }
+    client.setQueryData(
+      ["hosts", { includeSandbox: false }],
+      [{ host_id: "host_1", name: "Laptop", owner: "alice", status: "online" }],
+    );
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    const { result } = renderHook(() => useStoreCredential("host_1"), { wrapper: sharedWrapper });
+    fetchMock.mockResolvedValueOnce(credResult("codex-native", { "codex-native": true }));
+    result.current.mutate({ harness: "codex-native", kind: "key", secret: "sk" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    const hosts = client.getQueryData<Array<{ configured_harnesses?: Record<string, unknown> }>>([
+      "hosts",
+      { includeSandbox: false },
+    ]);
+    expect(hosts?.[0].configured_harnesses?.["codex-native"]).toBe(true);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["detected-credentials", "host_1"] });
+  });
+});
+
+describe("useDetectedCredentials", () => {
+  it("GETs the detect endpoint and returns the credentials array", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        credentials: [{ family: "openai", source: "$OPENAI_API_KEY", env_var: "OPENAI_API_KEY" }],
+      }),
+    );
+    const { result } = renderHook(() => useDetectedCredentials("host_1", true), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host_1/credentials/detected");
+    expect(result.current.data).toEqual([
+      { family: "openai", source: "$OPENAI_API_KEY", env_var: "OPENAI_API_KEY" },
+    ]);
+  });
+
+  it("degrades to an empty list when the body omits `credentials`", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    const { result } = renderHook(() => useDetectedCredentials("host_1", true), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toEqual([]);
+  });
+
+  it("does not fetch when disabled or without a host id", async () => {
+    const disabled = renderHook(() => useDetectedCredentials("host_1", false), { wrapper });
+    const noHost = renderHook(() => useDetectedCredentials(null, true), { wrapper });
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+    disabled.unmount();
+    noHost.unmount();
   });
 });

@@ -154,7 +154,9 @@ export function HarnessCredentialForm({
           className="flex items-center gap-2"
           onSubmit={(e) => {
             e.preventDefault();
-            if (apiKey.trim()) submit({ harness, kind: "key", secret: apiKey.trim() });
+            // Guard on !busy too: the Save button is disabled while a write is
+            // in flight, but Enter in the field would otherwise re-fire the POST.
+            if (!busy && apiKey.trim()) submit({ harness, kind: "key", secret: apiKey.trim() });
           }}
         >
           <Input
@@ -183,7 +185,8 @@ export function HarnessCredentialForm({
           data-testid="harness-credential-gateway"
           onSubmit={(e) => {
             e.preventDefault();
-            if (gatewayUrl.trim() && gatewayKey.trim()) {
+            // See the API-key form: gate on !busy so Enter can't re-POST mid-save.
+            if (!busy && gatewayUrl.trim() && gatewayKey.trim()) {
               submit({
                 harness,
                 kind: "gateway",

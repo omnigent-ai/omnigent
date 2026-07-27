@@ -20,8 +20,9 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 vi.mock("@/components/ui/toast", () => ({ showToast: showToastMock }));
 
 let detected: { family: string; source: string; env_var: string | null }[] = [];
+let storePending = false;
 vi.mock("@/hooks/useHosts", () => ({
-  useStoreCredential: () => ({ mutate: mutateMock, isPending: false }),
+  useStoreCredential: () => ({ mutate: mutateMock, isPending: storePending }),
   useDetectedCredentials: () => ({ data: detected }),
 }));
 
@@ -33,6 +34,7 @@ afterEach(() => {
   copyTextMock.mockClear();
   showToastMock.mockReset();
   detected = [];
+  storePending = false;
 });
 
 describe("HarnessCredentialForm", () => {
@@ -240,6 +242,20 @@ describe("HarnessCredentialForm", () => {
     );
     expect(showToastMock).not.toHaveBeenCalledWith(expect.stringContaining("is ready on"));
     expect(onDone).not.toHaveBeenCalled();
+  });
+
+  it("does not re-submit on Enter while a write is in flight", () => {
+    // The Save button is disabled during a write, but the input isn't — pressing
+    // Enter in the field (paste-then-hammer-Enter) would re-fire the POST and
+    // send the secret twice. The onSubmit is gated on !busy, so a submit while
+    // pending is a no-op.
+    storePending = true;
+    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    const keyInput = screen.getByTestId("harness-credential-key");
+    fireEvent.change(keyInput, { target: { value: "sk-x" } });
+    fireEvent.submit(keyInput.closest("form")!);
+    fireEvent.submit(keyInput.closest("form")!);
+    expect(mutateMock).not.toHaveBeenCalled();
   });
 
   it("uses the friendly label (not the raw harness id) in the ready toast", () => {
