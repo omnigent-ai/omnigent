@@ -2175,7 +2175,10 @@ async def _auto_create_cursor_terminal(
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
-    from omnigent.cursor_native_permissions import supervise_cursor_transcript_elicitations
+    from omnigent.cursor_native_permissions import (
+        cursor_launch_args_enable_yolo,
+        supervise_cursor_transcript_elicitations,
+    )
     from omnigent.cursor_native_usage import supervise_cursor_usage_forwarder
 
     if server_client is not None and ensure_comment_relay is not None:
@@ -2220,6 +2223,12 @@ async def _auto_create_cursor_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
+                # Yolo / force sessions still sometimes leave pending markers;
+                # answer those in-pane instead of mirroring a card to a parent
+                # that cannot click it.
+                auto_accept_approvals=cursor_launch_args_enable_yolo(
+                    launch_config.terminal_launch_args
+                ),
             ),
             supervise_cursor_usage_forwarder(
                 base_url=server_url,
