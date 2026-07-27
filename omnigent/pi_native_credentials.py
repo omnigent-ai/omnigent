@@ -414,7 +414,7 @@ _GPT_COMPLETIONS_COMPATIBLE: frozenset[str] = frozenset(
         "gpt-5-1",
         "gpt-5-mini",
         "gpt-5-nano",
-        "gpt-oss",  # excluded entirely via _unsupported_in_pi
+        "gpt-oss",
     }
 )
 
@@ -429,7 +429,7 @@ def _needs_responses_api(model_id_lower: str) -> bool:
     to the Responses API — safer for new models we haven't tested.
 
     Non-GPT models are handled separately (Kimi/inkling/Qwen3 routed via
-    system.ai.* Responses API; Gemini/gpt-oss excluded via _unsupported_in_pi).
+    system.ai.* Responses API; Gemini-2-5 excluded via _unsupported_in_pi).
 
     Expects a pre-lowercased model id.
     """
@@ -443,21 +443,12 @@ def _unsupported_in_pi(model_id_lower: str) -> bool:
 
     Gemini 2.5 thinking models return ``content`` as an array
     (``[{"type":"text","text":"...","thoughtSignature":"..."}]``) in streaming
-    responses when tools are present. Pi's ``openai-completions`` handler
-    expects ``content`` to be a string; receiving an array causes a JavaScript
-    ``[object Object]`` parse error — effectively a silent 400 from Pi's
-    perspective. The Responses API doesn't support Gemini at all.
-    Exclude these models from both providers so the picker can show them but
-    Pi doesn't try to call them with tools.
-
-    Also includes gpt-oss which returns content as a typed array when tools
-    are present. Pi's openai-completions streaming handler does
-    ``block.text += content`` where content is an array, producing
-    ``[object Object],[object Object]``.
+    responses when tools are present. The Responses API doesn't support Gemini
+    at all, so these models are excluded from both providers.
 
     Expects a pre-lowercased model id.
     """
-    return "gemini-2-5" in model_id_lower or "gpt-oss" in model_id_lower
+    return "gemini-2-5" in model_id_lower
 
 
 def _fetch_pi_model_lists(
