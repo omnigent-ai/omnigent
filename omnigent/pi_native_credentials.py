@@ -77,7 +77,7 @@ _PI_COMPLETIONS_PROVIDER_ID = "omnigent-completions"
 # using their system.ai.* alias (derived by stripping "databricks-" prefix).
 # Use specific enough fragments to avoid false-positives (e.g. bare "glm" would
 # match "zai-org-glm-4-7" which has no system.ai.* alias; "glm-" avoids that).
-_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "qwen35", "glm-")
+_SYSTEM_AI_MODEL_KEYWORDS: tuple[str, ...] = ("kimi", "inkling", "qwen3", "glm-")
 
 
 def _databricks_to_system_ai(model_id: str) -> str | None:
