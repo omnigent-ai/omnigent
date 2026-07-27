@@ -154,6 +154,7 @@ _CATALOG_PROVIDER_FAMILY: dict[str, str] = {
     # SDK directly with a GEMINI_API_KEY).
     "gemini": GEMINI_FAMILY,
     "openrouter": OPENAI_FAMILY,
+    "atlascloud": OPENAI_FAMILY,
     "groq": OPENAI_FAMILY,
     "deepseek": OPENAI_FAMILY,
     "xai": OPENAI_FAMILY,
@@ -188,6 +189,7 @@ class _VendorEndpoint:
 # :func:`default_base_url_for_family` (and openai keeps the Responses default).
 _KEY_PROVIDER_ENDPOINT: dict[str, _VendorEndpoint] = {
     "openrouter": _VendorEndpoint("https://openrouter.ai/api/v1", CHAT_WIRE_API),
+    "atlascloud": _VendorEndpoint("https://api.atlascloud.ai/v1", CHAT_WIRE_API),
     "groq": _VendorEndpoint("https://api.groq.com/openai/v1", CHAT_WIRE_API),
     "deepseek": _VendorEndpoint("https://api.deepseek.com", CHAT_WIRE_API),
     "xai": _VendorEndpoint("https://api.x.ai/v1", CHAT_WIRE_API),
@@ -244,6 +246,7 @@ _PROVIDER_DISPLAY_NAME: dict[str, str] = {
     "openai": "OpenAI",
     "anthropic": "Anthropic",
     "openrouter": "OpenRouter",
+    "atlascloud": "Atlas Cloud",
     "groq": "Groq",
     "deepseek": "DeepSeek",
     "xai": "xAI",
