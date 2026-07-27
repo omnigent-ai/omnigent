@@ -6,9 +6,19 @@
 // uses pointerDown on the trigger (matching the TasksPage tests).
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ScheduledTaskRow } from "./ScheduledTaskRow";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+
+// Capture navigate() calls; the row uses `@/lib/routing`'s useNavigate, which
+// falls back to react-router-dom. Mocking it lets us assert the target without
+// a full router history.
+const navigate = vi.fn();
+vi.mock("@/lib/routing", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/routing")>();
+  return { ...actual, useNavigate: () => navigate };
+});
 
 function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
@@ -53,11 +63,18 @@ function renderRow(
     busy: false,
     ...handlers,
   };
-  render(<ScheduledTaskRow {...props} />);
+  render(
+    <MemoryRouter>
+      <ScheduledTaskRow {...props} />
+    </MemoryRouter>,
+  );
   return props;
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  navigate.mockReset();
+});
 
 describe("next-run text (server-sourced, relative delta)", () => {
   it("renders the relative next-run with a 'Next run' prefix when nextRunAt is set", () => {
@@ -100,5 +117,33 @@ describe("⋯ menu actions", () => {
   it("disables the menu trigger while the row is busy", () => {
     renderRow(task(), { busy: true });
     expect(screen.getByTestId("task-row-menu")).toBeDisabled();
+  });
+});
+
+describe("card-body navigation", () => {
+  it("navigates to the task's detail page when the card body is clicked", () => {
+    const t = task({ id: "st_42" });
+    renderRow(t);
+    fireEvent.click(screen.getByTestId("task-row-open"));
+    expect(navigate).toHaveBeenCalledWith("/tasks/st_42");
+  });
+
+  it("opening the ⋯ menu does NOT navigate", () => {
+    renderRow(task({ id: "st_42" }));
+    // Radix opens on pointerdown; the trigger stops propagation so the
+    // card-body navigation never fires.
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("selecting a menu item dispatches its callback without navigating", () => {
+    const onRunNow = vi.fn();
+    const t = task({ id: "st_42" });
+    renderRow(t, { onRunNow });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("task-run-now"));
+    expect(onRunNow).toHaveBeenCalledWith(t);
+    expect(navigate).not.toHaveBeenCalled();
   });
 });

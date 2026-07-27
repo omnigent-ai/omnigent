@@ -10,6 +10,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createScheduledTask,
   deleteScheduledTask,
+  getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
   runScheduledTaskNow,
@@ -22,6 +23,11 @@ import {
 
 /** Query key for the caller's scheduled-tasks list. */
 export const SCHEDULED_TASKS_KEY = ["scheduled-tasks"] as const;
+
+/** Query key for one task's detail. */
+export function scheduledTaskKey(id: string): readonly unknown[] {
+  return ["scheduled-task", id];
+}
 
 /** Query key for one task's run history. */
 export function scheduledTaskRunsKey(id: string): readonly unknown[] {
@@ -51,6 +57,27 @@ export function useScheduledTasks() {
     // persistent scheduled-tasks indicator, add a SEPARATE lightweight query
     // (no short refetchInterval, or a much longer one) — don't reuse this one.
     refetchInterval: 60_000,
+  });
+}
+
+/**
+ * One task's detail (the `/tasks/:taskId` page). Seeds initial data from the
+ * already-cached list so navigating from the list paints instantly, then
+ * refetches to pick up any fields the list row didn't carry / staleness. The
+ * seed is `placeholderData` (not `initialData`) so the query is still
+ * considered stale and refetches immediately — a task edited elsewhere won't
+ * show a frozen list snapshot. `enabled` gates the fetch (e.g. a missing id).
+ */
+export function useScheduledTask(id: string, enabled: boolean = true) {
+  const queryClient = useQueryClient();
+  return useQuery<ScheduledTask>({
+    queryKey: scheduledTaskKey(id),
+    queryFn: () => getScheduledTask(id),
+    enabled: enabled && id !== "",
+    staleTime: 30_000,
+    // Paint from the list cache while the detail fetch is in flight.
+    placeholderData: () =>
+      queryClient.getQueryData<ScheduledTask[]>(SCHEDULED_TASKS_KEY)?.find((t) => t.id === id),
   });
 }
 
@@ -86,6 +113,8 @@ export function useUpdateScheduledTask() {
       updateScheduledTask(id, input),
     onSuccess: (updated) => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      // Refresh the detail query so the /tasks/:id page reflects the edit.
+      void queryClient.invalidateQueries({ queryKey: scheduledTaskKey(updated.id) });
       // A schedule/state change can shift the run history too (e.g. a
       // just-reactivated task), so refresh that task's runs if they're loaded.
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(updated.id) });
@@ -116,6 +145,7 @@ export function useRunScheduledTaskNow() {
     mutationFn: (id: string) => runScheduledTaskNow(id),
     onSuccess: (_data, id) => {
       void queryClient.invalidateQueries({ queryKey: SCHEDULED_TASKS_KEY });
+      void queryClient.invalidateQueries({ queryKey: scheduledTaskKey(id) });
       void queryClient.invalidateQueries({ queryKey: scheduledTaskRunsKey(id) });
     },
   });
