@@ -363,6 +363,7 @@ shipped. **12 PRs total** (Phase 1: 1.1–1.8, Phase 2: 2.1–2.4).
 |---|---|---|
 | 1.1 Provider model + resolver | in review | #3239 |
 | 1.2 Signature normalization | in review | (stacked on 1.1) |
+| 1.3 Resume hubs | in review | (stacked on 1.2) |
 
 ## Risks and open questions
 
