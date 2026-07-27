@@ -166,3 +166,10 @@ def test_main_check_flag_position_independent(tmp_path: Path) -> None:
     lock = tmp_path / "uv.lock"
     lock.write_text(f'source = {{ registry = "{_CANONICAL}" }}\n')
     assert _MOD.main([str(lock), "--check"]) == 0
+
+
+def test_main_missing_file_returns_two(tmp_path: Path) -> None:
+    """A missing lockfile is a real error (exit 2), not a rewrite signal."""
+    missing = tmp_path / "does-not-exist.lock"
+    assert _MOD.main([str(missing)]) == 2
+    assert _MOD.main(["--check", str(missing)]) == 2

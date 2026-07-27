@@ -78,7 +78,8 @@ def main(argv: list[str]) -> int:
     :returns: In fix mode, ``1`` when a file was modified (so the commit
         aborts and the change is re-staged) else ``0``.  In ``--check``
         mode, ``1`` when any file is not already canonical (printing the
-        offending URLs) else ``0``; no file is written.
+        offending URLs) else ``0``; no file is written. Missing or
+        unreadable files (and invalid JSON after rewrite) return ``2``.
     """
     check = "--check" in argv
     files = [a for a in argv if a != "--check"]
@@ -86,7 +87,12 @@ def main(argv: list[str]) -> int:
     if check:
         ok = True
         for name in files:
-            offenders = non_canonical_urls(Path(name).read_text())
+            try:
+                text = Path(name).read_text()
+            except OSError as exc:
+                print(f"error: {name}: {exc}", file=sys.stderr)
+                return 2
+            offenders = non_canonical_urls(text)
             if offenders:
                 ok = False
                 unique = sorted(set(offenders))
@@ -105,11 +111,21 @@ def main(argv: list[str]) -> int:
     changed = False
     for name in files:
         path = Path(name)
-        original = path.read_text()
+        try:
+            original = path.read_text()
+        except OSError as exc:
+            print(f"error: {name}: {exc}", file=sys.stderr)
+            return 2
         normalized = normalize_text(original)
         if normalized != original:
             # Validate that the result is still valid JSON before writing.
-            json.loads(normalized)
+            try:
+                json.loads(normalized)
+            except json.JSONDecodeError as exc:
+                print(
+                    f"error: {name}: normalized result is not valid JSON: {exc}", file=sys.stderr
+                )
+                return 2
             path.write_text(normalized)
             count = len(non_canonical_urls(original))
             print(f"{name}: normalized {count} resolved URL(s) to {_CANONICAL_REGISTRY}")

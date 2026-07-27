@@ -89,7 +89,8 @@ def main(argv: list[str]) -> int:
     :returns: In fix mode, ``1`` when a file was modified (so the commit
         aborts and the change is re-staged) else ``0``. In ``--check``
         mode, ``1`` when any file is not already canonical (printing the
-        offending URLs) else ``0``; no file is written.
+        offending URLs) else ``0``; no file is written. Missing or
+        unreadable files return ``2`` (distinct from the rewrite signal).
     """
     check = "--check" in argv
     files = [a for a in argv if a != "--check"]
@@ -97,7 +98,12 @@ def main(argv: list[str]) -> int:
     if check:
         ok = True
         for name in files:
-            offenders = non_canonical_registries(Path(name).read_text())
+            try:
+                text = Path(name).read_text()
+            except OSError as exc:
+                print(f"error: {name}: {exc}", file=sys.stderr)
+                return 2
+            offenders = non_canonical_registries(text)
             if offenders:
                 ok = False
                 unique = sorted(set(offenders))
@@ -114,7 +120,11 @@ def main(argv: list[str]) -> int:
     changed = False
     for name in files:
         path = Path(name)
-        original = path.read_text()
+        try:
+            original = path.read_text()
+        except OSError as exc:
+            print(f"error: {name}: {exc}", file=sys.stderr)
+            return 2
         normalized = normalize_text(original)
         if normalized != original:
             path.write_text(normalized)

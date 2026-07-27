@@ -13,7 +13,8 @@ commit lands clean — CI runs the same checks.
 
 Use `just` for common tasks; run `just --list` for grouped recipes.
 
-- `just ensure` — install/check prerequisites
+- `just ensure` — install/check prerequisites (`uv sync --frozen`)
+- `just relock` — intentionally re-resolve and rewrite `uv.lock`
 - `just run-ios` / `just run-android` — build/run mobile apps
 - `just dev` / `just dev-mobile` — start the omnigent dev pod
 - `just electron-dev` / `just electron-build` — Electron desktop shell
