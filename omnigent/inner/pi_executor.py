@@ -600,7 +600,6 @@ _DATABRICKS_RESPONSES_MODELS = [
         "contextWindow": 131072,
         "maxTokens": 8192,
         "input": ["text", "image"],
-        "reasoning": True,
     },
     {
         "id": "system.ai.inkling",
@@ -608,7 +607,6 @@ _DATABRICKS_RESPONSES_MODELS = [
         "contextWindow": 131072,
         "maxTokens": 8192,
         "input": ["text", "image"],
-        "reasoning": True,
     },
     {
         "id": "system.ai.qwen3-next-80b-a3b-instruct",
