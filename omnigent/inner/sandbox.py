@@ -521,10 +521,13 @@ def with_additional_read_roots(
     policy: SandboxPolicy,
     extra_roots: Sequence[Path],
 ) -> SandboxPolicy:
-    if policy.read_roots is None:
-        return policy
-
-    read_roots = list(policy.read_roots)
+    # ``read_roots=None`` means "no spec-supplied grants" for deny-default
+    # backends (darwin_seatbelt, linux_bwrap). Treat it as an empty list so
+    # caller-supplied extra roots (e.g. the pi node_modules dir granted by
+    # _try_sandbox_pi) are not silently dropped when the spec declares no
+    # read_paths. Do NOT short-circuit: the caller is explicitly widening the
+    # policy, so we must honour it even when the spec itself has no grants.
+    read_roots = list(policy.read_roots) if policy.read_roots is not None else []
     for root in extra_roots:
         resolved = root.resolve(strict=False)
         if all(existing != resolved for existing in read_roots):

@@ -533,13 +533,13 @@ export async function describeCreateError(res: Response): Promise<string> {
 }
 
 /**
- * The pre-feature "run omnigent setup" guidance (ReactNode), shown under the
+ * The pre-feature "run omni setup" guidance (ReactNode), shown under the
  * composer when the UI-driven setup feature is OFF.
  *
  * The ``needs-auth`` / ``binary-missing`` copy is Codex-specific ("run codex
  * login" / "set OMNIGENT_CODEX_PATH"), so it's gated on {@link isCodexHarness}.
  * Other harnesses that report those structured reasons (claude-native /
- * opencode-native now do) fall through to the generic "run omnigent setup"
+ * opencode-native now do) fall through to the generic "run omni setup"
  * message — matching the pre-feature behavior, where only Codex ever produced
  * these reasons and everything else showed the generic text.
  */
@@ -572,14 +572,13 @@ function harnessWarningMessage(
       <>
         {agentName} can&apos;t find the Codex binary on {hostName} — if codex is installed, restart
         the host with <code>omnigent host</code> so it picks up your PATH, or set{" "}
-        <code>OMNIGENT_CODEX_PATH</code>. Otherwise run <code>omnigent setup</code>.
+        <code>OMNIGENT_CODEX_PATH</code>. Otherwise run <code>omni setup</code>.
       </>
     );
   }
   return (
     <>
-      {agentName} isn&apos;t configured on {hostName} — run <code>omnigent setup</code> on that
-      machine.
+      {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.
     </>
   );
 }
@@ -1623,7 +1622,9 @@ export function NewChatLandingScreen() {
   const queryClient = useQueryClient();
   const serverUrl = getCliServerUrl();
   const { data: agents } = useAvailableAgents();
-  const { data: hosts, isLoading: hostsLoading } = useHosts();
+  // refetchOnFocus: returning from a terminal `omni setup` must clear the
+  // readiness badge even if the live push was missed while the tab was hidden.
+  const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
 
   const agentList = useMemo(
     () =>
@@ -1717,7 +1718,7 @@ export function NewChatLandingScreen() {
   const smartRoutingEnabled = info !== "loading" && info.smart_routing_enabled;
   // Gates the whole UI-driven setup experience (Set up affordance + dialog +
   // collapsed badge). OFF → the composer/picker fall back to the original
-  // "run omnigent setup" guidance, so a disabled flag is a no-op on the UI.
+  // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
   const harnessInstallEnabled = info !== "loading" && info.harness_install_enabled;
   const brainHarnessLabels = useBrainHarnessLabels(smartRoutingEnabled);
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
