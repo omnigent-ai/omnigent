@@ -1145,7 +1145,9 @@ def _apply_bind_auth_defaults(host: str) -> None:
             f"  ⚠ Binding to non-local interface {host}: enabling accounts "
             "(login) mode to prevent unauthorized access.\n"
             "    Open the server URL in a browser to create the first admin "
-            "account.",
+            "account.\n"
+            "    Set OMNIGENT_AUTH_ENABLED=0 first to override and stay in "
+            "single-user mode.",
             err=True,
         )
 
