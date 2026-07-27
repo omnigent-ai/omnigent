@@ -17,7 +17,6 @@ import {
   ArrowRightIcon,
   ChevronLeftIcon,
   Loader2Icon,
-  PauseIcon,
   PencilIcon,
   PlayIcon,
   Trash2Icon,
@@ -25,6 +24,7 @@ import {
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import {
   useDeleteScheduledTask,
@@ -175,18 +175,9 @@ export function TaskDetailPage() {
         </div>
       </div>
 
-      {/* Status line: pause/resume toggle + state pill + schedule + next-run. */}
+      {/* Status line: state pill + active toggle (Switch, ON = active) +
+          schedule + next-run. The Switch sits to the RIGHT of the pill. */}
       <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
-        <Button
-          variant="outline"
-          size="icon-sm"
-          aria-label={paused ? "Resume automation" : "Pause automation"}
-          data-testid="task-detail-pause-toggle"
-          disabled={busy}
-          onClick={handlePauseToggle}
-        >
-          {paused ? <PlayIcon className="size-4" /> : <PauseIcon className="size-4" />}
-        </Button>
         <span
           data-testid="task-detail-state-pill"
           className={cn(
@@ -198,6 +189,16 @@ export function TaskDetailPage() {
         >
           {paused ? "Paused" : "Active"}
         </span>
+        {/* A scheduled task is ON when active. onCheckedChange passes a boolean,
+            but handlePauseToggle derives the next state from `paused` and
+            ignores its args, so no rewiring is needed. */}
+        <Switch
+          aria-label={paused ? "Resume automation" : "Pause automation"}
+          data-testid="task-detail-pause-toggle"
+          checked={!paused}
+          disabled={busy}
+          onCheckedChange={handlePauseToggle}
+        />
         <span className="text-muted-foreground" data-testid="task-detail-schedule">
           {scheduleSummary}
           {nextRun && ` · Next run ${nextRun}`}

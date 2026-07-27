@@ -175,10 +175,33 @@ describe("header, prompt, configuration", () => {
     setTask(task({ state: "paused" }));
     renderPage();
     expect(screen.getByTestId("task-detail-state-pill")).toHaveTextContent("Paused");
-    expect(screen.getByTestId("task-detail-pause-toggle")).toHaveAttribute(
-      "aria-label",
-      "Resume automation",
-    );
+    const toggle = screen.getByTestId("task-detail-pause-toggle");
+    // The toggle is a Switch (role="switch"), OFF (unchecked) when paused.
+    expect(toggle).toHaveAttribute("role", "switch");
+    expect(toggle).toHaveAttribute("aria-label", "Resume automation");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("the active-state toggle Switch is ON for an active task", () => {
+    setTask(task({ state: "active" }));
+    renderPage();
+    const toggle = screen.getByTestId("task-detail-pause-toggle");
+    expect(toggle).toHaveAttribute("role", "switch");
+    expect(toggle).toHaveAttribute("aria-label", "Pause automation");
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("renders the status line as [state pill] [toggle] [schedule], in that order", () => {
+    setTask(task({ state: "active" }));
+    renderPage();
+    const pill = screen.getByTestId("task-detail-state-pill");
+    const toggle = screen.getByTestId("task-detail-pause-toggle");
+    const schedule = screen.getByTestId("task-detail-schedule");
+    // Document order: pill before toggle before schedule.
+    expect(pill.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(
+      toggle.compareDocumentPosition(schedule) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });
 
@@ -205,11 +228,19 @@ describe("header actions", () => {
     expect(runNowMutate).toHaveBeenCalledWith("st_1");
   });
 
-  it("pause toggle fires the update mutation with the flipped state", () => {
+  it("toggling the Switch off pauses an active task (update to paused)", () => {
     setTask(task({ state: "active" }));
     renderPage();
+    // Clicking the Switch fires onCheckedChange → handlePauseToggle.
     fireEvent.click(screen.getByTestId("task-detail-pause-toggle"));
     expect(updateMutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "paused" } });
+  });
+
+  it("toggling the Switch on resumes a paused task (update to active)", () => {
+    setTask(task({ state: "paused" }));
+    renderPage();
+    fireEvent.click(screen.getByTestId("task-detail-pause-toggle"));
+    expect(updateMutate).toHaveBeenCalledWith({ id: "st_1", input: { state: "active" } });
   });
 
   it("delete fires the mutation and navigates back to the list on success", () => {
