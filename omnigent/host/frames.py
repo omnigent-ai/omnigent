@@ -68,6 +68,8 @@ class HostFrameKind(str, Enum):
     FS_RESULT = "host.fs_result"
     MODEL_OPTIONS = "host.model_options"
     MODEL_OPTIONS_RESULT = "host.model_options_result"
+    OPEN_DIRECTORY_DIALOG = "host.open_directory_dialog"
+    OPEN_DIRECTORY_DIALOG_RESULT = "host.open_directory_dialog_result"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -102,6 +104,7 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     telemetry_opt_out: bool = False
     installation_id: str | None = None
+    capabilities: dict[str, Any] | None = None
 
 
 @dataclass
@@ -807,6 +810,57 @@ class HostModelOptionsResultFrame:
     error: str | None = None
 
 
+@dataclass
+class HostOpenDirectoryDialogFrame:
+    """Server → host: open the host's OS-native directory chooser.
+
+    Backs ``POST /v1/hosts/{id}/native-directory-dialog``, which the Web UI's
+    new-session workspace picker offers when the host advertises the
+    ``native_directory_dialog`` capability in its hello frame. The dialog runs
+    ON THE HOST (never the server) so it opens on the machine whose filesystem
+    is being selected — only a local, interactive host with a GUI session
+    advertises support; remote/headless/unsupported hosts fall back to the
+    in-app WorkspacePicker.
+
+    :param request_id: Correlates the result, e.g. ``"req_od_1"``.
+    """
+
+    request_id: str
+
+
+@dataclass
+class HostOpenDirectoryDialogResultFrame:
+    """Host → server: outcome of a native directory-dialog request.
+
+    :param request_id: Correlates to the
+        :class:`HostOpenDirectoryDialogFrame`, e.g. ``"req_od_1"``.
+    :param status: One of:
+
+        * ``"ok"`` — the user picked a directory; ``path`` holds its
+          absolute POSIX path.
+        * ``"cancelled"`` — the user dismissed the dialog without choosing.
+        * ``"unsupported"`` — this host cannot show a native dialog
+          (non-macOS platform, or no GUI/window-server session). The caller
+          falls back to the in-app WorkspacePicker.
+        * ``"error"`` — the dialog invocation failed unexpectedly (e.g.
+          ``osascript`` unavailable, window server unreachable); ``error``
+          carries a short message.
+    :param path: Absolute POSIX path the user selected, e.g.
+        ``"/Users/corey/projects"``. ``None`` unless ``status`` is ``"ok"``.
+        The host returns the realpath so symlinks cannot smuggle a workspace
+        out of an agent's ``os_env.cwd`` boundary — the same posture as
+        ``host.stat_result.canonical_path``.
+    :param error: Short failure reason when ``status`` is ``"error"`` (or
+        ``"unsupported"`` on non-macOS, for diagnostics). ``None`` on
+        ``"ok"``/``"cancelled"``.
+    """
+
+    request_id: str
+    status: str
+    path: str | None = None
+    error: str | None = None
+
+
 HostFrame = (
     HostHelloFrame
     | HostHarnessReadinessFrame
@@ -833,6 +887,8 @@ HostFrame = (
     | HostFsResultFrame
     | HostModelOptionsFrame
     | HostModelOptionsResultFrame
+    | HostOpenDirectoryDialogFrame
+    | HostOpenDirectoryDialogResultFrame
 )
 
 
@@ -881,6 +937,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "configured_harnesses": frame.configured_harnesses,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
+                "capabilities": frame.capabilities,
             }
         )
     if isinstance(frame, HostHarnessReadinessFrame):
@@ -1178,6 +1235,23 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostOpenDirectoryDialogFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.OPEN_DIRECTORY_DIALOG.value,
+                "request_id": frame.request_id,
+            }
+        )
+    if isinstance(frame, HostOpenDirectoryDialogResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.OPEN_DIRECTORY_DIALOG_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "path": frame.path,
+                "error": frame.error,
+            }
+        )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
 
 
@@ -1300,6 +1374,10 @@ def _decode_known_host_frame(
             return _decode_model_options(msg)
         case HostFrameKind.MODEL_OPTIONS_RESULT:
             return _decode_model_options_result(msg)
+        case HostFrameKind.OPEN_DIRECTORY_DIALOG:
+            return HostOpenDirectoryDialogFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.OPEN_DIRECTORY_DIALOG_RESULT:
+            return _decode_open_directory_dialog_result(msg)
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -1317,6 +1395,7 @@ def _decode_host_hello(msg: dict[str, Any]) -> HostHelloFrame:
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
+        capabilities=_optional_object_map(msg, "capabilities"),
     )
 
 
@@ -1804,6 +1883,33 @@ def _decode_model_options_result(msg: dict[str, Any]) -> HostModelOptionsResultF
     )
 
 
+def _decode_open_directory_dialog_result(
+    msg: dict[str, Any],
+) -> HostOpenDirectoryDialogResultFrame:
+    """Decode a host.open_directory_dialog_result frame.
+
+    Enforces the documented invariant at the protocol boundary: an ``ok``
+    status MUST carry a non-empty absolute POSIX path (leading ``/``). A
+    malformed or relative ``ok`` result is rejected so a buggy/malicious
+    host cannot smuggle a relative path into the workspace field — the
+    in-app picker only ever yields absolute paths.
+    """
+    status = _required_str(msg, "status")
+    path = _optional_nullable_str(msg, "path")
+    if status == "ok":
+        if not path or not path.startswith("/"):
+            raise ValueError(
+                "host.open_directory_dialog_result with status 'ok' must "
+                "carry a non-empty absolute path"
+            )
+    return HostOpenDirectoryDialogResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=status,
+        path=path,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
 # ── Field validators ─────────────────────────────────────
 
 
@@ -1882,6 +1988,24 @@ def _optional_str_availability_map(
     if not isinstance(val, dict):
         return None
     return {k: v for k, v in val.items() if isinstance(k, str) and is_harness_availability(v)}
+
+
+def _optional_object_map(msg: dict[str, Any], key: str) -> dict[str, Any] | None:
+    """Return an optional JSON-object field, tolerant of malformed peers.
+
+    Absent/null/non-dict values all decode to ``None`` ("not advertised")
+    rather than raising, so an older or newer host's hello never breaks the
+    tunnel handshake — the caller treats ``None`` as "no capabilities
+    advertised" and falls back to the in-app picker.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"capabilities"``.
+    :returns: A shallow copy of the object when present, else ``None``.
+    """
+    val = msg.get(key)
+    if not isinstance(val, dict):
+        return None
+    return dict(val)
 
 
 def _optional_nullable_str(msg: dict[str, Any], key: str) -> str | None:

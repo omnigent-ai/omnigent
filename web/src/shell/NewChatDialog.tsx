@@ -21,6 +21,7 @@ import {
   Loader2Icon,
   FileTextIcon,
   FolderIcon,
+  ClockIcon,
   ImageIcon,
   PaperclipIcon,
   PlusIcon,
@@ -120,7 +121,12 @@ import {
   nativeCodingAgentForAvailableAgent,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  hostSupportsNativeDirectoryDialog,
+  useHostModelOptions,
+  useHosts,
+  type Host,
+} from "@/hooks/useHosts";
 import {
   controlHost,
   getHostIdentity,
@@ -139,6 +145,7 @@ import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
+import { useOpenHostNativeDirectoryDialog } from "@/hooks/useHostNativeDirectoryDialog";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -1931,6 +1938,69 @@ export function NewChatLandingScreen() {
   }, []);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
+  // Live mirror of selectedHostId for the async native-dialog handler: the
+  // dialog can stay open across a host switch, and the result must NOT be
+  // applied if the user has since selected a different host (host A's path
+  // must never populate host B's workspace field). A ref reads the current
+  // value when the awaited promise resumes.
+  const selectedHostIdRef = useRef(selectedHostId);
+  selectedHostIdRef.current = selectedHostId;
+  // Record a workspace choice immediately (not only on session create) so a
+  // clicked older recent jumps to the front of the list right away and the
+  // recents list stays useful mid-flow. addRecent is per-host, de-dups,
+  // moves-to-front, and caps at 8 (see useRecentWorkspaces).
+  const commitWorkspace = useCallback(
+    (path: string) => {
+      setWorkspace(path);
+      addRecent(path);
+    },
+    [addRecent],
+  );
+  // OS-native folder chooser; only offered when the selected host is THIS
+  // desktop machine AND advertises the capability (local + interactive
+  // macOS host). The desktop-host identity match is the real locality gate
+  // — a GUI-capable remote host selected from another machine must NOT
+  // offer a dialog it would pop on a screen the user can't see. On any
+  // non-``ok`` result or thrown error the popover keeps the in-app
+  // WorkspacePicker, so the user always has a working browser.
+  const nativeDialog = useOpenHostNativeDirectoryDialog();
+  // `selectedHost` is derived further down; read the capability from the
+  // hosts list here so this hook group stays above its declaration. The
+  // helper tolerates null/undefined, so an unset host reads as unsupported.
+  const selectedHostSupportsNativeDialog = hostSupportsNativeDirectoryDialog(
+    (hosts ?? []).find((h) => h.host_id === selectedHostId),
+  );
+
+  async function handleOpenNativeDirectoryDialog() {
+    if (selectedHostId === null) return;
+    // Capture the requesting host so a host switch while the OS dialog is
+    // open does NOT apply host A's chosen path to host B. The ref holds the
+    // live selection when the awaited result resumes.
+    const requestedHostId = selectedHostId;
+    let result;
+    try {
+      result = await nativeDialog.mutateAsync(requestedHostId);
+    } catch {
+      // Offline host, timeout, or network error — fall back to the
+      // in-app picker without bothering the user (the picker is
+      // already visible below this button).
+      return;
+    }
+    // Discard the result if the user switched hosts while the dialog was
+    // open — the path belongs to `requestedHostId`, not whatever is now
+    // selected. Leave the popover open so the user can pick on the new host.
+    if (selectedHostIdRef.current !== requestedHostId) return;
+    if (result.status === "ok" && result.path) {
+      // commitWorkspace sets the path AND records it as a recent
+      // immediately. setWorkspace runs the SAME path state used for the
+      // picker; the existing isValidWorkspace + session-create validation
+      // still gates the launch — the native dialog never weakens checks.
+      commitWorkspace(result.path);
+      setWorkspacePopoverOpen(false);
+    }
+    // cancelled / unsupported / error → leave the picker open as the
+    // fallback, silently.
+  }
 
   const allHosts = hosts ?? [];
   const onlineHosts = allHosts.filter((h) => h.status === "online");
@@ -3683,23 +3753,92 @@ export function NewChatLandingScreen() {
                   narrow screen; desktop still gets the full width. */}
                   <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
                     {selectedHostId ? (
-                      <WorkspacePicker
-                        hostId={selectedHostId}
-                        initialPath={
-                          isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
-                        }
-                        onNavigate={setWorkspace}
-                        // Warn when browsing into a directory other live agents
-                        // occupy. Suppressed only when a NEW isolated worktree
-                        // will be created (no shared-dir conflict then). When
-                        // starting directly in an existing worktree the branch
-                        // is prefilled but the dir IS shared, so keep warning.
-                        occupancyForPath={
-                          !shouldCreateWorktree
-                            ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
-                            : undefined
-                        }
-                      />
+                      <div className="flex flex-col">
+                        {/* Per-host recent workspaces — one click sets the
+                            workspace without launching. Most-recent-first,
+                            capped at the hook's 8 entries; empty state is
+                            hidden so a fresh host shows only the picker. */}
+                        {recent.length > 0 && (
+                          <div
+                            className="flex flex-col gap-0.5 border-b px-2 py-1.5"
+                            data-testid="workspace-recents"
+                          >
+                            <span className="px-1 pb-0.5 text-[11px] font-medium text-muted-foreground">
+                              Recent
+                            </span>
+                            {recent.map((recentPath) => (
+                              <button
+                                key={recentPath}
+                                type="button"
+                                // preventDefault keeps the popover open so a
+                                // misclick doesn't dismiss it before the user
+                                // sees the path applied.
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => {
+                                  // commitWorkspace records the recent
+                                  // immediately so a clicked older entry
+                                  // jumps to the front right away.
+                                  commitWorkspace(recentPath);
+                                  setWorkspacePopoverOpen(false);
+                                }}
+                                className="flex items-center gap-2 rounded px-1 py-1 text-left text-xs text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+                                data-testid={`workspace-recent-${recentPath}`}
+                                title={recentPath}
+                              >
+                                <ClockIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                                <span className="truncate">{recentPath}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {/* OS-native folder chooser — primary action, shown
+                            only when the selected host is THIS desktop
+                            machine (locality) AND advertises the
+                            capability (macOS + GUI). A GUI-capable remote
+                            host selected from another machine is NOT
+                            offered the dialog. The WorkspacePicker below is
+                            always present as the secondary browser /
+                            fallback. */}
+                        {selectedHostSupportsNativeDialog &&
+                          thisMachineHostId !== null &&
+                          selectedHostId === thisMachineHostId && (
+                            <div className="border-b px-2 py-1.5">
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="secondary"
+                                disabled={nativeDialog.isPending}
+                                onClick={() => void handleOpenNativeDirectoryDialog()}
+                                className="w-full justify-start gap-2"
+                                data-testid="workspace-native-dialog"
+                              >
+                                {nativeDialog.isPending ? (
+                                  <Loader2Icon className="size-3.5 animate-spin" />
+                                ) : (
+                                  <MonitorIcon className="size-3.5" />
+                                )}
+                                Use system dialog…
+                              </Button>
+                            </div>
+                          )}
+                        <WorkspacePicker
+                          hostId={selectedHostId}
+                          initialPath={
+                            isNavigablePath(workspaceTrimmed) ? workspaceTrimmed : undefined
+                          }
+                          onNavigate={setWorkspace}
+                          // Warn when browsing into a directory other live agents
+                          // occupy. Suppressed only when a NEW isolated worktree
+                          // will be created (no shared-dir conflict then). When
+                          // starting directly in an existing worktree the branch
+                          // is prefilled but the dir IS shared, so keep warning.
+                          occupancyForPath={
+                            !shouldCreateWorktree
+                              ? (abs) => occupancyByDir.get(normalizeWorkspacePath(abs) ?? "") ?? 0
+                              : undefined
+                          }
+                        />
+                      </div>
                     ) : (
                       <p className="p-3 text-xs text-muted-foreground">Select a host first.</p>
                     )}

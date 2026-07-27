@@ -18,6 +18,9 @@ from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     _build_runner_env,
+    _host_capabilities,
+    _macos_gui_session_available,
+    _open_native_directory_dialog,
     _RunnerHandle,
     run_host_process,
 )
@@ -37,6 +40,8 @@ from omnigent.host.frames import (
     HostListDirResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostOpenDirectoryDialogFrame,
+    HostOpenDirectoryDialogResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
@@ -47,6 +52,7 @@ from omnigent.host.frames import (
     HostStoreSecretFrame,
     HostStoreSecretResultFrame,
     decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import (
@@ -3051,3 +3057,260 @@ def test_run_host_process_announces_session_log_dir_on_start(
     out = capsys.readouterr().out
     assert "Session logs: ~/.omnigent/logs/runner/" in out
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
+
+
+async def test_handle_open_directory_dialog_returns_host_pick() -> None:
+    """_handle_open_directory_dialog forwards the OS pick as an ok result.
+
+    The handler runs the dialog off the event loop and wraps the status/
+    path into the result frame; if the frame wiring is wrong the server
+    would never resolve the pending future and the UI would time out.
+    """
+    host = _make_host_process()
+    picked = "/Users/corey/picked-dir"
+    with patch(
+        "omnigent.host.connect._open_native_directory_dialog",
+        return_value=("ok", picked, None),
+    ):
+        result = await host._handle_open_directory_dialog(
+            HostOpenDirectoryDialogFrame(request_id="req_dialog"),
+        )
+    assert result == HostOpenDirectoryDialogResultFrame(
+        request_id="req_dialog",
+        status="ok",
+        path=picked,
+        error=None,
+    )
+
+
+async def test_handle_open_directory_dialog_passes_through_cancelled() -> None:
+    """A cancelled dialog returns a ``cancelled`` result (not an exception).
+
+    The UI keeps the picker open on cancel; raising here would surface a
+    500 instead of the ``cancelled`` status the contract promises.
+    """
+    host = _make_host_process()
+    with patch(
+        "omnigent.host.connect._open_native_directory_dialog",
+        return_value=("cancelled", None, None),
+    ):
+        result = await host._handle_open_directory_dialog(
+            HostOpenDirectoryDialogFrame(request_id="req_dialog"),
+        )
+    assert result.status == "cancelled"
+    assert result.path is None
+
+
+async def test_handle_open_directory_dialog_passes_through_unsupported() -> None:
+    """A non-macOS / headless host returns ``unsupported`` (not an error).
+
+    The UI falls back to the in-app picker; the status must pass through
+    rather than raising, so the endpoint returns 200 + unsupported.
+    """
+    host = _make_host_process()
+    with patch(
+        "omnigent.host.connect._open_native_directory_dialog",
+        return_value=("unsupported", None, "no GUI session"),
+    ):
+        result = await host._handle_open_directory_dialog(
+            HostOpenDirectoryDialogFrame(request_id="req_dialog"),
+        )
+    assert result.status == "unsupported"
+    assert result.path is None
+    assert result.error == "no GUI session"
+
+
+def test_host_capabilities_advertises_native_dialog_on_macos_gui() -> None:
+    """A macOS host with a GUI session advertises the dialog capability.
+
+    This is the gate the Web UI uses to show the "Use system dialog"
+    button; if the capability map is wrong the button never appears on a
+    supported host (or appears on an unsupported one).
+    """
+    import omnigent.host.connect as connect_mod
+
+    original_darwin = connect_mod.IS_DARWIN
+    try:
+        # macOS + GUI session → capability advertised.
+        connect_mod.IS_DARWIN = True
+        with patch.dict("os.environ", {"SECURITYSESSIONID": "fake"}, clear=False):
+            assert _macos_gui_session_available() is True
+            assert _host_capabilities() == {"native_directory_dialog": True}
+
+        # macOS but no GUI session (headless / SSH) → no capability.
+        with patch.dict("os.environ", {}, clear=True):
+            assert _macos_gui_session_available() is False
+            assert _host_capabilities() is None
+    finally:
+        connect_mod.IS_DARWIN = original_darwin
+
+
+def test_host_capabilities_none_off_macos() -> None:
+    """A non-macOS host advertises no capabilities.
+
+    Linux/Windows must read as None so the UI never offers a button that
+    would hang (the OS dialog isn\'t implemented there yet).
+    """
+    import omnigent.host.connect as connect_mod
+
+    original_darwin = connect_mod.IS_DARWIN
+    try:
+        connect_mod.IS_DARWIN = False
+        with patch.dict("os.environ", {"SECURITYSESSIONID": "fake"}, clear=False):
+            # Even with a GUI-session env, non-macOS is unsupported.
+            assert _host_capabilities() is None
+    finally:
+        connect_mod.IS_DARWIN = original_darwin
+
+
+def test_open_native_directory_dialog_returns_cancelled_on_osascript_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An osascript non-zero exit with "cancel" in stderr maps to cancelled.
+
+    AppleScript exits non-zero with "User canceled." when the user hits
+    Cancel; the helper must distinguish that from a genuine osascript error
+    so the UI keeps the picker open silently rather than surfacing a failure.
+    """
+    import omnigent.host.connect as connect_mod
+
+    monkeypatch.setattr(connect_mod, "IS_DARWIN", True)
+    monkeypatch.setenv("SECURITYSESSIONID", "fake")
+
+    class _FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "User canceled.\n"
+
+    def _fake_run(*_args: object, **_kwargs: object) -> _FakeProc:
+        return _FakeProc()
+
+    monkeypatch.setattr(connect_mod.subprocess, "run", _fake_run)
+    status, path, error = _open_native_directory_dialog()
+    assert status == "cancelled"
+    assert path is None
+    assert error is None
+
+
+# ── Native directory dialog: background task + serialization ──────────
+
+
+class _SendLogTunnel:
+    """Minimal ws double that records every ``send`` for dispatch tests."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+
+async def test_dispatch_directory_dialog_runs_in_background_keeps_loop_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dialog runs as a BACKGROUND task so pings still get answered.
+
+    The OS dialog blocks for as long as the user browses; if dispatch
+    awaited it inline the receive loop would stall and the server would
+    declare the host dead after ~90s. This dispatches a dialog, then a
+    ping, and asserts the pong is sent WHILE the dialog is still open —
+    proving the loop is not blocked.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+
+    host = _make_host_process()
+    ws = _SendLogTunnel()
+    # Gate the mock dialog on an event so it stays "open" until we release
+    # it — the handler runs it via asyncio.to_thread, so the blocker must
+    # be a synchronous function that waits on a threading.Event.
+    import threading
+
+    ready = threading.Event()
+
+    def _blocking_dialog_sync() -> tuple[str, str | None, str | None]:
+        ready.wait(5)
+        return "ok", "/Users/corey/picked", None
+
+    monkeypatch.setattr(
+        "omnigent.host.connect._open_native_directory_dialog",
+        _blocking_dialog_sync,
+    )
+
+    dialog_frame = HostOpenDirectoryDialogFrame(request_id="req_bg")
+    # Dispatch the dialog — must return immediately (background task spawned).
+    await host._handle_raw_message(ws, encode_host_frame(dialog_frame))
+    assert ws.sent == [], "dispatch must not block on the dialog"
+
+    # While the dialog is still open, a ping must be answered immediately —
+    # this is the keepalive the server uses to detect liveness.
+    ping_ts = 12345
+    await host._handle_raw_message(ws, encode_frame(PingFrame(ts=ping_ts)))
+    assert len(ws.sent) == 1, "pong must be sent while the dialog is open"
+    pong = decode_frame(ws.sent[0])
+    assert isinstance(pong, PongFrame)
+    assert pong.ts == ping_ts
+
+    # Release the dialog and let the background task send its result.
+    ready.set()
+    task = host._directory_dialog_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=2.0)
+    # The result frame is now the second sent frame.
+    assert len(ws.sent) == 2
+    result = decode_host_frame(ws.sent[1])
+    assert isinstance(result, HostOpenDirectoryDialogResultFrame)
+    assert result.status == "ok"
+    assert result.path == "/Users/corey/picked"
+    assert host._directory_dialog_task is None
+
+
+async def test_dispatch_rejects_concurrent_directory_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second dialog while one is open is rejected with a busy error.
+
+    Only one GUI dialog may be open at a time; the second request gets an
+    immediate ``error`` result so the caller falls back to the in-app
+    picker instead of queuing behind the first.
+    """
+    import threading
+
+    host = _make_host_process()
+    ws = _SendLogTunnel()
+    ready = threading.Event()
+
+    def _blocking_dialog_sync() -> tuple[str, str | None, str | None]:
+        ready.wait(5)
+        return "ok", "/Users/corey/picked", None
+
+    monkeypatch.setattr(
+        "omnigent.host.connect._open_native_directory_dialog",
+        _blocking_dialog_sync,
+    )
+
+    await host._handle_raw_message(
+        ws,
+        encode_host_frame(HostOpenDirectoryDialogFrame(request_id="req_first")),
+    )
+    # A concurrent request must be rejected immediately, not queued.
+    await host._handle_raw_message(
+        ws,
+        encode_host_frame(HostOpenDirectoryDialogFrame(request_id="req_second")),
+    )
+    assert len(ws.sent) == 1, "only the busy rejection should be sent"
+    result = decode_host_frame(ws.sent[0])
+    assert isinstance(result, HostOpenDirectoryDialogResultFrame)
+    assert result.request_id == "req_second"
+    assert result.status == "error"
+    assert "already open" in (result.error or "")
+
+    # Clean up the first dialog so the test doesn't leak a task.
+    ready.set()
+    task = host._directory_dialog_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=2.0)

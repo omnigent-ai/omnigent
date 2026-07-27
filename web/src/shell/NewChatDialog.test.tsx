@@ -46,6 +46,42 @@ vi.mock("@/hooks/useHosts", () => ({
   // The setup dialog mounts these; default to an inert mutation + not-installing
   // so tests that don't exercise install don't need to wire them up.
   useInstallHarness: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  // Capability helper is a pure function — re-export the real impl so tests
+  // can rely on the host's `capabilities` field directly.
+  hostSupportsNativeDirectoryDialog: (
+    host: { capabilities?: { native_directory_dialog?: boolean } | null } | null | undefined,
+  ) => Boolean(host?.capabilities?.native_directory_dialog),
+}));
+// The native directory-dialog mutation is mocked inert by default (no
+// host supports it); tests that exercise the button override the mock.
+const { useNativeDialogMock } = vi.hoisted(() => ({
+  useNativeDialogMock: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+}));
+vi.mock("@/hooks/useHostNativeDirectoryDialog", () => ({
+  useOpenHostNativeDirectoryDialog: useNativeDialogMock,
+}));
+// Desktop-shell identity (Electron). Default: NOT in Electron, so
+// `desktopHost` is null and the native-dialog locality gate is closed.
+// Tests that exercise the native-dialog button call setDesktopHost("host_X")
+// so the selected host matches this machine.
+const { desktopHostState, isElectronState } = vi.hoisted(() => ({
+  desktopHostState: { current: null as { hostId: string; cliInstalled: boolean } | null },
+  isElectronState: { current: false },
+}));
+function setDesktopHost(hostId: string | null) {
+  if (hostId === null) {
+    desktopHostState.current = null;
+    isElectronState.current = false;
+  } else {
+    desktopHostState.current = { hostId, cliInstalled: true };
+    isElectronState.current = true;
+  }
+}
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/nativeBridge")>()),
+  isElectronShell: () => isElectronState.current,
+  getHostIdentity: async () => desktopHostState.current,
+  onHostStatusChanged: () => () => {},
 }));
 // The setup dialog's copyable command rows call copyText; stub it so a click
 // can be asserted without touching the real clipboard.
@@ -1582,6 +1618,237 @@ describe("NewChatLandingScreen", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("src"),
     );
     expect(screen.getByTestId("workspace-picker")).toBeTruthy();
+  });
+
+  it("renders the recents list and sets the workspace on click", async () => {
+    // Two recents for host_1; the seeded "/Users/corey/repo" plus an older one.
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({ host_1: ["/Users/corey/repo", "/Users/corey/other"] }),
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    // The recents list renders most-recent-first with a testid per path.
+    expect(screen.getByTestId("workspace-recents")).toBeTruthy();
+    expect(screen.getByTestId("workspace-recent-/Users/corey/repo")).toBeTruthy();
+    expect(screen.getByTestId("workspace-recent-/Users/corey/other")).toBeTruthy();
+    // Clicking a recent sets the workspace (chip label flips to its basename).
+    fireEvent.click(screen.getByTestId("workspace-recent-/Users/corey/other"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("other"),
+    );
+  });
+
+  it("hides the recents list when there are no recent paths", async () => {
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [] }));
+    renderLanding();
+    // With no recents the chip shows the generic "Working directory" label;
+    // open the popover and assert the recents list is absent (empty state
+    // hidden) while the picker remains as the fallback browser.
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    await waitFor(() => expect(screen.getByTestId("workspace-picker")).toBeTruthy());
+    expect(screen.queryByTestId("workspace-recents")).toBeNull();
+  });
+
+  it("shows the native-dialog button only when the host advertises support", async () => {
+    // Default host (no capabilities) → button absent, picker present.
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    expect(screen.queryByTestId("workspace-native-dialog")).toBeNull();
+    expect(screen.getByTestId("workspace-picker")).toBeTruthy();
+  });
+
+  it("shows the native-dialog button when the host supports it", async () => {
+    setDesktopHost("host_1");
+    mockHosts([
+      {
+        host_id: "host_1",
+        name: "machine-1",
+        owner: "me",
+        status: "online",
+        capabilities: { native_directory_dialog: true },
+      },
+    ]);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    expect(screen.getByTestId("workspace-native-dialog")).toBeTruthy();
+    // The picker remains available as the secondary browser / fallback.
+    expect(screen.getByTestId("workspace-picker")).toBeTruthy();
+  });
+
+  it("sets the workspace from the native dialog on a successful pick", async () => {
+    setDesktopHost("host_1");
+    mockHosts([
+      {
+        host_id: "host_1",
+        name: "machine-1",
+        owner: "me",
+        status: "online",
+        capabilities: { native_directory_dialog: true },
+      },
+    ]);
+    const mutateAsync = vi.fn().mockResolvedValue({
+      status: "ok",
+      path: "/Users/corey/picked-native",
+      error: null,
+    });
+    useNativeDialogMock.mockReturnValue({ mutateAsync, isPending: false });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("workspace-native-dialog"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+        "picked-native",
+      ),
+    );
+    expect(mutateAsync).toHaveBeenCalledWith("host_1");
+  });
+
+  it("falls back to the picker when the native dialog is cancelled", async () => {
+    setDesktopHost("host_1");
+    mockHosts([
+      {
+        host_id: "host_1",
+        name: "machine-1",
+        owner: "me",
+        status: "online",
+        capabilities: { native_directory_dialog: true },
+      },
+    ]);
+    const mutateAsync = vi.fn().mockResolvedValue({
+      status: "cancelled",
+      path: null,
+      error: null,
+    });
+    useNativeDialogMock.mockReturnValue({ mutateAsync, isPending: false });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("workspace-native-dialog"));
+    // Cancel keeps the existing workspace; the picker is still there.
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalled());
+    expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo");
+  });
+
+  it("does NOT show the native-dialog button for a non-local (remote GUI) host", async () => {
+    // The host advertises the capability (it's a macOS GUI host) but it is
+    // NOT this desktop machine — a remote user selected it. Locality gate
+    // (selectedHostId === thisMachineHostId) must keep the button hidden so
+    // the dialog is never popped on a screen the user can't see.
+    setDesktopHost("host_local");
+    mockHosts([
+      {
+        host_id: "host_remote",
+        name: "remote-mac",
+        owner: "me",
+        status: "online",
+        capabilities: { native_directory_dialog: true },
+      },
+    ]);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    expect(screen.queryByTestId("workspace-native-dialog")).toBeNull();
+    // The in-app picker is still available as the fallback.
+    expect(screen.getByTestId("workspace-picker")).toBeTruthy();
+  });
+
+  it("discards the native-dialog result when the host switches mid-dialog", async () => {
+    // Open the dialog on host_1, then switch the selected host to host_2
+    // before the result resolves. Host A's picked path must NOT populate
+    // host B's workspace field (cross-host contamination).
+    setDesktopHost("host_1");
+    mockHosts([
+      {
+        host_id: "host_1",
+        name: "machine-1",
+        owner: "me",
+        status: "online",
+        capabilities: { native_directory_dialog: true },
+      },
+      {
+        host_id: "host_2",
+        name: "machine-2",
+        owner: "me",
+        status: "online",
+        capabilities: { native_directory_dialog: true },
+      },
+    ]);
+    // Hold the dialog open until the test switches the host.
+    let resolvePick!: (v: { status: string; path: string | null; error: string | null }) => void;
+    const pickPromise = new Promise((r) => {
+      resolvePick = r as typeof resolvePick;
+    });
+    const mutateAsync = vi.fn().mockReturnValue(pickPromise);
+    useNativeDialogMock.mockReturnValue({ mutateAsync, isPending: false });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("workspace-native-dialog"));
+    expect(mutateAsync).toHaveBeenCalledWith("host_1");
+    // Switch the selected host to host_2 while the dialog is still open.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-option-host_2"));
+    // Now resolve host_1's pick — it must be discarded.
+    resolvePick({ status: "ok", path: "/Users/corey/host-one-pick", error: null });
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalled());
+    // The chip must NOT show host one's path — the result was discarded.
+    const chipText = screen.getByTestId("new-chat-landing-workspace-chip").textContent ?? "";
+    expect(chipText).not.toContain("host-one-pick");
+  });
+
+  it("moves a clicked older recent to the front of the list", async () => {
+    // Recents are recorded on selection (not only on session create), so
+    // clicking an older entry immediately promotes it. Verify the per-host
+    // localStorage ordering after the click.
+    setDesktopHost("host_1");
+    mockHosts([
+      {
+        host_id: "host_1",
+        name: "machine-1",
+        owner: "me",
+        status: "online",
+        capabilities: { native_directory_dialog: true },
+      },
+    ]);
+    // Seed two recents: newest first.
+    window.localStorage.setItem(
+      "omnigent:recent-workspaces",
+      JSON.stringify({ host_1: ["/Users/corey/repo", "/Users/corey/other"] }),
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    await waitFor(() =>
+      expect(screen.getByTestId("workspace-recent-/Users/corey/other")).toBeTruthy(),
+    );
+    // Click the OLDER recent ("other") — it must jump to the front.
+    fireEvent.click(screen.getByTestId("workspace-recent-/Users/corey/other"));
+    const stored = JSON.parse(
+      window.localStorage.getItem("omnigent:recent-workspaces") ?? "{}",
+    ) as Record<string, string[]>;
+    expect(stored.host_1[0]).toBe("/Users/corey/other");
+    expect(stored.host_1).toContain("/Users/corey/repo");
   });
 
   it("hides the sandbox option when the server doesn't support managed sandboxes", () => {

@@ -22,7 +22,7 @@ from pathlib import Path
 import websockets.asyncio.client
 from websockets.exceptions import InvalidStatus, InvalidURI
 
-from omnigent._platform import WINDOWS_ENV_PASSTHROUGH
+from omnigent._platform import IS_DARWIN, WINDOWS_ENV_PASSTHROUGH
 from omnigent.env_credentials import env_names_with_omnigent_prefix
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -49,6 +49,8 @@ from omnigent.host.frames import (
     HostListWorktreesResultFrame,
     HostModelOptionsFrame,
     HostModelOptionsResultFrame,
+    HostOpenDirectoryDialogFrame,
+    HostOpenDirectoryDialogResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -522,6 +524,99 @@ _RETRYABLE_UPGRADE_STATUSES: frozenset[int] = frozenset({408, 429})
 _LOGIN_REDIRECT_FATAL_ATTEMPTS = 3
 
 
+def _macos_gui_session_available() -> bool:
+    """Whether this host process appears to run inside a macOS GUI session.
+
+    The native directory dialog only makes sense when the host IS the
+    machine the user sits at and a window server is reachable — a remote
+    or headless SSH daemon would pop a dialog nobody can see.
+    ``SECURITYSESSIONID`` is exported by ``loginwindow`` for Aqua (GUI
+    login) sessions and absent for SSH/plain-launchd contexts, so it is a
+    clean, dependency-free signal that the host is interactive. Carefully
+    conservative: a false negative (not offering the dialog) falls back
+    to the in-app picker, which always works, while a false positive would
+    offer a button that hangs. TODO: a display probe robust to launchd
+    LaunchAgents that strip env would catch more GUI contexts.
+    """
+    return bool(os.environ.get("SECURITYSESSIONID"))
+
+
+def _host_capabilities() -> dict[str, object] | None:
+    """Advertise host capabilities for the new-session UI to gate against.
+
+    Today the only capability is ``native_directory_dialog``: the host can
+    show an OS-native folder chooser on its own screen. Offered only on
+    macOS inside a GUI session (see :func:`_macos_gui_session_available`);
+    every other host returns ``None`` so the Web UI falls back to the
+    in-app WorkspacePicker unchanged. Absence is the older-host posture —
+    the server treats a missing capability as "unsupported".
+
+    This advertises a *capability* (the host CAN show a GUI dialog), NOT
+    locality. A Mac running ``omnigent host`` from Terminal advertises it
+    even when a remote user selected that host — correctly so, since the
+    host genuinely could pop a dialog on ITS screen. Locality (is this host
+    the machine the user sits at?) is established CLIENT-side in the Web UI
+    by matching the selected host id against the Electron desktop host
+    identity, and the server ENFORCES the capability before forwarding.
+    Together these guarantee the dialog only runs on the local desktop
+    host the user can actually see and interact with.
+    """
+    if IS_DARWIN and _macos_gui_session_available():
+        return {"native_directory_dialog": True}
+    return None
+
+
+def _open_native_directory_dialog() -> tuple[str, str | None, str | None]:
+    """Open the host's OS-native directory chooser.
+
+    :returns: A ``(status, path, error)`` triple. ``status`` is one of
+    ``"ok"`` (``path`` set, ``error`` ``None``), ``"cancelled"``,
+    ``"unsupported"`` (non-macOS, or no GUI session), or ``"error"`` (the
+    dialog invocation failed; ``error`` carries a short message).
+
+    Only macOS is implemented (AppleScript ``choose folder`` via
+    ``osascript`` — dependency-free, ships with macOS, directory-only).
+    Windows/Linux report ``"unsupported"" so the caller falls back to
+    the in-app WorkspacePicker; TODO: implement NSOpenPanel-equivalents
+    there and advertise the capability once a GUI-session probe exists.
+    """
+    if not IS_DARWIN:
+        return "unsupported", None, "native directory dialog is not supported on this platform"
+    if not _macos_gui_session_available():
+        return "unsupported", None, "no interactive macOS GUI session available"
+    try:
+        proc = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'POSIX path of (choose folder with prompt "Select a workspace directory")',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return "error", None, "osascript is not available"
+    except subprocess.SubprocessError as exc:
+        return "error", None, f"osascript failed: {exc}"
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        # osascript exits non-zero with "User canceled." when the user
+        # dismisses the dialog; any other failure surfaces as an error.
+        if "cancel" in stderr.lower():
+            return "cancelled", None, None
+        return "error", None, stderr or "osascript failed"
+    path = (proc.stdout or "").strip()
+    if not path:
+        return "error", None, "osascript returned an empty path"
+    # ``choose folder`` yields a POSIX path with a trailing slash; drop
+    # it (except at the root) so the result matches the in-app picker's
+    # shape. Session-create validation canonicalizes symlinks after this.
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    return "ok", path, None
+
+
 class HostConnectError(Exception):
     """A non-retryable failure while opening the host tunnel.
 
@@ -728,6 +823,12 @@ class HostProcess:
         # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
         # because both the mutation and the reaper run on the event loop.
         self._owned_subprocess_ops = 0
+        # In-flight OS-native directory-dialog task. Only one GUI dialog
+        # may be open at a time; a second request is rejected with a busy
+        # status. The dialog runs as a BACKGROUND task so the receive loop
+        # keeps answering server keepalives (pings) while the user browses
+        # — otherwise the tunnel would be declared dead after ~90s.
+        self._directory_dialog_task: asyncio.Task[None] | None = None
 
     def _tracked_runner_pids(self) -> set[int]:
         """PIDs of runners this host spawned and still tracks directly.
@@ -1866,6 +1967,60 @@ class HostProcess:
             models=models,
         )
 
+    async def _handle_open_directory_dialog(
+        self,
+        frame: HostOpenDirectoryDialogFrame,
+    ) -> HostOpenDirectoryDialogResultFrame:
+        """Open the host's OS-native directory chooser.
+
+        Runs the GUI dialog OFF the event loop (``osascript`` blocks until
+        the user picks or cancels); the result carries the absolute POSIX
+        path on success, or a ``cancelled`` / ``unsupported`` status so the
+        server's caller falls back to the in-app picker.
+
+        :param frame: The open-directory-dialog request (correlation id).
+        :returns: Result frame with the chosen path or a status explaining
+            why none was chosen.
+        """
+        status, path, error = await asyncio.to_thread(_open_native_directory_dialog)
+        return HostOpenDirectoryDialogResultFrame(
+            request_id=frame.request_id,
+            status=status,
+            path=path,
+            error=error,
+        )
+
+    async def _serve_directory_dialog(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        frame: HostOpenDirectoryDialogFrame,
+    ) -> None:
+        """Run one native directory dialog as a BACKGROUND task and reply.
+
+        The OS dialog blocks for as long as the user browses, so awaiting it
+        inline in :meth:`_dispatch_host_frame` would stall the receive loop
+        and starve the server's keepalive pings — the tunnel would be
+        declared dead after ~90s while the endpoint promises 300s. Running
+        the dialog as a task lets the loop keep answering pings. Only one
+        dialog is open at a time (serialized in the dispatch branch). If the
+        tunnel has dropped by the time the dialog completes, the reply send
+        is swallowed — the server already failed the pending future on
+        disconnect.
+
+        :param ws: The tunnel connection, used to send the result.
+        :param frame: The open-directory-dialog request.
+        """
+        try:
+            result = await self._handle_open_directory_dialog(frame)
+            await ws.send(encode_host_frame(result))
+        except Exception:  # noqa: BLE001
+            # Tunnel closed mid-dialog (the server failed the pending
+            # future fast on disconnect) or the send itself dropped —
+            # nothing useful to do; osascript has already exited.
+            _logger.debug("directory dialog reply could not be sent", exc_info=True)
+        finally:
+            self._directory_dialog_task = None
+
     @staticmethod
     def _dispatch_fs_op(
         reader: object,
@@ -2308,6 +2463,7 @@ class HostProcess:
             configured_harnesses=configured_harnesses,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            capabilities=_host_capabilities(),
         )
         await ws.send(encode_host_frame(hello))
         self._ws = ws
@@ -2463,6 +2619,30 @@ class HostProcess:
             await ws.send(encode_host_frame(result))
         elif isinstance(frame, HostModelOptionsFrame):
             await ws.send(encode_host_frame(await self._handle_model_options(frame)))
+        elif isinstance(frame, HostOpenDirectoryDialogFrame):
+            # The OS dialog blocks until the user picks/cancels. Run it as a
+            # BACKGROUND task so the receive loop keeps answering server
+            # keepalive pings while the user browses — awaiting inline would
+            # starve the pings and the tunnel would be declared dead after
+            # ~90s. Serialize: at most one GUI dialog is open at a time; a
+            # concurrent request is rejected with a busy status so the
+            # caller falls back to the in-app picker.
+            in_flight = self._directory_dialog_task
+            if in_flight is not None and not in_flight.done():
+                await ws.send(
+                    encode_host_frame(
+                        HostOpenDirectoryDialogResultFrame(
+                            request_id=frame.request_id,
+                            status="error",
+                            error="a directory dialog is already open on this host",
+                        ),
+                    ),
+                )
+                return
+            self._directory_dialog_task = asyncio.create_task(
+                self._serve_directory_dialog(ws, frame),
+                name=f"host-directory-dialog:{frame.request_id}",
+            )
 
 
 def run_host_process(
