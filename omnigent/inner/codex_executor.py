@@ -110,6 +110,10 @@ _DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
 # to running sessions without any action from Omnigent.
 _CODEX_HOME_SYMLINK_FILES = ("auth.json",)
 _CODEX_HOME_GLOBAL_INSTRUCTION_FILES = ("AGENTS.md", "AGENTS.override.md")
+# hooks.json is symlinked so the user's hooks are available in the private home
+# and hook-trust keys in config.toml (which reference source paths) can be
+# translated to point at the private copy instead of the global home.
+_CODEX_HOOKS_JSON = "hooks.json"
 
 # Files copied (not symlinked) from the real CODEX_HOME into the per-session
 # temp home. config.toml is intentionally copied so that an in-TUI ``/model``
@@ -709,7 +713,12 @@ def _populate_codex_home_config(
     - ``config.toml`` is **copied** so an in-TUI ``/model`` command writes
       only to the session's own private copy and never mutates the shared
       ``~/.codex/config.toml``. This keeps model selection and cost-policy
-      enforcement isolated between concurrent sessions.
+      enforcement isolated between concurrent sessions. Hook-trust keys inside
+      the copy are rewritten to reference the private home's paths so Codex
+      recognises previously-trusted hooks without an interactive prompt.
+    - ``hooks.json`` is **symlinked** (when present) so the user's hooks are
+      available at the same path within the private home that the rewritten
+      trust keys reference.
     - ``AGENTS.md``, ``AGENTS.override.md`` are **symlinked** so instructions
       are respected.
 
@@ -733,6 +742,11 @@ def _populate_codex_home_config(
     symlink_files = _CODEX_HOME_SYMLINK_FILES
     if not minimal_config:
         symlink_files += _CODEX_HOME_GLOBAL_INSTRUCTION_FILES
+        # Symlink hooks.json so hook-trust keys rewritten below resolve.
+        # Skipped in minimal_config mode: the minimal config.toml is rebuilt
+        # from scratch with no [hooks.state] entries, so symlinked hooks with
+        # no trust state would re-introduce the interactive trust prompt.
+        symlink_files += (_CODEX_HOOKS_JSON,)
     for filename in symlink_files:
         source_file = source_dir / filename
         if not source_file.is_file():
@@ -774,6 +788,7 @@ def _populate_codex_home_config(
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path)
+            _retarget_codex_hook_trust_keys(dest_path, source_dir, target_dir)
 
 
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
@@ -843,6 +858,149 @@ def _normalize_copied_codex_effort(config_path: Path) -> None:
             config_path.write_text("".join(lines), encoding="utf-8")
         except OSError:
             logger.warning("could not normalize model_reasoning_effort in %s", config_path)
+
+
+def _retarget_codex_hook_trust_keys(
+    config_path: Path,
+    source_dir: Path,
+    target_dir: Path,
+) -> None:
+    """Rewrite ``[hooks.state]`` trust keys in a copied ``config.toml``.
+
+    Codex keys hook-trust records by the absolute path of the file that
+    declares the hook, e.g.::
+
+        [hooks.state."/home/user/.codex/hooks.json:pre_tool_use:0:0"]
+        trusted_hash = "sha256:..."
+
+    After copying ``config.toml`` from *source_dir* to *target_dir* the
+    path component still references *source_dir* — but the hooks are now
+    loaded from *target_dir*. Every key therefore misses and Codex
+    classifies all hooks as new, prompting an interactive trust review that
+    headless sub-agents can never satisfy.
+
+    This function rewrites the path prefix in each ``[hooks.state.*]`` key
+    from *source_dir* to *target_dir*, leaving the hash value untouched.
+    Trust is neither widened nor weakened — it is only carried across the
+    copy that Omnigent performs.
+
+    :param config_path: The copied ``config.toml`` inside the per-session
+        ``CODEX_HOME``. Unreadable/unwritable files are skipped (best effort).
+    :param source_dir: Original ``CODEX_HOME`` whose path appears in the
+        trust keys, e.g. ``Path("/home/user/.codex")``.
+    :param target_dir: Per-session private ``CODEX_HOME`` whose path the
+        rewritten keys should reference, e.g.
+        ``Path("/home/user/.omnigent/codex-native/abc/codex-home")``.
+    """
+    source_prefix = str(source_dir)
+    target_prefix = str(target_dir)
+    if source_prefix == target_prefix:
+        return
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    # Match [hooks.state."<path>:<rest>"] table headers.  The path component
+    # is the part before the first colon that follows the opening quote.
+    # We only rewrite lines where the quoted path starts with source_prefix so
+    # unrelated trust entries (e.g. from a different machine's config that was
+    # synced in) are left untouched.
+    pattern = re.compile(
+        r'(\[hooks\.state\.")' + re.escape(source_prefix) + r'((?:/[^":]*)*:[^"]*"\])'
+    )
+    rewritten, count = pattern.subn(r"\g<1>" + target_prefix + r"\g<2>", text)
+    if count == 0:
+        return
+    try:
+        config_path.write_text(rewritten, encoding="utf-8")
+    except OSError:
+        logger.warning("could not retarget hook-trust keys in %s", config_path)
+
+
+def _merge_codex_hook_trust_back(
+    private_config: Path,
+    source_dir: Path,
+    target_dir: Path,
+) -> None:
+    """Merge ``[hooks.state]`` trust entries from a private session config back
+    into the global ``CODEX_HOME`` ``config.toml``.
+
+    When a user accepts the hook-trust prompt inside a session, Codex writes
+    ``[hooks.state.*]`` entries into the private per-session ``config.toml``
+    with path keys referencing *target_dir* (the private home). Those entries
+    are discarded when the session ends because the private home is ephemeral.
+
+    This function reads the accumulated trust state from the private copy,
+    translates the path keys back from *target_dir* → *source_dir*, and
+    upserts them into the global ``source_dir/config.toml`` so the next
+    session's copy starts with them already present — and
+    :func:`_retarget_codex_hook_trust_keys` can carry them forward again.
+
+    All writes are atomic (temp-file + rename) and best-effort: any failure
+    is logged as a warning rather than raised, since the session has already
+    ended and blocking on a trust-state flush would be unhelpful.
+
+    :param private_config: The per-session private ``config.toml``.
+    :param source_dir: Original ``CODEX_HOME``, e.g. ``Path("~/.codex")``.
+    :param target_dir: Per-session private ``CODEX_HOME`` whose path appears
+        in the private trust keys.
+    """
+    source_prefix = str(source_dir)
+    target_prefix = str(target_dir)
+    if source_prefix == target_prefix:
+        return
+    try:
+        import tomlkit
+
+        private_text = private_config.read_text(encoding="utf-8")
+        private_doc = tomlkit.parse(private_text)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read private config for hook-trust merge: %s", private_config)
+        return
+
+    private_state: dict = (
+        private_doc.get("hooks", {}).get("state", {})  # type: ignore[union-attr]
+    )
+    if not private_state:
+        return
+
+    # Translate keys: target_dir prefix → source_dir prefix.
+    translated: dict[str, object] = {}
+    for key, value in private_state.items():
+        if key.startswith(target_prefix):
+            translated[source_prefix + key[len(target_prefix) :]] = value
+        else:
+            translated[key] = value
+
+    global_config = source_dir / "config.toml"
+    try:
+        if global_config.is_file():
+            global_text = global_config.read_text(encoding="utf-8")
+            global_doc = tomlkit.parse(global_text)
+        else:
+            global_doc = tomlkit.document()
+    except Exception:  # noqa: BLE001
+        logger.warning("could not read global config for hook-trust merge: %s", global_config)
+        return
+
+    # Upsert into global [hooks.state], creating the tables if absent.
+    if "hooks" not in global_doc:
+        global_doc.add("hooks", tomlkit.table())
+    hooks_table = global_doc["hooks"]
+    if "state" not in hooks_table:
+        hooks_table.add("state", tomlkit.table())
+    state_table = hooks_table["state"]
+    for key, value in translated.items():
+        state_table[key] = value
+
+    tmp = global_config.with_suffix(".toml.tmp")
+    try:
+        tmp.write_text(tomlkit.dumps(global_doc), encoding="utf-8")
+        os.replace(tmp, global_config)
+    except OSError:
+        logger.warning("could not write hook-trust merge back to %s", global_config)
+        with suppress(FileNotFoundError):
+            tmp.unlink()
 
 
 def _databricks_codex_base_url(host: str) -> str:

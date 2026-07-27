@@ -4811,6 +4811,8 @@ async def _evaluate_input_policy(
     _runner_router: RunnerRouter | None,
     *,
     actor: dict[str, str] | None = None,
+    file_store: FileStore | None = None,
+    artifact_store: ArtifactStore | None = None,
 ) -> dict[str, Any] | None:
     """
     Evaluate a user message against REQUEST (input) phase policy rules.
@@ -4846,7 +4848,13 @@ async def _evaluate_input_policy(
     """
 
     user_text = _extract_user_text_from_event(body)
-    if not user_text:
+    # A message with a text attachment (e.g. an uploaded CSV) may carry no typed
+    # text — those ``input_file`` blocks are decoded below and must not be skipped
+    # here. ``content`` being a list is the cheap precondition for that; the
+    # actual (blocking) decode is deferred until after the policy-skip check.
+    content_blocks = body.data.get("content")
+    has_content_blocks = isinstance(content_blocks, list) and len(content_blocks) > 0
+    if not user_text and not has_content_blocks:
         return None
 
     # Resolve the agent spec off the event loop (blocking DB + cold-cache
@@ -4862,12 +4870,35 @@ async def _evaluate_input_policy(
     if not spec.guardrails and not get_caps().default_policies and get_policy_store() is None:
         return None
 
+    # Text-like attachments (e.g. an uploaded CSV) arrive as ``input_file`` blocks
+    # base64-inlined straight to the model — they are NOT part of ``user_text`` and
+    # would otherwise reach the LLM unscanned. Decode their text here so
+    # request-phase policies (e.g. deny_pii_in_llm_request) scan the attachment
+    # content too. Deferred until after the skip check so a no-policy agent never
+    # pays the artifact fetch. Best-effort; only runs when stores are wired.
+    attachments: list[dict[str, str]] = []
+    if has_content_blocks and file_store is not None and artifact_store is not None:
+        from omnigent.runtime.content_resolver import extract_text_attachments
+
+        attachments = await asyncio.to_thread(
+            extract_text_attachments,
+            content_blocks,
+            file_store,
+            artifact_store,
+            session_id=session_id,
+        )
+    if not user_text and not attachments:
+        return None
+    # Structured request content ({"user_content", "attachments"}) so policies
+    # can reason about attachments per-file instead of a merged string.
+    request_content = {"user_content": user_text, "attachments": attachments}
+
     engine = await asyncio.to_thread(
         _build_policy_engine_from_spec, spec, session_id, conversation_store
     )
     ctx = EvaluationContext(
         phase=Phase.REQUEST,
-        content=user_text,
+        content=request_content,
         tool_name=None,
         actor=actor,
     )

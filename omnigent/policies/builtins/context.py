@@ -15,7 +15,12 @@ import json
 import logging
 from typing import Any
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_user_text,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -172,8 +177,8 @@ def detect_task_switch(
         if event.get("type") != "request":
             return None
 
-        new_message = event.get("data", "")
-        if not isinstance(new_message, str) or not new_message.strip():
+        new_message = request_user_text(event.get("data"))
+        if not new_message.strip():
             return None
 
         state = event.get("session_state") or {}

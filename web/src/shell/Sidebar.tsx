@@ -652,7 +652,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
       ) : (
         <>
-          <div className="mt-1 flex h-8 shrink-0 items-center justify-between px-4">
+          <div className="flex h-12 shrink-0 translate-y-0.5 items-center justify-between px-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -668,7 +668,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 src={omnigentWordmark}
                 alt="Omnigent"
                 data-testid="sidebar-wordmark"
-                className="h-[15px] w-auto shrink-0 dark:invert"
+                className="h-[15px] w-auto shrink-0 translate-y-px dark:invert"
               />
             </Link>
             <div className="flex items-center gap-1" data-testid="sidebar-header-actions">

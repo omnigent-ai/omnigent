@@ -2385,6 +2385,10 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
 
     assert (target / "auth.json").is_symlink()
     assert not (target / "AGENTS.md").exists()
+    # hooks.json must NOT be symlinked in minimal mode: the rebuilt config.toml
+    # carries no [hooks.state] entries, so a symlinked hooks.json with no trust
+    # state would re-introduce the interactive trust prompt.
+    assert not (target / "hooks.json").exists()
     config_text = (target / "config.toml").read_text()
     assert 'model_provider = "Databricks"' in config_text
     assert "[model_providers.Databricks]" in config_text
@@ -2521,6 +2525,249 @@ def test_populate_codex_home_config_missing_source_dir(tmp_path: Path) -> None:
     _populate_codex_home_config(target, source)
 
     assert list(target.iterdir()) == []
+
+
+def test_populate_codex_home_config_symlinks_hooks_json(tmp_path: Path) -> None:
+    """``hooks.json`` is symlinked into the private home when present.
+
+    The user's hooks must be reachable at the same relative path inside the
+    private home so rewritten hook-trust keys in ``config.toml`` resolve.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert (target / "hooks.json").is_symlink()
+    assert (target / "hooks.json").read_text() == '{"hooks": {}}'
+
+
+def test_populate_codex_home_config_no_hooks_json_is_fine(tmp_path: Path) -> None:
+    """No ``hooks.json`` in the source is silently skipped."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / "hooks.json").exists()
+
+
+def test_populate_codex_home_config_retargets_hook_trust_keys(tmp_path: Path) -> None:
+    """``[hooks.state]`` path keys are rewritten from source to target dir.
+
+    Trust entries that reference the global ``CODEX_HOME`` path are rewritten
+    to reference the private session home so Codex recognises previously-trusted
+    hooks without an interactive review prompt.  The hash value is preserved.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_hooks = str(source / "hooks.json")
+    config_text = (
+        f'[hooks.state."{source_hooks}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:abc123"\n'
+        f'[hooks.state."{source_hooks}:post_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:def456"\n'
+    )
+    (source / "config.toml").write_text(config_text)
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    target_hooks = str(target / "hooks.json")
+    assert source_hooks not in copied
+    assert f'[hooks.state."{target_hooks}:pre_tool_use:0:0"]' in copied
+    assert f'[hooks.state."{target_hooks}:post_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:abc123"' in copied
+    assert 'trusted_hash = "sha256:def456"' in copied
+    # Source must be untouched.
+    assert (source / "config.toml").read_text() == config_text
+
+
+def test_populate_codex_home_config_retargets_config_toml_trust_keys(tmp_path: Path) -> None:
+    """Trust keys referencing ``config.toml`` itself are also rewritten."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config = str(source / "config.toml")
+    config_text = (
+        f'[hooks.state."{source_config}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:abc123"\n'
+    )
+    (source / "config.toml").write_text(config_text)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    target_config = str(target / "config.toml")
+    assert source_config not in copied
+    assert f'[hooks.state."{target_config}:pre_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:abc123"' in copied
+
+
+def test_populate_codex_home_config_preserves_unrelated_trust_keys(tmp_path: Path) -> None:
+    """Trust entries referencing other paths are left untouched."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    other_path = "/some/other/machine/hooks.json"
+    source_hooks = str(source / "hooks.json")
+    config_text = (
+        f'[hooks.state."{other_path}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:other"\n'
+        f'[hooks.state."{source_hooks}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:mine"\n'
+    )
+    (source / "config.toml").write_text(config_text)
+    (source / "hooks.json").write_text('{"hooks": {}}')
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    copied = (target / "config.toml").read_text()
+    # The unrelated path is untouched.
+    assert f'[hooks.state."{other_path}:pre_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:other"' in copied
+    # The source-home entry is rewritten.
+    target_hooks = str(target / "hooks.json")
+    assert f'[hooks.state."{target_hooks}:pre_tool_use:0:0"]' in copied
+    assert 'trusted_hash = "sha256:mine"' in copied
+
+
+# ---------------------------------------------------------------------------
+# _merge_codex_hook_trust_back tests
+# ---------------------------------------------------------------------------
+
+
+def test_merge_codex_hook_trust_back_writes_to_global(tmp_path: Path) -> None:
+    """Trust accepted in a session is flushed back to the global config.toml.
+
+    After close(), the next session's copy of config.toml will contain the
+    translated trust entries so _retarget_codex_hook_trust_keys can carry
+    them forward and Codex won't prompt again.
+    """
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('model = "gpt-5.5"\n')
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    target_config_path = str(target / "config.toml")
+    private_config = target / "config.toml"
+    private_config.write_text(
+        'model = "gpt-5.5"\n'
+        f'[hooks.state."{target_config_path}:pre_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:abc123"\n'
+    )
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    import tomllib
+
+    with open(source / "config.toml", "rb") as f:
+        global_doc = tomllib.load(f)
+    state = global_doc["hooks"]["state"]
+    source_config_path = str(source / "config.toml")
+    assert f"{source_config_path}:pre_tool_use:0:0" in state
+    assert state[f"{source_config_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:abc123"
+    # Private path must not appear in global config.
+    assert target_config_path not in str(global_doc)
+
+
+def test_merge_codex_hook_trust_back_merges_into_existing_state(tmp_path: Path) -> None:
+    """Existing [hooks.state] entries in the global config are preserved."""
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    source_config_path = str(source / "config.toml")
+    (source / "config.toml").write_text(
+        'model = "gpt-5.5"\n'
+        f'[hooks.state."{source_config_path}:post_tool_use:0:0"]\n'
+        'trusted_hash = "sha256:existing"\n'
+    )
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    target_config_path = str(target / "config.toml")
+    private_config = target / "config.toml"
+    private_config.write_text(
+        f'[hooks.state."{target_config_path}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:new"\n'
+    )
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    import tomllib
+
+    with open(source / "config.toml", "rb") as f:
+        global_doc = tomllib.load(f)
+    state = global_doc["hooks"]["state"]
+    assert f"{source_config_path}:post_tool_use:0:0" in state
+    assert state[f"{source_config_path}:post_tool_use:0:0"]["trusted_hash"] == "sha256:existing"
+    assert f"{source_config_path}:pre_tool_use:0:0" in state
+    assert state[f"{source_config_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:new"
+
+
+def test_merge_codex_hook_trust_back_noop_when_no_state(tmp_path: Path) -> None:
+    """No-op when the private config has no [hooks.state] entries."""
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = 'model = "gpt-5.5"\n'
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    private_config = target / "config.toml"
+    private_config.write_text('model = "gpt-5.5"\n')
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    assert (source / "config.toml").read_text() == original
+
+
+def test_merge_codex_hook_trust_back_preserves_unrelated_keys(tmp_path: Path) -> None:
+    """Trust entries keyed to unrelated paths are carried through unchanged."""
+    from omnigent.inner.codex_executor import _merge_codex_hook_trust_back
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / "config.toml").write_text('model = "gpt-5.5"\n')
+    target = tmp_path / "session_codex_home"
+    target.mkdir()
+    other_path = "/some/other/machine/hooks.json"
+    private_config = target / "config.toml"
+    private_config.write_text(
+        f'[hooks.state."{other_path}:pre_tool_use:0:0"]\ntrusted_hash = "sha256:other"\n'
+    )
+
+    _merge_codex_hook_trust_back(private_config, source, target)
+
+    import tomllib
+
+    with open(source / "config.toml", "rb") as f:
+        global_doc = tomllib.load(f)
+    state = global_doc["hooks"]["state"]
+    assert f"{other_path}:pre_tool_use:0:0" in state
+    assert state[f"{other_path}:pre_tool_use:0:0"]["trusted_hash"] == "sha256:other"
 
 
 def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
