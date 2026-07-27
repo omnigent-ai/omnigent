@@ -28,6 +28,7 @@ import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
+import { setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { stopSession } from "@/lib/sessionsApi";
 import {
   createProject as apiCreateProject,
@@ -883,9 +884,27 @@ export async function setConversationPinned(
  * timestamp until the pinned query refetched (a blank time field on the new
  * row). For the same reason the list overlay carries only `labels`, so pinning
  * can't blank an existing row's timestamp.
+ *
+ * Old-server fallback: when the server can't store pins (`filterHonored` is
+ * false — a pre-upgrade server that ignores `?pinned=true`), a PATCH would
+ * persist a bare `omnigent.pinned` key that the upgraded server discards on
+ * read (it only surfaces the caller's per-user `omnigent.pinned.<user>` key),
+ * so the pin would silently vanish on the server upgrade. Instead we write the
+ * pin to localStorage — the same store the pre-upgrade UI used — so it survives
+ * and later migrates through `useMigrateLocalPinsToServer` like any other
+ * pre-upgrade pin. The optimistic cache patch still runs, and the sidebar
+ * unions localStorage pins into the Pinned section, so it shows immediately.
  */
 export function useTogglePinnedConversation() {
   const queryClient = useQueryClient();
+
+  // Whether the server can store pins. Sourced from the pinned query's
+  // `filterHonored`; defaults to true when the query hasn't loaded (a manual
+  // toggle implies a reachable, working server — the same assumption the cache
+  // patch below makes).
+  const serverCanStorePins = (): boolean =>
+    queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.filterHonored ??
+    true;
 
   // Locate the fullest cached row for an id, so the pinned insert keeps a real
   // `updated_at` (the PATCH snapshot lacks it). A project session lives only in
@@ -950,8 +969,21 @@ export function useTogglePinnedConversation() {
   };
 
   return useMutation({
-    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      setConversationPinned(id, pinned),
+    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) => {
+      // Against an old server, persist the pin locally instead of PATCHing a
+      // bare key it would store but the upgraded server would drop on read.
+      if (!serverCanStorePins()) {
+        // Throws if the local write fails (e.g. storage full) — a sync throw
+        // here rejects the mutation, so `onError` rolls back the optimistic
+        // patch rather than reporting a success that won't survive a reload.
+        setLegacyPinnedConversationId(id, pinned);
+        // Resolve with a minimal snapshot; the optimistic patch already moved
+        // the row and there's no server row to reconcile.
+        const labels = pinned ? { [PINNED_LABEL_KEY]: String(Date.now()) } : {};
+        return Promise.resolve({ id, object: "conversation", labels } as Conversation);
+      }
+      return setConversationPinned(id, pinned);
+    },
     // Move the row immediately — don't wait for the PATCH round-trip. Without
     // this the row lingers in its project folder (or the flat list) until the
     // network resolves, which reads as lag. Snapshot the pinned cache so a

@@ -3295,6 +3295,100 @@ async def test_result_message_usage_populates_turn_complete_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_result_message_is_error_yields_executor_error() -> None:
+    """``ResultMessage`` with ``is_error=True`` must surface as ``ExecutorError``.
+
+    When the SDK signals a harness-level failure (e.g. expired login, not logged
+    in), ``is_error`` is ``True`` and ``result`` carries the failure text.  The
+    executor must route this into an ``ExecutorError`` — not store it as the
+    assistant's response.
+
+    Regression guard: before the fix, ``result`` was assigned to ``response_text``
+    unconditionally, so the failure appeared as an assistant message with no error
+    item and no log line.
+    """
+    from unittest.mock import patch
+
+    from claude_agent_sdk.types import (
+        ClaudeAgentOptions as SDKClaudeAgentOptions,
+    )
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorError, TurnComplete
+
+    class _Sentinel:
+        pass
+
+    sdk_result = SDKResultMessage(
+        subtype="success",  # subtype is unreliable — is_error is the real signal
+        session_id="s1",
+        result="Not logged in · Please run /login",
+        total_cost_usd=0.0,
+        duration_ms=100,
+        duration_api_ms=80,
+        is_error=True,
+        num_turns=1,
+        usage=None,
+    )
+
+    class _FakeSDK:
+        AssistantMessage = _Sentinel
+        UserMessage = _Sentinel
+        SystemMessage = _Sentinel
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [sdk_result]
+
+        class ClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def query(self, prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+            async def disconnect(self):
+                return None
+
+    executor = ClaudeSDKExecutor()
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+            )
+        ]
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, (
+        "Expected at least one ExecutorError for is_error=True ResultMessage, got none. "
+        "The failure text must not be stored as assistant content."
+    )
+    assert "Not logged in" in errors[0].message, (
+        f"ExecutorError.message {errors[0].message!r} does not contain the failure text."
+    )
+
+    # Must not also appear as assistant content
+    turns = [e for e in events if isinstance(e, TurnComplete)]
+    for t in turns:
+        assert "Not logged in" not in (t.response or ""), (
+            "Failure text must not appear in TurnComplete.response"
+            " — it leaked as assistant content."
+        )
+
+
+@pytest.mark.asyncio
 async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn() -> None:
     """``context_tokens`` must reflect the LAST API call, not the cumulative sum.
 

@@ -152,17 +152,18 @@ import { NewProjectButton } from "./NewProjectButton";
 import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
 import {
   type ActiveChatOverride,
+  clearLegacyPinnedConversationIds,
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
   EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
-  migratePinnedConversationIds,
   orderByPinnedTimestamp,
-  PINNED_CONVERSATION_IDS_STORAGE_KEY,
+  readPinnedConversationIds,
   resolveSidebarDrop,
   type SidebarDropTarget,
   sortByUpdatedAtDesc,
+  writeLegacyPinnedConversationIds,
 } from "./sidebarNav";
 
 // Positioning for a row's trailing session-state badge. On desktop the badge
@@ -651,7 +652,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
         <SettingsSidebarBody onNavClick={onNavClick} onClose={onClose} />
       ) : (
         <>
-          <div className="mt-1 flex h-12 shrink-0 items-center justify-between px-4">
+          <div className="mt-1 flex h-8 shrink-0 items-center justify-between px-4">
             {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -728,7 +729,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="flex flex-col gap-0 px-3 py-3" data-testid="sidebar-primary-nav">
+          <div className="flex flex-col gap-0 px-2 pt-0 pb-3" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -1033,9 +1034,9 @@ function ProjectFolder({
         title={name}
         icon={
           expanded ? (
-            <FolderOpenIcon className="size-4 shrink-0" />
+            <FolderOpenIcon className="size-4 shrink-0 text-muted-foreground" />
           ) : (
-            <FolderIcon className="size-4 shrink-0" />
+            <FolderIcon className="size-4 shrink-0 text-muted-foreground" />
           )
         }
         marker={marker}
@@ -4088,52 +4089,6 @@ function BulkActionBar({
 export function isMobileViewport(): boolean {
   if (typeof window === "undefined") return false;
   return !window.matchMedia("(min-width: 768px)").matches;
-}
-
-function readPinnedConversationIds(): string[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    // Migrate legacy prefixed ids (``conv_<hex>``) to the bare-hex form the API
-    // returns post id-to-binary migration; the write-back effect re-persists
-    // the migrated ids, so this one-time rewrite is durable across reloads.
-    return migratePinnedConversationIds(
-      parsed.filter((value): value is string => typeof value === "string"),
-    );
-  } catch {
-    // Browser storage is user-editable and can contain stale/corrupt values.
-    // Treat bad pin state as "no pins" instead of breaking navigation.
-    return [];
-  }
-}
-
-function clearLegacyPinnedConversationIds() {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
-  } catch {
-    // Best-effort cleanup — leaving the stale key is harmless (the migration
-    // guard skips already-pinned ids), so a failure here needn't surface.
-  }
-}
-
-// Overwrite the legacy key with exactly `ids` (empty ⇒ remove). Used by the
-// migration to retain only the pins whose server write failed, so a transient
-// failure retries on the next load instead of dropping the pin.
-function writeLegacyPinnedConversationIds(ids: string[]) {
-  if (typeof window === "undefined") return;
-  try {
-    if (ids.length === 0) {
-      window.localStorage.removeItem(PINNED_CONVERSATION_IDS_STORAGE_KEY);
-    } else {
-      window.localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(ids));
-    }
-  } catch {
-    // Best-effort — a write failure just means the migration retries next load.
-  }
 }
 
 // Default collapse state: every section (Pinned / Projects / Chats / Shared)

@@ -141,6 +141,7 @@ describe("project folder header icon/chevron", () => {
 
     const folder = header.querySelector(".lucide-folder") as HTMLElement;
     expect(folder).not.toBeNull();
+    expect(folder).toHaveClass("text-muted-foreground");
 
     // The folder icon sits in a wrapper that fades out on desktop hover/focus.
     const folderWrapper = folder.parentElement as HTMLElement;

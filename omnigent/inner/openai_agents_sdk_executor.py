@@ -434,11 +434,10 @@ def _get_openai_async_client(
     :param databricks_auth_command: Shell command from ucode state that
         prints a bearer token, e.g.
         ``"databricks auth token --host https://example.databricks.com ..."``.
-    :param model: The model name that will be used. When set to a
-        non-Databricks model (i.e. does not start with ``"databricks-"``),
-        both the explicit ``profile`` block and the ambient Databricks
-        credential fallback are skipped — the caller must supply
-        ``OPENAI_API_KEY`` (and optionally ``OPENAI_BASE_URL``) instead.
+    :param model: The model or model-service name that will be used. An
+        explicit ``profile`` selects Databricks regardless of this value.
+        Without a profile, only legacy ``"databricks-"`` names enable
+        ambient Databricks credential fallback.
     :raises DatabricksAuthError: When an explicit ``profile`` is given,
         authentication fails, and no ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY``
         env-var fallbacks are available.
@@ -498,11 +497,11 @@ def _get_openai_async_client(
             **retry_kwargs,
         )
 
-    is_databricks_model = model is None or model.startswith("databricks-")
+    allow_ambient_databricks = model is None or model.startswith("databricks-")
 
-    # Databricks profile auth only applies when the model is Databricks-hosted.
-    # An explicit spec/provider profile wins over ambient env vars.
-    if is_databricks_model and profile:
+    # An explicit Databricks profile is authoritative; model-service names
+    # are opaque Unity Catalog identifiers such as catalog.schema.service.
+    if profile:
         from .databricks_executor import DatabricksAuthError, _resolve_databricks_auth
 
         try:
@@ -547,17 +546,17 @@ def _get_openai_async_client(
     if api_key:
         return AsyncOpenAI(api_key=api_key, **retry_kwargs)
 
-    # Non-Databricks model with no OpenAI credentials — fail loudly rather
-    # than silently routing to the Databricks AI Gateway, which will 404.
-    if not is_databricks_model:
+    # Without an explicit profile, only legacy Databricks model names opt in
+    # to ambient Databricks credentials.
+    if not profile and not allow_ambient_databricks:
         raise ValueError(
-            f"Model {model!r} is not a Databricks-hosted model but no OpenAI "
-            "credentials were found. Set OPENAI_API_KEY (and optionally "
-            "OPENAI_BASE_URL) to use this model, or use a 'databricks-' "
-            "prefixed model name to route through Databricks."
+            f"No provider credentials were configured for model {model!r}. "
+            "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
+            "Databricks profile, or use a 'databricks-' prefixed model name "
+            "for legacy automatic Databricks routing."
         )
 
-    # No profile, no env — final fallback via ambient Databricks credentials.
+    # No env client: use the explicit profile or legacy ambient Databricks auth.
     try:
         from .databricks_executor import _resolve_databricks_auth
 

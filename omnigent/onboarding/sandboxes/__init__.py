@@ -1,17 +1,16 @@
-"""
-Sandbox launchers: run Omnigent hosts in remote sandboxes.
+"""Sandbox launchers: run Omnigent hosts in remote sandboxes.
 
 Public API for the ``omnigent sandbox`` CLI and anything else that
-bootstraps a sandbox-backed host. Providers are registered by name in
-:data:`_LAUNCHERS`; launcher modules may be absent from a given
-distribution (e.g. the Databricks Lakebox launcher), in which case the
-provider simply isn't offered.
+bootstraps a sandbox-backed host. Core Omnigent contributes built-in
+providers directly; third-party packages can contribute providers through
+the ``omnigent.sandbox_providers`` entry point group.
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
+import warnings
 
 import click
 
@@ -32,28 +31,64 @@ from omnigent.onboarding.sandboxes.bootstrap import (
     set_sandbox_host_name,
     ship_wheels,
 )
+from omnigent.onboarding.sandboxes.registry import (
+    COMMUNITY_MODULE_PREFIX,
+    SandboxProviderContribution,
+    SandboxProviderMetadata,
+    SandboxProviderPluginState,
+    SandboxRegistryError,
+    available_providers,
+    get_provider_metadata,
+    instantiate,
+    plugin_state,
+    reset_plugin_state_for_tests,
+)
+from omnigent.onboarding.sandboxes.types import (
+    HostContext,
+    SandboxCapabilities,
+    SandboxCommandError,
+    SandboxConfigError,
+    SandboxError,
+    SandboxInfo,
+    SandboxSpec,
+)
 
 __all__ = [
+    "COMMUNITY_MODULE_PREFIX",
     "DEFAULT_SANDBOX_NAME",
     "DerivedWorkspace",
+    "HostContext",
     "RemoteCommandResult",
     "RemoteProcess",
+    "SandboxCapabilities",
     "SandboxCapabilityError",
+    "SandboxCommandError",
+    "SandboxConfigError",
+    "SandboxError",
+    "SandboxInfo",
     "SandboxLauncher",
+    "SandboxProviderContribution",
+    "SandboxProviderMetadata",
+    "SandboxProviderPluginState",
+    "SandboxRegistryError",
+    "SandboxSpec",
     "available_providers",
     "bootstrap_sandbox_host",
     "build_wheels",
     "connect_sandbox_host",
     "derive_workspace",
     "get_launcher",
+    "get_provider_metadata",
     "login_app_oauth_in_sandbox",
+    "plugin_state",
+    "reset_plugin_state_for_tests",
     "set_sandbox_host_name",
     "ship_wheels",
 ]
 
-# Provider name → "module:ClassName" of its SandboxLauncher. Modules are
-# imported lazily (some pull in optional SDKs) and may be absent from a
-# distribution entirely (e.g. lakebox).
+# Legacy registration surface. It is no longer used by the registry, but is kept
+# as a fallback path so any provider not yet loaded through the entrypoint
+# mechanism still resolves for one release cycle.
 _LAUNCHERS: dict[str, str] = {
     "lakebox": "omnigent.onboarding.sandboxes.lakebox:LakeboxLauncher",
     "modal": "omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
@@ -71,27 +106,6 @@ _LAUNCHERS: dict[str, str] = {
     # `omnigent[kubernetes]` extra), imported lazily like modal/daytona.
     "kubernetes": "omnigent.onboarding.sandboxes.kubernetes:KubernetesSandboxLauncher",
 }
-
-
-def available_providers() -> tuple[str, ...]:
-    """
-    List the sandbox providers whose launcher modules exist in this
-    build.
-
-    Uses ``find_spec`` (no import side effects), so it is cheap enough
-    to call at CLI startup to decide whether to register the
-    ``omnigent sandbox`` command group.
-
-    :returns: Provider names in registration order, e.g.
-        ``("lakebox", "modal")`` internally or ``("modal",)`` in the
-        OSS build (where the lakebox module is excluded).
-    """
-    available: list[str] = []
-    for name, target in _LAUNCHERS.items():
-        module_name = target.partition(":")[0]
-        if importlib.util.find_spec(module_name) is not None:
-            available.append(name)
-    return tuple(available)
 
 
 def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxLauncher:
@@ -113,8 +127,28 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
     :raises click.ClickException: If the provider is unknown or its
         launcher module is not present in this build.
     """
+    if provider in plugin_state():
+        try:
+            return instantiate(provider, workspace_host=workspace_host)
+        except SandboxRegistryError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    # Legacy fallback for any provider not yet loaded by the registry.
+    warnings.warn(
+        f"Sandbox provider '{provider}' was resolved through the legacy "
+        f"_LAUNCHERS registry. Use the SandboxProviderContribution or "
+        f"omnigent.sandbox_providers entrypoints instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     target = _LAUNCHERS.get(provider)
-    if target is None or provider not in available_providers():
+    if target is None:
+        offered = ", ".join(available_providers()) or "(none in this build)"
+        raise click.ClickException(
+            f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."
+        )
+    module_name = target.partition(":")[0]
+    if importlib.util.find_spec(module_name) is None:
         offered = ", ".join(available_providers()) or "(none in this build)"
         raise click.ClickException(
             f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."

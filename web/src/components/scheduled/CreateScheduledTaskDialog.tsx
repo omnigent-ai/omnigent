@@ -23,12 +23,13 @@ import {
 } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
+import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { WorkspacePicker } from "@/shell/WorkspacePicker";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
-import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
+import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
 import {
   isBackdropOverlay,
@@ -80,14 +81,17 @@ export function CreateScheduledTaskDialog({
   // single `pickedAgentId` covers both cases — for a bare-harness pick it's the
   // `*-native-ui` agent's id, exactly what the interactive dialog sends.
   //
-  // Scheduled tasks currently create sessions from the selected agent. Model,
-  // effort, and permission controls are not offered here; upstream moved those into a separate
-  // gear-icon HarnessConfigModal (NewChatDialog); reusing it is disproportionate
-  // for a scheduled task (26 props, bound to smart-routing / cost-control /
-  // dynamic model loading). A scheduled task only requires `agent_id`; model_override
-  // / reasoning_effort are optional and simply omitted, so the fire path uses the
-  // agent's configured defaults. Model/effort can be a follow-up if wanted.
+  // Scheduled tasks create sessions from the selected agent. Model + effort are
+  // offered for native coding agents that support them (see `showModelEffort`
+  // below), reusing lightweight scheduled-local pickers rather than the
+  // interactive dialog's 26-prop HarnessConfigModal (bound to smart-routing /
+  // cost-control / per-turn model loading — disproportionate for a saved task).
+  // "" = unselected → `model_override` / `reasoning_effort` are omitted so the
+  // fire path uses the agent's configured defaults. Permission/approval/cursor
+  // mode is intentionally NOT offered here.
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
+  const [pickedModel, setPickedModel] = useState<string>("");
+  const [pickedEffort, setPickedEffort] = useState<string>("");
 
   const agentList = useMemo(
     () => sortAgentsForDisplay((agents ?? []).filter((a) => !HIDDEN_PICKER_AGENTS.has(a.name))),
@@ -112,6 +116,18 @@ export function CreateScheduledTaskDialog({
   function handleSelectAgent(agent: AvailableAgent) {
     setPickedAgentId(agent.id);
   }
+
+  // Model + effort are surfaced only for native coding agents that carry the
+  // model/effort surface — the same `permissionMode` capability the interactive
+  // dialog gates its Model/Effort/Permissions block on (Claude Code). Agents
+  // without it (plain SDK agents like Polly, or native harnesses with no
+  // model-picker surface) show no model/effort controls, exactly like
+  // interactive. In edit mode the agent is read-only, so gate on the loaded
+  // task's agent.
+  const modelEffortAgent = isEdit
+    ? agents?.find((a) => a.id === editingTask?.agentId)
+    : selectedAgent;
+  const showModelEffort = nativeAgentHasCapability(modelEffortAgent, "permissionMode");
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
   // The agent picker and host/schedule Selects portal dropdowns OUTSIDE DialogContent.
@@ -172,6 +188,9 @@ export function CreateScheduledTaskDialog({
         setName(editingTask.name);
         setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
+        // Prefill the model/effort controls from the loaded task; null → "".
+        setPickedModel(editingTask.modelOverride ?? "");
+        setPickedEffort(editingTask.reasoningEffort ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
@@ -180,6 +199,8 @@ export function CreateScheduledTaskDialog({
         setName(initialName ?? "");
         setPrompt(initialPrompt ?? "");
         setPickedAgentId(null);
+        setPickedModel("");
+        setPickedEffort("");
         setSchedule(DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
@@ -224,6 +245,8 @@ export function CreateScheduledTaskDialog({
     setName("");
     setPrompt("");
     setPickedAgentId(null);
+    setPickedModel("");
+    setPickedEffort("");
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
@@ -248,12 +271,30 @@ export function CreateScheduledTaskDialog({
         ...(hostId !== "" && workspace.trim() !== "" ? { workspace: workspace.trim() } : {}),
       };
       if (editingTask) {
-        await updateMutation.mutateAsync({ id: editingTask.id, input });
+        // Thread model/effort ONLY when the agent supports them. Each control's
+        // "" (Default) maps to `null` so an update CLEARS a previously-set
+        // override; a non-default pick sends the value. When the agent has no
+        // model/effort surface we send neither key (left untouched server-side).
+        const overrides = showModelEffort
+          ? {
+              modelOverride: pickedModel === "" ? null : pickedModel,
+              reasoningEffort: pickedEffort === "" ? null : pickedEffort,
+            }
+          : {};
+        await updateMutation.mutateAsync({
+          id: editingTask.id,
+          input: { ...input, ...overrides },
+        });
       } else {
         if (effectiveAgentId === null) return;
         await createMutation.mutateAsync({
           ...input,
           agentId: effectiveAgentId,
+          // Include an override only when the agent supports model/effort AND the
+          // user picked a non-default value; an unselected control is omitted so
+          // the create uses the agent's configured defaults.
+          ...(showModelEffort && pickedModel !== "" ? { modelOverride: pickedModel } : {}),
+          ...(showModelEffort && pickedEffort !== "" ? { reasoningEffort: pickedEffort } : {}),
         });
       }
       handleOpenChange(false);
@@ -379,10 +420,31 @@ export function CreateScheduledTaskDialog({
                 />
               </div>
             )}
-            <p className="text-[11px] text-muted-foreground">
-              Uses this agent&apos;s default model, effort, and permission settings
-            </p>
+            {!showModelEffort && (
+              <p className="text-[11px] text-muted-foreground">
+                Uses this agent&apos;s default model, effort, and permission settings
+              </p>
+            )}
           </div>
+
+          {/* Model + reasoning effort — only for native coding agents that
+              carry the model/effort surface (Claude Code). Unselected controls
+              fall back to the agent's configured defaults. */}
+          {showModelEffort && (
+            <div data-testid="task-model-effort-field">
+              <ModelEffortFields
+                model={pickedModel}
+                effort={pickedEffort}
+                hostId={hostId}
+                onModelChange={setPickedModel}
+                onEffortChange={setPickedEffort}
+                onSelectOpenChange={handleSelectOpenChange}
+              />
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                Leave on Default to use the agent&apos;s configured model and effort.
+              </p>
+            </div>
+          )}
 
           <ScheduleFields
             model={schedule}

@@ -33,6 +33,7 @@ import {
   type PinnedConversationsResult,
 } from "./useConversations";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -925,6 +926,114 @@ describe("useTogglePinnedConversation cache patching", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
+  });
+});
+
+describe("useTogglePinnedConversation old-server fallback", () => {
+  // When the server can't store pins (`filterHonored` is false — a pre-upgrade
+  // server that ignores `?pinned=true`), a PATCH would persist a bare
+  // `omnigent.pinned` key the upgraded server discards on read. So the toggle
+  // must write localStorage instead, so the pin survives to migrate later.
+  function seedOldServer(existingPinnedListItems: Conversation[] = []) {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: existingPinnedListItems,
+      filterHonored: false,
+    });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_x", updated_at: 150 })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useTogglePinnedConversation(), { wrapper });
+    return { queryClient, rendered };
+  }
+
+  beforeEach(() => localStorage.clear());
+
+  it("pins to localStorage and does NOT PATCH the server", async () => {
+    const { queryClient, rendered } = seedOldServer();
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    // No network write — a PATCH would be stored under a bare key the upgraded
+    // server drops.
+    expect(fetchMock).not.toHaveBeenCalled();
+    // Persisted to the legacy localStorage key so the migration picks it up.
+    expect(JSON.parse(localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY) ?? "[]")).toEqual([
+      "conv_x",
+    ]);
+    // Optimistic cache patch still moved the row into the Pinned section.
+    const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+    expect(pinned!.conversations.map((c) => c.id)).toContain("conv_x");
+    // The fallback must not flip the flag — the server still can't store pins.
+    expect(pinned!.filterHonored).toBe(false);
+  });
+
+  it("unpins by removing the id from localStorage", async () => {
+    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["conv_x"]));
+    const { queryClient, rendered } = seedOldServer([
+      conversation({ id: "conv_x", updated_at: 150 }),
+    ]);
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: false });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY)).toBeNull();
+    expect(
+      queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.conversations,
+    ).toEqual([]);
+  });
+
+  it("PATCHes the server (no localStorage write) once the server can store pins", async () => {
+    // filterHonored true → normal server path, localStorage untouched.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "conv_x", object: "conversation", labels: { [PINNED_LABEL_KEY]: "1" } }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
+      conversations: [],
+      filterHonored: true,
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useTogglePinnedConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: true });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((fetchMock.mock.calls[0] as [string, RequestInit])[1].method).toBe("PATCH");
+    expect(localStorage.getItem(PINNED_CONVERSATION_IDS_STORAGE_KEY)).toBeNull();
+  });
+
+  it("rolls back the optimistic pin when the local write fails (e.g. storage full)", async () => {
+    // The fallback's localStorage write is the pin's ONLY persistence, so a
+    // swallowed failure would report success while the pin vanishes on reload.
+    // It must throw → reject the mutation → roll back the optimistic patch.
+    const { queryClient, rendered } = seedOldServer();
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("QuotaExceededError");
+    });
+
+    try {
+      rendered.result.current.mutate({ id: "conv_x", pinned: true });
+      await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+      // No network write, nothing persisted locally, and the optimistic row was
+      // rolled back — the pinned section is empty again, honestly reflecting
+      // that the pin didn't take.
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(
+        queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations,
+      ).toEqual([]);
+    } finally {
+      setItemSpy.mockRestore();
+    }
   });
 });
 
