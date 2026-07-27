@@ -21,6 +21,8 @@ import {
   BotIcon,
   Code2Icon,
   CompassIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
   CornerDownRightIcon,
   FileTextIcon,
   FlaskConicalIcon,
@@ -54,6 +56,13 @@ import { useSession } from "@/hooks/useSession";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  activityDotClassName,
+  childStatus,
+  sessionStatus,
+  type AgentActivity,
+  type AgentStatus,
+} from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
 // Session-scoped URL params that the file viewer / Files panel write
@@ -99,21 +108,16 @@ interface SubagentsPanelProps {
 type ViewMode = "list" | "graph";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
-  // Every list in the tree polls at TREE_POLL_MS as a staleness floor;
-  // stream pushes remain the fast path. The stream only carries
-  // ``session.child_session.updated`` for the *streamed* (active)
-  // session's direct children — deeper levels, and the whole tree when
-  // the user is viewing a descendant, have no live channel, so without
-  // the poll their status would freeze at the snapshot. A child can be
-  // busy even when its parent is "idle" (parent parked awaiting the
-  // child); the poll + stream together surface that.
-  const { children, isLoading, error } = useChildSessions(rootSessionId, TREE_POLL_MS);
+  const { children, isLoading, error } = useChildSessions(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
+  const toggleCollapsedRow = (id: string) => {
+    setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
+  };
 
   // Loading/error states only surface when there's no cached data to
-  // show alongside the "main" row. Once any data is available we
-  // render the list and let polling refresh it transparently.
+  // show alongside the "main" row.
   if (isLoading && children.length === 0) {
     return (
       <div className="flex h-full flex-1 items-center justify-center px-4 py-8 text-center text-xs text-muted-foreground bg-card">
@@ -161,7 +165,14 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
       <ul className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-1">
         <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
         {children.map((child) => (
-          <SubagentRow key={child.id} child={child} depth={1} conversationId={conversationId} />
+          <SubagentRow
+            key={child.id}
+            child={child}
+            depth={1}
+            conversationId={conversationId}
+            collapsedRows={collapsedRows}
+            onToggleCollapsed={toggleCollapsedRow}
+          />
         ))}
       </ul>
       {/* Mounted only while open so a closed rail issues no /v1/agents
@@ -205,158 +216,6 @@ function ViewModeToggle({
     </div>
   );
 }
-
-// Collapsed activity of an agent, shared by the main row (derived from the
-// parent session's snapshot status) and the child rows (derived from
-// ``busy`` + ``current_task_status``). Drives the dot tone, whether the
-// label word shows, and whether the row is de-emphasized. ``awaiting`` =
-// parked on an approval / input prompt and needs the user's attention.
-// ``disconnected`` = the runner dropped its tunnel or exited; the task did
-// NOT genuinely fail, so it renders a quiet, non-destructive grey dot rather
-// than the red "Failed" one.
-type AgentActivity =
-  | "launching"
-  | "working"
-  | "awaiting"
-  | "done"
-  | "failed"
-  | "disconnected"
-  | "idle"
-  | "other";
-
-// Error codes that mean "the runner went away", not "the task failed".
-// ``runner_disconnected`` is published when the SSE relay's tunnel drops
-// mid-stream; ``runner_failed_to_start`` when a bound runner reports an
-// unexpected exit. Both are surfaced via ``last_task_error.code`` (child
-// rows) / the session snapshot's ``lastTaskError.code`` (main row). A
-// genuine task failure carries any other code (or none), so it still
-// renders the red "Failed" pill.
-const RUNNER_DISCONNECT_CODES = new Set(["runner_disconnected", "runner_failed_to_start"]);
-
-function isRunnerDisconnectCode(code: string | null | undefined): boolean {
-  return code != null && RUNNER_DISCONNECT_CODES.has(code);
-}
-
-interface AgentStatus {
-  activity: AgentActivity;
-  /** Human label, shown inline for notable states and always in the tooltip. */
-  label: string;
-  /** Optional detail for the tooltip / accessible label. */
-  details?: string;
-}
-
-function firstErrorLine(message: string): string {
-  const first = message
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean);
-  return first ?? message;
-}
-
-/**
- * Resolve a child session's display status.
- *
- * @param child - One child-session summary from the poll.
- * @returns The collapsed activity + its label, e.g.
- *   ``{ activity: "working", label: "Working" }``.
- */
-function childStatus(child: ChildSessionInfo): AgentStatus {
-  // Awaiting input outranks ``busy``: a sub-agent parked on an
-  // elicitation is still "running" its turn (the future is pending),
-  // so checking ``busy`` first would hide the prompt behind a generic
-  // "Working" pill — exactly the signal the user needs to act on.
-  if (child.pending_elicitations_count > 0) {
-    return { activity: "awaiting", label: "Needs response" };
-  }
-  // ``busy`` is the authoritative live flag (queued or in_progress);
-  // ``current_task_status`` may be "launching", "completed", "failed",
-  // "cancelled", or null when no task has run yet.
-  if (child.current_task_status === "launching") {
-    return { activity: "launching", label: "Launching" };
-  }
-  if (child.busy) return { activity: "working", label: "Working" };
-  // A runner disconnect/exit is NOT a task failure — branch on the error
-  // code before the generic failed paths so it renders the quiet blue
-  // disconnected dot instead of the red "Failed" pill.
-  if (isRunnerDisconnectCode(child.last_task_error?.code)) {
-    return {
-      activity: "disconnected",
-      label: "Disconnected",
-      details: child.last_task_error ? firstErrorLine(child.last_task_error.message) : undefined,
-    };
-  }
-  if (child.last_task_error) {
-    return {
-      activity: "failed",
-      label: "Failed",
-      details: firstErrorLine(child.last_task_error.message),
-    };
-  }
-  if (child.current_task_status === "failed") return { activity: "failed", label: "Failed" };
-  if (child.current_task_status === "completed") return { activity: "done", label: "Done" };
-  if (child.current_task_status) {
-    return { activity: "other", label: child.current_task_status };
-  }
-  return { activity: "idle", label: "Idle" };
-}
-
-/**
- * Resolve the parent ("main") session's display status from its snapshot.
- *
- * @param status - ``session.status`` from the snapshot, e.g. ``"running"``,
- *   or ``undefined`` while the snapshot is still loading.
- * @param lastTaskError - The snapshot's ``lastTaskError`` (code + message),
- *   used to tell a benign runner disconnect/exit apart from a real failure
- *   when ``status === "failed"``.
- * @returns The collapsed activity + its label.
- */
-function sessionStatus(
-  status: string | undefined,
-  lastTaskError?: { code: string; message: string } | null,
-): AgentStatus {
-  if (status === "launching") return { activity: "launching", label: "Launching" };
-  if (status === "running") return { activity: "working", label: "Working" };
-  if (status === "failed") {
-    // A runner disconnect/exit collapses the snapshot to ``failed`` but
-    // preserves the cause in ``lastTaskError.code`` — branch on it before
-    // the generic failed path so it reads as a quiet blue disconnected dot,
-    // not a real failure.
-    if (isRunnerDisconnectCode(lastTaskError?.code)) {
-      return {
-        activity: "disconnected",
-        label: "Disconnected",
-        details: lastTaskError ? firstErrorLine(lastTaskError.message) : undefined,
-      };
-    }
-    return { activity: "failed", label: "Failed" };
-  }
-  return { activity: "idle", label: "Idle" };
-}
-
-// Dot color per dot-rendered state. Working uses the animated RunningDot
-// and awaiting uses the "Needs response" tag, so both are excluded here.
-// Panel-scoped palette: the quiet connected-but-not-working states
-// (launching, idle, done) read in the blue --session-active hue, while the
-// disconnected runner reads in the neutral grey --muted-foreground. Blue
-// --session-active = session alive but not actively working; grey
-// --muted-foreground = disconnected. The global --session-active (blue) and
-// --muted-foreground (grey) values are unchanged.
-const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> = {
-  // Blue, quiet — "done" is an expected outcome, so it reads as a subtle
-  // (/55) blue dot rather than a loud green one.
-  done: "bg-session-active/55",
-  failed: "bg-destructive",
-  // Grey, not destructive — a disconnect is a transient liveness loss, not a
-  // task failure, so it reads distinctly from the red "Failed". Full-strength
-  // neutral --muted-foreground (not the shared amber --warning) so the "Needs
-  // response" badge keeps its amber and the dot stays notable (it is not a
-  // dimmed SETTLED_STATE).
-  disconnected: "bg-muted-foreground",
-  idle: "bg-session-active/55",
-  launching: "bg-session-active/70",
-  // Exception: the verbatim "other status" fallthrough stays neutral grey.
-  other: "bg-muted-foreground/55",
-};
 
 // Quiet states show only an indicator — the word lives in the tooltip — so the
 // row stays clean. Working is quiet too: the pulsing pink dot already reads as
@@ -497,7 +356,12 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
         className="inline-flex shrink-0 items-center gap-1 text-destructive text-xs"
       >
         <span>{label}</span>
-        <span className={cn("inline-block size-2 shrink-0 rounded-full", DOT_TONE.failed)} />
+        <span
+          className={cn(
+            "inline-block size-2 shrink-0 rounded-full",
+            activityDotClassName("failed"),
+          )}
+        />
       </span>
     );
   }
@@ -522,7 +386,12 @@ function StatusIndicator({ activity, label, details }: AgentStatus) {
       {activity === "working" ? (
         <RunningDot />
       ) : (
-        <span className={cn("inline-block size-2 shrink-0 rounded-full", DOT_TONE[activity])} />
+        <span
+          className={cn(
+            "inline-block size-2 shrink-0 rounded-full",
+            activityDotClassName(activity),
+          )}
+        />
       )}
     </span>
   );
@@ -688,28 +557,33 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   );
 }
 
-// Staleness-floor poll interval for every child list in the tree. See
-// the comment in SubagentsPanel — only the streamed session's direct
-// children get live pushes, so the rest of the tree relies on this.
-const TREE_POLL_MS = 15_000;
-
 // Indentation: depth 1 keeps the original 24px gutter (pl-6); each
 // further level steps in by another 14px so the connector glyphs read
 // as a tree.
 const ROW_BASE_PADDING_PX = 24;
 const ROW_DEPTH_STEP_PX = 14;
+const ROW_TOGGLE_SIZE_PX = 16;
+
+function rowPaddingLeft(depth: number): number {
+  return ROW_BASE_PADDING_PX + (depth - 1) * ROW_DEPTH_STEP_PX;
+}
 
 function SubagentRow({
   child,
   depth,
   conversationId,
+  collapsedRows,
+  onToggleCollapsed,
 }: {
   child: ChildSessionInfo;
   /** Levels below the root, 1 = direct child of "main". */
   depth: number;
   /** The conversation currently rendered in main, for row highlighting. */
   conversationId: string;
+  collapsedRows: Record<string, boolean>;
+  onToggleCollapsed: (id: string) => void;
 }) {
+  const collapsed = collapsedRows[child.id] ?? false;
   const status = childStatus(child);
   const search = railLinkSearch(useLocation().search);
   const Icon = brandChildIcon(child) ?? iconForAgentType(child.tool);
@@ -721,13 +595,28 @@ function SubagentRow({
   // This child's own sub-agents, rendered as the next tree level.
   // Disabled (null id) at the depth cap so the fan-out of fetches is
   // bounded; ``useChildSessions`` skips the query entirely for null.
-  const { children: grandchildren } = useChildSessions(
-    depth < MAX_TREE_DEPTH ? child.id : null,
-    TREE_POLL_MS,
-  );
+  const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
+  const hasGrandchildren = grandchildren.length > 0;
+  const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
   return (
     <>
-      <li>
+      <li className="relative">
+        {hasGrandchildren && (
+          <button
+            type="button"
+            data-testid="subagent-collapse-toggle"
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? "Expand subagents" : "Collapse subagents"}
+            style={{ left: rowPaddingLeft(depth) - ROW_TOGGLE_SIZE_PX }}
+            className="absolute top-2 z-10 flex size-4 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleCollapsed(child.id);
+            }}
+          >
+            <ToggleIcon aria-hidden="true" className="size-3.5" />
+          </button>
+        )}
         <Link
           // See MainRow: drop session-scoped params on rail navigation
           // (preserving global ones like ``?debug=1``) so a sticky
@@ -738,7 +627,7 @@ function SubagentRow({
           data-depth={depth}
           // Left gutter (depth-stepped) + connector glyph nests this row
           // under its parent, signaling where it sits in the tree.
-          style={{ paddingLeft: ROW_BASE_PADDING_PX + (depth - 1) * ROW_DEPTH_STEP_PX }}
+          style={{ paddingLeft: rowPaddingLeft(depth) }}
           className={cn(
             "flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left hover:bg-accent/60",
             isActive && "bg-accent",
@@ -746,12 +635,16 @@ function SubagentRow({
           )}
         >
           <div className="flex w-full items-center gap-1">
-            <CornerDownRightIcon
-              // Decorative nesting connector — the role icon beside it carries
-              // the meaning, so hide this from the accessibility tree.
-              aria-hidden="true"
-              className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
-            />
+            {hasGrandchildren ? (
+              <span aria-hidden="true" className="-ml-3 size-3 shrink-0" />
+            ) : (
+              <CornerDownRightIcon
+                // Decorative nesting connector — the role icon beside it carries
+                // the meaning, so hide this from the accessibility tree.
+                aria-hidden="true"
+                className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
+              />
+            )}
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-xs font-medium">{primary}</span>
             <span className="flex-1" />
@@ -768,14 +661,17 @@ function SubagentRow({
           )}
         </Link>
       </li>
-      {grandchildren.map((grandchild) => (
-        <SubagentRow
-          key={grandchild.id}
-          child={grandchild}
-          depth={depth + 1}
-          conversationId={conversationId}
-        />
-      ))}
+      {!collapsed &&
+        grandchildren.map((grandchild) => (
+          <SubagentRow
+            key={grandchild.id}
+            child={grandchild}
+            depth={depth + 1}
+            conversationId={conversationId}
+            collapsedRows={collapsedRows}
+            onToggleCollapsed={onToggleCollapsed}
+          />
+        ))}
     </>
   );
 }

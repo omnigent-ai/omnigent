@@ -103,6 +103,8 @@ class LineSink:
         elif isinstance(event, ProbeStarted):
             self._write(f"[{event.harness}]   {event.title}: running...")
         elif isinstance(event, ProbeFinished):
+            if event.verdict is Verdict.NOT_APPLICABLE:
+                return
             suffix = f" ({event.note})" if event.note else ""
             self._write(f"[{event.harness}]   {event.title}: {event.verdict.name}{suffix}")
         # HarnessFinished is silent in line mode (the per-probe lines suffice).

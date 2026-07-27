@@ -1,9 +1,10 @@
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// isElectronShell gates the whole relay; force it true so the hook registers.
+// supportsBrowser gates the whole relay; force it true so the hook registers.
 vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: () => true,
+  supportsBrowser: () => true,
 }));
 
 // The relay POSTs claim + result through authenticatedFetch; mock it so we can

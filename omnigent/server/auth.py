@@ -31,21 +31,50 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from enum import Enum
 
 from starlette.requests import HTTPConnection
 
 logger = logging.getLogger(__name__)
 
-# Opt-in multi-user switch. ``OMNIGENT_AUTH_ENABLED`` is the current
-# name; ``OMNIGENT_ACCOUNTS_ENABLED`` is the pre-rename name, still
-# honored as a deprecated alias (see :func:`_auth_enabled`).
+# Opt-in multi-user switch.
 _AUTH_ENABLED_ENV = "OMNIGENT_AUTH_ENABLED"
-_AUTH_ENABLED_ENV_DEPRECATED = "OMNIGENT_ACCOUNTS_ENABLED"
 
 RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+# Path prefixes a delegated (device-grant) access token may reach.
+# Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
+# any path not covered here, so it can never touch admin / user-management
+# endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
+# its underlying identity is an admin. Delegated clients only need these.
+_DELEGATED_ALLOWED_PREFIXES = (
+    "/health",
+    "/v1/agents",
+    "/v1/hosts",
+    "/v1/sessions",
+    "/v1/runners",
+    "/oauth/token",
+    "/oauth/revoke",
+)
+
+
+def delegated_path_allowed(path: str) -> bool:
+    """Return True if a delegated access token may access *path*.
+
+    Fail-closed: matches against :data:`_DELEGATED_ALLOWED_PREFIXES` and
+    rejects everything else. Exact match or a ``prefix/…`` sub-path
+    counts, so ``/v1/hosts`` and ``/v1/hosts/h1/runners`` pass but
+    ``/v1/hostsX`` does not.
+    """
+    for prefix in _DELEGATED_ALLOWED_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
+
 
 # Explicit single-user marker. Set by the managed local-server spawn
 # paths (`omnigent run` in chat.py, the daemon's
@@ -77,6 +106,78 @@ LEVEL_READ = 1
 LEVEL_EDIT = 2
 LEVEL_MANAGE = 3
 LEVEL_OWNER = 4
+
+
+class SharingMode(str, Enum):
+    """Server policy for creating new session permission grants.
+
+    - ``ON``: grants at any level (read/edit/manage) plus workspace/public read.
+    - ``READ_ONLY``: grants are capped at read (view) — edit/manage grants are
+      rejected; workspace/public read still allowed.
+    - ``RESTRICTED_READ_ONLY``: like ``READ_ONLY`` (grants capped at read), but
+      sessions whose working directory is a user home directory or the
+      filesystem root (see :func:`workspace_sharing_blocked`) cannot be shared
+      at all — not even read — because that cwd exposes an entire home/filesystem.
+    - ``OFF``: no new grants at all.
+
+    Value is the lowercase name so ``GET /v1/info`` and the
+    ``OMNIGENT_SHARING_MODE`` env var round-trip it directly. Defaults to ``ON``.
+    """
+
+    OFF = "off"
+    READ_ONLY = "read_only"
+    RESTRICTED_READ_ONLY = "restricted_read_only"
+    ON = "on"
+
+    @classmethod
+    def coerce(cls, value: object) -> SharingMode:
+        """Map a ``SharingMode``/str/``None`` to a mode, failing open to ``ON``
+        for anything unset or unrecognized (env-var parse + callable boundary)."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value.strip().lower())
+            except ValueError:
+                return cls.ON
+        return cls.ON
+
+
+# Directories whose *direct children* are user home directories, across the
+# Unix / macOS / container layouts a runner might use: ``/home`` (Linux),
+# ``/Users`` (macOS), and ``/var/home`` (ostree — Silverblue/CoreOS/Flatcar,
+# where ``/home`` symlinks here). Matched by path *shape*, never by resolving
+# ``~``: the runner and its home may live on a different host than this server
+# process, so the local process's home is not a reliable signal. Deliberately
+# excludes project-workspace roots (``/workspace``, ``/workspaces/<repo>``) —
+# those hold a single checkout, not a whole home, and stay shareable.
+_HOME_PARENT_DIRS = ("/home", "/Users", "/var/home")
+# Absolute paths that are themselves a home or the filesystem root.
+_BLOCKED_WORKSPACE_ROOTS = ("/", "/root")
+
+
+def workspace_sharing_blocked(workspace: str | None) -> bool:
+    """True when a session's working directory is too broad to share under
+    :attr:`SharingMode.RESTRICTED_READ_ONLY` — the filesystem root or a user
+    home directory, whose whole contents a grant would expose.
+
+    Recognizes the filesystem root (``/``), root's home (``/root``), and any
+    direct child of a common home parent (see :data:`_HOME_PARENT_DIRS` — e.g.
+    ``/home/alice``, ``/Users/bob``, ``/var/home/carol``). A subdirectory of a
+    home (``/home/alice/proj``) is shareable, as is a ``None``/empty workspace
+    (no recorded cwd).
+
+    Pattern-based on purpose: the runner (and thus the home the session lives
+    in) may be on a different host than this server process, so only the path
+    shape is reliable — resolving the local ``~`` would test the wrong host.
+    """
+    if not workspace:
+        return False
+    path = os.path.normpath(workspace)
+    if path in _BLOCKED_WORKSPACE_ROOTS:
+        return True
+    parent, _, leaf = path.rpartition("/")
+    return bool(leaf) and parent in _HOME_PARENT_DIRS
 
 
 def env_var_is_truthy(name: str, *, default: bool = False) -> bool:
@@ -153,40 +254,18 @@ def resolve_auth_header_strip_prefix() -> str:
     return os.environ.get(_AUTH_HEADER_STRIP_PREFIX_ENV, "").strip()
 
 
-_auth_enabled_deprecation_warned = False
-
-
 def _auth_enabled() -> bool:
     """Whether multi-user auth is opted in via the enable switch.
 
-    Reads ``OMNIGENT_AUTH_ENABLED``. The pre-rename name
-    ``OMNIGENT_ACCOUNTS_ENABLED`` is still honored as a deprecated
-    alias: when it is set and the current name is not, its value is
-    used and a one-time deprecation warning is logged. The current name
-    always wins when both are set, so a deploy migrating to the new name
-    can leave the old one in place without surprise.
-
-    Both names share the same truthiness rules (see
-    :func:`env_var_is_truthy`) and the same explicit-falsy kill-switch
-    semantics — ``OMNIGENT_AUTH_ENABLED=0`` disables auth even though
-    the var is "set", which is how the Docker entrypoint lets an
+    Reads ``OMNIGENT_AUTH_ENABLED``. The explicit-falsy kill-switch
+    semantics mean ``OMNIGENT_AUTH_ENABLED=0`` disables auth even
+    though the var is "set", which is how the Docker entrypoint lets an
     operator opt back out of the default-on accounts mode.
 
     :returns: ``True`` when multi-user auth should be enabled.
     """
-    global _auth_enabled_deprecation_warned
     if os.environ.get(_AUTH_ENABLED_ENV, "").strip():
         return env_var_is_truthy(_AUTH_ENABLED_ENV, default=False)
-    if os.environ.get(_AUTH_ENABLED_ENV_DEPRECATED, "").strip():
-        if not _auth_enabled_deprecation_warned:
-            logger.warning(
-                "%s is deprecated; rename it to %s. The old name still "
-                "works for now but will be removed in a future release.",
-                _AUTH_ENABLED_ENV_DEPRECATED,
-                _AUTH_ENABLED_ENV,
-            )
-            _auth_enabled_deprecation_warned = True
-        return env_var_is_truthy(_AUTH_ENABLED_ENV_DEPRECATED, default=False)
     return False
 
 
@@ -204,9 +283,8 @@ def resolve_auth_source() -> str:
       wins, e.g. ``"header"`` / ``"oidc"`` / ``"accounts"``. This is the
       low-level escape hatch.
     - Otherwise ``header`` is the default, unless the opt-in switch
-      ``OMNIGENT_AUTH_ENABLED`` is truthy (see :func:`_auth_enabled`,
-      which also honors the deprecated ``OMNIGENT_ACCOUNTS_ENABLED``
-      alias). When enabled, the mode depends on whether OIDC config was
+      ``OMNIGENT_AUTH_ENABLED`` is truthy (see :func:`_auth_enabled`).
+      When enabled, the mode depends on whether OIDC config was
       supplied:
 
       - ``OMNIGENT_OIDC_ISSUER`` is set → ``"oidc"`` (the operator
@@ -329,6 +407,19 @@ class UnifiedAuthProvider(AuthProvider):
             else resolve_auth_header_strip_prefix()
         )
         self._cookie_cache: dict[str, tuple[str, float]] = {}
+        # Set by create_app when a device-grant store is wired. Returns
+        # True if a grant_id has been revoked (or is unknown → fail
+        # closed). Consulted only for delegated tokens (those carrying a
+        # ``grant_id`` claim); left None disables the check.
+        self._grant_revoked: Callable[[str], bool] | None = None
+
+    def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
+        """Wire the device-grant revocation lookup.
+
+        :param check: Callable mapping a ``grant_id`` to True when the
+            grant is revoked or unknown (fail closed).
+        """
+        self._grant_revoked = check
 
     @property
     def login_url(self) -> str | None:
@@ -455,6 +546,18 @@ class UnifiedAuthProvider(AuthProvider):
         if not user_id or user_id in _RESERVED_USERS:
             return None
 
+        # Delegated (device-grant) tokens carry a ``grant_id`` claim.
+        # They get two extra, request-scoped checks — a fail-closed path
+        # allowlist and a live revocation lookup — so they are never
+        # served from the plain user-id cache (which would skip both).
+        grant_id = payload.get("grant_id")
+        if grant_id is not None:
+            if not delegated_path_allowed(request.url.path):
+                return None
+            if self._grant_revoked is not None and self._grant_revoked(grant_id):
+                return None
+            return user_id
+
         # Cache for remaining lifetime of the token.
         remaining = payload.get("exp", 0) - time.time()
         if remaining > 0:
@@ -548,11 +651,8 @@ def create_auth_provider() -> AuthProvider:
     ``Cf-Access-Authenticated-User-Email`` for Cloudflare Access — see
     :func:`resolve_auth_header`).
 
-    (``OMNIGENT_AUTH_ENABLED`` is the renamed opt-in gate,
-    commit ``b23e886e``, formerly ``OMNIGENT_ACCOUNTS_ENABLED``:
-    header is the shipped default, so the var is an enable switch, not
-    a kill switch. The old name is still honored as a deprecated
-    alias — see :func:`_auth_enabled`.)
+    (``OMNIGENT_AUTH_ENABLED`` is the opt-in gate: header is the
+    shipped default, so the var is an enable switch, not a kill switch.)
 
     Validates the source's required env vars at startup (fail
     loud) — OIDC fetches the discovery document, accounts decodes

@@ -330,7 +330,10 @@ class TestForwardLoop:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         usage.record_usage_payload(tmp_path, _TURN1)
-        client = await _run_loop_until(monkeypatch, tmp_path, _usage_posts)
+        # Gate on the idle POST: it is the LAST side effect of processing turn 1
+        # (usage POST, then the state write, then idle), so once it lands both
+        # assertions below read fully-settled state instead of racing the write.
+        client = await _run_loop_until(monkeypatch, tmp_path, _idle_posts)
         # Let several more polls run; with no new turns there must be no 2nd
         # usage POST and no further idle edge.
         await asyncio.sleep(0.1)

@@ -40,6 +40,19 @@ class _GenerateBuildInfo(build_py):
         self._write_build_info()
         super().run()
         self._bundle_examples()
+        self._bundle_scripts()
+
+    def _bundle_scripts(self) -> None:
+        """Copy top-level maintenance scripts into package resources."""
+        import shutil
+
+        root = Path(__file__).resolve().parent
+        src = root / "scripts" / "uninstall_oss.sh"
+        if not src.is_file():
+            return
+        dest = Path(self.build_lib) / "omnigent" / "resources" / "scripts" / src.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
 
     def _bundle_examples(self) -> None:
         """Copy bundled example agents into the wheel as real directories.

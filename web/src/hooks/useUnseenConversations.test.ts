@@ -13,9 +13,19 @@ type Mod = typeof import("./useUnseenConversations");
 /**
  * The module keeps its read-state mirror in module-level singletons
  * (lastSeenMap / explicitlyUnread / seeded / hydrated), so each test
- * re-imports a fresh copy to reset that state. PUTs resolve 204.
+ * re-imports a fresh copy to reset that state. The mirror is also
+ * localStorage-durable by design (dots survive reloads), so a fresh
+ * *browser* additionally means clearing storage before the module
+ * hydrates — tests that want the durability keep storage intact and
+ * re-import via {@link reloadKeepingStorage}. PUTs resolve 204.
  */
 async function loadFresh(): Promise<Mod> {
+  localStorage.clear();
+  return reloadKeepingStorage();
+}
+
+/** Re-import the module WITHOUT clearing storage (simulates a reload). */
+async function reloadKeepingStorage(): Promise<Mod> {
   vi.resetModules();
   authFetch.mockReset();
   authFetch.mockResolvedValue({ ok: true, status: 204, json: async () => ({}) });
@@ -266,5 +276,52 @@ describe("useMarkConversationSeen", () => {
 
     expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
     expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+});
+
+describe("pod-independent read-state (replica sharding)", () => {
+  it("seeds a read-as-of-load baseline when the server has no read-state", async () => {
+    // Under replica sharding the list can be served by a pod that never
+    // saw this user's read-state PUT (viewer_last_seen: null). The seed
+    // falls back to the row's updated_at, so a turn finishing AFTER load
+    // still lights the dot — previously the null seed froze the dot off.
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: null, updated_at: 1_000 }]);
+    expect(mod.isConversationUnseen("conv-1", 1_000, "idle")).toBe(false); // read as of load
+    expect(mod.isConversationUnseen("conv-1", 1_500, "idle")).toBe(true); // turn after load
+  });
+
+  it("keeps baselines across a reload via localStorage, even when the serving pod can't", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000, updated_at: 1_000 }]);
+    mod.markConversationSeen("conv-1", 2_000);
+    expect(mod.isConversationUnseen("conv-1", 1_500, "idle")).toBe(false);
+
+    // Reload lands on a pod with no read-state for this user: the stored
+    // baseline survives, so the already-read turn stays read (no false
+    // dot) and only genuinely newer activity lights it.
+    const reloaded = await reloadKeepingStorage();
+    reloaded.seedReadState([{ id: "conv-1", viewer_last_seen: null, updated_at: 1_500 }]);
+    expect(reloaded.isConversationUnseen("conv-1", 1_500, "idle")).toBe(false);
+    expect(reloaded.isConversationUnseen("conv-1", 2_500, "idle")).toBe(true);
+  });
+
+  it("max-merges the server seed: a newer cross-device read wins, an older one can't lower", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    mod.markConversationSeen("conv-1", 3_000);
+
+    // Another device read up to 5_000 and its PUT landed on the pod now
+    // serving the list → the higher server value wins on reload.
+    const newer = await reloadKeepingStorage();
+    newer.seedReadState([{ id: "conv-1", viewer_last_seen: 5_000 }]);
+    expect(newer.isConversationUnseen("conv-1", 4_000, "idle")).toBe(false);
+
+    // A pod holding only a STALE server value cannot lower the local
+    // baseline (last-seen is monotonic).
+    const stale = await reloadKeepingStorage();
+    stale.seedReadState([{ id: "conv-1", viewer_last_seen: 100 }]);
+    expect(stale.isConversationUnseen("conv-1", 4_000, "idle")).toBe(false);
+    expect(stale.isConversationUnseen("conv-1", 6_000, "idle")).toBe(true);
   });
 });

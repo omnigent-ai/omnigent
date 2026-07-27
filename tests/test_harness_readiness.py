@@ -61,11 +61,40 @@ def test_configured_harness_map_exposes_pi_native(monkeypatch: pytest.MonkeyPatc
 
     The agent picker warns "needs setup" by looking up the agent's harness
     (``pi-native``) in this map; without the key the Pi row could never warn.
+    A missing binary now reports the richer ``"binary-missing"`` reason (Pi
+    gained the credential axis) rather than a bare ``False``.
     """
     monkeypatch.setattr(hr, "harness_cli_installed", lambda _key: False)
     cmap = hr.configured_harness_map()
-    assert cmap.get("pi-native") is False
-    assert cmap.get("pi") is False
+    assert cmap.get("pi-native") == "binary-missing"
+    assert cmap.get("pi") == "binary-missing"
+
+
+def test_configured_harness_map_pi_installed_no_provider_needs_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi installed but with no configured provider reports ``"needs-auth"``.
+
+    Pi has no CLI login — its only credential is an omnigent-managed provider —
+    so an installed binary with no provider is the yellow "installed but not
+    configured" state the setup dialog offers an "Add key" action for.
+    """
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: False)
+    cmap = hr.configured_harness_map()
+    assert cmap.get("pi") == "needs-auth"
+    assert cmap.get("pi-native") == "needs-auth"
+
+
+def test_configured_harness_map_pi_installed_with_provider_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi installed AND a provider configured reports ready (``True``)."""
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key: True)
+    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: True)
+    cmap = hr.configured_harness_map()
+    assert cmap.get("pi") is True
+    assert cmap.get("pi-native") is True
 
 
 def test_configured_harness_map_exposes_kiro_native(monkeypatch: pytest.MonkeyPatch) -> None:

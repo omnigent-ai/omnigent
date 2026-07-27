@@ -23,6 +23,7 @@ import pytest
 from omnigent import claude_native_bridge, native_cost_popup
 from omnigent.claude_native_bridge import (
     _claude_prompt_rendered,
+    _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
     _JsonlRecord,
     augment_claude_args,
@@ -73,7 +74,11 @@ def subprocess_bridge_root() -> Iterator[Path]:
         ``python -m omnigent.claude_native_bridge`` accepts bridge
         writes without inheriting pytest monkeypatches.
     """
-    production_root = Path("/tmp") / f"omnigent-{os.getuid()}" / "claude-native"
+    production_root = (
+        Path(tempfile.gettempdir())
+        / f"omnigent-{claude_native_bridge.stable_user_id()}"
+        / "claude-native"
+    )
     production_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(production_root.parent, 0o700)
     os.chmod(production_root, 0o700)
@@ -334,6 +339,21 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     # Confirm the bearer token did NOT land in the attacker-controlled
     # directory — the refusal happened before any file write.
     assert not (attacker_dir / "bridge.json").exists()
+
+
+def test_ensure_secure_dir_succeeds_without_getuid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows lacks ``os.getuid()``; bridge dir creation must still work."""
+    monkeypatch.delattr(os, "getuid", raising=False)
+
+    bridge_dir = tmp_path / "bridge-without-getuid"
+
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+    claude_native_bridge._ensure_secure_dir(bridge_dir)
+
+    assert bridge_dir.is_dir()
 
 
 def test_trusted_parent_accepts_qwen_native_bridge_dir(
@@ -600,6 +620,164 @@ def test_read_transcript_items_since_parses_claude_visible_events(tmp_path: Path
         "content": [{"type": "output_text", "text": "Done."}],
     }
     assert current_response_id == tool_call.response_id
+
+
+def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
+    """
+    Reading an image file must not replay its base64 data as prompt text.
+
+    Claude's ``Read`` tool returns image files as a list of
+    ``{"type": "image", "source": {"type": "base64", ...}}`` blocks.
+    Serialized verbatim, a single image costs hundreds of thousands of
+    tokens and overflows the context window on resume. The stored
+    ``function_call_output`` must drop the base64 payload.
+    """
+    huge_b64 = "iVBORw0KGgo" + "A" * 100_000
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-tool-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_read_img",
+                                    "name": "Read",
+                                    "input": {"file_path": "chart.png"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "tool-result-1",
+                        "parentUuid": "assistant-tool-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "toolu_read_img",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/png",
+                                                "data": huge_b64,
+                                            },
+                                        }
+                                    ],
+                                    "is_error": False,
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    outputs = [item for item in items if item.item_type == "function_call_output"]
+    assert len(outputs) == 1
+    output = outputs[0].data["output"]
+    assert huge_b64 not in output, "base64 image data must not be replayed as text"
+    # The placeholder names the media type and tells the agent how to
+    # recover the image (re-run the tool call), so it is not silently lost.
+    assert "image/png image omitted from history" in output
+    assert "re-run the tool call" in output
+    assert len(output) < 300
+
+
+def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Path) -> None:
+    task_notification = (
+        "<task-notification>\n"
+        "<task-id>b1mhekpmy</task-id>\n"
+        '<summary>Monitor event: "PR 2086 E2E UI + npm test CI results"</summary>\n'
+        "<event>E2E UI Tests (shard 2/3)\tfail\t1m50s\thttps://example.test</event>\n"
+        "</task-notification>"
+    )
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "task-notification-1",
+                "message": {"role": "user", "content": task_notification},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert current_response_id is None
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "is_meta": True,
+        "content": [{"type": "input_text", "text": task_notification}],
+    }
+
+
+def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
+    """
+    An ``isCompactSummary`` user record is flagged, not rendered as a bubble.
+
+    Claude writes an ``isCompactSummary: true`` user record carrying the
+    continuation summary right after it compacts. The bridge must surface it
+    as a single ``message`` item with ``is_compact_summary=True`` (so the
+    forwarder can persist a durable compaction boundary) and preserve the
+    summary text — never drop it or route it through slash/scaffolding
+    detection.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "compact-summary-1",
+                "isCompactSummary": True,
+                "message": {
+                    "role": "user",
+                    "content": "This session is being continued. Prior summary: …",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert len(items) == 1
+    assert items[0].is_compact_summary is True
+    assert items[0].item_type == "message"
+    assert items[0].data["content"][0]["text"].startswith("This session is being continued")
 
 
 @pytest.mark.parametrize(
@@ -2084,6 +2262,53 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
     assert settings["effortLevel"] == "high"
 
 
+def test_augment_claude_args_appends_caller_system_prompt(
+    tmp_path: Path,
+) -> None:
+    """Claude native appends framework instructions supplied by its launcher."""
+    framework_instruction = "Keep framework metadata separate."
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=framework_instruction,
+    )
+
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == framework_instruction
+
+
+def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
+    """Framework preapproval extends rather than replaces the user's allowlist."""
+    args = augment_claude_args(
+        ("--allowedTools", "Bash,mcp__user__tool"),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        allowed_tools=("mcp__omnigent__sys_session_rename", "Bash"),
+    )
+
+    assert args.count("--allowedTools") == 1
+    index = args.index("--allowedTools")
+    assert args[index + 1].split(",") == [
+        "Bash",
+        "mcp__user__tool",
+        "mcp__omnigent__sys_session_rename",
+    ]
+
+
+def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
+    """The bridge does not invent framework policy on its own."""
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert "--append-system-prompt" not in args
+
+
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:
     """
     A user-supplied ``--disallowedTools`` passes through unchanged.
@@ -2307,7 +2532,10 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
     Code would refuse to start with that capability advertised under
     org policy, breaking the native wrapper.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_abc", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -2516,6 +2744,78 @@ def test_inject_user_message_pastes_content_then_submits(
         "claude:0.0",
         "Enter",
     ]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("plain text", "plain text"),
+        ("/help", "\ufeff/help"),
+        ("/exit", "\ufeff/exit"),
+        ("/quit now", "\ufeff/quit now"),
+        ("  /help", "  \ufeff/help"),
+        ("/clear", "/clear"),
+        ("/compact", "/compact"),
+        ("/model sonnet-4", "/model sonnet-4"),
+        ("/effort high", "/effort high"),
+        ("/ultrareview", "/ultrareview"),
+        ("/branch", "/branch"),
+        ("/fork", "/fork"),
+        ("/my-skill some args", "/my-skill some args"),
+    ],
+)
+def test_escape_unsupported_slash_command(content: str, expected: str) -> None:
+    """
+    Dropped Claude Code commands are escaped so they become plain text;
+    supported commands and skills are left untouched.
+    """
+    assert _escape_unsupported_slash_command(content) == expected
+
+
+def test_inject_user_message_escapes_unsupported_slash_command_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Unsupported slash commands land in the tmux buffer with a leading
+    zero-width escape so Claude Code treats them as user text.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    loaded_payloads: list[bytes] = []
+    tui = {"pane": "❯ "}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Record buffer payloads and simulate a ready TUI.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess with rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "load-buffer" in cmd:
+            loaded_payloads.append(Path(cmd[-1]).read_bytes())
+        if "paste-buffer" in cmd:
+            tui["pane"] = "❯ [Pasted text #1 +2 lines]"
+        if cmd[-1] == "Enter":
+            tui["pane"] = "❯ "
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    inject_user_message(bridge_dir, content="/help")
+    assert loaded_payloads[0].startswith("\ufeff/help".encode("utf-8"))
+
+    inject_user_message(bridge_dir, content="/clear")
+    assert not loaded_payloads[1].startswith("\ufeff".encode("utf-8"))
 
 
 def test_inject_user_message_raises_when_tmux_target_never_published(
@@ -3233,7 +3533,10 @@ async def test_channel_server_relays_active_omnigent_tools(
     This fails if Claude Code can receive web-channel inputs but cannot
     call the Omnigent tools made available to the server-side agent.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_tools", workspace=tmp_path)
     proc = subprocess.Popen(
@@ -3440,7 +3743,10 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     ``-32000: Connection closed``). Without the guard, the decode error kills
     ``_serve_mcp`` and the ``tools/list`` read below times out.
     """
-    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", Path("/tmp"))
+    monkeypatch.setattr(
+        "omnigent.claude_native_bridge._TRUSTED_PARENT",
+        Path(tempfile.gettempdir()),
+    )
     monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", subprocess_bridge_root)
     bridge_dir = prepare_bridge_dir("conv_crash", workspace=tmp_path)
 
@@ -4997,6 +5303,59 @@ def test_claude_prompt_rendered_ignores_unframed_glyph_deep_in_tail() -> None:
         ]
     )
     assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_ignores_custom_api_key_menu() -> None:
+    """The custom-API-key menu's selected row is not the chat input.
+
+    Claude Code's startup "Detected a custom API key" confirmation renders
+    its highlighted choice with the same ``❯`` glyph the chat composer uses
+    (``❯ 2. No (recommended)``). Treating it as ready pastes the first web
+    message into the menu, so no turn starts — the tmux delivery false
+    positive this guards against.
+    """
+    pane = "\n".join(
+        [
+            "Detected a custom API key in your environment",
+            "Do you want to use this API key?",
+            "  1. Yes",
+            "❯ 2. No (recommended)",  # selected menu row, NOT the chat input
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
+def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
+    """A real chat prompt still reads ready even past a menu-shaped echo.
+
+    A numbered ``❯`` choice echoed into scrollback must not suppress the
+    live input box below it: the chat ``❯`` row (no numbered choice after
+    the glyph) is the one that marks readiness.
+    """
+    pane = "\n".join(
+        [
+            "❯ 2. No (recommended)",  # scrollback echo of a prior menu row
+            "output",
+            "────────────────────────────────────────",  # input box top rule
+            "❯ ",  # the live chat prompt
+            "────────────────────────────────────────",  # box closing rule
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
+    """A numbered composer draft is distinguished from an unframed menu row."""
+    pane = "\n".join(
+        [
+            "────────────────────────────────────────",
+            "❯ 2. buy milk",
+            "────────────────────────────────────────",
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
 
 
 def _write_deltas_lines(bridge_dir: Path, lines: list[str]) -> None:

@@ -11,9 +11,8 @@
 // data) and the runner is online.
 
 import { useQuery } from "@tanstack/react-query";
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { authenticatedFetch } from "@/lib/identity";
-import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
+import { useWorkspaceChangedFiles, useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
 
 // The primary workspace environment is always "default".
 const DEFAULT_ENVIRONMENT_ID = "default";
@@ -59,14 +58,14 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
  * - the file does not appear in the session's changed-files list
  */
 export function useFileDiff(conversationId: string | undefined, path: string | null) {
-  const runnerOnline = useSessionRunnerOnline(conversationId);
+  const serveable = useWorkspaceServeable(conversationId);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 
   return useQuery({
     queryKey: ["file-diff", conversationId, path],
     queryFn: () => fetchFileDiff(conversationId!, path!),
-    enabled: !!conversationId && !!path && runnerOnline !== false && isInChangedFiles,
+    enabled: !!conversationId && !!path && serveable !== false && isInChangedFiles,
     staleTime: 5_000,
   });
 }

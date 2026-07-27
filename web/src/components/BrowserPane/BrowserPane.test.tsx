@@ -2,10 +2,11 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
 
-// isElectronShell gates the whole pane. Force it true so the pane renders; the
-// plain-browser (returns null) path is covered by reading the early return.
+// supportsBrowser gates the whole pane. Force it true so the pane renders; the
+// unsupported-shell (returns null) path is covered by reading the early return.
 vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: () => true,
+  supportsBrowser: () => true,
 }));
 
 /**

@@ -96,6 +96,13 @@ def test_coding_subagents(polly_spec: AgentSpec) -> None:
     assert fam["pi"] == "pi"
     # Six distinct vendors → any implementer's diff is reviewable by another.
     assert len(set(fam.values())) == 6
+    # Headless bypass knobs so workers don't stall on ApprovalCards.
+    by_name = {a.name: a for a in polly_spec.sub_agents}
+    assert by_name["claude_code"].executor.config.get("permission_mode") == "auto"
+    assert by_name["claude_code"].executor.model is None
+    assert by_name["codex"].executor.config.get("yolo") in (True, "True", "true")
+    assert by_name["cursor"].executor.config.get("yolo") in (True, "True", "true")
+    assert by_name["cursor"].executor.model == "grok-4.5"
     for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
         prompt = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
         assert "IMPLEMENT — write real product code" in prompt
@@ -199,6 +206,43 @@ def test_orchestrator_keeps_timer_tool_but_forbids_worker_polling(
     assert polly_spec.timers is True
     assert "Timers remain available for genuine scheduled reminders" in compact
     assert "not for polling workers that already auto-wake you" in compact
+
+
+def test_polly_test_count_ground_truth_guidance() -> None:
+    """
+    Polly prevents pytest count reconciliation from using source-function counts.
+
+    Regression guard for #949: a prior orchestration handoff compared a worker's
+    multi-file pytest total against ``grep -c 'def test_'`` from a single file,
+    which misses parametrized case expansion and falsely labels accurate reports
+    as over-counts. The contract must be present at the orchestrator layer, the
+    cross-review workflow, while workers supply enough exact test context for
+    Polly to verify the same gate.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    cross_review = (_POLLY_BUNDLE / "skills" / "cross-review" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    config_compact = " ".join(config.split())
+    cross_review_compact = " ".join(cross_review.split())
+    for text in (config_compact, cross_review_compact):
+        assert "python -m pytest --collect-only -q <same files>" in text
+        assert "grep -c 'def test_'" in text
+        assert "collected cases" in text
+        assert "parametrized" in text
+
+    assert "same command, same file set, and same commit" in config_compact
+    assert "miscount`, `over-report`, or `fabrication`" in config_compact
+    assert "exact file set/command/commit" in cross_review_compact
+
+    for name in ("claude_code", "codex", "opencode", "cursor", "hermes", "pi"):
+        worker = (_POLLY_BUNDLE / "agents" / name / "config.yaml").read_text(encoding="utf-8")
+        worker_compact = " ".join(worker.split())
+        assert "When you report test results, include the exact command and file set" in (
+            worker_compact
+        ), name
+        assert "distinguish collected test cases from test functions" in worker_compact, name
 
 
 def test_orchestrator_forbids_premature_idle_after_announcing_intent() -> None:

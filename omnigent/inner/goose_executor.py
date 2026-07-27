@@ -252,16 +252,21 @@ class GooseExecutor(Executor):
     # Low-level ACP transport
     # ------------------------------------------------------------------
 
+    def _reset_process_state(self) -> None:
+        """Clear state owned by a goose ACP subprocess."""
+        self._session_id = None
+        self._system_prompt_sent = False
+        self._initialized = False
+        self._image_supported = False
+
     async def _start_process(self) -> None:
         """Start ``goose acp`` as an asyncio subprocess.
 
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
         response or tool output line can't hit the default 64 KiB per-line cap.
         """
-        # Reset handshake state: this may be a restart after the previous
-        # subprocess died. ``_initialized`` is a one-way latch.
-        self._initialized = False
-        self._image_supported = False
+        # This may be a restart after the previous subprocess died.
+        self._reset_process_state()
         env = os.environ.copy()
         env.update(self._provider_env())
         argv: list[str] = ["acp"]
@@ -926,10 +931,13 @@ class GooseExecutor(Executor):
         proc = self._proc
         if proc is None or proc.returncode is not None:
             return False
-        with contextlib.suppress(ProcessLookupError):
+        try:
             proc.terminate()
-            return True
-        return False
+        except ProcessLookupError:
+            self._reset_process_state()
+            return False
+        self._reset_process_state()
+        return True
 
     async def run_turn(
         self,

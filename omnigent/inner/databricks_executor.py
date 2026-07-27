@@ -278,6 +278,38 @@ def _read_databrickscfg_host(profile: str | None = None) -> str | None:
     return None
 
 
+def _databricks_gateway_host(profile: str | None = None) -> str | None:
+    """Resolve the gateway workspace host that matches *profile*'s minted token.
+
+    Codex/Pi gateway launches derive the base URL from the profile host but
+    mint the bearer with ``databricks auth token --profile <profile>``, which
+    reads the profile section only and ignores ``DATABRICKS_HOST``. The SDK
+    resolver (:func:`_read_databrickscfg`) instead lets ``DATABRICKS_HOST``
+    override the profile host, so on a machine whose environment or ``DEFAULT``
+    section points at a different workspace, the base URL and the token would
+    target two workspaces and the gateway rejects the token ("Invalid Token").
+
+    So for an explicit profile, read the profile section host directly
+    (env-independent, same as the token) and only fall back to the SDK/ambient
+    chain when the section has no host — e.g. a spec authored with a profile
+    that is absent on a Databricks App container, which authenticates through
+    ambient env/OIDC credentials. Without a profile there is no profile-pinned
+    token to diverge from, so the SDK path (which the ``--host`` auth command
+    matches) is used directly.
+
+    :param profile: Databricks config profile name, or ``None``.
+    :returns: Workspace host URL, or ``None`` when none can be resolved.
+    """
+    if profile is not None:
+        host = _read_databrickscfg_host(profile)
+        if host:
+            return host
+    creds = _read_databrickscfg(profile)
+    if creds is not None:
+        return creds.host
+    return _read_databrickscfg_host(profile)
+
+
 class DatabricksAuthError(OSError):
     """Raised when Databricks credential resolution or token refresh fails.
 

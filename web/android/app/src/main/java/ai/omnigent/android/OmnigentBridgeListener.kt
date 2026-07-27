@@ -2,6 +2,7 @@ package ai.omnigent.android
 
 import android.net.Uri
 import android.webkit.WebView
+import androidx.appcompat.app.AppCompatDelegate
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebMessageCompat
 import androidx.webkit.WebViewCompat
@@ -17,8 +18,7 @@ import org.json.JSONObject
  * structural equivalent of the iOS `isMainFrame` + frame-origin check that a
  * raw `addJavascriptInterface` bridge cannot express.
  *
- * Callbacks arrive on the UI thread, so notification calls need no hop; the
- * blob write offloads to [BlobSaver]'s own worker.
+ * [BlobSaver] offloads writes to its own worker.
  */
 class OmnigentBridgeListener(
     private val notifications: NativeNotificationManager,
@@ -33,6 +33,11 @@ class OmnigentBridgeListener(
     ) {
         if (!isMainFrame) return // origin allowlist already gates; defense in depth.
         val data = message.data ?: return
+        handle(data)
+    }
+
+    /** Parse and dispatch one bridge message; malformed input is dropped. */
+    internal fun handle(data: String) {
         val json =
             try {
                 JSONObject(data)
@@ -41,8 +46,35 @@ class OmnigentBridgeListener(
             }
 
         when (json.optString("method")) {
+            "setColorScheme" -> {
+                when (json.optString("scheme")) {
+                    "light" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_NO,
+                        )
+                    }
+
+                    "dark" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_YES,
+                        )
+                    }
+
+                    "system" -> {
+                        AppCompatDelegate.setDefaultNightMode(
+                            AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM,
+                        )
+                    }
+                }
+            }
+
             "setBadgeCount" -> {
-                notifications.setBadgeCount(json.optInt("count", 0))
+                notifications.setBadgeCount(
+                    count = json.optInt("count", 0),
+                    navigatePath = json.optString("navigatePath").ifEmpty { null },
+                    title = json.optString("title").ifEmpty { null },
+                    body = json.optString("body").ifEmpty { null },
+                )
             }
 
             "notify" -> {

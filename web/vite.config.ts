@@ -203,8 +203,57 @@ function emitPwaAssets(): Plugin {
   };
 }
 
+// Safari < 16.4 cannot parse regex lookbehind; these dependency regexes would
+// otherwise throw there, at module scope during boot or on the first rendered
+// markdown message (#1978):
+// - marked probes lookbehind support with `new RegExp("(?<=1)(?<!1)")` inside
+//   try/catch, but rolldown constant-folds the probe to `true`; route the
+//   constructor through `globalThis` so it stays a runtime check.
+// - remend builds its single-tilde repair regex at module scope with no
+//   guard; fall back to a never-matching regex so the repair no-ops.
+// - mdast-util-gfm-autolink-literal's email regex is constructed when a GFM
+//   message renders; fall back to a never-matching regex (plain-text emails
+//   just don't autolink).
+const LOOKBEHIND_REWRITES: [string, string][] = [
+  ['new RegExp("(?<=1)(?<!1)")', 'new globalThis.RegExp("(?<=1)(?<!1)")'],
+  [
+    'new RegExp("(?<=[\\\\p{L}\\\\p{N}_])~(?!~)(?=[\\\\p{L}\\\\p{N}_])","gu")',
+    '(() => { try { return new globalThis.RegExp("(?<=[\\\\p{L}\\\\p{N}_])~(?!~)(?=[\\\\p{L}\\\\p{N}_])", "gu"); } catch { return /(?!)/gu; } })()',
+  ],
+  [
+    "/(?<=^|\\s|\\p{P}|\\p{S})([-.\\w+]+)@([-\\w]+(?:\\.[-\\w]+)+)/gu",
+    '(() => { try { return new globalThis.RegExp("(?<=^|\\\\s|\\\\p{P}|\\\\p{S})([-.\\\\w+]+)@([-\\\\w]+(?:\\\\.[-\\\\w]+)+)", "gu"); } catch { return /(?!)/gu; } })()',
+  ],
+];
+const LOOKBEHIND_REWRITE_MODULES = [
+  "/node_modules/marked/",
+  "/node_modules/remend/",
+  "/node_modules/mdast-util-gfm-autolink-literal/",
+];
+
+function isLookbehindRewriteModule(id: string): boolean {
+  const normalizedId = id.replaceAll("\\", "/");
+  return LOOKBEHIND_REWRITE_MODULES.some((modulePath) => normalizedId.includes(modulePath));
+}
+
+function safariLookbehindWorkarounds(): Plugin {
+  return {
+    name: "safari-lookbehind-workarounds",
+    transform(code, id) {
+      if (!isLookbehindRewriteModule(id)) return;
+
+      let out = code;
+      for (const [from, to] of LOOKBEHIND_REWRITES) {
+        out = out.replaceAll(from, to);
+      }
+      if (out === code) return;
+      return { code: out, map: null };
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [emitPwaAssets(), react(), tailwindcss()],
+  plugins: [emitPwaAssets(), safariLookbehindWorkarounds(), react(), tailwindcss()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -241,6 +290,8 @@ export default defineConfig({
     proxy: proxyConfig,
   },
   build: {
+    // default baseline is Safari 16.4+; iPadOS 15 can't parse dep regex lookbehinds (#1978)
+    target: ["chrome111", "edge111", "firefox114", "safari15", "ios15"],
     outDir: path.resolve(__dirname, "../omnigent/server/static/web-ui"),
     emptyOutDir: true,
   },

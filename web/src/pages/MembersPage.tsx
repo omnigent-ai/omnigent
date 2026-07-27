@@ -48,6 +48,7 @@ import {
 } from "@/lib/accountsApi";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSingleUserMode } from "@/lib/capabilities";
 
 export function MembersPage() {
   const info = useServerInfo();
@@ -55,14 +56,10 @@ export function MembersPage() {
   // accounts mode — OIDC identities are owned by the IdP, so under OIDC
   // this page is a read-only user list (no action column, no modals).
   const manageable = info !== "loading" && info.accounts_enabled;
-  // Plain header/single-user mode: no auth endpoints exist. server_version
-  // distinguishes a live single-user server from a failed /v1/info probe
-  // (which uses the same accounts_enabled:false / login_url:null sentinel).
-  const isSingleUser =
-    info !== "loading" &&
-    !info.accounts_enabled &&
-    info.login_url === null &&
-    info.server_version !== null;
+  // Plain header/single-user mode: no auth endpoints exist. The nav + route
+  // already hide Members here; this placeholder is a fallback for a direct
+  // hit before the redirect resolves.
+  const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
   const [meId, setMeId] = useState<string | null>(null);
   const [users, setUsers] = useState<AccountListEntry[] | null>(null);
@@ -112,12 +109,12 @@ export function MembersPage() {
 
   if (isSingleUser) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Members</h1>
         <p className="text-sm text-muted-foreground">
           Member management is not available in single-user mode.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -137,12 +134,12 @@ export function MembersPage() {
   // Non-admin: hard stop. Server would also 403, this is just UX.
   if (meIsAdmin === false) {
     return (
-      <div className="mx-auto w-full max-w-2xl px-6 py-12">
+      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
         <h1 className="mb-2 text-2xl font-semibold">Members</h1>
         <p className="text-sm text-muted-foreground">
           You don't have permission to manage members.
         </p>
-      </div>
+      </PageScroll>
     );
   }
 
@@ -189,7 +186,7 @@ export function MembersPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Members</h1>
         {/* Invite mints a password-backed account — accounts mode only.

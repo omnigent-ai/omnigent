@@ -30,7 +30,6 @@ from omnigent.inner.hermes_executor import (
     _build_hermes_args,
     _extract_last_user_message,
     _parse_session_id,
-    _populate_hermes_home,
     _strip_hermes_metadata,
 )
 
@@ -146,55 +145,78 @@ class TestUtils:
 # ---------------------------------------------------------------------------
 
 
-class TestPopulateHermesHome:
-    """Tests for the per-session HERMES_HOME setup."""
+class TestSetupHermesHome:
+    """The headless executor's HERMES_HOME setup (option B: private-tempdir home,
+    shared bridge dir for the runner<->serve-mcp rendezvous only)."""
 
-    def test_creates_config_with_hook(self, tmp_path: pathlib.Path) -> None:
-        """config.yaml contains the pre_tool_call hook registration."""
-        _populate_hermes_home(
-            tmp_path,
-            "/path/to/hook.py",
-            "http://127.0.0.1:6767",
-            "conv_test123",
+    @pytest.fixture
+    def setup(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+        """Build an executor with a fake bridge root + session id.
+
+        Returns (home, bridge_dir): the credential-bearing HERMES_HOME (a private
+        tempdir) and the deterministic bridge dir (runner rendezvous)."""
+        import omnigent.hermes_native_bridge as hnb
+
+        monkeypatch.setattr(hnb, "_BRIDGE_ROOT", tmp_path)
+        monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:6767")
+        monkeypatch.setattr(
+            "omnigent.inner.hermes_executor._get_conversation_id",
+            lambda: "conv_test123",
         )
-        config_path = tmp_path / "config.yaml"
-        assert config_path.exists()
-        config = json.loads(config_path.read_text())
+        monkeypatch.setattr(pathlib.Path, "home", classmethod(lambda cls: tmp_path / "nohome"))
+        executor = HermesExecutor(hermes_path="/usr/bin/hermes-fake", cwd="/tmp")
+        assert executor._hermes_home is not None
+        bridge_dir = hnb.bridge_dir_for_session_id("conv_test123")
+        return executor._hermes_home, bridge_dir
+
+    def test_config_registers_policy_hook(self, setup) -> None:
+        """config.yaml carries the pre_tool_call hook registration."""
+        home, _ = setup
+        config = json.loads((home / "config.yaml").read_text())
         assert config["hooks_auto_accept"] is True
         hooks = config["hooks"]["pre_tool_call"]
         assert len(hooks) == 1
         assert "omnigent-policy-hook.sh" in hooks[0]["command"]
 
-    def test_creates_wrapper_script(self, tmp_path: pathlib.Path) -> None:
-        """Wrapper script exports env vars and execs the Python hook."""
-        _populate_hermes_home(
-            tmp_path,
-            "/path/to/hook.py",
-            "http://127.0.0.1:6767",
-            "conv_test123",
-        )
-        wrapper = tmp_path / "omnigent-policy-hook.sh"
-        assert wrapper.exists()
-        content = wrapper.read_text()
-        assert "http://127.0.0.1:6767" in content
-        assert "conv_test123" in content
-        assert "/path/to/hook.py" in content
+    def test_config_registers_omnigent_mcp_server(self, setup) -> None:
+        """config.yaml carries mcp_servers.omnigent (serve-mcp) pointed at the bridge
+        dir — the parity gap. Fails on the previous setup, which wrote no mcp_servers
+        key: a headless Hermes agent had zero Omnigent tools."""
+        home, bridge_dir = setup
+        omnigent_mcp = json.loads((home / "config.yaml").read_text())["mcp_servers"]["omnigent"]
+        assert omnigent_mcp["args"][:2] == ["-m", "omnigent.claude_native_bridge"]
+        assert "serve-mcp" in omnigent_mcp["args"]
+        assert str(bridge_dir) in omnigent_mcp["args"]  # serve-mcp --bridge-dir <bridge_dir>
 
-    def test_creates_allowlist(self, tmp_path: pathlib.Path) -> None:
-        """shell-hooks-allowlist.json is pre-populated with correct format."""
-        _populate_hermes_home(
-            tmp_path,
-            "/path/to/hook.py",
-            "http://127.0.0.1:6767",
-            "conv_test123",
-        )
-        allowlist_path = tmp_path / "shell-hooks-allowlist.json"
-        assert allowlist_path.exists()
-        allowlist = json.loads(allowlist_path.read_text())
+    def test_credentials_stay_off_the_predictable_bridge_path(self, setup, tmp_path) -> None:
+        """The HERMES_HOME holding .env/auth.json/the token-bearing wrapper is a
+        private tempdir, NOT under the deterministic bridge dir — so credentials never
+        land on a predictable path another local user could pre-create."""
+        home, bridge_dir = setup
+        assert not home.is_relative_to(tmp_path)  # bridge root is tmp_path; home is elsewhere
+        assert (home / "omnigent-policy-hook.sh").is_file()
+        assert not (bridge_dir / "hermes_home").exists()  # no creds under the bridge dir
+
+    def test_home_is_owner_only(self, setup) -> None:
+        """The private HERMES_HOME is 0700 (mkdtemp default) — it holds credentials."""
+        import stat
+
+        home, _ = setup
+        assert stat.S_IMODE(home.stat().st_mode) & 0o077 == 0
+
+    def test_bridge_json_written_for_serve_mcp(self, setup) -> None:
+        """bridge.json (serve-mcp control token) lands in the deterministic bridge
+        dir — the runner<->serve-mcp rendezvous, same as the hermes-native path."""
+        _, bridge_dir = setup
+        assert (bridge_dir / "bridge.json").is_file()
+
+    def test_creates_allowlist(self, setup) -> None:
+        """shell-hooks-allowlist.json is pre-populated so Hermes never prompts."""
+        home, _ = setup
+        allowlist = json.loads((home / "shell-hooks-allowlist.json").read_text())
         approvals = allowlist["approvals"]
         assert len(approvals) == 1
         assert approvals[0]["event"] == "pre_tool_call"
-        assert "omnigent-policy-hook.sh" in approvals[0]["command"]
 
 
 # ---------------------------------------------------------------------------

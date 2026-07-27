@@ -1,0 +1,124 @@
+name: Run Omnigent agent
+description: >-
+  Set up uv + the Claude Code CLI + an Omnigent gateway provider, run a tools-less
+  Omnigent agent headlessly on a prompt file, and secret-scan its output. Shared by
+  the release-cut (draft-release-notes) and publish (publish-changelog) workflows so
+  the LLM-runner scaffold lives in one place. The caller mints no write-token until
+  after this action returns — the only secret here is the model key.
+
+inputs:
+  workdir:
+    description: >-
+      Repo checkout dir relative to the workspace (`.` when checked out at the
+      root, `omnigent` when checked out into a subdir). Drives the venv path, the
+      cache key, and the uv --project / agent paths.
+    required: false
+    default: "."
+  agent:
+    description: Agent directory name under <workdir>/.github/agents/.
+    required: true
+  prompt-file:
+    description: Absolute path to the file holding the agent prompt.
+    required: true
+  output-file:
+    description: Absolute path to write the agent's stdout to.
+    required: true
+  stderr-file:
+    description: Absolute path to write the agent's stderr to.
+    required: false
+    default: /tmp/omnigent-agent-stderr.log
+  gateway-base-url:
+    description: Base URL of the Anthropic-compatible gateway.
+    required: true
+  llm-api-key:
+    description: Model API key (referenced by the provider config, used to scan output).
+    required: true
+  claude-code-version:
+    description: "@anthropic-ai/claude-code npm version to install."
+    required: false
+    default: 2.1.170
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: true
+
+    - name: Cache virtualenv
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ inputs.workdir }}/.venv
+        key: venv-${{ runner.os }}-${{ hashFiles(format('{0}/.python-version', inputs.workdir)) }}-${{ hashFiles(format('{0}/uv.lock', inputs.workdir)) }}
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.workdir }}
+      run: uv sync --extra all --extra dev
+
+    - name: Install Claude Code CLI
+      shell: bash
+      env:
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+      run: |
+        set -euo pipefail
+        mkdir -p "${GITHUB_WORKSPACE}/.cc-cli"
+        cd "${GITHUB_WORKSPACE}/.cc-cli"
+        npm install --ignore-scripts --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+        node node_modules/@anthropic-ai/claude-code/install.cjs
+        echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Write Omnigent provider config
+      shell: bash
+      env:
+        GATEWAY_BASE_URL: ${{ inputs.gateway-base-url }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.omnigent"
+        python3 -c "
+        import pathlib, os, json
+        gw = os.environ['GATEWAY_BASE_URL']
+        cfg = {'providers': {'databricks-gateway': {
+            'kind': 'gateway', 'default': ['anthropic'],
+            'anthropic': {
+                'base_url': gw + '/anthropic',
+                'api_key_ref': 'env:LLM_API_KEY',
+                'models': {'default': 'databricks-claude-opus-4-8'},
+            }}}}
+        pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
+        "
+
+    - name: Run the agent
+      shell: bash
+      env:
+        LLM_API_KEY: ${{ inputs.llm-api-key }}
+        WORKDIR: ${{ inputs.workdir }}
+        AGENT: ${{ inputs.agent }}
+        PROMPT_FILE: ${{ inputs.prompt-file }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+        STDERR_FILE: ${{ inputs.stderr-file }}
+      run: |
+        set -euo pipefail
+        project="${GITHUB_WORKSPACE}/${WORKDIR}"
+        prompt="$(cat "$PROMPT_FILE")"
+        uv run --project "$project" omnigent run \
+          "${project}/.github/agents/${AGENT}" \
+          -p "$prompt" --no-session \
+          2>"$STDERR_FILE" | tee "$OUTPUT_FILE" \
+          || { echo "::warning::agent exited non-zero — caller keeps its fallback"; cat "$STDERR_FILE"; }
+
+    # ::add-mask:: only redacts rendered logs; the caller still redacts artifact
+    # files before upload. This aborts the run outright if the key leaked to stdout.
+    - name: Scan agent output for secrets
+      shell: bash
+      env:
+        LLM_API_KEY: ${{ inputs.llm-api-key }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+      run: |
+        set -euo pipefail
+        if [ -n "${LLM_API_KEY:-}" ] && grep -qF "$LLM_API_KEY" "$OUTPUT_FILE" 2>/dev/null; then
+          echo "::error::Agent output contains LLM_API_KEY — aborting."
+          exit 1
+        fi

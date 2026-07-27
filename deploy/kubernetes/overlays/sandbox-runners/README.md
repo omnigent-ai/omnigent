@@ -128,15 +128,53 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | Key | Meaning |
 |---|---|
 | `server_url` | URL the runner Pod's host dials back to (in-cluster service DNS by default). |
+| `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
 | `image` | Optional runner image override (defaults to the official multi-arch amd64/arm64 host image). |
 | `env` | Optional list of SERVER env-var names to inject as literal Pod env (prefer `secret_name` for credentials). |
-| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. (arm64 note: the CEL policy module is unavailable there — `cel-expr-python` ships no aarch64 wheel — and degrades gracefully.) |
+| `node_selector` | Optional extra node labels, merged with a default `kubernetes.io/arch: amd64` — set that key to `arm64` to schedule runners on arm64 nodes. |
 | `resources` | Optional `requests` / `limits` (`cpu` / `memory`) override. |
 | `in_cluster` | Optional cluster-config source: `true` (in-cluster SA only), `false` (kubeconfig only), omit (try in-cluster, then kubeconfig). |
 | `kubeconfig` | Optional kubeconfig path for the out-of-cluster fallback (env: `OMNIGENT_KUBERNETES_KUBECONFIG`). |
+| `pvc_mounts` | Optional pre-created PersistentVolumeClaims mounted into every runner Pod — see [Persistent storage mounts](#persistent-storage-mounts-pvc_mounts). |
+
+## Persistent storage mounts (`pvc_mounts`)
+
+Runner Pods are ephemeral by design — the workspace lives on an `emptyDir` and
+dies with the Pod. To expose durable data (datasets, model caches, shared
+output directories) mount pre-created PersistentVolumeClaims:
+
+1. Create the PV/PVC **in the runner namespace** (`omnigent-sandboxes`) out of
+   band — via your GitOps repo, with whatever backend your cluster provides
+   (NFS/SMB CSI drivers, SAN, cloud disks). Omnigent only references the claim;
+   it never creates volumes, so the server RBAC stays unchanged.
+2. List the claims under `sandbox.kubernetes.pvc_mounts` (see
+   `sandbox-config.yaml`). Mount paths may not overlap `/home/omnigent`, the
+   OS directories, or their ancestors (e.g. `/home`, `/var`) — the server
+   rejects such config at startup.
+
+Caveats:
+
+- **Multiple runners share writable claims concurrently** — use a
+  `ReadWriteMany`-capable backend (NFS/SMB/CephFS) for anything writable, and
+  prefer `read_only: true` (the default) everywhere else: a writable shared
+  mount lets one session's agent read and modify what another session wrote,
+  and anything written there outlives the Pod and its launch token.
+- Runner Pods run as uid/gid 1000660000 with `fsGroup`. NFS `root_squash` and
+  SMB ownership mapping must permit that identity (export to the uid, or use
+  CSI mount options like `uid=`/`gid=` for SMB); `fsGroupChangePolicy:
+  OnRootMismatch` avoids re-chowning large exports on every start.
+- `ReadWriteOnce` claims pin all runners to one node — combine with
+  `node_selector` deliberately, or the second Pod sits `Pending`.
+- A mount visible in the Pod is not automatically visible to a harness's own
+  OS-level sandbox (OmniBox path grants are separate).
+
+To verify `host_config` end to end against a live cluster, run
+`python tests/e2e/integrations/deploy/kubernetes/e2e_managed_host_config.py
+--server <url>` — it creates a managed session and asserts the injected
+config inside the runner Pod.
 
 ## Troubleshooting
 

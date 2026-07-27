@@ -15,4 +15,6 @@
     <string name="connect_action">Connect</string>
     <string name="connect_recents">Recent servers</string>
     <string name="connect_invalid">Enter a valid http(s) server URL</string>
+    <string name="menu_reload">Reload</string>
+    <string name="menu_connect_new">Connect to New Server</string>
 </resources>

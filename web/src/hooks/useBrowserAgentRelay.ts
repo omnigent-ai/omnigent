@@ -4,12 +4,14 @@
  *  (atomic CAS on the server), and only the `{claimed:true, claim_token}` winner
  *  dispatches to `window.omnigentDesktop.browser*` and POSTs the result back
  *  with its token — so multiple windows can't double-execute.
- *  Gated on `isElectronShell()`: without a WebContentsView the hook registers
- *  nothing and actions time out cleanly (no headless fallback). */
+ *  Gated on `supportsBrowser()`: without a WebContentsView the hook registers
+ *  nothing and actions time out cleanly (no headless fallback). An older
+ *  desktop build that predates the `browser*` bridge is treated as unsupported,
+ *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
-import { isElectronShell } from "@/lib/nativeBridge";
+import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
@@ -32,7 +34,7 @@ interface BrowserDesktopBridge {
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
-  if (!isElectronShell()) return null;
+  if (!supportsBrowser()) return null;
   const w = window as unknown as { omnigentDesktop?: BrowserDesktopBridge };
   return w.omnigentDesktop ?? null;
 }
@@ -344,11 +346,11 @@ async function postResult(
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
   useEffect(() => {
     if (!conversationId) return;
-    if (!isElectronShell()) return;
+    if (!supportsBrowser()) return;
 
     const handler = async (evt: BrowserActionRequestEvent) => {
       const desktop = getBrowserDesktop();
-      if (!desktop) return; // not the Electron shell — nothing to claim
+      if (!desktop) return; // no browser-capable shell — nothing to claim
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(conversationId, evt.actionId);
       if (!claimToken) return;

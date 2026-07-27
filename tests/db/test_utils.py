@@ -465,23 +465,23 @@ def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fa
 def test_generate_item_id_supports_slash_command() -> None:
     """Append path raises ``ValueError`` here if the prefix is missing."""
     item_id = generate_item_id("slash_command")
-    assert item_id.startswith("sc_")
+    assert re.fullmatch(r"[0-9a-f]{32}", item_id)
 
 
 def test_generate_item_id_supports_error_item() -> None:
-    """Append path raises ``ValueError`` here if the error prefix is missing."""
+    """``generate_item_id`` raises ``ValueError`` here if ``error`` is unknown."""
     item_id = generate_item_id("error")
-    assert item_id.startswith("err_")
+    assert re.fullmatch(r"[0-9a-f]{32}", item_id)
 
 
 def test_generate_item_id_supports_resource_event() -> None:
     """Regression: ``resource_event`` (terminal launch/close lifecycle) was
     registered in the read-path map (``ITEM_TYPE_TO_DATA_CLS``) but missing
-    from ``_ITEM_TYPE_PREFIX``, so every such item failed ``generate_item_id``
+    from ``_ITEM_TYPES``, so every such item failed ``generate_item_id``
     with 'unknown item type' and never persisted (relay-persist traceback flood
     on every terminal launch/close)."""
     item_id = generate_item_id("resource_event")
-    assert item_id.startswith("rse_")
+    assert re.fullmatch(r"[0-9a-f]{32}", item_id)
 
 
 def test_item_type_id_and_data_registries_cover_the_same_types() -> None:
@@ -494,13 +494,13 @@ def test_item_type_id_and_data_registries_cover_the_same_types() -> None:
     loud unit-test failure instead of a per-item production traceback — exactly
     how ``resource_event`` slipped through (added to the data map, forgotten in
     the id map)."""
-    from omnigent.db.utils import _ITEM_TYPE_PREFIX
+    from omnigent.db.utils import _ITEM_TYPES
     from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 
-    assert set(_ITEM_TYPE_PREFIX) == set(ITEM_TYPE_TO_DATA_CLS), (
+    assert set(_ITEM_TYPES) == set(ITEM_TYPE_TO_DATA_CLS), (
         "item-type registries diverged — "
-        f"only in id/write path: {set(_ITEM_TYPE_PREFIX) - set(ITEM_TYPE_TO_DATA_CLS)}; "
-        f"only in data/read path: {set(ITEM_TYPE_TO_DATA_CLS) - set(_ITEM_TYPE_PREFIX)}"
+        f"only in id/write path: {set(_ITEM_TYPES) - set(ITEM_TYPE_TO_DATA_CLS)}; "
+        f"only in data/read path: {set(ITEM_TYPE_TO_DATA_CLS) - set(_ITEM_TYPES)}"
     )
 
 
@@ -511,11 +511,11 @@ def test_builtin_agent_id_is_deterministic_and_name_specific() -> None:
 
 
 def test_builtin_agent_id_matches_generated_id_shape_and_length() -> None:
-    """Pins both to ``ag_`` + 32 hex (35 chars) so a built-in id stays
+    """Pins both to a bare 32-char hex id so a built-in id stays
     indistinguishable from a generated one and the two can't diverge in length."""
     built_in = builtin_agent_id("nessie")
-    assert re.fullmatch(r"ag_[0-9a-f]{32}", built_in)
-    assert len(built_in) == len(generate_agent_id()) == 35
+    assert re.fullmatch(r"[0-9a-f]{32}", built_in)
+    assert len(built_in) == len(generate_agent_id()) == 32
 
 
 def test_extract_search_text_for_slash_command_with_output() -> None:
@@ -571,7 +571,7 @@ def test_extract_search_text_for_resource_event_item() -> None:
     """Runner resource replay persists cleanly and indexes stable ids."""
     item = NewConversationItem(
         type="resource_event",
-        response_id="conv_1",
+        response_id="8e32600337d08f59ad381caf96a90659",
         data=ResourceEventData(
             event_type="session.resource.created",
             resource_id="resource_codex_conv_1",

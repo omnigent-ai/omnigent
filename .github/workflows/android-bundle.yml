@@ -1,0 +1,64 @@
+name: Android Bundle
+
+# Builds an unsigned release AAB in CI and uploads it as a workflow artifact.
+# Download the artifact and sign it locally with your upload keystore — no
+# secrets on GitHub, no signing key in CI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version-code:
+        description: "versionCode (must be higher than the last uploaded to Play; starts at 3)"
+        required: true
+        type: string
+      version-note:
+        description: "Optional note appended to the artifact filename (e.g. rc1)"
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - ".github/workflows/android-bundle.yml"
+      - "web/android/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned AAB
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/android
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947  # v4
+        with:
+          cache-read-only: false
+
+      - name: Build release AAB
+        run: ./gradlew bundleRelease --no-daemon --console=plain -PversionCode=${{ github.event.inputs.version-code }}
+
+      - name: Verify artifact
+        run: |
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          test -f "$AAB" || { echo "::error::AAB not found at $AAB"; exit 1; }
+          echo "AAB size: $(du -h "$AAB" | cut -f1)"
+
+      - name: Upload artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: omnigent-android-aab${{ inputs.version-note && format('-{0}', inputs.version-note) || '' }}
+          path: web/android/app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30

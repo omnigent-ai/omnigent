@@ -112,12 +112,12 @@ def test_dispatch_by_runtime_claude_native_remote_routes_to_wrapper(
     monkeypatch.setattr("omnigent.claude_native.run_claude_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
-        target="conv_abc",
+        target="4e92b5a0c0ee6db3f874f9c4a3f855a5",
         server="https://example.com/",  # trailing slash — must be normalized
     )
 
     # session_id preserves the Omnigent conv id end-to-end.
-    assert captured["session_id"] == "conv_abc"
+    assert captured["session_id"] == "4e92b5a0c0ee6db3f874f9c4a3f855a5"
     # Trailing slash stripped — the wrapper expects a bare base URL.
     assert captured["server"] == "https://example.com"
     # No leaking claude args; the wrapper builds its own.
@@ -152,11 +152,11 @@ def test_dispatch_by_runtime_codex_native_remote_routes_to_wrapper(
     monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
-        target="conv_abc",
+        target="4e92b5a0c0ee6db3f874f9c4a3f855a5",
         server="https://example.com/",
     )
 
-    assert captured["session_id"] == "conv_abc"
+    assert captured["session_id"] == "4e92b5a0c0ee6db3f874f9c4a3f855a5"
     assert captured["server"] == "https://example.com"
     assert captured["codex_args"] == ()
 
@@ -189,11 +189,11 @@ def test_dispatch_by_runtime_codex_native_local_routes_to_wrapper(
     monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
-        target="conv_codex",
+        target="415c9954e2fe4b9276083a4d2c66f689",
         server=None,
     )
 
-    assert captured["session_id"] == "conv_codex"
+    assert captured["session_id"] == "415c9954e2fe4b9276083a4d2c66f689"
     assert captured["server"] is None
     assert captured["codex_args"] == ()
 
@@ -215,11 +215,11 @@ def test_dispatch_by_runtime_kiro_native_remote_routes_to_wrapper(
     monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
-        target="conv_kiro",
+        target="823dbd1aab969b5a813fac59bb977a77",
         server="https://example.com/",
     )
 
-    assert captured["session_id"] == "conv_kiro"
+    assert captured["session_id"] == "823dbd1aab969b5a813fac59bb977a77"
     assert captured["server"] == "https://example.com"
     assert captured["kiro_args"] == ()
 
@@ -256,11 +256,11 @@ def test_dispatch_by_runtime_antigravity_native_remote_routes_to_wrapper(
     monkeypatch.setattr("omnigent.antigravity_native.run_antigravity_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
-        target="conv_agy",
+        target="a8bcbee631c58ddb98fb5e3f54a1592a",
         server="https://example.com/",
     )
 
-    assert captured["session_id"] == "conv_agy"
+    assert captured["session_id"] == "a8bcbee631c58ddb98fb5e3f54a1592a"
     assert captured["server"] == "https://example.com"
     assert captured["antigravity_args"] == ()
 
@@ -293,11 +293,11 @@ def test_dispatch_by_runtime_antigravity_native_local_routes_to_wrapper(
     monkeypatch.setattr("omnigent.antigravity_native.run_antigravity_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
-        target="conv_agy_local",
+        target="e85224ee39457def1d20bcce5b74ed8c",
         server=None,
     )
 
-    assert captured["session_id"] == "conv_agy_local"
+    assert captured["session_id"] == "e85224ee39457def1d20bcce5b74ed8c"
     assert captured["server"] is None
     assert captured["antigravity_args"] == ()
 
@@ -330,11 +330,11 @@ def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
     monkeypatch.setattr("omnigent.claude_native.run_claude_native", _capture)
 
     resume_dispatch._dispatch_by_runtime(
-        target="conv_claude",
+        target="64a784c3aa907d1774f44313546947c6",
         server=None,
     )
 
-    assert captured["session_id"] == "conv_claude"
+    assert captured["session_id"] == "64a784c3aa907d1774f44313546947c6"
     assert captured["server"] is None
     assert captured["claude_args"] == ()
 
@@ -356,12 +356,12 @@ def test_dispatch_by_runtime_non_wrapper_local_raises_with_hint(
 
     with pytest.raises(click.ClickException) as excinfo:
         resume_dispatch._dispatch_by_runtime(
-            target="conv_chat",
+            target="11dc2163ab84c5afa09348998a2b6690",
             server=None,
         )
 
     msg = excinfo.value.message
-    assert "conv_chat" in msg
+    assert "11dc2163ab84c5afa09348998a2b6690" in msg
     assert "omnigent run --resume" in msg
     assert "<agent.yaml>" in msg
 
@@ -385,9 +385,9 @@ def test_read_wrapper_label_local_reads_persistent_store(
     db_path = tmp_path / "chat.db"
     store = SqlAlchemyConversationStore(f"sqlite:///{db_path}")
     created = store.create_session_with_agent(
-        agent_id="ag_codex",
+        agent_id="12c8c7631b209d1027416b4bf7604999",
         agent_name="codex-native-ui",
-        agent_bundle_location="ag_codex/bundle",
+        agent_bundle_location="12c8c7631b209d1027416b4bf7604999/bundle",
         agent_description=None,
         labels={"omnigent.wrapper": "codex-native-ui"},
     )
@@ -426,12 +426,12 @@ def test_dispatch_by_runtime_non_claude_native_remote_raises_with_hint(
 
     with pytest.raises(click.ClickException) as excinfo:
         resume_dispatch._dispatch_by_runtime(
-            target="conv_xyz",
+            target="12b8fd5b4413ededb99560e847b32b0e",
             server="https://example.com",
         )
     msg = excinfo.value.message
     # All three load-bearing pieces of the hint must appear.
-    assert "conv_xyz" in msg
+    assert "12b8fd5b4413ededb99560e847b32b0e" in msg
     assert "omnigent run --resume" in msg
     assert "https://example.com" in msg
 
@@ -458,12 +458,12 @@ def test_read_wrapper_label_remote_returns_label_when_present(
         :returns: A 200 response with a labelled body.
         """
         del headers, timeout
-        assert url.endswith("/v1/sessions/conv_abc"), url
+        assert url.endswith("/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5"), url
         return httpx.Response(
             200,
             json={
-                "id": "conv_abc",
-                "agent_id": "ag_1",
+                "id": "4e92b5a0c0ee6db3f874f9c4a3f855a5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
                 "status": "idle",
                 "created_at": 1,
                 "labels": {"omnigent.wrapper": "claude-code-native-ui"},
@@ -478,7 +478,7 @@ def test_read_wrapper_label_remote_returns_label_when_present(
 
     result = resume_dispatch._read_wrapper_label_remote(
         server="https://example.com",
-        conv_id="conv_abc",
+        conv_id="4e92b5a0c0ee6db3f874f9c4a3f855a5",
     )
     assert result == "claude-code-native-ui"
 
@@ -499,8 +499,8 @@ def test_read_wrapper_label_remote_returns_none_when_label_missing(
         return httpx.Response(
             200,
             json={
-                "id": "conv_abc",
-                "agent_id": "ag_1",
+                "id": "4e92b5a0c0ee6db3f874f9c4a3f855a5",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
                 "status": "idle",
                 "created_at": 1,
                 "labels": {"some.other": "label"},
@@ -515,7 +515,7 @@ def test_read_wrapper_label_remote_returns_none_when_label_missing(
 
     result = resume_dispatch._read_wrapper_label_remote(
         server="https://example.com",
-        conv_id="conv_abc",
+        conv_id="4e92b5a0c0ee6db3f874f9c4a3f855a5",
     )
     assert result is None
 
@@ -545,7 +545,7 @@ def test_read_wrapper_label_remote_raises_on_404(
     with pytest.raises(click.ClickException) as excinfo:
         resume_dispatch._read_wrapper_label_remote(
             server="https://example.com",
-            conv_id="conv_missing",
+            conv_id="5eca720dc2bc6cdc3a99028d7bd0f917",
         )
-    assert "conv_missing" in excinfo.value.message
+    assert "5eca720dc2bc6cdc3a99028d7bd0f917" in excinfo.value.message
     assert "not found" in excinfo.value.message

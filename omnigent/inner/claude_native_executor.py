@@ -24,7 +24,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
-from omnigent.inner.native_attachments import materialize_attachment
+from omnigent.inner.native_attachments import attachment_reference_line
 
 _logger = logging.getLogger(__name__)
 
@@ -245,13 +245,7 @@ def _content_to_text(content: Any, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                path = materialize_attachment(block, bridge_dir)
-                if path is not None:
-                    # Marker format is load-bearing: the transcript mirrors
-                    # this text back as the durable user message, and title
-                    # seeding strips lines matching _ATTACHMENT_MARKER_RE in
-                    # omnigent/entities/conversation.py. Keep in sync.
-                    attachment_lines.append(f"[Attached: {path}]")
+                attachment_lines.append(attachment_reference_line(block, bridge_dir))
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""

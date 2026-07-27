@@ -59,8 +59,10 @@ class SqlAlchemyCommentStore(CommentStore):
     def get(self, comment_id: str, conversation_id: str) -> Comment | None:
         """Fetch a single comment by id, scoped to a conversation. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != conversation_id:
+            # conversation_id is part of the PK, so the lookup itself enforces
+            # the conversation scoping — a wrong conversation simply misses.
+            row = session.get(SqlComment, (current_workspace_id(), conversation_id, comment_id))
+            if row is None:
                 return None
             return _to_entity(row)
 
@@ -81,7 +83,7 @@ class SqlAlchemyCommentStore(CommentStore):
         # backfill (created_at * 1e6) and docs rely on.
         created_us = now_epoch_us()
         row = SqlComment(
-            id=str(uuid.uuid4()),
+            id=uuid.uuid4().hex,
             conversation_id=conversation_id,
             path=path,
             start_index=start_index,
@@ -126,8 +128,8 @@ class SqlAlchemyCommentStore(CommentStore):
     ) -> Comment | None:
         """Update a comment's fields, scoped to a conversation. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != conversation_id:
+            row = session.get(SqlComment, (current_workspace_id(), conversation_id, comment_id))
+            if row is None:
                 return None
             if status is not None:
                 row.status = encode_comment_status(status)
@@ -140,8 +142,8 @@ class SqlAlchemyCommentStore(CommentStore):
     def delete(self, comment_id: str, conversation_id: str) -> Comment | None:
         """Delete a single comment by id, scoped to a conversation. See base class for contract."""
         with self._session() as session:
-            row = session.get(SqlComment, (current_workspace_id(), comment_id))
-            if row is None or row.conversation_id != conversation_id:
+            row = session.get(SqlComment, (current_workspace_id(), conversation_id, comment_id))
+            if row is None:
                 return None
             entity = _to_entity(row)
             session.delete(row)

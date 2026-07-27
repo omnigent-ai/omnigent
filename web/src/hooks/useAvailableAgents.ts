@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
@@ -39,6 +39,10 @@ export interface AvailableAgent {
   // immutable, so it is the stable signal. Omitted on older servers and on
   // session-derived agents (whose recency comes from the scanned session).
   created_at?: number | null;
+  // Session id used to fetch the full agent spec on hover. Only set on
+  // session-discovered agents (custom uploads); absent on catalog agents
+  // whose full data is already present from GET /v1/agents.
+  sessionId?: string;
 }
 
 const DISPLAY_NAMES: Record<string, string> = {
@@ -132,11 +136,11 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
-    // Raw passthrough (not coerced): an absent value stays undefined so
-    // older servers degrade to "protected" and existing strict-equality
-    // tests (which ignore undefined props) are unaffected.
-    builtin: a.builtin,
-    created_at: a.created_at,
+    // Omit rather than set to undefined so toEqual comparisons aren't
+    // sensitive to absent-vs-undefined. Logic that reads builtin treats
+    // undefined as "protected" (same as true), so omission is safe.
+    ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
+    ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
   }));
 }
 
@@ -194,42 +198,72 @@ interface AgentObjectWire {
 }
 
 /**
- * Enrich one scanned session agent into the picker's AvailableAgent
- * shape via `GET /v1/sessions/{id}/agent` (description, harness,
- * bundled skills). On failure the agent is still listed with the
- * name-only fields from the scan — mirroring the server's own
- * `_to_agent_object` degradation: one unloadable bundle must not
- * break discovery.
+ * Build an AvailableAgent from session scan data alone — no extra fetch.
+ * description, harness, and skills are null/empty and filled in on hover
+ * via prefetchAvailableAgentDetails.
  */
-async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<AvailableAgent> {
-  const fallback: AvailableAgent = {
+function sessionAgentFromScan(scanned: ScannedSessionAgent): AvailableAgent {
+  return {
     id: scanned.agentId,
     name: scanned.agentName,
     display_name: displayNameForAgent(scanned.agentName),
     description: null,
     harness: null,
     skills: [],
+    sessionId: scanned.sessionId,
     // builtin/created_at intentionally omitted: session-derived agents never
     // seed the catalog, and their recency comes from the scanned session's
     // createdAt (used directly in the dedup), not from this object.
   };
+}
+
+/**
+ * Fetch harness, description, and skills for a session-discovered agent and
+ * patch them into the ["available-agents"] cache. Call on hover so the data
+ * is ready before the user clicks — zero cost for agents they never hover.
+ */
+export async function prefetchAvailableAgentDetails(
+  agent: AvailableAgent,
+  queryClient: QueryClient,
+): Promise<void> {
+  if (!agent.sessionId || agent.harness !== null || agent.description !== null) return;
   try {
     const res = await authenticatedFetch(
-      `/v1/sessions/${encodeURIComponent(scanned.sessionId)}/agent`,
+      `/v1/sessions/${encodeURIComponent(agent.sessionId)}/agent`,
     );
-    if (!res.ok) return fallback;
+    if (!res.ok) return;
     const json = (await res.json()) as AgentObjectWire;
-    return {
-      ...fallback,
-      display_name: displayNameForAgent(json.name, json.harness),
-      description: json.description ?? null,
-      harness: json.harness ?? null,
-      skills: json.skills ?? [],
-    };
+    queryClient.setQueryData<AvailableAgent[]>(["available-agents"], (prev) => {
+      if (!prev) return prev;
+      const enriched = prev.map((a) =>
+        a.id !== agent.id
+          ? a
+          : {
+              ...a,
+              display_name: displayNameForAgent(json.name, json.harness),
+              description: json.description ?? null,
+              harness: json.harness ?? null,
+              skills: json.skills ?? [],
+            },
+      );
+      // If enrichment reveals this agent is a native coding agent (e.g. a
+      // kiro-native session with a non-canonical name), remove it when a
+      // seeded built-in with the same native key already exists so it doesn't
+      // surface as a duplicate picker row.
+      const enrichedAgent = enriched.find((a) => a.id === agent.id);
+      const enrichedKey = enrichedAgent
+        ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
+        : undefined;
+      if (enrichedKey) {
+        const builtinExists = enriched.some(
+          (a) => a.id !== agent.id && nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
+        );
+        if (builtinExists) return enriched.filter((a) => a.id !== agent.id);
+      }
+      return enriched;
+    });
   } catch {
-    // Network-level failure — same best-effort degradation as the
-    // non-ok branch above: list the agent from scan fields.
-    return fallback;
+    // Best-effort — agent stays name-only on failure.
   }
 }
 
@@ -326,16 +360,12 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
     }
   }
 
-  const resolved = (
-    await Promise.all(
-      Array.from(byName.values()).map((c) =>
-        c.template !== null ? Promise.resolve(c.template) : enrichSessionAgent(c.scanned!),
-      ),
-    )
-  ).filter((agent) => {
-    const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
-    return nativeKey !== "kiro" || !hasKiroBuiltin;
-  });
+  const resolved = Array.from(byName.values())
+    .map((c) => (c.template !== null ? c.template : sessionAgentFromScan(c.scanned!)))
+    .filter((agent) => {
+      const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
+      return nativeKey !== "kiro" || !hasKiroBuiltin;
+    });
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names
   // keep this relative order.

@@ -13,6 +13,9 @@ covered by the codex_native_forwarder unit tests.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
+
 import httpx
 from playwright.sync_api import Page, expect
 
@@ -39,6 +42,41 @@ def _publish_mcp_startup(
         timeout=10.0,
     )
     resp.raise_for_status()
+
+
+def _publish_until(
+    base_url: str,
+    session_id: str,
+    servers: dict[str, dict[str, str | None]],
+    expectation: Callable[[], None],
+) -> None:
+    """Publish a live-only startup map until the band reflects it.
+
+    The session stream is snapshot-plus-live-tail with no buffer or
+    replay (see ``_stream_live_events``): a map published in the window
+    between the page's snapshot load and its live SSE subscription is
+    dropped, leaving the band stuck on the last-rendered state. The
+    startup map is full-state and idempotent, so the fix is to keep
+    re-publishing it until the assertion passes — a real live-handler
+    regression still never satisfies *expectation*, so this closes the
+    connect race without weakening the check.
+
+    :param base_url: Base URL of the local e2e server.
+    :param session_id: Session/conversation id.
+    :param servers: Full startup map to publish each attempt.
+    :param expectation: Playwright ``expect`` assertion for the state the
+        published map should drive; polled between re-publishes.
+    :returns: None.
+    """
+    deadline = time.monotonic() + 30.0
+    while True:
+        _publish_mcp_startup(base_url, session_id, servers)
+        try:
+            expectation()
+            return
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
 
 
 def test_mcp_startup_band_lifecycle(
@@ -71,8 +109,10 @@ def test_mcp_startup_band_lifecycle(
     expect(band).to_contain_text("Starting MCP servers (0/3): glean, jira, safe", timeout=15_000)
 
     # 2. Live progress: one server settles, the count advances and the
-    #    settled name drops out of the pending list.
-    _publish_mcp_startup(
+    #    settled name drops out of the pending list. This is the first
+    #    live-tail-dependent step, so re-publish the idempotent map until
+    #    the browser's SSE subscription is up and receives it.
+    _publish_until(
         base_url,
         session_id,
         {
@@ -80,12 +120,14 @@ def test_mcp_startup_band_lifecycle(
             "jira": {"status": "starting", "error": None},
             "safe": {"status": "starting", "error": None},
         },
+        lambda: expect(band).to_contain_text(
+            "Starting MCP servers (1/3): jira, safe", timeout=3_000
+        ),
     )
-    expect(band).to_contain_text("Starting MCP servers (1/3): jira, safe", timeout=15_000)
 
     # 3. The round settles with a failure: the spinner flips to the
     #    warning naming the server that never came up.
-    _publish_mcp_startup(
+    _publish_until(
         base_url,
         session_id,
         {
@@ -93,13 +135,19 @@ def test_mcp_startup_band_lifecycle(
             "jira": {"status": "ready", "error": None},
             "safe": {"status": "failed", "error": "handshaking with MCP server failed"},
         },
+        lambda: expect(band).to_contain_text(
+            "MCP startup incomplete (failed: safe)", timeout=3_000
+        ),
     )
-    expect(band).to_contain_text("MCP startup incomplete (failed: safe)", timeout=15_000)
 
     # 4. A settled-empty map clears the band entirely (and evicts the
     #    snapshot cache): the session reads as a normal idle chat again.
-    _publish_mcp_startup(base_url, session_id, {})
-    expect(band).to_have_count(0, timeout=15_000)
+    _publish_until(
+        base_url,
+        session_id,
+        {},
+        lambda: expect(band).to_have_count(0, timeout=3_000),
+    )
 
 
 def test_mcp_startup_band_shows_cancelled_after_stop(
@@ -131,11 +179,13 @@ def test_mcp_startup_band_shows_cancelled_after_stop(
     expect(band).to_contain_text("Starting MCP server: storage-console", timeout=15_000)
 
     # What the runner's Stop handler publishes after cancel_pending_mcp_startup.
-    _publish_mcp_startup(
+    # First live-tail-dependent step — re-publish until the SSE subscription
+    # is up (the seed above rode the snapshot on load; this one does not).
+    _publish_until(
         base_url,
         session_id,
         {"storage-console": {"status": "cancelled", "error": None}},
-    )
-    expect(band).to_contain_text(
-        "MCP startup incomplete (cancelled: storage-console)", timeout=15_000
+        lambda: expect(band).to_contain_text(
+            "MCP startup incomplete (cancelled: storage-console)", timeout=3_000
+        ),
     )

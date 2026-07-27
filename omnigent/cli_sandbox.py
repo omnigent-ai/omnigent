@@ -95,7 +95,7 @@ def _require_cli_bootstrap(launcher: SandboxLauncher) -> None:
     :raises click.ClickException: When the provider has no CLI
         bootstrap flow.
     """
-    if not launcher.supports_cli_bootstrap:
+    if not launcher.capabilities.cli_bootstrap:
         raise click.ClickException(
             f"The '{launcher.provider}' provider supports server-managed "
             "sessions only — create one with "
@@ -276,7 +276,7 @@ def sandbox_create(
     # The in-sandbox login only exists for providers that can forward
     # the browser's callback port — others skip it automatically, no
     # --no-auth acknowledgement required.
-    if not launcher.supports_local_port_forward:
+    if not launcher.capabilities.local_port_forward:
         skip_auth = True
     sandbox_id = bootstrap_sandbox_host(
         launcher,

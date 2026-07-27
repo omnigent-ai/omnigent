@@ -63,6 +63,7 @@ import type {
   StreamEvent,
   TextDelta,
   ToolCall,
+  ToolOutputDelta,
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
@@ -322,6 +323,12 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const final = typeof data.final === "boolean" ? data.final : undefined;
     return { type: "text_delta", delta, messageId, index, final } satisfies TextDelta;
   }
+  if (eventType === "response.function_call_output.delta") {
+    const callId = data.call_id;
+    const delta = data.delta;
+    if (typeof callId !== "string" || !callId || typeof delta !== "string") return null;
+    return { type: "tool_output_delta", callId, delta } satisfies ToolOutputDelta;
+  }
 
   // Reasoning.
   if (eventType === "response.reasoning.started") {
@@ -430,12 +437,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         typeof data.background_task_count === "number" && data.background_task_count >= 0
           ? data.background_task_count
           : undefined;
+      const rawError = data.error;
+      const error =
+        rawError != null &&
+        typeof rawError === "object" &&
+        typeof (rawError as Record<string, unknown>).code === "string" &&
+        typeof (rawError as Record<string, unknown>).message === "string"
+          ? {
+              code: (rawError as Record<string, unknown>).code as string,
+              message: (rawError as Record<string, unknown>).message as string,
+            }
+          : undefined;
       return {
         type: "session_status",
         conversationId,
         status,
         responseId,
         backgroundTaskCount,
+        ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
     }
     return null;

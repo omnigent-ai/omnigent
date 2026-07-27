@@ -37,7 +37,7 @@ def _seed_session_with_grants(
     :param db_uri: SQLite URI for the per-test database.
     :param grants: Mapping of ``{user_email: level}`` to grant on the new
         session, e.g. ``{"alice@example.com": LEVEL_EDIT}``.
-    :returns: The newly created conversation ID, e.g. ``"conv_abc123"``.
+    :returns: The newly created conversation ID, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     """
     conv_store = SqlAlchemyConversationStore(db_uri)
     conversation = conv_store.create_conversation()
@@ -149,7 +149,7 @@ async def test_create_policy(
     assert body["enabled"] is True
     assert body["source"] == "session"
     assert body["object"] == "session.policy"
-    assert body["id"].startswith("pol_")
+    assert len(body["id"]) == 32
     assert body["created_at"] > 0
     assert body["updated_at"] is None
 
@@ -372,7 +372,7 @@ async def test_get_nonexistent_returns_404(
     """
     session_id = _seed_session_with_grants(db_uri, {"alice@example.com": LEVEL_READ})
     resp = await auth_client.get(
-        f"/v1/sessions/{session_id}/policies/spol_nonexistent",
+        f"/v1/sessions/{session_id}/policies/1849035e76954fbd652b51dff31a4a96",
         headers={"X-Forwarded-Email": "alice@example.com"},
     )
     assert resp.status_code == 404

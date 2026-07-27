@@ -23,7 +23,12 @@ import json
 import logging
 from typing import Any
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_user_text,
+)
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
@@ -354,8 +359,8 @@ def intent_based_authorization() -> PolicyCallable:
             if state.get(_INTENT_KEY):
                 return None  # intent already recorded — nothing to do
 
-            message = event.get("data", "")
-            if not isinstance(message, str) or not message.strip():
+            message = request_user_text(event.get("data"))
+            if not message.strip():
                 return None
 
             return {

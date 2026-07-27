@@ -23,7 +23,7 @@ import {
   WrenchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isElectronShell } from "@/lib/nativeBridge";
+import { supportsBrowser } from "@/lib/nativeBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 
@@ -87,7 +87,7 @@ interface BrowserPaneBridge {
 }
 
 function getBridge(): BrowserPaneBridge | null {
-  if (!isElectronShell()) return null;
+  if (!supportsBrowser()) return null;
   const w = window as unknown as { omnigentDesktop?: BrowserPaneBridge };
   return w.omnigentDesktop ?? null;
 }
@@ -106,7 +106,7 @@ export interface BrowserPaneProps {
 export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
-  const electron = isElectronShell();
+  const browserSupported = supportsBrowser();
   // Whether a native view is attached for THIS conversation — drives when the
   // measuring placeholder mounts (no empty pane on an idle conversation).
   const [viewActive, setViewActive] = useState(false);
@@ -130,7 +130,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   // probe on re-mount; (3) host-active-changed for later attach/detach.
   // browser-view-closed flips it false.
   useEffect(() => {
-    if (!electron) return;
+    if (!browserSupported) return;
     const bridge = getBridge();
     if (!bridge) return;
     let cancelled = false;
@@ -159,13 +159,13 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
       unsubActive?.();
       unsubClosed?.();
     };
-  }, [conversationId, electron]);
+  }, [conversationId, browserSupported]);
 
   // Live-track the real URL + back/forward via did-navigate listeners (redirects,
   // link clicks, agent nav all keep the bar honest), but never stomp the input
   // while the user is editing it (urlEditingRef).
   useEffect(() => {
-    if (!electron) return;
+    if (!browserSupported) return;
     const bridge = getBridge();
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
@@ -182,7 +182,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
       unsubUrl?.();
       unsubNav?.();
     };
-  }, [conversationId, electron]);
+  }, [conversationId, browserSupported]);
 
   // ── Toolbar handlers ─────────────────────────────────────────────────────
 
@@ -285,7 +285,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   // present; DETACH (not destroy) on unmount so a background agent's page keeps
   // running when the user switches away. A later mount re-attaches.
   useEffect(() => {
-    if (!electron || !viewActive) return;
+    if (!browserSupported || !viewActive) return;
     const bridge = getBridge();
     if (!bridge?.browserSetActive) return;
     void bridge.browserSetActive(conversationId);
@@ -313,7 +313,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
         /* swallow — window may be tearing down */
       }
     };
-  }, [conversationId, electron, viewActive, syncBounds]);
+  }, [conversationId, browserSupported, viewActive, syncBounds]);
 
   // Reconcile bounds every frame while shown (cheap: same-rect setBounds is a
   // no-op + we dedupe via lastBoundsRef). Catches position-only shifts that
@@ -321,7 +321,7 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
   // teardown still schedules the next frame — else the rAF chain dies and the
   // overlay strands.
   useEffect(() => {
-    if (!electron || !viewActive) return;
+    if (!browserSupported || !viewActive) return;
     let rafId = 0;
     const tick = () => {
       try {
@@ -333,13 +333,13 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, [electron, viewActive, syncBounds]);
+  }, [browserSupported, viewActive, syncBounds]);
 
   // Defense-in-depth against a hung rAF chain: ResizeObserver (size), window
   // resize, and visibilitychange (tab-back, where rAFs were throttled) each
   // recover bounds on the next interaction.
   useEffect(() => {
-    if (!electron || !viewActive || !containerRef.current) return;
+    if (!browserSupported || !viewActive || !containerRef.current) return;
     const el = containerRef.current;
     const ro = new ResizeObserver(() => syncBounds());
     ro.observe(el);
@@ -354,11 +354,12 @@ export function BrowserPane({ conversationId, className }: BrowserPaneProps) {
       window.removeEventListener("resize", onResize);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [electron, viewActive, syncBounds]);
+  }, [browserSupported, viewActive, syncBounds]);
 
-  // Plain browser (non-Electron): render nothing so the web build has no empty
-  // split pane. The relay is a no-op there anyway.
-  if (!electron) return null;
+  // No browser-capable shell (plain web build, or a desktop build too old for
+  // the embedded browser): render nothing so there's no empty split pane. The
+  // relay is a no-op there anyway.
+  if (!browserSupported) return null;
 
   // Flex column: the toolbar (shrink-0) is ALWAYS the first child so the URL bar
   // is reachable from a cold start (typing a URL creates the view on demand →
