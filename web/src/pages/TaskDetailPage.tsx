@@ -12,7 +12,7 @@
  * open-conversation link) — never an invented summary line.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   CalendarOffIcon,
@@ -75,16 +75,6 @@ export function TaskDetailPage() {
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
-  // Keeps the Run now button disabled through the ~10s post-fire poll window so
-  // a quick second click can't trigger a 409 "already in flight" from the server.
-  const [justFired, setJustFired] = useState(false);
-  const justFiredTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (justFiredTimerRef.current != null) clearTimeout(justFiredTimerRef.current);
-    };
-  }, []);
 
   // Resolve the agent + host display labels from their catalogs. Both are
   // best-effort: an unknown id falls back to the raw id (agent) or a friendly
@@ -145,14 +135,7 @@ export function TaskDetailPage() {
 
   function handleRunNow() {
     runNowMutation.mutate(task!.id, {
-      onSuccess: () => {
-        showToast("Run started");
-        // Disable Run now for ~10s while the background fire is in flight so a
-        // quick second click doesn't hit the server's overlap guard (409).
-        setJustFired(true);
-        if (justFiredTimerRef.current != null) clearTimeout(justFiredTimerRef.current);
-        justFiredTimerRef.current = setTimeout(() => setJustFired(false), 10_000);
-      },
+      onSuccess: () => showToast("Run started"),
       onError: (err) => {
         // A 409 (CONFLICT) means a run for this task is already in flight — the
         // run is fine. Show a truthful, non-alarming message.
@@ -203,17 +186,18 @@ export function TaskDetailPage() {
           >
             <Trash2Icon className="size-4" />
           </Button>
-          <Button
-            data-testid="task-detail-run-now"
-            disabled={busy || justFired}
-            onClick={handleRunNow}
-          >
+          <Button data-testid="task-detail-run-now" disabled={busy} onClick={handleRunNow}>
             {runNowMutation.isPending ? (
-              <Loader2Icon className="size-4 animate-spin" />
+              <>
+                <Loader2Icon className="size-4 animate-spin" />
+                In progress
+              </>
             ) : (
-              <PlayIcon className="size-4" />
+              <>
+                <PlayIcon className="size-4" />
+                Run now
+              </>
             )}
-            Run now
           </Button>
         </div>
       </div>
@@ -487,7 +471,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
           data-testid="run-status-dot"
           data-run-icon="unread"
           data-run-unread={true}
-          className="size-2.5 shrink-0 rounded-full bg-brand-accent"
+          className="size-2 shrink-0 rounded-full bg-brand-accent"
         />
       </IndicatorWithTooltip>
     );
@@ -500,7 +484,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
       data-testid="run-status-dot"
       data-run-icon={run.status === "succeeded" ? "read" : "pending"}
       data-run-unread={run.status === "succeeded" ? false : undefined}
-      className="size-2.5 shrink-0 rounded-full bg-muted-foreground/40"
+      className="size-2 shrink-0 rounded-full bg-muted-foreground/40"
     />
   );
   if (run.status === "succeeded") {

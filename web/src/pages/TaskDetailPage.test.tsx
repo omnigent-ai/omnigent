@@ -9,7 +9,7 @@
 // All data hooks are mocked at their seam; the edit dialog is stubbed so we
 // only assert it opened. useParams/useNavigate come from `@/lib/routing`.
 
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -317,31 +317,34 @@ describe("header actions", () => {
     expect(showToast).toHaveBeenCalledWith("This run is already in progress");
   });
 
-  it("Run now button stays disabled through the 10s justFired window after success", async () => {
-    vi.useFakeTimers();
-    try {
-      runNowMutate.mockImplementation(
-        (_id: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) =>
-          opts?.onSuccess?.(),
-      );
-      setTask(task());
-      renderPage();
-      const btn = screen.getByTestId("task-detail-run-now");
-      expect(btn).not.toBeDisabled();
-      // Wrap in act so the synchronous onSuccess → setJustFired(true) state update flushes.
-      await act(async () => {
-        fireEvent.click(btn);
-      });
-      // After success the button should be disabled (justFired=true).
-      expect(btn).toBeDisabled();
-      // Advance past the 10s window so the timer fires and setJustFired(false) runs.
-      await act(async () => {
-        vi.advanceTimersByTime(10_001);
-      });
-      expect(btn).not.toBeDisabled();
-    } finally {
-      vi.useRealTimers();
-    }
+  it("Run now button shows spinner + 'In progress' while pending and re-enables after", () => {
+    // Simulate a pending mutation (isPending=true while it hasn't resolved).
+    vi.mocked(hooks.useRunScheduledTaskNow).mockReturnValue({
+      mutate: runNowMutate,
+      isPending: true,
+    } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+    setTask(task());
+    renderPage();
+    const btn = screen.getByTestId("task-detail-run-now");
+    // Button is disabled while pending (busy includes runNowMutation.isPending).
+    expect(btn).toBeDisabled();
+    // Shows "In progress" text (not "Run now").
+    expect(btn).toHaveTextContent("In progress");
+    expect(btn.querySelector(".animate-spin")).not.toBeNull();
+
+    // Once the mutation resolves (isPending=false), button re-enables with "Run now".
+    vi.mocked(hooks.useRunScheduledTaskNow).mockReturnValue({
+      mutate: runNowMutate,
+      isPending: false,
+    } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
+    // Re-render by re-calling renderPage on a fresh DOM is awkward; just check the
+    // idle state in a separate render.
+    cleanup();
+    renderPage();
+    const idleBtn = screen.getByTestId("task-detail-run-now");
+    expect(idleBtn).not.toBeDisabled();
+    expect(idleBtn).toHaveTextContent("Run now");
+    expect(idleBtn.querySelector(".animate-spin")).toBeNull();
   });
 
   it("toggling the Switch off pauses an active task (update to paused)", () => {
