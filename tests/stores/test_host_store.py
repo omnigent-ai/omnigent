@@ -855,6 +855,46 @@ def test_delete_host_removes_row_and_revokes_token(db_uri: str) -> None:
     store.delete_host("dcf4eb5fc0b04985ec45f79cfda95566")
 
 
+def test_delete_host_fully_unbinds_bound_conversations(db_uri: str) -> None:
+    """
+    ``delete_host`` nulls the whole binding, not just ``host_id``.
+
+    The machine behind the row is gone, so a surviving ``runner_id`` /
+    ``workspace`` / ``git_branch`` points at nothing. Worse, the leftover
+    ``runner_id`` is load-bearing: rebinding matches only
+    ``runner_id IS NULL``, so a partial unbind locks the session out of
+    every future host for good.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    store.upsert_on_connect(
+        host_id="c3d1b3f4c2a54c8fa1de5f0b9c7e2d10",
+        name="doomed-vm",
+        user_id="alice@example.com",
+    )
+    conv = conversations.create_conversation(
+        host_id="c3d1b3f4c2a54c8fa1de5f0b9c7e2d10",
+        workspace="/home/alice/proj",
+        git_branch="feature/x",
+        runner_id="runner_token_cafebabe",
+    )
+
+    store.delete_host("c3d1b3f4c2a54c8fa1de5f0b9c7e2d10")
+
+    unbound = conversations.get_conversation(conv.id)
+    assert unbound is not None
+    assert unbound.host_id is None
+    assert unbound.runner_id is None
+    assert unbound.workspace is None
+    assert unbound.git_branch is None
+    # The row is genuinely reusable, not merely blank.
+    assert conversations.set_runner_id(conv.id, "runner_token_d00dfeed")
+
+
 def test_revoke_launch_token_keeps_row_but_stops_resolution(db_uri: str) -> None:
     """
     ``revoke_launch_token`` is the relaunch-failure cleanup: the
