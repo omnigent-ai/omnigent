@@ -645,6 +645,20 @@ describe("BlockRenderer file-path linkification", () => {
     expect(openFile).toHaveBeenCalledWith("src/Design Notes.ts");
   });
 
+  it("preserves Streamdown attributes on external Markdown links", () => {
+    renderMessage("See [GitHub](https://github.com/omnigent-ai/omnigent).", {
+      openFile: vi.fn(),
+      isChangedPath: () => false,
+      conversationId: "conv_1",
+    });
+
+    const link = screen.getByRole("link", { name: "GitHub" });
+    expect(link.getAttribute("data-streamdown")).toBe("link");
+    expect(link.className).toContain("wrap-anywhere");
+    expect(link.getAttribute("target")).toBe("_blank");
+    expect(link.getAttribute("rel")?.split(/\s+/)).toContain("noreferrer");
+  });
+
   it("leaves an absolute path OUTSIDE the workspace root as plain code (no fetch)", async () => {
     // `/etc/hosts` is absolute but not under the root → unresolvable → must
     // never linkify, and must not trigger an existence listing.

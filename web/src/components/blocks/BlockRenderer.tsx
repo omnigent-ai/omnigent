@@ -151,12 +151,18 @@ function decodeWorkspacePathReference(href: string): string | null {
  */
 function WorkspacePathMarkdownLink({
   children,
+  className,
   href,
   onClick,
   ...linkProps
 }: React.ComponentPropsWithoutRef<"a">) {
+  // Streamdown passes its mdast node to custom renderers; never forward that
+  // internal object to the DOM anchor.
+  Reflect.deleteProperty(linkProps, "node");
   const openFile = useFileViewer();
   const { root, home } = useWorkspacePaths();
+  const incomplete = href === "streamdown:incomplete-link";
+  const linkClassName = cn("wrap-anywhere font-medium text-primary underline", className);
   const explicitWorkspacePath =
     typeof href === "string" && (href.startsWith("/") || href.startsWith("~/"));
   const rawPath = explicitWorkspacePath ? decodeWorkspacePathReference(href) : null;
@@ -164,7 +170,16 @@ function WorkspacePathMarkdownLink({
 
   if (!openFile || !linkPath) {
     return (
-      <a href={href} onClick={onClick} {...linkProps}>
+      <a
+        className={linkClassName}
+        data-incomplete={incomplete}
+        data-streamdown="link"
+        href={href}
+        onClick={onClick}
+        rel="noreferrer"
+        target="_blank"
+        {...linkProps}
+      >
         {children}
       </a>
     );
@@ -177,6 +192,9 @@ function WorkspacePathMarkdownLink({
 
   return (
     <a
+      className={linkClassName}
+      data-incomplete={incomplete}
+      data-streamdown="link"
       href={fileHref}
       onClick={(event) => {
         onClick?.(event);
@@ -193,6 +211,8 @@ function WorkspacePathMarkdownLink({
         event.preventDefault();
         openFile(linkPath);
       }}
+      rel="noreferrer"
+      target="_blank"
       {...linkProps}
     >
       {children}
