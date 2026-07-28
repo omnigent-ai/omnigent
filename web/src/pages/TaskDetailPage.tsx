@@ -77,6 +77,40 @@ export function TaskDetailPage() {
 
   const [editOpen, setEditOpen] = useState(false);
 
+  // "Awaiting new run row" loading state for the Run now button. The button
+  // stays in its loading state after the POST returns 202 until the accelerated
+  // poll delivers a new run row (newest id changes) or the 20s safety cap fires.
+  const [awaitingRunRow, setAwaitingRunRow] = useState(false);
+  const preFireNewestIdRef = useRef<string | null>(null);
+  const awaitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Clear the awaiting flag and its safety timer (shared by the effect and
+  // the timer callback so neither leaks).
+  function clearAwaitingRunRow() {
+    setAwaitingRunRow(false);
+    if (awaitingTimerRef.current != null) {
+      clearTimeout(awaitingTimerRef.current);
+      awaitingTimerRef.current = null;
+    }
+  }
+
+  // Clear the flag when a new run row appears (newestId changed from snapshot).
+  useEffect(() => {
+    if (!awaitingRunRow) return;
+    const newestId = runs?.[0]?.id ?? null;
+    if (newestId != null && newestId !== preFireNewestIdRef.current) {
+      clearAwaitingRunRow();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runs, awaitingRunRow]);
+
+  // Unmount cleanup so the safety timer doesn't fire into an unmounted component.
+  useEffect(() => {
+    return () => {
+      if (awaitingTimerRef.current != null) clearTimeout(awaitingTimerRef.current);
+    };
+  }, []);
+
   // Auto-mark newly-completed (succeeded) runs as unread so the pink dot
   // appears until the user opens the conversation.
   //
@@ -182,9 +216,20 @@ export function TaskDetailPage() {
   }
 
   function handleRunNow() {
+    // Snapshot the pre-fire newest run id so the awaiting effect knows what
+    // "a new row appeared" means.
+    preFireNewestIdRef.current = runs?.[0]?.id ?? null;
     runNowMutation.mutate(task!.id, {
-      onSuccess: () => showToast("Run started"),
+      onSuccess: () => {
+        showToast("Run started");
+        // Keep the button in loading state until the new run row appears (~1s).
+        setAwaitingRunRow(true);
+        // Safety cap: clear after 20s even if no row ever shows up.
+        if (awaitingTimerRef.current != null) clearTimeout(awaitingTimerRef.current);
+        awaitingTimerRef.current = setTimeout(clearAwaitingRunRow, 20_000);
+      },
       onError: (err) => {
+        clearAwaitingRunRow();
         // A 409 (CONFLICT) means a run for this task is already in flight — the
         // run is fine. Show a truthful, non-alarming message.
         if (err instanceof ScheduledTaskApiError && err.status === 409) {
@@ -234,8 +279,12 @@ export function TaskDetailPage() {
           >
             <Trash2Icon className="size-4" />
           </Button>
-          <Button data-testid="task-detail-run-now" disabled={busy} onClick={handleRunNow}>
-            {runNowMutation.isPending ? (
+          <Button
+            data-testid="task-detail-run-now"
+            disabled={busy || awaitingRunRow}
+            onClick={handleRunNow}
+          >
+            {runNowMutation.isPending || awaitingRunRow ? (
               <>
                 <Loader2Icon className="size-4 animate-spin" />
                 In progress

@@ -9,7 +9,7 @@
 // All data hooks are mocked at their seam; the edit dialog is stubbed so we
 // only assert it opened. useParams/useNavigate come from `@/lib/routing`.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -346,6 +346,74 @@ describe("header actions", () => {
     expect(idleBtn).not.toBeDisabled();
     expect(idleBtn).toHaveTextContent("Run now");
     expect(idleBtn.querySelector(".animate-spin")).toBeNull();
+  });
+
+  it("Run now button stays 'In progress' after 202 until a new run row appears", async () => {
+    // Start with empty runs so preFireNewestId = null.
+    setTask(task());
+    setRuns([]);
+    runNowMutate.mockImplementation(
+      (_id: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) =>
+        opts?.onSuccess?.(),
+    );
+    const { rerender } = renderPage();
+
+    const btn = screen.getByTestId("task-detail-run-now");
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+
+    // After onSuccess fires, button is in "In progress" state (awaitingRunRow=true).
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveTextContent("In progress");
+
+    // Simulate the accelerated poll delivering a new run row.
+    setRuns([run({ id: "run_new", status: "running", conversationId: "c_new" })]);
+    await act(async () => {
+      rerender(
+        <QueryClientProvider
+          client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}
+        >
+          <TooltipProvider>
+            <MemoryRouter>
+              <TaskDetailPage />
+            </MemoryRouter>
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
+    });
+
+    // New row appeared (id changed) → flag cleared → button re-enables.
+    expect(btn).not.toBeDisabled();
+    expect(btn).toHaveTextContent("Run now");
+  });
+
+  it("Run now button re-enables after 20s safety cap if no row arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      setTask(task());
+      setRuns([]);
+      runNowMutate.mockImplementation(
+        (_id: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) =>
+          opts?.onSuccess?.(),
+      );
+      renderPage();
+      const btn = screen.getByTestId("task-detail-run-now");
+      await act(async () => {
+        fireEvent.click(btn);
+      });
+      expect(btn).toBeDisabled();
+      expect(btn).toHaveTextContent("In progress");
+
+      // Advance past the 20s safety cap.
+      await act(async () => {
+        vi.advanceTimersByTime(20_001);
+      });
+      expect(btn).not.toBeDisabled();
+      expect(btn).toHaveTextContent("Run now");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("toggling the Switch off pauses an active task (update to paused)", () => {
