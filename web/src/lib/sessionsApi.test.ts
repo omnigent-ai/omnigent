@@ -96,6 +96,8 @@ describe("createSession", () => {
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
+      backgroundTaskCount: undefined,
       todos: [],
       skills: [],
       codexModelOptions: [],
