@@ -234,7 +234,7 @@ jobs:
         run: |
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.212
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
