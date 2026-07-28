@@ -2016,6 +2016,7 @@ class _CodexAppServerSession:
         disable_native_tools: bool = False,
         bundle_dir: Path | None = None,
         skills_filter: str | list[str] = "all",
+        runtime_workspace_roots: tuple[str, ...] = (),
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2025,6 +2026,7 @@ class _CodexAppServerSession:
         self._disable_native_tools = disable_native_tools
         self._bundle_dir = bundle_dir
         self._skills_filter = skills_filter
+        self._runtime_workspace_roots = runtime_workspace_roots
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -2343,6 +2345,8 @@ class _CodexAppServerSession:
                 "model": model,
                 "sandbox": sandbox,
             }
+            if self._runtime_workspace_roots:
+                params["runtimeWorkspaceRoots"] = list(self._runtime_workspace_roots)
             if system_prompt:
                 params["developerInstructions"] = system_prompt
             if tools:
@@ -2930,6 +2934,7 @@ class _AppSessionFactory(Protocol):
         disable_native_tools: bool,
         bundle_dir: Path | None,
         skills_filter: str | list[str],
+        runtime_workspace_roots: tuple[str, ...],
     ) -> _CodexAppServerSession: ...
 
 
@@ -2943,6 +2948,7 @@ def _default_app_session_factory(
     disable_native_tools: bool,
     bundle_dir: Path | None,
     skills_filter: str | list[str],
+    runtime_workspace_roots: tuple[str, ...],
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
@@ -2953,6 +2959,7 @@ def _default_app_session_factory(
         disable_native_tools=disable_native_tools,
         bundle_dir=bundle_dir,
         skills_filter=skills_filter,
+        runtime_workspace_roots=runtime_workspace_roots,
     )
 
 
@@ -2961,6 +2968,7 @@ class CodexExecutor(Executor):
         self,
         *,
         cwd: str | None = None,
+        additional_directories: tuple[str, ...] = (),
         os_env: OSEnvSpec | None = None,
         model: str | None = None,
         codex_path: str | None = None,
@@ -2982,6 +2990,8 @@ class CodexExecutor(Executor):
         """Create a CodexExecutor.
 
         :param cwd: Working directory for the Codex subprocess.
+        :param additional_directories: Attached project roots beyond ``cwd``.
+            Exposed to Codex app-server as runtime workspace roots.
         :param os_env: Optional OS environment / sandbox spec.
         :param model: Override the model name, e.g. ``"databricks-gpt-5-4-mini"``.
         :param codex_path: Absolute path to a ``codex`` CLI binary.  When
@@ -3052,6 +3062,7 @@ class CodexExecutor(Executor):
             on name conflict).
         """
         self._cwd = cwd
+        self._additional_directories = additional_directories
         self._os_env_spec = os_env
         self._model_override = model
         self._model_provider_override = model_provider_override
@@ -3273,6 +3284,16 @@ class CodexExecutor(Executor):
             disable_native_tools=self._disable_native_tools,
             bundle_dir=self._bundle_dir,
             skills_filter=self._skills_filter,
+            runtime_workspace_roots=(
+                tuple(
+                    dict.fromkeys(
+                        str(Path(path).expanduser().resolve())
+                        for path in (effective_cwd, *self._additional_directories)
+                    )
+                )
+                if self._additional_directories
+                else ()
+            ),
         )
         state.app_session = app_session
         state.signature = signature

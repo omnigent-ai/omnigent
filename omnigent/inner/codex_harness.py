@@ -40,6 +40,9 @@ Env vars read at startup:
 - ``HARNESS_CODEX_CWD``: working directory the executor launches
   the Codex CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE``
   if set, then to the subprocess's inherited cwd.
+- ``HARNESS_CODEX_ADD_DIRS``: JSON list of attached absolute project roots
+  beyond ``HARNESS_CODEX_CWD``. The executor exposes them through Codex
+  app-server's ``runtimeWorkspaceRoots`` field.
 - ``OMNIGENT_CODEX_PATH``: absolute path to a ``codex`` CLI binary.
   ``None`` searches ``PATH``. (Legacy ``HARNESS_CODEX_PATH`` still honored,
   deprecated.)
@@ -111,6 +114,7 @@ _ENV_DATABRICKS_PROFILE = "HARNESS_CODEX_DATABRICKS_PROFILE"
 _ENV_MODEL_PROVIDER = "HARNESS_CODEX_MODEL_PROVIDER"
 _ENV_GATEWAY_HOST = "HARNESS_CODEX_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_CODEX_CWD"
+_ENV_ADD_DIRS = "HARNESS_CODEX_ADD_DIRS"
 _ENV_CODEX_PATH = "OMNIGENT_CODEX_PATH"
 # Deprecated alias — read via resolve_harness_path() which warns on use.
 # Remove this constant and the HARNESS_CODEX_PATH read in v0.8.0.
@@ -265,6 +269,32 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
+def _resolve_additional_directories() -> tuple[str, ...]:
+    """Decode attached project roots from the per-spawn environment."""
+    raw = os.environ.get(_ENV_ADD_DIRS, "").strip()
+    if not raw:
+        return ()
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        _logger.warning(
+            "%s is not valid JSON (%s); ignoring attached directories",
+            _ENV_ADD_DIRS,
+            exc,
+        )
+        return ()
+    if not isinstance(decoded, list) or not all(
+        isinstance(path, str) and path for path in decoded
+    ):
+        _logger.warning(
+            "%s decoded to unsupported shape %r; ignoring attached directories",
+            _ENV_ADD_DIRS,
+            decoded,
+        )
+        return ()
+    return tuple(str(Path(path).expanduser().resolve()) for path in decoded)
+
+
 def _build_codex_executor() -> Executor:
     """
     Construct a :class:`CodexExecutor` from env-var config.
@@ -289,6 +319,7 @@ def _build_codex_executor() -> Executor:
     agent_name = agent_name_raw or None
     return CodexExecutor(
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
+        additional_directories=_resolve_additional_directories(),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         codex_path=resolve_harness_path("codex"),

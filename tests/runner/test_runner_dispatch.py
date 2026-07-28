@@ -1448,6 +1448,25 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
     assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
 
 
+def test_build_spawn_env_threads_codex_additional_directories(tmp_path: Path) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+    )
+    roots = (tmp_path / "shared", tmp_path / "docs")
+
+    env = _build_spawn_env_from_spec(
+        spec,
+        "codex",
+        cwd=tmp_path / "primary",
+        additional_directories=roots,
+    )
+
+    assert env is not None
+    assert json.loads(env["HARNESS_CODEX_ADD_DIRS"]) == [str(path) for path in roots]
+
+
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

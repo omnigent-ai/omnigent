@@ -901,6 +901,27 @@ def test_build_codex_remote_args_passes_transport_verbatim(
     )
 
 
+def test_build_codex_remote_args_adds_attached_directories_before_resume() -> None:
+    """Attached roots use repeatable global flags before the resume command."""
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=("--model", "gpt-5.4-mini"),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+        additional_directories=("/repo/shared", "/repo/docs"),
+    ) == [
+        "--model",
+        "gpt-5.4-mini",
+        "--add-dir",
+        "/repo/shared",
+        "--add-dir",
+        "/repo/docs",
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
+    ]
+
+
 @pytest.mark.parametrize(
     ("thread_id", "expected"),
     [

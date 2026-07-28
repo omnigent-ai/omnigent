@@ -347,6 +347,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=True,
         interrupt=True,
         streaming=True,
+        additional_directories=True,
         fork_history=_FH.REBUILD,
         shell_tool_name="shell",
         shell_tool_prompt=_SHELL_PROMPT,
@@ -511,6 +512,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        additional_directories=True,
     ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,

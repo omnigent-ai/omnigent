@@ -1289,6 +1289,7 @@ def _build_codex_spawn_env(
     *,
     cwd: Path | None = None,
     workdir: Path | None = None,
+    additional_directories: tuple[Path, ...] = (),
 ) -> dict[str, str]:
     """
     Build the env-var dict the codex harness wrap reads.
@@ -1314,6 +1315,8 @@ def _build_codex_spawn_env(
         ``HARNESS_CODEX_BUNDLE_DIR`` so the harness wrap's executor
         can also source bundled skills from
         ``<bundle>/skills/<name>/``.
+    :param additional_directories: Attached project roots beyond ``cwd``.
+        JSON-encoded for Codex app-server's ``runtimeWorkspaceRoots``.
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -1349,6 +1352,11 @@ def _build_codex_spawn_env(
     # ``HARNESS_CODEX_CWD`` in ``omnigent/inner/codex_harness.py``.
     if cwd is not None:
         env["HARNESS_CODEX_CWD"] = str(cwd)
+    if additional_directories:
+        env["HARNESS_CODEX_ADD_DIRS"] = json.dumps(
+            [str(path) for path in additional_directories],
+            separators=(",", ":"),
+        )
     if workdir is not None:
         env["HARNESS_CODEX_BUNDLE_DIR"] = str(workdir)
     os_env_payload = _serialize_os_env(spec.os_env)

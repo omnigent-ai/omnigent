@@ -15,6 +15,7 @@ Unit test — no subprocess spawn, no real CLIs.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -90,3 +91,18 @@ def test_builder_omits_cwd_when_none(harness: str, builder, cwd_var: str) -> Non
     env = builder(_make_spec(harness), cwd=None, workdir=None)
 
     assert cwd_var not in env
+
+
+def test_codex_builder_threads_additional_directories(tmp_path: Path) -> None:
+    """Codex receives attached roots separately from its primary cwd."""
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    docs = tmp_path / "docs"
+
+    env = _build_codex_spawn_env(
+        _make_spec("codex"),
+        cwd=primary,
+        additional_directories=(shared, docs),
+    )
+
+    assert json.loads(env["HARNESS_CODEX_ADD_DIRS"]) == [str(shared), str(docs)]

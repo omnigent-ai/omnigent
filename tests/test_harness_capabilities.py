@@ -97,6 +97,12 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
         assert caps[harness].streaming is True, harness
 
 
+def test_codex_harnesses_declare_additional_directory_support() -> None:
+    caps = harness_capabilities()
+    assert caps["codex-native"].additional_directories is True
+    assert caps["codex"].additional_directories is True
+
+
 def test_optional_bench_capabilities_default_to_unknown() -> None:
     capability = HarnessCapabilities(
         IntegrationMode.SDK_IN_PROCESS,
