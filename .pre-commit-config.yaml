@@ -36,6 +36,13 @@ repos:
         types: [python]
         files: ^tests/
 
+      - id: no-hardcoded-models
+        name: no new hardcoded LLM model ids
+        language: system
+        entry: .venv/bin/python dev/lint/lint_no_hardcoded_models.py
+        pass_filenames: false
+        files: ^((omnigent|scripts|examples|\.github|dev/lint)/.*\.(py|ya?ml|json|toml|sh)|dev/lint/hardcoded_model_allowlist\.txt)$
+
       - id: web-prettier
         name: web prettier
         language: system
