@@ -16,9 +16,8 @@ The remaining pins fall into a few buckets:
   `omnigent/inner/*_executor.py`, and `omnigent/codex_native_app_server.py`
   still carry fallback model ids.
 - **Static pickers/catalogs:** `omnigent/model_catalog.py`,
-  `omnigent/cursor_native.py`, `omnigent/kiro_native.py`, and
-  `omnigent/server/smart_routing.py` encode static model choices for CLIs or
-  routing tiers that do not always expose a live listing API.
+  `omnigent/cursor_native.py`, and `omnigent/kiro_native.py` encode static
+  model choices for CLIs that do not always expose a live listing API.
 - **Policy and sizing logic:** `omnigent/llms/context_window.py`,
   `omnigent/policies/builtins/routing.py`, and `omnigent/tools/builtins/spawn.py`
   mention concrete models when mapping windows, routing examples, or dispatch
@@ -133,3 +132,15 @@ boundary:
 Static picker rows, smart-routing tiers, context/wire heuristics, and CI model
 inputs remain separate migration slices because they require different discovery
 or configuration sources.
+
+## Smart Routing Migration
+
+Smart routing now treats the runner's live worker catalog as its only candidate
+source. Provider-relative cost metadata orders candidates for the stable `fast`,
+`balanced`, and `powerful` intents; catalog order remains the tie-breaker when
+cost is unknown. If discovery is unavailable, routing skips the override and the
+harness keeps the provider-resolved default instead of consulting a stale table.
+
+The remaining exact compatibility exclusions in smart routing are temporary
+wire-API workarounds. They stay isolated until catalog wire metadata can express
+the affected harness constraints without model-name checks.

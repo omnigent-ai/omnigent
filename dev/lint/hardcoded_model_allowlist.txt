@@ -61,13 +61,8 @@ omnigent/onboarding/wizard.py databricks-gpt-5-4 1
 omnigent/onboarding/wizard.py gpt-4o 1
 omnigent/policies/builtins/routing.py databricks-claude-opus-4-6 1
 omnigent/policies/builtins/routing.py o3 1
-omnigent/server/smart_routing.py databricks-claude-haiku-4-5 3
-omnigent/server/smart_routing.py databricks-claude-opus-4-8 2
-omnigent/server/smart_routing.py databricks-claude-sonnet-4-6 2
-omnigent/server/smart_routing.py databricks-gpt-5-4 2
-omnigent/server/smart_routing.py databricks-gpt-5-4-mini 2
-omnigent/server/smart_routing.py databricks-gpt-5-4-nano 2
-omnigent/server/smart_routing.py databricks-gpt-5-5 3
+omnigent/server/smart_routing.py databricks-claude-haiku-4-5 1
+omnigent/server/smart_routing.py databricks-gpt-5-5 1
 omnigent/server/smart_routing.py databricks-gpt-5-5-pro 1
 omnigent/server/smart_routing.py databricks-gpt-5-6-luna 1
 omnigent/server/smart_routing.py databricks-gpt-5-6-sol 1
