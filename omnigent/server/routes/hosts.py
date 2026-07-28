@@ -91,6 +91,7 @@ async def _proxy_model_options(
     host_registry: HostRegistry,
     host_conn: HostConnection,
     harness: str,
+    workspace: str | None = None,
 ) -> dict[str, Any]:
     """Ask a host for the model catalog it would use for a new session."""
     request_id = secrets.token_hex(8)
@@ -98,7 +99,7 @@ async def _proxy_model_options(
     future: asyncio.Future[dict[str, Any]] = loop.create_future()
     host_conn.pending_model_options[request_id] = future
     frame = encode_host_frame(
-        HostModelOptionsFrame(request_id=request_id, harness=harness),
+        HostModelOptionsFrame(request_id=request_id, harness=harness, workspace=workspace),
     )
     try:
         try:
@@ -647,6 +648,7 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
+        workspace: str | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """Return pre-launch model choices resolved by the selected host.
 
@@ -668,6 +670,7 @@ def create_hosts_router(
             host_registry=host_registry,
             host_conn=conn,
             harness=canonicalize_harness(harness) or harness,
+            workspace=workspace,
         )
         if result.get("status") != "ok":
             raise HTTPException(

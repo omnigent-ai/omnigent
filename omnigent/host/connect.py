@@ -1853,7 +1853,10 @@ class HostProcess:
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="ok",
-                    models=pi_native_model_options(),
+                    models=await asyncio.to_thread(
+                        pi_native_model_options,
+                        cwd=frame.workspace,
+                    ),
                 )
             from omnigent.claude_native import (
                 claude_native_model_options,

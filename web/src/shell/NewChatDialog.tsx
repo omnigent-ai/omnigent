@@ -1785,6 +1785,17 @@ export function NewChatLandingScreen() {
     () => landingDraft?.sandboxRepoBranch ?? "",
   );
   const [workspace, setWorkspace] = useState<string>(() => landingDraft?.workspace ?? "");
+  const [modelOptionsWorkspace, setModelOptionsWorkspace] = useState<string | null>(() => {
+    const initial = landingDraft?.workspace?.trim();
+    return initial ? initial : null;
+  });
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const trimmed = workspace.trim();
+      setModelOptionsWorkspace(trimmed || null);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [workspace, selectedHostId, sandboxSelected]);
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -2153,7 +2164,10 @@ export function NewChatLandingScreen() {
   const { data: hostModelOptions, isLoading: hostModelsLoading } = useHostModelOptions(
     selectedHostId,
     modelOptionsHarness,
-    !sandboxSelected && supportsModelSelection,
+    !sandboxSelected &&
+      supportsModelSelection &&
+      (modelOptionsHarness !== "pi-native" || modelOptionsWorkspace !== null),
+    modelOptionsHarness === "pi-native" ? modelOptionsWorkspace : null,
   );
   const modelOptions = useMemo(
     () =>
@@ -2639,15 +2653,17 @@ export function NewChatLandingScreen() {
     if (mentionFsQuery.isPlaceholderData) return [];
     const rows = (mentionFsQuery.data?.entries ?? [])
       .filter((e) => e.type === "directory" || e.type === "file")
-      .map((e): WorkspaceFile => ({
-        path: e.path.startsWith(workspaceRoot)
-          ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
-          : e.name,
-        name: e.name,
-        type: e.type === "directory" ? "directory" : "file",
-        bytes: e.bytes,
-        modified_at: e.modified_at,
-      }));
+      .map(
+        (e): WorkspaceFile => ({
+          path: e.path.startsWith(workspaceRoot)
+            ? e.path.slice(workspaceRoot.length).replace(/^\/+/, "")
+            : e.name,
+          name: e.name,
+          type: e.type === "directory" ? "directory" : "file",
+          bytes: e.bytes,
+          modified_at: e.modified_at,
+        }),
+      );
     return rankMentionEntries(rows, mentionFilter);
   }, [
     mentionEnabled,

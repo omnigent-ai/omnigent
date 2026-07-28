@@ -80,9 +80,13 @@ export function useHosts(options: UseHostsOptions = {}) {
 async function fetchHostModelOptions(
   hostId: string,
   harness: string,
+  workspace: string | null,
 ): Promise<NativeModelOption[]> {
+  const params = new URLSearchParams();
+  if (workspace) params.set("workspace", workspace);
+  const query = params.size > 0 ? `?${params.toString()}` : "";
   const res = await authenticatedFetch(
-    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options${query}`,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { models?: NativeModelOption[] };
@@ -90,10 +94,15 @@ async function fetchHostModelOptions(
 }
 
 /** Model choices available before launch, resolved on the selected host. */
-export function useHostModelOptions(hostId: string | null, harness: string, enabled = true) {
+export function useHostModelOptions(
+  hostId: string | null,
+  harness: string,
+  enabled = true,
+  workspace: string | null = null,
+) {
   return useQuery({
-    queryKey: ["host-model-options", hostId, harness],
-    queryFn: () => fetchHostModelOptions(hostId as string, harness),
+    queryKey: ["host-model-options", hostId, harness, workspace],
+    queryFn: () => fetchHostModelOptions(hostId as string, harness, workspace),
     enabled: enabled && hostId !== null,
     staleTime: 30_000,
     retry: false,

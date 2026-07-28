@@ -204,6 +204,93 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_pi_terminal_resolves_local_model_in_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A selected Pi model is resolved using the session workspace."""
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_bridge
+
+    session_id = "conv_pi_workspace_model"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "/usr/bin/pi")
+
+    captured: dict[str, Any] = {}
+
+    def _resolve_local(model: str, *, env: Any = None, cwd: Any = None):
+        captured.update(model=model, env=env, cwd=cwd)
+        return "project-provider", model
+
+    monkeypatch.setattr(pi_native, "resolve_pi_native_local_model_selection", _resolve_local)
+
+    class _SnapshotClient:
+        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+            del url, timeout
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "external_session_id": None,
+                    "model_override": "project-model",
+                },
+                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
+            )
+
+    launched: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched["args"] = list(spec.args)
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi",
+            )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-workspace-model",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    await _auto_create_pi_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_SnapshotClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    assert captured == {"model": "project-model", "env": None, "cwd": workspace}
+    assert launched["args"][-4:] == [
+        "--provider",
+        "project-provider",
+        "--model",
+        "project-model",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

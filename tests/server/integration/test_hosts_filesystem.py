@@ -178,7 +178,8 @@ async def fs_setup(
                 continue
             frame = decode_host_frame(text)
             if isinstance(frame, HostModelOptionsFrame):
-                reply = replies.get(f"model:{frame.harness}", {})
+                workspace_key = f"model:{frame.harness}:{frame.workspace}"
+                reply = replies.get(workspace_key, replies.get(f"model:{frame.harness}", {}))
                 await comm.send_input(
                     {
                         "type": "websocket.receive",
@@ -244,7 +245,7 @@ async def test_host_model_options_returns_prelaunch_catalog(
 ) -> None:
     """The REST endpoint proxies the selected host's launch catalog."""
     app, _reg, _comm, replies, _drain = fs_setup
-    replies["model:claude-native"] = {
+    replies["model:claude-native:/workspace/project"] = {
         "models": [
             {
                 "id": "sonnet",
@@ -257,6 +258,7 @@ async def test_host_model_options_returns_prelaunch_catalog(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get(
             f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/model-options",
+            params={"workspace": "/workspace/project"},
         )
 
     assert resp.status_code == 200

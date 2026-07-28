@@ -386,6 +386,21 @@ describe("useHostModelOptions", () => {
     expect(result.current.data?.map((model) => model.displayName)).toEqual(["Sonnet 4.6"]);
   });
 
+  it("includes the selected workspace in the model-options request", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ models: [] }));
+
+    const { result } = renderHook(
+      () => useHostModelOptions("host_1", "pi-native", true, "/workspace/with spaces"),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/hosts/host_1/harnesses/pi-native/model-options?workspace=%2Fworkspace%2Fwith+spaces",
+      expect.any(Object),
+    );
+  });
+
   it("does not fetch without a selected host", async () => {
     renderHook(() => useHostModelOptions(null, "claude-native"), { wrapper });
     await Promise.resolve();

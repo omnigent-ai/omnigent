@@ -211,6 +211,7 @@ beforeEach(() => {
   navigateMock.mockReset();
   setPendingInitialPromptMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(useHostModelOptions).mockClear();
   vi.mocked(useHostModelOptions).mockReturnValue({
     data: [
       { id: "opus", displayName: "Opus" },
@@ -859,6 +860,14 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
+    await waitFor(() =>
+      expect(useHostModelOptions).toHaveBeenLastCalledWith(
+        "host_1",
+        "pi-native",
+        true,
+        SEEDED_WORKSPACE,
+      ),
+    );
     openAgentConfig("ag_pi");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
       "system.ai.gpt-5-6-sol",

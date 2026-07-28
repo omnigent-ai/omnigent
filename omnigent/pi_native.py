@@ -61,18 +61,23 @@ _SESSION_LABELS = {
 
 def _pi_default_model_selection(
     agent_dir: Path | None = None,
+    cwd: str | Path | None = None,
 ) -> tuple[str, str] | None:
     """Return Pi's configured ``(provider, model)`` default, if present."""
     root = agent_dir or Path.home() / ".pi" / "agent"
-    settings_path = root / "settings.json"
-    try:
-        raw = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    provider = raw.get("defaultProvider")
-    model = raw.get("defaultModel")
+
+    def load_settings(path: Path) -> dict[str, Any]:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    settings = load_settings(root / "settings.json")
+    if cwd is not None:
+        settings.update(load_settings(Path(cwd) / ".pi" / "settings.json"))
+    provider = settings.get("defaultProvider")
+    model = settings.get("defaultModel")
     if not isinstance(provider, str) or not provider.strip():
         return None
     if not isinstance(model, str) or not model.strip():
@@ -83,6 +88,7 @@ def _pi_default_model_selection(
 def pi_native_model_options(
     *,
     env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> list[dict[str, Any]]:
     """Return the models Pi itself reports as available on this machine."""
@@ -90,10 +96,15 @@ def pi_native_model_options(
         executable = resolve_pi_executable(env=env)
     except click.ClickException:
         return []
+    args = [executable]
+    if cwd is not None and pi_supports_approve(executable):
+        args.append("--approve")
+    args.append("--list-models")
     try:
         result = run(
-            [executable, "--list-models"],
+            args,
             env=dict(env) if env is not None else None,
+            cwd=os.fspath(cwd) if cwd is not None else None,
             capture_output=True,
             text=True,
             timeout=15,
@@ -107,7 +118,8 @@ def pi_native_model_options(
     configured_agent_dir = env.get("PI_CODING_AGENT_DIR", "").strip() if env else ""
     home = Path(env.get("HOME", str(Path.home()))) if env else Path.home()
     default = _pi_default_model_selection(
-        Path(configured_agent_dir) if configured_agent_dir else home / ".pi" / "agent"
+        Path(configured_agent_dir) if configured_agent_dir else home / ".pi" / "agent",
+        cwd=cwd,
     )
     options: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -135,12 +147,13 @@ def resolve_pi_native_local_model_selection(
     model: str,
     *,
     env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
 ) -> tuple[str, str] | None:
     """Resolve a model override against Pi's own available provider catalog."""
     stripped = model.strip()
     if not stripped:
         return None
-    options = pi_native_model_options(env=env)
+    options = pi_native_model_options(env=env, cwd=cwd)
     matches = [option for option in options if option.get("id") == stripped]
     if not matches:
         return None

@@ -55,6 +55,22 @@ def test_model_options_frames_round_trip() -> None:
     assert request == HostModelOptionsFrame(
         request_id="req_models",
         harness="claude-native",
+        workspace=None,
+    )
+
+    workspace_request = decode_host_frame(
+        encode_host_frame(
+            HostModelOptionsFrame(
+                request_id="req_pi_models",
+                harness="pi-native",
+                workspace="/workspace/project",
+            ),
+        )
+    )
+    assert workspace_request == HostModelOptionsFrame(
+        request_id="req_pi_models",
+        harness="pi-native",
+        workspace="/workspace/project",
     )
 
     result = decode_host_frame(

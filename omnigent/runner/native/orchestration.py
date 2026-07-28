@@ -1864,7 +1864,10 @@ async def _auto_create_pi_terminal(
         # model_override (set by /model or sys_session_create's model arg)
         # takes precedence over the spec's pinned executor.model.
         local_selection = (
-            resolve_pi_native_local_model_selection(launch_config.model_override)
+            resolve_pi_native_local_model_selection(
+                launch_config.model_override,
+                cwd=launch_config.workspace,
+            )
             if launch_config.model_override
             else None
         )

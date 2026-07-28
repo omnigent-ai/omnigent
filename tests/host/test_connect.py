@@ -105,10 +105,11 @@ async def test_handle_model_options_uses_host_pi_catalog(
     """The launch picker asks Pi for the models available on this host."""
     from omnigent import pi_native
 
-    monkeypatch.setattr(
-        pi_native,
-        "pi_native_model_options",
-        lambda: [
+    captured: dict[str, object] = {}
+
+    def model_options(**kwargs: object) -> list[dict[str, object]]:
+        captured.update(kwargs)
+        return [
             {
                 "id": "system.ai.gpt-5-6-sol",
                 "model": "system.ai.gpt-5-6-sol",
@@ -116,17 +117,27 @@ async def test_handle_model_options_uses_host_pi_catalog(
                 "provider": "databricks-mlflow",
                 "isDefault": True,
             }
-        ],
+        ]
+
+    monkeypatch.setattr(
+        pi_native,
+        "pi_native_model_options",
+        model_options,
     )
     host = _make_host_process()
 
     result = await host._handle_model_options(
-        HostModelOptionsFrame(request_id="req_pi_models", harness="pi-native"),
+        HostModelOptionsFrame(
+            request_id="req_pi_models",
+            harness="pi-native",
+            workspace="/workspace/project",
+        ),
     )
 
     assert result.status == "ok"
     assert result.models[0]["id"] == "system.ai.gpt-5-6-sol"
     assert result.models[0]["isDefault"] is True
+    assert captured == {"cwd": "/workspace/project"}
 
 
 def _make_host_process() -> HostProcess:

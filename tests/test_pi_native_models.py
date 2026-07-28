@@ -10,9 +10,24 @@ from omnigent import pi_native
 from omnigent.pi_native import pi_native_model_options
 
 
-def test_pi_native_model_options_uses_cli_catalog_and_marks_default(tmp_path: Path) -> None:
+def test_pi_native_model_options_uses_workspace_catalog_and_marks_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     agent_dir = tmp_path / "pi-agent"
     agent_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".pi").mkdir()
+    (workspace / ".pi" / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultProvider": "databricks-mlflow",
+                "defaultModel": "system.ai.gpt-5-6-luna",
+            }
+        ),
+        encoding="utf-8",
+    )
     (agent_dir / "settings.json").write_text(
         json.dumps(
             {
@@ -23,8 +38,11 @@ def test_pi_native_model_options_uses_cli_catalog_and_marks_default(tmp_path: Pa
         encoding="utf-8",
     )
 
-    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        del args, kwargs
+    captured: dict[str, object] = {}
+
+    def run(args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["args"] = args
+        captured.update(kwargs)
         return subprocess.CompletedProcess(
             args=["pi", "--list-models"],
             returncode=0,
@@ -36,12 +54,15 @@ def test_pi_native_model_options_uses_cli_catalog_and_marks_default(tmp_path: Pa
             stderr="",
         )
 
+    monkeypatch.setattr(pi_native, "pi_supports_approve", lambda _executable: True)
+
     options = pi_native_model_options(
         env={
             "PATH": "/bin",
             "OMNIGENT_PI_PATH": "/bin/echo",
             "PI_CODING_AGENT_DIR": str(agent_dir),
         },
+        cwd=workspace,
         run=run,
     )
 
@@ -50,8 +71,10 @@ def test_pi_native_model_options_uses_cli_catalog_and_marks_default(tmp_path: Pa
         "system.ai.gpt-5-6-luna",
     ]
     assert options[0]["provider"] == "databricks-mlflow"
-    assert options[0]["isDefault"] is True
-    assert "isDefault" not in options[1]
+    assert "isDefault" not in options[0]
+    assert options[1]["isDefault"] is True
+    assert captured["args"] == ["/bin/echo", "--approve", "--list-models"]
+    assert captured["cwd"] == str(workspace)
 
 
 def test_resolve_pi_native_local_model_selection_keeps_its_provider(
