@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -5521,6 +5521,7 @@ def _build_claude_native_base_args(
     model_override: str | None,
     terminal_launch_args: list[str] | None,
     resume_external_session_id: str | None = None,
+    additional_directories: Sequence[str] = (),
 ) -> tuple[str, ...]:
     """
     Assemble the base ``claude`` CLI args for a native-terminal launch.
@@ -5558,6 +5559,8 @@ def _build_claude_native_base_args(
         the same plain ``--resume`` path serves both cold resume and
         fork resume. ``None`` (a fresh launch, or no local transcript
         could be synthesized) adds nothing.
+    :param additional_directories: Attached project roots beyond the launch
+        cwd. Forwarded through Claude Code's variadic ``--add-dir`` option.
     :returns: The assembled base args, e.g.
         ``("--resume", "<sid>", "--effort", "high")``.
     """
@@ -5575,6 +5578,9 @@ def _build_claude_native_base_args(
     # or the joined ``--model=X`` form).
     if model_override and not any(arg == "--model" or arg.startswith("--model=") for arg in args):
         args.extend(("--model", model_override))
+    if additional_directories:
+        args.append("--add-dir")
+        args.extend(additional_directories)
     return tuple(args)
 
 
@@ -6035,6 +6041,8 @@ async def _auto_create_claude_terminal(
     agent_spec: AgentSpec | ResolvedSpec | None = None,
     skills_filter: str | list[str] = "all",
     session_init: RunnerSessionInitEnvelope | None = None,
+    runtime_cwd: Path | None = None,
+    additional_directories: Sequence[str] = (),
     auth_token_factory: Callable[[], str | None] | None = None,
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
@@ -6076,6 +6084,11 @@ async def _auto_create_claude_terminal(
         :func:`augment_claude_args`. Defaults to ``"all"``.
     :param session_init: Versioned server snapshot. ``None`` selects the
         isolated legacy callback path.
+    :param runtime_cwd: Resolved session cwd. This is distinct from
+        ``snapshot.workspace`` for narrowed child sessions that start in a
+        private scratch directory.
+    :param additional_directories: Attached project roots beyond
+        ``runtime_cwd``. Forwarded to Claude Code via ``--add-dir``.
     :param auth_token_factory: Runner-owned refreshable bearer factory.
         ``None`` preserves direct-call behavior by resolving one locally.
     :param resolve_launch_config: Optional per-session resolver shared with
@@ -6098,9 +6111,13 @@ async def _auto_create_claude_terminal(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     workspace = (
-        session_init.snapshot.workspace
-        if session_init is not None and session_init.snapshot.workspace
-        else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+        str(runtime_cwd)
+        if runtime_cwd is not None
+        else (
+            session_init.snapshot.workspace
+            if session_init is not None and session_init.snapshot.workspace
+            else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+        )
     )
     started_at = time.monotonic()
     _logger.info(
@@ -6483,6 +6500,7 @@ async def _auto_create_claude_terminal(
         model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
+        additional_directories=additional_directories,
     )
 
     # Pass ``ap_server_url`` so ``build_hook_settings`` registers the
@@ -7107,6 +7125,8 @@ class NativeLaunchContext:
     skills_filter: str | list[str] = "all"
     agent_name: str | None = None
     session_init: RunnerSessionInitEnvelope | None = None
+    runtime_cwd: Path | None = None
+    additional_directories: Sequence[str] = ()
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
@@ -7267,6 +7287,8 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         agent_spec=ctx.agent_spec,
         skills_filter=ctx.skills_filter,
         session_init=ctx.session_init,
+        runtime_cwd=ctx.runtime_cwd,
+        additional_directories=ctx.additional_directories,
         auth_token_factory=ctx.auth_token_factory,
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,

@@ -36,6 +36,8 @@ Env vars read at startup:
 - ``HARNESS_CLAUDE_SDK_CWD``: working directory the SDK launches
   the Claude CLI in. ``None`` falls back to the subprocess's
   inherited cwd.
+- ``HARNESS_CLAUDE_SDK_ADD_DIRS``: JSON list of attached project
+  roots forwarded to ``ClaudeAgentOptions.add_dirs``.
 - ``HARNESS_CLAUDE_SDK_PERMISSION_MODE``: SDK permission mode
   (``"auto"``, ``"bypassPermissions"``, ``"acceptEdits"``,
   ``"plan"``, ``"dontAsk"``, ``"default"``). Defaults to
@@ -108,6 +110,7 @@ _ENV_GATEWAY = "HARNESS_CLAUDE_SDK_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_CLAUDE_SDK_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_CLAUDE_SDK_CWD"
+_ENV_ADD_DIRS = "HARNESS_CLAUDE_SDK_ADD_DIRS"
 _ENV_PERMISSION_MODE = "HARNESS_CLAUDE_SDK_PERMISSION_MODE"
 _ENV_OS_ENV = "HARNESS_CLAUDE_SDK_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
@@ -129,6 +132,22 @@ _ENV_API_KEY_HELPER = "HARNESS_CLAUDE_SDK_API_KEY_HELPER"
 # tool calls with background safety checks that verify actions align
 # with the request.
 _DEFAULT_PERMISSION_MODE = "auto"
+
+
+def _resolve_add_dirs() -> list[str]:
+    """Decode the session's additional project roots from spawn config."""
+    raw = os.environ.get(_ENV_ADD_DIRS, "").strip()
+    if not raw:
+        return []
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        _logger.warning("%s is not valid JSON (%s); ignoring it", _ENV_ADD_DIRS, exc)
+        return []
+    if isinstance(decoded, list) and all(isinstance(path, str) and path for path in decoded):
+        return decoded
+    _logger.warning("%s must encode a list of non-empty paths; ignoring it", _ENV_ADD_DIRS)
+    return []
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -281,6 +300,7 @@ def _build_claude_sdk_executor() -> Executor:
         # sandbox at the whole home dir. Mirrors goose / kimi / pi / qwen
         # / hermes harness cwd resolution.
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
+        add_dirs=_resolve_add_dirs(),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),

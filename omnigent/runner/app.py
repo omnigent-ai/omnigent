@@ -2476,6 +2476,20 @@ def create_runner_app(
             return Path(root).resolve() if root is not None else None
         return runner_workspace.resolve() if runner_workspace is not None else None
 
+    async def _session_additional_directory_paths(
+        session_id: str,
+        *,
+        cwd: Path | None = None,
+    ) -> tuple[Path, ...]:
+        """Return attached roots other than the session's launch cwd."""
+        resolved_cwd = cwd if cwd is not None else await _session_runtime_cwd(session_id)
+        directories = await _session_directory_values(session_id)
+        return tuple(
+            Path(directory.path).expanduser().resolve()
+            for directory in directories
+            if resolved_cwd is None or Path(directory.path).expanduser().resolve() != resolved_cwd
+        )
+
     async def _load_legacy_session_init_context() -> _SessionInitContext:
         await _get_server_version(server_client)
         return _SessionInitContext(envelope=None)
@@ -2664,6 +2678,10 @@ def create_runner_app(
         sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
         resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
         resolver_cwd = await _session_runtime_cwd(conversation_id)
+        resolver_additional_directories = await _session_additional_directory_paths(
+            conversation_id,
+            cwd=resolver_cwd,
+        )
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
                 agent_id=resolver_agent_id,
@@ -2673,6 +2691,7 @@ def create_runner_app(
                 harness_override=body.harness_override,
                 sub_agent_name=sub_agent_name,
                 cwd=resolver_cwd,
+                additional_directories=resolver_additional_directories,
             )
             generator_spec = generator_spec_for_harness(effective_harness)
             if generator_spec is None:
@@ -2687,6 +2706,7 @@ def create_runner_app(
                     harness_override=resolver_harness,
                     sub_agent_name=sub_agent_name,
                     cwd=resolver_cwd,
+                    additional_directories=resolver_additional_directories,
                 )
                 if resolved_harness != resolver_harness:
                     return BackgroundSessionTitleResponse(status="unsupported")
@@ -2846,12 +2866,18 @@ def create_runner_app(
                 server_client=server_client,
                 routing_class=_routing_class,
             )
+            runtime_cwd = await _session_runtime_cwd(session_id)
+            additional_directories = await _session_additional_directory_paths(
+                session_id,
+                cwd=runtime_cwd,
+            )
             spawn_env = _build_spawn_env_from_spec(
                 spec,
                 harness_name,
                 workdir=_resolved_spec_workdir(spec_entry),
-                cwd=await _session_runtime_cwd(session_id),
+                cwd=runtime_cwd,
                 session_id=session_id,
+                additional_directories=additional_directories,
             )
             if spawn_env is None:
                 spawn_env = await _resolve_native_spawn_env(
@@ -2999,6 +3025,11 @@ def create_runner_app(
                         skills_filter,
                     )
                     _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                    claude_cwd = await _session_runtime_cwd(session_id)
+                    claude_additional_directories = await _session_additional_directory_paths(
+                        session_id,
+                        cwd=claude_cwd,
+                    )
                     return dataclasses.replace(
                         ctx,
                         bundle_dir=bundle_dir,
@@ -3006,6 +3037,10 @@ def create_runner_app(
                         agent_spec=spec,
                         skills_filter=skills_filter,
                         session_init=init_context.envelope,
+                        runtime_cwd=claude_cwd,
+                        additional_directories=tuple(
+                            str(path) for path in claude_additional_directories
+                        ),
                         auth_token_factory=auth_token_factory,
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
@@ -5435,13 +5470,18 @@ def create_runner_app(
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
         if cached_spec is not None:
+            runtime_cwd = await _session_runtime_cwd(conv)
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
                 cast(str, harness_name),
                 workdir=cached_spec_workdir,
-                cwd=await _session_runtime_cwd(conv),
+                cwd=runtime_cwd,
                 model_override=cast(str | None, msg_body.get("model_override")),
                 session_id=conv,
+                additional_directories=await _session_additional_directory_paths(
+                    conv,
+                    cwd=runtime_cwd,
+                ),
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -5711,6 +5751,7 @@ def create_runner_app(
         if not harness_name:
             _agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
             _sub_agent_name = await _recover_sub_agent_name(conv_id)
+            runtime_cwd = await _session_runtime_cwd(conv_id)
             try:
                 harness_name, spawn_env = await _resolve_harness_config(
                     agent_id=_agent_id,
@@ -5719,7 +5760,11 @@ def create_runner_app(
                     model_override=cast(str | None, body.get("model_override")),
                     harness_override=cast(str | None, body.get("harness_override")),
                     sub_agent_name=_sub_agent_name,
-                    cwd=await _session_runtime_cwd(conv_id),
+                    cwd=runtime_cwd,
+                    additional_directories=await _session_additional_directory_paths(
+                        conv_id,
+                        cwd=runtime_cwd,
+                    ),
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
                 return JSONResponse(
@@ -6939,9 +6984,18 @@ def create_runner_app(
                     ctx: NativeLaunchContext,
                 ) -> NativeLaunchContext:
                     claude_agent_spec = await _resolve_session_agent_spec(session_id)
+                    claude_cwd = await _session_runtime_cwd(session_id)
+                    claude_additional_directories = await _session_additional_directory_paths(
+                        session_id,
+                        cwd=claude_cwd,
+                    )
                     return dataclasses.replace(
                         ctx,
                         agent_spec=claude_agent_spec,
+                        runtime_cwd=claude_cwd,
+                        additional_directories=tuple(
+                            str(path) for path in claude_additional_directories
+                        ),
                         auth_token_factory=auth_token_factory,
                         resolve_launch_config=lambda: _resolve_session_claude_launch_config(
                             session_id
@@ -9098,6 +9152,7 @@ async def _resolve_harness_config(
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
     cwd: Path | None = None,
+    additional_directories: tuple[Path, ...] = (),
 ) -> tuple[str, dict[str, str] | None]:
     """Resolve harness type + spawn-env from the agent spec.
 
@@ -9119,6 +9174,7 @@ async def _resolve_harness_config(
         :func:`_find_spec_by_name` before harness derivation. ``None`` for
         top-level sessions.
     :param cwd: Runtime working directory for harnesses that need it.
+    :param additional_directories: Attached project roots beyond ``cwd``.
     :returns: ``(harness, spawn_env)``; a default for unresolved specs.
     """
     if agent_id and spec_resolver:
@@ -9148,6 +9204,7 @@ async def _resolve_harness_config(
                 workdir=workdir,
                 model_override=model_override,
                 session_id=session_id,
+                additional_directories=additional_directories,
             )
             return harness, spawn_env
 
@@ -9250,6 +9307,7 @@ def _build_spawn_env_from_spec(
     workdir: Path | None = None,
     model_override: str | None = None,
     session_id: str | None = None,
+    additional_directories: tuple[Path, ...] = (),
 ) -> dict[str, str] | None:
     """Build spawn-env from spec — mirrors workflow.py's helpers.
 
@@ -9267,6 +9325,7 @@ def _build_spawn_env_from_spec(
         via ``--model`` in :func:`_build_claude_native_base_args`; the
         SDK harnesses have no such arg, so the override must land in the
         env var here.)
+    :param additional_directories: Attached project roots beyond ``cwd``.
     :returns: The spawn-env dict, or ``None`` for native / unknown harnesses.
     """
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
@@ -9302,7 +9361,12 @@ def _build_spawn_env_from_spec(
         )
 
         if harness == "claude-sdk":
-            env = _build_claude_sdk_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env = _build_claude_sdk_spawn_env(
+                effective_spec,
+                cwd=cwd,
+                workdir=workdir,
+                additional_directories=additional_directories,
+            )
         elif harness == "codex":
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "pi":

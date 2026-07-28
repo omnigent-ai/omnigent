@@ -1325,7 +1325,7 @@ class TestSystemMessages(unittest.TestCase):
         shim_upstream: dict[str, str] = {}
 
         async def _t():
-            executor = ClaudeSDKExecutor()
+            executor = ClaudeSDKExecutor(add_dirs=["/repo/shared", "/repo/docs"])
             executor._gateway = True
             executor._databricks_profile = "oss"
             executor._base_url_override = "https://host/ai-gateway/anthropic"
@@ -1377,6 +1377,7 @@ class TestSystemMessages(unittest.TestCase):
         self.assertEqual(captured_options[0].env["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"], "900000")
         self.assertNotIn("OMNIGENT_CLAUDE_API_KEY_HELPER", captured_options[0].env)
         self.assertNotIn("ANTHROPIC_AUTH_TOKEN", captured_options[0].env)
+        self.assertEqual(captured_options[0].add_dirs, ["/repo/shared", "/repo/docs"])
 
     def test_auth_retry_surfaces_executor_error(self):
         from claude_agent_sdk.types import (

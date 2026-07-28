@@ -1448,6 +1448,25 @@ def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.Monke
     assert overridden["HARNESS_HERMES_MODEL"] == "hermes-4-70b"
 
 
+def test_build_spawn_env_threads_claude_additional_directories(tmp_path: Path) -> None:
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+    roots = (tmp_path / "shared", tmp_path / "docs")
+
+    env = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        cwd=tmp_path / "primary",
+        additional_directories=roots,
+    )
+
+    assert env is not None
+    assert json.loads(env["HARNESS_CLAUDE_SDK_ADD_DIRS"]) == [str(path) for path in roots]
+
+
 @pytest.mark.asyncio
 async def test_resolve_harness_config_applies_harness_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1557,7 +1576,11 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
         )
 
     def _raising_build(
-        spec: object, *, cwd: object = None, workdir: object = None
+        spec: object,
+        *,
+        cwd: object = None,
+        workdir: object = None,
+        additional_directories: object = (),
     ) -> dict[str, str]:
         """
         Stand in for ``_build_claude_sdk_spawn_env`` and fail the way the
@@ -1568,7 +1591,7 @@ async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
         :returns: Never returns.
         :raises OmnigentError: Always — mirrors the no-model provider error.
         """
-        del spec, workdir
+        del spec, cwd, workdir, additional_directories
         raise OmnigentError(
             "No model resolved for the 'claude-sdk' harness on a generic provider.",
             code=ErrorCode.INVALID_INPUT,
@@ -1653,7 +1676,11 @@ async def test_runner_failed_status_carries_setup_error_message(
         )
 
     def _raising_build(
-        spec: object, *, cwd: object = None, workdir: object = None
+        spec: object,
+        *,
+        cwd: object = None,
+        workdir: object = None,
+        additional_directories: object = (),
     ) -> dict[str, str]:
         """
         Fail the spawn-env build the way the no-model provider path does.
@@ -1663,7 +1690,7 @@ async def test_runner_failed_status_carries_setup_error_message(
         :returns: Never returns.
         :raises OmnigentError: Always.
         """
-        del spec, workdir
+        del spec, cwd, workdir, additional_directories
         raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
 
     monkeypatch.setattr(
