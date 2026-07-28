@@ -129,6 +129,12 @@ from omnigent.runner.session_init_protocol import (
     parse_runner_session_init_envelope,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.prompt import (
+    SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
+    input_items_have_multiple_authors,
+    prepare_input_items_for_model,
+    shared_message_attribution_enabled,
+)
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -1851,6 +1857,7 @@ def create_runner_app(
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
+    _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
@@ -3487,6 +3494,7 @@ def create_runner_app(
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
         _session_histories.pop(session_id, None)
+        _author_attribution_sessions.discard(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -3671,13 +3679,14 @@ def create_runner_app(
             ):
                 _skipped_types.append(str(item_type))
             if item_type == "message":
-                result.append(
-                    {
-                        "type": "message",
-                        "role": item.get("role", "user"),
-                        "content": item.get("content", []),
-                    }
-                )
+                message = {
+                    "type": "message",
+                    "role": item.get("role", "user"),
+                    "content": item.get("content", []),
+                }
+                if item.get("created_by") is not None:
+                    message["created_by"] = item["created_by"]
+                result.append(message)
             elif item_type == "function_call":
                 result.append(
                     {
@@ -5469,6 +5478,50 @@ def create_runner_app(
             )
         await _cancel_active_turn(conv_id, expected_task=target)
 
+    def _history_message_from_body(body: dict[str, Any]) -> dict[str, Any]:
+        message = {
+            "type": "message",
+            "role": body.get("role", "user"),
+            "content": body.get("content", []),
+        }
+        if body.get("created_by") is not None:
+            message["created_by"] = body["created_by"]
+        return message
+
+    def _note_message_author(session_id: str, body: dict[str, Any]) -> None:
+        if session_id in _author_attribution_sessions:
+            return
+        if body.get("author_attribution_required") is True:
+            _author_attribution_sessions.add(session_id)
+            return
+        authors = {
+            item.get("created_by")
+            for item in _session_histories.get(session_id, [])
+            if isinstance(item.get("created_by"), str) and item.get("created_by")
+        }
+        created_by = body.get("created_by")
+        if isinstance(created_by, str) and created_by:
+            authors.add(created_by)
+        if len(authors) >= 2:
+            _author_attribution_sessions.add(session_id)
+
+    def _message_body_for_harness(
+        body: dict[str, Any],
+        *,
+        force_author_attribution: bool,
+    ) -> dict[str, Any]:
+        event = {
+            key: value
+            for key, value in body.items()
+            if key not in {"created_by", "author_attribution_required"}
+        }
+        prepared = prepare_input_items_for_model(
+            [_history_message_from_body(body)],
+            force_author_attribution=force_author_attribution,
+        )
+        event["content"] = prepared[0]["content"]
+        return event
+
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
@@ -5496,11 +5549,7 @@ def create_runner_app(
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
-                    {
-                        "type": "message",
-                        "role": next_body.get("role", "user"),
-                        "content": next_body.get("content", []),
-                    }
+                    _history_message_from_body(next_body)
                 )
             else:
                 all_bodies = list(buf)
@@ -5509,11 +5558,7 @@ def create_runner_app(
 
                 for body in all_bodies:
                     _session_histories.setdefault(session_id, []).append(
-                        {
-                            "type": "message",
-                            "role": body.get("role", "user"),
-                            "content": body.get("content", []),
-                        }
+                        _history_message_from_body(body)
                     )
                 next_body = all_bodies[-1]
 
@@ -5816,6 +5861,10 @@ def create_runner_app(
             _session_histories[conv] = (
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
+        if conv not in _author_attribution_sessions and input_items_have_multiple_authors(
+            _session_histories[conv]
+        ):
+            _author_attribution_sessions.add(conv)
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -5826,7 +5875,17 @@ def create_runner_app(
             )
             from omnigent.runtime.prompt import build_instructions
 
-            instructions = build_instructions(cached_spec, None, [])
+            framework_instructions = (
+                (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
+                if shared_message_attribution_enabled() and conv in _author_attribution_sessions
+                else ()
+            )
+            instructions = build_instructions(
+                cached_spec,
+                None,
+                [],
+                framework_instructions=framework_instructions,
+            )
 
         ctx = TurnDispatch(
             agent_id=msg_body.get("agent_id"),
@@ -5845,7 +5904,14 @@ def create_runner_app(
             "model": msg_body.get("model", ""),
         }
         if _session_histories[conv]:
-            harness_body["content"] = _session_histories[conv]
+            history = _session_histories[conv]
+            if any("created_by" in item for item in history):
+                harness_body["content"] = prepare_input_items_for_model(
+                    history,
+                    force_author_attribution=conv in _author_attribution_sessions,
+                )
+            else:
+                harness_body["content"] = history
         else:
             harness_body["content"] = msg_body.get(
                 "content",
@@ -6424,11 +6490,7 @@ def create_runner_app(
                                         _session_message_buffers[conv_id] = _remaining
                                         for _m in _consumed:
                                             _session_histories.setdefault(conv_id, []).append(
-                                                {
-                                                    "type": "message",
-                                                    "role": _m.get("role", "user"),
-                                                    "content": _m.get("content", []),
-                                                }
+                                                _history_message_from_body(_m)
                                             )
                                     continue
                                 if _evt_type == "response.output_text.delta":
@@ -6732,6 +6794,7 @@ def create_runner_app(
                         session_id=conversation_id,
                         server_client=server_client,
                     )
+                _note_message_author(conversation_id, message_body)
 
                 if conversation_id in _active_turns:
                     _native = _is_native_harness(conversation_id)
@@ -6757,9 +6820,15 @@ def create_runner_app(
                     if _can_forward and process_manager is not None:
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
+                            injection_body = _message_body_for_harness(
+                                message_body,
+                                force_author_attribution=(
+                                    conversation_id in _author_attribution_sessions
+                                ),
+                            )
                             _injection_resp = await _hc.post(
                                 f"/v1/sessions/{conversation_id}/events",
-                                json=message_body,
+                                json=injection_body,
                                 timeout=5.0,
                             )
                             if _injection_resp.status_code >= 400:
@@ -6792,11 +6861,7 @@ def create_runner_app(
                         },
                     )
 
-                new_item = {
-                    "type": "message",
-                    "role": message_body.get("role", "user"),
-                    "content": message_body.get("content", []),
-                }
+                new_item = _history_message_from_body(message_body)
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:

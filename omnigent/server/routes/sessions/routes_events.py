@@ -1327,6 +1327,7 @@ def register_events_routes(
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
             created_by=created_by,
+            author_attribution_required=(access.level is not None and access.level < LEVEL_OWNER),
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
         )

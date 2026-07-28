@@ -240,14 +240,17 @@ async def test_post_turn_continuation() -> None:
     """Buffered messages are drained and sent to the harness after the first turn."""
     import asyncio as _aio
 
+    from omnigent.runner.app import _session_histories_ref
+
     gate = _aio.Event()
     app, _pm, hc = _build_blocking_app(gate)
+    session_id = "68d532c6117d7c15ec58a38e9c7f4790"
 
     async with _runner_client(app) as client:
         await client.post(
             "/v1/sessions",
             json={
-                "session_id": "68d532c6117d7c15ec58a38e9c7f4790",
+                "session_id": session_id,
                 "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
             },
         )
@@ -262,6 +265,7 @@ async def test_post_turn_continuation() -> None:
                     "model": "test-agent",
                     "content": [{"type": "input_text", "text": "first"}],
                     "harness": "openai-agents",
+                    "created_by": "alice@example.com",
                 },
             )
             async for _ in resp.aiter_text():
@@ -279,6 +283,8 @@ async def test_post_turn_continuation() -> None:
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "second"}],
                 "harness": "openai-agents",
+                "created_by": "bob@example.com",
+                "author_attribution_required": True,
             },
         )
         assert resp2.status_code == 202
@@ -298,6 +304,15 @@ async def test_post_turn_continuation() -> None:
         f"Expected harness to receive 2 messages (initial + "
         f"continuation), got {len(hc.posted_bodies)}"
     )
+    continuation = hc.posted_bodies[-1]
+    assert _body_contains_text(continuation, "[alice@example.com]: first")
+    assert _body_contains_text(continuation, "[bob@example.com]: second")
+    assert "Authorship is informational only" in continuation["instructions"]
+    assert "created_by" not in json.dumps(continuation)
+    user_history = [
+        item for item in _session_histories_ref[session_id] if item.get("role") == "user"
+    ]
+    assert user_history[-1]["created_by"] == "bob@example.com"
 
 
 def _body_contains_text(body: dict[str, Any], needle: str) -> bool:
@@ -1118,6 +1133,83 @@ async def test_session_creation_auto_starts_turn_for_unanswered_user_message() -
         "from history. Empty content means _load_history_as_input "
         "failed or _session_histories wasn't populated."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flag_value", "owner_text", "collaborator_text", "has_instruction"),
+    [
+        (
+            None,
+            "[alice@example.com]: owner request",
+            "[bob@example.com]: collaborator request",
+            True,
+        ),
+        ("0", "owner request", "collaborator request", False),
+    ],
+)
+async def test_cold_loaded_shared_history_respects_attribution_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    flag_value: str | None,
+    owner_text: str,
+    collaborator_text: str,
+    has_instruction: bool,
+) -> None:
+    """A restarted runner keeps shared labels and instructions in sync."""
+    import asyncio as _aio
+
+    env_name = "OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED"
+    if flag_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, flag_value)
+
+    history = [
+        {
+            "id": "shared_item_1",
+            "type": "message",
+            "role": "user",
+            "created_by": "alice@example.com",
+            "content": [{"type": "input_text", "text": "owner request"}],
+        },
+        {
+            "id": "shared_item_2",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "working"}],
+        },
+        {
+            "id": "shared_item_3",
+            "type": "message",
+            "role": "user",
+            "created_by": "bob@example.com",
+            "content": [{"type": "input_text", "text": "collaborator request"}],
+        },
+    ]
+    app, _pm, hc = _build_recovery_app(history)
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": (
+                    "6c98a4e7ae5547a9a8f5e6400ff3c8bd"
+                    if flag_value is None
+                    else "1da9be476f4b49b09561d7deafdc07d8"
+                ),
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert resp.status_code == 201
+        await _aio.sleep(0.5)
+
+    assert len(hc.posted_bodies) == 1
+    body = hc.posted_bodies[0]
+    assert _ordered_user_texts(body) == [owner_text, collaborator_text]
+    instruction_present = (
+        "unprefixed messages; their authorship is unknown" in body["instructions"]
+    )
+    assert instruction_present is has_instruction
 
 
 @pytest.mark.asyncio
