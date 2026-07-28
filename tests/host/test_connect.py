@@ -99,6 +99,36 @@ async def test_handle_model_options_uses_host_claude_configuration(
     )
 
 
+async def test_handle_model_options_uses_host_pi_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch picker asks Pi for the models available on this host."""
+    from omnigent import pi_native
+
+    monkeypatch.setattr(
+        pi_native,
+        "pi_native_model_options",
+        lambda: [
+            {
+                "id": "system.ai.gpt-5-6-sol",
+                "model": "system.ai.gpt-5-6-sol",
+                "displayName": "system.ai.gpt-5-6-sol",
+                "provider": "databricks-mlflow",
+                "isDefault": True,
+            }
+        ],
+    )
+    host = _make_host_process()
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_pi_models", harness="pi-native"),
+    )
+
+    assert result.status == "ok"
+    assert result.models[0]["id"] == "system.ai.gpt-5-6-sol"
+    assert result.models[0]["isDefault"] is True
+
+
 def _make_host_process() -> HostProcess:
     """Create a HostProcess with a test identity.
 

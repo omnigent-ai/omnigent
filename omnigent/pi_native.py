@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,100 @@ _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
+
+
+def _pi_default_model_selection(
+    agent_dir: Path | None = None,
+) -> tuple[str, str] | None:
+    """Return Pi's configured ``(provider, model)`` default, if present."""
+    root = agent_dir or Path.home() / ".pi" / "agent"
+    settings_path = root / "settings.json"
+    try:
+        raw = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    provider = raw.get("defaultProvider")
+    model = raw.get("defaultModel")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    return provider.strip(), model.strip()
+
+
+def pi_native_model_options(
+    *,
+    env: Mapping[str, str] | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[dict[str, Any]]:
+    """Return the models Pi itself reports as available on this machine."""
+    launch_env = dict(os.environ if env is None else env)
+    try:
+        executable = resolve_pi_executable(env=launch_env)
+    except click.ClickException:
+        return []
+    try:
+        result = run(
+            [executable, "--list-models"],
+            env=launch_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    configured_agent_dir = launch_env.get("PI_CODING_AGENT_DIR", "").strip()
+    home = Path(launch_env.get("HOME", str(Path.home())))
+    default = _pi_default_model_selection(
+        Path(configured_agent_dir) if configured_agent_dir else home / ".pi" / "agent"
+    )
+    options: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in result.stdout.splitlines()[1:]:
+        columns = line.split()
+        if len(columns) < 2:
+            continue
+        provider, model = columns[0], columns[1]
+        if model in seen:
+            continue
+        seen.add(model)
+        option: dict[str, Any] = {
+            "id": model,
+            "model": model,
+            "displayName": model,
+            "provider": provider,
+        }
+        if default == (provider, model):
+            option["isDefault"] = True
+        options.append(option)
+    return options
+
+
+def resolve_pi_native_local_model_selection(
+    model: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """Resolve a model override against Pi's own available provider catalog."""
+    stripped = model.strip()
+    if not stripped:
+        return None
+    options = pi_native_model_options(env=env)
+    matches = [option for option in options if option.get("id") == stripped]
+    if not matches:
+        return None
+    selected = next((option for option in matches if option.get("isDefault") is True), matches[0])
+    provider = selected.get("provider")
+    resolved_model = selected.get("model")
+    if not isinstance(provider, str) or not isinstance(resolved_model, str):
+        return None
+    return provider, resolved_model
 
 
 @dataclass(frozen=True)

@@ -1221,8 +1221,8 @@ function HarnessConfigModal({
   cursorExecMode,
   bypassSandbox,
   pickedModel,
-  claudeModelOptions,
-  claudeModelsLoading,
+  modelOptions,
+  modelsLoading,
   pickedEffort,
   pickedHarness,
   costControlMode,
@@ -1247,8 +1247,8 @@ function HarnessConfigModal({
   cursorExecMode: string;
   bypassSandbox: boolean;
   pickedModel: string;
-  claudeModelOptions: readonly { id: string; displayName: string }[];
-  claudeModelsLoading: boolean;
+  modelOptions: readonly { id: string; displayName: string; isDefault?: boolean }[];
+  modelsLoading: boolean;
   pickedEffort: string;
   pickedHarness: string | null;
   costControlMode: CostControlMode;
@@ -1268,6 +1268,8 @@ function HarnessConfigModal({
   const hasPermission = nativeAgentHasCapability(agent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(agent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(agent, "cursorMode");
+  const isPi = entryHarness === "pi-native";
+  const hasModelSelection = hasPermission || isPi;
   const isCodex = entryHarness === "codex-native";
   const brainDefault =
     agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
@@ -1322,19 +1324,20 @@ function HarnessConfigModal({
   };
 
   const save = () => {
-    if (hasPermission) {
+    if (hasModelSelection) {
       // Order matters: commit model first (its setter clears routing when a
       // model is set), then routing (its setter clears the model when "on") —
       // the two setters enforce the mutual exclusion between them.
       setPickedModel(draftModel);
-      setPickedEffort(draftEffort);
-      setPermissionMode(draftPermission);
       if (entryHarness)
         writeHarnessOption(entryHarness, {
           model: draftModel,
-          effort: draftEffort,
-          mode: draftPermission,
+          ...(hasPermission ? { effort: draftEffort, mode: draftPermission } : {}),
         });
+      if (hasPermission) {
+        setPickedEffort(draftEffort);
+        setPermissionMode(draftPermission);
+      }
     } else if (hasApproval) {
       setApprovalMode(draftApproval);
       setBypassSandbox(draftBypass);
@@ -1389,7 +1392,7 @@ function HarnessConfigModal({
               </div>
             </ConfigRow>
           )}
-          {hasPermission && (
+          {hasModelSelection && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
                 <Select value={modelValue} onValueChange={onModelChange}>
@@ -1408,18 +1411,18 @@ function HarnessConfigModal({
                     {smartRoutingEligible && (
                       <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
                     )}
-                    <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
-                    {claudeModelOptions.map((m) => (
+                    {!isPi && <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>}
+                    {modelOptions.map((m) => (
                       <SelectItem key={m.id} value={m.id}>
                         {m.displayName}
                       </SelectItem>
                     ))}
-                    {claudeModelsLoading && (
+                    {modelsLoading && (
                       <div className="px-2.5 py-1 text-xs text-muted-foreground">
                         Loading models…
                       </div>
                     )}
-                    {!claudeModelsLoading && claudeModelOptions.length === 0 && (
+                    {!modelsLoading && modelOptions.length === 0 && (
                       <div className="px-2.5 py-1 text-xs text-muted-foreground">
                         Models unavailable
                       </div>
@@ -1428,45 +1431,49 @@ function HarnessConfigModal({
                 </Select>
               </ConfigRow>
 
-              <ConfigRow label="Effort" description="Reasoning depth vs. speed">
-                <Select
-                  value={draftEffort || EFFORT_SELECT_NONE}
-                  onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
-                  // Smart Routing picks the model + effort per turn, so an
-                  // explicit effort can't apply — freeze it to Default.
-                  disabled={smartRoutingOn}
-                >
-                  <SelectTrigger
-                    className="w-full"
-                    data-testid="new-chat-landing-config-effort"
-                    aria-label="Reasoning effort"
+              {hasPermission && (
+                <ConfigRow label="Effort" description="Reasoning depth vs. speed">
+                  <Select
+                    value={draftEffort || EFFORT_SELECT_NONE}
+                    onValueChange={(v) => setDraftEffort(v === EFFORT_SELECT_NONE ? "" : v)}
+                    // Smart Routing picks the model + effort per turn, so an
+                    // explicit effort can't apply — freeze it to Default.
+                    disabled={smartRoutingOn}
                   >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="[&_[data-slot=select-item]]:pl-2.5"
-                  >
-                    <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                    {CLAUDE_NATIVE_EFFORTS.map((e) => (
-                      <SelectItem key={e.value} value={e.value}>
-                        {e.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </ConfigRow>
+                    <SelectTrigger
+                      className="w-full"
+                      data-testid="new-chat-landing-config-effort"
+                      aria-label="Reasoning effort"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent
+                      position="popper"
+                      align="start"
+                      className="[&_[data-slot=select-item]]:pl-2.5"
+                    >
+                      <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+                      {CLAUDE_NATIVE_EFFORTS.map((e) => (
+                        <SelectItem key={e.value} value={e.value}>
+                          {e.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </ConfigRow>
+              )}
 
-              <ConfigRow label="Permissions" description="What the agent can do without asking">
-                <DescribedSelect
-                  value={draftPermission}
-                  onValueChange={setDraftPermission}
-                  options={CLAUDE_NATIVE_PERMISSION_MODES}
-                  testId="new-chat-landing-config-permission"
-                  ariaLabel="Permissions"
-                />
-              </ConfigRow>
+              {hasPermission && (
+                <ConfigRow label="Permissions" description="What the agent can do without asking">
+                  <DescribedSelect
+                    value={draftPermission}
+                    onValueChange={setDraftPermission}
+                    options={CLAUDE_NATIVE_PERMISSION_MODES}
+                    testId="new-chat-landing-config-permission"
+                    ariaLabel="Permissions"
+                  />
+                </ConfigRow>
+              )}
             </>
           )}
 
@@ -1756,24 +1763,6 @@ export function NewChatLandingScreen() {
   // (host_type: "managed"), so no host_id or workspace is sent.
   const [sandboxSelected, setSandboxSelected] = useState(
     () => landingDraft?.sandboxSelected ?? false,
-  );
-  const { data: hostClaudeModelOptions, isLoading: hostClaudeModelsLoading } = useHostModelOptions(
-    selectedHostId,
-    "claude-native",
-    !sandboxSelected,
-  );
-  const claudeModelOptions = useMemo(
-    () =>
-      sandboxSelected
-        ? CLAUDE_NATIVE_MODELS.map((model) => ({
-            id: model.id,
-            displayName: model.label,
-          }))
-        : (hostClaudeModelOptions ?? []).map((option) => ({
-            id: option.id,
-            displayName: option.displayName ?? option.id,
-          })),
-    [hostClaudeModelOptions, sandboxSelected],
   );
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
@@ -2153,6 +2142,34 @@ export function NewChatLandingScreen() {
         : agentList.find((a) => a.id === effectiveAgentId),
     [agentList, effectiveAgentId, pendingAgent],
   );
+  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  const modelOptionsHarness = selectedNativeHarness === "pi-native" ? "pi-native" : "claude-native";
+  const supportsModelSelection =
+    selectedNativeHarness === "pi-native" ||
+    nativeAgentHasCapability(selectedAgent, "permissionMode");
+  const { data: hostModelOptions, isLoading: hostModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    modelOptionsHarness,
+    !sandboxSelected && supportsModelSelection,
+  );
+  const modelOptions = useMemo(
+    () =>
+      sandboxSelected && modelOptionsHarness === "claude-native"
+        ? CLAUDE_NATIVE_MODELS.map((model) => ({
+            id: model.id,
+            displayName: model.label,
+            isDefault: undefined,
+          }))
+        : (hostModelOptions ?? []).map((option) => ({
+            id: option.id,
+            displayName:
+              modelOptionsHarness === "pi-native" && option.isDefault
+                ? `${option.displayName ?? option.id} (Default)`
+                : (option.displayName ?? option.id),
+            isDefault: option.isDefault,
+          })),
+    [hostModelOptions, modelOptionsHarness, sandboxSelected],
+  );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
@@ -2166,6 +2183,7 @@ export function NewChatLandingScreen() {
   // lives only in the modal now, so an agent with just that (e.g. Pi) still
   // needs the gear.
   const selectedAgentHasKnobs =
+    supportsModelSelection ||
     supportsPermissionMode ||
     supportsApprovalMode ||
     supportsCursorMode ||
@@ -2179,10 +2197,10 @@ export function NewChatLandingScreen() {
   // agent) never shows misleading Smart Routing rows in the tooltip.
   const routingOn = smartRoutingEligible && costControlMode === "on";
   const configSummary = useMemo((): { label: string; value: string }[] => {
+    const selectedModelLabel =
+      modelOptions.find((model) => model.id === pickedModel)?.displayName ?? "Default";
     if (supportsPermissionMode) {
-      const modelValue = routingOn
-        ? "Smart Routing"
-        : (claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? "Default");
+      const modelValue = routingOn ? "Smart Routing" : selectedModelLabel;
       // Smart Routing freezes effort to the default (the router picks per turn),
       // so mirror the modal: show "Default" whenever routing is on or effort is
       // unset, else the picked level.
@@ -2199,6 +2217,7 @@ export function NewChatLandingScreen() {
         { label: "Permissions", value: permissionValue },
       ];
     }
+    if (supportsModelSelection) return [{ label: "Model", value: selectedModelLabel }];
     // Non-Claude routable agents surface Smart Routing as a standalone toggle,
     // so reflect it here when on (Claude folds it into Model above).
     const routingRow: { label: string; value: string }[] =
@@ -2231,6 +2250,7 @@ export function NewChatLandingScreen() {
     return routingRow;
   }, [
     supportsPermissionMode,
+    supportsModelSelection,
     supportsApprovalMode,
     supportsCursorMode,
     smartRoutingEligible,
@@ -2238,7 +2258,7 @@ export function NewChatLandingScreen() {
     brainHarnessLabels,
     routingOn,
     pickedModel,
-    claudeModelOptions,
+    modelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -2267,7 +2287,6 @@ export function NewChatLandingScreen() {
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
-  const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
   // new session on the options they used last for that harness instead of the
@@ -2285,24 +2304,28 @@ export function NewChatLandingScreen() {
     // the current list resolves to the default for the same reason.
     const resolve = (modes: readonly { value: string }[], dflt: string) =>
       stored.mode != null && modes.some((m) => m.value === stored.mode) ? stored.mode : dflt;
-    if (supportsPermissionMode) {
-      setPermissionMode(
-        resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
-      );
+    if (supportsModelSelection) {
       // The model + effort picker remembers its own last pick (same per-harness
-      // snapshot the mode knob uses), validated against the current vocab. With
-      // nothing stored (or a retired id) it resolves to "" — unselected, so the
-      // create omits the override and Claude Code uses its own configured model.
+      // snapshot the mode knob uses), validated against the current vocabulary.
+      // Pi falls back to the default reported by its own CLI so a new Omnigent
+      // session starts on the same model as direct Pi.
       setPickedModel(
-        stored.model != null && claudeModelOptions.some((m) => m.id === stored.model)
+        stored.model != null && modelOptions.some((m) => m.id === stored.model)
           ? stored.model
-          : "",
+          : selectedNativeHarness === "pi-native"
+            ? (modelOptions.find((model) => model.isDefault)?.id ?? "")
+            : "",
       );
-      setPickedEffort(
-        stored.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
-          ? stored.effort
-          : "",
-      );
+      if (supportsPermissionMode) {
+        setPermissionMode(
+          resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+        );
+        setPickedEffort(
+          stored.effort != null && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
+            ? stored.effort
+            : "",
+        );
+      }
     } else if (supportsApprovalMode) {
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
     } else if (supportsCursorMode) {
@@ -2311,7 +2334,7 @@ export function NewChatLandingScreen() {
     // Reseed on harness changes and when the selected host's catalog resolves;
     // capability flags are derived from the same harness and stay omitted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedNativeHarness, claudeModelOptions]);
+  }, [selectedNativeHarness, modelOptions]);
   // Native-terminal agents interpret slash commands inside their own CLI
   // (the runner injects the text verbatim), so the landing composer must
   // not intercept them — no skills menu, no slash_command routing.
@@ -2805,6 +2828,9 @@ export function NewChatLandingScreen() {
       const agent = agentList.find((a) => a.id === effectiveAgentId);
       const nativeLabels = nativeWrapperLabelsForAgent(agent);
       const agentSupportsPermissionMode = nativeAgentHasCapability(agent, "permissionMode");
+      const agentSupportsModelSelection =
+        nativeCodingAgentForAvailableAgent(agent)?.harness === "pi-native" ||
+        agentSupportsPermissionMode;
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
 
@@ -2886,12 +2912,11 @@ export function NewChatLandingScreen() {
                   : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
                     : undefined,
-            // Model + reasoning effort, persisted on the session row before
-            // the runner launches. Only claude-native surfaces the picker, so
-            // only its agents carry the choice; the runner reads them as
-            // `--model` / `--effort` at terminal launch. An unselected ("")
-            // knob is omitted so Claude Code keeps its own configured model.
-            model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
+            // Model + reasoning effort, persisted before the runner launches.
+            // Claude and Pi both accept a launch model; only Claude accepts the
+            // separate effort override. An unselected ("") model is omitted so
+            // the native CLI keeps its own configured default.
+            model_override: agentSupportsModelSelection && pickedModel ? pickedModel : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
             // Smart routing toggle — server-side. The "Auto" harness always
@@ -3366,10 +3391,8 @@ export function NewChatLandingScreen() {
                     cursorExecMode={cursorExecMode}
                     bypassSandbox={bypassSandbox}
                     pickedModel={pickedModel}
-                    claudeModelOptions={claudeModelOptions}
-                    claudeModelsLoading={
-                      !sandboxSelected && selectedHostId !== null && hostClaudeModelsLoading
-                    }
+                    modelOptions={modelOptions}
+                    modelsLoading={!sandboxSelected && selectedHostId !== null && hostModelsLoading}
                     pickedEffort={pickedEffort}
                     pickedHarness={pickedHarness}
                     costControlMode={costControlMode}
