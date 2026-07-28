@@ -1001,6 +1001,49 @@ async def _session_turn_actor(
     return actor if isinstance(actor, str) and actor else None
 
 
+async def _post_child_message_event(
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    content: list[dict[str, Any]],
+    created_by: str | None,
+) -> httpx.Response:
+    """Post a child message, retrying once without best-effort attribution."""
+
+    def _payload(actor: str | None) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": content,
+            },
+            **({"created_by": actor} if actor is not None else {}),
+        }
+
+    resp = await server_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=_payload(created_by),
+        # This message is gated at the recipient's REQUEST phase, which can
+        # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
+        # ``ask_timeout``. A 30s read budget severed that park → fail-closed
+        # /retry → duplicate cards. Wait for the real verdict (one-day read
+        # budget, fast connect); a non-parking eval still returns immediately.
+        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+    )
+    if created_by is None or resp.status_code != 403:
+        return resp
+
+    _logger.debug(
+        "Child message POST attribution rejected for session=%s; retrying without actor",
+        session_id,
+    )
+    return await server_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=_payload(None),
+        timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+    )
+
+
 def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
@@ -1880,22 +1923,11 @@ async def _execute_subagent_tool(
     # post_event forwards it to the runner and starts the child
     # turn.
     try:
-        msg_resp = await server_client.post(
-            f"/v1/sessions/{child_session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": message_content,
-                },
-                **({"created_by": dispatch_created_by} if dispatch_created_by is not None else {}),
-            },
-            # This message is gated at the recipient's REQUEST phase, which can
-            # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
-            # ``ask_timeout``. A 30s read budget severed that park → fail-closed
-            # /retry → duplicate cards. Wait for the real verdict (one-day read
-            # budget, fast connect); a non-parking eval still returns immediately.
-            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        msg_resp = await _post_child_message_event(
+            server_client,
+            child_session_id,
+            content=message_content,
+            created_by=dispatch_created_by,
         )
     except httpx.HTTPError as exc:
         teardown_warning = await _teardown_failed_child(
@@ -2042,21 +2074,11 @@ async def _send_to_existing_session(
     )
 
     try:
-        msg_resp = await server_client.post(
-            f"/v1/sessions/{target_session_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": message}],
-                },
-                **({"created_by": created_by} if created_by is not None else {}),
-            },
-            # Same as the other message-send: gated at the recipient's REQUEST
-            # phase, which can PARK on a human ASK up to the policy's
-            # ``ask_timeout``. Wait for the real verdict (one-day read budget,
-            # fast connect) instead of severing at 30s and retrying into duplicates.
-            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        msg_resp = await _post_child_message_event(
+            server_client,
+            target_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=created_by,
         )
     except httpx.HTTPError as exc:
         _runner_app.unregister_child_session(target_session_id)
