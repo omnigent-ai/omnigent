@@ -152,3 +152,11 @@ bound runner and forwards the CLI's model ids, default, descriptions, context
 windows, and credit rates. The server caches the runner response through the
 same asynchronous picker path as Codex, so provider changes no longer require an
 Omnigent source update and snapshots do not block on the CLI process.
+
+## Ad-hoc CLI Defaults
+
+Minimal agent YAMLs that declare neither a harness nor a model now resolve the
+Databricks OpenAI-family default from the provider catalog during bundle
+materialization. `--model` and `OMNIGENT_MODEL` remain higher-precedence explicit
+choices. If discovery is unavailable, the CLI asks for one of those explicit
+values instead of silently baking a release-specific model into the bundle.

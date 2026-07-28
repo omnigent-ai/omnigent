@@ -18,7 +18,6 @@
 .github/workflows/security-triage.yml databricks-claude-sonnet-4-6 1
 .github/workflows/vscode-release-pr.yml databricks-claude-sonnet-4-6 1
 examples/kimi_hello.yaml kimi-k2-turbo 1
-omnigent/chat.py databricks-gpt-5-4 1
 omnigent/cli_config.py claude-opus-4-5-20251101-v1:0 1
 omnigent/cursor_native.py claude-opus-4-5 1
 omnigent/cursor_native.py claude-opus-4-6 1
