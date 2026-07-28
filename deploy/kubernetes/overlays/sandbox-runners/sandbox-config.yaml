@@ -42,6 +42,11 @@ data:
         # env: [PROXY_URL]           # SERVER env vars injected as literal Pod env (prefer secret_name for creds)
         # node_selector:             # extra node labels; default kubernetes.io/arch: amd64, override to arm64 to run there
         #   disktype: ssd
+        # tolerations:               # Pod tolerations, e.g. for a tainted dedicated agent node pool
+        #   - key: dedicated
+        #     operator: Equal
+        #     value: agents
+        #     effect: NoSchedule
         # resources:                 # runner Pod sizing (defaults: 0.5-2 cpu / 1-4Gi)
         #   requests: {cpu: "500m", memory: "1Gi"}
         #   limits: {cpu: "2", memory: "4Gi"}

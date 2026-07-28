@@ -519,7 +519,8 @@ def install_fake_kubernetes_launcher(
 
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
-    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…)``; the shim records those
+    kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, tolerations=…)``; the
+    shim records those
     constructor args on the fake and hands it back, so production code runs
     unmodified against it.
 
@@ -540,6 +541,7 @@ def install_fake_kubernetes_launcher(
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
         pvc_mounts: list[dict[str, object]] | None = None,
+        tolerations: list[dict[str, object]] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -552,6 +554,7 @@ def install_fake_kubernetes_launcher(
         fake.in_cluster = in_cluster
         fake.resources = resources
         fake.pvc_mounts = pvc_mounts
+        fake.tolerations = tolerations
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
