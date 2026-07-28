@@ -67,10 +67,12 @@ vi.mock("@/hooks/useConversations", () => ({
 // Read-state mirror: control unread verdicts deterministically. Default read.
 const isConversationUnseen = vi.fn(() => false);
 const isExplicitlyUnread = vi.fn(() => false);
+const markConversationUnread = vi.fn();
 vi.mock("@/hooks/useUnseenConversations", () => ({
   useUnseenTick: () => 0,
   isConversationUnseen: (...args: unknown[]) => isConversationUnseen(...(args as [])),
   isExplicitlyUnread: (...args: unknown[]) => isExplicitlyUnread(...(args as [])),
+  markConversationUnread: (...args: unknown[]) => markConversationUnread(...args),
 }));
 
 // Freeze the ticking clock so relative next-run text is deterministic.
@@ -168,6 +170,7 @@ beforeEach(() => {
   isConversationUnseen.mockReturnValue(false);
   isExplicitlyUnread.mockReset();
   isExplicitlyUnread.mockReturnValue(false);
+  markConversationUnread.mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate: updateMutate,
     isPending: false,
@@ -560,5 +563,100 @@ describe("run history", () => {
     setRuns([], { isError: true });
     renderPage();
     expect(screen.getByTestId("task-detail-runs-error")).toBeInTheDocument();
+  });
+});
+
+describe("auto-mark runs unread", () => {
+  it("marks a newly-completed run unread when it transitions running→succeeded", () => {
+    setTask(task());
+    // First render: one running run (sets baseline — NOT marked).
+    setRuns([
+      run({
+        id: "run_new",
+        status: "running",
+        conversationId: "c_new",
+        firedAt: 1_700_000_000,
+        finishedAt: null,
+      }),
+    ]);
+    const { rerender } = renderPage();
+    // Baseline seeded with the running run (not terminal → not in autoMarked set).
+    // markConversationUnread should NOT have been called yet.
+    expect(markConversationUnread).not.toHaveBeenCalled();
+
+    // Simulate the run completing: update the mock to return succeeded.
+    setRuns([
+      run({
+        id: "run_new",
+        status: "succeeded",
+        conversationId: "c_new",
+        firedAt: 1_700_000_000,
+        finishedAt: 1_700_000_042,
+      }),
+    ]);
+    rerender(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}
+      >
+        <TooltipProvider>
+          <MemoryRouter>
+            <TaskDetailPage />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    expect(markConversationUnread).toHaveBeenCalledWith("c_new", 1_700_000_042);
+  });
+
+  it("does NOT re-mark a run that was already opened (resurrection guard)", () => {
+    setTask(task());
+    // First render: empty runs (baseline seeded as empty).
+    setRuns([]);
+    const { rerender } = renderPage();
+    expect(markConversationUnread).not.toHaveBeenCalled();
+
+    // Run completes — gets marked once.
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_opened" })]);
+    rerender(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}
+      >
+        <TooltipProvider>
+          <MemoryRouter>
+            <TaskDetailPage />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    expect(markConversationUnread).toHaveBeenCalledTimes(1);
+
+    // Simulate user opening the conversation (would call clearUnreadOverride /
+    // markConversationSeen externally). Now poll re-fetches the same runs list.
+    rerender(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}
+      >
+        <TooltipProvider>
+          <MemoryRouter>
+            <TaskDetailPage />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+    // markConversationUnread must NOT be called again — the id is in the ref.
+    expect(markConversationUnread).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT auto-mark pre-existing terminal runs on first page load (no-retroactive guard)", () => {
+    setTask(task());
+    // First render: two already-succeeded runs (pre-existing history).
+    setRuns([
+      run({ id: "run_old_1", status: "succeeded", conversationId: "c_old_1" }),
+      run({ id: "run_old_2", status: "succeeded", conversationId: "c_old_2" }),
+    ]);
+    renderPage();
+    // Baseline seeds both ids as already-seen → markConversationUnread never called.
+    expect(markConversationUnread).not.toHaveBeenCalled();
   });
 });

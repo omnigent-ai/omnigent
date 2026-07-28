@@ -12,7 +12,7 @@
  * open-conversation link) — never an invented summary line.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   CalendarOffIcon,
@@ -41,6 +41,7 @@ import { fetchConversationById } from "@/hooks/useConversations";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
+  markConversationUnread,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { useNow } from "@/hooks/useNow";
@@ -75,6 +76,53 @@ export function TaskDetailPage() {
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
+
+  // Auto-mark newly-completed (succeeded) runs as unread so the pink dot
+  // appears until the user opens the conversation.
+  //
+  // Two guards prevent incorrect behaviour:
+  //   1. ONCE-PER-SESSION: `autoMarkedRef` tracks every conversationId this
+  //      component has already auto-marked. Re-marking on a subsequent poll
+  //      would resurrect the dot for a run the user already opened.
+  //   2. NO-RETROACTIVE: the ref is seeded on the FIRST non-empty runs response
+  //      with all currently-terminal ids, so pre-existing history is never
+  //      mass-marked pink on page load. Only runs that appear as terminal AFTER
+  //      the baseline is established trigger a mark.
+  const autoMarkedRef = useRef<Set<string>>(new Set());
+  const baselineSeededRef = useRef(false);
+  useEffect(() => {
+    if (!runs) return;
+
+    if (!baselineSeededRef.current) {
+      // Seed the baseline from the initial run list — skip all currently-terminal
+      // ids so existing history stays read. Seed even when empty so a subsequent
+      // update with a new completed run is correctly treated as "new", not as a
+      // second baseline seed.
+      for (const run of runs) {
+        if (run.conversationId && run.status === "succeeded") {
+          autoMarkedRef.current.add(run.conversationId);
+        }
+      }
+      baselineSeededRef.current = true;
+      return;
+    }
+
+    // On subsequent updates, mark any succeeded run whose conversationId hasn't
+    // been auto-marked yet (new completion observed by this client).
+    for (const run of runs) {
+      if (
+        run.status === "succeeded" &&
+        run.conversationId &&
+        !autoMarkedRef.current.has(run.conversationId)
+      ) {
+        autoMarkedRef.current.add(run.conversationId);
+        markConversationUnread(
+          run.conversationId,
+          run.finishedAt ?? run.firedAt ?? Math.floor(Date.now() / 1000),
+        );
+      }
+    }
+  }, [runs]);
 
   // Resolve the agent + host display labels from their catalogs. Both are
   // best-effort: an unknown id falls back to the raw id (agent) or a friendly
