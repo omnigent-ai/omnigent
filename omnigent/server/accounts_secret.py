@@ -28,6 +28,8 @@ import secrets
 import stat
 from pathlib import Path
 
+from omnigent._platform import IS_POSIX
+
 logger = logging.getLogger(__name__)
 
 # Filename used to persist the auto-generated cookie secret inside
@@ -49,9 +51,11 @@ def load_or_generate_cookie_secret(data_dir: str | os.PathLike[str]) -> str:
     3. Fresh ``secrets.token_hex(32)`` — generated, written to the
        same path with ``0o600`` mode, returned.
 
-    Parent dir is created with ``0o700`` if missing. File mode is
-    re-applied on every write so a pre-existing file doesn't
-    leak via a too-permissive umask.
+    Parent dir is created with ``0o700`` if missing. On POSIX the file
+    mode is re-applied on every write so a pre-existing file doesn't
+    leak via a too-permissive umask. Windows has no ``os.fchmod`` and no
+    umask to defend against — its file modes are ACL-backed, and the
+    secret inherits the per-user profile directory's ACL instead.
 
     :param data_dir: Where the server keeps its persistent state.
     :returns: 64-character hex string.
@@ -70,7 +74,12 @@ def load_or_generate_cookie_secret(data_dir: str | os.PathLike[str]) -> str:
     fresh = secrets.token_hex(32)
     fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        # POSIX-only: `os.fchmod` is absent on Windows, where the mode bits
+        # passed to `os.open` above are already a no-op. Calling it
+        # unguarded raised AttributeError and took down every accounts-mode
+        # boot on Windows.
+        if IS_POSIX:
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
         os.write(fd, fresh.encode("ascii") + b"\n")
     finally:
         os.close(fd)

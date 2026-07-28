@@ -31,7 +31,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone, tzinfo
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -44,7 +44,10 @@ from omnigent.server.scheduled.rrule import (
 
 _logger = logging.getLogger(__name__)
 
-_UTC = ZoneInfo("UTC")
+# Fixed offset rather than `ZoneInfo("UTC")` so the module imports on a host
+# with no IANA tz database (Windows without `tzdata`); `_resolve_tz` then
+# degrades every task to UTC instead of failing the server at boot.
+_UTC = timezone.utc
 
 # A tick that arrives more than this many seconds after its scheduled time is
 # treated as a misfire and skipped (event loop was blocked, clock jumped, etc.).
@@ -77,7 +80,7 @@ class _Job:
     task_id: str
     workspace_id: int
     trigger: RRuleTrigger
-    tz: ZoneInfo
+    tz: tzinfo
     next_run: datetime | None = None
     next_run_epoch: float | None = None
     timer: Any = None
@@ -85,7 +88,7 @@ class _Job:
     running: bool = False  # Drop overlapping on_fire callbacks.
 
 
-def _resolve_tz(name: str | None) -> ZoneInfo:
+def _resolve_tz(name: str | None) -> tzinfo:
     """Resolve an IANA timezone name, defaulting to UTC on missing/invalid."""
     if not name:
         return _UTC

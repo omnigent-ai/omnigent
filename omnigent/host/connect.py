@@ -804,6 +804,15 @@ class HostProcess:
 
         :returns: Count of orphan (non-runner) processes reaped this sweep.
         """
+        if not hasattr(os, "WNOHANG"):
+            # Windows: nothing to reap and no API to reap it with. There is no
+            # subreaper (``_install_child_subreaper`` returns False), so no
+            # orphan ever reparents here, and ``os.waitpid`` has neither
+            # ``WNOHANG`` nor the ``-1`` "any child" pid. The sweep is
+            # definitionally a no-op — but ``run``'s shutdown ``finally``
+            # calls it unconditionally, where an AttributeError would escape
+            # and mask the real exit path.
+            return 0
         if self._owned_subprocess_ops > 0:
             # A host-owned subprocess (e.g. a git worktree command) is running
             # in a worker thread. Its child is a DIRECT child of this process
@@ -2321,12 +2330,22 @@ class HostProcess:
         # success line after the noisy ``databricks.sdk`` warnings —
         # otherwise the terminal goes silent after auth and there's no
         # signal the WS handshake actually completed.
-        print(
+        banner = (
             f"✓ Connected as {self._identity.name!r} "
             f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
-            "Listening for sessions — Ctrl-C to disconnect.",
-            flush=True,
+            "Listening for sessions — Ctrl-C to disconnect."
         )
+        try:
+            print(banner, flush=True)
+        except UnicodeEncodeError:
+            # The banner is cosmetic; the tunnel above it is not. A console
+            # that can't encode "✓"/"—" (cp1252 on Windows, or a C locale)
+            # would otherwise raise here, unwind into the reconnect loop, and
+            # flap a perfectly healthy connection forever. Degrade the glyphs
+            # instead. Daemon spawns pin PYTHONIOENCODING=utf-8, so this is
+            # the foreground `omnigent host connect` path.
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(banner.encode(encoding, "replace").decode(encoding), flush=True)
 
         loop = asyncio.get_running_loop()
         next_quick_refresh = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
