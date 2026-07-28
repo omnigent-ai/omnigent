@@ -72,6 +72,8 @@ export interface Conversation {
   updated_at: number;
   labels: Record<string, string>;
   permission_level: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  can_approve?: boolean | null;
   owner?: string | null;
   runner_id?: string | null;
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
@@ -200,6 +202,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
+    can_approve: wire.can_approve ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
