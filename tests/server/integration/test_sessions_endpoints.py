@@ -2912,17 +2912,35 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert body["items"][1]["data"]["name"] == "Read"
     assert body["items"][2]["data"] == {"call_id": "toolu_read_1", "output": "todo contents"}
     assert body["items"][3]["data"]["role"] == "assistant"
+    # Receipt fields (action/terminal_id/…) stay None on bridge-observed
+    # items — only the server's shell_command receipts fill them.
+    _receipt_defaults = {
+        "action": None,
+        "terminal_id": None,
+        "terminal_name": None,
+        "session_key": None,
+        "status": None,
+        "error": None,
+        "attempt_id": None,
+        "attempt_fingerprint": None,
+        "sequence": None,
+        "terminal": None,
+        "http_status": None,
+        "error_code": None,
+    }
     assert body["items"][4]["data"] == {
         "kind": "input",
         "input": "pwd",
         "stdout": None,
         "stderr": None,
+        **_receipt_defaults,
     }
     assert body["items"][5]["data"] == {
         "kind": "output",
         "input": None,
         "stdout": "/tmp/project",
         "stderr": "",
+        **_receipt_defaults,
     }
 
     assert [event["type"] for _, event in published] == [

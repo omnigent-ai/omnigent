@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
@@ -38,6 +40,9 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins import sys_terminal as sys_terminal_module
+from omnigent.tools.builtins.sys_terminal import SysTerminalReadTool, SysTerminalSendTool
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
@@ -834,6 +839,1028 @@ async def test_get_terminal_returns_404_for_unknown(
     resp = await client.get("/v1/sessions/conv_abc/resources/terminals/terminal_nope_s1")
 
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_sends_under_instance_lock(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /input sends literal text with default Enter under the instance lock."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    lock = instance.op_lock
+    calls: list[tuple[str | None, str]] = []
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        assert lock.locked(), "the shared send helper must hold the per-instance lock"
+        calls.append((text, keys))
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", record_send)
+
+    async def forbid_readiness_wait(**kwargs: float) -> bool:
+        del kwargs
+        raise AssertionError("ordinary terminal input must not wait for shell readiness")
+
+    monkeypatch.setattr(
+        instance,
+        "wait_for_shell_ready",
+        forbid_readiness_wait,
+    )
+
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": "printf '$HOME | literal'"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "sent", "outcome": "sent"}
+    assert calls == [("printf '$HOME | literal'", "Enter")]
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_returns_404_for_unknown(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /input distinguishes an unknown resource from a stopped terminal."""
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_nope_s1/input",
+        json={"text": "echo ignored"},
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "terminal_not_running"
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_returns_409_when_not_running(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /input returns 409 for a known registry entry that is stopped."""
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_stale_s3/input",
+        json={"text": "echo ignored"},
+    )
+
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_returns_409_when_send_observes_exit(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /input maps a tmux exit observed during send to 409."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+
+    async def report_exit(
+        text: str | None = None,
+        *,
+        keys: str = "Enter",
+        wait_for_ready: bool = False,
+    ) -> dict[str, str]:
+        del text, keys
+        instance.running = False
+        return {"error": "Terminal bash:s1 is no longer running"}
+
+    monkeypatch.setattr(instance, "send", report_exit)
+
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": "echo races with exit"},
+    )
+
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_requires_json_content_type(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /input rejects a text/plain JSON body before parsing it."""
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        content=json.dumps({"text": "echo ignored"}),
+        headers={"content-type": "text/plain"},
+    )
+
+    assert resp.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_rejects_invalid_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /input validates text, keys, and the readiness opt-in."""
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": 42, "keys": ["Enter"]},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": "echo ignored", "wait_for_ready": "yes"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_flag_like_keys_returns_400_without_attempt_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """A flag-like ``keys`` token surfaces the send guard's 400 invalid_input."""
+    resp = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": "echo hi", "keys": "-X"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_flag_like_keys_returns_400_with_attempt_id(
+    client: httpx.AsyncClient,
+) -> None:
+    """The idempotency ledger must not mask the guard's 400 as delivery_unknown.
+
+    A same-``attempt_id`` replay of the rejected request must return the same
+    400 — the ledger caches the failing task, not a fake ``delivery_unknown``.
+    """
+    attempt_id = _attempt_id()
+    body = {"attempt_id": attempt_id, "text": "echo hi", "keys": "-X"}
+
+    first = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=body,
+    )
+    assert first.status_code == 400
+    assert first.json()["error"]["code"] == "invalid_input"
+
+    replay = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=body,
+    )
+    assert replay.status_code == 400
+    assert replay.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_route_and_send_tool_share_primitive(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The agent tool and runner route delegate to the same send chokepoint."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    lock = instance.op_lock
+    calls: list[
+        tuple[TerminalRegistry, TerminalInstance, threading.Lock, str | None, str, bool]
+    ] = []
+
+    def record_send(
+        target_registry: TerminalRegistry,
+        snapshot: Any,
+        text: str | None,
+        *,
+        keys: str = "Enter",
+        wait_for_ready: bool = False,
+    ) -> dict[str, str]:
+        calls.append(
+            (
+                target_registry,
+                snapshot.instance,
+                snapshot.op_lock,
+                text,
+                keys,
+                wait_for_ready,
+            )
+        )
+        return {"status": "sent"}
+
+    # This stub proves delegation and argument identity for both callers.
+    # Lock behavior and real tmux delivery are covered by their focused tests.
+    monkeypatch.setattr(sys_terminal_module, "send_terminal_input", record_send)
+    tool = SysTerminalSendTool(registry=registry)
+    ctx = ToolContext(
+        task_id="task_parity",
+        agent_id="agent_parity",
+        workspace=tmp_path,
+        conversation_id="conv_abc",
+    )
+
+    tool_result = await asyncio.to_thread(
+        tool.invoke,
+        json.dumps(
+            {
+                "terminal": "bash",
+                "session": "s1",
+                "text": "echo parity",
+                "keys": "C-j",
+            }
+        ),
+        ctx,
+    )
+    route_result = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"text": "echo parity", "keys": "C-j"},
+    )
+
+    assert tool_result == '{"status": "sent"}'
+    assert route_result.status_code == 200
+    assert route_result.json() == {"status": "sent", "outcome": "sent"}
+    assert calls == [
+        (registry, instance, lock, "echo parity", "C-j", False),
+        (registry, instance, lock, "echo parity", "C-j", False),
+    ]
+
+
+def _attempt_id() -> str:
+    """Return one canonical attempt id for runner input tests."""
+    return str(uuid.uuid4())
+
+
+async def _post_terminal_input(
+    client: httpx.AsyncClient,
+    *,
+    attempt_id: str,
+    text: str = "echo fenced",
+) -> httpx.Response:
+    """POST one idempotent input request to the seeded bash terminal."""
+    return await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={"attempt_id": attempt_id, "text": text},
+    )
+
+
+def _snapshot_for_seeded_bash(registry: TerminalRegistry) -> Any:
+    """Capture the atomic ownership snapshot for the seeded bash terminal."""
+    snapshot = registry.resolve_snapshot("conv_abc", "terminal_bash_s1")
+    assert snapshot is not None
+    assert getattr(snapshot, "code", None) != "ambiguous_resource_id"
+    return snapshot
+
+
+def _patch_stale_resolution(
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: Any,
+) -> None:
+    """Force the route to exercise a snapshot captured before a mutation."""
+    monkeypatch.setattr(registry, "resolve_snapshot", lambda *_args: snapshot)
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_after_transfer_uses_zero_tmux_calls(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender that lost to transfer fails closed before touching tmux."""
+    snapshot = _snapshot_for_seeded_bash(registry)
+    instance = snapshot.instance
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", record_send)
+    assert registry.transfer("conv_abc", "conv_new", "bash", "s1") is True
+    _patch_stale_resolution(registry, monkeypatch, snapshot)
+
+    response = await _post_terminal_input(client, attempt_id=_attempt_id())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "terminal_moved"
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_after_close_uses_zero_tmux_calls(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender that lost to close fails closed before touching tmux."""
+    snapshot = _snapshot_for_seeded_bash(registry)
+    instance = snapshot.instance
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    async def close_without_tmux() -> None:
+        instance.running = False
+
+    monkeypatch.setattr(instance, "send", record_send)
+    monkeypatch.setattr(instance, "close", close_without_tmux)
+    assert await registry.close("conv_abc", "bash", "s1") is True
+    _patch_stale_resolution(registry, monkeypatch, snapshot)
+
+    response = await _post_terminal_input(client, attempt_id=_attempt_id())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "terminal_moved"
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_after_cleanup_uses_zero_tmux_calls(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender that lost to conversation cleanup performs no tmux input."""
+    snapshot = _snapshot_for_seeded_bash(registry)
+    instance = snapshot.instance
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    async def close_without_tmux() -> None:
+        instance.running = False
+
+    monkeypatch.setattr(instance, "send", record_send)
+    monkeypatch.setattr(instance, "close", close_without_tmux)
+    await registry.cleanup_conversation("conv_abc")
+    _patch_stale_resolution(registry, monkeypatch, snapshot)
+
+    response = await _post_terminal_input(client, attempt_id=_attempt_id())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "terminal_moved"
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_after_shutdown_uses_zero_tmux_calls(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender that lost to runner shutdown performs no tmux input."""
+    snapshot = _snapshot_for_seeded_bash(registry)
+    instance = snapshot.instance
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    async def close_without_tmux() -> None:
+        instance.running = False
+
+    monkeypatch.setattr(instance, "send", record_send)
+    monkeypatch.setattr(instance, "close", close_without_tmux)
+    await registry.shutdown()
+    _patch_stale_resolution(registry, monkeypatch, snapshot)
+
+    response = await _post_terminal_input(client, attempt_id=_attempt_id())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "terminal_moved"
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_transfer_out_and_back_rejects_aba_snapshot(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returning the same instance to its old owner cannot revive a stale send."""
+    snapshot = _snapshot_for_seeded_bash(registry)
+    instance = snapshot.instance
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", record_send)
+    assert registry.transfer("conv_abc", "conv_new", "bash", "s1") is True
+    assert registry.transfer("conv_new", "conv_abc", "bash", "s1") is True
+    assert registry.get("conv_abc", "bash", "s1") is instance
+    _patch_stale_resolution(registry, monkeypatch, snapshot)
+
+    response = await _post_terminal_input(client, attempt_id=_attempt_id())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "terminal_moved"
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_read_after_transfer_rejects_stale_snapshot(
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A read captured by the old owner cannot expose the new owner's pane."""
+    snapshot = _snapshot_for_seeded_bash(registry)
+    instance = snapshot.instance
+    read_calls = 0
+
+    async def record_read(scrollback: int = 0) -> dict[str, object]:
+        nonlocal read_calls
+        del scrollback
+        read_calls += 1
+        return {"screen": "new-owner-secret"}
+
+    monkeypatch.setattr(instance, "read", record_read)
+    assert registry.transfer("conv_abc", "conv_new", "bash", "s1") is True
+    _patch_stale_resolution(registry, monkeypatch, snapshot)
+    tool = SysTerminalReadTool(registry=registry)
+    context = ToolContext(
+        task_id="task_read_fence",
+        agent_id="agent_read_fence",
+        workspace=tmp_path,
+        conversation_id="conv_abc",
+    )
+
+    result = json.loads(
+        await asyncio.to_thread(
+            tool.invoke,
+            json.dumps({"terminal": "bash", "session": "s1"}),
+            context,
+        )
+    )
+
+    assert result["code"] == "terminal_moved"
+    assert read_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_concurrent_duplicate_executes_once(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent identical attempt ids await one shielded send task."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    started = threading.Event()
+    release = threading.Event()
+    send_calls = 0
+
+    async def gated_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", gated_send)
+    attempt_id = _attempt_id()
+    first = asyncio.create_task(_post_terminal_input(client, attempt_id=attempt_id))
+    assert await asyncio.to_thread(started.wait, 2.0)
+    second = asyncio.create_task(_post_terminal_input(client, attempt_id=attempt_id))
+    release.set()
+
+    first_response, second_response = await asyncio.gather(first, second)
+
+    assert first_response.status_code == second_response.status_code == 200
+    assert (
+        first_response.json()
+        == second_response.json()
+        == {
+            "status": "sent",
+            "outcome": "sent",
+        }
+    )
+    assert send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_attempt_fingerprint_mismatch_is_conflict(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attempt id is permanently bound to its first input fingerprint."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", record_send)
+    attempt_id = _attempt_id()
+    first = await _post_terminal_input(client, attempt_id=attempt_id, text="echo one")
+    conflict = await _post_terminal_input(client, attempt_id=attempt_id, text="echo two")
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "attempt_conflict"
+    assert send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_cancelling_first_waiter_keeps_single_flight(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling one waiter cannot cancel or unclaim the shared send."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    started = threading.Event()
+    release = threading.Event()
+    send_calls = 0
+
+    async def gated_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", gated_send)
+    attempt_id = _attempt_id()
+    first = asyncio.create_task(_post_terminal_input(client, attempt_id=attempt_id))
+    assert await asyncio.to_thread(started.wait, 2.0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    retry = asyncio.create_task(_post_terminal_input(client, attempt_id=attempt_id))
+    release.set()
+    response = await retry
+
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "sent"
+    assert send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_cancelled_owner_entry_stays_purgeable() -> None:
+    """A directly-cancelled owner task stamps completion so its slot is reclaimed.
+
+    ``_purge_expired_locked`` only evicts completed entries; without the
+    synchronous stamp a cancelled owner would leak its slot forever and poison
+    that attempt_id for the process lifetime.
+    """
+    from omnigent.runner.app import (
+        _TERMINAL_INPUT_ATTEMPT_TTL_SECONDS,
+        _TerminalInputAttempt,
+        _TerminalInputAttempts,
+    )
+
+    attempts = _TerminalInputAttempts()
+    key = ("conv_abc", "attempt-cancelled")
+    placeholder = asyncio.create_task(asyncio.sleep(0))
+    await placeholder
+    attempts._entries[key] = _TerminalInputAttempt(
+        fingerprint=("terminal_bash_s1", "echo hi", "Enter", False),
+        task=placeholder,
+    )
+
+    async def _cancelled_operation() -> Any:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await attempts._run_claimed(key, _cancelled_operation)
+
+    assert attempts._entries[key].completed_at is not None
+
+    attempts._entries[key].completed_at = (
+        time.monotonic() - _TERMINAL_INPUT_ATTEMPT_TTL_SECONDS - 1
+    )
+    attempts._purge_expired_locked()
+    assert key not in attempts._entries
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_partial_send_is_delivery_unknown_and_retry_is_noop(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Text success followed by Enter failure is cached as delivery unknown."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    tmux_calls = 0
+
+    async def fail_enter(*args: str) -> None:
+        nonlocal tmux_calls
+        tmux_calls += 1
+        if tmux_calls == 2:
+            raise RuntimeError("enter response lost")
+
+    monkeypatch.setattr(instance, "_tmux", fail_enter)
+    attempt_id = _attempt_id()
+    first = await _post_terminal_input(client, attempt_id=attempt_id)
+    retry = await _post_terminal_input(client, attempt_id=attempt_id)
+
+    assert first.status_code == retry.status_code == 200
+    assert first.json() == retry.json()
+    assert first.json()["outcome"] == "delivery_unknown"
+    assert tmux_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_readiness_timeout_is_definite_and_cached(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing final-process ACK rejects before any input operation."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    instance.shell_ready_nonce = "OMNIGENT_SHELL_READY_never_seen"
+    readiness_checks = 0
+    readiness_timeouts: list[float] = []
+    send_calls = 0
+
+    async def _not_ready(*, timeout_s: float, poll_interval_s: float = 0.025) -> bool:
+        nonlocal readiness_checks
+        del poll_interval_s
+        readiness_checks += 1
+        readiness_timeouts.append(timeout_s)
+        return False
+
+    async def _record_send(
+        text: str | None = None,
+        *,
+        keys: str = "Enter",
+    ) -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "wait_for_shell_ready", _not_ready)
+    monkeypatch.setattr(instance, "send", _record_send)
+    attempt_id = _attempt_id()
+    body = {
+        "attempt_id": attempt_id,
+        "text": "echo never-dispatched",
+        "wait_for_ready": True,
+    }
+
+    first = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=body,
+    )
+    replay = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=body,
+    )
+
+    assert first.status_code == replay.status_code == 409
+    assert first.json() == replay.json()
+    assert first.json()["error"]["code"] == "terminal_not_ready"
+    assert readiness_checks == 1
+    assert readiness_timeouts == [10.0]
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("acknowledge", "expected_status", "expected_send_calls"),
+    [(True, 200, 1), (False, 409, 0)],
+)
+async def test_terminal_input_retries_incomplete_probe_without_unsafe_delivery(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    acknowledge: bool,
+    expected_status: int,
+    expected_send_calls: int,
+) -> None:
+    """An incomplete probe is retryable but never bypasses the ACK gate."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    lock = instance.op_lock
+    instance.shell_ready_nonce = "OMNIGENT_SHELL_READY_capability"
+    monkeypatch.setattr(sys_terminal_module, "_SHELL_READINESS_TIMEOUT_SECONDS", 0.05)
+    probe_sends = 0
+    probe_nonces: list[str] = []
+    clear_history_calls = 0
+    send_calls = 0
+    history_nonce: str | None = None
+
+    async def readiness_tmux(*args: str) -> None:
+        nonlocal probe_sends, clear_history_calls, history_nonce
+        assert lock.locked(), "readiness and delivery must share the instance lock"
+        if args[:2] == ("send-keys", "-l"):
+            probe_sends += 1
+            assert instance.shell_ready_nonce is not None
+            probe_nonces.append(instance.shell_ready_nonce)
+        elif args == ("send-keys", "-t", "main", "Enter"):
+            history_nonce = instance.shell_ready_nonce if acknowledge else None
+        elif args[0] == "clear-history":
+            clear_history_calls += 1
+            history_nonce = None
+            if clear_history_calls == 1:
+                await asyncio.sleep(1)
+
+    async def readiness_capture(*args: str) -> str:
+        assert lock.locked(), "readiness and delivery must share the instance lock"
+        if "-S" in args:
+            return history_nonce or "clean prompt"
+        return "clean prompt"
+
+    async def record_send(
+        text: str | None = None,
+        *,
+        keys: str = "Enter",
+    ) -> dict[str, str]:
+        nonlocal send_calls
+        assert lock.locked(), "readiness and delivery must share the instance lock"
+        assert text == "echo exactly-once"
+        assert keys == "Enter"
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "_tmux", readiness_tmux)
+    monkeypatch.setattr(instance, "_tmux_output", readiness_capture)
+    monkeypatch.setattr(instance, "send", record_send)
+    first = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={
+            "attempt_id": _attempt_id(),
+            "text": "echo exactly-once",
+            "wait_for_ready": True,
+        },
+    )
+    retry_attempt_id = _attempt_id()
+    retry_body = {
+        "attempt_id": retry_attempt_id,
+        "text": "echo exactly-once",
+        "wait_for_ready": True,
+    }
+    second = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=retry_body,
+    )
+    replay = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=retry_body,
+    )
+
+    assert first.status_code == 409
+    assert first.json()["error"]["code"] == "terminal_not_ready"
+    assert second.status_code == replay.status_code == expected_status
+    assert second.json() == replay.json()
+    if acknowledge:
+        assert second.json() == {"status": "sent", "outcome": "sent"}
+    else:
+        assert second.json()["error"]["code"] == "terminal_not_ready"
+    assert probe_sends == 2
+    assert len(set(probe_nonces)) == 2
+    assert clear_history_calls == (2 if acknowledge else 0)
+    assert history_nonce is None
+    assert send_calls == expected_send_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("becomes_ready", "expected_status", "expected_send_calls"),
+    [(True, 200, 1), (False, 409, 0)],
+)
+async def test_terminal_input_retries_after_over_budget_readiness_evaluation(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    becomes_ready: bool,
+    expected_status: int,
+    expected_send_calls: int,
+) -> None:
+    """One over-budget probe cannot latch readiness or bypass fail-closed delivery."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    lock = instance.op_lock
+    instance.shell_ready_nonce = "OMNIGENT_SHELL_READY_over_budget"
+    monkeypatch.setattr(sys_terminal_module, "_SHELL_READINESS_TIMEOUT_SECONDS", 0.01)
+    readiness_evaluations = 0
+    send_calls = 0
+
+    async def evaluate_readiness(
+        *,
+        timeout_s: float,
+        poll_interval_s: float,
+    ) -> bool:
+        nonlocal readiness_evaluations
+        del poll_interval_s
+        assert lock.locked(), "readiness and delivery must share the instance lock"
+        assert instance._shell_ready_probe_sent is False
+        readiness_evaluations += 1
+        instance._shell_ready_probe_sent = True
+        if readiness_evaluations == 2 and becomes_ready:
+            instance._shell_ready_acknowledged = True
+            return True
+        await asyncio.sleep(timeout_s * 4)
+        if becomes_ready:
+            instance._shell_ready_acknowledged = True
+            return True
+        return False
+
+    async def record_send(
+        text: str | None = None,
+        *,
+        keys: str = "Enter",
+    ) -> dict[str, str]:
+        nonlocal send_calls
+        assert lock.locked(), "readiness and delivery must share the instance lock"
+        assert text == "echo exactly-once"
+        assert keys == "Enter"
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "_wait_for_shell_ready_once", evaluate_readiness)
+    monkeypatch.setattr(instance, "send", record_send)
+    first = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={
+            "attempt_id": _attempt_id(),
+            "text": "echo exactly-once",
+            "wait_for_ready": True,
+        },
+    )
+    retry_attempt_id = _attempt_id()
+    retry_body = {
+        "attempt_id": retry_attempt_id,
+        "text": "echo exactly-once",
+        "wait_for_ready": True,
+    }
+    second = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=retry_body,
+    )
+    replay = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json=retry_body,
+    )
+
+    assert first.status_code == 409
+    assert first.json()["error"]["code"] == "terminal_not_ready"
+    assert second.status_code == replay.status_code == expected_status
+    assert second.json() == replay.json()
+    if becomes_ready:
+        assert second.json() == {"status": "sent", "outcome": "sent"}
+    else:
+        assert second.json()["error"]["code"] == "terminal_not_ready"
+    assert readiness_evaluations == 2
+    assert send_calls == expected_send_calls
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_rejects_unsupported_readiness_before_send(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal with no readiness contract fails explicitly and sends nothing."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    instance.shell_ready_nonce = None
+    instance.ready_process = None
+    send_calls = 0
+
+    async def _record_send(
+        text: str | None = None,
+        *,
+        keys: str = "Enter",
+    ) -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", _record_send)
+    response = await client.post(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_bash_s1/input",
+        json={
+            "attempt_id": _attempt_id(),
+            "text": "echo never-dispatched",
+            "wait_for_ready": True,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "shell_readiness_unsupported"
+    assert send_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_completed_attempt_replays_after_transfer(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed attempt replays before terminal ownership is re-resolved."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", record_send)
+    attempt_id = _attempt_id()
+    first = await _post_terminal_input(client, attempt_id=attempt_id)
+    assert registry.transfer("conv_abc", "conv_new", "bash", "s1") is True
+    replay = await _post_terminal_input(client, attempt_id=attempt_id)
+
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_capacity_rejects_before_execute(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    registry: TerminalRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full attempt ledger rejects a new id without a second send."""
+    instance = registry.get("conv_abc", "bash", "s1")
+    assert instance is not None
+    app.state.terminal_input_attempts.max_entries = 1
+    send_calls = 0
+
+    async def record_send(text: str | None = None, *, keys: str = "Enter") -> dict[str, str]:
+        nonlocal send_calls
+        del text, keys
+        send_calls += 1
+        return {"status": "sent"}
+
+    monkeypatch.setattr(instance, "send", record_send)
+    first_id = _attempt_id()
+    first = await _post_terminal_input(client, attempt_id=first_id)
+    rejected = await _post_terminal_input(client, attempt_id=_attempt_id())
+    replay = await _post_terminal_input(client, attempt_id=first_id)
+
+    assert first.status_code == replay.status_code == 200
+    assert rejected.status_code == 503
+    assert rejected.json()["error"]["code"] == "idempotency_capacity_exhausted"
+    assert send_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_registration_rejects_colliding_name_key(
+    registry: TerminalRegistry,
+) -> None:
+    """Sanitized name/key collisions are rejected before spawning tmux."""
+    with pytest.raises(RuntimeError, match=r"resource id.*collides"):
+        await registry.launch(
+            "conv_abc",
+            "bash ",
+            "s1",
+            TerminalEnvSpec(command="bash"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_input_ambiguous_resource_id_returns_409(
+    client: httpx.AsyncClient,
+    registry: TerminalRegistry,
+    tmp_path: Path,
+) -> None:
+    """A legacy colliding registry fails closed instead of choosing first."""
+    collision = _make_instance("bash ", "s1", tmp_path)
+    registry._by_conversation["conv_abc"][(collision.name, collision.session_key)] = collision
+
+    response = await _post_terminal_input(client, attempt_id=_attempt_id())
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "ambiguous_resource_id"
 
 
 @pytest.mark.asyncio

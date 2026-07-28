@@ -24,10 +24,12 @@ from omnigent.cli import (
     _CLICK_SUBCOMMANDS,
     _GLOBAL_CONFIG_KEYS,
     _NATIVE_TERMINAL_DISPATCH_SPECS,
+    _SINGLE_OWNER_ERROR,
     _bundle,
     _bundled_example_path,
     _dispatch_native_terminal_harness,
     _dispatch_run,
+    _enforce_single_owner_or_exit,
     _ensure_sqlite_parent_dir,
     _expand_config_env_vars,
     _extract_global_logging_flags,
@@ -81,6 +83,13 @@ from omnigent.runner.transports.ws_tunnel.limits import (
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
 
+_OWNER_ENV_KEYS = (
+    "WEB_CONCURRENCY",
+    "UVICORN_WORKERS",
+    "GUNICORN_WORKERS",
+    "OMNIGENT_MULTI_REPLICA",
+)
+
 
 @pytest.fixture(autouse=True)
 def _restore_logging_state() -> Iterator[None]:
@@ -112,6 +121,62 @@ def _restore_logging_state() -> Iterator[None]:
         logger.handlers = list(handlers)
         logger.setLevel(level)
         logger.propagate = propagate
+
+
+def test_single_owner_guard_allows_default_or_one_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset and explicitly single-worker environments remain supported."""
+    for key in _OWNER_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    _enforce_single_owner_or_exit()
+
+    for key in _OWNER_ENV_KEYS[:-1]:
+        monkeypatch.setenv(key, "1")
+    monkeypatch.setenv("OMNIGENT_MULTI_REPLICA", "false")
+    _enforce_single_owner_or_exit()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("WEB_CONCURRENCY", "2"),
+        ("UVICORN_WORKERS", "2"),
+        ("GUNICORN_WORKERS", "2"),
+        ("OMNIGENT_MULTI_REPLICA", "true"),
+    ],
+)
+def test_single_owner_guard_exits_with_verbatim_message(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    key: str,
+    value: str,
+) -> None:
+    """Every declared multi-owner configuration fails before server boot."""
+    for env_key in _OWNER_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv(key, value)
+    caplog.set_level(logging.ERROR, logger="omnigent.cli")
+
+    with pytest.raises(SystemExit) as exc_info:
+        _enforce_single_owner_or_exit()
+
+    assert exc_info.value.code == 2
+    assert caplog.messages == [_SINGLE_OWNER_ERROR]
+
+
+def test_server_command_refuses_web_concurrency_before_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real CLI exits non-zero and prints the guard before uvicorn starts."""
+    for env_key in _OWNER_ENV_KEYS:
+        monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv("WEB_CONCURRENCY", "2")
+
+    result = CliRunner().invoke(cli, ["server"])
+
+    assert result.exit_code == 2
+    assert _SINGLE_OWNER_ERROR in result.output
 
 
 def test_python_module_entrypoint_uses_unified_click_cli() -> None:

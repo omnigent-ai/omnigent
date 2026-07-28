@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 import click
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.entities.session_resources import (
@@ -129,12 +129,19 @@ from omnigent.runner.session_init_protocol import (
     parse_runner_session_init_envelope,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from omnigent.spec.types import LocalToolInfo, SkillSpec
+from omnigent.terminals import (
+    AmbiguousResourceId,
+    AmbiguousResourceIdError,
+    ResolveSnapshot,
+    TerminalRegistry,
+)
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -1649,6 +1656,163 @@ def get_session_agent_id(session_id: str) -> str | None:
 # a single walk. Module-level so it can be tuned/patched in one place.
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 _SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
+_TERMINAL_INPUT_ATTEMPT_TTL_SECONDS = 24 * 60 * 60
+_TERMINAL_INPUT_ATTEMPT_MAX_ENTRIES = 50_000
+
+
+async def _terminal_snapshot_is_alive(
+    registry: TerminalRegistry,
+    snapshot: ResolveSnapshot,
+) -> bool:
+    """Probe tmux only while an atomic terminal owner snapshot remains valid."""
+    return await asyncio.to_thread(
+        registry.run_fenced,
+        snapshot,
+        snapshot.instance.is_alive,
+        invalid=False,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _TerminalInputOutcome:
+    """Exact status/body pair cached for one runner input attempt."""
+
+    status_code: int
+    body: dict[str, Any]
+
+
+_DELIVERY_UNKNOWN = _TerminalInputOutcome(
+    status_code=200,
+    body={"outcome": "delivery_unknown"},
+)
+
+
+def _terminal_not_running(terminal_id: str) -> _TerminalInputOutcome:
+    return _TerminalInputOutcome(
+        status_code=404,
+        body={
+            "error": {
+                "code": "terminal_not_running",
+                "message": f"Terminal {terminal_id!r} is not running",
+            }
+        },
+    )
+
+
+@dataclasses.dataclass
+class _TerminalInputAttempt:
+    """One in-flight or completed attempt bound to its request fingerprint."""
+
+    fingerprint: tuple[str, str, str, bool]
+    task: asyncio.Task[_TerminalInputOutcome]
+    completed_at: float | None = None
+
+
+class _TerminalInputAttempts:
+    """Bounded atomic single-flight ledger for terminal input delivery."""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str], _TerminalInputAttempt] = {}
+        self._lock = asyncio.Lock()
+        self.max_entries = _TERMINAL_INPUT_ATTEMPT_MAX_ENTRIES
+
+    async def execute(
+        self,
+        *,
+        session_id: str,
+        attempt_id: str,
+        fingerprint: tuple[str, str, str, bool],
+        operation: Callable[[], Awaitable[_TerminalInputOutcome]],
+    ) -> _TerminalInputOutcome:
+        """Claim an id atomically or await its existing shielded task.
+
+        A repeated ``attempt_id`` replays the cached outcome (including
+        ``delivery_unknown``); actually retrying delivery requires a fresh
+        ``attempt_id``.
+        """
+        key = (session_id, attempt_id)
+        async with self._lock:
+            self._purge_expired_locked()
+            existing = self._entries.get(key)
+            if existing is not None:
+                if existing.fingerprint != fingerprint:
+                    return _TerminalInputOutcome(
+                        status_code=409,
+                        body={
+                            "error": {
+                                "code": "attempt_conflict",
+                                "message": "attempt_id is bound to a different terminal input",
+                            }
+                        },
+                    )
+                task = existing.task
+            else:
+                if len(self._entries) >= self.max_entries:
+                    return _TerminalInputOutcome(
+                        status_code=503,
+                        body={
+                            "error": {
+                                "code": "idempotency_capacity_exhausted",
+                                "message": "Runner input idempotency capacity is exhausted",
+                            }
+                        },
+                    )
+                task = asyncio.create_task(
+                    self._run_claimed(key, operation),
+                    name=f"terminal-input-{attempt_id}",
+                )
+                self._entries[key] = _TerminalInputAttempt(
+                    fingerprint=fingerprint,
+                    task=task,
+                )
+        return await asyncio.shield(task)
+
+    async def _run_claimed(
+        self,
+        key: tuple[str, str],
+        operation: Callable[[], Awaitable[_TerminalInputOutcome]],
+    ) -> _TerminalInputOutcome:
+        try:
+            outcome = await operation()
+        except asyncio.CancelledError:
+            # Cancellation only happens at teardown today; stamp completion so
+            # the slot stays purgeable (never a permanently-leaked, replay-
+            # poisoning entry) if that ever changes. Synchronous write, no
+            # await — safe on the single event-loop thread mid-cancellation.
+            entry = self._entries.get(key)
+            if entry is not None:
+                entry.completed_at = time.monotonic()
+            raise
+        except (ValueError, OmnigentError):
+            # These carry dedicated global handlers that answer 4xx (a
+            # flag-like ``keys`` token raises ValueError before any dispatch).
+            # Record completion so a same-id replay re-hits this failing task,
+            # then propagate instead of faking a delivery_unknown.
+            await self._mark_completed(key)
+            raise
+        except Exception:
+            _logger.exception("terminal input attempt failed after dispatch")
+            outcome = _DELIVERY_UNKNOWN
+        await self._mark_completed(key)
+        return outcome
+
+    async def _mark_completed(self, key: tuple[str, str]) -> None:
+        async with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None:
+                entry.completed_at = time.monotonic()
+
+    def _purge_expired_locked(self) -> None:
+        cutoff = time.monotonic() - _TERMINAL_INPUT_ATTEMPT_TTL_SECONDS
+        expired = [
+            key
+            for key, entry in self._entries.items()
+            if entry.completed_at is not None and entry.completed_at <= cutoff
+        ]
+        for key in expired:
+            self._entries.pop(key, None)
+        if expired:
+            _logger.info("evicted %d expired terminal input attempts", len(expired))
 
 
 class _BodyRequest:
@@ -1717,6 +1881,8 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+    terminal_input_attempts = _TerminalInputAttempts()
+    app.state.terminal_input_attempts = terminal_input_attempts
 
     from omnigent.runtime import telemetry
 
@@ -7766,6 +7932,7 @@ def create_runner_app(
                 scrollback=spec.get("scrollback", 10000),
                 tmux_allow_passthrough=bool(spec.get("tmux_allow_passthrough", False)),
                 tmux_start_on_attach=bool(spec.get("tmux_start_on_attach", False)),
+                ready_process=spec.get("ready_process"),
             )
         bridge_inject = bool(body.get("bridge_inject_dir"))
         bridge_id: str | None = None
@@ -7937,6 +8104,130 @@ def create_runner_app(
             content=session_resource_view_to_dict(resource),
         )
 
+    @app.post(
+        "/v1/sessions/{session_id}/resources/terminals/{terminal_id}/input",
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def send_session_terminal_input(
+        session_id: str,
+        terminal_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Send literal text and key chords to a running terminal.
+
+        The public server authorizes the owning user before proxying here;
+        this runner-local endpoint resolves only runner-owned terminal state.
+
+        :param session_id: Session/conversation identifier.
+        :param terminal_id: Opaque terminal resource id.
+        :param request: JSON body containing ``text`` and optional ``keys`` /
+            ``wait_for_ready`` fields.
+        :returns: The terminal send result or a structured error response.
+        """
+        body = await request.json()
+        text = body.get("text") if isinstance(body, dict) else None
+        keys = body.get("keys", "Enter") if isinstance(body, dict) else None
+        wait_for_ready = body.get("wait_for_ready", False) if isinstance(body, dict) else None
+        attempt_id = body.get("attempt_id") if isinstance(body, dict) else None
+        if (
+            not isinstance(text, str)
+            or not isinstance(keys, str)
+            or not isinstance(wait_for_ready, bool)
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": "invalid_input",
+                        "message": (
+                            "'text' is required, 'text' and 'keys' must be strings, "
+                            "and 'wait_for_ready' must be a boolean"
+                        ),
+                    }
+                },
+            )
+        if attempt_id is not None and (
+            not isinstance(attempt_id, str) or not attempt_id.strip() or len(attempt_id) > 128
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": "invalid_input",
+                        "message": (
+                            "'attempt_id' must be a non-empty string of at most 128 characters"
+                        ),
+                    }
+                },
+            )
+
+        terminal_registry = resource_registry.terminal_registry
+
+        async def _execute_input() -> _TerminalInputOutcome:
+            if terminal_registry is None:
+                return _terminal_not_running(terminal_id)
+            resolved = terminal_registry.resolve_snapshot(session_id, terminal_id)
+            if isinstance(resolved, AmbiguousResourceId):
+                return _TerminalInputOutcome(
+                    status_code=409,
+                    body={
+                        "error": {
+                            "code": resolved.code,
+                            "message": f"Terminal {terminal_id!r} resolves to multiple entries",
+                        }
+                    },
+                )
+            if resolved is None:
+                return _terminal_not_running(terminal_id)
+
+            from omnigent.tools.builtins.sys_terminal import send_terminal_input
+
+            try:
+                result = await asyncio.to_thread(
+                    send_terminal_input,
+                    terminal_registry,
+                    resolved,
+                    text,
+                    keys=keys,
+                    wait_for_ready=wait_for_ready,
+                )
+            except (RuntimeError, OSError, asyncio.CancelledError):
+                _logger.warning(
+                    "terminal input delivery could not be confirmed for %s/%s",
+                    session_id,
+                    terminal_id,
+                    exc_info=True,
+                )
+                return _DELIVERY_UNKNOWN
+            if result.get("delivery_unknown"):
+                return _DELIVERY_UNKNOWN
+            if "error" in result:
+                code = str(result.get("code") or "terminal_not_running")
+                return _TerminalInputOutcome(
+                    status_code=409,
+                    body={
+                        "error": {
+                            "code": code,
+                            "message": str(result["error"]),
+                        }
+                    },
+                )
+            return _TerminalInputOutcome(
+                status_code=200,
+                body={**result, "outcome": "sent"},
+            )
+
+        if attempt_id is None:
+            outcome = await _execute_input()
+        else:
+            outcome = await terminal_input_attempts.execute(
+                session_id=session_id,
+                attempt_id=attempt_id,
+                fingerprint=(terminal_id, text, keys, wait_for_ready),
+                operation=_execute_input,
+            )
+        return JSONResponse(status_code=outcome.status_code, content=outcome.body)
+
     @app.post("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer")
     async def transfer_session_terminal(
         session_id: str,
@@ -7960,6 +8251,19 @@ def create_runner_app(
                 source_session_id=session_id,
                 target_session_id=target_session_id,
                 terminal_id=terminal_id,
+            )
+        except AmbiguousResourceIdError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "ambiguous_resource_id",
+                        "message": _client_safe_error_detail(
+                            exc,
+                            context="terminal transfer",
+                        ),
+                    }
+                },
             )
         except RuntimeError as exc:
             return JSONResponse(
@@ -7991,10 +8295,21 @@ def create_runner_app(
         session_id: str,
         terminal_id: str,
     ) -> JSONResponse:
-        closed = await resource_registry.close_terminal(
-            session_id,
-            terminal_id,
-        )
+        try:
+            closed = await resource_registry.close_terminal(
+                session_id,
+                terminal_id,
+            )
+        except AmbiguousResourceIdError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "ambiguous_resource_id",
+                        "message": _client_safe_error_detail(exc, context="terminal close"),
+                    }
+                },
+            )
         if not closed:
             return JSONResponse(
                 status_code=404,
@@ -8022,9 +8337,25 @@ def create_runner_app(
         registry = resource_registry.terminal_registry
         lock = _repl_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            existing = registry.get(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
-            if existing is None or not existing.running or not await existing.is_alive():
-                await registry.close(session_id, _REPL_TERMINAL_NAME, _REPL_TERMINAL_SESSION_KEY)
+            existing = registry.resolve_key_snapshot(
+                session_id,
+                _REPL_TERMINAL_NAME,
+                _REPL_TERMINAL_SESSION_KEY,
+            )
+            if isinstance(existing, AmbiguousResourceId):
+                return None
+            alive = (
+                await _terminal_snapshot_is_alive(registry, existing)
+                if isinstance(existing, ResolveSnapshot)
+                else False
+            )
+            if not alive:
+                # Low-level registry close, not ``close_terminal``: the
+                # resource-level scan skips entries whose ``running`` flag is
+                # already False, orphaning the activity watcher and scratch
+                # dir. ``close_snapshot`` pops and tears the instance down.
+                if isinstance(existing, ResolveSnapshot):
+                    await registry.close_snapshot(existing)
                 try:
                     repl_agent_spec = await _resolve_session_agent_spec(session_id)
                 except OmnigentError:
@@ -8053,9 +8384,21 @@ def create_runner_app(
         registry = resource_registry.terminal_registry
         lock = _qwen_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            existing = registry.get(session_id, "qwen", "main")
-            if existing is None or not existing.running or not await existing.is_alive():
-                await registry.close(session_id, "qwen", "main")
+            existing = registry.resolve_key_snapshot(session_id, "qwen", "main")
+            if isinstance(existing, AmbiguousResourceId):
+                return None
+            alive = (
+                await _terminal_snapshot_is_alive(registry, existing)
+                if isinstance(existing, ResolveSnapshot)
+                else False
+            )
+            if not alive:
+                # Low-level registry close, not ``close_terminal``: the
+                # resource-level scan skips entries whose ``running`` flag is
+                # already False, orphaning the activity watcher and scratch
+                # dir. ``close_snapshot`` pops and tears the instance down.
+                if isinstance(existing, ResolveSnapshot):
+                    await registry.close_snapshot(existing)
                 try:
                     await _auto_create_qwen_terminal(
                         session_id,
@@ -8081,24 +8424,41 @@ def create_runner_app(
         transport: str | None = Query(default=None),
     ) -> None:
         await websocket.accept()
-        entry = resolve_terminal_entry_by_resource_id(
-            session_id,
-            terminal_id,
-            terminal_registry,
-        )
+        attach_snapshot: ResolveSnapshot | None = None
+        ambiguous_owner = False
+        if terminal_registry is not None:
+            resolved = terminal_registry.resolve_snapshot(session_id, terminal_id)
+            if isinstance(resolved, ResolveSnapshot):
+                if await _terminal_snapshot_is_alive(terminal_registry, resolved):
+                    attach_snapshot = resolved
+            elif isinstance(resolved, AmbiguousResourceId):
+                ambiguous_owner = True
+        entry = attach_snapshot.entry if attach_snapshot is not None else None
         terminal_role = (
             resource_registry.terminal_resource_role(session_id, terminal_id)
             if resource_registry is not None
             else None
         )
-        if entry is None or not entry.instance.running or not await entry.instance.is_alive():
-            if terminal_role == OMNIGENT_REPL_TERMINAL_ROLE:
+        if entry is None:
+            if ambiguous_owner:
+                entry = None
+            elif terminal_role == OMNIGENT_REPL_TERMINAL_ROLE:
                 entry = await _recreate_repl_terminal(session_id, terminal_id)
             elif terminal_role == QWEN_NATIVE_TERMINAL_ROLE:
                 entry = await _recreate_qwen_terminal(session_id, terminal_id)
             else:
                 entry = None
             if entry is None:
+                await websocket.close(
+                    code=WS_CLOSE_TERMINAL_NOT_FOUND,
+                    reason="terminal resource not found or not running",
+                )
+                return
+            if terminal_registry is not None:
+                recreated = terminal_registry.resolve_snapshot(session_id, terminal_id)
+                if isinstance(recreated, ResolveSnapshot):
+                    attach_snapshot = recreated
+            if attach_snapshot is None:
                 await websocket.close(
                     code=WS_CLOSE_TERMINAL_NOT_FOUND,
                     reason="terminal resource not found or not running",
@@ -8127,12 +8487,24 @@ def create_runner_app(
             if resolved_transport == TERMINAL_TRANSPORT_CONTROL
             else bridge_tmux_pty_to_websocket
         )
+
+        async def _send_attached_input(data: bytes) -> bool:
+            assert attach_snapshot is not None
+            assert terminal_registry is not None
+            return await asyncio.to_thread(
+                terminal_registry.run_fenced,
+                attach_snapshot,
+                lambda: attach_snapshot.instance.send_raw_bytes(data),
+                invalid=False,
+            )
+
         await bridge(
             websocket,
             socket_path=str(entry.instance.socket_path),
             tmux_target=entry.instance.tmux_target,
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
+            on_client_input=_send_attached_input,
         )
 
     async def _require_os_env(session_id: str) -> Any | None:

@@ -39,9 +39,13 @@ def _clean_session_stream_registry() -> None:
     test that leaks a subscriber would silently change the behavior
     of every later test by retaining the leak's slot.
     """
-    session_stream._subscribers.clear()
+    with session_stream._lock:
+        session_stream._subscribers.clear()
+        session_stream._sequence = 0
     yield
-    session_stream._subscribers.clear()
+    with session_stream._lock:
+        session_stream._subscribers.clear()
+        session_stream._sequence = 0
 
 
 async def _collect(conv_id: str, expected: int) -> list[dict[str, Any]]:
@@ -95,6 +99,22 @@ async def test_publish_without_subscriber_is_silent_noop() -> None:
     )
 
 
+def test_sequence_is_global_and_monotonic_across_producer_kinds() -> None:
+    """Relay, native-bridge, and REST-shaped events share one sequencer."""
+    events = [
+        {"type": "response.output_text.delta", "delta": "relay"},
+        {"type": "response.output_item.done", "item": {"id": "native"}},
+        {"type": "session.resource.created", "resource": {"id": "rest"}},
+        {"type": "session.resource.deleted", "resource_id": "rest"},
+    ]
+
+    for index, event in enumerate(events):
+        session_stream.publish(f"conv_{index}", event)
+
+    assert [event["sequence"] for event in events] == [1, 2, 3, 4]
+    assert session_stream.current_sequence() == 4
+
+
 @pytest.mark.asyncio
 async def test_single_subscriber_receives_events_in_order() -> None:
     """
@@ -118,9 +138,9 @@ async def test_single_subscriber_receives_events_in_order() -> None:
     # Exact ordering of i=1,2,3 — anything else means publish
     # reordered or the queue isn't FIFO.
     assert received == [
-        {"type": "e", "i": 1},
-        {"type": "e", "i": 2},
-        {"type": "e", "i": 3},
+        {"type": "e", "i": 1, "sequence": 1},
+        {"type": "e", "i": 2, "sequence": 2},
+        {"type": "e", "i": 3, "sequence": 3},
     ], (
         f"Subscriber saw {received!r}; expected i=1,2,3 in order. "
         f"A mismatch indicates either reordering inside publish or "
@@ -149,7 +169,7 @@ async def test_pre_subscribe_events_are_lost() -> None:
     await asyncio.sleep(0)
     session_stream.publish("conv_lost", {"type": "live", "i": 1})
     received = await asyncio.wait_for(task, timeout=2.0)
-    assert received == [{"type": "live", "i": 1}], (
+    assert received == [{"type": "live", "i": 1, "sequence": 2}], (
         f"Subscriber received {received!r}; expected only the "
         f"post-subscribe event. A buffered/replayed early event "
         f"would have appeared first."
@@ -178,7 +198,10 @@ async def test_multi_subscriber_fan_out_independently_delivers() -> None:
     session_stream.publish("conv_fan", {"type": "x", "i": 2})
     r1, r2 = await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
     # Both subscribers see ALL events — that's the fan-out contract.
-    expected = [{"type": "x", "i": 1}, {"type": "x", "i": 2}]
+    expected = [
+        {"type": "x", "i": 1, "sequence": 1},
+        {"type": "x", "i": 2, "sequence": 2},
+    ]
     assert r1 == expected, (
         f"Subscriber 1 received {r1!r}, expected {expected!r}. "
         f"Missing events indicate a single-consumer queue regression "
@@ -219,10 +242,10 @@ async def test_close_broadcasts_done_to_all_subscribers() -> None:
     session_stream.close("conv_close")
     # Both subscribers terminate cleanly under the close sentinel.
     await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
-    assert out1 == [{"type": "a", "i": 1}], (
+    assert out1 == [{"type": "a", "i": 1, "sequence": 1}], (
         f"Subscriber 1 saw {out1!r}; close should have delivered the event before terminating."
     )
-    assert out2 == [{"type": "a", "i": 1}], (
+    assert out2 == [{"type": "a", "i": 1, "sequence": 1}], (
         f"Subscriber 2 saw {out2!r}; close should have delivered the event before terminating."
     )
 
@@ -456,7 +479,7 @@ async def test_heartbeat_interleaves_with_published_events() -> None:
         # on the queue before our wait_for starts.
         await asyncio.sleep(0)
         second = await asyncio.wait_for(gen.__anext__(), timeout=1.0)
-        assert second == {"type": "real", "i": 1}, (
+        assert second == {"type": "real", "i": 1, "sequence": 1}, (
             f"After publishing a real event, the next yield was "
             f"{second!r}; expected the real event. A heartbeat here "
             f"means the timeout path swallowed the queued item."

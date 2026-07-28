@@ -847,6 +847,14 @@ def _parse_terminals(
             raise OmnigentError(
                 f"terminals.{name}.env must be a mapping", code=ErrorCode.INVALID_INPUT
             )
+        ready_process = entry.get("ready_process")
+        if ready_process is not None and (
+            not isinstance(ready_process, str) or not ready_process.strip()
+        ):
+            raise OmnigentError(
+                f"terminals.{name}.ready_process must be a non-empty string",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # os_env may be a nested mapping (parsed like top-level os_env), the
         # literal string "inherit", or absent.
         raw_os_env = entry.get("os_env")
@@ -866,6 +874,7 @@ def _parse_terminals(
             session_prefix=str(entry.get("session_prefix", "omni_")),
             tmux_allow_passthrough=bool(entry.get("tmux_allow_passthrough", False)),
             tmux_start_on_attach=bool(entry.get("tmux_start_on_attach", False)),
+            ready_process=ready_process,
         )
     return terminals or None
 

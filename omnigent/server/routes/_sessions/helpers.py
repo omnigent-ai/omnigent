@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import secrets
 import time
 import urllib.parse
+import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 
 import httpx
 from fastapi import (
@@ -53,6 +55,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -584,7 +587,7 @@ def _publish_and_persist_resource_event(
     resource_type: str,
     conversation_store: ConversationStore,
     resource: dict[str, Any] | None = None,
-) -> None:
+) -> bool:
     """Publish an SSE event and persist it as a conversation item.
 
     Emits the event on the live session stream so connected
@@ -599,6 +602,11 @@ def _publish_and_persist_resource_event(
     :param resource_type: Kind of resource, e.g. ``"terminal"``.
     :param conversation_store: Store for persisting the item.
     :param resource: Full resource dict for created events.
+    :returns: ``True`` when the item was persisted; ``False`` when the
+        append failed and was suppressed. Most callers treat
+        persistence as best-effort and ignore this; callers that need
+        the durable record (the ``shell_command`` spawn path) must
+        check it.
     """
     from omnigent.entities.conversation import ResourceEventData
 
@@ -610,7 +618,19 @@ def _publish_and_persist_resource_event(
         sse_payload["resource_type"] = resource_type
         sse_payload["session_id"] = session_id
 
-    session_stream.publish(session_id, sse_payload)
+    publish_error = session_stream.publish_best_effort(session_id, sse_payload)
+    if publish_error is not None:
+        _logger.warning(
+            "resource-event SSE publish failed for session=%s type=%s: %s",
+            session_id,
+            event_type,
+            publish_error,
+        )
+    sequence = sse_payload.get("sequence")
+    if not isinstance(sequence, int):
+        sequence = None
+    elif event_type == "session.resource.created" and resource is not None:
+        resource["sequence"] = sequence
 
     item = NewConversationItem(
         type="resource_event",
@@ -620,6 +640,7 @@ def _publish_and_persist_resource_event(
             resource_id=resource_id,
             resource_type=resource_type,
             resource=resource,
+            sequence=sequence,
         ),
     )
     try:
@@ -630,6 +651,8 @@ def _publish_and_persist_resource_event(
             session_id,
             exc_info=True,
         )
+        return False
+    return True
 
 
 def _structured_ask_user_question(
@@ -4242,6 +4265,125 @@ async def _get_runner_client_for_resource_access_impl(
     return cast("httpx.AsyncClient | None", get_runner_client())
 
 
+async def _proxy_get_to_runner(
+    session_id: str,
+    path: str,
+    params: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Proxy a GET request to the runner and return parsed JSON.
+
+    :param session_id: Session/conversation identifier.
+    :param path: Runner-relative URL path.
+    :param params: Optional query params forwarded to the runner,
+        e.g. ``{"order": "asc"}``. ``None`` sends no query string.
+    :returns: Parsed JSON response body.
+    :raises HTTPException: 502 on runner failure.
+    """
+    runner_client = await _get_runner_client_for_resource_access(session_id)
+    if runner_client is None:
+        raise HTTPException(
+            status_code=502,
+            detail="no runner available for resource access",
+        )
+    try:
+        resp = await runner_client.get(path, params=params, timeout=10.0)
+    except (httpx.HTTPError, ConnectionError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="runner resource endpoint unavailable",
+        ) from exc
+    if resp.status_code == 404:
+        raise OmnigentError(
+            resp.json().get("error", {}).get("message", "Resource not found"),
+            code=ErrorCode.NOT_FOUND,
+        )
+    if resp.status_code != 200:
+        try:
+            body = resp.json()
+            error = body.get("error", {})
+            msg = error.get("message") or "runner resource endpoint failed"
+        except (ValueError, AttributeError, TypeError, httpx.HTTPError):
+            msg = "runner resource endpoint failed"
+        raise HTTPException(status_code=502, detail=msg)
+    return resp.json()
+
+
+async def _proxy_post_to_runner(
+    session_id: str,
+    path: str,
+    body: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Proxy a POST request to the runner and return status + JSON.
+
+    :param session_id: Session/conversation identifier.
+    :param path: Runner-relative URL path.
+    :param body: JSON body to forward.
+    :returns: Tuple of (status_code, parsed_json_body).
+    :raises HTTPException: 502 on transport failure.
+    """
+    runner_client = await _get_runner_client_for_resource_access(session_id)
+    if runner_client is None:
+        raise HTTPException(
+            status_code=502,
+            detail="no runner available for resource access",
+        )
+    try:
+        resp = await runner_client.post(
+            path,
+            json=body,
+            timeout=10.0,
+        )
+    except (httpx.HTTPError, ConnectionError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="runner resource endpoint unavailable",
+        ) from exc
+    return resp.status_code, resp.json()
+
+
+async def _create_terminal_idempotently(
+    session_id: str,
+    path: str,
+    body: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Retry one ambiguous terminal-create response with the same stable key."""
+    try:
+        return await _proxy_post_to_runner(session_id, path, body)
+    except HTTPException as exc:
+        if exc.status_code != 502:
+            raise
+        return await _proxy_post_to_runner(session_id, path, body)
+
+
+def _raise_invalid_shell_attempt_id(cause: ValueError | None = None) -> NoReturn:
+    error = OmnigentError(
+        "shell_command requires data.attempt_id as a canonical UUIDv4 string",
+        code=ErrorCode.INVALID_INPUT,
+    )
+    if cause is not None:
+        raise error from cause
+    raise error
+
+
+def _require_shell_attempt_id(value: object) -> str:
+    """Validate and return one canonical UUIDv4 shell-command attempt id."""
+    parsed: uuid.UUID | None = None
+    if isinstance(value, str) and value and len(value) <= _SHELL_ATTEMPT_ID_MAX_CHARS:
+        try:
+            parsed = uuid.UUID(value)
+        except ValueError as exc:
+            _raise_invalid_shell_attempt_id(exc)
+    if parsed is None or parsed.version != 4 or str(parsed) != value:
+        _raise_invalid_shell_attempt_id()
+    return value
+
+
+def _shell_spawn_session_key(attempt_id: str) -> str:
+    """Derive the stable 128-bit user-shell key for one attempt."""
+    digest = hashlib.sha256(attempt_id.encode()).hexdigest()
+    return f"u-{digest[:_SHELL_SPAWN_DIGEST_CHARS]}"
+
+
 async def _proxy_get_session_resources_to_runner(
     runner_client: httpx.AsyncClient,
     session_id: str,
@@ -6219,6 +6361,61 @@ def _load_agent_spec_for_session_impl(
     )
 
 
+async def _require_declared_terminal(
+    conv: Conversation,
+    terminal_name: object,
+    agent_store: AgentStore,
+) -> TerminalEnvSpec:
+    """Enforce the user-facing declared-terminal launch gate.
+
+    A user-initiated terminal launch must name a terminal from the
+    agent spec's ``terminals:`` block — the single security gate
+    shared by the terminal create route and the ``shell_command``
+    spawn path, so the two cannot drift. Callers with an exemption
+    (the create route's native-bootstrap shape) decide that BEFORE
+    calling this.
+
+    :param conv: Conversation whose agent spec declares the terminals.
+    :param terminal_name: Requested terminal name, e.g. ``"zsh"``.
+    :param agent_store: Store used to resolve the agent spec.
+    :returns: The matching declared terminal spec.
+    :raises OmnigentError: 400 when the name is not declared (or the
+        agent has no ``terminals:`` block at all).
+    """
+    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    terminal_specs = (spec.terminals or {}) if spec is not None else {}
+    declared = list(terminal_specs)
+    if not isinstance(terminal_name, str) or terminal_name not in terminal_specs:
+        raise OmnigentError(
+            (
+                f"Terminal {terminal_name!r} is not declared by this "
+                f"agent. Terminals can only be created for agents whose spec "
+                f"declares them; this agent declares: {declared or 'none'}."
+            ),
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return terminal_specs[terminal_name]
+
+
+def _error_text_from_exc(exc: OmnigentError | HTTPException, fallback: str) -> str:
+    """Extract a human-readable cause from a failed runner proxy call.
+
+    The resource proxies fail two ways: the runner router raises
+    :class:`OmnigentError` before any HTTP client exists (session not
+    bound, runner offline), or the transport raises and is wrapped as
+    an :class:`HTTPException` 502. Receipts must record the cause in
+    either case.
+
+    :param exc: The exception a proxy helper raised.
+    :param fallback: Message used when the exception carries no
+        usable detail text.
+    :returns: The failure text to store on the error receipt.
+    """
+    if isinstance(exc, OmnigentError):
+        return exc.message
+    return exc.detail if isinstance(exc.detail, str) and exc.detail else fallback
+
+
 def _build_policy_engine_from_spec(*args: Any, **kwargs: Any) -> PolicyEngine:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
@@ -6844,7 +7041,10 @@ async def _stream_live_events(
                         f"session stream event missing string ``type`` field: {event!r}",
                     )
                 validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
-                yield _format_sse(event_type, validated.model_dump())
+                wire_event = validated.model_dump()
+                if wire_event.get("sequence") is None:
+                    wire_event.pop("sequence", None)
+                yield _format_sse(event_type, wire_event)
     except session_stream.SubscriberOverflowError:
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
@@ -8411,6 +8611,7 @@ __all__ = [
     "_consume_pre_resolved_harness_elicitation",
     "_create_and_publish_codex_child",
     "_create_session_worktree",
+    "_create_terminal_idempotently",
     "_delete_stored_session_bundle_after_failure",
     "_derive_terminal_launch_args_from_spec",
     "_descendant_sessions",
@@ -8418,6 +8619,7 @@ __all__ = [
     "_dispatch_skill_slash_command_to_runner",
     "_emit_server_routing_decision",
     "_error_item_from_sse",
+    "_error_text_from_exc",
     "_evaluate_output_policy",
     "_extract_assistant_text_from_event",
     "_extract_claude_native_runner_failure",
@@ -8487,6 +8689,8 @@ __all__ = [
     "_priced_cost_for_display",
     "_provision_managed_sandbox",
     "_proxy_get_session_resources_to_runner",
+    "_proxy_get_to_runner",
+    "_proxy_post_to_runner",
     "_prune_pre_resolved_harness_elicitations",
     "_prune_session_read_state",
     "_publish_and_persist_resource_event",
@@ -8518,6 +8722,7 @@ __all__ = [
     "_publish_status",
     "_publish_terminal_pending",
     "_query_host_runner_status",
+    "_raise_invalid_shell_attempt_id",
     "_read_state_entry",
     "_read_upload_capped",
     "_record_daily_cost",
@@ -8530,8 +8735,10 @@ __all__ = [
     "_replace_text_in_message_body",
     "_require_collaboration_mode_forward",
     "_require_cost_control_label_authority",
+    "_require_declared_terminal",
     "_require_external_status_forward",
     "_require_host_conn_for_worktree",
+    "_require_shell_attempt_id",
     "_reset_runner_resources_after_switch",
     "_reset_runner_resources_after_switch_impl",
     "_resolve_harness",
@@ -8548,6 +8755,7 @@ __all__ = [
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
     "_set_read_state",
+    "_shell_spawn_session_key",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",
     "_spec_config_flag_explicitly_disabled",

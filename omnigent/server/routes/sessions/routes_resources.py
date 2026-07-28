@@ -58,6 +58,7 @@ from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
+    session_stream,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import *
@@ -222,50 +223,6 @@ def register_resources_routes(
             raise _session_not_found()
         return conv
 
-    async def _proxy_get_to_runner(
-        session_id: str,
-        path: str,
-        params: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        """Proxy a GET request to the runner and return parsed JSON.
-
-        :param session_id: Session/conversation identifier.
-        :param path: Runner-relative URL path.
-        :param params: Optional query params forwarded to the runner,
-            e.g. ``{"order": "asc"}``. ``None`` sends no query string.
-        :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
-        """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-        )
-        if runner_client is None:
-            raise HTTPException(
-                status_code=502,
-                detail="no runner available for resource access",
-            )
-        try:
-            resp = await runner_client.get(path, params=params, timeout=10.0)
-        except (httpx.HTTPError, ConnectionError) as exc:
-            raise HTTPException(
-                status_code=502,
-                detail="runner resource endpoint unavailable",
-            ) from exc
-        if resp.status_code == 404:
-            raise OmnigentError(
-                resp.json().get("error", {}).get("message", "Resource not found"),
-                code=ErrorCode.NOT_FOUND,
-            )
-        if resp.status_code != 200:
-            try:
-                body = resp.json()
-                error = body.get("error", {})
-                msg = error.get("message") or "runner resource endpoint failed"
-            except Exception:
-                msg = "runner resource endpoint failed"
-            raise HTTPException(status_code=502, detail=msg)
-        return resp.json()
-
     async def _fs_get_with_host_fallback(
         session_id: str,
         *,
@@ -362,40 +319,6 @@ def register_resources_routes(
             # Any other host FS failure (e.g. git_status_failed 500) mirrors the
             # runner proxy, which wraps non-200/404 responses as a 502.
             raise HTTPException(status_code=502, detail=exc.message) from exc
-
-    async def _proxy_post_to_runner(
-        session_id: str,
-        path: str,
-        body: dict[str, Any],
-    ) -> tuple[int, dict[str, Any]]:
-        """Proxy a POST request to the runner and return status + JSON.
-
-        :param session_id: Session/conversation identifier.
-        :param path: Runner-relative URL path.
-        :param body: JSON body to forward.
-        :returns: Tuple of (status_code, parsed_json_body).
-        :raises HTTPException: 502 on transport failure.
-        """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-        )
-        if runner_client is None:
-            raise HTTPException(
-                status_code=502,
-                detail="no runner available for resource access",
-            )
-        try:
-            resp = await runner_client.post(
-                path,
-                json=body,
-                timeout=10.0,
-            )
-        except (httpx.HTTPError, ConnectionError) as exc:
-            raise HTTPException(
-                status_code=502,
-                detail="runner resource endpoint unavailable",
-            ) from exc
-        return resp.status_code, resp.json()
 
     async def _proxy_delete_to_runner(
         session_id: str,
@@ -609,7 +532,13 @@ def register_resources_routes(
             for key, value in request.query_params.items()
             if key in ("limit", "after", "before", "order")
         }
-        return await _proxy_get_to_runner(session_id, path, params=forwarded or None)
+        resource_revision = session_stream.current_sequence()
+        payload = await _proxy_get_to_runner(session_id, path, params=forwarded or None)
+        return {
+            **payload,
+            "resource_revision": resource_revision,
+            "full_snapshot": True,
+        }
 
     @router.post(
         "/sessions/{session_id}/resources/terminals",
@@ -653,25 +582,29 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
+        if not isinstance(body, dict):
+            raise OmnigentError(
+                "Terminal create body must be a JSON object",
+                code=ErrorCode.INVALID_INPUT,
+            )
         is_native_bootstrap = (
             bool(body.get("ensure_native_terminal") or body.get("bridge_inject_dir"))
             and native_coding_agent_for_terminal_name(body.get("terminal")) is not None
             and body.get("session_key") == "main"
         )
+        attempt_id: str | None = None
+        if body.get("attempt_id") is not None:
+            attempt_id = _require_shell_attempt_id(body["attempt_id"])
+            if not is_native_bootstrap:
+                body = {
+                    **body,
+                    "attempt_id": attempt_id,
+                    "session_key": _shell_spawn_session_key(attempt_id),
+                }
         if not is_native_bootstrap:
-            spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-            declared = list(spec.terminals or {}) if spec is not None else []
-            if body.get("terminal") not in declared:
-                raise OmnigentError(
-                    (
-                        f"Terminal {body.get('terminal')!r} is not declared by this "
-                        f"agent. Terminals can only be created for agents whose spec "
-                        f"declares them; this agent declares: {declared or 'none'}."
-                    ),
-                    code=ErrorCode.INVALID_INPUT,
-                )
+            await _require_declared_terminal(conv, body.get("terminal"), agent_store)
         path = f"/v1/sessions/{session_id}/resources/terminals"
-        status, payload = await _proxy_post_to_runner(
+        status, payload = await _create_terminal_idempotently(
             session_id,
             path,
             body,
@@ -691,7 +624,12 @@ def register_resources_routes(
             conversation_store=conversation_store,
             resource=payload,
         )
-        return payload
+        if attempt_id is None:
+            return payload
+        return {
+            "terminal": payload,
+            "sequence": payload.get("sequence"),
+        }
 
     @router.get(
         "/sessions/{session_id}/resources/terminals/{terminal_id}",

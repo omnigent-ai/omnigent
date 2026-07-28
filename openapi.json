@@ -270,6 +270,18 @@
             "title": "Args",
             "type": "object"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -304,6 +316,18 @@
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"cancelled\"`."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -585,6 +609,18 @@
             "description": "Synthetic `call_id` the SDK uses to reconcile the local task; `None` when no pending tool call row exists for the task.",
             "title": "Call Id"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -734,6 +770,18 @@
             "default": null,
             "title": "Compacted Messages"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -866,6 +914,18 @@
       "CompactionFailedEvent": {
         "description": "Conversation history compaction failed.\n\nEmitted by `omnigent/server/routes/sessions.py` when\n`compact_conversation_now()` raises. Clients that rendered a\n\"Compacting\u2026\" spinner on `CompactionInProgressEvent`\nshould dismiss it without leaving a permanent marker, since the\nconversation history was not modified.",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -894,6 +954,18 @@
       "CompactionInProgressEvent": {
         "description": "Conversation history is being compacted.\n\nEmitted by `omnigent/runtime/compaction.py` while a\ncompaction step runs so clients can render a \"summarizing\nhistory\u2026\" indicator. Wire shape matches `compaction.py:765`.",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -925,6 +997,18 @@
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"completed\"`."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -1236,6 +1320,18 @@
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The newly-allocated response object."
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -1280,6 +1376,18 @@
           "params": {
             "$ref": "#/components/schemas/ElicitationRequestParams",
             "description": "The MCP-shaped params block carrying the prompt and (form-mode only) the requested schema."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -1421,6 +1529,18 @@
             "title": "Elicitation Id",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -1507,6 +1627,18 @@
             "$ref": "#/components/schemas/RetryErrorDetail",
             "description": "Classified error description."
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -1563,6 +1695,18 @@
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"failed\"` and `error` populated."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -1694,6 +1838,18 @@
             "default": null,
             "description": "Sequence number of the last non- heartbeat event seen on the same stream, e.g. `42`. `None` before any user-visible event has fired (first heartbeat of the turn, before deltas land), or when the producer chose not to populate it.",
             "title": "Last Event Seq"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -1844,6 +2000,18 @@
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The response object with `status=\"in_progress\"`."
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -1891,6 +2059,18 @@
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"incomplete\"` and `incomplete_details` populated describing the reason."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -2329,6 +2509,18 @@
             "description": "Original filename if the annotation supplied one, e.g. `\"report.pdf\"`. `None` otherwise.",
             "title": "Filename"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -2363,6 +2555,18 @@
             "description": "The completed item dict. Heterogeneous and item-type-specific; see `omnigent/entities/conversation.py` for the per-type `*Data` shapes that drive serialization. Example for a function_call item: `{\"id\": \"fc_abc123\", \"type\": \"function_call\", \"status\": \"action_required\", \"name\": \"search.web\", \"arguments\": \"{\\\"q\\\": \\\"foo\\\"}\", \"call_id\": \"call_xyz\"}`.",
             "title": "Item",
             "type": "object"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -2436,6 +2640,18 @@
             "default": null,
             "description": "For terminal-observed streaming (claude-native), the vendor's stable per-message id, e.g. `\"2ca51d97-2f0f-493a-aed7-85a5b56c5747\"`. Lets the web UI scope an in-flight buffer to one assistant message and reconcile it against the final item. `None` for ordinary in-process task streaming, where deltas already group by the active response.",
             "title": "Message Id"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -2559,6 +2775,18 @@
             "title": "Reason",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -2660,6 +2888,18 @@
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The response object with `status=\"queued\"`."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -2768,6 +3008,18 @@
       "ReasoningStartedEvent": {
         "description": "Marker emitted once when a reasoning block begins.\n\nFired even when the reasoning content itself is encrypted /\nredacted (so no delta events follow), letting clients render\na \"thinking\u2026\" indicator regardless of provider verification\nstatus. Wire shape matches `omnigent/runtime/workflow.py:1350`.",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -2800,6 +3052,18 @@
             "description": "The summary text fragment, e.g. `\"Will use the search tool to gather context.\"`.",
             "title": "Delta",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -2834,6 +3098,18 @@
             "description": "The reasoning text fragment, e.g. `\"Considering the user's intent...\"`.",
             "title": "Delta",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -2891,6 +3167,18 @@
             "description": "Kind of resource, e.g. `\"terminal\"`, `\"file\"`, `\"environment\"`.",
             "title": "Resource Type",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Process-local resource revision stamped on the corresponding live event. `None` for legacy records.",
+            "title": "Sequence"
           }
         },
         "required": [
@@ -3120,6 +3408,18 @@
             "description": "Total tries allowed by the retry policy, e.g. `3`. Lets clients render \"attempt 2 of 3\".",
             "title": "Max Attempts",
             "type": "integer"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -3511,6 +3811,18 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -3547,6 +3859,18 @@
             "description": "Environment whose changes were invalidated, e.g. `\"default\"`.",
             "title": "Environment Id",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -3598,6 +3922,18 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -3638,6 +3974,18 @@
             "description": "The active collaboration mode string, e.g. `\"plan\"` or `\"default\"`. Category: **transient** (SSE-only). The server also writes `omnigent.codex_native.collaboration_mode` on the conversation labels, so reconnect clients restore the same state from the session snapshot.",
             "title": "Mode",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -3704,6 +4052,18 @@
             "default": null,
             "description": "Echo of `conversation_id` for consumers that key on a dedicated \"parent\" field rather than the carrier `conversation_id`. Always equal to `conversation_id`; included for forward-compat with clients that may relay these events across stream boundaries. Category: **transient** (SSE-only). The corresponding durable record of \"a child session exists\" lives in the conversation store as the child conversation row itself (`parent_conversation_id` foreign key) and the parent's tunneled `function_call` item \u2014 reconnecting clients discover children by walking the parent's persisted history, not by replaying this event.",
             "title": "Parent Session Id"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -3812,6 +4172,18 @@
       "SessionHeartbeatEvent": {
         "description": "Idle-stream keepalive on `GET /v1/sessions/{id}/stream`.\n\nEmitted by the session-stream route on a fixed cadence whenever\nthe underlying publish queue has been quiet (no turn in flight,\nno resource events). Distinct from `HeartbeatEvent`\n(`response.heartbeat`), which is per-turn and is driven by\nthe runtime workflow while a response is producing output.\n\nWhy this exists: the session stream stays open across many turns\nand through idle periods (waiting for the user to type). Without\na periodic emit, intermediate proxies, OS-level sockets, and the\nclient's SSE read-timeout can leave a half-open stream\nundetected for minutes after a network event (laptop sleep,\nWi-Fi handoff). The heartbeat puts a regular byte on the wire\nso the client's read-timeout and the server's\n`request.is_disconnected()` check both fire promptly.\n\nConsumers MAY ignore the payload entirely (the bytes crossing\nthe wire are sufficient). The optional `server_time` mirrors\n`HeartbeatEvent` for symmetry and debugging.",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -3856,6 +4228,18 @@
           "data": {
             "$ref": "#/components/schemas/SessionInputConsumedPayload",
             "description": "The decoded queued-item payload \u2014 see `SessionInputConsumedPayload`."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -3943,6 +4327,18 @@
           "data": {
             "$ref": "#/components/schemas/SessionInterruptedPayload",
             "description": "The interrupt metadata \u2014 see `SessionInterruptedPayload`."
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -4355,6 +4751,18 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -4403,6 +4811,18 @@
             "title": "Model",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -4438,6 +4858,18 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -4471,6 +4903,18 @@
             "description": "The conversation whose stream delivered this event \u2014 the root or a sub-agent conversation, e.g. `\"conv_abc123\"`. Matches the streamed conversation (not necessarily the tree's root) so clients can guard events by the conversation they are viewing.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -4555,6 +4999,18 @@
             "description": "Reasoning effort now active for the session, e.g. `\"medium\"`, or `None` when Codex cleared to its default. Category: **transient** (SSE-only). The server also writes `reasoning_effort` on the conversation, so on reconnect clients restore the selection from the session snapshot rather than from a replayed event.",
             "title": "Reasoning Effort"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -4589,6 +5045,18 @@
             "description": "The newly created resource object.",
             "title": "Resource",
             "type": "object"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -4628,6 +5096,18 @@
             "description": "Type of the deleted resource, e.g. `\"terminal\"`, `\"file\"`.",
             "title": "Resource Type",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -5267,6 +5747,18 @@
             "description": "Failure detail when `stage == \"failed\"`, e.g. `\"managed sandbox launch failed: spend limit reached\"`. `None` otherwise. Category: **transient** (SSE-only). On reconnect, clients seed the progress indicator from the session snapshot's `sandbox_status` field, which is populated by `_session_sandbox_status_cache` at snapshot build time.",
             "title": "Error"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -5314,6 +5806,18 @@
             "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed the menu from the session snapshot's `skills` field, which is populated by the runner-skills cache at snapshot build time.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -5386,6 +5890,18 @@
             "description": "Optional active response id for terminal-backed integrations, e.g. `\"codex_turn_abc123\"`. Clients use it to associate coarse session status edges with the assistant bubble they describe. `None` for ordinary in-process runtime edges.",
             "title": "Response Id"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -5440,6 +5956,18 @@
             "title": "Reason",
             "type": "string"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -5491,6 +6019,18 @@
       "SessionTerminalActivityEvent": {
         "description": "A terminal's pane produced output (runner-determined activity pulse).\n\nPowers the web \"active\" badge for any terminal without a client PTY\nattach \u2014 the runner's per-terminal pane watcher emits this when the\npane content changes. Transient (a live pulse; not persisted, not in\nthe connect snapshot).",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -5541,6 +6081,18 @@
             "title": "Pending",
             "type": "boolean"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -5575,6 +6127,18 @@
             "description": "Session identifier, e.g. `\"conv_abc123\"`.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -5698,6 +6262,18 @@
             "description": "Session identifier.",
             "title": "Conversation Id",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -5975,8 +6551,81 @@
         "type": "object"
       },
       "TerminalCommandData": {
-        "description": "Data payload for a runner-side terminal command (`!cmd`) observed\nin a harness transcript (today: Claude Code's embedded TUI).\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nClaude Code writes two sibling transcript records per `!cmd`\ninvocation: one `<bash-input>` record and one combined\n`<bash-stdout>`/`<bash-stderr>` record. Each maps to one\n`terminal_command` item with `kind=\"input\"` or\n`kind=\"output\"` respectively.",
+        "description": "Data payload for a runner-side terminal command (`!cmd`).\n\nTwo producers write this item type:\n\n* the native-bridge observer mirroring `!cmd` entries the vendor\n  TUI executed itself (one `kind=\"input\"` and one\n  `kind=\"output\"` record per invocation);\n* the server's `shell_command` event, which persists ONE\n  `kind=\"input\"` receipt per web-composer bang command, filling\n  the optional routing/outcome fields below.\n\nListed in `NON_CONTENT_ITEM_TYPES` so the agent loop never\ninjects this as phantom content into the LLM's message history.\n\nThe optional fields default to `None` so legacy persisted items\n(native-bridge observer records predating receipts) deserialize\nwithout backfill \u2014 the same additive-optional idiom as\n`SlashCommandData.kind`.",
         "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "enum": [
+                  "spawn",
+                  "send"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"spawn\"` when the command launched a new shell, `\"send\"` when routed into an existing one. `None` for legacy native-bridge observer items.",
+            "title": "Action"
+          },
+          "attempt_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempt Fingerprint"
+          },
+          "attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Client-generated idempotency key. `None` only for legacy native-bridge records.",
+            "title": "Attempt Id"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human-readable failure text when `status=\"error\"`.",
+            "title": "Error"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "http_status": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Http Status"
+          },
           "input": {
             "anyOf": [
               {
@@ -5997,6 +6646,47 @@
             ],
             "title": "Kind",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Authoritative resource revision for a spawn receipt. `None` for sends and legacy records.",
+            "title": "Sequence"
+          },
+          "session_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Display session key, e.g. `\"u-ab12cd\"`.",
+            "title": "Session Key"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ok",
+                  "error",
+                  "unknown"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Delivery outcome \u2014 `\"ok\"` when delivery was confirmed, `\"unknown\"` when it may have occurred, and `\"error\"` for definite non-delivery.",
+            "title": "Status"
           },
           "stderr": {
             "anyOf": [
@@ -6021,6 +6711,42 @@
             ],
             "description": "Captured stdout text. Present when `kind=\"output\"`, `None` otherwise.",
             "title": "Stdout"
+          },
+          "terminal": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal"
+          },
+          "terminal_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Target terminal resource id, e.g. `\"terminal_zsh_u-ab12cd\"`.",
+            "title": "Terminal Id"
+          },
+          "terminal_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Shell type for display, e.g. `\"zsh\"`.",
+            "title": "Terminal Name"
           }
         },
         "required": [
@@ -6041,6 +6767,18 @@
             "description": "Command stdout/stderr fragment.",
             "title": "Delta",
             "type": "string"
+          },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
           },
           "sequence_number": {
             "anyOf": [
@@ -6072,6 +6810,18 @@
       "TurnCancelledEvent": {
         "description": "Emitted when a turn is interrupted by the user or system.",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -6106,6 +6856,18 @@
       "TurnCompletedEvent": {
         "description": "Emitted when a turn finishes successfully with no pending work.",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -6146,6 +6908,18 @@
             "title": "Error",
             "type": "object"
           },
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -6180,6 +6954,18 @@
       "TurnStartedEvent": {
         "description": "Emitted when the runner starts a new turn for a session.",
         "properties": {
+          "sequence": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence"
+          },
           "sequence_number": {
             "anyOf": [
               {

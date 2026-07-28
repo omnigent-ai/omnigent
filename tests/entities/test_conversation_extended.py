@@ -137,6 +137,17 @@ def test_resource_event_deleted() -> None:
     assert red.resource is None
 
 
+def test_resource_event_sequence_round_trips() -> None:
+    red = ResourceEventData(
+        event_type="session.resource.created",
+        resource_id="terminal_bash_s1",
+        resource_type="terminal",
+        resource={"id": "terminal_bash_s1"},
+        sequence=41,
+    )
+    assert red.model_dump(exclude_none=True)["sequence"] == 41
+
+
 # ── TerminalCommandData ───────────────────────────────
 
 
@@ -162,6 +173,137 @@ def test_terminal_command_output() -> None:
 def test_terminal_command_invalid_kind() -> None:
     with pytest.raises(ValidationError):
         TerminalCommandData(kind="unknown")  # type: ignore[arg-type]
+
+
+def test_terminal_command_legacy_item_deserializes_unchanged() -> None:
+    """Persisted items predating the receipt fields need no backfill.
+
+    Native-bridge observer records carry only kind/input (or
+    kind/stdout/stderr); the receipt fields must default to ``None``
+    so old rows keep parsing after the schema gains them.
+    """
+    data = parse_item_data("terminal_command", {"kind": "input", "input": "pwd"})
+    assert isinstance(data, TerminalCommandData)
+    assert data.action is None
+    assert data.terminal_id is None
+    assert data.terminal_name is None
+    assert data.session_key is None
+    assert data.status is None
+    assert data.error is None
+    assert data.attempt_id is None
+    assert data.sequence is None
+
+
+def test_terminal_command_legacy_item_api_dict_unchanged() -> None:
+    """Legacy items render the same wire shape as before the receipt fields.
+
+    ``to_api_dict`` spreads data over the envelope with
+    ``exclude_none=True`` — absent receipt fields must not appear, and
+    the item-level lifecycle ``status`` must survive (a receipt's data
+    ``status`` would overwrite it; legacy items have none).
+    """
+    item = ConversationItem(
+        id="tc_1",
+        type="terminal_command",
+        status="completed",
+        response_id="resp_1",
+        created_at=1,
+        data=TerminalCommandData(kind="input", input="pwd"),
+    )
+    assert item.to_api_dict() == {
+        "id": "tc_1",
+        "response_id": "resp_1",
+        "type": "terminal_command",
+        "status": "completed",
+        "kind": "input",
+        "input": "pwd",
+    }
+
+
+def test_actionless_unknown_terminal_record_keeps_optional_fields_absent() -> None:
+    """Native records can carry unknown status without receipt-only fields."""
+    data = TerminalCommandData(kind="input", input="pwd", status="unknown")
+    assert data.action is None
+    assert data.model_dump(exclude_none=True) == {
+        "kind": "input",
+        "input": "pwd",
+        "status": "unknown",
+    }
+
+
+def test_terminal_command_receipt_fields_round_trip() -> None:
+    data = parse_item_data(
+        "terminal_command",
+        {
+            "kind": "input",
+            "input": "echo hi",
+            "action": "spawn",
+            "terminal_id": "terminal_zsh_u-ab12cd",
+            "terminal_name": "zsh",
+            "session_key": "u-ab12cd",
+            "status": "ok",
+        },
+    )
+    assert isinstance(data, TerminalCommandData)
+    assert data.action == "spawn"
+    assert data.terminal_id == "terminal_zsh_u-ab12cd"
+    assert data.terminal_name == "zsh"
+    assert data.session_key == "u-ab12cd"
+    assert data.status == "ok"
+    assert data.error is None
+
+
+def test_terminal_command_receipt_status_flattens_over_lifecycle_status() -> None:
+    """The receipt's delivery ``status`` wins the item-level slot on the wire.
+
+    ``to_api_dict`` spreads data fields AFTER the envelope fields, so a
+    receipt's ``status`` ("ok"/"error") lands in the top-level ``status``
+    slot, replacing the lifecycle value ("completed"). The web client
+    narrows on this exact flattening — changing it breaks receipts.
+    """
+    item = ConversationItem(
+        id="tc_2",
+        type="terminal_command",
+        status="completed",
+        response_id="turn_abc",
+        created_at=1,
+        data=TerminalCommandData(
+            kind="input",
+            input="make test",
+            action="send",
+            terminal_id="terminal_zsh_u-ab12cd",
+            terminal_name="zsh",
+            session_key="u-ab12cd",
+            status="error",
+            error="Terminal 'terminal_zsh_u-ab12cd' is not running",
+        ),
+        created_by="alice@example.com",
+    )
+    assert item.to_api_dict() == {
+        "id": "tc_2",
+        "response_id": "turn_abc",
+        "type": "terminal_command",
+        # Data ``status`` overwrote the lifecycle "completed".
+        "status": "error",
+        "kind": "input",
+        "input": "make test",
+        "action": "send",
+        "terminal_id": "terminal_zsh_u-ab12cd",
+        "terminal_name": "zsh",
+        "session_key": "u-ab12cd",
+        "error": "Terminal 'terminal_zsh_u-ab12cd' is not running",
+        "created_by": "alice@example.com",
+    }
+
+
+def test_terminal_command_rejects_invalid_action() -> None:
+    with pytest.raises(ValidationError):
+        TerminalCommandData(kind="input", input="ls", action="focus")  # type: ignore[arg-type]
+
+
+def test_terminal_command_rejects_invalid_status() -> None:
+    with pytest.raises(ValidationError):
+        TerminalCommandData(kind="input", input="ls", status="failed")  # type: ignore[arg-type]
 
 
 # ── NON_CONTENT_ITEM_TYPES ───────────────────────────

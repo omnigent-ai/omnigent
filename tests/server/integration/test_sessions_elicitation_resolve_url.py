@@ -605,10 +605,11 @@ async def test_child_codex_elicitation_bubbles_to_parent_stream(
         assert verdict.status_code == 202, verdict.text
 
         resolved_event = await parent_resolved
-        assert resolved_event == {
+        assert {k: v for k, v in resolved_event.items() if k != "sequence"} == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
         }
+        assert isinstance(resolved_event["sequence"], int)
 
         resp = await hook_task
         assert resp.status_code == 200, resp.text
@@ -684,10 +685,11 @@ async def test_child_policy_elicitation_bubbles_to_parent_stream(
         assert verdict.status_code == 202, verdict.text
 
         resolved_event = await parent_resolved
-        assert resolved_event == {
+        assert {k: v for k, v in resolved_event.items() if k != "sequence"} == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
         }
+        assert isinstance(resolved_event["sequence"], int)
 
         resp = await evaluate
         assert resp.status_code == 200, resp.text
@@ -794,10 +796,11 @@ async def test_child_mcp_elicitation_bubbles_to_parent_stream(
         assert verdict.status_code == 202, verdict.text
 
         resolved_event = await parent_resolved
-        assert resolved_event == {
+        assert {k: v for k, v in resolved_event.items() if k != "sequence"} == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
         }
+        assert isinstance(resolved_event["sequence"], int)
     finally:
         for task in [parent_drain, parent_resolved]:
             if task is not None and not task.done():
@@ -869,10 +872,11 @@ async def test_child_claude_ask_user_question_bubbles_to_parent_stream(
         assert verdict.status_code == 202, verdict.text
 
         resolved_event = await parent_resolved
-        assert resolved_event == {
+        assert {k: v for k, v in resolved_event.items() if k != "sequence"} == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
         }
+        assert isinstance(resolved_event["sequence"], int)
 
         resp = await hook_task
         assert resp.status_code == 200, resp.text

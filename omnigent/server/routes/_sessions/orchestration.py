@@ -4298,14 +4298,18 @@ async def _relay_runner_stream(
                     # (session.resource.created / .deleted) emitted by
                     # agent-tool terminal launches/closes so reconnecting
                     # clients rediscover the resource in the snapshot.
-                    # The live publish below already updates connected
-                    # clients.
+                    # The shared helper stamps and publishes before append.
                     resource_item = _resource_event_item_from_sse(session_id, event)
                     if resource_item is not None:
-                        await _relay_persist(
-                            conversation_store,
+                        resource_data = resource_item.data
+                        await asyncio.to_thread(
+                            _publish_and_persist_resource_event,
                             session_id,
-                            resource_item,
+                            resource_data.event_type,
+                            resource_data.resource_id,
+                            resource_data.resource_type,
+                            conversation_store,
+                            resource_data.resource,
                         )
                         # Self-heal the spin-up flag: a created terminal is
                         # authoritative proof the session is no longer
@@ -4314,11 +4318,12 @@ async def _relay_runner_stream(
                         # between launch and clear). Only fire on a real
                         # state change to avoid redundant stream traffic.
                         if (
-                            resource_item.data.event_type == "session.resource.created"
-                            and resource_item.data.resource_type == "terminal"
+                            resource_data.event_type == "session.resource.created"
+                            and resource_data.resource_type == "terminal"
                             and _session_terminal_pending_cache.get(session_id, False)
                         ):
                             _publish_terminal_pending(session_id, False)
+                        continue
 
                     # Intelligent-model-router decision emitted by the runner's
                     # cost advisor at turn start. Persist as a display-only

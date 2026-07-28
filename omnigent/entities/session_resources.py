@@ -334,9 +334,11 @@ def resolve_terminal_entry_by_resource_id(
     """
     if terminal_registry is None:
         return None
-    for entry in terminal_registry.list_for_conversation(session_id):
-        if not entry.instance.running:
-            continue
-        if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
-            return entry
-    return None
+    from omnigent.terminals.registry import ResolveSnapshot
+
+    resolved = terminal_registry.resolve_snapshot(session_id, terminal_id)
+    if not isinstance(resolved, ResolveSnapshot):
+        return None
+    if resolved.instance.retired or not resolved.instance.running:
+        return None
+    return resolved.entry

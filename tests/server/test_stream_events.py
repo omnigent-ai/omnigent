@@ -303,6 +303,7 @@ def test_session_skills_event_round_trips_through_union() -> None:
         "type": "session.skills",
         "conversation_id": "conv_abc",
         "sequence_number": None,
+        "sequence": None,
     }
     parsed = _ADAPTER.validate_python(dumped)
     # Discriminator must route to SessionSkillsEvent, not some other
@@ -323,6 +324,7 @@ def test_session_model_options_event_round_trips_through_union() -> None:
         "type": "session.model_options",
         "conversation_id": "conv_abc",
         "sequence_number": None,
+        "sequence": None,
     }
     parsed = _ADAPTER.validate_python(dumped)
     # Discriminator must route to the model-options nudge, otherwise
@@ -492,6 +494,40 @@ async def test_stream_overflow_closes_without_done_for_reconnect(
     assert len(frames) == 1
     assert frames[0].startswith("event: session.heartbeat\n")
     assert all("[DONE]" not in frame for frame in frames)
+
+
+@pytest.mark.asyncio
+async def test_stream_frames_preserve_sequence_and_omit_legacy_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stamped frames carry ``sequence`` while unstamped frames stay identical."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes.sessions import _stream_live_events
+
+    async def two_events(*_args: Any, **_kwargs: Any):
+        yield {"type": "session.heartbeat", "sequence": 91}
+        yield {"type": "session.heartbeat"}
+
+    class ConnectedRequest:
+        """Request stub that remains connected through both events."""
+
+        async def is_disconnected(self) -> bool:
+            return False
+
+    monkeypatch.setattr(session_stream, "subscribe", two_events)
+    frames = [
+        frame
+        async for frame in _stream_live_events(
+            ConnectedRequest(),
+            "conv_sequence",
+        )
+    ]
+    payloads = [
+        json.loads(frame.split("data: ", 1)[1]) for frame in frames if frame.startswith("event:")
+    ]
+
+    assert payloads[0]["sequence"] == 91
+    assert "sequence" not in payloads[1]
 
 
 def test_publish_session_status_helper_uses_waiting_literal() -> None:

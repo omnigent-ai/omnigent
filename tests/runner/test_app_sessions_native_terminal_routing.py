@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1002,7 +1001,6 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
 
     with registry._lock:
         registry._by_conversation[sid] = {("claude", "main"): dead_instance}
-        registry._instance_locks[(sid, "claude", "main")] = threading.Lock()
 
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
@@ -1070,7 +1068,6 @@ async def test_dead_registered_pane_close_restores_running_for_kill_server(
 
     with registry._lock:
         registry._by_conversation[sid] = {("claude", "main"): dead_instance}
-        registry._instance_locks[(sid, "claude", "main")] = threading.Lock()
 
     alive = await dead_instance.is_alive()
     assert alive is False

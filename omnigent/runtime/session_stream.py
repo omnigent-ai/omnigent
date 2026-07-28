@@ -8,7 +8,8 @@ behind past the bound is disconnected so it can recover through the
 snapshot + live-tail reconnect contract. Events emitted before any
 subscriber is connected are LOST — there is no buffer and no replay.
 Clients that need to recover state across a disconnect fetch
-``GET /v1/sessions/{id}`` for the persisted history and dedupe by item id.
+``GET /v1/sessions/{id}`` for persisted history and reconcile resource
+state with the process-local ``sequence`` watermark.
 
 This module owns no per-conversation lifecycle. There is no
 ``register`` / ``unregister`` step: the first ``subscribe`` call
@@ -57,6 +58,13 @@ _subscribers: dict[
     set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
 ] = {}
 _lock = threading.Lock()
+_sequence = 0
+
+
+def current_sequence() -> int:
+    """Return the latest process-local event sequence under the stream lock."""
+    with _lock:
+        return _sequence
 
 
 def _enqueue_or_overflow(
@@ -82,10 +90,11 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
     """
     Broadcast an event to every active subscriber of the given
     conversation (called from sync workflow thread). The event
-    payload is delivered verbatim — no sequence number or other
-    ordering field is added on the wire. Events emitted while no
-    subscriber is connected are dropped silently; reconnecting
-    clients use the snapshot endpoint, not replay.
+    payload is stamped in place with one process-global ``sequence``
+    before the subscriber snapshot is taken. Events emitted while no
+    subscriber is connected are dropped from live delivery but still
+    consume a sequence; reconnecting clients use the persisted resource
+    event log and snapshot watermark rather than stream replay.
 
     No-op when ``_subscribers`` has no entry for this
     ``conversation_id`` (typical between turns when nothing is
@@ -131,10 +140,22 @@ def publish(conversation_id: str, event: dict[str, Any]) -> None:
     pending_elicitations.record_publish(conversation_id, event)
     if suppress_live:
         return
+    global _sequence
     with _lock:
+        _sequence += 1
+        event["sequence"] = _sequence
         subs = list(_subscribers.get(conversation_id, ()))
     for queue, loop in subs:
         loop.call_soon_threadsafe(_enqueue_or_overflow, queue, event)
+
+
+def publish_best_effort(conversation_id: str, event: dict[str, Any]) -> Exception | None:
+    """Publish without allowing an SSE notification failure to escape."""
+    try:
+        publish(conversation_id, event)
+    except Exception as exc:
+        return exc
+    return None
 
 
 def close(conversation_id: str) -> None:

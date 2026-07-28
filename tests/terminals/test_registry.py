@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -27,7 +26,11 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpe
 from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals import registry as registry_mod
-from omnigent.terminals.registry import TerminalListEntry, conversation_link_for_id
+from omnigent.terminals.registry import (
+    ResolveSnapshot,
+    TerminalListEntry,
+    conversation_link_for_id,
+)
 
 # ── Pure bookkeeping (no tmux) ────────────────────────────────
 
@@ -52,6 +55,69 @@ def test_get_returns_none_for_unknown_triple() -> None:
     """
     reg = TerminalRegistry()
     assert reg.get("conv_nope", "bash", "s1") is None
+
+
+def _registered_snapshot(tmp_path: Path) -> tuple[TerminalRegistry, ResolveSnapshot]:
+    reg = TerminalRegistry()
+    instance = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "bash.sock",
+        private_dir=tmp_path / "bash",
+        running=True,
+    )
+    reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
+    snapshot = reg.resolve_key_snapshot("conv_a", "bash", "s1")
+    assert isinstance(snapshot, ResolveSnapshot)
+    return reg, snapshot
+
+
+def test_run_fenced_runs_valid_async_function(tmp_path: Path) -> None:
+    reg, snapshot = _registered_snapshot(tmp_path)
+    calls = 0
+
+    async def operation() -> str:
+        nonlocal calls
+        calls += 1
+        return "ran"
+
+    assert reg.run_fenced(snapshot, operation, invalid="invalid") == "ran"
+    assert calls == 1
+
+
+def test_run_fenced_returns_invalid_sentinel_without_running_function(
+    tmp_path: Path,
+) -> None:
+    reg, snapshot = _registered_snapshot(tmp_path)
+    sentinel = object()
+    ran = False
+
+    async def operation() -> None:
+        nonlocal ran
+        ran = True
+
+    reg._by_conversation.clear()
+
+    assert reg.run_fenced(snapshot, operation, invalid=sentinel) is sentinel
+    assert ran is False
+
+
+def test_run_fenced_holds_snapshot_lock_during_function(tmp_path: Path) -> None:
+    reg, snapshot = _registered_snapshot(tmp_path)
+
+    async def operation() -> bool:
+        return snapshot.op_lock.locked()
+
+    assert reg.run_fenced(snapshot, operation, invalid=False) is True
+
+
+def test_run_fenced_preserves_direct_value_operation(tmp_path: Path) -> None:
+    reg, snapshot = _registered_snapshot(tmp_path)
+
+    def operation() -> tuple[str, bool]:
+        return "ran", snapshot.op_lock.locked()
+
+    assert reg.run_fenced(snapshot, operation, invalid=None) == ("ran", True)
 
 
 def test_list_for_conversation_returns_empty_for_unknown_id() -> None:
@@ -201,7 +267,6 @@ async def test_launch_replaces_stale_running_entry(
         running=False,
     )
     reg._by_conversation["conv_x"] = {("shell", "s1"): stale}
-    reg._instance_locks[("conv_x", "shell", "s1")] = threading.Lock()
 
     def _fake_create_terminal_instance(*_args: object, **_kwargs: object) -> TerminalCreateResult:
         return TerminalCreateResult(instance=created, cwd=tmp_path)
@@ -218,6 +283,60 @@ async def test_launch_replaces_stale_running_entry(
     assert result is created
     assert stale.closed is True
     assert reg.get("conv_x", "shell", "s1") is created
+
+
+async def test_launch_rejects_collision_at_final_registration_and_closes_loser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A collision racing the spawn is rejected without leaking its tmux."""
+    reg = TerminalRegistry()
+    collision = TerminalInstance(
+        name="bash",
+        session_key="s1",
+        socket_path=tmp_path / "winner.sock",
+        private_dir=tmp_path / "winner",
+        running=True,
+    )
+
+    class _RacingTerminal(TerminalInstance):
+        closed: bool = False
+
+        async def launch(self, *, cwd: Path | None = None) -> None:
+            del cwd
+            self.running = True
+            reg._by_conversation["conv_x"] = {("bash", "s1"): collision}
+
+        async def is_alive(self) -> bool:
+            return True
+
+        async def close(self) -> None:
+            self.closed = True
+            self.running = False
+
+    created = _RacingTerminal(
+        name="bash ",
+        session_key="s1",
+        socket_path=tmp_path / "loser.sock",
+        private_dir=tmp_path / "loser",
+    )
+
+    def _fake_create_terminal_instance(*_args: object, **_kwargs: object) -> TerminalCreateResult:
+        return TerminalCreateResult(instance=created, cwd=tmp_path)
+
+    monkeypatch.setattr(registry_mod, "create_terminal_instance", _fake_create_terminal_instance)
+
+    with pytest.raises(RuntimeError, match=r"resource id.*collides"):
+        await reg.launch(
+            "conv_x",
+            "bash ",
+            "s1",
+            TerminalEnvSpec(command="bash"),
+        )
+
+    assert created.closed is True
+    assert reg.get("conv_x", "bash", "s1") is collision
+    assert reg.get("conv_x", "bash ", "s1") is None
 
 
 def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:
@@ -237,9 +356,8 @@ def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:
         private_dir=tmp_path / "claude",
         running=True,
     )
-    lock = threading.Lock()
+    generation = instance.owner_generation
     reg._by_conversation["conv_old"] = {("claude", "main"): instance}
-    reg._instance_locks[("conv_old", "claude", "main")] = lock
 
     moved = reg.transfer("conv_old", "conv_new", "claude", "main")
 
@@ -247,8 +365,7 @@ def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:
     assert reg.get("conv_old", "claude", "main") is None
     assert reg.get("conv_new", "claude", "main") is instance
     assert instance.running is True
-    assert reg.get_instance_lock("conv_old", "claude", "main") is None
-    assert reg.get_instance_lock("conv_new", "claude", "main") is lock
+    assert instance.owner_generation == generation + 1
     assert reg.active_conversation_ids() == ["conv_new"]
 
 
@@ -514,39 +631,6 @@ async def test_shutdown_clears_all_conversations(
     assert reg_with_tmux.list_for_conversation("conv_b") == []
 
 
-# ── Additional pure-bookkeeping tests (no tmux) ─────────────
-
-
-def test_get_instance_lock_returns_none_for_unknown_triple() -> None:
-    """
-    ``get_instance_lock`` returns ``None`` for a triple that was never
-    registered. Callers treat ``None`` as "not running" and surface
-    an error to the LLM.
-    """
-    reg = TerminalRegistry()
-    assert reg.get_instance_lock("conv_nope", "bash", "s1") is None
-
-
-def test_get_instance_lock_returns_lock_after_manual_registration(tmp_path: Path) -> None:
-    """
-    After manually inserting an instance and its lock (as ``launch``
-    would), ``get_instance_lock`` returns the same lock object.
-    """
-    reg = TerminalRegistry()
-    lock = threading.Lock()
-    instance = TerminalInstance(
-        name="bash",
-        session_key="s1",
-        socket_path=tmp_path / "bash.sock",
-        private_dir=tmp_path / "bash",
-        running=True,
-    )
-    reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
-    reg._instance_locks[("conv_a", "bash", "s1")] = lock
-
-    assert reg.get_instance_lock("conv_a", "bash", "s1") is lock
-
-
 def test_transfer_nonexistent_source_returns_false() -> None:
     """
     Transferring from a conversation that has no terminals returns
@@ -590,9 +674,7 @@ def test_transfer_cleans_up_empty_source_slot(tmp_path: Path) -> None:
         private_dir=tmp_path / "bash",
         running=True,
     )
-    lock = threading.Lock()
     reg._by_conversation["conv_old"] = {("bash", "s1"): instance}
-    reg._instance_locks[("conv_old", "bash", "s1")] = lock
 
     reg.transfer("conv_old", "conv_new", "bash", "s1")
 
@@ -671,12 +753,13 @@ def test_conversation_link_for_id_method_delegates_to_module_function() -> None:
     assert "conv_abc" in link
 
 
-async def test_close_removes_instance_lock(tmp_path: Path) -> None:
+async def test_close_retires_instance_and_unmaps_owner(tmp_path: Path) -> None:
     """
-    After ``close``, the per-instance lock is removed so
-    ``get_instance_lock`` returns ``None``. Subsequent tool calls
-    that try to acquire the lock see "not running" rather than
-    operating on a closed tmux session.
+    After ``close``, the retired instance is no longer registry-addressable.
+
+    Subsequent tool calls see "not running" rather than operating on a
+    retired tmux session, while stale snapshots retain the same lock object
+    and observe the generation transition.
     """
     reg = TerminalRegistry()
     instance = TerminalInstance(
@@ -687,14 +770,15 @@ async def test_close_removes_instance_lock(tmp_path: Path) -> None:
         running=True,
     )
     instance.close = AsyncMock()  # type: ignore[method-assign]
-    lock = threading.Lock()
     reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
-    reg._instance_locks[("conv_a", "bash", "s1")] = lock
+    generation = instance.owner_generation
 
     result = await reg.close("conv_a", "bash", "s1")
 
     assert result is True
-    assert reg.get_instance_lock("conv_a", "bash", "s1") is None
+    assert reg.get("conv_a", "bash", "s1") is None
+    assert instance.retired is True
+    assert instance.owner_generation == generation + 1
     instance.close.assert_awaited_once()
 
 
@@ -718,7 +802,6 @@ async def test_close_with_timeout_still_returns_true(tmp_path: Path) -> None:
 
     instance.close = _hang_forever  # type: ignore[method-assign]
     reg._by_conversation["conv_a"] = {("bash", "s1"): instance}
-    reg._instance_locks[("conv_a", "bash", "s1")] = threading.Lock()
 
     # The close should not hang — it uses asyncio.wait_for with _CLOSE_TIMEOUT_S.
     # We patch _CLOSE_TIMEOUT_S to a tiny value so the test finishes quickly.
@@ -768,8 +851,6 @@ async def test_cleanup_conversation_tolerates_close_exception(tmp_path: Path) ->
         ("bash", "s1"): good_instance,
         ("bash", "s2"): bad_instance,
     }
-    reg._instance_locks[("conv_a", "bash", "s1")] = threading.Lock()
-    reg._instance_locks[("conv_a", "bash", "s2")] = threading.Lock()
 
     # Should not raise despite bad_instance.close() exploding.
     await reg.cleanup_conversation("conv_a")
@@ -810,8 +891,6 @@ async def test_shutdown_tolerates_close_exception(tmp_path: Path) -> None:
 
     reg._by_conversation["conv_a"] = {("bash", "s1"): bad}
     reg._by_conversation["conv_b"] = {("bash", "s1"): good}
-    reg._instance_locks[("conv_a", "bash", "s1")] = threading.Lock()
-    reg._instance_locks[("conv_b", "bash", "s1")] = threading.Lock()
 
     await reg.shutdown()
 

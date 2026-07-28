@@ -1014,6 +1014,7 @@ async def test_list_environments_proxies_to_runner(
 @pytest.mark.asyncio
 async def test_list_terminals_forwards_pagination_params_to_runner(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """GET /resources/terminals forwards order/limit to the runner.
 
@@ -1025,12 +1026,19 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     """
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": []})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    monkeypatch.setattr(session_stream, "current_sequence", lambda: 73)
 
     resp = await client.get(
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals?order=asc&limit=1000&bogus=1",
     )
 
     assert resp.status_code == 200
+    assert resp.json() == {
+        "object": "list",
+        "data": [],
+        "resource_revision": 73,
+        "full_snapshot": True,
+    }
     assert fake_runner.calls == [
         ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
@@ -1153,6 +1161,7 @@ async def test_create_terminal_proxies_to_runner(
 
     assert resp.status_code == 200
     assert resp.json()["id"] == "terminal_bash_s1"
+    assert isinstance(resp.json()["sequence"], int)
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
@@ -2711,11 +2720,12 @@ async def test_filesystem_write_publishes_changed_files_invalidation(
         await stream.aclose()
 
     assert resp.status_code == 200
-    assert event == {
+    assert {key: value for key, value in event.items() if key != "sequence"} == {
         "type": "session.changed_files.invalidated",
         "session_id": "79b22ebd2309e48fdeb450c65611d51b",
         "environment_id": "default",
     }
+    assert isinstance(event["sequence"], int)
 
 
 @pytest.mark.asyncio
@@ -3040,6 +3050,12 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
     # Persisted item carries the full resource dict for snapshot replay.
     assert events[0].data.resource is not None
     assert events[0].data.resource["id"] == "terminal_zsh_s1"
+    assert isinstance(events[0].data.sequence, int)
+    assert events[0].data.resource["sequence"] == events[0].data.sequence
+    reloaded = ConversationItem.model_validate(
+        events[0].model_dump(mode="json", exclude_none=True)
+    )
+    assert reloaded.data.sequence == events[0].data.sequence
     # Resource events thread on the session id (matches the REST path).
     assert events[0].response_id == "79b22ebd2309e48fdeb450c65611d51b"
 
@@ -3076,6 +3092,7 @@ async def test_relay_persists_terminal_resource_deleted_from_runner() -> None:
     assert events[0].data.event_type == "session.resource.deleted"
     assert events[0].data.resource_id == "terminal_zsh_s1"
     assert events[0].data.resource_type == "terminal"
+    assert isinstance(events[0].data.sequence, int)
     # Delete carries no resource body.
     assert events[0].data.resource is None
 

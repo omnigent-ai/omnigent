@@ -52,7 +52,7 @@ import json
 import logging
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 
@@ -312,6 +312,7 @@ async def bridge_tmux_control_to_websocket(
     tmux_target: str,
     read_only: bool,
     on_client_interaction: Callable[[], None] | None = None,
+    on_client_input: Callable[[bytes], Awaitable[bool]] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
 ) -> None:
@@ -332,6 +333,8 @@ async def bridge_tmux_control_to_websocket(
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints. See the PTY bridge
         for the full rationale.
+    :param on_client_input: Optional owner-fenced raw-input dispatcher. A
+        ``False`` result closes an attachment whose captured owner changed.
     :param reader_done: Optional test-only event set once the reader has queued
         the full backlog and the ``None`` EOF sentinel, letting a test await the
         reader draining tmux instead of sleeping. Inert (never awaited) when
@@ -490,13 +493,29 @@ async def bridge_tmux_control_to_websocket(
                             rows = int(ctl["rows"])
                         except (KeyError, TypeError, ValueError):
                             continue
+                        if on_client_input is not None and not await on_client_input(b""):
+                            with contextlib.suppress(RuntimeError):
+                                await websocket.close(
+                                    code=WS_CLOSE_TERMINAL_NOT_FOUND,
+                                    reason="terminal ownership changed",
+                                )
+                            return
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                 elif data is not None and not read_only:
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()
-                    for cmd in _hex_send_keys_commands(tmux_target, data):
-                        await _send_command(cmd)
+                    if on_client_input is not None:
+                        if not await on_client_input(data):
+                            with contextlib.suppress(RuntimeError):
+                                await websocket.close(
+                                    code=WS_CLOSE_TERMINAL_NOT_FOUND,
+                                    reason="terminal ownership changed",
+                                )
+                            return
+                    else:
+                        for cmd in _hex_send_keys_commands(tmux_target, data):
+                            await _send_command(cmd)
         except WebSocketDisconnect:
             return
 

@@ -3,24 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import secrets
-from collections.abc import Callable
-from typing import Any
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import httpx
 from fastapi import (
     APIRouter,
+    HTTPException,
     Request,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy.exc import SQLAlchemyError
 
 from omnigent.entities import (
+    Conversation,
+    ConversationItem,
     ErrorData,
     NewConversationItem,
+    TerminalCommandData,
 )
 from omnigent.entities.conversation import (
     parse_item_data,
 )
+from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -80,6 +90,7 @@ from omnigent.server.schemas import (
     ElicitationRequestParams,
     ErrorDetail,
     McpServerStartup,
+    OutputItemDoneEvent,
     SessionEventInput,
 )
 from omnigent.session_lifecycle import (
@@ -94,6 +105,234 @@ from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedE
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+
+
+def _shell_attempt_fingerprint(
+    *,
+    session_id: str,
+    action: Literal["spawn", "send"],
+    command: str,
+    terminal_name: str | None,
+    terminal_id: str | None,
+    session_key: str | None,
+) -> str:
+    """Bind one attempt id to its complete semantic shell request."""
+    canonical = json.dumps(
+        {
+            "action": action,
+            "command": command,
+            "session_id": session_id,
+            "session_key": session_key,
+            "terminal_id": terminal_id,
+            "terminal_name": terminal_name,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class _ShellCommandReplay:
+    """Stored HTTP result replayed for one completed shell attempt."""
+
+    status_code: int
+    body: dict[str, Any]
+
+
+class _ShellCommandRunnerError(OmnigentError):
+    """Preserve an explicit runner status alongside its stable error code."""
+
+    def __init__(self, message: str, *, code: str, http_status: int) -> None:
+        super().__init__(message, code=code)
+        self._http_status = http_status
+
+    @property
+    def http_status(self) -> int:
+        """Return the runner's definite non-delivery status unchanged."""
+        return self._http_status
+
+
+@dataclass
+class _InFlightShellCommand:
+    """One process-local single-flight slot backed by a durable receipt."""
+
+    fingerprint: str
+    result: asyncio.Future[_ShellCommandReplay]
+
+
+def _replay_from_shell_receipt(item: ConversationItem) -> _ShellCommandReplay:
+    """Rebuild the original mutation response from a durable receipt."""
+    if not isinstance(item.data, TerminalCommandData):
+        raise TypeError("shell-command ledger resolved a non-terminal receipt")
+    data = item.data
+    if data.status == "error":
+        if data.error_code is None:
+            return _ShellCommandReplay(
+                status_code=data.http_status or 500,
+                body={"detail": data.error or "Shell command failed"},
+            )
+        return _ShellCommandReplay(
+            status_code=data.http_status or 500,
+            body={
+                "error": {
+                    "code": data.error_code or ErrorCode.INTERNAL_ERROR,
+                    "message": data.error or "Shell command failed",
+                }
+            },
+        )
+    body: dict[str, Any] = {
+        "item_id": item.id,
+        "item": item.to_api_dict(),
+        "terminal": data.terminal,
+    }
+    if data.sequence is not None:
+        body["sequence"] = data.sequence
+    return _ShellCommandReplay(status_code=200, body=body)
+
+
+class _ShellCommandAttemptLedger:
+    """Single-flight execution with durable receipt-based replay."""
+
+    def __init__(self, conversation_store: ConversationStore) -> None:
+        self._conversation_store = conversation_store
+        self._lock = asyncio.Lock()
+        self._in_flight: dict[tuple[str, str], _InFlightShellCommand] = {}
+        # Retain the fire-and-forget cleanup tasks: the event loop keeps
+        # only a weak reference, so an un-held task can be GC'd before it
+        # releases the abandoned slot, wedging duplicate waiters forever.
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
+
+    def _find_receipt(self, session_id: str, attempt_id: str) -> ConversationItem | None:
+        after: str | None = None
+        while True:
+            page = self._conversation_store.list_items(
+                session_id,
+                limit=1000,
+                after=after,
+                order="desc",
+                type="terminal_command",
+            )
+            for item in page.data:
+                if (
+                    isinstance(item.data, TerminalCommandData)
+                    and item.data.attempt_id == attempt_id
+                ):
+                    return item
+            if not page.has_more or page.last_id is None:
+                return None
+            after = page.last_id
+
+    async def wait_or_claim(
+        self,
+        *,
+        session_id: str,
+        attempt_id: str,
+        fingerprint: str,
+    ) -> _ShellCommandReplay | None:
+        """Return a replay for a duplicate, or claim the caller as owner."""
+        key = (session_id, attempt_id)
+        async with self._lock:
+            existing = self._in_flight.get(key)
+            if existing is not None:
+                if existing.fingerprint != fingerprint:
+                    raise OmnigentError(
+                        "attempt_id is already bound to a different shell command",
+                        code=ErrorCode.ATTEMPT_CONFLICT,
+                    )
+                result = existing.result
+            else:
+                receipt = await asyncio.to_thread(self._find_receipt, session_id, attempt_id)
+                if receipt is not None:
+                    data = receipt.data
+                    if (
+                        not isinstance(data, TerminalCommandData)
+                        or data.attempt_fingerprint != fingerprint
+                    ):
+                        raise OmnigentError(
+                            "attempt_id is already bound to a different shell command",
+                            code=ErrorCode.ATTEMPT_CONFLICT,
+                        )
+                    return _replay_from_shell_receipt(receipt)
+
+                result = asyncio.get_running_loop().create_future()
+                result.add_done_callback(
+                    lambda completed: None if completed.cancelled() else completed.exception()
+                )
+                entry = _InFlightShellCommand(fingerprint=fingerprint, result=result)
+                self._in_flight[key] = entry
+                owner = asyncio.current_task()
+                if owner is None:
+                    self._in_flight.pop(key, None)
+                    raise RuntimeError("shell-command claim requires an asyncio task")
+                owner.add_done_callback(
+                    lambda completed: self._schedule_finish_abandoned(key, entry, completed)
+                )
+                return None
+        return await asyncio.shield(result)
+
+    def _schedule_finish_abandoned(
+        self,
+        key: tuple[str, str],
+        entry: _InFlightShellCommand,
+        owner: asyncio.Task[Any],
+    ) -> None:
+        """Spawn and retain the abandoned-owner cleanup task.
+
+        Holding a strong reference until the task finishes keeps the
+        loop from garbage-collecting it mid-run, which would otherwise
+        leave the in-flight slot un-released.
+        """
+        task = asyncio.create_task(self._finish_abandoned(key, entry, owner))
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+    async def complete(
+        self,
+        *,
+        session_id: str,
+        attempt_id: str,
+        receipt: ConversationItem,
+    ) -> None:
+        """Resolve current waiters from the just-persisted durable receipt."""
+        key = (session_id, attempt_id)
+        async with self._lock:
+            entry = self._in_flight.pop(key, None)
+            if entry is not None and not entry.result.done():
+                entry.result.set_result(_replay_from_shell_receipt(receipt))
+
+    async def _finish_abandoned(
+        self,
+        key: tuple[str, str],
+        entry: _InFlightShellCommand,
+        owner: asyncio.Task[Any],
+    ) -> None:
+        """Release waiters if an owner exits before persisting a receipt."""
+        async with self._lock:
+            if self._in_flight.get(key) is not entry:
+                return
+            self._in_flight.pop(key, None)
+            if entry.result.done():
+                return
+            if owner.cancelled():
+                # The owner was cancelled before persisting a receipt.
+                # Cancelling the shared future would surface as a
+                # CancelledError (HTTP 500) on innocent duplicate
+                # waiters — resolve them with a retryable error so a
+                # resend of the same attempt re-claims and executes.
+                entry.result.set_exception(
+                    OmnigentError(
+                        "shell-command attempt was abandoned before completing; retry",
+                        code=ErrorCode.ATTEMPT_ABANDONED,
+                    )
+                )
+                return
+            exc = owner.exception()
+            entry.result.set_exception(
+                exc
+                if exc is not None
+                else RuntimeError("shell-command owner exited without a durable receipt")
+            )
 
 
 def register_events_routes(
@@ -114,6 +353,509 @@ def register_events_routes(
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
+    shell_command_attempts = _ShellCommandAttemptLedger(conversation_store)
+
+    def _build_shell_command_receipt_item(
+        command: str,
+        *,
+        action: Literal["spawn", "send"],
+        terminal_id: str | None,
+        terminal_name: str | None,
+        session_key: str | None,
+        status: Literal["ok", "error", "unknown"],
+        error: str | None,
+        attempt_id: str,
+        attempt_fingerprint: str,
+        sequence: int | None,
+        terminal: dict[str, Any] | None,
+        http_status: int,
+        error_code: str | None,
+        created_by: str | None,
+    ) -> NewConversationItem:
+        """Construct one ``terminal_command`` receipt item.
+
+        Pure construction, no I/O — the only step that can raise on
+        malformed field values (e.g. a non-string ``terminal_id``
+        committed to orchestration state). Callers isolate this so a
+        construction failure can fall back to a minimal receipt WITHOUT
+        risking a double persist.
+
+        Uses a synthetic ``turn_`` response id since no agent turn
+        exists for a bang command.
+
+        :param command: Verbatim command text sent to the shell.
+        :param action: ``"spawn"`` or ``"send"``.
+        :param terminal_id: Target terminal resource id, when known.
+        :param terminal_name: Shell type for display, when known.
+        :param session_key: Display session key, when known.
+        :param status: Delivery outcome: ``"ok"``, ``"unknown"``, or
+            ``"error"``.
+        :param error: Failure text when ``status="error"``.
+        :param created_by: Authenticated actor id, or ``None`` in
+            single-user mode.
+        :returns: The unpersisted receipt item.
+        """
+        return NewConversationItem(
+            type="terminal_command",
+            response_id=f"turn_{uuid.uuid4().hex}",
+            data=TerminalCommandData(
+                kind="input",
+                input=command,
+                action=action,
+                terminal_id=terminal_id,
+                terminal_name=terminal_name,
+                session_key=session_key,
+                status=status,
+                error=error,
+                attempt_id=attempt_id,
+                sequence=sequence,
+                attempt_fingerprint=attempt_fingerprint,
+                terminal=terminal,
+                http_status=http_status,
+                error_code=error_code,
+            ),
+            created_by=created_by,
+        )
+
+    async def _dispatch_shell_command_event(
+        session_id: str,
+        conv: Conversation,
+        body: SessionEventInput,
+        *,
+        created_by: str | None,
+    ) -> JSONResponse:
+        """Execute one idempotent bang command without starting an agent turn.
+
+        ``attempt_id`` binds the request fingerprint and produces exactly
+        one durable receipt. Input success is determined only from the T1
+        ``outcome`` discriminator; ambiguous delivery becomes ``unknown``.
+        Receipt publication is best-effort after append and can never change
+        the command outcome or cause a second receipt.
+
+        :param session_id: Session/conversation identifier.
+        :param conv: Conversation row for ``session_id``.
+        :param body: Validated ``shell_command`` event body.
+        :param created_by: Authenticated actor id for attribution.
+        :returns: 200 ``{"item_id": ..., "item": <receipt>,
+            "terminal": <resource|None>, "sequence": <int?>}``.
+        :raises OmnigentError: On gate/validation failures,
+            runner-reported terminal errors, and unrouteable runners.
+        :raises HTTPException: 502 when the runner transport fails or
+            a stage hits a decode, shape, or persistence failure.
+        """
+        action = body.data.get("action")
+        if action not in ("spawn", "send"):
+            raise OmnigentError(
+                "shell_command requires data.action of 'spawn' or 'send'",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        command = body.data.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise OmnigentError(
+                "shell_command requires a non-empty string data.command",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
+        attempt_id = _require_shell_attempt_id(body.data.get("attempt_id"))
+        terminal_name: str | None = None
+        session_key: str | None = None
+        terminal_id: str | None = None
+        if action == "spawn":
+            requested_name = body.data.get("terminal")
+            if not isinstance(requested_name, str) or not requested_name:
+                raise OmnigentError(
+                    "shell_command spawn requires a non-empty string data.terminal",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            terminal_name = requested_name
+            session_key = _shell_spawn_session_key(attempt_id)
+            terminal_id = terminal_resource_id(terminal_name, session_key)
+        else:
+            requested_id = body.data.get("terminal_id")
+            if not isinstance(requested_id, str) or not requested_id:
+                raise OmnigentError(
+                    "shell_command send requires a non-empty string data.terminal_id",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            terminal_id = requested_id
+
+        attempt_fingerprint = _shell_attempt_fingerprint(
+            session_id=session_id,
+            action=action,
+            command=command,
+            terminal_name=terminal_name,
+            terminal_id=terminal_id,
+            session_key=session_key,
+        )
+        replay = await shell_command_attempts.wait_or_claim(
+            session_id=session_id,
+            attempt_id=attempt_id,
+            fingerprint=attempt_fingerprint,
+        )
+        if replay is not None:
+            return JSONResponse(status_code=replay.status_code, content=replay.body)
+
+        terminals_path = f"/v1/sessions/{session_id}/resources/terminals"
+        terminal_resource: dict[str, Any] | None = None
+        terminal_created = False
+        # The attempt's one receipt. _receipt_once's guard makes any
+        # persist-then-reraise path physically unable to append twice.
+        receipt_box: list[ConversationItem] = []
+
+        async def _receipt_once(
+            status: Literal["ok", "error", "unknown"],
+            error: str | None = None,
+            *,
+            http_status: int = 200,
+            error_code: str | None = None,
+        ) -> ConversationItem:
+            """Persist this attempt's single receipt (idempotent).
+
+            Reads the orchestration state (terminal id/name/key) at
+            call time, so the receipt reflects how far the attempt got.
+
+            The exactly-once guarantee is structural: the receipt is
+            appended to ``receipt_box`` right after it persists and
+            BEFORE it publishes, so a later publish failure (or any
+            re-entry) short-circuits on the guard instead of persisting
+            a second time. The minimal-receipt fallback covers ONLY
+            item construction — never the persist/publish — so it can
+            never fire after a durable append.
+
+            :param status: Delivery outcome for the receipt.
+            :param error: Failure text when ``status="error"``.
+            :returns: The persisted receipt item.
+            """
+            if receipt_box:
+                return receipt_box[0]
+
+            raw_sequence = (
+                terminal_resource.get("sequence")
+                if action == "spawn" and terminal_resource is not None
+                else None
+            )
+            resource_sequence = raw_sequence if isinstance(raw_sequence, int) else None
+            common_receipt_args: dict[str, Any] = {
+                "action": action,
+                "status": status,
+                "attempt_id": attempt_id,
+                "attempt_fingerprint": attempt_fingerprint,
+                "sequence": resource_sequence,
+                "terminal": terminal_resource,
+                "http_status": http_status,
+                "error_code": error_code,
+                "created_by": created_by,
+            }
+
+            # Fallback scope is item CONSTRUCTION only. If building the
+            # full receipt raises (e.g. a stage committed an invalid
+            # field to orchestration state), fall back to a minimal
+            # receipt rather than lose the record entirely.
+            try:
+                item = _build_shell_command_receipt_item(
+                    command,
+                    terminal_id=terminal_id,
+                    terminal_name=terminal_name,
+                    session_key=session_key,
+                    error=error,
+                    **common_receipt_args,
+                )
+            except (ValueError, TypeError):
+                _logger.warning(
+                    "shell_command receipt construction failed for session=%s; "
+                    "persisting minimal receipt",
+                    session_id,
+                    exc_info=True,
+                )
+                fallback_error = error
+                if status == "error" and fallback_error is None:
+                    fallback_error = "shell command receipt details unavailable"
+                item = _build_shell_command_receipt_item(
+                    command,
+                    terminal_id=None,
+                    terminal_name=None,
+                    session_key=None,
+                    error=fallback_error,
+                    **common_receipt_args,
+                )
+
+            # Persist, then record in the box BEFORE publishing: a
+            # publish failure must not trigger a second append.
+            persisted = (await asyncio.to_thread(conversation_store.append, session_id, [item]))[0]
+            receipt_box.append(persisted)
+            await shell_command_attempts.complete(
+                session_id=session_id,
+                attempt_id=attempt_id,
+                receipt=persisted,
+            )
+            event = OutputItemDoneEvent(
+                type="response.output_item.done", item=persisted.to_api_dict()
+            )
+            publish_error = session_stream.publish_best_effort(
+                session_id,
+                event.model_dump(),
+            )
+            if publish_error is not None:
+                _logger.warning(
+                    "shell-command receipt SSE publish failed for session=%s attempt=%s: %s",
+                    session_id,
+                    attempt_id,
+                    publish_error,
+                )
+            return receipt_box[0]
+
+        def _partial(cause: str) -> str:
+            """Note the created-but-undelivered outcome on late spawn failures.
+
+            :param cause: The underlying failure text.
+            :returns: The receipt error text, prefixed when the shell
+                already exists (``session.resource.created`` went out).
+            """
+            if action == "spawn" and terminal_created:
+                return f"Terminal was created but the command was not delivered: {cause}"
+            return cause
+
+        async def _run_stage(stage: Callable[[], Awaitable[Any]], describe: str) -> Any:
+            """Run one orchestration stage, receipting EVERY failure class.
+
+            :param stage: The stage body to execute.
+            :param describe: Human phrase for receipt error text, e.g.
+                ``"launching the terminal"``.
+            :returns: The stage's return value.
+            :raises OmnigentError: Re-raised stage errors (status maps
+                through, e.g. gate 400 / dead shell 404/409).
+            :raises HTTPException: Re-raised transport 502s, and
+                decode/shape/persist failures normalized to 502.
+            """
+            try:
+                return await stage()
+            except (OmnigentError, HTTPException) as exc:
+                response_status = (
+                    exc.http_status if isinstance(exc, OmnigentError) else exc.status_code
+                )
+                response_code = exc.code if isinstance(exc, OmnigentError) else None
+                await _receipt_once(
+                    "error",
+                    _partial(_error_text_from_exc(exc, f"Runner unreachable while {describe}")),
+                    http_status=response_status,
+                    error_code=response_code,
+                )
+                raise
+            except (
+                ValueError,
+                TypeError,
+                AttributeError,
+                LookupError,
+                RuntimeError,
+                SQLAlchemyError,
+            ) as exc:
+                # Non-JSON body, non-object JSON, or a persistence
+                # failure (including DB-level store errors) —
+                # normalized into a receipted 502 so no attempt can
+                # exit without its receipt.
+                cause = _partial(f"Unexpected failure while {describe}: {exc}")
+                await _receipt_once("error", cause, http_status=502)
+                raise HTTPException(status_code=502, detail=cause) from exc
+
+        def _error_from_runner_body(payload: Any, fallback: str) -> tuple[str, str]:
+            """Extract (message, code) from a runner error body of any shape.
+
+            :param payload: Decoded runner response body — possibly not
+                an object at all.
+            :param fallback: Message used when the body carries none.
+            :returns: ``(message, error_code)`` for an OmnigentError.
+            """
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            if not isinstance(detail, dict):
+                return fallback, ErrorCode.INTERNAL_ERROR
+            message = detail.get("message")
+            code = detail.get("code")
+            return (
+                message if isinstance(message, str) else fallback,
+                code if isinstance(code, str) else ErrorCode.INTERNAL_ERROR,
+            )
+
+        if action == "spawn":
+            if terminal_name is None or session_key is None:
+                raise RuntimeError("validated spawn routing fields are missing")
+
+            async def _gate_stage() -> None:
+                """Require a declared terminal that can ACK before creation."""
+                terminal_spec = await _require_declared_terminal(
+                    conv,
+                    terminal_name,
+                    agent_store,
+                )
+                from omnigent.inner.terminal import terminal_spec_supports_shell_readiness
+
+                if not terminal_spec_supports_shell_readiness(terminal_spec):
+                    raise OmnigentError(
+                        (
+                            f"Terminal {terminal_name!r} does not provide a shell "
+                            "readiness contract and cannot be used for shell_command spawn."
+                        ),
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+
+            await _run_stage(_gate_stage, "validating the terminal type")
+
+            async def _create_stage() -> dict[str, Any]:
+                """Launch the terminal; returns the validated resource.
+
+                Success is strictly 2xx — a redirect must not count as
+                a launched terminal. The resource ``id`` is validated
+                here, BEFORE it is committed to orchestration state, so
+                a malformed value can never poison the receipt itself.
+                """
+                status_code, payload = await _create_terminal_idempotently(
+                    session_id,
+                    terminals_path,
+                    {
+                        "terminal": terminal_name,
+                        "session_key": session_key,
+                        "attempt_id": attempt_id,
+                    },
+                )
+                if not 200 <= status_code < 300:
+                    message, code = _error_from_runner_body(
+                        payload,
+                        f"Terminal launch failed (runner returned HTTP {status_code})",
+                    )
+                    raise OmnigentError(message, code=code)
+                if not isinstance(payload, dict):
+                    raise TypeError(f"expected a resource object, got {type(payload).__name__}")
+                resource_id = payload.get("id")
+                if not isinstance(resource_id, str) or not resource_id:
+                    raise TypeError(
+                        f"terminal resource id must be a non-empty string, got {resource_id!r}"
+                    )
+                return payload
+
+            created = await _run_stage(_create_stage, "launching the terminal")
+            terminal_created = True
+            terminal_id = created["id"]
+            terminal_resource = created
+
+            async def _record_stage() -> None:
+                """Announce + persist the new terminal for reconnects.
+
+                The shared helper suppresses append failures for its
+                best-effort callers; here the durable record is part of
+                the contract, so a suppressed failure is a stage
+                failure.
+                """
+                event_persisted = _publish_and_persist_resource_event(
+                    session_id,
+                    "session.resource.created",
+                    resource_id=created["id"],
+                    resource_type="terminal",
+                    conversation_store=conversation_store,
+                    resource=created,
+                )
+                if not event_persisted:
+                    raise RuntimeError("session.resource.created was not persisted")
+
+            await _run_stage(_record_stage, "recording the new terminal")
+        else:
+            if terminal_id is None:
+                raise RuntimeError("validated send terminal id is missing")
+
+            async def _resolve_stage() -> dict[str, Any]:
+                """Resolve the target terminal; returns the resource."""
+                payload = await _proxy_get_to_runner(session_id, f"{terminals_path}/{terminal_id}")
+                if not isinstance(payload, dict):
+                    raise TypeError(f"expected a resource object, got {type(payload).__name__}")
+                return payload
+
+            # Resolve the target so the receipt carries the shell's
+            # display name/key and a dead id fails before any input.
+            terminal_resource = await _run_stage(_resolve_stage, "resolving the terminal")
+            metadata = terminal_resource.get("metadata")
+            if isinstance(metadata, dict):
+                raw_name = metadata.get("terminal_name")
+                raw_key = metadata.get("session_key")
+                terminal_name = raw_name if isinstance(raw_name, str) else None
+                session_key = raw_key if isinstance(raw_key, str) else None
+
+        async def _input_stage() -> Literal["ok", "unknown"]:
+            """Deliver once and classify the runner's outcome discriminator."""
+            runner_client = await _get_runner_client_for_resource_access(session_id)
+            if runner_client is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail="no runner available for resource access",
+                )
+            try:
+                input_payload: dict[str, Any] = {
+                    "attempt_id": attempt_id,
+                    "text": command,
+                    "keys": "Enter",
+                    "wait_for_ready": action == "spawn",
+                }
+                resp = await runner_client.post(
+                    f"{terminals_path}/{terminal_id}/input",
+                    json=input_payload,
+                    timeout=_SHELL_COMMAND_RUNNER_POST_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                return "unknown"
+            except (httpx.HTTPError, ConnectionError):
+                return "unknown"
+            if 200 <= resp.status_code < 300:
+                try:
+                    success_payload: Any = resp.json()
+                except ValueError:
+                    return "unknown"
+                if not isinstance(success_payload, dict):
+                    return "unknown"
+                outcome = success_payload.get("outcome")
+                if outcome == "sent":
+                    return "ok"
+                return "unknown"
+
+            try:
+                payload: Any = resp.json()
+            except ValueError:
+                payload = None
+            message, code = _error_from_runner_body(
+                payload,
+                f"Terminal input failed (runner returned HTTP {resp.status_code})",
+            )
+            if resp.status_code >= 500:
+                if code != ErrorCode.IDEMPOTENCY_CAPACITY_EXHAUSTED:
+                    return "unknown"
+            elif resp.status_code == 404 and code == ErrorCode.INTERNAL_ERROR:
+                code = ErrorCode.NOT_FOUND
+            elif resp.status_code == 409 and code == ErrorCode.INTERNAL_ERROR:
+                code = ErrorCode.CONFLICT
+            elif resp.status_code == 400 and code == ErrorCode.INTERNAL_ERROR:
+                code = ErrorCode.INVALID_INPUT
+            if 400 <= resp.status_code < 600:
+                raise _ShellCommandRunnerError(
+                    message,
+                    code=code,
+                    http_status=resp.status_code,
+                )
+            raise OmnigentError(message, code=code)
+
+        delivery_status = await _run_stage(_input_stage, "sending terminal input")
+
+        item = await _receipt_once(delivery_status)
+        # Explicit 200 overriding the events route's 202 default: the
+        # command has already executed and its receipt is durable —
+        # nothing was "accepted for later processing". No ``queued``
+        # field for the same reason.
+        response_content: dict[str, Any] = {
+            "item_id": item.id,
+            "item": item.to_api_dict(),
+            "terminal": terminal_resource,
+        }
+        if action == "spawn" and terminal_resource is not None:
+            sequence = terminal_resource.get("sequence")
+            if isinstance(sequence, int):
+                response_content["sequence"] = sequence
+        return JSONResponse(status_code=200, content=response_content)
+
     @router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -127,7 +869,7 @@ def register_events_routes(
         request: Request,
         session_id: str,
         body: SessionEventInput,
-    ) -> dict[str, bool | str]:
+    ) -> dict[str, Any] | JSONResponse:
         """
         Submit a session event (input message, tool output,
         approval, or interrupt).
@@ -178,6 +920,13 @@ def register_events_routes(
         - ``"external_codex_collaboration_mode_change"`` persists the
           Codex app-server collaboration mode kind as an internal session label
           (``omnigent.codex_native.collaboration_mode``).
+        - ``"shell_command"`` executes a web-composer bang (``!``)
+          command against a session shell (owner-only): ``spawn``
+          launches a declared terminal then sends the command,
+          ``send`` routes it into an existing terminal. Persists one
+          ``terminal_command`` receipt item with the outcome and
+          starts NO agent turn. Responds 200 (already executed), not
+          the route's 202 default.
         - ``"stop_session"`` terminates the live session without
           deleting the conversation (owner-only). Forwarded
           harness-agnostically to the runner, which hard-kills the
@@ -239,6 +988,7 @@ def register_events_routes(
             _MCP_ELICITATION_TYPE,
             _COMPACT_TYPE,
             _SLASH_COMMAND_TYPE,
+            _SHELL_COMMAND_TYPE,
             _STOP_SESSION_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
@@ -633,6 +1383,18 @@ def register_events_routes(
                 [item],
             )
             return {"queued": True}
+        if body.type == _SHELL_COMMAND_TYPE:
+            # Keystroke injection by another name — owner-only, matching
+            # the interactive write-attach gate in terminal_attach.py.
+            await _require_access(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            return await _dispatch_shell_command_event(
+                session_id,
+                conv,
+                body,
+                created_by=_attribution_user(user_id),
+            )
         if body.type == _EXTERNAL_ASSISTANT_MESSAGE_TYPE:
             item_id = await _persist_external_assistant_message(
                 session_id,

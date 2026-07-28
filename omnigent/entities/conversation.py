@@ -471,27 +471,37 @@ class ResourceEventData(BaseModel):
         ``"terminal"``, ``"file"``, ``"environment"``.
     :param resource: Full resource object dict for ``created``
         events. ``None`` for ``deleted`` events.
+    :param sequence: Process-local resource revision stamped on the
+        corresponding live event. ``None`` for legacy records.
     """
 
     event_type: str
     resource_id: str
     resource_type: str
     resource: dict[str, Any] | None = None
+    sequence: int | None = None
 
 
 class TerminalCommandData(BaseModel):
     """
-    Data payload for a runner-side terminal command (``!cmd``) observed
-    in a harness transcript (today: Claude Code's embedded TUI).
+    Data payload for a runner-side terminal command (``!cmd``).
+
+    Two producers write this item type:
+
+    * the native-bridge observer mirroring ``!cmd`` entries the vendor
+      TUI executed itself (one ``kind="input"`` and one
+      ``kind="output"`` record per invocation);
+    * the server's ``shell_command`` event, which persists ONE
+      ``kind="input"`` receipt per web-composer bang command, filling
+      the optional routing/outcome fields below.
 
     Listed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop never
     injects this as phantom content into the LLM's message history.
 
-    Claude Code writes two sibling transcript records per ``!cmd``
-    invocation: one ``<bash-input>`` record and one combined
-    ``<bash-stdout>``/``<bash-stderr>`` record. Each maps to one
-    ``terminal_command`` item with ``kind="input"`` or
-    ``kind="output"`` respectively.
+    The optional fields default to ``None`` so legacy persisted items
+    (native-bridge observer records predating receipts) deserialize
+    without backfill — the same additive-optional idiom as
+    :attr:`SlashCommandData.kind`.
 
     :param kind: ``"input"`` for the command text, ``"output"`` for
         the combined stdout/stderr result.
@@ -501,12 +511,39 @@ class TerminalCommandData(BaseModel):
         ``None`` otherwise.
     :param stderr: Captured stderr text. Present when ``kind="output"``,
         ``None`` otherwise.
+    :param action: ``"spawn"`` when the command launched a new shell,
+        ``"send"`` when routed into an existing one. ``None`` for
+        legacy native-bridge observer items.
+    :param terminal_id: Target terminal resource id, e.g.
+        ``"terminal_zsh_u-ab12cd"``.
+    :param terminal_name: Shell type for display, e.g. ``"zsh"``.
+    :param session_key: Display session key, e.g. ``"u-ab12cd"``.
+    :param status: Delivery outcome — ``"ok"`` when delivery was
+        confirmed, ``"unknown"`` when it may have occurred, and
+        ``"error"`` for definite non-delivery.
+    :param error: Human-readable failure text when ``status="error"``.
+    :param attempt_id: Client-generated idempotency key. ``None`` only
+        for legacy native-bridge records.
+    :param sequence: Authoritative resource revision for a spawn receipt.
+        ``None`` for sends and legacy records.
     """
 
     kind: Literal["input", "output"]
     input: str | None = None
     stdout: str | None = None
     stderr: str | None = None
+    action: Literal["spawn", "send"] | None = None
+    terminal_id: str | None = None
+    terminal_name: str | None = None
+    session_key: str | None = None
+    status: Literal["ok", "error", "unknown"] | None = None
+    error: str | None = None
+    attempt_id: str | None = None
+    sequence: int | None = None
+    attempt_fingerprint: str | None = None
+    terminal: dict[str, Any] | None = None
+    http_status: int | None = None
+    error_code: str | None = None
 
 
 class RoutingDecisionData(BaseModel):

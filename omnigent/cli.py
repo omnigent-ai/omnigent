@@ -3098,6 +3098,32 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
             ) from exc
 
 
+_SINGLE_OWNER_ERROR = (
+    "Omnigent requires a single server process per conversation: resource-event ordering is "
+    "process-local (session affinity). Refusing to start with WEB_CONCURRENCY/workers > 1 or "
+    "OMNIGENT_MULTI_REPLICA set. Run one worker and one replica, or implement a durable "
+    "cross-worker resource revision first (tracked for v0.8.0)."
+)
+
+
+def _enforce_single_owner_or_exit() -> None:
+    """Reject worker/replica settings that invalidate process-local ordering."""
+    worker_count = max(
+        int(os.environ.get("WEB_CONCURRENCY", "1")),
+        int(os.environ.get("UVICORN_WORKERS", "1")),
+        int(os.environ.get("GUNICORN_WORKERS", "1")),
+    )
+    multi_replica = os.environ.get("OMNIGENT_MULTI_REPLICA", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if worker_count > 1 or multi_replica:
+        logging.getLogger(__name__).error(_SINGLE_OWNER_ERROR)
+        click.echo(_SINGLE_OWNER_ERROR, err=True)
+        raise SystemExit(2)
+
+
 @cli.group("server", invoke_without_command=True)
 @click.option(
     "--host",
@@ -3243,7 +3269,6 @@ def server(
         # A subcommand (stop/status) handles this invocation; the body
         # below is the server path for the bare ``server`` group.
         return
-
     if background:
         # `omnigent server --background` replaces the removed `server start`
         # subcommand: ensure (or reuse) the managed detached local server and
@@ -3264,6 +3289,9 @@ def server(
             click.echo(f"  log: {_display_path(startup.log_path)}")
         return
 
+    # The single-owner guard applies to the in-process boot; the background
+    # path spawns a detached server that re-enters here and runs it there.
+    _enforce_single_owner_or_exit()
     port_source = ctx.get_parameter_source("port")
     port_was_explicit = port_source is click.core.ParameterSource.COMMANDLINE
     if port_was_explicit:

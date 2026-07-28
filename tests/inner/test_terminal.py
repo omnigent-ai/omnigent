@@ -378,6 +378,9 @@ async def _capture_launch_argv(
     monkeypatch: pytest.MonkeyPatch,
     *,
     keep_alive_after_exit: bool,
+    command: str = "bash",
+    args: list[str] | None = None,
+    shell_ready_nonce: str | None = None,
 ) -> list[str]:
     """
     Launch a terminal with mocked tmux and return the single setup argv.
@@ -385,6 +388,9 @@ async def _capture_launch_argv(
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
+    :param command: Pane command to launch.
+    :param args: Arguments passed to the pane command.
+    :param shell_ready_nonce: Optional direct-shell readiness nonce.
     :returns: The flattened tmux launch argv.
     """
     captured: list[list[str]] = []
@@ -414,11 +420,272 @@ async def _capture_launch_argv(
         session_key="s1",
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
+        command=command,
+        args=list(args or []),
         keep_alive_after_exit=keep_alive_after_exit,
+        shell_ready_nonce=shell_ready_nonce,
     )
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "args"),
+    [
+        ("bash", ["-f"]),
+        ("bash", ["--noprofile", "--norc"]),
+        ("bash", ["-l"]),
+        ("zsh", ["-f"]),
+        ("zsh", ["-l"]),
+    ],
+)
+async def test_direct_shell_readiness_preserves_declared_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    args: list[str],
+) -> None:
+    """Readiness instrumentation leaves direct-shell argv semantics intact."""
+    argv = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        keep_alive_after_exit=False,
+        command=command,
+        args=args,
+        shell_ready_nonce="OMNIGENT_SHELL_READY_test",
+    )
+
+    assert " ".join([command, *args]) in argv
+
+
+@pytest.mark.parametrize(
+    ("spec", "supported"),
+    [
+        (TerminalEnvSpec(command="bash", args=["--noprofile", "--norc"]), True),
+        (TerminalEnvSpec(command="zsh", args=["-f"]), True),
+        (TerminalEnvSpec(command="bash", args=["-l"]), True),
+        (TerminalEnvSpec(command="bash", args=["-c", "echo no-loop"]), False),
+        (TerminalEnvSpec(command="zsh", args=["script.zsh"]), False),
+        (TerminalEnvSpec(command=sys.executable, args=["-c", "pass"]), False),
+        (
+            TerminalEnvSpec(
+                command=sys.executable,
+                args=["-c", "pass"],
+                ready_process="bash",
+            ),
+            True,
+        ),
+    ],
+)
+def test_terminal_spec_shell_readiness_support_is_explicit(
+    spec: TerminalEnvSpec,
+    supported: bool,
+) -> None:
+    """Only direct input-loop shells or declared final processes can be awaited."""
+    assert terminal_mod.terminal_spec_supports_shell_readiness(spec) is supported
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "guard"),
+    [
+        ("bash", "BASH_SOURCE"),
+        ("zsh", "ZSH_EVAL_CONTEXT"),
+    ],
+)
+async def test_direct_shell_readiness_requires_input_loop_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    guard: str,
+) -> None:
+    """The nonce appears only after the final shell executes a guarded probe."""
+    nonce = f"OMNIGENT_SHELL_READY_{'ab' * 16}"
+    monkeypatch.setattr(terminal_mod.secrets, "token_hex", lambda _size: "ab" * 16)
+    instance = TerminalInstance(
+        name=command,
+        session_key="ready",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        command=command,
+        shell_ready_nonce=nonce,
+        running=True,
+    )
+    tmux_calls: list[tuple[str, ...]] = []
+    events: list[str] = []
+    snapshots = iter(["startup still running", nonce, "fresh prompt"])
+
+    async def record_tmux(*args: str) -> None:
+        tmux_calls.append(args)
+        events.append(f"tmux:{args[0]}")
+
+    async def capture(*args: str) -> str:
+        del args
+        snapshot = next(snapshots)
+        events.append(f"capture:{snapshot}")
+        return snapshot
+
+    instance._tmux = record_tmux  # type: ignore[method-assign]
+    instance._tmux_output = capture  # type: ignore[method-assign]
+
+    assert await instance.wait_for_shell_ready(timeout_s=0.5, poll_interval_s=0)
+    assert len(tmux_calls) == 4
+    assert tmux_calls[0][:4] == ("send-keys", "-l", "-t", "main")
+    probe = tmux_calls[0][-1]
+    assert guard in probe
+    assert nonce not in probe
+    assert tmux_calls[1] == ("send-keys", "-t", "main", "Enter")
+    assert tmux_calls[2] == ("send-keys", "-t", "main", "C-l")
+    assert tmux_calls[3] == ("clear-history", "-t", "main")
+    assert events == [
+        "tmux:send-keys",
+        "tmux:send-keys",
+        "capture:startup still running",
+        f"capture:{nonce}",
+        "tmux:send-keys",
+        "capture:fresh prompt",
+        "tmux:clear-history",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_direct_shell_retry_uses_fresh_nonce_and_ignores_stale_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late ACK from a timed-out probe cannot satisfy its successor."""
+    token_hexes = iter(["11" * 16, "22" * 16])
+    monkeypatch.setattr(terminal_mod.secrets, "token_hex", lambda _size: next(token_hexes))
+    instance = TerminalInstance(
+        name="bash",
+        session_key="fresh-nonce",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        command="bash",
+        shell_ready_nonce="OMNIGENT_SHELL_READY_capability",
+        running=True,
+    )
+    probe_nonces: list[str] = []
+    scrollback_snapshots: list[str] = []
+    clear_history_calls = 0
+
+    async def record_tmux(*args: str) -> None:
+        nonlocal clear_history_calls
+        if args[:2] == ("send-keys", "-l"):
+            assert instance.shell_ready_nonce is not None
+            probe_nonces.append(instance.shell_ready_nonce)
+        elif args[0] == "clear-history":
+            clear_history_calls += 1
+
+    async def capture(*args: str) -> str:
+        if "-S" not in args:
+            return "clean prompt"
+        if len(probe_nonces) == 1:
+            await asyncio.sleep(1)
+            raise AssertionError("the timed-out capture should be cancelled")
+        snapshot = probe_nonces[len(scrollback_snapshots)]
+        scrollback_snapshots.append(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(instance, "_tmux", record_tmux)
+    monkeypatch.setattr(instance, "_tmux_output", capture)
+
+    assert not await instance.wait_for_shell_ready(timeout_s=0.01, poll_interval_s=0)
+    assert await instance.wait_for_shell_ready(timeout_s=0.5, poll_interval_s=0)
+
+    assert probe_nonces == [
+        f"OMNIGENT_SHELL_READY_{'11' * 16}",
+        f"OMNIGENT_SHELL_READY_{'22' * 16}",
+    ]
+    assert scrollback_snapshots == probe_nonces
+    assert clear_history_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_direct_shell_fast_path_sends_no_probe(tmp_path: Path) -> None:
+    """An established shell accepts readiness without injecting more bytes."""
+    instance = TerminalInstance(
+        name="bash",
+        session_key="already-ready",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        command="bash",
+        shell_ready_nonce="OMNIGENT_SHELL_READY_acknowledged",
+        _shell_ready_probe_sent=True,
+        _shell_ready_acknowledged=True,
+        running=True,
+    )
+
+    async def reject_tmux(*args: str) -> None:
+        raise AssertionError(f"already-ready shell received tmux input: {args!r}")
+
+    async def reject_capture(*args: str) -> str:
+        raise AssertionError(f"already-ready shell was polled: {args!r}")
+
+    instance._tmux = reject_tmux  # type: ignore[method-assign]
+    instance._tmux_output = reject_capture  # type: ignore[method-assign]
+
+    assert await instance.wait_for_shell_ready(timeout_s=0.5, poll_interval_s=0)
+
+
+@pytest.mark.asyncio
+async def test_process_ready_path_sends_no_direct_shell_probe(tmp_path: Path) -> None:
+    """Declared-process readiness polls metadata without injecting pane bytes."""
+    instance = TerminalInstance(
+        name="shell",
+        session_key="process-ready",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        command=sys.executable,
+        ready_process="bash",
+        running=True,
+    )
+    process_polls = 0
+
+    async def reject_tmux(*args: str) -> None:
+        raise AssertionError(f"process-ready terminal received tmux input: {args!r}")
+
+    async def capture_process(*args: str) -> str:
+        nonlocal process_polls
+        assert args == (
+            "display-message",
+            "-p",
+            "-t",
+            "main",
+            "#{pane_current_command}",
+        )
+        process_polls += 1
+        return "bash"
+
+    instance._tmux = reject_tmux  # type: ignore[method-assign]
+    instance._tmux_output = capture_process  # type: ignore[method-assign]
+
+    assert await instance.wait_for_shell_ready(timeout_s=0.5, poll_interval_s=0)
+    assert process_polls == terminal_mod._SHELL_READY_STABLE_SAMPLES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_keys", ["-X", "+", "Enter -N", "C-c +5"])
+async def test_send_rejects_flag_like_key_tokens(tmp_path: Path, bad_keys: str) -> None:
+    """A key token starting with '-'/'+' is rejected before any tmux dispatch."""
+    instance = TerminalInstance(
+        name="bash",
+        session_key="flag-guard",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        command="bash",
+        running=True,
+    )
+
+    async def reject_tmux(*args: str) -> None:
+        raise AssertionError(f"flag-like key reached tmux: {args!r}")
+
+    instance._tmux = reject_tmux  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="must not start with '-' or '\\+'"):
+        await instance.send("hello", keys=bad_keys)
 
 
 @pytest.mark.parametrize("keep_alive", [True, False])

@@ -64,6 +64,15 @@ _SLASH_COMMAND_TYPE: str = "slash_command"
 _STOP_SESSION_TYPE: str = "stop_session"
 
 
+# Web-composer bang (``!``) shell command — a control event, not an
+# item type: the server orchestrates the terminal create/input proxies,
+# persists a ``terminal_command`` receipt, and starts no agent turn.
+_SHELL_COMMAND_TYPE: str = "shell_command"
+_SHELL_ATTEMPT_ID_MAX_CHARS = 128
+_SHELL_SPAWN_DIGEST_CHARS = 32
+_SHELL_COMMAND_RUNNER_POST_TIMEOUT_SECONDS = 15.0
+
+
 _EXTERNAL_ASSISTANT_MESSAGE_TYPE: str = "external_assistant_message"
 
 
@@ -345,6 +354,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _APPROVAL_TYPE,
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
+    _SHELL_COMMAND_TYPE,
     _STOP_SESSION_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
@@ -768,6 +778,10 @@ __all__ = [
     "_SESSION_UPDATES_MAX_WATCHED",
     "_SESSION_UPDATES_RESCAN_INTERVAL_S",
     "_SHARED_DISCOVERY_KEY",
+    "_SHELL_ATTEMPT_ID_MAX_CHARS",
+    "_SHELL_COMMAND_RUNNER_POST_TIMEOUT_SECONDS",
+    "_SHELL_COMMAND_TYPE",
+    "_SHELL_SPAWN_DIGEST_CHARS",
     "_SLASH_COMMAND_TYPE",
     "_SNAPSHOT_RUNNER_TIMEOUT_S",
     "_STOP_RUNNER_RESULT_TIMEOUT_S",

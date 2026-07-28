@@ -31,18 +31,36 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import threading
 from dataclasses import dataclass
 from typing import Any
 
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.spec.types import AgentSpec
-from omnigent.terminals import TerminalRegistry
+from omnigent.terminals import AmbiguousResourceId, ResolveSnapshot, TerminalRegistry
 from omnigent.tools.base import Tool, ToolContext
 
 _logger = logging.getLogger(__name__)
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
+_SHELL_READINESS_TIMEOUT_SECONDS = 10.0
+
+
+def _fence_error(
+    error_code: str,
+    *,
+    delivery_not_attempted: bool = False,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "error": (
+            "Terminal ownership changed"
+            if error_code == "terminal_moved"
+            else "Terminal is not running"
+        ),
+        "code": error_code,
+    }
+    if delivery_not_attempted:
+        result["delivery_not_attempted"] = True
+    return result
 
 
 def _has_meaningful_cwd(cwd: str | None) -> bool:
@@ -92,7 +110,7 @@ class _ValidatedLaunchArgs:
 
 @dataclass(frozen=True)
 class _ResolvedInstance:
-    """A running :class:`TerminalInstance` plus its parsed tool args + lock.
+    """A captured running-terminal owner plus its parsed tool arguments.
 
     Returned by :func:`_resolve_running_instance` on the success
     path. Using a dataclass keeps call-sites self-documenting:
@@ -101,18 +119,13 @@ class _ResolvedInstance:
 
     :param instance: The live :class:`TerminalInstance`.
     :param parsed: The parsed JSON arguments dict for the tool.
-    :param lock: The per-instance ``threading.Lock`` from
-        :meth:`TerminalRegistry.get_instance_lock`. Callers MUST
-        acquire this around the ``asyncio.run(instance.X())`` call
-        to serialize concurrent tmux ops on the same instance —
-        without it, a ``send(text=X, keys="Enter")`` call can
-        interleave its 2 tmux subprocess invocations with another
-        thread's send. See ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §9.1.
+    :param snapshot: Atomic registry owner snapshot. Operations acquire its
+        instance-owned lock and revalidate it immediately before tmux I/O.
     """
 
     instance: TerminalInstance
     parsed: dict[str, Any]
-    lock: threading.Lock
+    snapshot: ResolveSnapshot
 
 
 def _format_launch_envelope(
@@ -454,12 +467,19 @@ def _resolve_running_instance(
     invalid = _validate_session_required_args(parsed)
     if invalid is not None:
         return json.dumps(invalid)
-    instance = registry.get(ctx.conversation_id, parsed["terminal"], parsed["session"])
-    lock = registry.get_instance_lock(ctx.conversation_id, parsed["terminal"], parsed["session"])
-    # Either the entry is missing from both (never launched / already
-    # closed) or both are present (launched and registered atomically).
-    # If only one is present, the registry's invariants are broken.
-    if instance is None or not instance.running or lock is None:
+    resolved = registry.resolve_key_snapshot(
+        ctx.conversation_id,
+        parsed["terminal"],
+        parsed["session"],
+    )
+    if isinstance(resolved, AmbiguousResourceId):
+        return json.dumps(
+            {
+                "error": f"terminal resource '{resolved.terminal_id}' is ambiguous",
+                "code": resolved.code,
+            }
+        )
+    if resolved is None:
         return json.dumps(
             {
                 "error": (
@@ -467,7 +487,78 @@ def _resolve_running_instance(
                 )
             }
         )
-    return _ResolvedInstance(instance=instance, parsed=parsed, lock=lock)
+    return _ResolvedInstance(
+        instance=resolved.instance,
+        parsed=parsed,
+        snapshot=resolved,
+    )
+
+
+def send_terminal_input(
+    registry: TerminalRegistry,
+    snapshot: ResolveSnapshot,
+    text: str | None,
+    *,
+    keys: str = "Enter",
+    wait_for_ready: bool = False,
+) -> dict[str, Any]:
+    """Revalidate one atomic owner snapshot and send under its stable lock.
+
+    Both the synchronous agent tool and async runner route use this
+    chokepoint so their tmux sends cannot drift or interleave.
+
+    :param registry: Registry that captured and revalidates the owner.
+    :param snapshot: Atomic terminal ownership snapshot.
+    :param text: Literal text passed to ``tmux send-keys -l``.
+    :param keys: Space-separated tmux key names pressed after the text.
+    :param wait_for_ready: Require the final shell readiness ACK first.
+    :returns: The terminal's send result.
+    """
+
+    async def _send() -> dict[str, Any]:
+        if wait_for_ready:
+            if (
+                snapshot.instance.shell_ready_nonce is None
+                and snapshot.instance.ready_process is None
+            ):
+                return {
+                    "error": "Terminal does not support a shell readiness contract",
+                    "code": "shell_readiness_unsupported",
+                    "delivery_not_attempted": True,
+                }
+            ready = await snapshot.instance.wait_for_shell_ready(
+                timeout_s=_SHELL_READINESS_TIMEOUT_SECONDS,
+            )
+            if not ready:
+                return {
+                    "error": "Terminal shell readiness was not acknowledged",
+                    "code": "terminal_not_ready",
+                    "delivery_not_attempted": True,
+                }
+        return await snapshot.instance.send(text, keys=keys)
+
+    return registry.run_fenced(
+        snapshot,
+        _send,
+        invalid=lambda error_code: _fence_error(
+            error_code,
+            delivery_not_attempted=True,
+        ),
+    )
+
+
+def read_terminal_output(
+    registry: TerminalRegistry,
+    snapshot: ResolveSnapshot,
+    *,
+    scrollback: int,
+) -> dict[str, Any]:
+    """Revalidate and capture one terminal pane under the instance lock."""
+    return registry.run_fenced(
+        snapshot,
+        lambda: snapshot.instance.read(scrollback=scrollback),
+        invalid=_fence_error,
+    )
 
 
 def _parse_arguments(arguments: str) -> dict[str, Any] | dict[str, str]:
@@ -852,20 +943,19 @@ class SysTerminalSendTool(Tool):
         keys = resolved.parsed.get("keys", "Enter")
         if not isinstance(keys, str):
             return json.dumps({"error": "'keys' must be a string if provided"})
-        # Hold the per-instance lock across the full ``send`` op.
-        # ``send(text=X, keys="Enter")`` issues ~2 tmux subprocess
-        # calls with a 50ms ``asyncio.sleep`` between them; without
-        # the lock, two concurrent sends interleave their commands
-        # and corrupt the shell input.
-        with resolved.lock:
-            try:
-                result = asyncio.run(resolved.instance.send(text, keys=keys))
-            except (RuntimeError, OSError) as exc:
-                # tmux send-keys subprocess failures and stale-socket
-                # errors land here. Wrap so the LLM sees a structured
-                # error and can decide whether to relaunch the terminal.
-                _logger.exception("sys_terminal_send failed")
-                return json.dumps({"error": f"send failed: {exc}"})
+        try:
+            result = send_terminal_input(
+                self._registry,
+                resolved.snapshot,
+                text,
+                keys=keys,
+            )
+        except (RuntimeError, OSError) as exc:
+            # tmux send-keys subprocess failures and stale-socket
+            # errors land here. Wrap so the LLM sees a structured
+            # error and can decide whether to relaunch the terminal.
+            _logger.exception("sys_terminal_send failed")
+            return json.dumps({"error": f"send failed: {exc}"})
         return json.dumps(result)
 
 
@@ -925,18 +1015,15 @@ class SysTerminalReadTool(Tool):
         if not isinstance(scrollback_raw, int) or scrollback_raw < 0:
             return json.dumps({"error": "'scrollback' must be a non-negative integer"})
 
-        # Hold the per-instance lock so a concurrent ``send`` can't
-        # mutate the pane mid-capture. ``capture-pane`` is one tmux
-        # call and probably atomic from tmux's view, but a send can
-        # land between two interleaved reads or between a read and
-        # whatever the LLM does next. Cheap insurance.
-        with resolved.lock:
-            try:
-                result = asyncio.run(resolved.instance.read(scrollback=scrollback_raw))
-            except (RuntimeError, OSError) as exc:
-                # tmux capture-pane subprocess failures land here.
-                _logger.exception("sys_terminal_read failed")
-                return json.dumps({"error": f"read failed: {exc}"})
+        try:
+            result = read_terminal_output(
+                self._registry,
+                resolved.snapshot,
+                scrollback=scrollback_raw,
+            )
+        except (RuntimeError, OSError) as exc:
+            _logger.exception("sys_terminal_read failed")
+            return json.dumps({"error": f"read failed: {exc}"})
         return json.dumps(result)
 
 
@@ -1059,19 +1146,24 @@ class SysTerminalCloseTool(Tool):
         terminal_name = parsed["terminal"]
         session_key = parsed["session"]
 
-        # Acquire the per-instance lock BEFORE asking the registry
-        # to close. This serializes against any in-flight send/read
-        # holding the same lock, so the actual ``instance.close()``
-        # never races with a tmux op already in progress. ``None``
-        # means the instance was already closed (or never launched);
-        # registry.close() returns False in that case anyway.
-        lock = self._registry.get_instance_lock(ctx.conversation_id, terminal_name, session_key)
+        resolved = self._registry.resolve_key_snapshot(
+            ctx.conversation_id,
+            terminal_name,
+            session_key,
+        )
+        if isinstance(resolved, AmbiguousResourceId):
+            return json.dumps(
+                {
+                    "error": f"terminal resource '{resolved.terminal_id}' is ambiguous",
+                    "code": resolved.code,
+                }
+            )
 
         def _do_close() -> bool:
             try:
-                return asyncio.run(
-                    self._registry.close(ctx.conversation_id, terminal_name, session_key)
-                )
+                if resolved is None:
+                    return False
+                return asyncio.run(self._registry.close_snapshot(resolved))
             except (RuntimeError, OSError) as exc:
                 # tmux teardown can raise when the server is already
                 # gone — surface but don't propagate.
@@ -1079,11 +1171,7 @@ class SysTerminalCloseTool(Tool):
                 raise _CloseFailed(str(exc)) from exc
 
         try:
-            if lock is not None:
-                with lock:
-                    closed = _do_close()
-            else:
-                closed = _do_close()
+            closed = _do_close()
         except _CloseFailed as exc:
             return json.dumps({"error": f"close failed: {exc}"})
 

@@ -2489,13 +2489,11 @@ class _SSEEventBase(BaseModel):
 
     - ``type``: the event-type discriminator literal (defined per
       subclass so :data:`ServerStreamEvent` can dispatch).
-    - ``sequence_number``: monotonic per-stream sequence number
-      assigned by the SSE serializer at emit time
-      (``_format_sse`` in ``omnigent/server/routes/sessions.py``).
-      Producers leave it ``None``; the route serializer populates
-      it on the wire. ``None`` on session-scoped events emitted
-      directly by the runtime (the session stream does not number
-      events).
+    - ``sequence_number``: optional producer-local legacy ordering
+      field. ``None`` when that producer does not supply one.
+    - ``sequence``: process-local mutation order stamped by
+      :func:`omnigent.runtime.session_stream.publish`. ``None`` for
+      direct/legacy events that bypass that publisher.
 
     Subclasses MUST declare ``type`` as ``Literal[...]`` so the
     discriminated-union machinery can route incoming dicts. The
@@ -2507,9 +2505,11 @@ class _SSEEventBase(BaseModel):
         producer side (before serialization) and on session-scoped
         events that the runtime publishes directly without
         sequencing.
+    :param sequence: Process-local event sequence, when stamped.
     """
 
     sequence_number: int | None = None
+    sequence: int | None = None
 
     model_config = ConfigDict(extra="ignore")
 

@@ -25,6 +25,7 @@ from omnigent.terminals.control_bridge import (
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
+from omnigent.terminals.ws_bridge import WS_CLOSE_TERMINAL_NOT_FOUND
 
 _HAS_TMUX = shutil.which("tmux") is not None
 
@@ -63,6 +64,7 @@ class _FakeWebSocket:
         self.sent: list[bytes] = []
         self.close_code: int | None = None
         self.close_reason: str | None = None
+        self.close_codes: list[int] = []
         self._recv_gate = asyncio.Event()
         # Per-send delay simulates a real network so a burst backlogs behind the
         # send — the condition under which the forwarder coalesces.
@@ -84,6 +86,7 @@ class _FakeWebSocket:
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.close_code = code
         self.close_reason = reason
+        self.close_codes.append(code)
 
 
 async def _new_private_tmux(inner: str) -> tuple[Path, str]:
@@ -346,6 +349,52 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
 
     # Kill the server → the control client's stdout closes → bridge exits.
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_owner_fence_rejects_stale_input() -> None:
+    """The control transport closes before injecting a revoked frame."""
+    sock, target = await _new_private_tmux("cat")
+    marker = b"STALE-OWNER-INPUT"
+    ws = _FakeWebSocket(inbound=[{"type": "websocket.receive", "bytes": marker + b"\r"}])
+    guarded: list[bytes] = []
+
+    async def _owner_guard(data: bytes) -> bool:
+        guarded.append(data)
+        return False
+
+    try:
+        await asyncio.wait_for(
+            bridge_tmux_control_to_websocket(
+                ws,
+                socket_path=str(sock),
+                tmux_target=target,
+                read_only=False,
+                on_client_input=_owner_guard,
+            ),
+            timeout=5.0,
+        )
+        tmux = shutil.which("tmux")
+        assert tmux is not None
+        capture = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "capture-pane",
+            "-p",
+            "-t",
+            target,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await capture.communicate()
+
+        assert guarded == [marker + b"\r"]
+        assert marker not in stdout
+        assert WS_CLOSE_TERMINAL_NOT_FOUND in ws.close_codes
+    finally:
+        await _kill_tmux(sock)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
