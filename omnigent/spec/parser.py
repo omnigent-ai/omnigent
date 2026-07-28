@@ -3454,8 +3454,9 @@ def _parse_context_providers(raw: Any) -> list[FunctionRef] | None:
     policy's ``function:`` — accepted as a bare dotted-path string, a
     ``{path, arguments}`` mapping, or a ``{type: function, function:
     {path, arguments}}`` mapping (so the block reads like ``policies``).
-    Providers are resolved once at load and invoked on every turn; each
-    returns text appended to the system instructions.
+    Parsing records the reference only: the runtime resolves the path and
+    calls any factory on every turn, and each provider returns text
+    appended to the system instructions.
 
     :param raw: The raw ``context_providers:`` value from YAML.
     :returns: A list of :class:`FunctionRef`, or ``None`` when the block

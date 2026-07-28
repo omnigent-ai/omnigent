@@ -1506,10 +1506,12 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``SharePolicy.NONE``.**
     :param context_providers: Per-turn context providers — dotted-path
         callables (same ``FunctionRef`` shape as function policies)
-        resolved once at load and invoked on every turn. Each returns
-        text that is **appended** to the system instructions (additive;
-        it never replaces the agent prompt). ``None`` means no
-        ``context_providers:`` block was declared. See
+        resolved and invoked on every turn, so a factory here is rebuilt
+        per turn. Each returns text that is **appended** to the system
+        instructions (additive; it never replaces the agent prompt).
+        ``None`` means no ``context_providers:`` block was declared.
+        Uploaded bundles may only name providers in the handler registry
+        (see ``omnigent.server.bundles``). See
         ``runtime/prompt.py::build_instructions``.
     """
 
