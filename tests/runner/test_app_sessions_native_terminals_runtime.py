@@ -2703,6 +2703,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
             event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
@@ -2765,6 +2766,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             codex_ws_url="ws://127.0.0.1:1",
             codex_home=tmp_path / "codex-home",
             event_client=_Client(),  # type: ignore[arg-type]
+            routing_summary="provider 'test' (model=gpt-test)",
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)

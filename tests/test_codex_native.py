@@ -9891,3 +9891,90 @@ def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> Non
     )
     types = [r["type"] for r in records]
     assert "compacted" not in types
+
+
+# --- #2745: routing summary surfaced in the startup-timeout error ---
+
+
+def test_native_codex_launch_summary_defaults_empty() -> None:
+    """The new summary field defaults to empty so existing call sites stay valid."""
+    launch = codex_native_app_server.NativeCodexLaunch(
+        config_overrides=[], model=None, profile=None
+    )
+    assert launch.summary == ""
+
+
+def test_resolve_native_codex_launch_no_provider_sets_login_fallback_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No configured provider -> summary names the login fallback (#2745)."""
+    from omnigent.onboarding import detected, provider_config
+    from omnigent.runtime import workflow
+
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda cfg: False)
+    monkeypatch.setattr(detected, "effective_config_with_detected", lambda cfg: {})
+    monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda cfg, harness: None)
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda: None)
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model=None)
+
+    assert launch.profile is None
+    assert "no provider configured" in launch.summary
+    assert "sign-in" in launch.summary
+
+
+def test_resolve_native_codex_launch_databricks_provider_sets_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Databricks provider default -> summary names the ucode profile (#2745)."""
+    from omnigent.onboarding import detected, provider_config
+
+    entry = SimpleNamespace(kind=provider_config.DATABRICKS_KIND, profile="my-profile")
+    monkeypatch.setattr(provider_config, "load_config", dict)
+    monkeypatch.setattr(detected, "codex_config_provider_dismissed", lambda cfg: False)
+    monkeypatch.setattr(
+        provider_config, "default_provider_for_harness", lambda cfg, harness: entry
+    )
+
+    launch = codex_native_app_server.resolve_native_codex_launch(model="gpt-5.5")
+
+    assert launch.profile == "my-profile"
+    assert launch.summary == "Databricks ucode profile 'my-profile'"
+
+
+def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A startup timeout records the launch routing summary in the bridge error (#2745)."""
+    from omnigent import codex_native_forwarder as _fwd
+    from omnigent.codex_native_bridge import read_bridge_startup_error
+    from omnigent.runner.native import orchestration as native_orch
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    async def _timeout(_client: object) -> str:
+        raise TimeoutError("no thread event")
+
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _timeout)
+
+    class _FakeClient:
+        async def close(self) -> None:
+            return None
+
+    asyncio.run(
+        native_orch._codex_discover_thread_and_forward(
+            session_id="conv_test",
+            bridge_dir=bridge_dir,
+            codex_ws_url="ws://127.0.0.1:9999",
+            codex_home=tmp_path / "codex-home",
+            event_client=_FakeClient(),
+            routing_summary="Codex CLI login (no provider configured) -- SENTINEL",
+        )
+    )
+
+    err = read_bridge_startup_error(bridge_dir)
+    assert err is not None
+    assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in err
+    assert "startup timed out" in err

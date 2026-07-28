@@ -1,6 +1,7 @@
 packages:
   - 'web'
   - 'web/electron'
+  - '.github/ci-deps'
 
 settings:
   # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
@@ -72,6 +73,9 @@ overrides:
   express-rate-limit>ip-address: ^10.1.1
 
 allowBuilds:
+  '@anthropic-ai/claude-code': true
+  '@google/genai': true
   canvas: true
   electron-winstaller: true
   msw: true
+  protobufjs: true
