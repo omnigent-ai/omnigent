@@ -39,7 +39,7 @@ repos:
       - id: web-prettier
         name: web prettier
         language: system
-        entry: npm --prefix web exec -- prettier --write
+        entry: bash -c 'test -x web/node_modules/.bin/prettier && web/node_modules/.bin/prettier --write "$@"' --
         files: ^web/.*\.(css|html|js|jsx|json|md|mdx|ts|tsx|yaml|yml)$
         # Exclude generated assets: web-ui build output, Xcode asset catalogs,
         # and Apple Icon Composer `.icon` bundles (machine-formatted; prettier

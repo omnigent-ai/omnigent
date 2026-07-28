@@ -2086,6 +2086,15 @@ wheels = [
 ]
 
 [[package]]
+name = "json5"
+version = "0.15.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/7d/05c46a96a78147ae3bf99c2f4169ce144a70220b8d6fcd56f6ec368b8ce9/json5-0.15.0.tar.gz", hash = "sha256:7424d1f1eb1d56da6e3d70643f53619862b4ce81440bdb8ecfd6f875e5ba4a71", upload-time = "2026-06-19T20:08:27.716Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/eb/be/59527c99478aade6bb33a68d72e6e18dd4e6ff6eacfc7d01bdb15bc76912/json5-0.15.0-py3-none-any.whl", hash = "sha256:56636a30c0e8a4665fe2179c0212f32eae3796dea89ea6f649b9436ecdb39618", upload-time = "2026-06-19T20:08:26.748Z" },
+]
+
+[[package]]
 name = "jsonschema"
 version = "4.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2909,7 +2918,7 @@ wheels = [
 
 [[package]]
 name = "omnigent"
-version = "0.7.0.dev0"
+version = "0.8.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
@@ -2922,6 +2931,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "ftfy" },
     { name = "httpx" },
+    { name = "json5" },
     { name = "keyring" },
     { name = "mcp" },
     { name = "omnigent-client" },
@@ -3086,6 +3096,7 @@ requires-dist = [
     { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.4.0" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "islo", marker = "extra == 'islo'", specifier = ">=0.3.5,<0.4" },
+    { name = "json5", specifier = ">=0.10,<1" },
     { name = "keyring", specifier = ">=24,<26" },
     { name = "kubernetes", marker = "extra == 'kubernetes'", specifier = ">=36,<37" },
     { name = "mcp", specifier = ">=1.0,<2" },
@@ -3149,7 +3160,7 @@ provides-extras = ["claude-sdk", "openai-agents", "all", "bedrock", "s3", "verte
 
 [[package]]
 name = "omnigent-client"
-version = "0.7.0.dev0"
+version = "0.8.0.dev0"
 source = { editable = "sdks/python-client" }
 dependencies = [
     { name = "httpx" },
@@ -3166,7 +3177,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-slack"
-version = "0.7.0.dev0"
+version = "0.8.0.dev0"
 source = { editable = "integrations/slack" }
 dependencies = [
     { name = "aiohttp" },
@@ -3191,7 +3202,7 @@ requires-dist = [
 
 [[package]]
 name = "omnigent-ui-sdk"
-version = "0.7.0.dev0"
+version = "0.8.0.dev0"
 source = { editable = "sdks/ui" }
 dependencies = [
     { name = "omnigent-client" },
@@ -3202,7 +3213,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "omnigent-client", specifier = "==0.7.0.dev0" },
+    { name = "omnigent-client", specifier = "==0.8.0.dev0" },
     { name = "prompt-toolkit", specifier = ">=3" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "rich", specifier = ">=13" },

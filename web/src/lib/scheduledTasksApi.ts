@@ -16,12 +16,7 @@ export type ScheduledTaskState = "active" | "paused";
 
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
-  | "scheduled"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "skipped"
-  | "incomplete";
+  "scheduled" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
 
 /**
  * A scheduled task, camelCased from the server's `_to_response` shape. The

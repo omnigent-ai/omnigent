@@ -499,9 +499,9 @@ describe("harnessUnconfiguredOnHost", () => {
     expect(harnessUnavailableReasonOnHost("codex-native", testHost)).toBe("binary-missing");
   });
 
-  it("ignores unknown future reason strings", () => {
+  it("falls back to a generic warning for unknown reason strings", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future-reason" }))).toBe(
-      null,
+      "unconfigured",
     );
   });
 

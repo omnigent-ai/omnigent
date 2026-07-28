@@ -2920,6 +2920,125 @@ def test_materialize_harness_launcher_file_acp_slug() -> None:
     assert re.fullmatch(r"[a-zA-Z0-9_-]+", raw["name"])  # passes the agent-name validator
 
 
+def test_run_from_openclaw_dispatches_ephemeral_acp_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-shot OpenClaw launch reaches ACP spawn env without writing config."""
+    from omnigent.onboarding.openclaw_config import (
+        OpenClawAgentEntry,
+        OpenClawDiscovery,
+    )
+    from omnigent.runtime.workflow import _build_acp_spawn_env
+    from omnigent.spec import load
+
+    source_path = tmp_path / "config.json"
+    discovery = OpenClawDiscovery(
+        agents=(
+            OpenClawAgentEntry(
+                name="Gemini CLI",
+                command="gemini",
+                args=("--experimental-acp",),
+                source="acpx",
+                path=source_path,
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.openclaw_config.discover_openclaw_agents",
+        lambda: discovery,
+    )
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    config_home = tmp_path / "omnigent-config"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        ["run", "--from-openclaw", "Gemini CLI", "-p", "hello"],
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
+    generated = Path(run_chat.call_args.kwargs["target"])
+    raw = yaml.safe_load(generated.read_text())
+    assert raw["executor"] == {
+        "harness": "acp:gemini-cli",
+        "acp_agent": {
+            "name": "Gemini CLI",
+            "command": "gemini --experimental-acp",
+        },
+    }
+    env = _build_acp_spawn_env(load(generated))
+    assert env["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
+    assert env["HARNESS_ACP_NAME"] == "Gemini CLI"
+    assert not (config_home / "config.yaml").exists()
+
+
+def test_run_from_openclaw_agent_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.onboarding.openclaw_config import OpenClawDiscovery
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.openclaw_config.discover_openclaw_agents",
+        lambda: OpenClawDiscovery(agents=()),
+    )
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, ["run", "--from-openclaw", "missing"])
+
+    assert result.exit_code != 0
+    assert "OpenClaw/acpx agent 'missing' was not found" in result.output
+    assert "No agents were discovered" in result.output
+    run_chat.assert_not_called()
+
+
+def test_run_from_openclaw_forwards_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.onboarding.openclaw_config import (
+        OpenClawAgentEntry,
+        OpenClawDiscovery,
+    )
+
+    discovery = OpenClawDiscovery(
+        agents=(
+            OpenClawAgentEntry(
+                name="Gemini CLI",
+                command="gemini",
+                args=("--experimental-acp",),
+                source="acpx",
+                path=tmp_path / "config.json",
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.openclaw_config.discover_openclaw_agents",
+        lambda: discovery,
+    )
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "run",
+            "--from-openclaw",
+            "Gemini CLI",
+            "--server",
+            "https://example.com",
+            "-p",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["server_url"] == "https://example.com"
+
+
 def test_materialize_harness_launcher_file_kimi_gets_os_env() -> None:
     """``run --harness kimi`` bakes a caller-process ``os_env`` so the SDK kimi
     operates in the user's current directory, matching claude-sdk.

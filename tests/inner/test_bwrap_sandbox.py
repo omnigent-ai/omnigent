@@ -412,6 +412,28 @@ def test_wrap_launcher_argv_includes_required_mounts_and_chdir(
     assert argv[chdir_idx + 1] == str(tmp_path.resolve(strict=False))
 
 
+def test_wrap_launcher_argv_binds_etc_alternatives(tmp_path: Path) -> None:
+    """
+    ``/etc/alternatives`` is bound read-only by default.
+
+    Tools invoked by generic name (awk, python3, editor, ...) resolve
+    through ``/usr/bin/<name> -> /etc/alternatives/<name> -> real
+    binary``. Without the ``/etc/alternatives`` dir bind the middle
+    symlink node is missing inside the jail and the lookup fails with
+    "command not found", even though the real binary under ``/usr`` is
+    mounted.
+    """
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+    assert "/etc/alternatives" in argv
+    # Emitted as ``--ro-bind-try <src> <dest>`` with src == dest, like the
+    # other default /etc dir binds; never read-write.
+    idx = argv.index("/etc/alternatives")
+    assert argv[idx - 1] == "--ro-bind-try"
+    assert argv[idx + 1] == "/etc/alternatives"
+
+
 @pytest.mark.parametrize(
     "allow_network,should_unshare",
     [(True, False), (False, True)],

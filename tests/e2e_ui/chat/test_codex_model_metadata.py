@@ -125,7 +125,10 @@ def test_codex_native_picker_uses_raw_model_metadata(
     expect(model_row).to_contain_text("Codex Pretty 5.5")
     # Close the model listbox, then open the Effort dropdown.
     page.keyboard.press("Escape")
-    page.get_by_test_id("composer-config-effort").click()
+    expect(model_row).to_be_hidden()
+    effort_trigger = page.get_by_test_id("composer-config-effort")
+    expect(effort_trigger).to_be_visible()
+    effort_trigger.click()
     effort_row = page.locator('[role="option"][data-effort-level="xhigh"]')
     expect(effort_row).to_be_visible()
     expect(effort_row).to_contain_text("xhigh")

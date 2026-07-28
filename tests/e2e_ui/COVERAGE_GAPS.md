@@ -24,7 +24,7 @@ Status legend: ✅ now covered · ⬜ still open.
 
 ## Medium-priority gaps
 
-Status legend: ✅ e2e covered · 🧪 covered by web vitest (`npm test`) — e2e adds little · ⬜ still open.
+Status legend: ✅ e2e covered · 🧪 covered by web vitest (`pnpm test`) — e2e adds little · ⬜ still open.
 
 | Status | Feature | Where it lives | Coverage |
 |---|---|---|---|

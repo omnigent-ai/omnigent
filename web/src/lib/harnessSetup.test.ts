@@ -103,14 +103,22 @@ describe("harnessUnavailableReasonOnHost", () => {
       "needs-auth",
     );
     expect(
-      harnessUnavailableReasonOnHost("cursor-native", hostWith({ "cursor-native": false })),
-    ).toBe("cursor-cli-missing");
+      harnessUnavailableReasonOnHost(
+        "cursor-native",
+        hostWith({ "cursor-native": "binary-missing" }),
+      ),
+    ).toBe("binary-missing");
     expect(harnessUnavailableReasonOnHost("pi", hostWith({ pi: false }))).toBe("unconfigured");
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "version-too-low" }))).toBe(
+      "version-too-low",
+    );
   });
 
   it("returns null when ready, unknown, or no host", () => {
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: true }))).toBe(null);
-    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future" }))).toBe(null);
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "future" }))).toBe(
+      "unconfigured",
+    );
     expect(harnessUnavailableReasonOnHost("codex", hostWith(null))).toBe(null);
     expect(harnessUnavailableReasonOnHost(null, hostWith({ codex: false }))).toBe(null);
   });
@@ -223,6 +231,14 @@ describe("resolveSetupSteps", () => {
   it("marks install done + auth todo when installed but not signed in", () => {
     const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: "needs-auth" }));
     expect(steps.map((s) => s.status)).toEqual(["done", "todo"]);
+  });
+
+  it("marks install todo + auth todo when the binary is present but too old", () => {
+    const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: "version-too-low" }));
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "todo"],
+      ["auth", "todo"],
+    ]);
   });
 
   it("marks both done when the harness is ready", () => {

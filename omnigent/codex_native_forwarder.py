@@ -3088,13 +3088,12 @@ async def _handle_turn_plan_updated(
     params: dict[str, Any],
 ) -> None:
     """
-    Mirror a Codex plan update in both the transcript and the todo panel.
+    Mirror a Codex plan update in the todo panel.
 
     Codex emits plan changes as app-server notifications rather than
     ordinary assistant text. The forwarder posts the structured plan as an
     ``external_session_todos`` event so the web ``TodoPanel`` renders it like
-    Claude's todo list, and also mirrors it as a compact assistant message so
-    the plan stays visible inline in the transcript.
+    Claude's todo list without duplicating it in the chat transcript.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -3108,20 +3107,6 @@ async def _handle_turn_plan_updated(
             session_id=session_id,
             todos=todos,
         )
-    text = _plan_text_from_update(params)
-    if not text:
-        return
-    await _post_external_item(
-        client,
-        session_id,
-        item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
-        response_id=_response_id(params),
-    )
 
 
 def _handle_turn_diff_updated(
@@ -5288,11 +5273,10 @@ async def _post_review_mode_marker(
     Codex ``/review`` brackets a turn with ``enteredReviewMode`` /
     ``exitedReviewMode`` thread items. The web UI has no dedicated review
     affordance, and a review transition is session *state*, not user input —
-    so it is surfaced as a short assistant-message marker (the same visible
-    rail used for plan updates in :func:`_handle_turn_plan_updated`). A
-    user-role ``[System: …]`` note was rejected here because a non-meta
-    user item drains the pending-input FIFO server-side, which would
-    swallow the web user's next real message.
+    so it is surfaced as a short assistant-message marker. A user-role
+    ``[System: …]`` note was rejected here because a non-meta user item drains
+    the pending-input FIFO server-side, which would swallow the web user's next
+    real message.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -6885,37 +6869,6 @@ def _json_string(value: dict[str, Any]) -> str | None:
         return None
 
 
-def _plan_text_from_update(params: dict[str, Any]) -> str | None:
-    """
-    Render a Codex ``turn/plan/updated`` payload as Markdown text.
-
-    :param params: Codex plan update params.
-    :returns: Markdown plan text, or ``None`` when no valid plan steps
-        are present.
-    """
-    plan = params.get("plan")
-    if not isinstance(plan, list) or not plan:
-        return None
-    lines: list[str] = []
-    explanation = params.get("explanation")
-    if isinstance(explanation, str) and explanation:
-        lines.append(explanation)
-        lines.append("")
-    lines.append("Plan:")
-    for entry in plan:
-        if not isinstance(entry, dict):
-            continue
-        step = entry.get("step")
-        if not isinstance(step, str) or not step:
-            continue
-        status = entry.get("status")
-        marker = _plan_status_marker(status)
-        lines.append(f"{marker} {step}")
-    if len(lines) == 1 or (len(lines) == 3 and lines[-1] == "Plan:"):
-        return None
-    return "\n".join(lines)
-
-
 def _plan_todos_from_update(params: dict[str, Any]) -> list[dict[str, Any]] | None:
     """
     Map a Codex ``turn/plan/updated`` payload to the todo-list schema.
@@ -6960,20 +6913,6 @@ def _plan_todo_status(status: Any) -> str:
     if status in {"inProgress", "in_progress"}:
         return "in_progress"
     return "pending"
-
-
-def _plan_status_marker(status: Any) -> str:
-    """
-    Return a readable Markdown marker for a Codex plan step status.
-
-    :param status: Codex step status value.
-    :returns: Markdown list marker.
-    """
-    return {
-        "completed": "- [x]",
-        "in_progress": "- [~]",
-        "pending": "- [ ]",
-    }[_plan_todo_status(status)]
 
 
 def _response_id(params: dict[str, Any]) -> str:

@@ -1271,11 +1271,16 @@ class NativeCodexLaunch:
     :param profile: Databricks profile for the ucode path, or ``None`` (a
         generic provider routes via *config_overrides*; CLI login uses
         neither).
+    :param summary: Human-readable one-line description of the routing
+        outcome (provider / profile / model, or the login-fallback state),
+        set at resolution time and surfaced in the startup-timeout error so
+        hosted users can diagnose without runner-log access (see #2745).
     """
 
     config_overrides: list[str]
     model: str | None
     profile: str | None
+    summary: str = ""
 
 
 def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
@@ -1354,7 +1359,12 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     )
 
     if entry.kind == DATABRICKS_KIND:
-        return NativeCodexLaunch(config_overrides=[], model=model, profile=entry.profile)
+        return NativeCodexLaunch(
+            config_overrides=[],
+            model=model,
+            profile=entry.profile,
+            summary=f"Databricks ucode profile {entry.profile!r}",
+        )
     if entry.kind == CLI_CONFIG_KIND:
         # Pin the config.toml-defined provider by name; its table (and
         # credential) ride along via the bridged config.toml. json.dumps
@@ -1363,6 +1373,9 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
             config_overrides=[f"model_provider={json.dumps(entry.model_provider)}"],
             model=model,
             profile=None,
+            summary=(
+                f"provider {entry.name!r} via cli-config (model_provider={entry.model_provider!r})"
+            ),
         )
     if entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         return None
@@ -1389,7 +1402,12 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         auth_command=auth_command,
         wire_api=family.wire_api or "responses",
     )
-    return NativeCodexLaunch(config_overrides=overrides, model=pinned, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=overrides,
+        model=pinned,
+        profile=None,
+        summary=f"provider {entry.name!r} (model={pinned})",
+    )
 
 
 def _first_routable_codex_provider(
@@ -1485,7 +1503,10 @@ def _resolve_subscription_launch(
             entry.name,
         )
         return NativeCodexLaunch(
-            config_overrides=subscription_overrides, model=model, profile=None
+            config_overrides=subscription_overrides,
+            model=model,
+            profile=None,
+            summary=f"Codex CLI login (subscription provider {entry.name!r}; Codex is logged in)",
         )
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
@@ -1495,7 +1516,16 @@ def _resolve_subscription_launch(
         "Codex login and no alternative provider is configured)",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=subscription_overrides, model=model, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=subscription_overrides,
+        model=model,
+        profile=None,
+        summary=(
+            f"Codex CLI login (subscription provider {entry.name!r} has no usable Codex "
+            "login and no alternative provider is configured) — the TUI likely renders "
+            "the sign-in screen and never starts a thread"
+        ),
+    )
 
 
 def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
@@ -1554,9 +1584,19 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         # (parity with _resolve_provider_for_build).
         global_auth = _load_global_auth()
         if isinstance(global_auth, DatabricksAuth):
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=global_auth.profile)
+            return NativeCodexLaunch(
+                config_overrides=[],
+                model=model,
+                profile=global_auth.profile,
+                summary=f"Databricks ucode profile {global_auth.profile!r} (global auth block)",
+            )
         if global_auth is not None:
-            return NativeCodexLaunch(config_overrides=[], model=model, profile=None)
+            return NativeCodexLaunch(
+                config_overrides=[],
+                model=model,
+                profile=None,
+                summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
+            )
         entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
     if entry is None:
@@ -1565,7 +1605,17 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
             "through a provider."
         )
-        return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+        return NativeCodexLaunch(
+            config_overrides=no_provider_overrides,
+            model=model,
+            profile=None,
+            summary=(
+                "Codex CLI login (no provider configured for the codex harness, no "
+                "Databricks profile) — the TUI likely renders the ChatGPT sign-in "
+                "screen and never starts a thread; run `omnigent setup` to route through "
+                "a provider"
+            ),
+        )
     if entry.kind == SUBSCRIPTION_KIND:
         return _resolve_subscription_launch(entry, model, explicit)
 
@@ -1583,7 +1633,16 @@ def resolve_native_codex_launch(*, model: str | None) -> NativeCodexLaunch:
         "credential — falling back to Codex's own login.",
         entry.name,
     )
-    return NativeCodexLaunch(config_overrides=no_provider_overrides, model=model, profile=None)
+    return NativeCodexLaunch(
+        config_overrides=no_provider_overrides,
+        model=model,
+        profile=None,
+        summary=(
+            f"Codex CLI login (provider {entry.name!r} is the codex default but has no "
+            "usable openai credential) — the TUI likely renders the sign-in screen "
+            "and never starts a thread"
+        ),
+    )
 
 
 def client_for_transport(

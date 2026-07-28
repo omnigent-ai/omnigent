@@ -374,6 +374,22 @@ def _connect_ro(db_path: Path) -> sqlite3.Connection | None:
     return None
 
 
+def _table_columns(con: sqlite3.Connection, table: str) -> frozenset[str]:
+    """Return the set of column names on *table*, or empty on any error.
+
+    Hermes' ``state.db`` schema drifts across versions (e.g. schema_version 11
+    dropped ``sessions.cwd`` and ``messages.active`` / ``messages.compacted``
+    that older builds carried). The forwarder introspects the live schema and
+    adapts its SELECTs instead of assuming a fixed column set — otherwise a
+    single ``no such column`` error aborts discovery / mirroring and the chat
+    goes silent even though Hermes itself is working (visible in the terminal).
+    """
+    try:
+        return frozenset(str(r[1]) for r in con.execute(f"PRAGMA table_info({table})"))
+    except sqlite3.Error:
+        return frozenset()
+
+
 def _discover_session_id(
     db_path: Path,
     workspace: str,
@@ -401,11 +417,25 @@ def _discover_session_id(
     if con is None:
         return None
     floor_s = launch_epoch_s - _DISCOVERY_SKEW_S
+    # Newer Hermes (schema_version >= 11) no longer records ``sessions.cwd``.
+    # Select it only when present; otherwise treat every row as cwd-less and
+    # rely on the started_at-since-launch fallback below (the newest lone
+    # session started after this terminal launched is this terminal's session).
+    has_cwd = "cwd" in _table_columns(con, "sessions")
     try:
-        rows = con.execute(
-            "SELECT id, cwd FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
-            (floor_s,),
-        ).fetchall()
+        if has_cwd:
+            rows = con.execute(
+                "SELECT id, cwd FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
+                (floor_s,),
+            ).fetchall()
+        else:
+            rows = [
+                (sid, None)
+                for (sid,) in con.execute(
+                    "SELECT id FROM sessions WHERE started_at >= ? ORDER BY started_at DESC",
+                    (floor_s,),
+                ).fetchall()
+            ]
     except sqlite3.Error as exc:
         _warn_sqlite_once("session discovery", exc)
         return None
@@ -621,12 +651,24 @@ def _read_new_items(
     con = _connect_ro(db_path)
     if con is None:
         return []
+    # ``messages.active`` (compaction soft-delete flag) was dropped in newer
+    # Hermes schemas; only filter on it when present.
+    cols = _table_columns(con, "messages")
+    active_filter = " AND active = 1" if "active" in cols else ""
+    # ``reasoning_content`` / ``reasoning`` were added in newer schemas; SELECT
+    # them only when present so a v11 (or other older) DB does not raise
+    # ``no such column``.
+    reasoning_cols = ""
+    if "reasoning_content" in cols:
+        reasoning_cols += ", reasoning_content"
+    if "reasoning" in cols:
+        reasoning_cols += ", reasoning"
     try:
         rows = con.execute(
-            "SELECT id, role, content, tool_calls, tool_call_id, tool_name, "
-            "reasoning_content, reasoning "
+            "SELECT id, role, content, tool_calls, tool_call_id, tool_name "
+            f"{reasoning_cols} "
             "FROM messages "
-            "WHERE session_id = ? AND id > ? AND active = 1 ORDER BY id",
+            f"WHERE session_id = ? AND id > ?{active_filter} ORDER BY id",
             (hermes_session_id, last_id),
         ).fetchall()
     except sqlite3.Error as exc:
@@ -635,16 +677,12 @@ def _read_new_items(
     finally:
         con.close()
     items: list[_MirrorItem] = []
-    for (
-        msg_id,
-        role,
-        content,
-        tool_calls_json,
-        tool_call_id,
-        tool_name_val,
-        reasoning_content,
-        reasoning,
-    ) in rows:
+    for row in rows:
+        # The trailing reasoning_content / reasoning columns are present
+        # only when the live schema carries them; unpack positionally.
+        msg_id, role, content, tool_calls_json, tool_call_id, tool_name_val = row[:6]
+        reasoning_content = row[6] if len(row) > 6 and "reasoning_content" in cols else None
+        reasoning = row[-1] if len(row) > 6 and "reasoning" in cols else None
         converted = _message_to_items(
             msg_id,
             role,
@@ -887,6 +925,11 @@ def _has_new_compaction(db_path: Path, hermes_session_id: str) -> bool:
     con = _connect_ro(db_path)
     if con is None:
         return False
+    # ``messages.compacted`` was dropped in newer Hermes schemas; without it we
+    # cannot detect a compaction boundary here (safe: no boundary item posted).
+    if "compacted" not in _table_columns(con, "messages"):
+        con.close()
+        return False
     try:
         row = con.execute(
             "SELECT 1 FROM messages WHERE session_id = ? AND compacted = 1 LIMIT 1",
@@ -918,10 +961,10 @@ async def _persist_hermes_compaction_item(
     compacted_messages = None
     con = _connect_ro(db_path)
     if con is not None:
+        _active = " AND active = 1" if "active" in _table_columns(con, "messages") else ""
         try:
             rows = con.execute(
-                "SELECT role, content FROM messages "
-                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                f"SELECT role, content FROM messages WHERE session_id = ?{_active} ORDER BY id",
                 (hermes_session_id,),
             ).fetchall()
             msgs = []

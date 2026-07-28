@@ -668,9 +668,7 @@ def built_spa(request: pytest.FixtureRequest) -> None:
     pytest sessions or worktrees would clobber each other. A
     cross-process file lock at ``web/.build.lock`` serializes
     builds; the second caller waits for the first to finish and
-    then no-ops past its own build (npm is idempotent enough that
-    double-building is harmless, but the lock keeps the static
-    output consistent during the window the FastAPI app reads it).
+    then no-ops past its own build.
 
     :param request: pytest request — reads ``--ui-base-url`` /
         ``--ui-skip-build``.
@@ -684,17 +682,15 @@ def built_spa(request: pytest.FixtureRequest) -> None:
 
     lock_path = _WEB_DIR / ".build.lock"
     with filelock.FileLock(str(lock_path), timeout=600):
-        # --legacy-peer-deps: package-lock.json already pins the tree;
-        # without this flag npm spends the full job re-resolving the
-        # @emoji-mart/react / React 19 peer conflict. This matches the
-        # workflow-side fix for parity with local runs and the case
-        # where conftest installs override CI's build.
+        # pnpm frozen-lockfile uses the root workspace lockfile, which
+        # keeps the pinned tree matching CI and avoids re-resolving the
+        # React peer conflicts that used to require --legacy-peer-deps.
         subprocess.run(
-            ["npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-            cwd=_WEB_DIR,
+            ["pnpm", "install", "--frozen-lockfile", "--filter", "web"],
+            cwd=_REPO_ROOT,
             check=True,
         )
-        subprocess.run(["npm", "run", "build"], cwd=_WEB_DIR, check=True)
+        subprocess.run(["pnpm", "--filter", "web", "run", "build"], cwd=_REPO_ROOT, check=True)
 
     _assert_pwa_build(_BUILD_OUTPUT)
 

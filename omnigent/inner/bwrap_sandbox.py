@@ -128,14 +128,17 @@ _DEFAULT_ETC_FILES = (
 )
 
 # Read-only directory binds for the multi-file /etc subtrees — linker
-# search paths and TLS trust stores. Bound as directories so adding /
-# updating cert bundles on the host stays transparent inside the
-# sandbox.
+# search paths, TLS trust stores, and the update-alternatives symlink
+# hub (so generic names like awk/python3/editor resolve through
+# /etc/alternatives to their real binaries under the mounted /usr).
+# Bound as directories so host-side changes stay transparent inside
+# the sandbox.
 _DEFAULT_ETC_DIRS = (
     "/etc/ld.so.conf.d",
     "/etc/ssl",
     "/etc/ca-certificates",
     "/etc/pki",
+    "/etc/alternatives",
 )
 
 # Linux ``CLONE_NEW*`` flag bits. Any of these set in arg 0 of

@@ -992,6 +992,25 @@ def register_events_routes(
                 if conv is None:
                     raise _session_not_found()
                 runner_client = await _get_runner_client(session_id, runner_router)
+        if runner_client is None and conv.kind == "sub_agent":
+            # A sub-agent copies its parent's runner_id at creation and is
+            # never repointed when the parent's runner is relaunched.  If the
+            # runner is dead but the parent has a live replacement, repair the
+            # stale binding via the ancestor chain and continue through the
+            # normal init+dispatch flow.
+            _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+            healed_client = await _heal_subagent_runner_binding_via_parent(
+                conv,
+                runner_router,
+                _tunnel_registry,
+                conversation_store,
+            )
+            if healed_client is not None:
+                runner_client = healed_client
+                _runner_needs_session_init = True
+                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                if conv is None:
+                    raise _session_not_found()
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = getattr(request.app.state, "host_registry", None)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -1059,8 +1060,8 @@ async def _run_auto_create_cursor_terminal(
     monkeypatch: pytest.MonkeyPatch,
     agent_spec: AgentSpec | None,
     terminal_launch_args: list[str] | None,
-) -> Any:
-    """Drive ``_auto_create_cursor_terminal`` and return the captured launch spec.
+) -> dict[str, Any]:
+    """Drive ``_auto_create_cursor_terminal`` and return what it wired up.
 
     Stubs the cursor-agent binary lookup, the transcript forwarder, and the
     runner auth factory so the model-injection branch runs without a real
@@ -1068,6 +1069,10 @@ async def _run_auto_create_cursor_terminal(
     (workspace + ``terminal_launch_args``) is served from an in-memory
     ``httpx.MockTransport``, and a fake registry records the ``spec`` passed to
     ``launch_required_terminal`` so the test can assert on ``spec.args``.
+
+    :returns: ``{"spec": <launch spec>, "elicitation_kwargs": <kwargs>}``, the
+        latter captured from the elicitation supervisor the forwarder task
+        gathers (empty if that task never got to start it).
     """
     from omnigent.runner import _entry as _runner_entry
 
@@ -1084,11 +1089,25 @@ async def _run_auto_create_cursor_terminal(
         "omnigent.cursor_native_forwarder.supervise_cursor_forwarder",
         _no_op_forwarder,
     )
+    monkeypatch.setattr(
+        "omnigent.cursor_native_usage.supervise_cursor_usage_forwarder",
+        _no_op_forwarder,
+    )
     # The forwarder is stubbed, so the auth it would carry is never used — keep
     # the factory from reaching for ambient Databricks credentials in tests.
     monkeypatch.setattr(_runner_entry, "_make_auth_token_factory", lambda *a, **k: None)
 
-    captured: dict[str, Any] = {}
+    captured: dict[str, Any] = {"elicitation_kwargs": {}}
+    started = asyncio.Event()
+
+    async def _capture_elicitation_supervisor(**kwargs: Any) -> None:
+        captured["elicitation_kwargs"] = kwargs
+        started.set()
+
+    monkeypatch.setattr(
+        "omnigent.cursor_native_permissions.supervise_cursor_transcript_elicitations",
+        _capture_elicitation_supervisor,
+    )
 
     class _FakeResourceRegistry:
         """Captures the launched terminal spec; no real terminal registry."""
@@ -1130,9 +1149,13 @@ async def _run_auto_create_cursor_terminal(
             ensure_comment_relay=None,
             agent_spec=agent_spec,
         )
+        # The bridge supervisors are gathered in a background task, so give it
+        # a beat to record the kwargs the wiring derived.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(started.wait(), timeout=2.0)
     finally:
         await fake_client.aclose()
-    return captured["spec"]
+    return captured
 
 
 @pytest.mark.asyncio
@@ -1146,7 +1169,7 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
     session's ``executor.model`` (from ``--model`` or config.yaml ``model:``)
     must reach the TUI as ``--model <id>`` — the regression #933 fixes.
     """
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1154,6 +1177,7 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
         ),
         terminal_launch_args=None,
     )
+    spec = captured["spec"]
     assert spec.command == "cursor-agent"
     assert "--model" in spec.args
     assert spec.args[spec.args.index("--model") + 1] == "sonnet-4-thinking"
@@ -1178,7 +1202,7 @@ async def test_auto_create_cursor_terminal_user_model_wins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A user-pinned passthrough model wins; the spec model is not injected."""
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1186,6 +1210,7 @@ async def test_auto_create_cursor_terminal_user_model_wins(
         ),
         terminal_launch_args=passthrough,
     )
+    spec = captured["spec"]
     # Exactly the user's args survive — no second ``--model`` / spec model added.
     assert spec.args.count("--model") == passthrough.count("--model")
     assert "sonnet-4-thinking" not in spec.args
@@ -1207,7 +1232,7 @@ async def test_auto_create_cursor_terminal_omits_model_when_unusable(
     Gateway-routed ``databricks-*`` ids are not cursor-agent model ids, so they
     are dropped rather than passed through (which would error on launch).
     """
-    spec = await _run_auto_create_cursor_terminal(
+    captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
@@ -1215,7 +1240,42 @@ async def test_auto_create_cursor_terminal_omits_model_when_unusable(
         ),
         terminal_launch_args=None,
     )
-    assert "--model" not in spec.args
+    assert "--model" not in captured["spec"].args
+
+
+@pytest.mark.parametrize(
+    ("terminal_launch_args", "expected"),
+    [
+        (None, False),
+        (["--auto-review"], False),
+        (["--yolo=false"], False),
+        (["--yolo"], True),
+        (["--force"], True),
+        (["-f"], True),
+    ],
+    ids=["none", "auto-review", "yolo-off", "yolo", "force", "short-force"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_wires_yolo_auto_accept(
+    terminal_launch_args: list[str] | None,
+    expected: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The elicitation supervisor's yolo stance is derived from the launch args.
+
+    This wiring is the only thing that turns the in-pane auto-accept on. It is
+    a single kwarg in a large auto-create function, so without this assertion a
+    rebase can drop it and leave the feature inert with the rest of the suite
+    green.
+    """
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        agent_spec=None,
+        terminal_launch_args=terminal_launch_args,
+    )
+    assert captured["elicitation_kwargs"]["auto_accept_approvals"] is expected
 
 
 @pytest.mark.parametrize(

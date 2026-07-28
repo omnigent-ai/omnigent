@@ -122,10 +122,10 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **`uv`** (required). https://docs.astral.sh/uv/getting-started/installation/
   The installer offers to set this up for you.
 - **`git`** (required).
-- **Node.js 22 LTS or newer** with **`npm`**, for the npm-installed coding
-  harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
-  harness CLI you pick.
-  https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- **Node.js 22 LTS or newer** with **`npm`** (for the coding-harness CLIs
+  installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
+  both from a single Node install; pnpm is available via
+  `corepack enable` or `npm install -g pnpm`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
