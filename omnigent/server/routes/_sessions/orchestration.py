@@ -766,6 +766,7 @@ def _build_session_response(
         items=items,
         permission_level=permission_level,
         sub_agent_name=conv.sub_agent_name,
+        kind=conv.kind,
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,

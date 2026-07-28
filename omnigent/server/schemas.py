@@ -1826,6 +1826,7 @@ class SessionResponse(BaseModel):
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
     sub_agent_name: str | None = None
+    kind: str = "default"
     parent_session_id: str | None = None
     root_conversation_id: str | None = None
     llm_model: str | None = None
