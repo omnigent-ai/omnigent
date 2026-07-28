@@ -455,12 +455,7 @@ export interface Session {
  * only — the snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  | "provisioning"
-  | "cloning"
-  | "starting"
-  | "connecting"
-  | "ready"
-  | "failed";
+  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors

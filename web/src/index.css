@@ -881,6 +881,18 @@
   cursor: pointer;
 }
 
+/* Streamdown renders links with `wrap-anywhere` (overflow-wrap: anywhere),
+ * which also shrinks the element's min-content width to a single character.
+ * In an auto-layout table that lets a link-only column collapse to ~2ch, so
+ * a short link like "#3090" stacks one or two characters per line while the
+ * prose columns hog the width. `break-word` still wraps overlong URLs, but
+ * keeps min-content at the longest unbreakable run so the column can't be
+ * squeezed below it. */
+:is([data-streamdown="table-cell"], [data-streamdown="table-header-cell"])
+  [data-streamdown="link"] {
+  overflow-wrap: break-word;
+}
+
 /* Flatten Streamdown's loud heading ramp (text-3xl..xl) to em sizes proportional to body. */
 [data-streamdown="heading-1"] {
   font-size: 1.4em;

@@ -162,8 +162,8 @@ jobs:
         with:
           python-version-file: ".python-version"
 
-      - name: Set up Node 20
-        uses: ./.github/actions/setup-node
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
@@ -222,20 +222,20 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          cd web
-          npm ci --legacy-peer-deps --no-audit --no-fund
-          npm run build
+          pnpm install --frozen-lockfile --filter web
+          pnpm --filter web run build
 
       - name: Install Claude Code CLI
         # Pinned to match e2e-ui.yml (2.1.170 recognises the native bridge
-        # hook events). --ignore-scripts then run the audited install.cjs.
+        # hook events). Runs lifecycle scripts so the platform-specific binary
+        # is linked and put on PATH.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          mkdir -p "${GITHUB_WORKSPACE}/.cc-cli" && cd "${GITHUB_WORKSPACE}/.cc-cli"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
+          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
+          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.170
+          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
         # @openai/codex pinned to match e2e-ui.yml; goal-mode app-server APIs
@@ -243,9 +243,10 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          mkdir -p "${GITHUB_WORKSPACE}/.codex-cli" && cd "${GITHUB_WORKSPACE}/.codex-cli"
+          CODEX_CLI_DIR="${RUNNER_TEMP}/omnigent-codex-cli"
+          mkdir -p "$CODEX_CLI_DIR" && cd "$CODEX_CLI_DIR"
           npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
-          echo "${GITHUB_WORKSPACE}/.codex-cli/node_modules/.bin" >> "$GITHUB_PATH"
+          echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Run pytest target
         # Inputs validated by prep. Word-splitting on $TEST_TARGET / $EXTRA_ARGS

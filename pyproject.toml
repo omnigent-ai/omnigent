@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.7.0.dev0"
+version = "0.8.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,8 +26,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.7.0.dev0",
-    "omnigent-ui-sdk==0.7.0.dev0",
+    "omnigent-client==0.8.0.dev0",
+    "omnigent-ui-sdk==0.8.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     # openai-agents<0.18.2 omits a field required by openai>=2.45.
@@ -225,7 +225,7 @@ memory = ["hindsight-client>=0.4.0"]
 # (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
 # `[project].version` in `integrations/slack/pyproject.toml`.
 slack = [
-    "omnigent-slack==0.7.0.dev0",
+    "omnigent-slack==0.8.0.dev0",
 ]
 databricks = [
     # Floor matches what core code was tested against when the SDK was a

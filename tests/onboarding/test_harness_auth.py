@@ -137,6 +137,57 @@ def test_store_flips_readiness_to_configured(monkeypatch: pytest.MonkeyPatch) ->
     assert default_provider_for_harness(load_config(), "claude-native") is not None
 
 
+def _seed_subscription_defaults(tmp_path: Path) -> None:
+    """Write a config whose anthropic + openai family defaults are subscription
+    CLI logins — the shape a user who ran `claude auth login` / `codex login`
+    ends up with, and the case that stranded Pi."""
+    (Path(tmp_path) / "config.yaml").write_text(
+        "providers:\n"
+        "  claude: {cli: claude, default: true, kind: subscription}\n"
+        "  codex: {cli: codex, default: true, kind: subscription}\n"
+    )
+
+
+def test_store_key_makes_pi_ready_despite_subscription_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pi credential must make Pi resolvable even when the anthropic family
+    default is a subscription login Pi can't use.
+
+    Regression: Pi consumes the anthropic family but has no CLI login, so it
+    depends on an omnigent-managed provider. With a pre-existing subscription
+    default, the new key was written as a non-default sibling and Pi's resolver
+    (which skips subscription) fell through to nothing — Pi stayed "needs-auth"
+    after a successful write. The write now also pins the key as Pi's own
+    default (pi-scoped), without disturbing Claude's subscription.
+    """
+    _seed_subscription_defaults(tmp_path)
+    assert default_provider_for_harness(load_config(), "pi") is None
+
+    result = ha.store_harness_credential(family="anthropic", kind="key", secret="sk-ant-pi")
+    assert result.stored is True
+
+    cfg = load_config()
+    # Pi now resolves a usable (non-subscription) provider…
+    pi_provider = default_provider_for_harness(cfg, "pi")
+    assert pi_provider is not None and pi_provider.kind != "subscription"
+    # …while Claude's own subscription default is left intact.
+    claude_provider = default_provider_for_harness(cfg, "claude-native")
+    assert claude_provider is not None and claude_provider.kind == "subscription"
+
+
+def test_adopt_makes_pi_ready_despite_subscription_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same pi-scope pin applies to the adopt path (env-var credential)."""
+    _seed_subscription_defaults(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-present")
+    result = ha.adopt_env_credential(family="anthropic", env_var="ANTHROPIC_API_KEY")
+    assert result.stored is True
+    pi_provider = default_provider_for_harness(load_config(), "pi")
+    assert pi_provider is not None and pi_provider.kind != "subscription"
+
+
 def test_adopt_env_credential_writes_env_reference(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -28,7 +28,8 @@ Install local prerequisites first:
 - `bubblewrap` (`bwrap`), **Linux only**, used to OS-sandbox those native
   Claude/Codex/Pi terminals (`apt install bubblewrap` on Debian/Ubuntu). macOS
   uses the built-in `seatbelt` sandbox and needs nothing extra.
-- Node.js 22 LTS or newer with `npm` when working on `web/`.
+- Node.js 22 LTS or newer with `pnpm` (install via `corepack enable` or
+  `npm install -g pnpm`) when working on `web/`.
 - A Rust toolchain for the recommended `omnidev` local development supervisor.
 
 ```bash
@@ -52,7 +53,7 @@ uv run pre-commit run --all-files
 When touching `web/`:
 
 ```bash
-cd web && npm install && npm run lint && npm run build
+cd web && pnpm install && pnpm run lint && pnpm run build
 ```
 
 ## Running locally
@@ -118,7 +119,7 @@ uv run omnigent host --server http://localhost:6767
 
 # Terminal 3: frontend dev server
 cd web
-npm run dev
+pnpm run dev
 ```
 
 Open the Vite URL from the frontend dev server, usually
@@ -219,7 +220,7 @@ Two cross-cutting suites sit on top of these:
 Frontend changes follow the same expectation with a different toolchain:
 
 - Add or update a **colocated Vitest test** — a `*.test.ts`/`*.test.tsx` file
-  next to the component or module you changed — and run it with `npm test`.
+  next to the component or module you changed — and run it with `pnpm test`.
 - A change to **user-facing UI behaviour** also needs a Playwright test under
   `tests/e2e_ui/`. This one is enforced mechanically by the `E2E UI Required`
   check, so a UI PR won't merge without a covering test (or a maintainer

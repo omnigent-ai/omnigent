@@ -286,10 +286,7 @@ export interface SidebarDragSource {
     drop that landed on nothing droppable (e.g. "Shared with me", which is
     never a target — sessions can't be filed there). */
 export type SidebarDropTarget =
-  | { type: "project"; name: string }
-  | { type: "ungroup" }
-  | { type: "pin" }
-  | null;
+  { type: "project"; name: string } | { type: "ungroup" } | { type: "pin" } | null;
 
 /** The action a drop resolves to. `move` files the session into a project;
     `ungroup` removes it from its current project (the caller still confirms
