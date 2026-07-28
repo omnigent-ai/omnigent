@@ -1007,12 +1007,14 @@ def register_events_routes(
             )
             if healed_client is not None:
                 runner_client = healed_client
-                # The parent's runner already hosts the child's session —
-                # only the DB row was stale. No re-initialization needed.
-                _runner_needs_session_init = False
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is None:
                     raise _session_not_found()
+                # For native-terminal sub-agents (pi-native, claude-native)
+                # the runner must initialize the child's terminal session.
+                # For SDK/non-native sub-agents the parent runner already
+                # holds the child's state — no re-initialization needed.
+                _runner_needs_session_init = _is_native_terminal_session(conv)
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
             _grace_host_reg = getattr(request.app.state, "host_registry", None)
