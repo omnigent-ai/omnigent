@@ -37,13 +37,14 @@ import logging
 import os
 import subprocess
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import httpx
 from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
+from omnigent.model_metadata import ModelMetadata
 from omnigent.model_override import model_family_mismatch
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
@@ -154,13 +155,18 @@ class ModelEntry:
         ``"databricks-claude-sonnet-4-6"`` or ``"gpt-5.4-mini"``.
     :param family: Vendor family token — ``"claude"``, ``"openai"``, or
         ``"other"``.
-    :param context_window: Context window in tokens when the provider
-        reports one (e.g. OpenRouter ``context_length``), else ``None``.
+    :param metadata: Provider-neutral capabilities and limits. Metadata fields
+        remain unknown when the listing API reports only a model id.
     """
 
     id: str
     family: str
-    context_window: int | None = None
+    metadata: ModelMetadata = field(default_factory=ModelMetadata)
+
+    @property
+    def context_window(self) -> int | None:
+        """Return the normalized context window for compatibility callers."""
+        return self.metadata.context_window
 
 
 @dataclass(frozen=True)
@@ -715,8 +721,23 @@ def _listing_payload(listing: ModelListing) -> dict[str, Any]:  # type: ignore[e
     models: list[dict[str, Any]] = []  # type: ignore[explicit-any]  # JSON-shaped tool payload
     for entry in listing.models:
         row: dict[str, Any] = {"id": entry.id, "family": entry.family}  # type: ignore[explicit-any]
-        if entry.context_window is not None:
-            row["context_window"] = entry.context_window
+        metadata = entry.metadata
+        if metadata.context_window is not None:
+            row["context_window"] = metadata.context_window
+        capabilities = {
+            capability.value: supported
+            for supported, values in (
+                (True, metadata.supported_capabilities),
+                (False, metadata.unsupported_capabilities),
+            )
+            for capability in sorted(values, key=lambda value: value.value)
+        }
+        if capabilities:
+            row["capabilities"] = capabilities
+        if metadata.cost_tier is not None:
+            row["cost_tier"] = metadata.cost_tier.value
+        if metadata.wire_apis:
+            row["wire_apis"] = sorted(wire_api.value for wire_api in metadata.wire_apis)
         models.append(row)
     return {
         "source": listing.source,
@@ -1084,7 +1105,9 @@ def _fetch_openai_compatible_listing(
             ModelEntry(
                 id=model_id,
                 family=model_family_token(model_id),
-                context_window=context_length if isinstance(context_length, int) else None,
+                metadata=ModelMetadata(
+                    context_window=context_length if isinstance(context_length, int) else None
+                ),
             )
         )
     return ModelListing(

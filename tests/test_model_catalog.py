@@ -22,10 +22,18 @@ from cachetools import TTLCache
 
 import omnigent.model_catalog as model_catalog
 from omnigent.model_catalog import (
+    ModelEntry,
+    ModelListing,
     catalog_for_spec,
     list_models_for_worker,
     resolve_model_provider,
     spec_harness,
+)
+from omnigent.model_metadata import (
+    ModelCapability,
+    ModelCostTier,
+    ModelMetadata,
+    ModelWireAPI,
 )
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec
@@ -1118,6 +1126,41 @@ def test_catalog_payload_is_json_serializable_and_omits_unknown_context(
     payload = json.loads(json.dumps(catalog))
     assert payload["worker"]["source"] == "gateway"
     assert all("context_window" not in m for m in payload["worker"]["models"])
+
+
+def test_catalog_payload_serializes_normalized_model_metadata() -> None:
+    """Known metadata is exposed without inventing values for unknown fields."""
+    listing = ModelListing(
+        source="catalog",
+        verified=True,
+        models=(
+            ModelEntry(
+                id="provider/model-a",
+                family="provider-family",
+                metadata=ModelMetadata(
+                    supported_capabilities=frozenset({ModelCapability.TOOL_USE}),
+                    unsupported_capabilities=frozenset({ModelCapability.VISION}),
+                    context_window=200_000,
+                    cost_tier=ModelCostTier.STANDARD,
+                    wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+                ),
+            ),
+        ),
+        note="test catalog",
+    )
+
+    payload = model_catalog._listing_payload(listing)
+
+    assert payload["models"] == [
+        {
+            "id": "provider/model-a",
+            "family": "provider-family",
+            "context_window": 200_000,
+            "capabilities": {"tool-use": True, "vision": False},
+            "cost_tier": "standard",
+            "wire_apis": ["openai-responses"],
+        }
+    ]
 
 
 def test_spec_harness_derivation() -> None:

@@ -82,3 +82,25 @@ prepared with `just ensure`; CI is the enforcement backstop.
    increases and stale allowances.
 6. **Document escape hatches.** If a temporary pin is unavoidable, require a
    short rationale near the call site and the smallest allowlist count.
+
+## Resolver Contract
+
+The first migration building block lives in `omnigent/model_metadata.py` and
+`omnigent/model_resolver.py`:
+
+- Callers request a stable `ModelIntent` instead of a concrete model id.
+- `ModelMetadata` records known capabilities, context window, provider-relative
+  cost tier, and supported wire APIs. Capability support is tri-state so a
+  provider that reports only ids does not accidentally claim support.
+- Resolution follows explicit user/session choice, configured provider default,
+  live catalog, then documented static fallback precedence.
+- Capability, context, family, and wire requirements filter discovered models;
+  unknown metadata does not satisfy a requirement.
+- Provider catalog order is the default tie-breaker. Providers with richer
+  preference rules can supply a `ModelPreferencePolicy` without changing
+  callers or the precedence contract.
+
+This contract is intentionally pure and side-effect free. Follow-up migrations
+will adapt executor defaults and smart routing to it, then enrich catalog entries
+from provider and MLflow metadata. Until those callers move, their existing
+selection behavior remains unchanged.
