@@ -547,10 +547,7 @@ class TestConstructor(unittest.TestCase):
         generic-provider gateway path never does this (see
         ``test_neutral_gateway_no_model_does_not_inject_databricks_default``).
         """
-        from omnigent.inner.claude_sdk_executor import (
-            _DATABRICKS_CLAUDE_DEFAULT_MODEL,
-            ClaudeSDKExecutor,
-        )
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
         async def _t():
@@ -578,7 +575,7 @@ class TestConstructor(unittest.TestCase):
                     async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
                         pass
 
-            self.assertEqual(captured["model"], _DATABRICKS_CLAUDE_DEFAULT_MODEL)
+            self.assertEqual(captured["model"], "catalog-databricks-claude-default")
 
         _run(_t())
 

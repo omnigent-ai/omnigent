@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from omnigent import model_catalog
 from omnigent.model_override import normalize_model_for_provider
 from omnigent.onboarding.provider_config import (
     CHAT_WIRE_API,
@@ -57,11 +58,6 @@ PI_CODING_AGENT_DIR_ENV_VAR = "PI_CODING_AGENT_DIR"
 # Provider id registered in the generated ``models.json``. Stable so
 # ``--provider`` can select it.
 _PI_PROVIDER_ID = "omnigent"
-
-# Default model for the Databricks AI Gateway's Anthropic surface — the same
-# default the in-process Databricks executor pins. Used when the session
-# carries no explicit model override.
-_DATABRICKS_PI_DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
 
 # Provider id for the secondary OpenAI Responses provider (GPT models that only
 # support tools via the Responses API, e.g. gpt-5.5, gpt-5.6-*).
@@ -293,7 +289,7 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{host}{_DATABRICKS_ANTHROPIC_GATEWAY_PATH}",
         api="anthropic-messages",
-        model=model or _DATABRICKS_PI_DEFAULT_MODEL,
+        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token is refreshed per request (the auth command itself
         # force-refreshes), matching codex-native's refresh semantics.
@@ -788,7 +784,7 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         provider_id=_PI_PROVIDER_ID,
         base_url=_gateway_anthropic_base_url(transport.base_url),
         api="anthropic-messages",
-        model=model or _DATABRICKS_PI_DEFAULT_MODEL,
+        model=model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id,
         # Pi resolves a "!command" apiKey at request time, so the gateway
         # bearer token (the codex auth command prints it) is refreshed per
         # request — matching codex-native's refresh semantics.

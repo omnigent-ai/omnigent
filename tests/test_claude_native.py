@@ -33,6 +33,16 @@ from omnigent.terminals.ws_bridge import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
+
+
 def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     """
     The terminal launch body pins ``cwd`` to the user's launch dir.
@@ -506,7 +516,7 @@ def test_ucode_config_for_profile_defaults_model_when_ucode_omits_it(
 
     assert config is not None
     # The verified routable gateway endpoint name, not the CLI's own default.
-    assert config.model == "databricks-claude-opus-4-8"
+    assert config.model == "catalog-databricks-claude-default"
 
 
 def test_ucode_config_refreshes_live_models_and_builds_picker_options(

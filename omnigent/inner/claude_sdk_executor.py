@@ -42,12 +42,12 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Protocol, TypeAlias, cast
 
+from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
@@ -741,8 +741,6 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 # Default model for the Databricks-profile gateway path (no gateway base URL
 # supplied directly), used when no spec/cfg model is set. On the ucode-cached
 # path the Omnigent producer resolves the model instead (see workflow.py).
-_DATABRICKS_CLAUDE_DEFAULT_MODEL = DATABRICKS_CLAUDE_DEFAULT_MODEL
-
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
@@ -2183,7 +2181,7 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = _DATABRICKS_CLAUDE_DEFAULT_MODEL
+            model = model_catalog.resolve_catalog_model("databricks", family="claude").model_id
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in

@@ -26,6 +26,7 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
+from omnigent import model_catalog
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
@@ -53,9 +54,6 @@ from .open_responses_sdk import (
 )
 
 logger = logging.getLogger(__name__)
-
-_OPENAI_AGENTS_DEFAULT_MODEL = "gpt-5.3-codex"
-_DATABRICKS_OPENAI_AGENTS_DEFAULT_MODEL = "databricks-gpt-5-5"
 
 # Total run attempts per turn (1 initial + retries). The Databricks
 # gateway occasionally returns a completed-but-empty turn (status
@@ -1442,15 +1440,10 @@ class OpenAIAgentsSDKExecutor(Executor):
         # cfg.model (per-request /model override; agent name no longer
         # leaks here) wins over the spec default
         # (HARNESS_OPENAI_AGENTS_MODEL → self._model_override).
-        model = (
-            cfg.model
-            or self._model_override
-            or (
-                _DATABRICKS_OPENAI_AGENTS_DEFAULT_MODEL
-                if self._databricks
-                else _OPENAI_AGENTS_DEFAULT_MODEL
-            )
-        )
+        model = cfg.model or self._model_override
+        if model is None:
+            provider_name = "databricks" if self._databricks else "openai"
+            model = model_catalog.resolve_catalog_model(provider_name, family="openai").model_id
         agents_sdk = cast(_AgentsSDK, _ensure_agents_sdk())
         session_key = self._session_key(messages)
         try:

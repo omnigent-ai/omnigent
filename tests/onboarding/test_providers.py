@@ -193,6 +193,27 @@ def test_get_chat_models_sorted_newest_first() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("provider-gpt-5-6", 5.6),
+        ("provider-claude-opus-4-8", 4.8),
+        ("provider/llama-3.1-instruct", 3.1),
+        ("o3", 3.0),
+        ("provider-gpt-audio-2025-12-15", 0.0),
+        ("provider-gpt-oss-120b", 0.0),
+        ("provider-qwen35-122b", 0.0),
+    ],
+)
+def test_extract_model_version_ignores_dates_sizes_and_unknown_families(
+    name: str, expected: float
+) -> None:
+    """Only vendor version tokens influence newest-first ordering."""
+    from omnigent.onboarding.providers import _extract_model_version
+
+    assert _extract_model_version(name) == expected
+
+
 # ── default_chat_model ─────────────────────────────────────
 
 

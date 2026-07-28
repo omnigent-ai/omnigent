@@ -574,7 +574,7 @@ class TestDatabricksExecutorConfig(unittest.TestCase):
         _run(_t())
 
     def test_default_model(self):
-        """When no model is specified, falls back to databricks-claude-sonnet-4-6."""
+        """When no model is specified, resolves the Databricks Claude catalog."""
 
         async def _t():
             chunks = _make_text_stream("ok")
@@ -584,7 +584,7 @@ class TestDatabricksExecutorConfig(unittest.TestCase):
             [e async for e in executor.run_turn([], [], "", config=ExecutorConfig())]
             self.assertEqual(
                 client.chat.completions.last_kwargs["model"],
-                "databricks-claude-sonnet-4-6",
+                "catalog-databricks-claude-default",
             )
 
         _run(_t())

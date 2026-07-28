@@ -38,7 +38,6 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -2876,7 +2875,9 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True)
-    assert executor._resolve_model(ExecutorConfig(model=None)) == DATABRICKS_CLAUDE_DEFAULT_MODEL
+    assert executor._resolve_model(ExecutorConfig(model=None)) == (
+        "catalog-databricks-claude-default"
+    )
 
 
 def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
@@ -2932,22 +2933,6 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
     assert executor._resolve_model(ExecutorConfig(model=None)) is None
-
-
-def test_databricks_default_model_is_resolvable_in_models_json() -> None:
-    """
-    The shared Databricks default must route to the anthropic provider AND
-    be listed in that provider's models — otherwise the default the
-    producer/executor inject can't be resolved by pi at spawn time.
-
-    Failure means the default-model constant and pi's models.json drifted
-    apart: every modelless gateway agent would fail its first turn with a
-    pi "unknown model" error.
-    """
-    assert _pi_provider_for_model(DATABRICKS_CLAUDE_DEFAULT_MODEL) == "databricks-anthropic"
-    models = _build_models_json("https://host.example.com", "tok")
-    anthropic_ids = [m["id"] for m in models["providers"]["databricks-anthropic"]["models"]]
-    assert DATABRICKS_CLAUDE_DEFAULT_MODEL in anthropic_ids
 
 
 def test_models_json_lists_only_gateway_verified_models() -> None:

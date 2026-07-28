@@ -48,9 +48,9 @@ from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 from urllib.parse import urlparse as _urlparse
 
+from omnigent import model_catalog
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.onboarding.databricks_config import DATABRICKS_CLAUDE_DEFAULT_MODEL
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
@@ -1867,10 +1867,9 @@ class PiExecutor(Executor):
 
         ``cfg.model`` (per-request /model override) wins over the spec
         default (``HARNESS_PI_MODEL`` → ``self._model_override``). On the
-        Databricks-profile gateway path a missing model falls back to
-        :data:`DATABRICKS_CLAUDE_DEFAULT_MODEL` — Pi's own default is an
-        Anthropic-direct id the gateway rejects. Elsewhere ``None`` falls
-        through to let Pi pick its own default.
+        Databricks-profile gateway path a missing model resolves from the
+        Databricks Claude catalog — Pi's own default may be a direct-provider
+        id the gateway rejects. Elsewhere ``None`` lets Pi pick its own default.
 
         :param config: Optional :class:`ExecutorConfig` whose ``model``
             takes precedence when set.
@@ -1880,7 +1879,7 @@ class PiExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            return DATABRICKS_CLAUDE_DEFAULT_MODEL
+            return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
         return model
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:

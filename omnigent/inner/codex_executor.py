@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -98,14 +99,6 @@ _TURN_COMPLETED_DRAIN_SECONDS = 1.0
 _CODEX_VERSION_PROBE_TIMEOUT_SECONDS = 5.0
 _STDERR_CHUNK_LIMIT = 65536
 _STREAM_READ_CHUNK_SIZE = 65536
-_OPENAI_CODEX_DEFAULT_MODEL = "gpt-5.4-mini"
-# Databricks-specific default model for the Databricks-profile-derivation
-# gateway path (no gateway base URL supplied directly). The neutral
-# generic-provider gateway path never uses this — it requires the Omnigent producer
-# to resolve a concrete model. Used only when constructing the codex config
-# from ~/.databrickscfg credentials with no spec/override model.
-_DATABRICKS_CODEX_DEFAULT_MODEL = "databricks-gpt-5-5"
-
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
 # to running sessions without any action from Omnigent.
@@ -2551,9 +2544,13 @@ class CodexExecutor(Executor):
                     if gateway_auth_command is not None
                     else _databricks_codex_auth_command(host, databricks_profile)
                 )
-                # Databricks-profile path: a Databricks default is legitimate.
+                # Databricks-profile path: select a gateway endpoint from the
+                # catalog when no caller supplied one.
                 self._gateway_uses_databricks_profile = True
-                effective_model = model or _DATABRICKS_CODEX_DEFAULT_MODEL
+                effective_model = (
+                    model
+                    or model_catalog.resolve_catalog_model("databricks", family="openai").model_id
+                )
             else:
                 if base_url_override is None:
                     raise OSError(
@@ -2700,20 +2697,12 @@ class CodexExecutor(Executor):
         cfg = config or ExecutorConfig()
         session_key = _session_key(messages)
         state = self._session_states.setdefault(session_key, _CodexSessionState())
-        # cfg.model (per-request /model override) wins over the spec
-        # default (HARNESS_CODEX_MODEL → self._model_override). The final
-        # fallback is the Databricks default only on the Databricks-profile
-        # gateway path; the neutral gateway path (and the built-in path) never
-        # select a ``databricks-*`` model.
-        model = (
-            cfg.model
-            or self._model_override
-            or (
-                _DATABRICKS_CODEX_DEFAULT_MODEL
-                if self._gateway_uses_databricks_profile
-                else _OPENAI_CODEX_DEFAULT_MODEL
-            )
-        )
+        # cfg.model (per-request /model override) wins over the spec default.
+        # An unresolved default comes from the active provider catalog.
+        model = cfg.model or self._model_override
+        if model is None:
+            provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
+            model = model_catalog.resolve_catalog_model(provider_name, family="openai").model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )
