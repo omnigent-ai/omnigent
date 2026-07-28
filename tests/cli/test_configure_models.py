@@ -13,8 +13,9 @@ harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
 ``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Quit``. There is no "More" folding — every harness is
-visible at once — and the actionable hint (install command / next step)
+``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
+``15=Quit``. There is no "More" folding — every harness is visible at once —
+and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
 credential`` and ``← Back``. So an empty harness's level 2 is ``1=+Add 2=Back``;
@@ -1645,7 +1646,7 @@ def _overview_row_names(options: list[str], selectable: list[bool]) -> list[str]
 def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeypatch) -> None:
     """The overview shows every harness on one compact row, in 0.3 priority order.
 
-    No "More" folding: all thirteen harnesses are visible at once, followed by
+    No "More" folding: all harness actions are visible at once, followed by
     Quit. A regression that hides a harness, reorders the core six, or
     reintroduces a collapse row fails here. The menu also opts into the compact
     top-level rendering.
@@ -1666,6 +1667,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Copilot",
         "Kiro",
         "Kimi Code",
+        "Import from OpenClaw",
         "Custom ACP agent",
         "Quit",
     ]
@@ -1719,8 +1721,21 @@ def test_overview_lists_configured_acp_agents_as_rows(isolated_config, monkeypat
     assert "Custom ACP agent" not in names
 
 
-def test_overview_lists_openclaw_import_row(isolated_config, monkeypatch) -> None:
-    """Discovered OpenClaw/acpx agents appear as a setup import action."""
+def test_overview_always_lists_openclaw_import_row(isolated_config, monkeypatch) -> None:
+    """OpenClaw import remains available even when discovery finds nothing."""
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+    names = _overview_row_names(options, selectable)
+
+    assert "Import from OpenClaw" in names
+    assert names.index("Import from OpenClaw") < names.index("Custom ACP agent")
+
+
+def test_overview_hints_at_automatically_discovered_openclaw_agents(
+    isolated_config, monkeypatch
+) -> None:
+    """The always-visible import action hints at canonical-path discoveries."""
     acpx_dir = isolated_config / ".acpx"
     acpx_dir.mkdir()
     (acpx_dir / "config.json").write_text(
@@ -1728,13 +1743,16 @@ def test_overview_lists_openclaw_import_row(isolated_config, monkeypatch) -> Non
         encoding="utf-8",
     )
 
-    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+    options, _selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
-    names = _overview_row_names(options, selectable)
+    from rich.text import Text
 
-    assert "Import OpenClaw agents" in names
-    assert names.index("Import OpenClaw agents") < names.index("Custom ACP agent")
+    rendered = [Text.from_markup(option).plain for option in options]
+    assert any(
+        "Import from OpenClaw" in option and "1 agent found automatically" in option
+        for option in rendered
+    )
 
 
 def test_setup_imports_openclaw_agents(isolated_config) -> None:
@@ -1746,15 +1764,52 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["13", "", "q"]) + "\n"
+    stdin = "\n".join(["13", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
+    assert "~/.acpx/config.json" in result.output
+    assert "1 agent" in result.output
     assert "Import coding agents from OpenClaw?" in result.output
     assert "Imported 1 OpenClaw/acpx agent" in result.output
     assert _config_yaml(isolated_config)["acp"] == {
         "agents": [{"name": "Gemini CLI", "command": "gemini --experimental-acp"}]
     }
+
+
+def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) -> None:
+    """The import action accepts a non-canonical OpenClaw/acpx config path."""
+    selected = isolated_config / "downloads" / "agents.json"
+    selected.parent.mkdir()
+    selected.write_text(
+        '{"agents": {"My Goose": {"command": "goose", "args": ["acp"]}}}',
+        encoding="utf-8",
+    )
+
+    stdin = "\n".join(["13", "", str(selected), "", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "Choose another file" in result.output
+    assert "OpenClaw/acpx config path" in result.output
+    assert "Imported 1 OpenClaw/acpx agent" in result.output
+    assert _config_yaml(isolated_config)["acp"] == {
+        "agents": [{"name": "My Goose", "command": "goose acp"}]
+    }
+
+
+def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
+    """A selected JSON file must contain an acpx or wrapped OpenClaw registry."""
+    selected = isolated_config / "package.json"
+    selected.write_text('{"name": "unrelated"}', encoding="utf-8")
+
+    stdin = "\n".join(["13", "", str(selected), "2", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+
+    assert result.exit_code == 0, result.output
+    assert "file is not an OpenClaw/acpx agent registry" in result.output
+    config = _config_yaml(isolated_config)
+    assert "acp" not in config
 
 
 def test_overview_rows_are_single_line(isolated_config, monkeypatch) -> None:
@@ -1942,7 +1997,7 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("10", "_manage_copilot_harness"),
         ("11", "_manage_kiro_harness"),
         ("12", "_manage_kimi_harness"),
-        ("13", "_add_acp_agent"),
+        ("14", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(

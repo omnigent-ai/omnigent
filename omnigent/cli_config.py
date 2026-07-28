@@ -40,6 +40,7 @@ from omnigent.onboarding.ucode_setup import (
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
     from omnigent.onboarding.ambient import DetectedProvider
+    from omnigent.onboarding.openclaw_config import OpenClawDiscovery
     from omnigent.onboarding.provider_config import ProviderEntry
 
 # _INTERNAL_BETA_DEFAULT_SERVER (internal Databricks Apps host) moved to
@@ -2183,52 +2184,108 @@ def _add_acp_agent() -> None:
     console.print(f"  ✓ Added {name}")
 
 
+def _display_openclaw_path(path: Path) -> str:
+    """Return a compact user-facing config path."""
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        return str(path)
+
+
+def _choose_openclaw_source() -> OpenClawDiscovery | None:
+    """Choose an auto-detected or user-provided OpenClaw/acpx config."""
+    from omnigent.onboarding.interactive import prompt_text, select
+    from omnigent.onboarding.openclaw_config import (
+        default_config_paths,
+        openclaw_agents_to_acp_entries,
+        read_openclaw_config,
+    )
+
+    detected: list[OpenClawDiscovery] = []
+    options: list[str] = []
+    for source, path in zip(("acpx", "openclaw"), default_config_paths(), strict=True):
+        try:
+            exists = path.exists()
+        except OSError:
+            exists = True
+        if not exists:
+            continue
+        discovery = read_openclaw_config(path, source=source)
+        detected.append(discovery)
+        count = len(openclaw_agents_to_acp_entries(discovery.agents))
+        if count:
+            noun = "agent" if count == 1 else "agents"
+            hint = f"{count} {noun}"
+        elif discovery.errors:
+            hint = "unreadable"
+        else:
+            hint = "no agents"
+        options.append(f"{_display_openclaw_path(path)}  ·  {hint}")
+
+    custom_index = len(options)
+    options.extend(["Choose another file…", "← Back"])
+    choice = select("Import agents from OpenClaw", options, clear_on_exit=True)
+    if choice < 0 or choice == len(options) - 1:
+        return None
+    if choice < custom_index:
+        return detected[choice]
+
+    entered = prompt_text("OpenClaw/acpx config path").strip()
+    path = Path(os.path.expandvars(entered)).expanduser()
+    return read_openclaw_config(path)
+
+
 def _import_openclaw_agents() -> None:
-    """Import OpenClaw/acpx agents into the generic ``acp:`` block."""
+    """Import selected OpenClaw/acpx agents into the generic ``acp:`` block."""
     from rich.markup import escape
 
     from omnigent.onboarding.acp_auth import acp_agents_settings, command_binary_on_path
     from omnigent.onboarding.interactive import console
     from omnigent.onboarding.openclaw_config import (
-        discover_openclaw_agents,
         merge_imported_acp_entries,
         openclaw_agents_to_acp_entries,
     )
 
-    discovery = discover_openclaw_agents()
-    if discovery.errors:
-        console.print("\n  [yellow]Some OpenClaw/acpx config files could not be read:[/yellow]")
-        for error in discovery.errors:
-            console.print(f"    • {escape(str(error.path))}: {escape(error.message)}")
+    while True:
+        discovery = _choose_openclaw_source()
+        if discovery is None:
+            return
+        if discovery.errors:
+            console.print("\n  [yellow]Some OpenClaw/acpx entries could not be read:[/yellow]")
+            for error in discovery.errors:
+                console.print(f"    • {escape(str(error.path))}")
+                console.print(f"      {escape(error.message)}")
 
-    imported = openclaw_agents_to_acp_entries(discovery.agents)
-    merged, added = merge_imported_acp_entries(imported)
-    if not imported:
-        console.print("  [yellow]No OpenClaw/acpx agents found.[/yellow]")
+        imported = openclaw_agents_to_acp_entries(discovery.agents)
+        merged, added = merge_imported_acp_entries(imported)
+        if not imported:
+            console.print("  [yellow]No OpenClaw/acpx agents found in that file.[/yellow]")
+            continue
+        if not added:
+            console.print("  ✓ Those OpenClaw/acpx agents are already imported.")
+            continue
+
+        console.print("\n  [bold]OpenClaw/acpx agents found[/bold]")
+        for entry in added:
+            suffix = (
+                ""
+                if command_binary_on_path(entry.command)
+                else " [yellow](binary not found on PATH)[/yellow]"
+            )
+            console.print(
+                f"    • [bold]{escape(entry.name)}[/bold] → "
+                f"[dim]{escape(entry.command)}[/dim]{suffix}"
+            )
+        console.print("  [dim]Omnigent stores only these launch commands, not credentials.[/dim]")
+
+        if not click.confirm("Import coding agents from OpenClaw?", default=True):
+            console.print("  [yellow]Skipped OpenClaw import.[/yellow]")
+            return
+
+        _save_global_config(acp_agents_settings(merged))
+        noun = "agent" if len(added) == 1 else "agents"
+        console.print(f"  ✓ Imported {len(added)} OpenClaw/acpx {noun}.")
         return
-    if not added:
-        console.print("  ✓ OpenClaw/acpx agents are already imported.")
-        return
-
-    console.print("\n  [bold]OpenClaw/acpx agents found[/bold]")
-    for entry in added:
-        suffix = (
-            ""
-            if command_binary_on_path(entry.command)
-            else " [yellow](binary not found on PATH)[/yellow]"
-        )
-        console.print(
-            f"    • [bold]{escape(entry.name)}[/bold] → [dim]{escape(entry.command)}[/dim]{suffix}"
-        )
-    console.print("  [dim]Omnigent stores only these launch commands, not credentials.[/dim]")
-
-    if not click.confirm("Import coding agents from OpenClaw?", default=True):
-        console.print("  [yellow]Skipped OpenClaw import.[/yellow]")
-        return
-
-    _save_global_config(acp_agents_settings(merged))
-    noun = "agent" if len(added) == 1 else "agents"
-    console.print(f"  ✓ Imported {len(added)} OpenClaw/acpx {noun}.")
 
 
 def _manage_acp_agent(slug: str) -> None:
@@ -3606,7 +3663,6 @@ def _run_configure_harnesses_interactive() -> None:
         from omnigent.onboarding.acp_auth import acp_config_summary
         from omnigent.onboarding.openclaw_config import (
             discover_openclaw_agents,
-            merge_imported_acp_entries,
             openclaw_agents_to_acp_entries,
         )
 
@@ -3623,21 +3679,21 @@ def _run_configure_harnesses_interactive() -> None:
             )
         openclaw_discovery = discover_openclaw_agents()
         openclaw_imported = openclaw_agents_to_acp_entries(openclaw_discovery.agents)
-        _merged, openclaw_added = merge_imported_acp_entries(
-            openclaw_imported, existing=list(acp_summary.agents)
-        )
-        if openclaw_added:
-            count = len(openclaw_added)
+        count = len(openclaw_imported)
+        if count:
             noun = "agent" if count == 1 else "agents"
-            rows.append(
-                (
-                    _ACP_IMPORT,
-                    "Import OpenClaw agents",
-                    f"{count} new {noun}",
-                    "action",
-                    "Import coding agents from OpenClaw/acpx config.",
-                )
+            import_status = f"{count} {noun} found automatically"
+        else:
+            import_status = ""
+        rows.append(
+            (
+                _ACP_IMPORT,
+                "Import from OpenClaw",
+                import_status,
+                "action",
+                "Choose a detected OpenClaw/acpx config or enter another path.",
             )
+        )
         rows.append(
             (
                 _ACP_ADD,
@@ -3664,7 +3720,7 @@ def _run_configure_harnesses_interactive() -> None:
         # Cap the status text from the actual terminal width so verbose status
         # rows (e.g. OpenCode's provider summary) do not wrap in the compact
         # single-line overview.
-        max_status_width = max(8, min(30, term_width - 7 - name_col - len("✓ ")))
+        max_status_width = max(1, min(30, term_width - 7 - name_col - len("✓ ")))
         options: list[str] = []
         selectable: list[bool] = []
         row_target: list[str | None] = []

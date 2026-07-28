@@ -9,6 +9,7 @@ from omnigent.onboarding.openclaw_config import (
     discover_openclaw_agents,
     merge_imported_acp_entries,
     openclaw_agents_to_acp_entries,
+    read_openclaw_config,
     resolve_openclaw_acp_agent,
 )
 
@@ -68,6 +69,58 @@ def test_discovers_openclaw_wrapped_json5_config(tmp_path: Path) -> None:
     assert [(agent.name, agent.command_line, agent.source) for agent in discovery.agents] == [
         ("Claude Code", "npx -y @zed-industries/claude-code-acp", "openclaw")
     ]
+
+
+def test_reads_selected_acpx_config_by_shape(tmp_path: Path) -> None:
+    config = tmp_path / "agents.json"
+    config.write_text(
+        '{"agents": {"Gemini CLI": {"command": "gemini", "args": ["--acp"]}}}',
+        encoding="utf-8",
+    )
+
+    discovery = read_openclaw_config(config)
+
+    assert discovery.errors == ()
+    assert [(agent.name, agent.command_line, agent.source) for agent in discovery.agents] == [
+        ("Gemini CLI", "gemini --acp", "acpx")
+    ]
+
+
+def test_reads_selected_openclaw_config_by_shape(tmp_path: Path) -> None:
+    config = tmp_path / "registry.json"
+    config.write_text(
+        "{plugins: {entries: {acpx: {config: {agents: "
+        '{Goose: {command: "goose", args: ["acp"]}}}}}}}',
+        encoding="utf-8",
+    )
+
+    discovery = read_openclaw_config(config)
+
+    assert discovery.errors == ()
+    assert [(agent.name, agent.command_line, agent.source) for agent in discovery.agents] == [
+        ("Goose", "goose acp", "openclaw")
+    ]
+
+
+def test_selected_unrelated_file_is_rejected(tmp_path: Path) -> None:
+    config = tmp_path / "package.json"
+    config.write_text('{"name": "not-an-agent-registry"}', encoding="utf-8")
+
+    discovery = read_openclaw_config(config)
+
+    assert discovery.agents == ()
+    assert len(discovery.errors) == 1
+    assert discovery.errors[0].message == "file is not an OpenClaw/acpx agent registry"
+
+
+def test_selected_missing_file_is_soft_error(tmp_path: Path) -> None:
+    config = tmp_path / "missing.json"
+
+    discovery = read_openclaw_config(config)
+
+    assert discovery.agents == ()
+    assert len(discovery.errors) == 1
+    assert discovery.errors[0].path == config
 
 
 def test_discovers_both_config_shapes(tmp_path: Path) -> None:

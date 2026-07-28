@@ -79,13 +79,36 @@ def discover_openclaw_agents(
         try:
             if not path.exists():
                 continue
-            raw = _load_config(path, json5_format=source == "openclaw")
-            extracted, extraction_errors = _extract_agents(raw, source=source, path=path)
-            agents.extend(extracted)
-            errors.extend(extraction_errors)
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
             errors.append(OpenClawConfigError(path=path, message=str(exc)))
+            continue
+        discovery = read_openclaw_config(path, source=source)
+        agents.extend(discovery.agents)
+        errors.extend(discovery.errors)
     return OpenClawDiscovery(agents=tuple(agents), errors=tuple(errors))
+
+
+def read_openclaw_config(
+    path: Path,
+    *,
+    source: SourceKind | None = None,
+) -> OpenClawDiscovery:
+    """Read one selected acpx/OpenClaw config file.
+
+    When ``source`` is omitted, detects the top-level acpx ``agents`` shape or
+    the wrapped OpenClaw ``plugins.entries.acpx.config`` shape. Files that match
+    neither are rejected instead of being treated as an empty registry.
+    """
+    try:
+        raw = _load_config(path, json5_format=source != "acpx")
+        resolved_source = source or _detect_source(raw)
+        agents, errors = _extract_agents(raw, source=resolved_source, path=path)
+        return OpenClawDiscovery(agents=tuple(agents), errors=tuple(errors))
+    except (OSError, ValueError) as exc:
+        return OpenClawDiscovery(
+            agents=(),
+            errors=(OpenClawConfigError(path=path, message=str(exc)),),
+        )
 
 
 def openclaw_agents_to_acp_entries(
@@ -221,6 +244,21 @@ def _extract_agents(
             )
         )
     return agents, errors
+
+
+def _detect_source(raw: Any) -> SourceKind:
+    if not isinstance(raw, dict):
+        raise ValueError("config root must be an object")
+    if "agents" in raw:
+        return "acpx"
+    plugins = raw.get("plugins")
+    if isinstance(plugins, dict):
+        entries = plugins.get("entries")
+        if isinstance(entries, dict):
+            acpx = entries.get("acpx")
+            if isinstance(acpx, dict) and isinstance(acpx.get("config"), dict):
+                return "openclaw"
+    raise ValueError("file is not an OpenClaw/acpx agent registry")
 
 
 def _normalize_args(raw: Any, *, agent_name: str) -> tuple[str, ...]:
