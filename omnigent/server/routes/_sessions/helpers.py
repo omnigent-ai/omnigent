@@ -3884,7 +3884,7 @@ async def _validate_session_workspace(
 
     The caller's host ownership is checked BEFORE the ``host.stat``
     round-trip the validation performs, so a non-owner never reaches
-    another user's host (raises 403/404 via ``resolve_host_owner``).
+    another user's host (raises 403/404 via ``resolve_host_access``).
 
     :param user_id: Authenticated caller, e.g.
         ``"alice@example.com"``, or ``None`` when auth is disabled.
@@ -3916,6 +3916,8 @@ async def _validate_session_workspace(
         agent_cache=agent_cache,
         host_store=getattr(request.app.state, "host_store", None),
         host_registry=getattr(request.app.state, "host_registry", None),
+        host_permission_store=getattr(request.app.state, "host_permission_store", None),
+        permission_store=getattr(request.app.state, "permission_store", None),
     )
 
 
@@ -3953,6 +3955,7 @@ async def _launch_runner_on_host_impl(
     conversation_store: ConversationStore,
     host_registry: HostRegistry,
     host_conn: HostConnection,
+    permission_store: PermissionStore | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6421,18 +6424,9 @@ def _build_evaluation_context(
         text = data.get("text") or data.get("content") or str(data)
     else:
         text = str(data)
-    text_str = text if isinstance(text, str) else json.dumps(text)
-    # REQUEST content is the structured dict ({"user_content", "attachments"}) so
-    # every request reaches policies in one shape, whatever the entry point. This
-    # native/terminal path carries no uploads, so ``attachments`` is always empty;
-    # the web input gate (_evaluate_input_policy) is what populates it. RESPONSE
-    # stays a plain string — attachments are an input-only concern.
-    request_or_response_content: Any = (
-        {"user_content": text_str, "attachments": []} if phase == Phase.REQUEST else text_str
-    )
     return EvaluationContext(
         phase=phase,
-        content=request_or_response_content,
+        content=text if isinstance(text, str) else json.dumps(text),
         actor=actor,
         model=hook_model,
         harness=hook_harness,

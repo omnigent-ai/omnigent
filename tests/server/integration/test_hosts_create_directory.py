@@ -32,6 +32,9 @@ from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.host_store import HostStore
 
 # Same liveness-race flake guard as test_hosts_filesystem.py: the mock
@@ -100,7 +103,12 @@ def mkdir_app(
         prefix="/v1",
     )
     app.include_router(
-        create_hosts_router(registry, host_store, conv_store),
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            host_permission_store=SqlAlchemyHostPermissionStore(db_uri),
+        ),
         prefix="/v1",
     )
     return app, registry, host_store, conv_store

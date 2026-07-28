@@ -48,6 +48,9 @@ from omnigent.server.passwords import (
     needs_rehash,
     verify_password,
 )
+from omnigent.stores.host_permission_store.sqlalchemy_store import (
+    SqlAlchemyHostPermissionStore,
+)
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
@@ -437,6 +440,7 @@ def test_resolve_auth_source_defaults_to_header(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     assert resolve_auth_source() == "header"
 
 
@@ -482,7 +486,40 @@ def test_resolve_auth_source_oidc_issuer_ignored_when_auth_disabled(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://accounts.google.com")
+    assert resolve_auth_source() == "header"
+
+
+def test_resolve_auth_source_deprecated_alias_still_selects_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-rename ``OMNIGENT_ACCOUNTS_ENABLED`` alias still works.
+
+    Existing deploys that set the old name must keep booting in accounts
+    mode after the rename. If this regressed, an upgrade would silently
+    drop those deploys back to single-user header mode (no login).
+    """
+    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+    monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
+    assert resolve_auth_source() == "accounts"
+
+
+def test_resolve_auth_source_new_var_wins_over_deprecated_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The current name wins when both names are set.
+
+    A deploy migrating to ``OMNIGENT_AUTH_ENABLED`` can leave the old
+    ``OMNIGENT_ACCOUNTS_ENABLED`` in place: an explicit ``=0`` on the
+    new name disables auth even though the old name is truthy. If the
+    alias took precedence the new value would be unsettable while the
+    old one lingered.
+    """
+    monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
+    monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_ENABLED", "1")
     assert resolve_auth_source() == "header"
 
 
@@ -517,6 +554,7 @@ def test_factory_defaults_to_header_when_env_unset(
     """
     monkeypatch.delenv("OMNIGENT_AUTH_PROVIDER", raising=False)
     monkeypatch.delenv("OMNIGENT_AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_ENABLED", raising=False)
 
     provider = create_auth_provider()
 
@@ -1041,6 +1079,7 @@ def _build_accounts_app(
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_url),
         auth_provider=auth_provider,
         account_store=account_store,
     )
@@ -1132,6 +1171,7 @@ def header_mode_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
         comment_store=comment_store,
         permission_store=permission_store,
         host_store=host_store,
+        host_permission_store=SqlAlchemyHostPermissionStore(db_url),
         auth_provider=auth_provider,
         account_store=None,
     )

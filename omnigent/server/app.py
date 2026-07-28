@@ -99,6 +99,7 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
+from omnigent.stores.host_permission_store import HostPermissionStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -1133,6 +1134,7 @@ def create_app(
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
+    host_permission_store: HostPermissionStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
     extra_routers: list[tuple[Any, str, list[str]]] | None = None,
     policy_modules: list[str] | None = None,
@@ -1188,6 +1190,10 @@ def create_app(
     :param host_store: Store for host registrations. ``None``
         disables host connectivity features (list hosts, launch
         runners on remote hosts).
+    :param host_permission_store: Store for host-sharing grants.
+        Required when ``host_store`` is provided — the host routes
+        resolve owned-or-shared visibility and per-host access through
+        it. ``None`` is allowed only when host support is disabled.
     :param policy_modules: Additional dotted module paths to
         scan for ``POLICY_REGISTRY`` lists at startup, e.g.
         ``["myorg.policies.safety"]``. Sourced from the server
@@ -1453,27 +1459,23 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+            from omnigent.server.scheduled.fire import FireDeps, build_on_fire
 
-            fire_deps = FireDeps(
-                scheduled_task_store=scheduled_task_store,
-                agent_store=agent_store,
-                conversation_store=conversation_store,
-                permission_store=permission_store,
-                host_store=host_store,
-                host_registry=host_registry,
-                agent_cache=agent_cache,
-                runner_router=runner_router,
-                tunnel_registry=tunnel_registry,
-                file_store=file_store,
-                artifact_store=artifact_store,
+            on_fire = build_on_fire(
+                FireDeps(
+                    scheduled_task_store=scheduled_task_store,
+                    agent_store=agent_store,
+                    conversation_store=conversation_store,
+                    permission_store=permission_store,
+                    host_store=host_store,
+                    host_registry=host_registry,
+                    agent_cache=agent_cache,
+                    runner_router=runner_router,
+                    tunnel_registry=tunnel_registry,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                )
             )
-            on_fire = build_on_fire(fire_deps)
-            # The manual "run now" trigger reuses the same fire path (dispatch /
-            # preflight / in-flight guard) as the scheduler; it only differs in
-            # allowing a paused task to fire. Exposed on app.state for the
-            # POST /v1/scheduled-tasks/{id}/run route.
-            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
                 on_fire=on_fire,
@@ -1544,6 +1546,8 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    app.state.host_permission_store = host_permission_store
+    app.state.permission_store = permission_store
     app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
@@ -1555,6 +1559,7 @@ def create_app(
     from omnigent.server.admin_list import load_admin_list
 
     admin_list = load_admin_list(extra=frozenset(admins or ()))
+    app.state.admin_list = admin_list
     # Session-sharing policy, normalized to a per-request callable, plus a
     # ``sharing_mode_writable`` flag gating the admin ``PUT /v1/sharing``
     # endpoint.
@@ -2675,6 +2680,13 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        if host_permission_store is None:
+            # Host routes resolve owned-or-shared visibility and per-host
+            # access through the host permission store; mounting them
+            # without it would 500 on every host request. Fail loud at
+            # wiring time instead.
+            raise ValueError("host_permission_store is required when host_store is provided")
+
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
 
@@ -2700,10 +2712,14 @@ def create_app(
                 host_registry,
                 host_store,
                 conversation_store,
+                host_permission_store=host_permission_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
                 agent_store=agent_store,
                 agent_cache=agent_cache,
+                # Same roster /v1/me consults, so the admin fleet view
+                # authorizes exactly the users the SPA shows it to.
+                admin_list=admin_list,
             ),
             prefix="/v1",
             tags=["hosts"],
