@@ -1,5 +1,7 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { UserMessageBlock } from "@/lib/blocks";
+import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { HistoryAutoLoader, JumpToTopButton } from "./ChatPage";
 
@@ -12,6 +14,21 @@ vi.mock("use-stick-to-bottom", () => ({
 }));
 
 const originalLoadMoreHistory = useChatStore.getState().loadMoreHistory;
+
+function userBlock(id: string, text = id): UserMessageBlock {
+  return {
+    type: "user_message",
+    ctx: {
+      agent: null,
+      depth: 0,
+      turn: 0,
+      timestamp: 0,
+      responseId: id,
+      itemId: id,
+    },
+    content: [{ type: "input_text", text }],
+  };
+}
 
 /**
  * Installs mutable layout metrics on a jsdom element.
@@ -45,6 +62,13 @@ function setScrollMetrics(
 describe("HistoryAutoLoader", () => {
   beforeEach(() => {
     stickContext.scrollRef.current = null;
+    useChatStore.setState({
+      blocks: [userBlock("user_1"), userBlock("user_2")],
+      hasMoreHistory: false,
+      loadingMoreHistory: false,
+      loadingInitialWindow: false,
+      historyGeneration: 0,
+    });
   });
 
   afterEach(() => {
@@ -94,12 +118,104 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
+  it("loads to the second real user prompt even when the viewport already scrolls", async () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({
+      blocks: [userBlock("latest"), userBlock("system", "[System: task completed]")],
+      loadMoreHistory,
+    });
+    const scrollRoot = document.createElement("div");
+    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    const view = render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState().loadingInitialWindow).toBe(true);
+
+    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
+    act(() => {
+      useChatStore.setState({ blocks: [userBlock("previous"), userBlock("latest")] });
+    });
+    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+
+    await waitFor(() => expect(useChatStore.getState().loadingInitialWindow).toBe(false));
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps the prompt search but keeps filling an underflowing viewport", async () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ blocks: [userBlock("latest")], loadMoreHistory });
+
+    const holder: { cb: (() => void) | null } = { cb: null };
+    class StubResizeObserver {
+      constructor(cb: () => void) {
+        holder.cb = cb;
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    const view = render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    // The newest page counts as page one. Settle seven older pages without
+    // finding another prompt; the semantic search must then stop at the cap.
+    for (let page = 2; page < MAX_INITIAL_PAGES; page++) {
+      view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
+      view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    }
+    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
+    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+
+    await waitFor(() => expect(useChatStore.getState().loadingInitialWindow).toBe(false));
+    expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES - 1);
+
+    // Once the viewport underflows, reachability wins over the prompt cap.
+    metrics.clientHeight = 1200;
+    act(() => holder.cb?.());
+    expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES);
+    expect(useChatStore.getState().loadingInitialWindow).toBe(true);
+  });
+
   it("auto-loads when the window is too short to scroll", () => {
     const loadMoreHistory = vi.fn(async () => {});
     useChatStore.setState({ loadMoreHistory });
     const scrollRoot = document.createElement("div");
     // Content shorter than the viewport → no scrollbar, scroll trigger can't fire.
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 100, clientHeight: 500 });
+    stickContext.scrollRef.current = scrollRoot;
+
+    render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not count the transient spinner toward viewport fill", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    const spinner = document.createElement("div");
+    spinner.dataset.initialHistorySpinner = "";
+    vi.spyOn(spinner, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      top: 0,
+      right: 0,
+      bottom: 30,
+      left: 0,
+      width: 0,
+      height: 30,
+      toJSON: () => ({}),
+    });
+    scrollRoot.append(spinner);
+    setScrollMetrics(scrollRoot, { scrollTop: 20, scrollHeight: 520, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);

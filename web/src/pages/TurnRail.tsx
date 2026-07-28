@@ -26,12 +26,6 @@ type Scroller = { el: HTMLElement };
 // older history — mirrors HistoryAutoLoader's transcript threshold.
 const FETCH_TOP_PX = 40;
 
-// How many ticks to show on first load. The transcript's initial history
-// window is only "back to the previous user message" (a turn or two), so the
-// rail eagerly pages older history up to this many turns — then the user
-// scrolls the rail up for more. Matches the "≤20 ticks initially" spec.
-const INITIAL_TURNS = 20;
-
 // Width of the top/bottom fade ramps, in px. Single source of truth: fed to
 // the CSS mask via the --turn-rail-fade variable AND used as the usable-edge
 // inset in the thumb-tracking math below, so the mask and the math stay in
@@ -73,12 +67,6 @@ export function TurnRail({
   // Vertical center of the hovered tick within the rail's own coordinate
   // space, so the (rail-relative) preview box tracks it as the rail scrolls.
   const [previewTop, setPreviewTop] = useState(0);
-  // Gate the first paint until the eager back-fill settles, so the rail fades
-  // in once at its full run of ticks instead of flashing the initial 2-turn
-  // window before older history lands. Latches true and stays true — later
-  // scroll-up loads must not re-hide it.
-  const [revealed, setRevealed] = useState(false);
-
   const scrollEl = scroller?.el ?? null;
 
   // Track which turns' messages are on screen, so their ticks read as active.
@@ -149,7 +137,7 @@ export function TurnRail({
     const rail = railRef.current;
     if (!rail || visibleIds.size === 0) return;
     // Don't fight the user: while they're browsing the rail (pointer over it),
-    // a `turns` change from eager/scroll-up history loading must not snap the
+    // a `turns` change from history loading must not snap the
     // rail back to the transcript's visible run.
     if (interactingRef.current) return;
     let top = Infinity;
@@ -178,36 +166,12 @@ export function TurnRail({
     const clamped = Math.max(0, Math.min(next, max));
     if (Math.abs(clamped - rail.scrollTop) < 1) return;
     rail.scrollTo({ top: clamped, behavior: "smooth" });
-    // Re-run on `turns` too, not just `visibleIds`: eager-loading older history
+    // Re-run on `turns` too, not just `visibleIds`: loading older history
     // prepends ticks without changing which transcript turns are on screen, so
     // `visibleIds` stays put. Without this, a fresh load (pinned to the bottom)
     // leaves the rail stuck at the top with the active run stranded off-screen
     // below the fade — the reported "should start at the bottom" bug.
   }, [visibleIds, turns]);
-
-  // Eagerly page older history until the rail has its initial run of ticks.
-  // The first history window holds only a turn or two (20 items ≈ a handful of
-  // user turns), so without this the rail is a short, unscrollable stub. This
-  // pages back-to-back and commits once (loadHistoryUntilUserMessages) so the
-  // rail lands at ~INITIAL_TURNS ticks.
-  //
-  // Depends on loadingMoreHistory + hasMoreHistory, not just turns.length: the
-  // first call can land while the initial bind still holds the history lock and
-  // no-op. Re-running when the lock releases (and while more history exists)
-  // resumes paging instead of wedging at the partial set.
-  useEffect(() => {
-    if (turns.length >= INITIAL_TURNS || !hasMoreHistory || loadingMoreHistory) return;
-    void useChatStore.getState().loadHistoryUntilUserMessages(INITIAL_TURNS);
-  }, [turns.length, hasMoreHistory, loadingMoreHistory]);
-
-  // Reveal the rail once the eager back-fill has settled: either it reached the
-  // initial run of ticks, or history ran out first (a genuinely short session).
-  // Gating on !loadingMoreHistory avoids revealing mid-fetch at a partial count.
-  // Latches once — never reset — so scroll-up loads later don't re-hide it.
-  useEffect(() => {
-    if (revealed || loadingMoreHistory) return;
-    if (turns.length >= INITIAL_TURNS || !hasMoreHistory) setRevealed(true);
-  }, [revealed, turns.length, hasMoreHistory, loadingMoreHistory]);
 
   // Page in older history when the rail nears its own top. Two triggers:
   //  - scroll: fires when the ticks overflow the box and the user scrolls up.
@@ -339,14 +303,9 @@ export function TurnRail({
       // Vertically centered on the left edge (not full-height) so a short run
       // of ticks sits mid-page rather than clustering at the top. The row is
       // wide enough for the ticks; the preview box overflows to the right.
-      // Fades in once the eager back-fill settles (see `revealed`) so the rail
-      // doesn't flash the initial 2-turn window before older history lands.
       // Hidden on mobile (max-md:hidden): the rail is a hover minimap and
       // touch has no hover, so mobile keeps the ↑↓ nav buttons instead.
-      className={cn(
-        "pointer-events-none absolute left-0 top-1/2 z-40 flex w-6 -translate-y-1/2 items-center transition-opacity duration-200 max-md:hidden",
-        revealed ? "opacity-100" : "opacity-0",
-      )}
+      className="pointer-events-none absolute left-0 top-1/2 z-40 flex w-6 -translate-y-1/2 items-center max-md:hidden"
       onMouseLeave={() => {
         interactingRef.current = false;
         setHoveredId(null);
@@ -367,12 +326,8 @@ export function TurnRail({
         // past both ends. items-start (not center) so a hover-widened tick
         // extends rightward from a fixed left edge instead of re-centering the
         // column; pl-2 insets the dashes from the screen edge; scrollbar hidden
-        // — this is chrome. pointer-events only once revealed, so the invisible
-        // (opacity-0) rail isn't a silent click target before it fades in.
-        className={cn(
-          "turn-rail-fade flex max-h-72 flex-col items-start overflow-y-auto py-6 pl-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-          revealed ? "pointer-events-auto" : "pointer-events-none",
-        )}
+        // — this is chrome.
+        className="turn-rail-fade pointer-events-auto flex max-h-72 flex-col items-start overflow-y-auto py-6 pl-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
       >
         {turns.map((turn) => {
           const isHovered = turn.itemId === hoveredId;

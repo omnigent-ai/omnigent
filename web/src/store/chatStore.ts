@@ -54,8 +54,6 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
-import type { ConversationItem } from "@/lib/conversationItems";
-import { isSystemUserContent } from "@/lib/systemMessage";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -66,9 +64,7 @@ import {
   getSessionSlim,
   fetchInitialHistoryWindow,
   fetchSessionItemsPage,
-  initialWindowComplete,
   interrupt as interruptSession,
-  MAX_INITIAL_PAGES,
   openSessionStream,
   postEvent,
   type SessionItemsPage,
@@ -401,13 +397,7 @@ export interface ChatState {
   hasMoreHistory: boolean;
   /** True while a `loadMoreHistory` fetch is in flight. */
   loadingMoreHistory: boolean;
-  /**
-   * True while the post-render initial-window backfill is paging older
-   * items to satisfy the "last two user prompts" boundary. Bind renders
-   * the first page immediately, then fills the rest in the background;
-   * this drives the top-of-history spinner so the user sees more is
-   * coming rather than a truncated transcript. See `backfillInitialWindow`.
-   */
+  /** True while the post-render history loader is building the initial window. */
   loadingInitialWindow: boolean;
   /**
    * The item id at the start of the current `blocks` history window —
@@ -656,14 +646,6 @@ export interface ChatState {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: () => Promise<void>;
-  /**
-   * Page older history back-to-back until at least `minUserMessages` user
-   * prompts are loaded (or history runs out), committing all pages in ONE
-   * update. Used by the turn rail so it lands with its initial run of ticks
-   * in a single render instead of growing page-by-page. No-op if the target
-   * is already met or a fetch is already in flight.
-   */
-  loadHistoryUntilUserMessages: (minUserMessages: number) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -1879,103 +1861,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ loadingMoreHistory: false, hasMoreHistory: false });
     }
   },
-
-  loadHistoryUntilUserMessages: async (minUserMessages) => {
-    const start = get();
-    if (start.loadingMoreHistory) return;
-    // Count only REAL user turns, not `[System: …]` marker blocks (task/timer/
-    // sub-agent notices arrive as user-role). The rail derives its ticks from
-    // the same non-system predicate, so counting markers here would let the
-    // loader hit the target while the rail has too few ticks — and, since the
-    // early-return leaves hasMoreHistory set, wedge the rail permanently hidden.
-    const countUsers = (blocks: AnyBlock[]): number =>
-      blocks.reduce(
-        (n, b) => n + (b.type === "user_message" && !isSystemUserContent(b.content) ? 1 : 0),
-        0,
-      );
-    // Users already in state count toward the target: we only need to fetch
-    // enough MORE to top up to minUserMessages, else we overshoot by whatever
-    // state already holds and blow past the "≤20 ticks initially" intent.
-    const existingUsers = countUsers(start.blocks);
-    if (existingUsers >= minUserMessages) return;
-
-    const { conversationId, historyGeneration } = start;
-    if (!conversationId) return;
-    const stale = (): boolean =>
-      get().conversationId !== conversationId || get().historyGeneration !== historyGeneration;
-
-    // Page older windows into a local buffer, then commit ONCE so the rail
-    // (and transcript) jump straight to the initial run of turns rather than
-    // growing one page per render. Large per-page limit because turns can span
-    // many items (tool calls, reasoning) — a turn here averages well over the
-    // default 20-item page, so small pages would need a dozen+ round-trips to
-    // reach the target. Bounded page count is a backstop against a pathological
-    // single turn.
-    const EAGER_PAGE_LIMIT = 200;
-    const MAX_EAGER_PAGES = 10;
-    set({ loadingMoreHistory: true });
-    let cursor = start.oldestItemId;
-    let hasMore = start.hasMoreHistory;
-    const older: AnyBlock[] = [];
-    const seenNew = new Set<string>();
-    // Commit whatever pages we gathered, even on a mid-loop error — discarding
-    // the buffer would lose progress AND leave turns.length unchanged, so the
-    // rail's eager-load effect (keyed on it) would never re-fire and the rail
-    // would wedge at a partial, unscrollable set of ticks.
-    const commit = () => {
-      set((state) => {
-        const seen = new Set(
-          state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
-        );
-        const unique = older.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
-        return {
-          blocks: [...unique, ...state.blocks],
-          hasMoreHistory: hasMore,
-          oldestItemId: cursor ?? state.oldestItemId,
-          loadingMoreHistory: false,
-        };
-      });
-    };
-    try {
-      // Each page starts before the cursor returned by the prior page.
-      /* oxlint-disable no-await-in-loop */
-      for (let pages = 0; pages < MAX_EAGER_PAGES && hasMore && cursor; pages++) {
-        const page = await fetchSessionItemsPage(conversationId, {
-          olderThan: cursor,
-          limit: EAGER_PAGE_LIMIT,
-        });
-        if (stale()) return;
-        hasMore = page.hasMore;
-        cursor = page.items[0]?.id ?? cursor;
-        // Each page is chronological (oldest→newest) and older than the last.
-        // Collect this page's new blocks in order, then prepend the whole page
-        // as a group — prepending item-by-item would reverse each page's
-        // internal order, scrambling the transcript.
-        const pageBlocks: AnyBlock[] = [];
-        for (const b of itemsToBlocks(page.items)) {
-          const iid = b.ctx.itemId;
-          if (iid && seenNew.has(iid)) continue;
-          if (iid) seenNew.add(iid);
-          pageBlocks.push(b);
-        }
-        older.unshift(...pageBlocks);
-        if (existingUsers + countUsers(older) >= minUserMessages) break;
-        if (!page.items[0]?.id) break;
-      }
-      /* oxlint-enable no-await-in-loop */
-      commit();
-    } catch {
-      if (stale()) return;
-      // Commit progress, but disable further history fetches. This function is
-      // auto-fired by the rail's eager-load effect (no user gesture), so a
-      // persistent failure that left hasMoreHistory true would re-arm the
-      // effect on the very next render — a tight retry loop hammering the
-      // failing endpoint. Matching loadMoreHistory's policy stops the loop
-      // (and lets the rail's `revealed` latch instead of staying hidden).
-      hasMore = false;
-      commit();
-    }
-  },
 }));
 
 // ── Internal helpers ─────────────────────────────────────
@@ -2352,22 +2237,16 @@ async function bindStream(
   // Always refetch the snapshot on bind. A cached session snapshot can
   // be stale after the agent commits new items while the user is viewing
   // another conversation; reusing it drops messages until a page refresh.
-  // History is windowed to max(one page, back-to-previous-user-message)
-  // so opening a long transcript stays fast while still showing the last
-  // full turn and its preceding prompt; `loadMoreHistory` pages older on
-  // scroll-up. See `fetchInitialHistoryWindow`.
+  // Bind waits for only the newest page. HistoryAutoLoader grows the initial
+  // window after render, and `loadMoreHistory` handles later scroll-up paging.
   // `retry: false` because the most common failure here is "invalid conv
   // id in URL" (not transient).
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   try {
-    // Fetch only the FIRST page here so the transcript renders as soon as
-    // the newest items arrive. The rest of the initial window (paging back
-    // to the previous user prompt) fills in via `backfillInitialWindow`
-    // after this bind commits — a top-of-history spinner covers the gap.
-    // Previously this awaited the whole multi-page window, blocking first
-    // paint on up to `MAX_INITIAL_PAGES` serial round-trips.
+    // Fetch one page here so the newest items can render after one round-trip.
+    // HistoryAutoLoader fetches any additional initial pages after this commit.
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
@@ -2453,9 +2332,6 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
-    // Page the rest of the initial window in the background only when the
-    // first page didn't already reach the boundary and older items exist.
-    const needsBackfill = page.hasMore && !initialWindowComplete(items);
     set((state) => {
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
@@ -2617,10 +2493,7 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        // Arm the top-of-history spinner when the first page didn't already
-        // reach the previous-prompt boundary; `backfillInitialWindow` (fired
-        // below) pages the rest and clears this.
-        loadingInitialWindow: needsBackfill,
+        loadingInitialWindow: false,
         sessionStatus: session.status,
         // Re-show "N background tasks still running" after a reload/navigate-back: the
         // live SSE edge that set this is long gone, so the count rides in on
@@ -2647,85 +2520,12 @@ async function bindStream(
       };
     });
     racedNativeModelOptions.delete(id);
-    // Fill the rest of the initial window after first paint (not awaited):
-    // page older items until the previous-prompt boundary is reached, with
-    // the top spinner lit. Pinned to this bind's generation so a navigate-
-    // away/back or reconnect that resets the window cancels it.
-    if (needsBackfill) {
-      void backfillInitialWindow(id, page.items, get().historyGeneration, set, get);
-    }
   } catch (err) {
     if (get().conversationId !== id) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
-  }
-}
-
-/**
- * Page older history after the initial bind until the initial-window
- * boundary (`initialWindowComplete`) is reached or history runs out —
- * the deferred remainder of what `fetchInitialHistoryWindow` used to
- * fetch synchronously before first paint. Continues the same paging loop
- * across the render boundary: `windowItems` seeds it with the first page
- * (already rendered) so the boundary is evaluated on the same accumulated
- * item view the old synchronous helper used.
- *
- * Runs in the background with `loadingInitialWindow` lit (top-of-history
- * spinner) and holds the `loadingMoreHistory` lock so scroll-up / rail
- * loaders don't fetch the same pages concurrently. Bounded by
- * `MAX_INITIAL_PAGES` (the first page counts as one); if the cap is hit
- * mid-turn, `hasMoreHistory` stays true so the rest is reachable via
- * scroll-up. Drops its result if the window was reset while a page was in
- * flight (generation guard), mirroring `loadMoreHistory`.
- */
-async function backfillInitialWindow(
-  id: string,
-  firstPageItems: ConversationItem[],
-  generation: number,
-  set: Setter,
-  get: Getter,
-): Promise<void> {
-  const stale = (): boolean =>
-    get().conversationId !== id || get().historyGeneration !== generation;
-  // Accumulate items exactly as fetchInitialHistoryWindow did, seeded with
-  // the already-rendered first page, so `initialWindowComplete` sees the
-  // full window (not just the latest page) when deciding to stop.
-  let windowItems = firstPageItems;
-  set({ loadingMoreHistory: true });
-  try {
-    // The first page counts as page 0; cap the extra pages so the total
-    // matches the old synchronous window's bound.
-    for (let pages = 1; pages < MAX_INITIAL_PAGES; pages++) {
-      const cursor = windowItems[0]?.id;
-      if (!cursor) break; // no cursor to page further; avoid a spin
-      const { items, hasMore } = await fetchSessionItemsPage(id, { olderThan: cursor });
-      if (stale()) return;
-      windowItems = [...items, ...windowItems]; // prepend the older page
-      const newBlocks = itemsToBlocks(items);
-      set((state) => {
-        // Dedupe against the current window: a live-pump item or an
-        // overlapping page could already be present.
-        const seen = new Set(
-          state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
-        );
-        const unique = newBlocks.filter((b) => !b.ctx.itemId || !seen.has(b.ctx.itemId));
-        return {
-          blocks: [...unique, ...state.blocks],
-          hasMoreHistory: hasMore,
-          oldestItemId: items[0]?.id ?? state.oldestItemId,
-        };
-      });
-      if (!hasMore || initialWindowComplete(windowItems)) break;
-    }
-  } catch {
-    // Match loadMoreHistory: a persistent failure must not leave the
-    // scroll-up / rail loaders re-arming against a broken endpoint.
-    if (stale()) return;
-    set({ hasMoreHistory: false });
-  } finally {
-    if (!stale()) set({ loadingMoreHistory: false, loadingInitialWindow: false });
   }
 }
 

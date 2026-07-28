@@ -57,6 +57,7 @@ import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { initialWindowComplete } from "@/lib/sessionsApi";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
@@ -1456,8 +1457,7 @@ function MainAgentSurface({
   const terminalFirst = useTerminalFirst();
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
   // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
-  // mobile never runs its eager history backfill (up to 2000 items/open) for a
-  // rail the user can't see.
+  // mobile never mounts observers and history listeners for a rail it can't see.
   const isMobileViewport = useIsMobileViewport();
   // Mirrors ChatPage's `sandboxLaunching`: while the managed-sandbox
   // launch runs, the composer must stay sendable — the server parks
@@ -1470,10 +1470,7 @@ function MainAgentSurface({
   // staring at a fresh session during a slow MCP boot sees the startup band
   // instead of a bare "What should we work on?" empty state.
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
-  // True while the post-render initial-window backfill is still paging older
-  // items toward the previous-prompt boundary. Drives the top-of-history
-  // spinner so opening a conversation shows the newest turn immediately with
-  // a "loading earlier messages" cue rather than blocking on the full window.
+  // True while the post-render loader builds the initial history window.
   const loadingInitialWindow = useChatStore((s) => s.loadingInitialWindow);
   // Render the inline terminal whenever the user has opted in via the
   // connection pill. The terminal surface owns its no-terminal state,
@@ -1503,8 +1500,8 @@ function MainAgentSurface({
   // One rail tick per real user turn, paired with a preview of the reply that
   // followed. Walk bubbles in order: each non-system user bubble opens a turn,
   // and the first assistant text after it (before the next user bubble) is the
-  // preview. Same first-page window as the transcript, so a fresh load shows
-  // ≤20 ticks and older ones page in on scroll-up.
+  // preview. It mirrors the transcript's loaded window and grows lazily as
+  // older pages arrive.
   const turns = useMemo<Turn[]>(() => {
     const out: Turn[] = [];
     for (let i = 0; i < bubbles.length; i++) {
@@ -1754,13 +1751,12 @@ function MainAgentSurface({
               )
             ) : (
               <>
-                {/* Top-of-history spinner while the initial-window backfill
-                    pages older items in the background (see
-                    `backfillInitialWindow`). Sits above the oldest loaded
-                    bubble so the newest turn renders immediately and the user
-                    sees earlier messages are still arriving. */}
+                {/* The newest page renders first; older initial pages arrive here. */}
                 {loadingInitialWindow && (
-                  <div className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm">
+                  <div
+                    data-initial-history-spinner
+                    className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm"
+                  >
                     <Loader2Icon className="size-4 animate-spin" aria-hidden />
                     Loading earlier messages…
                   </div>
@@ -1836,8 +1832,7 @@ function MainAgentSurface({
         {/* Left-edge minimap: one tick per turn, scrolls independently, pages
             in older history on scroll-up. Sibling of Conversation for the same
             reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
-            Desktop-only: not mounted on mobile so its eager backfill never
-            runs where the rail is hidden. */}
+            Desktop-only: not mounted on mobile where the rail is hidden. */}
         {!isMobileViewport && (
           <TurnRail
             turns={turns}
@@ -2121,19 +2116,8 @@ function PreserveScrollDistanceOnResize() {
 }
 
 /**
- * Headless older-history loader. Pages older session items in two ways
- * with no visible control:
- *
- * 1. Near-top scroll trigger — fetches as the user scrolls toward the top.
- * 2. Viewport-fill guard — when the loaded window is too short to produce a
- *    scrollbar (so the scroll trigger can never fire), keeps paging until
- *    the content overflows or history runs out, keeping older messages
- *    reachable without a button.
- *
- * Must be rendered inside a `StickToBottom` tree to access `scrollRef`.
- *
- * @param hasMoreHistory - Whether older messages exist before the loaded window.
- * @param loadingMoreHistory - Whether an older-history page is currently loading.
+ * Builds the initial history window after first paint, then loads on scroll-up.
+ * Viewport filling remains uncapped so older history never becomes unreachable.
  */
 export function HistoryAutoLoader({
   hasMoreHistory,
@@ -2148,17 +2132,35 @@ export function HistoryAutoLoader({
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
     scrollRef: React.RefObject<HTMLElement>;
   };
+  const historyGeneration = useChatStore((s) => s.historyGeneration);
+  const userPromptCount = useChatStore((s) =>
+    s.blocks.reduce(
+      (count, block) =>
+        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
+      0,
+    ),
+  );
+  const pagesFetchedRef = useRef(1);
+
+  useEffect(() => {
+    pagesFetchedRef.current = 1;
+    useChatStore.setState({ loadingInitialWindow: false });
+  }, [historyGeneration]);
 
   // Preserve scroll position when items are prepended after a scroll-up
   // fetch. Snapshot scrollHeight before the call; restore the offset in a
   // layout effect so the visible content doesn't jump.
   const prevScrollHeightRef = useRef<number | null>(null);
   const loadOlderPreservingOffset = useCallback(() => {
-    if (!hasMoreHistory || loadingMoreHistory) return;
+    if (!hasMoreHistory || loadingMoreHistory || useChatStore.getState().loadingMoreHistory) return;
     const el = ctx.scrollRef?.current;
     if (el) prevScrollHeightRef.current = el.scrollHeight;
+    if (!initialWindowComplete(userPromptCount, pagesFetchedRef.current)) {
+      pagesFetchedRef.current += 1;
+      useChatStore.setState({ loadingInitialWindow: true });
+    }
     void useChatStore.getState().loadMoreHistory();
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
+  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, userPromptCount]);
 
   useLayoutEffect(() => {
     const el = ctx.scrollRef?.current;
@@ -2183,23 +2185,34 @@ export function HistoryAutoLoader({
     return () => el.removeEventListener("scroll", handleScroll);
   }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, loadOlderPreservingOffset]);
 
-  // Viewport-fill guard. When the loaded window is too short to overflow, page
-  // again so older history stays reachable without a scrollbar to scroll up.
-  // No offset snapshot here: with a short window the user sits at the bottom
-  // and use-stick-to-bottom keeps them pinned as older items prepend.
-  const maybeFillViewport = useCallback(() => {
+  // Continue until the prompt boundary is satisfied AND the viewport scrolls.
+  // The page cap is inside initialWindowComplete, so it never caps viewport fill.
+  const maybeBuildInitialWindow = useCallback(() => {
     const el = ctx.scrollRef?.current;
-    if (!el || !hasMoreHistory || loadingMoreHistory) return;
-    if (el.scrollHeight <= el.clientHeight) {
-      void useChatStore.getState().loadMoreHistory();
+    if (!el || loadingMoreHistory || useChatStore.getState().loadingMoreHistory) return;
+    if (!hasMoreHistory) {
+      useChatStore.setState({ loadingInitialWindow: false });
+      return;
     }
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory]);
+    const needsPromptBoundary = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
+    // The transient spinner must not be what creates the scrollbar.
+    const spinnerHeight =
+      el.querySelector<HTMLElement>("[data-initial-history-spinner]")?.getBoundingClientRect()
+        .height ?? 0;
+    const needsViewportFill = el.scrollHeight - spinnerHeight <= el.clientHeight;
+    if (!needsPromptBoundary && !needsViewportFill) {
+      useChatStore.setState({ loadingInitialWindow: false });
+      return;
+    }
+    pagesFetchedRef.current += 1;
+    useChatStore.setState({ loadingInitialWindow: true });
+    void useChatStore.getState().loadMoreHistory();
+  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, userPromptCount]);
 
-  // Re-check on mount and whenever a fetch settles (loadingMoreHistory flips
-  // back to false): if content still doesn't overflow, the callback pages again.
+  // Re-check after every prepend so layout can settle between requests.
   useEffect(() => {
-    maybeFillViewport();
-  }, [maybeFillViewport]);
+    maybeBuildInitialWindow();
+  }, [maybeBuildInitialWindow]);
 
   // Re-check when the viewport grows (window resize, side panel close): a
   // previously-scrollable window can stop overflowing, removing the scrollbar
@@ -2207,10 +2220,10 @@ export function HistoryAutoLoader({
   useEffect(() => {
     const el = ctx.scrollRef?.current;
     if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => maybeFillViewport());
+    const observer = new ResizeObserver(() => maybeBuildInitialWindow());
     observer.observe(el);
     return () => observer.disconnect();
-  }, [ctx.scrollRef, maybeFillViewport]);
+  }, [ctx.scrollRef, maybeBuildInitialWindow]);
 
   // No visible control — history loads purely on scroll-up / viewport fill.
   return null;
