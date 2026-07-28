@@ -1825,18 +1825,23 @@ function selectValueToProject(value: string): string | undefined {
   return value.slice(PROJECT_VALUE_PREFIX.length);
 }
 
-function dateGroupLabel(timestampSec: number): string {
+function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   const date = new Date(timestampSec * 1000);
-  const now = new Date();
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const startOfYesterday = new Date(startOfToday.getTime() - 86_400_000);
-  const startOf7DaysAgo = new Date(startOfToday.getTime() - 7 * 86_400_000);
-  const startOf30DaysAgo = new Date(startOfToday.getTime() - 30 * 86_400_000);
+
+  const yesterday = new Date(startOfToday);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const sevenDaysAgo = new Date(startOfToday);
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+  const thirtyDaysAgo = new Date(startOfToday);
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
   if (date >= startOfToday) return "Today";
-  if (date >= startOfYesterday) return "Yesterday";
-  if (date >= startOf7DaysAgo) return "Previous 7 days";
-  if (date >= startOf30DaysAgo) return "Previous 30 days";
+  if (date >= yesterday) return "Yesterday";
+  if (date >= sevenDaysAgo) return "Previous 7 days";
+  if (date >= thirtyDaysAgo) return "Previous 30 days";
   return date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
 }
 

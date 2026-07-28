@@ -929,4 +929,37 @@ describe("SettingsPage", () => {
     expect(screen.getByTestId("archived-row")).toBeInTheDocument();
     expect(screen.getByText("Deep archive")).toBeInTheDocument();
   });
+
+  it("groups archived sessions under date headers", () => {
+    // Fix "now" to 2026-07-15T12:00:00Z so bucket boundaries are deterministic.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-07-15T12:00:00Z"));
+
+    const todaySec = new Date("2026-07-15T10:00:00Z").getTime() / 1000;
+    const yesterdaySec = new Date("2026-07-14T08:00:00Z").getTime() / 1000;
+    const fiveDaysAgoSec = new Date("2026-07-10T08:00:00Z").getTime() / 1000;
+    const twentyDaysAgoSec = new Date("2026-06-25T08:00:00Z").getTime() / 1000;
+    const oldSec = new Date("2026-03-01T08:00:00Z").getTime() / 1000;
+
+    mocks.conversations = [
+      conv("c_today", { archived: true, title: "Today chat", updated_at: todaySec }),
+      conv("c_yesterday", { archived: true, title: "Yesterday chat", updated_at: yesterdaySec }),
+      conv("c_week", { archived: true, title: "This week chat", updated_at: fiveDaysAgoSec }),
+      conv("c_month", { archived: true, title: "This month chat", updated_at: twentyDaysAgoSec }),
+      conv("c_old", { archived: true, title: "Old chat", updated_at: oldSec }),
+    ];
+    renderPage("/settings/archived");
+
+    expect(screen.getByText("Today")).toBeInTheDocument();
+    expect(screen.getByText("Yesterday")).toBeInTheDocument();
+    expect(screen.getByText("Previous 7 days")).toBeInTheDocument();
+    expect(screen.getByText("Previous 30 days")).toBeInTheDocument();
+    // March 2026 — locale-dependent label for the oldest session.
+    expect(screen.getByText(/March.*2026/)).toBeInTheDocument();
+
+    // Each session renders under its respective group.
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(5);
+
+    vi.useRealTimers();
+  });
 });
