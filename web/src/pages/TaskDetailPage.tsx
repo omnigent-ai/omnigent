@@ -436,7 +436,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
         <TriangleAlertIcon
           data-testid="run-status-icon"
           data-run-icon="failed"
-          className="size-3 shrink-0 text-amber-500"
+          className="size-3.5 shrink-0 text-amber-500"
         />
       </IndicatorWithTooltip>
     );
@@ -447,7 +447,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
         <CalendarOffIcon
           data-testid="run-status-icon"
           data-run-icon="skipped"
-          className="size-3 shrink-0 text-muted-foreground"
+          className="size-3.5 shrink-0 text-muted-foreground"
         />
       </IndicatorWithTooltip>
     );
