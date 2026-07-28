@@ -226,7 +226,9 @@ jobs:
         if: steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          OMNIGENT_AGENT_MODEL: ${{ vars.OMNIGENT_CI_FAST_ANTHROPIC_MODEL }}
         run: |
+          : "${OMNIGENT_AGENT_MODEL:?Set OMNIGENT_CI_FAST_ANTHROPIC_MODEL}"
           mkdir -p "$HOME/.omnigent"
           python3 -c "
           import pathlib, os, json
@@ -239,7 +241,7 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': 'databricks-claude-sonnet-4-6'},
+                          'models': {'default': os.environ['OMNIGENT_AGENT_MODEL']},
                       },
                   }
               }

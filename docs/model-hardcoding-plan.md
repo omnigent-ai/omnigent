@@ -8,9 +8,8 @@ the hook while net-new pins still fail.
 
 The remaining pins fall into a few buckets:
 
-- **CI automation:** `.github/actions/*`, `.github/scripts/ci/*`, and
-  `.github/workflows/*` pin Databricks gateway models for review bots, release
-  helpers, image generation, and integration stress jobs.
+- **CI automation:** model roles are read from repository variables; mock-only
+  integration jobs use the protocol-level `mock-model` fixture id.
 - **Harness defaults:** native/executor launch paths such as
   `omnigent/pi_native_credentials.py`, `omnigent/opencode_native_provider.py`,
   `omnigent/inner/*_executor.py`, and `omnigent/codex_native_app_server.py`
@@ -152,3 +151,19 @@ bound runner and forwards the CLI's model ids, default, descriptions, context
 windows, and credit rates. The server caches the runner response through the
 same asynchronous picker path as Codex, so provider changes no longer require an
 Omnigent source update and snapshots do not block on the CLI process.
+
+## CI Model Configuration
+
+Credentialed automation reads model roles from repository variables instead of
+pinning provider releases in workflow source:
+
+- `OMNIGENT_CI_ANTHROPIC_MODEL`
+- `OMNIGENT_CI_FAST_ANTHROPIC_MODEL`
+- `OMNIGENT_CI_OPENAI_MODEL`
+- `OMNIGENT_CI_E2E_JUDGE_MODEL`
+- `OMNIGENT_CI_E2E_MODEL_POOL_GPT`
+- `OMNIGENT_CI_IMAGE_MODEL`
+
+Operators can update those values as provider catalogs change without a code
+release. Workflows deliberately do not carry source-controlled model defaults;
+missing required variables fail or take their existing fail-open path.

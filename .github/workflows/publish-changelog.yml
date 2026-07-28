@@ -264,6 +264,7 @@ jobs:
           stderr-file: /tmp/format-stderr.log
           gateway-base-url: ${{ secrets.GATEWAY_BASE_URL }}
           llm-api-key: ${{ secrets.LLM_API_KEY }}
+          model: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
 
       - name: Extract narrative post (fall back to raw body)
         if: steps.creds.outputs.available == 'true'
