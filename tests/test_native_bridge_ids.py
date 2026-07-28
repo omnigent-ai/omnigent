@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+
 import pytest
 
 from omnigent.antigravity_native_bridge import (
@@ -47,7 +50,9 @@ def test_normalize_bridge_id_strips_only_the_legacy_prefix(
     "bridge_dir_for_bridge_id",
     [claude_bridge_dir, codex_bridge_dir, opencode_bridge_dir, antigravity_bridge_dir],
 )
-def test_legacy_and_bare_bridge_ids_share_one_dir(bridge_dir_for_bridge_id) -> None:  # type: ignore[no-untyped-def]
+def test_legacy_and_bare_bridge_ids_share_one_dir(
+    bridge_dir_for_bridge_id: Callable[[str], Path],
+) -> None:
     """Both spellings of a session id must key the same rendezvous directory."""
     assert bridge_dir_for_bridge_id(f"conv_{_SESSION_ID}") == bridge_dir_for_bridge_id(_SESSION_ID)
 
