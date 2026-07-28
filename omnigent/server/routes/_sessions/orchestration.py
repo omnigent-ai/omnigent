@@ -1847,6 +1847,97 @@ async def _enrich_idle_status_with_subagent_output(
     return {**data, "output": output}
 
 
+async def _heal_subagent_runner_binding_via_parent(
+    child_conv: Conversation,
+    runner_router: RunnerRouter | None,
+    tunnel_registry: TunnelRegistry | None,
+    conversation_store: ConversationStore,
+) -> httpx.AsyncClient | None:
+    """
+    Repair a sub-agent's stale ``runner_id`` and return its parent's live client.
+
+    A sub-agent child copies its parent's ``runner_id`` once at creation and is
+    never repointed when the parent's runner is later relaunched.  This walks up
+    the ancestor chain (immediate parent → root) to find the nearest live runner,
+    heals the child's DB row to point at that runner, and returns the live
+    ``httpx.AsyncClient`` so the caller can proceed as if the binding were always
+    current.
+
+    After healing, the caller must set ``_runner_needs_session_init = True`` and
+    re-read the conversation row, because rebinding the DB row does not by itself
+    prove the replacement runner has initialized that child's harness/session state.
+
+    :param child_conv: The sub-agent child whose ``runner_id`` may be stale.
+    :param runner_router: Router used to resolve runner clients, or ``None`` in
+        in-process setups.
+    :param tunnel_registry: Runner-tunnel registry used to await the ancestor
+        runner's (re)connect, or ``None`` in setups without runner tunnels.
+    :param conversation_store: Store used to look up ancestors and persist the
+        healed ``runner_id``.
+    :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
+        after healing, or ``None`` when no live ancestor could be found.
+    """
+    # Walk the ancestor chain (immediate parent first, then root) to find a
+    # live runner.  A single hop covers the common case; two hops cover nested
+    # sub-agents where the immediate parent's runner is also stale but the root
+    # is still healthy.
+    candidate_ids: list[str] = []
+    if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
+        candidate_ids.append(child_conv.parent_conversation_id)
+    if (
+        child_conv.root_conversation_id
+        and child_conv.root_conversation_id != child_conv.id
+        and child_conv.root_conversation_id not in candidate_ids
+    ):
+        candidate_ids.append(child_conv.root_conversation_id)
+    if not candidate_ids:
+        return None
+
+    live_runner_id: str | None = None
+    live_client: httpx.AsyncClient | None = None
+    for ancestor_id in candidate_ids:
+        ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
+        if ancestor is None or ancestor.runner_id is None:
+            continue
+        ancestor_runner_id = ancestor.runner_id
+        # Wait briefly for the ancestor's tunnel — covers the reconnect gap
+        # right after a relaunch.  When no registry is wired (in-process /
+        # tests) fall back to a best-effort direct resolve.
+        if tunnel_registry is not None:
+            client = await _wait_for_runner_client(
+                ancestor_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=ancestor_runner_id,
+                timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
+            )
+        else:
+            client = await _get_runner_client(ancestor_id, runner_router)
+        if client is not None:
+            live_runner_id = ancestor_runner_id
+            live_client = client
+            break
+
+    if live_runner_id is None or live_client is None:
+        return None
+
+    if live_runner_id != child_conv.runner_id:
+        # Heal the divergence so this child's row matches the live runner: the
+        # next forward resolves directly and a future ``_on_runner_connect``
+        # (which rebinds by matching runner_id) can recover it.
+        try:
+            await asyncio.to_thread(
+                conversation_store.replace_runner_id, child_conv.id, live_runner_id
+            )
+        except ConversationNotFoundError:
+            # The child was deleted between reading it and this heal (e.g.
+            # removed mid-teardown).  Degrade gracefully rather than surfacing
+            # a benign race as an unhandled 500.
+            return None
+
+    return live_client
+
+
 async def _recover_subagent_status_forward_via_parent(
     child_conv: Conversation,
     runner_router: RunnerRouter | None,
@@ -1889,41 +1980,11 @@ async def _recover_subagent_status_forward_via_parent(
         runner was resolved, or ``None`` when none could be (the caller then
         fails the forward as before).
     """
-    parent_id = child_conv.parent_conversation_id or child_conv.root_conversation_id
-    if not parent_id or parent_id == child_conv.id:
+    client = await _heal_subagent_runner_binding_via_parent(
+        child_conv, runner_router, tunnel_registry, conversation_store
+    )
+    if client is None:
         return None
-    parent = await asyncio.to_thread(conversation_store.get_conversation, parent_id)
-    if parent is None or parent.runner_id is None:
-        return None
-    parent_runner_id = parent.runner_id
-    # Wait for the parent's runner tunnel to be live before re-resolving. When
-    # no registry is wired (in-process / tests) skip the wait and retry
-    # best-effort against whatever the router resolves.
-    if tunnel_registry is not None:
-        client = await _wait_for_runner_client(
-            parent_id,
-            runner_router,
-            tunnel_registry,
-            runner_id=parent_runner_id,
-            timeout_s=_SUBAGENT_FORWARD_RECONNECT_WAIT_S,
-        )
-        if client is None:
-            return None
-    if parent_runner_id != child_conv.runner_id:
-        # Heal the divergence so this child's id matches the live runner: the
-        # next forward resolves directly and a future ``_on_runner_connect``
-        # (which rebinds by matching runner_id) can recover it.
-        try:
-            await asyncio.to_thread(
-                conversation_store.replace_runner_id, child_conv.id, parent_runner_id
-            )
-        except ConversationNotFoundError:
-            # The child was deleted between ``post_event`` reading it and this
-            # heal (e.g. the session was removed mid-teardown). Recovery is
-            # strictly best-effort — degrade to ``None`` so the caller falls
-            # through to the existing 503/no-op rather than surfacing this
-            # benign race as an unhandled 500.
-            return None
     return await _forward_session_change_to_runner(
         child_conv.id,
         runner_router,
@@ -6589,6 +6650,7 @@ __all__ = [
     "_publish_and_wait_for_harness_elicitation",
     "_publish_runner_recovered_status",
     "_publish_subtree_cost_to_ancestors",
+    "_heal_subagent_runner_binding_via_parent",
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",
     "_relay_runner_stream",
