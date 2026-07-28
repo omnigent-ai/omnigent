@@ -64,11 +64,15 @@ runs:
         CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
       run: |
         set -euo pipefail
-        mkdir -p "${GITHUB_WORKSPACE}/.cc-cli"
-        cd "${GITHUB_WORKSPACE}/.cc-cli"
+        # Install outside the checked-out tree: a repo-root package.json would
+        # otherwise capture this bare `npm install` and hoist it there, leaving
+        # this dir's node_modules empty.
+        CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
+        mkdir -p "$CC_CLI_DIR"
+        cd "$CC_CLI_DIR"
         npm install --ignore-scripts --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
         node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "${GITHUB_WORKSPACE}/.cc-cli/node_modules/.bin" >> "$GITHUB_PATH"
+        echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
     - name: Write Omnigent provider config
       shell: bash
