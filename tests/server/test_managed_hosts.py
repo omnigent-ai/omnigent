@@ -657,7 +657,8 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     """
     The documented kubernetes YAML shape parses into a config whose factory
     constructs Kubernetes launchers carrying namespace / Secret / SA / node
-    selector / in-cluster / resources, with the 7-day token TTL.
+    selector / in-cluster / resources / pod-ready timeout, with the 7-day
+    token TTL.
     """
     cfg = parse_sandbox_config(
         {
@@ -672,6 +673,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
                 "node_selector": {"omnigent.ai/runner-ready": "true"},
                 "in_cluster": True,
                 "resources": {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}},
+                "pod_ready_timeout_s": 300,
             },
         }
     )
@@ -692,6 +694,7 @@ def test_parse_valid_kubernetes_config_builds_parameterized_factory(
     assert fake.node_selector == {"omnigent.ai/runner-ready": "true"}
     assert fake.in_cluster is True
     assert fake.resources == {"requests": {"cpu": "500m"}, "limits": {"memory": "8Gi"}}
+    assert fake.pod_ready_timeout_s == 300
 
 
 def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -712,6 +715,7 @@ def test_parse_kubernetes_without_section_defaults(monkeypatch: pytest.MonkeyPat
     assert fake.in_cluster is None
     assert fake.resources is None
     assert fake.pvc_mounts is None
+    assert fake.pod_ready_timeout_s is None
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -847,6 +851,11 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         # A misspelled section key would silently no-op (e.g. no PVCs mounted)
         # without the allowlist check.
         ({"pvc_mount": [{"claim_name": "c", "mount_path": "/mnt/x"}]}, "unknown key"),
+        # The wait budget must be a real positive integer — a coerced "90" or
+        # a YAML boolean would silently change how long launches may take.
+        ({"pod_ready_timeout_s": 0}, "positive integer"),
+        ({"pod_ready_timeout_s": "90"}, "positive integer"),
+        ({"pod_ready_timeout_s": True}, "positive integer"),
     ],
 )
 def test_parse_kubernetes_invalid_block_fails_loud(

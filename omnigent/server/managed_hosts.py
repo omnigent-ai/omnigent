@@ -1164,6 +1164,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "resources",
                     "pvc_mounts",
                     "secret_mounts",
+                    "pod_ready_timeout_s",
                 },
                 "sandbox.kubernetes",
             )
@@ -1182,6 +1183,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             resources=_parse_kubernetes_resources(raw),
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
+            pod_ready_timeout_s=_parse_provider_positive_int(
+                raw, "kubernetes", "pod_ready_timeout_s"
+            ),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -2431,6 +2435,7 @@ def _kubernetes_launcher_factory(
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
     secret_mounts: list[dict[str, object]] | None,
+    pod_ready_timeout_s: int | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -2456,6 +2461,8 @@ def _kubernetes_launcher_factory(
         or ``None``.
     :param secret_mounts: Normalized Secret file-mount entries added to every
         runner Pod (rotation-friendly credential volumes), or ``None``.
+    :param pod_ready_timeout_s: Pod-start wait budget in seconds, or ``None``
+        for the launcher's built-in default.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -2477,6 +2484,7 @@ def _kubernetes_launcher_factory(
             resources=resources,
             pvc_mounts=pvc_mounts,
             secret_mounts=secret_mounts,
+            pod_ready_timeout_s=pod_ready_timeout_s,
         )
 
     return _build
