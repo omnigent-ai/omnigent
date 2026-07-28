@@ -6172,6 +6172,10 @@ async def _evaluate_async_tool_call_policy(
     that inspect ``arguments.command``) see the same structure every in-turn
     evaluation path delivers.
 
+    An ASK verdict parks the gate server-side (up to the policy's
+    ``ask_timeout``) and blocks the background task until resolved or timed
+    out — ``sys_cancel_async`` cannot interrupt a parked evaluation.
+
     :returns: ``True`` when the tool may proceed; ``False`` to DENY.
     """
     evaluation_id = f"poleval_async_{uuid.uuid4().hex[:12]}"
