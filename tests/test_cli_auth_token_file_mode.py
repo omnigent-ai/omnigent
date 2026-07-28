@@ -17,9 +17,7 @@ import pytest
 
 from omnigent import cli_auth
 
-posix_only = pytest.mark.skipif(
-    sys.platform == "win32", reason="POSIX mode bits"
-)
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits")
 
 SERVER = "http://localhost:6767"
 
