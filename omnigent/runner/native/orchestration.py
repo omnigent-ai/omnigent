@@ -1850,6 +1850,7 @@ async def _auto_create_pi_terminal(
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
+        from omnigent.pi_native import resolve_pi_native_local_model_selection
         from omnigent.pi_native_credentials import (
             pi_native_provider_launch,
             resolve_pi_native_provider,
@@ -1862,13 +1863,30 @@ async def _auto_create_pi_terminal(
         # (no model declared) keeps the provider's default model.
         # model_override (set by /model or sys_session_create's model arg)
         # takes precedence over the spec's pinned executor.model.
-        spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
-        provider = resolve_pi_native_provider(model=spec_model)
-        if provider is not None:
-            cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
-            pi_env.update(cred_env)
-            pi_args.extend(cred_args)
-            credential_warning = provider.credential_warning
+        spec_model = _pi_native_model_from_spec(agent_spec)
+        requested_model = launch_config.model_override or spec_model
+        local_selection = (
+            resolve_pi_native_local_model_selection(
+                launch_config.model_override,
+                cwd=launch_config.workspace,
+            )
+            if resume_session_id is None and launch_config.model_override
+            else None
+        )
+        if local_selection is not None:
+            local_provider, local_model = local_selection
+            pi_args.extend(["--provider", local_provider, "--model", local_model])
+        else:
+            provider = resolve_pi_native_provider(model=requested_model)
+            if provider is not None:
+                cred_env, cred_args = pi_native_provider_launch(
+                    bridge_dir / "pi-agent",
+                    provider,
+                    pin_model=resume_session_id is None and requested_model is not None,
+                )
+                pi_env.update(cred_env)
+                pi_args.extend(cred_args)
+                credential_warning = provider.credential_warning
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to

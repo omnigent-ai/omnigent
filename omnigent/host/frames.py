@@ -795,6 +795,7 @@ class HostModelOptionsFrame:
 
     request_id: str
     harness: str
+    workspace: str | None = None
 
 
 @dataclass
@@ -1166,6 +1167,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.MODEL_OPTIONS.value,
                 "request_id": frame.request_id,
                 "harness": frame.harness,
+                "workspace": frame.workspace,
             }
         )
     if isinstance(frame, HostModelOptionsResultFrame):
@@ -1788,6 +1790,7 @@ def _decode_model_options(msg: dict[str, Any]) -> HostModelOptionsFrame:
     return HostModelOptionsFrame(
         request_id=_required_str(msg, "request_id"),
         harness=_required_str(msg, "harness"),
+        workspace=_optional_nullable_str(msg, "workspace"),
     )
 
 

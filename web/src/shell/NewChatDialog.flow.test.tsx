@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import type { Host } from "@/hooks/useHosts";
-import { useHosts } from "@/hooks/useHosts";
+import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "./NewChatDialog";
@@ -211,6 +211,15 @@ beforeEach(() => {
   navigateMock.mockReset();
   setPendingInitialPromptMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
+  vi.mocked(useHostModelOptions).mockClear();
+  vi.mocked(useHostModelOptions).mockReturnValue({
+    data: [
+      { id: "opus", displayName: "Opus" },
+      { id: "sonnet", displayName: "Sonnet" },
+      { id: "haiku", displayName: "Haiku" },
+    ],
+    isLoading: false,
+  } as ReturnType<typeof useHostModelOptions>);
   // Clear the module-level landing draft so a base branch (or other field)
   // left behind by an unmounting test doesn't seed the next one.
   resetLandingDraft();
@@ -826,6 +835,126 @@ describe("NewChatLandingScreen create flow", () => {
     const body = JSON.parse(init.body as string);
     expect(body.model_override).toBe("opus");
     expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("offers Pi models before launch and seeds Pi's direct default", async () => {
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "system.ai.gpt-5-6-sol",
+          displayName: "system.ai.gpt-5-6-sol",
+          isDefault: true,
+        },
+        {
+          id: "system.ai.gpt-5-6-luna",
+          displayName: "system.ai.gpt-5-6-luna",
+        },
+      ],
+      isLoading: false,
+    } as ReturnType<typeof useHostModelOptions>);
+    setAgents([agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_pi" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    await waitFor(() =>
+      expect(useHostModelOptions).toHaveBeenLastCalledWith(
+        "host_1",
+        "pi-native",
+        true,
+        SEEDED_WORKSPACE,
+      ),
+    );
+    openAgentConfig("ag_pi");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "system.ai.gpt-5-6-sol",
+    );
+    pickSelectOption("new-chat-landing-config-model", "system.ai.gpt-5-6-luna");
+    saveConfig();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("system.ai.gpt-5-6-luna");
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("shows Pi's default when its catalog resolves after the config opens", async () => {
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: undefined,
+      isLoading: true,
+    } as ReturnType<typeof useHostModelOptions>);
+    setAgents([agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi" })]);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_pi");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+      "Loading models…",
+    );
+
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "system.ai.gpt-5-6-sol",
+          displayName: "system.ai.gpt-5-6-sol",
+          isDefault: true,
+        },
+        {
+          id: "system.ai.gpt-5-6-luna",
+          displayName: "system.ai.gpt-5-6-luna",
+        },
+      ],
+      isLoading: false,
+    } as ReturnType<typeof useHostModelOptions>);
+    typeMessage("trigger rerender");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
+        "system.ai.gpt-5-6-sol (Default)",
+      ),
+    );
+  });
+
+  it("prefers the last valid Pi selection over Pi's configured default", async () => {
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "pi-native": { model: "system.ai.gpt-5-6-luna" } }),
+    );
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "system.ai.gpt-5-6-sol",
+          displayName: "system.ai.gpt-5-6-sol",
+          isDefault: true,
+        },
+        {
+          id: "system.ai.gpt-5-6-luna",
+          displayName: "system.ai.gpt-5-6-luna",
+        },
+      ],
+      isLoading: false,
+    } as ReturnType<typeof useHostModelOptions>);
+    setAgents([agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_pi" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("system.ai.gpt-5-6-luna");
   });
 
   it("seeds the model + effort from the last pick for claude-native on a new session", async () => {

@@ -974,15 +974,20 @@ def write_pi_models_config(agent_dir: Path, provider: PiProviderConfig) -> Path:
 
 
 def pi_native_provider_launch(
-    agent_dir: Path, provider: PiProviderConfig
+    agent_dir: Path,
+    provider: PiProviderConfig,
+    *,
+    pin_model: bool = True,
 ) -> tuple[dict[str, str], list[str]]:
     """Write the managed config and return the launch env + CLI args for Pi.
 
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
+    :param pin_model: Whether to append an explicit ``--provider`` / ``--model``
+        selection. ``False`` leaves startup selection to Pi's native resolver.
     :returns: ``(env, args)`` — the env vars to merge into the terminal spec
         (relocating Pi's config dir) and the ``--provider``/``--model`` args to
-        append to the Pi command.
+        append to the Pi command when *pin_model* is true.
     """
     write_pi_models_config(agent_dir, provider)
     # Copy the user's global Pi settings but suppress defaultThinkingLevel.
@@ -997,6 +1002,8 @@ def pi_native_provider_launch(
 
     prepare_managed_pi_agent_dir(agent_dir, overlay={"defaultThinkingLevel": None})
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
+    if not pin_model:
+        return env, []
     # Resolve which provider the selected model lives in. Non-Claude models
     # (GLM, GPT, Llama…) are in additional_providers (omnigent-openai);
     # Claude models are in the primary provider (omnigent). Pass the correct

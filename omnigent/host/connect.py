@@ -1839,13 +1839,25 @@ class HostProcess:
         resolves its own catalog at launch, and the in-session picker
         re-reads that authoritative snapshot after bind.
         """
-        if canonicalize_harness(frame.harness) != "claude-native":
+        harness = canonicalize_harness(frame.harness)
+        if harness not in {"claude-native", "pi-native"}:
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"model options are unsupported for harness {frame.harness!r}",
             )
         try:
+            if harness == "pi-native":
+                from omnigent.pi_native import pi_native_model_options
+
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    models=await asyncio.to_thread(
+                        pi_native_model_options,
+                        cwd=frame.workspace,
+                    ),
+                )
             from omnigent.claude_native import (
                 claude_native_model_options,
                 resolve_native_claude_config,

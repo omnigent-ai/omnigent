@@ -82,20 +82,35 @@ def _key_provider_config() -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize(
+    (
+        "resume_session_id",
+        "model_override",
+        "spec_model",
+        "expected_model",
+        "expect_model_pin",
+    ),
+    [
+        (None, None, "claude-opus-4-7", "claude-opus-4-7", True),
+        (None, "claude-haiku-4-5", "claude-opus-4-7", "claude-haiku-4-5", True),
+        ("pi-session-resume", None, "claude-opus-4-7", "claude-opus-4-7", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
+async def test_auto_create_pi_terminal_pins_explicit_model_only_for_fresh_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    resume_session_id: str | None,
+    model_override: str | None,
+    spec_model: str,
+    expected_model: str,
+    expect_model_pin: bool,
 ) -> None:
-    """End-to-end: the spec's ``executor.model`` reaches the generated models.json.
+    """An explicit model configures the catalog but only pins a fresh session.
 
-    Drives ``_auto_create_pi_terminal`` with a spec pinning
-    ``claude-opus-4-7`` and a key-kind provider whose family default is
-    ``claude-sonnet-4-6``. The threaded override must win: the generated
-    ``models.json`` selects ``claude-opus-4-7`` and the appended Pi
-    ``--model`` arg reflects it. This is the runner-side seam the feature
-    adds — without threading the spec model, the models.json would carry
-    the family default instead.
+    Covers both a session ``model_override`` and a spec ``executor.model``.
+    A fresh session receives explicit model args; a resumed session omits them
+    so Pi can restore its recorded model.
 
     :param tmp_path: Temp dir backing the pi-native bridge root.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -104,7 +119,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     import omnigent.pi_native_bridge as pi_bridge
     import omnigent.pi_native_credentials as creds
 
-    session_id = "conv_pi_model_e2e"
+    session_id = f"conv_pi_model_{'resume' if resume_session_id else 'fresh'}"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     # Redirect the bridge tree into tmp so the generated managed Pi config dir
@@ -114,7 +129,17 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     # Resolve a Pi executable without requiring the real binary on PATH.
-    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    monkeypatch.setattr(
+        "omnigent.pi_native.resolve_pi_executable", lambda **_kwargs: "/usr/bin/pi"
+    )
+
+    async def _resolve_resume_session(**_kwargs: Any) -> str | None:
+        return resume_session_id
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._resolve_pi_resume_session",
+        _resolve_resume_session,
+    )
 
     # ``resolve_pi_native_provider``'s default config_loader is bound at def
     # time, so inject the test config by patching the module symbol the runner
@@ -139,6 +164,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
                     "workspace": str(workspace),
                     "terminal_launch_args": None,
                     "external_session_id": None,
+                    "model_override": model_override,
                 },
                 request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
             )
@@ -176,7 +202,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
         executor=ExecutorSpec(
             type="omnigent",
             config={"harness": "pi-native"},
-            model="claude-opus-4-7",
+            model=spec_model,
         ),
     )
 
@@ -189,30 +215,120 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     )
 
     # The runner threaded the spec model into resolve_pi_native_provider.
-    assert captured["model"] == "claude-opus-4-7"
+    assert captured["model"] == expected_model
 
-    # The appended Pi args select the override, not the family default.
     args = launched["args"]
-    assert "--model" in args
-    assert args[args.index("--model") + 1] == "claude-opus-4-7"
-    assert "--provider" in args
+    if expect_model_pin:
+        assert "--model" in args
+        assert args[args.index("--model") + 1] == expected_model
+        assert "--provider" in args
+    else:
+        assert "--model" not in args
+        assert "--provider" not in args
 
     # The managed config dir env was set and its models.json selects the override.
     agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])
     models = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
-    assert models["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+    assert models["providers"]["omnigent"]["models"] == [{"id": expected_model}]
 
 
 @pytest.mark.asyncio
-async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
+async def test_auto_create_pi_terminal_resolves_local_model_in_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no spec model, the provider's family default is used (unchanged).
+    """A selected Pi model keeps the provider resolved in its workspace."""
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_bridge
 
-    Guards the ``None`` case: a spec without ``executor.model`` must leave
-    Pi on the provider default (``claude-sonnet-4-6`` here), not break the
-    launch.
+    session_id = "conv_pi_workspace_model"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda **_kwargs: "/usr/bin/pi")
+
+    captured: dict[str, Any] = {}
+
+    def _resolve_local(model: str, *, env: Any = None, cwd: Any = None):
+        captured.update(model=model, env=env, cwd=cwd)
+        return "project-provider", model
+
+    monkeypatch.setattr(pi_native, "resolve_pi_native_local_model_selection", _resolve_local)
+
+    class _SnapshotClient:
+        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+            del url, timeout
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "external_session_id": None,
+                    "model_override": "project-model",
+                },
+                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
+            )
+
+    launched: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched["args"] = list(spec.args)
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi",
+            )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-workspace-model",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    await _auto_create_pi_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_SnapshotClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    assert captured == {"model": "project-model", "env": None, "cwd": workspace}
+    assert launched["args"][-4:] == [
+        "--provider",
+        "project-provider",
+        "--model",
+        "project-model",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_no_spec_model_defers_to_pi_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no explicit model, configure the provider without pinning Pi.
+
+    The generated catalog still includes the provider fallback, but Pi receives
+    no ``--provider`` / ``--model`` arguments and applies its native startup
+    precedence instead.
 
     :param tmp_path: Temp dir backing the pi-native bridge root.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -228,7 +344,9 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    monkeypatch.setattr(
+        "omnigent.pi_native.resolve_pi_executable", lambda **_kwargs: "/usr/bin/pi"
+    )
 
     real_resolve = creds.resolve_pi_native_provider
     captured: dict[str, Any] = {}
@@ -292,6 +410,8 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     )
 
     assert captured["model"] is None
+    assert "--provider" not in launched["args"]
+    assert "--model" not in launched["args"]
     agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])
     models = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
     assert models["providers"]["omnigent"]["models"] == [{"id": "claude-sonnet-4-6"}]

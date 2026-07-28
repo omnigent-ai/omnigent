@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,115 @@ _SESSION_LABELS = {
     "omnigent.ui": "terminal",
     _WRAPPER_LABEL_KEY: _WRAPPER_LABEL_VALUE,
 }
+
+
+def _pi_default_model_selection(
+    agent_dir: Path | None = None,
+    cwd: str | Path | None = None,
+) -> tuple[str, str] | None:
+    """Return Pi's configured ``(provider, model)`` default, if present."""
+    root = agent_dir or Path.home() / ".pi" / "agent"
+
+    def load_settings(path: Path) -> dict[str, Any]:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    settings = load_settings(root / "settings.json")
+    if cwd is not None:
+        settings.update(load_settings(Path(cwd) / ".pi" / "settings.json"))
+    provider = settings.get("defaultProvider")
+    model = settings.get("defaultModel")
+    if not isinstance(provider, str) or not provider.strip():
+        return None
+    if not isinstance(model, str) or not model.strip():
+        return None
+    return provider.strip(), model.strip()
+
+
+def pi_native_model_options(
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> list[dict[str, Any]]:
+    """Return the models Pi itself reports as available on this machine."""
+    try:
+        executable = resolve_pi_executable(env=env)
+    except click.ClickException:
+        return []
+    args = [executable]
+    if cwd is not None and pi_supports_approve(executable):
+        args.append("--approve")
+    args.append("--list-models")
+    try:
+        result = run(
+            args,
+            env=dict(env) if env is not None else None,
+            cwd=os.fspath(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    configured_agent_dir = env.get("PI_CODING_AGENT_DIR", "").strip() if env else ""
+    home = Path(env.get("HOME", str(Path.home()))) if env else Path.home()
+    default = _pi_default_model_selection(
+        Path(configured_agent_dir) if configured_agent_dir else home / ".pi" / "agent",
+        cwd=cwd,
+    )
+    options: list[dict[str, Any]] = []
+    option_index_by_model: dict[str, int] = {}
+    for line in result.stdout.splitlines()[1:]:
+        columns = line.split()
+        if len(columns) < 2:
+            continue
+        provider, model = columns[0], columns[1]
+        option: dict[str, Any] = {
+            "id": model,
+            "model": model,
+            "displayName": model,
+            "provider": provider,
+        }
+        if default == (provider, model):
+            option["isDefault"] = True
+        existing_index = option_index_by_model.get(model)
+        if existing_index is not None:
+            if option.get("isDefault") is True:
+                options[existing_index] = option
+            continue
+        option_index_by_model[model] = len(options)
+        options.append(option)
+    return options
+
+
+def resolve_pi_native_local_model_selection(
+    model: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
+) -> tuple[str, str] | None:
+    """Resolve a model override against Pi's own available provider catalog."""
+    stripped = model.strip()
+    if not stripped:
+        return None
+    options = pi_native_model_options(env=env, cwd=cwd)
+    matches = [option for option in options if option.get("id") == stripped]
+    if not matches:
+        return None
+    selected = next((option for option in matches if option.get("isDefault") is True), matches[0])
+    provider = selected.get("provider")
+    resolved_model = selected.get("model")
+    if not isinstance(provider, str) or not isinstance(resolved_model, str):
+        return None
+    return provider, resolved_model
 
 
 @dataclass(frozen=True)

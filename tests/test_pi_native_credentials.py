@@ -246,6 +246,24 @@ def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
     assert (agent_dir / "models.json").exists()
 
 
+def test_provider_launch_can_defer_model_selection_to_pi(tmp_path: Path) -> None:
+    """Provider setup can omit model args so Pi applies its startup precedence."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+    agent_dir = tmp_path / "pi-agent"
+    env, args = creds.pi_native_provider_launch(agent_dir, provider, pin_model=False)
+
+    assert env == {creds.PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
+    assert args == []
+    assert (agent_dir / "models.json").exists()
+
+
 def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.MonkeyPatch) -> None:
     """An OpenAI family with wire_api: chat → openai-completions API.
 
