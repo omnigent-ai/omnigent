@@ -357,11 +357,11 @@ export function TaskDetailPage() {
           Loading runs…
         </div>
       ) : runsError ? (
-        <p className="py-6 text-sm text-muted-foreground" data-testid="task-detail-runs-error">
+        <p className="pb-2 text-sm text-muted-foreground" data-testid="task-detail-runs-error">
           Couldn’t load run history.
         </p>
       ) : (runs ?? []).length === 0 ? (
-        <p className="py-6 text-sm text-muted-foreground" data-testid="task-detail-runs-empty">
+        <p className="pb-2 text-sm text-muted-foreground" data-testid="task-detail-runs-empty">
           No runs yet.
         </p>
       ) : (
