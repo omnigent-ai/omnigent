@@ -1007,7 +1007,9 @@ def register_events_routes(
             )
             if healed_client is not None:
                 runner_client = healed_client
-                _runner_needs_session_init = True
+                # The parent's runner already hosts the child's session —
+                # only the DB row was stale. No re-initialization needed.
+                _runner_needs_session_init = False
                 conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
                 if conv is None:
                     raise _session_not_found()
