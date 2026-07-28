@@ -44,6 +44,18 @@ class NativeNotificationManager(
     private var lastBadge: BadgeState? = null
 
     init {
+        ensureChannel()
+    }
+
+    /**
+     * Create the notification channel, idempotently. `createNotificationChannel`
+     * is a no-op when the channel already exists, so this is cheap to call
+     * repeatedly. Exposed (and re-run from the constructor) so a WorkManager-only
+     * process — one that spawned in the background with no Activity ever
+     * on-screen — still has the channel before it posts; otherwise an O+ post to
+     * a missing channel is silently dropped. A no-op on pre-O.
+     */
+    fun ensureChannel() {
         val channel =
             NotificationChannel(
                 CHANNEL_ID,
@@ -57,8 +69,15 @@ class NativeNotificationManager(
         title: String,
         body: String?,
         navigatePath: String?,
+        // A caller-supplied STABLE id (e.g. per-session, via notificationIdFor)
+        // so a re-fire updates the same notification instead of stacking, and
+        // distinct subjects never collide. When null, an incrementing per-
+        // instance id is used — fine for one-off in-app toasts, but NOT for the
+        // background worker, which builds a fresh manager each run (the counter
+        // would restart and collide across runs).
+        notificationId: Int? = null,
     ) {
-        val id = nextId.getAndIncrement()
+        val id = notificationId ?: nextId.getAndIncrement()
         val builder =
             NotificationCompat
                 .Builder(context, CHANNEL_ID)
@@ -129,6 +148,17 @@ class NativeNotificationManager(
     fun replayBadge() {
         val badge = lastBadge ?: return
         setBadgeCount(badge.count, badge.navigatePath, badge.title, badge.body)
+    }
+
+    /**
+     * Cancel every notification this app has posted. Called on a fresh login so
+     * per-session notifications (id >= 2) left over from the PRIOR account don't
+     * linger — they'd expose the old account's titles and deep-link into its
+     * session ids. The badge (id 1) is withdrawn too; the web layer re-pushes
+     * the current count on its next tick, so it self-heals for the new account.
+     */
+    fun cancelAll() {
+        manager.cancelAll()
     }
 
     /**

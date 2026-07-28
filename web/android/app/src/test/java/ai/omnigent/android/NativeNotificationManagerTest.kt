@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.app.Application
+import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
@@ -19,6 +20,7 @@ class NativeNotificationManagerTest {
     private lateinit var context: Application
     private lateinit var manager: NativeNotificationManager
     private lateinit var shadow: ShadowNotificationManager
+    private lateinit var notificationManager: NotificationManager
 
     // The reserved badge-summary notification id (NativeNotificationManager's
     // BADGE_NOTIFICATION_ID is private; the contract is "id 1").
@@ -28,13 +30,34 @@ class NativeNotificationManagerTest {
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
         manager = NativeNotificationManager(context)
-        shadow =
-            shadowOf(
-                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
-            )
+        notificationManager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        shadow = shadowOf(notificationManager)
     }
 
     private fun badgeNotification() = shadow.getNotification(badgeId)
+
+    @Test
+    fun `constructing the manager creates the sessions channel`() {
+        // The background poll worker constructs a fresh manager in a process
+        // where no Activity ran; the channel must exist so an O+ post isn't
+        // silently dropped. `manager` is built in setUp — assert the channel is
+        // present with the expected id and importance.
+        val channel: NotificationChannel? =
+            notificationManager.getNotificationChannel(
+                "omnigent.sessions",
+            )
+        assertNotNull(channel)
+        assertEquals(NotificationManager.IMPORTANCE_HIGH, channel!!.importance)
+    }
+
+    @Test
+    fun `ensureChannel is idempotent and keeps the channel present`() {
+        // Cheap to call repeatedly — the worker path relies on this being safe.
+        manager.ensureChannel()
+        manager.ensureChannel()
+        assertNotNull(notificationManager.getNotificationChannel("omnigent.sessions"))
+    }
 
     @Test
     fun `badge posts a summary notification with the count and tap intent`() {
