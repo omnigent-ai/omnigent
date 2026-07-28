@@ -41,7 +41,7 @@ import { fetchConversationById } from "@/hooks/useConversations";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
-  markConversationUnread,
+  seedRunUnreadBaseline,
   useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { useNow } from "@/hooks/useNow";
@@ -150,7 +150,7 @@ export function TaskDetailPage() {
         !autoMarkedRef.current.has(run.conversationId)
       ) {
         autoMarkedRef.current.add(run.conversationId);
-        markConversationUnread(
+        seedRunUnreadBaseline(
           run.conversationId,
           run.finishedAt ?? run.firedAt ?? Math.floor(Date.now() / 1000),
         );

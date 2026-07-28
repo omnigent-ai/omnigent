@@ -67,12 +67,12 @@ vi.mock("@/hooks/useConversations", () => ({
 // Read-state mirror: control unread verdicts deterministically. Default read.
 const isConversationUnseen = vi.fn(() => false);
 const isExplicitlyUnread = vi.fn(() => false);
-const markConversationUnread = vi.fn();
+const seedRunUnreadBaseline = vi.fn();
 vi.mock("@/hooks/useUnseenConversations", () => ({
   useUnseenTick: () => 0,
   isConversationUnseen: (...args: unknown[]) => isConversationUnseen(...(args as [])),
   isExplicitlyUnread: (...args: unknown[]) => isExplicitlyUnread(...(args as [])),
-  markConversationUnread: (...args: unknown[]) => markConversationUnread(...args),
+  seedRunUnreadBaseline: (...args: unknown[]) => seedRunUnreadBaseline(...args),
 }));
 
 // Freeze the ticking clock so relative next-run text is deterministic.
@@ -170,7 +170,7 @@ beforeEach(() => {
   isConversationUnseen.mockReturnValue(false);
   isExplicitlyUnread.mockReset();
   isExplicitlyUnread.mockReturnValue(false);
-  markConversationUnread.mockReset();
+  seedRunUnreadBaseline.mockReset();
   vi.mocked(hooks.useUpdateScheduledTask).mockReturnValue({
     mutate: updateMutate,
     isPending: false,
@@ -649,8 +649,8 @@ describe("auto-mark runs unread", () => {
     ]);
     const { rerender } = renderPage();
     // Baseline seeded with the running run (not terminal → not in autoMarked set).
-    // markConversationUnread should NOT have been called yet.
-    expect(markConversationUnread).not.toHaveBeenCalled();
+    // seedRunUnreadBaseline should NOT have been called yet.
+    expect(seedRunUnreadBaseline).not.toHaveBeenCalled();
 
     // Simulate the run completing: update the mock to return succeeded.
     setRuns([
@@ -674,7 +674,7 @@ describe("auto-mark runs unread", () => {
       </QueryClientProvider>,
     );
 
-    expect(markConversationUnread).toHaveBeenCalledWith("c_new", 1_700_000_042);
+    expect(seedRunUnreadBaseline).toHaveBeenCalledWith("c_new", 1_700_000_042);
   });
 
   it("does NOT re-mark a run that was already opened (resurrection guard)", () => {
@@ -682,7 +682,7 @@ describe("auto-mark runs unread", () => {
     // First render: empty runs (baseline seeded as empty).
     setRuns([]);
     const { rerender } = renderPage();
-    expect(markConversationUnread).not.toHaveBeenCalled();
+    expect(seedRunUnreadBaseline).not.toHaveBeenCalled();
 
     // Run completes — gets marked once.
     setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_opened" })]);
@@ -697,7 +697,7 @@ describe("auto-mark runs unread", () => {
         </TooltipProvider>
       </QueryClientProvider>,
     );
-    expect(markConversationUnread).toHaveBeenCalledTimes(1);
+    expect(seedRunUnreadBaseline).toHaveBeenCalledTimes(1);
 
     // Simulate user opening the conversation (would call clearUnreadOverride /
     // markConversationSeen externally). Now poll re-fetches the same runs list.
@@ -712,8 +712,8 @@ describe("auto-mark runs unread", () => {
         </TooltipProvider>
       </QueryClientProvider>,
     );
-    // markConversationUnread must NOT be called again — the id is in the ref.
-    expect(markConversationUnread).toHaveBeenCalledTimes(1);
+    // seedRunUnreadBaseline must NOT be called again — the id is in the ref.
+    expect(seedRunUnreadBaseline).toHaveBeenCalledTimes(1);
   });
 
   it("does NOT auto-mark pre-existing terminal runs on first page load (no-retroactive guard)", () => {
@@ -724,7 +724,43 @@ describe("auto-mark runs unread", () => {
       run({ id: "run_old_2", status: "succeeded", conversationId: "c_old_2" }),
     ]);
     renderPage();
-    // Baseline seeds both ids as already-seen → markConversationUnread never called.
-    expect(markConversationUnread).not.toHaveBeenCalled();
+    // Baseline seeds both ids as already-seen → seedRunUnreadBaseline never called.
+    expect(seedRunUnreadBaseline).not.toHaveBeenCalled();
+  });
+
+  it("uses seedRunUnreadBaseline (not markConversationUnread) so the dot clears when the conversation is opened", () => {
+    // Regression: previously markConversationUnread set the explicitlyUnread
+    // override, which blocked markConversationSeen in ChatPage (the initial-mount
+    // guard skips clearUnreadOverride on a fresh mount). The dot would therefore
+    // stick after the user clicked through. seedRunUnreadBaseline omits the
+    // override so markConversationSeen isn't blocked.
+    //
+    // Verify: auto-mark calls seedRunUnreadBaseline (no override), NOT
+    // markConversationUnread. The absence of markConversationUnread in the mock
+    // confirms the dot is driven by the baseline alone — openable via
+    // markConversationSeen without any guard blocking it.
+    setTask(task());
+    setRuns([]);
+    const { rerender } = renderPage();
+
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_run" })]);
+    rerender(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })}
+      >
+        <TooltipProvider>
+          <MemoryRouter>
+            <TaskDetailPage />
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+
+    // seedRunUnreadBaseline was called — not markConversationUnread.
+    expect(seedRunUnreadBaseline).toHaveBeenCalledWith("c_run", expect.any(Number));
+    // isExplicitlyUnread is never set by seedRunUnreadBaseline, so opening the
+    // conversation (markConversationSeen) is not blocked. The dot is driven
+    // purely by isConversationUnseen, which clears normally on open.
+    expect(isExplicitlyUnread).not.toHaveBeenCalledWith("c_run");
   });
 });
