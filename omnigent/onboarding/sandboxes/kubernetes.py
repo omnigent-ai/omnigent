@@ -160,7 +160,9 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 # Pod-start wait budget, consumed inside start_host BEFORE the
 # shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
 # image / clone its repo fails fast with a clear reason instead of as a generic
-# online timeout. Kept tight; a cold image pull is the usual slow case.
+# online timeout. Kept tight; a cold image pull is the usual slow case —
+# deployments whose host image regularly takes longer to pull can raise the
+# budget via ``sandbox.kubernetes.pod_ready_timeout_s``.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
 
@@ -839,6 +841,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         in_cluster: bool | None = None,
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
+        pod_ready_timeout_s: int | None = None,
     ) -> None:
         """
         Initialize the launcher.
@@ -865,6 +868,9 @@ class KubernetesSandboxLauncher(SandboxLauncher):
             for the built-in defaults.
         :param pvc_mounts: Normalized ``sandbox.kubernetes.pvc_mounts`` entries
             (validated at parse time), or ``None`` for none.
+        :param pod_ready_timeout_s: Pod-start wait budget in seconds
+            (``sandbox.kubernetes.pod_ready_timeout_s``), or ``None`` for
+            :data:`_POD_READY_TIMEOUT_S`.
         """
         self._image_ref = image
         self._namespace = namespace
@@ -876,6 +882,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         self._in_cluster = in_cluster
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
+        self._pod_ready_timeout_s = pod_ready_timeout_s
         self._core: k8s_client.CoreV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
 
@@ -1236,7 +1243,12 @@ class KubernetesSandboxLauncher(SandboxLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        deadline = time.monotonic() + _POD_READY_TIMEOUT_S
+        timeout_s = (
+            self._pod_ready_timeout_s
+            if self._pod_ready_timeout_s is not None
+            else _POD_READY_TIMEOUT_S
+        )
+        deadline = time.monotonic() + timeout_s
         last_reason: str | None = None
         while True:
             try:
@@ -1257,8 +1269,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1270,8 +1281,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1311,7 +1321,7 @@ class KubernetesSandboxLauncher(SandboxLauncher):
                     self._pod_failure_message(
                         namespace,
                         pod_name,
-                        f"did not start within {_POD_READY_TIMEOUT_S}s "
+                        f"did not start within {timeout_s}s "
                         f"(last phase '{phase or 'unknown'}'{detail})",
                     )
                 )

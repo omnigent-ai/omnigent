@@ -836,6 +836,7 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
                     "in_cluster",
                     "resources",
                     "pvc_mounts",
+                    "pod_ready_timeout_s",
                 },
                 "sandbox.kubernetes",
             )
@@ -850,6 +851,9 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
             in_cluster=_parse_provider_bool(raw, "kubernetes", "in_cluster"),
             resources=_parse_kubernetes_resources(raw),
             pvc_mounts=_parse_kubernetes_pvc_mounts(raw),
+            pod_ready_timeout_s=_parse_provider_positive_int(
+                raw, "kubernetes", "pod_ready_timeout_s"
+            ),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     else:
@@ -1926,6 +1930,7 @@ def _kubernetes_launcher_factory(
     in_cluster: bool | None,
     resources: dict[str, object] | None,
     pvc_mounts: list[dict[str, object]] | None,
+    pod_ready_timeout_s: int | None,
 ) -> Callable[[], SandboxLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -1949,6 +1954,8 @@ def _kubernetes_launcher_factory(
     :param resources: Validated ``resources`` block, or ``None`` for defaults.
     :param pvc_mounts: Normalized PVC mount entries added to every runner Pod,
         or ``None``.
+    :param pod_ready_timeout_s: Pod-start wait budget in seconds, or ``None``
+        for the launcher's built-in default.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -1969,6 +1976,7 @@ def _kubernetes_launcher_factory(
             in_cluster=in_cluster,
             resources=resources,
             pvc_mounts=pvc_mounts,
+            pod_ready_timeout_s=pod_ready_timeout_s,
         )
 
     return _build
