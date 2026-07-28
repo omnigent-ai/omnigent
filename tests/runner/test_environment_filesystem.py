@@ -1740,3 +1740,109 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
         assert "error" in resp.json()
     finally:
         locked.chmod(0o700)
+
+
+@pytest.mark.asyncio
+async def test_additional_directory_routes_files_search_git_and_writes(
+    tmp_path: Path,
+) -> None:
+    """Every attached root is a stable, independently-routed environment."""
+    env = _git_env()
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    for root in (primary, shared):
+        root.mkdir()
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, env=env)
+        (root / "tracked.txt").write_text(f"baseline {root.name}\n")
+        subprocess.run(["git", "add", "."], cwd=root, check=True, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+    (shared / "tracked.txt").write_text("changed shared\n")
+    (shared / "shared-only.txt").write_text("find me\n")
+
+    session_id = "conv_multidir_files"
+    shared_id = f"dir_{7:032x}"
+
+    async def _mock_transport(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/v1/sessions/{session_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": session_id,
+                    "agent_id": "agent_1",
+                    "status": "idle",
+                    "created_at": 1000,
+                    "workspace": str(primary),
+                    "directories": [
+                        {"id": "default", "path": str(primary), "name": "primary"},
+                        {"id": shared_id, "path": str(shared), "name": "shared"},
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_mock_transport),
+        base_url="http://fake-server",
+    )
+    app = create_runner_app(
+        resource_registry=SessionResourceRegistry(),
+        runner_workspace=primary,
+        server_client=server_client,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        environments = await client.get(f"/v1/sessions/{session_id}/resources/environments")
+        assert environments.status_code == 200, environments.text
+        by_id = {item["id"]: item for item in environments.json()["data"]}
+        assert set(by_id) == {"default", shared_id}
+        assert by_id[shared_id]["metadata"]["root"] == str(shared)
+        assert by_id[shared_id]["metadata"]["directory_id"] == shared_id
+
+        listing = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{shared_id}/filesystem"
+        )
+        assert listing.status_code == 200, listing.text
+        assert "shared-only.txt" in {item["name"] for item in listing.json()["data"]}
+
+        search = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{shared_id}/search?q=shared-only"
+        )
+        assert [item["path"] for item in search.json()["data"]] == ["shared-only.txt"]
+
+        changes = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{shared_id}/changes"
+        )
+        assert changes.status_code == 200, changes.text
+        shared_changes = {item["path"]: item for item in changes.json()["data"]}
+        assert shared_changes["tracked.txt"]["directory_id"] == shared_id
+        assert shared_changes["shared-only.txt"]["environment_id"] == shared_id
+
+        diff = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{shared_id}/diff/tracked.txt"
+        )
+        assert diff.status_code == 200, diff.text
+        assert diff.json()["before"] == "baseline shared\n"
+        assert diff.json()["after"] == "changed shared\n"
+        assert diff.json()["directory_id"] == shared_id
+
+        written = await client.put(
+            f"/v1/sessions/{session_id}/resources/environments/{shared_id}/filesystem/web.txt",
+            json={"content": "from web\n"},
+        )
+        assert written.status_code == 200, written.text
+        assert (shared / "web.txt").read_text() == "from web\n"
+
+        primary_changes = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/default/changes"
+        )
+        assert primary_changes.status_code == 200, primary_changes.text
+        assert primary_changes.json()["data"] == []
+
+    await server_client.aclose()

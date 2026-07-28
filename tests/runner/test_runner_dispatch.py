@@ -2769,6 +2769,21 @@ def test_maybe_signal_changed_files_throttles_within_window() -> None:
     _maybe_signal_changed_files(sid, None, now=200.0)
     assert len(published) == 2
 
+    # Independent roots have independent throttle windows, so one root cannot
+    # suppress the invalidation needed to refresh another root's file panel.
+    second_sid = "conv_changed_files_multiroot_unique"
+    _maybe_signal_changed_files(second_sid, _pub, now=300.0)
+    _maybe_signal_changed_files(
+        second_sid,
+        _pub,
+        now=300.0,
+        environment_id=f"dir_{1:032x}",
+    )
+    assert [event["environment_id"] for event in published[-2:]] == [
+        "default",
+        f"dir_{1:032x}",
+    ]
+
 
 def test_subagent_read_tools_are_runner_local() -> None:
     """

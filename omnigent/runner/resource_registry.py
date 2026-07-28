@@ -30,6 +30,7 @@ from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
+    directory_environment_resource,
     filter_resources_by_type,
     get_resource_by_id,
     list_session_resources_from_terminal_registry,
@@ -346,6 +347,7 @@ class SessionResourceRegistry:
         self._runner_workspace = runner_workspace
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
+        self._directory_envs: dict[tuple[str, str], OSEnvironment] = {}
         self._session_directories: dict[str, tuple[SessionDirectory, ...]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
@@ -423,6 +425,8 @@ class SessionResourceRegistry:
                 )
                 if not is_matching_legacy_default:
                     raise ValueError("session directory changes require a relaunch")
+            if any(key[0] == session_id for key in self._directory_envs) and existing != values:
+                raise ValueError("session directory changes require a relaunch")
             self._session_directories[session_id] = values
 
     def session_directories(self, session_id: str) -> tuple[SessionDirectory, ...]:
@@ -672,6 +676,41 @@ class SessionResourceRegistry:
             has_os_env=has_os_env,
             primary_os_env_spec=primary_os_env_spec,
         )
+        configured = self.session_directories(session_id)
+        if has_os_env and configured:
+            directory_resources = [
+                directory_environment_resource(session_id, directory, primary_os_env_spec)
+                for directory in configured
+            ]
+            configured_ids = {resource.id for resource in directory_resources}
+            legacy_default = next(
+                (resource for resource in page.data if resource.id == DEFAULT_ENVIRONMENT_ID),
+                None,
+            )
+            resources = [
+                *(
+                    [legacy_default]
+                    if legacy_default is not None and DEFAULT_ENVIRONMENT_ID not in configured_ids
+                    else []
+                ),
+                *directory_resources,
+                *(
+                    resource
+                    for resource in page.data
+                    if resource.id not in configured_ids
+                    and not (
+                        legacy_default is not None
+                        and DEFAULT_ENVIRONMENT_ID not in configured_ids
+                        and resource.id == DEFAULT_ENVIRONMENT_ID
+                    )
+                ),
+            ]
+            page = PagedList(
+                data=resources,
+                first_id=resources[0].id if resources else None,
+                last_id=resources[-1].id if resources else None,
+                has_more=False,
+            )
         if resource_type is not None:
             return filter_resources_by_type(page, resource_type)
         return page
@@ -688,10 +727,7 @@ class SessionResourceRegistry:
             e.g. ``"default"`` or ``"terminal_bash_s1"``.
         :returns: The matching resource or ``None``.
         """
-        page = list_session_resources_from_terminal_registry(
-            session_id,
-            self._terminal_registry,
-        )
+        page = self.list_resources(session_id)
         return get_resource_by_id(page, resource_id)
 
     async def get_terminal_resource(
@@ -765,6 +801,10 @@ class SessionResourceRegistry:
         if environment_id == DEFAULT_ENVIRONMENT_ID:
             return self._resolve_primary(session_id, agent_spec)
 
+        directory = self._directory_for_environment(session_id, environment_id)
+        if directory is not None:
+            return self._resolve_directory_environment(session_id, directory, agent_spec)
+
         if self._terminal_registry is not None:
             for entry in self._terminal_registry.list_for_conversation(
                 session_id,
@@ -779,6 +819,75 @@ class SessionResourceRegistry:
                     return entry.instance.os_env
 
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
+
+    def _directory_for_environment(
+        self,
+        session_id: str,
+        environment_id: str,
+    ) -> SessionDirectory | None:
+        """Return the attached directory represented by an environment id."""
+        for directory in self._session_directories.get(session_id, ()):
+            if directory.id == environment_id:
+                return directory
+        return None
+
+    def compute_environment_root(
+        self,
+        session_id: str,
+        environment_id: str,
+        agent_spec: AgentSpec | None,
+    ) -> str | None:
+        """Return the filesystem root represented by an environment id."""
+        if environment_id == DEFAULT_ENVIRONMENT_ID:
+            return self.compute_default_env_root(session_id, agent_spec)
+        directory = self._directory_for_environment(session_id, environment_id)
+        if directory is not None:
+            return str(Path(directory.path).resolve())
+        return None
+
+    def _resolve_directory_environment(
+        self,
+        session_id: str,
+        directory: SessionDirectory,
+        agent_spec: AgentSpec | None,
+    ) -> OSEnvironment:
+        """Get or create an environment rooted at an additional directory."""
+        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+        from omnigent.inner.os_env import create_os_environment
+
+        key = (session_id, directory.id)
+        with self._lock:
+            cached = self._directory_envs.get(key)
+            if cached is not None:
+                return cached
+
+            spec_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
+            if agent_spec is not None and spec_os_env is None:
+                raise ValueError(
+                    "Agent spec has no os_env; cannot create a filesystem environment."
+                )
+            if spec_os_env is None:
+                effective_spec = OSEnvSpec(
+                    type="caller_process",
+                    cwd=directory.path,
+                    sandbox=OSEnvSandboxSpec(type="none"),
+                )
+            else:
+                effective_spec = OSEnvSpec(
+                    type=spec_os_env.type,
+                    cwd=directory.path,
+                    sandbox=spec_os_env.sandbox,
+                    fork=spec_os_env.fork,
+                    start_in_scratch=spec_os_env.start_in_scratch,
+                )
+            env = create_os_environment(effective_spec)
+            if env is None:
+                raise RuntimeError(
+                    f"Failed to create directory environment {directory.id!r} "
+                    f"for session {session_id!r}"
+                )
+            self._directory_envs[key] = env
+            return env
 
     def _resolve_primary(
         self,
@@ -1673,6 +1782,11 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             primary = self._primary_envs.pop(session_id, None)
+            directory_envs = [
+                self._directory_envs.pop(key)
+                for key in list(self._directory_envs)
+                if key[0] == session_id
+            ]
             self._session_directories.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
@@ -1688,6 +1802,14 @@ class SessionResourceRegistry:
             except Exception:
                 _logger.exception(
                     "Error closing primary env for session=%s",
+                    session_id,
+                )
+        for environment in directory_envs:
+            try:
+                environment.close()
+            except Exception:
+                _logger.exception(
+                    "Error closing directory env for session=%s",
                     session_id,
                 )
 

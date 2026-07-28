@@ -1317,10 +1317,9 @@ def test_configured_directories_control_cwd_and_sandbox_reach(tmp_path: Path) ->
     assert env.cwd == primary.resolve()
     assert env.sandbox.read_roots == [shared.resolve()]
     assert env.sandbox.write_roots == [shared.resolve()]
-    # Core deliberately exposes only the legacy/default environment. The
-    # per-root Files/Git resource surface is layered in a child PR.
     assert [resource.id for resource in registry.list_resources("conv_multi").data] == [
-        DEFAULT_ENVIRONMENT_ID
+        DEFAULT_ENVIRONMENT_ID,
+        f"dir_{1:032x}",
     ]
 
 

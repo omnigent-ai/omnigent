@@ -2368,6 +2368,7 @@ def create_runner_app(
 
     from omnigent.runtime.filesystem_registry import (
         FilesystemRegistry,
+        MultiRootFilesystemRegistry,
         create_filesystem_registry,
     )
 
@@ -2378,7 +2379,8 @@ def create_runner_app(
         filesystem_registry = None
     app.state.filesystem_registry = filesystem_registry
 
-    _session_fs_registries: dict[str, FilesystemRegistry] = {}
+    _session_fs_registries: dict[tuple[str, str], FilesystemRegistry] = {}
+    app.state.session_filesystem_registries = _session_fs_registries
 
     async def _session_snapshot(session_id: str) -> _SessionSnapshot:
         cached = _session_snapshot_cache.get(session_id)
@@ -2552,23 +2554,51 @@ def create_runner_app(
 
     async def _resolve_session_fs_registry(
         session_id: str,
+        environment_id: str = DEFAULT_ENVIRONMENT_ID,
     ) -> FilesystemRegistry | None:
-        if session_id in _session_fs_registries:
-            return _session_fs_registries[session_id]
+        key = (session_id, environment_id)
+        if key in _session_fs_registries:
+            return _session_fs_registries[key]
 
+        directories = await _session_directory_values(session_id)
         session_workspace = await _session_workspace_value(session_id)
-        if session_workspace is None:
+        if (
+            environment_id == DEFAULT_ENVIRONMENT_ID
+            and not directories
+            and session_workspace is None
+        ):
+            return filesystem_registry
+        root = resource_registry.compute_environment_root(session_id, environment_id, None)
+        if root is None:
+            return None
+        root_path = Path(root).resolve()
+        if filesystem_registry is not None and root_path == filesystem_registry.cwd:
             return filesystem_registry
 
-        session_ws_path = Path(session_workspace).resolve()
-        runner_ws_resolved = runner_workspace.resolve() if runner_workspace is not None else None
-        if runner_ws_resolved is not None and session_ws_path == runner_ws_resolved:
-            return filesystem_registry
-
-        registry = create_filesystem_registry(watch_path=session_ws_path)
+        registry = create_filesystem_registry(watch_path=root_path)
         registry.start()
-        _session_fs_registries[session_id] = registry
+        _session_fs_registries[key] = registry
         return registry
+
+    async def _resolve_session_tool_fs_registry(
+        session_id: str,
+    ) -> FilesystemRegistry | None:
+        """Build a path-routing registry for runner-local agent tools."""
+        directories = await _session_directory_values(session_id)
+        environment_ids = [DEFAULT_ENVIRONMENT_ID]
+        environment_ids.extend(
+            directory.id for directory in directories if directory.id != DEFAULT_ENVIRONMENT_ID
+        )
+        registries: dict[str, FilesystemRegistry] = {}
+        for environment_id in environment_ids:
+            registry = await _resolve_session_fs_registry(session_id, environment_id)
+            if registry is not None:
+                registries[environment_id] = registry
+        if DEFAULT_ENVIRONMENT_ID not in registries:
+            return None
+        if len(registries) == 1:
+            return registries[DEFAULT_ENVIRONMENT_ID]
+        return MultiRootFilesystemRegistry(registries)
 
     from omnigent.entities.environment_filesystem import (
         FilesystemEntry,
@@ -3432,7 +3462,11 @@ def create_runner_app(
         _session_snapshot_locks.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
-        _session_fs_registries.pop(session_id, None)
+        stale_fs_registries = [key for key in _session_fs_registries if key[0] == session_id]
+        for key in stale_fs_registries:
+            registry = _session_fs_registries.pop(key)
+            registry.unregister_conversation(session_id)
+            registry.stop()
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
@@ -6146,7 +6180,11 @@ def create_runner_app(
                                                         conv_id
                                                     ),
                                                     publish_event=_publish_event,
-                                                    filesystem_registry=filesystem_registry,
+                                                    filesystem_registry=(
+                                                        await _resolve_session_tool_fs_registry(
+                                                            conv_id
+                                                        )
+                                                    ),
                                                 )
                                             )
                                         )
@@ -6702,6 +6740,7 @@ def create_runner_app(
         from omnigent.entities.pagination import paginate_in_memory
 
         spec = await _resolve_session_agent_spec(session_id)
+        await _ensure_session_registered(session_id)
         full = resource_registry.list_resources(
             session_id,
             resource_type=cast(_ResourceType | None, type),
@@ -6770,6 +6809,7 @@ def create_runner_app(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ) -> JSONResponse:
+        await _ensure_session_registered(session_id)
         return _build_typed_list_response(
             session_id,
             "environment",
@@ -6818,6 +6858,7 @@ def create_runner_app(
         environment_id: str,
     ) -> JSONResponse:
         agent_spec = await _resolve_session_agent_spec(session_id)
+        await _ensure_session_registered(session_id)
         resource = resource_registry.get_resource(
             session_id,
             environment_id,
@@ -6833,21 +6874,21 @@ def create_runner_app(
                 },
             )
         content = session_resource_view_to_dict(resource)
-        if environment_id == DEFAULT_ENVIRONMENT_ID:
-            root = resource_registry.compute_default_env_root(session_id, agent_spec)
-            if root is not None:
-                raw_metadata = content.get("metadata")
-                metadata: dict[str, object] = (
-                    dict(cast(Mapping[str, object], raw_metadata))
-                    if isinstance(raw_metadata, Mapping)
-                    else {}
-                )
-                metadata["root"] = root
+        root = resource_registry.compute_environment_root(session_id, environment_id, agent_spec)
+        if root is not None:
+            raw_metadata = content.get("metadata")
+            metadata: dict[str, object] = (
+                dict(cast(Mapping[str, object], raw_metadata))
+                if isinstance(raw_metadata, Mapping)
+                else {}
+            )
+            metadata["root"] = root
+            if environment_id == DEFAULT_ENVIRONMENT_ID:
                 home = os.path.expanduser("~")
                 if os.path.isabs(home):
                     metadata["home"] = home
-                metadata["reachable"] = _environment_reach(root, agent_spec)
-                content = {**content, "metadata": metadata}
+            metadata["reachable"] = _environment_reach(root, agent_spec)
+            content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,
             content=content,
@@ -7547,7 +7588,7 @@ def create_runner_app(
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
-        environment_id: str,  # noqa: ARG001
+        environment_id: str,
     ) -> JSONResponse:
         import asyncio as _asyncio
 
@@ -7555,7 +7596,7 @@ def create_runner_app(
 
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         try:
             # ``list_changed_files`` shells out to ``git status`` synchronously,
             # which on a large repo (cold untracked cache) can take seconds.
@@ -7586,6 +7627,8 @@ def create_runner_app(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                "environment_id": environment_id,
+                "directory_id": environment_id,
             }
             for rec in raw_changes
         ]
@@ -7605,7 +7648,7 @@ def create_runner_app(
     ) -> JSONResponse:
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
 
         from omnigent.entities.environment_filesystem import InvalidPath
         from omnigent.runner.environment_filesystem import _validate_path
@@ -7689,6 +7732,8 @@ def create_runner_app(
                 "path": relative_path,
                 "before": before,
                 "after": after,
+                "environment_id": environment_id,
+                "directory_id": environment_id,
             },
         )
 
@@ -7731,6 +7776,8 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -7744,8 +7791,8 @@ def create_runner_app(
         content_bytes = content_str.encode(encoding)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
+            if existing.encoding and session_registry is not None:
+                session_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
                     session_id=session_id,
@@ -7757,8 +7804,8 @@ def create_runner_app(
             content_bytes,
             create_parents=create_parents,
         )
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        if session_registry is not None:
+            session_registry.record_change(relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -7789,6 +7836,8 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -7797,8 +7846,8 @@ def create_runner_app(
         fs = CallerProcessFilesystem(env)
         try:
             existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
+            if existing.encoding and session_registry is not None:
+                session_registry.seed_snapshot(
                     relative_path,
                     existing.data.decode(existing.encoding, errors="replace"),
                     session_id=session_id,
@@ -7812,8 +7861,8 @@ def create_runner_app(
             replace_all=body.get("replace_all", False),
         )
         result = await fs.edit_text(relative_path, edit_req)
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        if session_registry is not None:
+            session_registry.record_change(relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -7842,6 +7891,8 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        session_registry = await _resolve_session_fs_registry(session_id, environment_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -7849,8 +7900,8 @@ def create_runner_app(
         )
         fs = CallerProcessFilesystem(env)
         result = await fs.delete(relative_path, recursive=recursive)
-        if filesystem_registry is not None and result.type == "file":
-            filesystem_registry.record_change(relative_path, "deleted", session_id)
+        if session_registry is not None and result.type == "file":
+            session_registry.record_change(relative_path, "deleted", session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -8307,6 +8358,7 @@ def create_runner_app(
         )
 
         agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(
             session_id,
             environment_id,
@@ -8357,6 +8409,7 @@ def create_runner_app(
         session_id: str,
         resource_id: str,
     ) -> JSONResponse:
+        await _ensure_session_registered(session_id)
         resource = resource_registry.get_resource(
             session_id,
             resource_id,
@@ -8667,7 +8720,7 @@ def create_runner_app(
                         session_async_tasks=_session_async_tasks.get(session_id),
                         harness_client=None,
                         publish_event=_publish_event,
-                        filesystem_registry=filesystem_registry,
+                        filesystem_registry=(await _resolve_session_tool_fs_registry(session_id)),
                     )
                 except Exception as exc:  # noqa: BLE001
                     return JSONResponse(

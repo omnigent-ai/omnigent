@@ -780,8 +780,11 @@ async def test_inline_launch_rejects_bad_workspace(
 
 
 async def _inline_launch_session(
-    client: httpx.AsyncClient, comm: ApplicationCommunicator
-) -> dict[str, str]:
+    client: httpx.AsyncClient,
+    comm: ApplicationCommunicator,
+    *,
+    directories: list[str] | None = None,
+) -> dict[str, Any]:
     """Inline-launch a host-bound session and return its id + runner_id.
 
     Drives ``POST /v1/sessions`` with ``host_id`` + ``workspace`` while
@@ -795,13 +798,20 @@ async def _inline_launch_session(
     """
     agent = await create_test_agent(client)
     launch_responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    body: dict[str, Any] = {
+        "agent_id": agent["id"],
+        "host_id": _HOST_ID,
+        "workspace": _WORKSPACE,
+    }
+    if directories:
+        body["directories"] = [{"path": path} for path in directories]
     create_resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        json=body,
     )
     await launch_responder
     assert create_resp.status_code == 201, create_resp.text
-    return {"id": create_resp.json()["id"], "runner_id": create_resp.json()["runner_id"]}
+    return create_resp.json()
 
 
 async def test_inline_launch_keeps_symlink_name_as_additional_directory_title(
@@ -1724,7 +1734,7 @@ async def test_health_reports_online_for_host_on_other_replica(
 
 async def _serve_fs_requests(
     comm: ApplicationCommunicator,
-    workspace_root: str,
+    workspace_root: str | dict[str, str],
     *,
     max_frames: int = 60,
 ) -> None:
@@ -1749,7 +1759,15 @@ async def _serve_fs_requests(
     from omnigent.host.frames import HostFsRequestFrame, HostFsResultFrame
     from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
 
-    reader = WorkspaceReader(Path(workspace_root))
+    if isinstance(workspace_root, str):
+        readers: dict[str, WorkspaceReader] | None = None
+        default_reader = WorkspaceReader(Path(workspace_root))
+    else:
+        readers = {
+            requested_root: WorkspaceReader(Path(actual_root))
+            for requested_root, actual_root in workspace_root.items()
+        }
+        default_reader = None
     for _ in range(max_frames):
         output = await comm.receive_output(timeout=3.0)
         if output["type"] != "websocket.send":
@@ -1757,6 +1775,9 @@ async def _serve_fs_requests(
         frame = decode_host_frame(output["text"])
         if not isinstance(frame, HostFsRequestFrame):
             continue
+        reader = default_reader if readers is None else readers.get(frame.workspace)
+        if reader is None:
+            raise AssertionError(f"unexpected host filesystem root {frame.workspace!r}")
         params = frame.params or {}
         try:
             if frame.op == "list_or_read":
@@ -1877,6 +1898,89 @@ async def test_offline_runner_serves_file_content_and_changes_from_host(
         assert diff.status_code == 200, diff.text
         assert diff.json()["before"] == "original\n"
         assert diff.json()["after"] == "changed on disk\n"
+    finally:
+        set_runner_router(prior_router)
+        responder.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await responder
+
+
+async def test_offline_runner_serves_requested_additional_directory_from_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    tmp_path,
+) -> None:
+    """Host fallback resolves the requested stable root, including for Git."""
+    import os
+    import subprocess
+
+    shared = tmp_path / "shared-repo"
+    shared.mkdir()
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "T",
+        "GIT_AUTHOR_EMAIL": "t@e.com",
+        "GIT_COMMITTER_NAME": "T",
+        "GIT_COMMITTER_EMAIL": "t@e.com",
+    }
+    subprocess.run(["git", "init"], cwd=shared, check=True, capture_output=True, env=git_env)
+    (shared / "shared.txt").write_text("baseline\n")
+    subprocess.run(["git", "add", "."], cwd=shared, check=True, capture_output=True, env=git_env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=shared,
+        check=True,
+        capture_output=True,
+        env=git_env,
+    )
+    (shared / "shared.txt").write_text("changed\n")
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, directories=[str(shared)])
+    session_id = session["id"]
+    shared_id = next(
+        directory["id"] for directory in session["directories"] if directory["id"] != "default"
+    )
+
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> object:
+            del session_id
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    prior_router = _globals._runner_router
+    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+    responder = asyncio.create_task(_serve_fs_requests(comm, {str(shared): str(shared)}))
+    try:
+        environments = await client.get(f"/v1/sessions/{session_id}/resources/environments")
+        assert environments.status_code == 200, environments.text
+        assert {item["id"] for item in environments.json()["data"]} == {
+            "default",
+            shared_id,
+        }
+
+        base = f"/v1/sessions/{session_id}/resources/environments/{shared_id}"
+        environment = await client.get(base)
+        assert environment.status_code == 200, environment.text
+        assert environment.json()["metadata"]["root"] == str(shared)
+
+        changes = await client.get(f"{base}/changes")
+        assert changes.status_code == 200, changes.text
+        [change] = changes.json()["data"]
+        assert change["path"] == "shared.txt"
+        assert change["directory_id"] == shared_id
+
+        content = await client.get(f"{base}/filesystem/shared.txt")
+        assert content.status_code == 200, content.text
+        assert content.json()["content"] == "changed\n"
+
+        diff = await client.get(f"{base}/diff/shared.txt")
+        assert diff.status_code == 200, diff.text
+        assert diff.json()["before"] == "baseline\n"
+        assert diff.json()["after"] == "changed\n"
+        assert diff.json()["environment_id"] == shared_id
     finally:
         set_runner_router(prior_router)
         responder.cancel()

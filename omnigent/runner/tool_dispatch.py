@@ -5360,7 +5360,7 @@ _CHANGED_FILES_SIGNAL_THROTTLE_S = 0.75
 # can't grow it without limit. Clearing past the cap only risks one extra
 # (harmless) signal for sessions whose timestamp is dropped.
 _CHANGED_FILES_SIGNAL_MAX_TRACKED = 4096
-_changed_files_last_signal: dict[str, float] = {}
+_changed_files_last_signal: dict[tuple[str, str], float] = {}
 # Tools that can mutate the workspace filesystem. ``sys_os_shell`` is
 # included because git-mode change detection derives from `git status`
 # and shell edits are otherwise untracked.
@@ -5374,6 +5374,7 @@ def _maybe_signal_changed_files(
     publish_event: Callable[[str, _JsonObject], None] | None,
     *,
     now: float,
+    environment_id: str = "default",
 ) -> None:
     """Publish a throttled ``session.changed_files.invalidated`` event.
 
@@ -5388,18 +5389,19 @@ def _maybe_signal_changed_files(
     """
     if conversation_id is None or publish_event is None:
         return
-    last = _changed_files_last_signal.get(conversation_id, 0.0)
+    throttle_key = (conversation_id, environment_id)
+    last = _changed_files_last_signal.get(throttle_key, 0.0)
     if now - last < _CHANGED_FILES_SIGNAL_THROTTLE_S:
         return
     if len(_changed_files_last_signal) > _CHANGED_FILES_SIGNAL_MAX_TRACKED:
         _changed_files_last_signal.clear()
-    _changed_files_last_signal[conversation_id] = now
+    _changed_files_last_signal[throttle_key] = now
     publish_event(
         conversation_id,
         {
             "type": "session.changed_files.invalidated",
             "session_id": conversation_id,
-            "environment_id": "default",
+            "environment_id": environment_id,
         },
     )
 
@@ -5471,11 +5473,36 @@ async def dispatch_tool_locally(
     # A file-mutating tool just ran — nudge the web to refetch the
     # changed-files list (throttled, coalesced client-side).
     if tool_name in _CHANGED_FILES_TOOLS:
-        _maybe_signal_changed_files(
-            conversation_id,
-            publish_event,
-            now=asyncio.get_running_loop().time(),
-        )
+        environment_ids = ("default",)
+        routed_ids = getattr(filesystem_registry, "environment_ids", None)
+        route_path = getattr(filesystem_registry, "environment_id_for_path", None)
+        if tool_name == SysOsShellTool.name() and isinstance(routed_ids, tuple):
+            environment_ids = tuple(
+                environment_id for environment_id in routed_ids if isinstance(environment_id, str)
+            )
+        elif callable(route_path):
+            try:
+                parsed_arguments = json.loads(arguments)
+                raw_path = (
+                    parsed_arguments.get("path") if isinstance(parsed_arguments, dict) else None
+                )
+                if isinstance(raw_path, str):
+                    routed_environment_id = route_path(raw_path)
+                    if isinstance(routed_environment_id, str):
+                        environment_ids = (routed_environment_id,)
+            except (TypeError, ValueError):
+                _logger.debug(
+                    "Could not route changed-files invalidation; using the default environment",
+                    exc_info=True,
+                )
+        now = asyncio.get_running_loop().time()
+        for environment_id in environment_ids:
+            _maybe_signal_changed_files(
+                conversation_id,
+                publish_event,
+                now=now,
+                environment_id=environment_id,
+            )
 
     # POST the result back to the harness as a ``tool_result``
     # event on the session-keyed events endpoint. ``conversation_id``

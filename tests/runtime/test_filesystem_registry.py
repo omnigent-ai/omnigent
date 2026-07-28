@@ -23,6 +23,7 @@ from omnigent.runtime.filesystem_registry import (
     AgentEditFilesystemRegistry,
     GitFilesystemRegistry,
     GitStatusUnavailable,
+    MultiRootFilesystemRegistry,
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
@@ -80,15 +81,41 @@ def test_created_then_modified_shows_added(registry: AgentEditFilesystemRegistry
         f"Expected 1 record for trip.md, got {len(results)}. "
         "Duplicate entries suggest the dedup merge didn't fire."
     )
-
-    # Status must be "created" — the file is new to this session regardless of edits.
-    # If "modified", the modified event overwrote the created event (the bug).
+    # Status must remain created even after later edits in the same session.
     assert results[0]["status"] == "created", (
         f"Expected status 'created' (file is newly created this session), "
         f"got '{results[0]['status']}'. "
         "A 'M' result means the modified event incorrectly replaced the created event."
     )
     assert results[0]["path"] == "trip.md"
+
+
+def test_multi_root_registry_routes_absolute_agent_tool_paths(tmp_path: Path) -> None:
+    """Absolute writes are attributed to their attached project root."""
+    primary = tmp_path / "primary"
+    shared = tmp_path / "shared"
+    primary.mkdir()
+    shared.mkdir()
+    default_registry = AgentEditFilesystemRegistry(primary)
+    shared_registry = AgentEditFilesystemRegistry(shared)
+    shared_id = f"dir_{9:032x}"
+    router = MultiRootFilesystemRegistry({"default": default_registry, shared_id: shared_registry})
+    changed = shared / "src" / "changed.py"
+    changed.parent.mkdir()
+    changed.write_text("changed\n")
+
+    router.record_change(str(changed), "modified", "conv_multi")
+
+    assert default_registry.list_changed_files("conv_multi", limit=10) == []
+    assert shared_registry.list_changed_files("conv_multi", limit=10) == [
+        {
+            "path": "src/changed.py",
+            "status": "modified",
+            "bytes": 8,
+            "modified_at": int(changed.stat().st_mtime),
+        }
+    ]
+    assert router.environment_id_for_path(str(changed)) == shared_id
 
 
 def test_modified_only_shows_modified(registry: AgentEditFilesystemRegistry) -> None:

@@ -1222,6 +1222,83 @@ class GitFilesystemRegistry(FilesystemRegistry):
         return counts
 
 
+class MultiRootFilesystemRegistry(FilesystemRegistry):
+    """Route agent-tool change tracking to the matching project root.
+
+    Relative paths belong to the session's primary environment. Absolute paths
+    are matched against every attached root, preferring the most specific root.
+    Query methods delegate to the primary registry; root-specific REST routes
+    query their concrete registries directly.
+    """
+
+    def __init__(
+        self,
+        registries: dict[str, FilesystemRegistry],
+        *,
+        default_environment_id: str = "default",
+    ) -> None:
+        if default_environment_id not in registries:
+            raise ValueError("multi-root filesystem registry requires a default environment")
+        self._registries = dict(registries)
+        self._default_environment_id = default_environment_id
+        super().__init__(self._registries[default_environment_id].cwd)
+
+    @property
+    def environment_ids(self) -> tuple[str, ...]:
+        """Return routed environment ids in stable insertion order."""
+        return tuple(self._registries)
+
+    def environment_id_for_path(self, path: str) -> str:
+        """Return the environment id that owns an agent-tool path."""
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            return self._default_environment_id
+        resolved = candidate.resolve(strict=False)
+        matches: list[tuple[int, str]] = []
+        for environment_id, registry in self._registries.items():
+            try:
+                resolved.relative_to(registry.cwd)
+            except ValueError:
+                continue
+            matches.append((len(registry.cwd.parts), environment_id))
+        if not matches:
+            return self._default_environment_id
+        return max(matches)[1]
+
+    def _route(self, path: str) -> tuple[FilesystemRegistry, str]:
+        environment_id = self.environment_id_for_path(path)
+        registry = self._registries[environment_id]
+        candidate = Path(path)
+        if candidate.is_absolute():
+            with contextlib.suppress(ValueError):
+                path = str(candidate.resolve(strict=False).relative_to(registry.cwd))
+        return registry, path
+
+    def record_change(self, path: str, operation: str, session_id: str) -> None:
+        registry, routed_path = self._route(path)
+        registry.record_change(routed_path, operation, session_id)
+
+    def seed_snapshot(self, path: str, content: str, *, session_id: str | None = None) -> None:
+        registry, routed_path = self._route(path)
+        registry.seed_snapshot(routed_path, content, session_id=session_id)
+
+    def unregister_conversation(self, conversation_id: str) -> None:
+        for registry in set(self._registries.values()):
+            registry.unregister_conversation(conversation_id)
+
+    def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
+        return self._registries[self._default_environment_id].list_changed_files(
+            conversation_id,
+            limit=limit,
+        )
+
+    def get_changed_file(self, session_id: str, path: str) -> dict[str, Any] | None:
+        return self._registries[self._default_environment_id].get_changed_file(session_id, path)
+
+    def get_baseline(self, path: str) -> str | None:
+        return self._registries[self._default_environment_id].get_baseline(path)
+
+
 # ── Factory ───────────────────────────────────────────────────────────────────
 
 

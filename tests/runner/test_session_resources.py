@@ -21,6 +21,7 @@ from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.session_resources import (
     SessionResourceView,
     default_environment_resource,
+    directory_environment_resource,
     environment_safety_metadata,
     terminal_resource_id,
     terminal_resource_view,
@@ -37,6 +38,7 @@ from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.session_directories import SessionDirectory
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -349,7 +351,7 @@ async def test_session_resources_new_session_lists_default_only(tmp_path: Path) 
                 "object": "session.resource",
                 "type": "environment",
                 "session_id": "conv_new",
-                "name": "Primary environment",
+                "name": "Working folder",
                 "metadata": {
                     "environment_type": "caller_process",
                     "role": "primary",
@@ -1424,6 +1426,21 @@ def test_default_environment_resource_without_spec_is_legacy_shape() -> None:
         "environment_type": "caller_process",
         "role": "primary",
     }
+
+
+def test_directory_environment_resource_uses_editable_display_name() -> None:
+    """Directory resources expose the working-folder label and nicknames."""
+    primary = directory_environment_resource(
+        "conv_x",
+        SessionDirectory("default", "/repo/main"),
+    )
+    shared = directory_environment_resource(
+        "conv_x",
+        SessionDirectory(f"dir_{1:032x}", "/repo/shared", "Shared services"),
+    )
+
+    assert primary.name == "Working folder"
+    assert shared.name == "Shared services"
 
 
 @pytest.mark.asyncio
