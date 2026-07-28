@@ -31,6 +31,7 @@ import yaml
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -1848,12 +1849,22 @@ async def test_subagent_message_heals_stale_runner_binding_via_parent(
         healed_for.append(child_conv.id)
         return fake_runner
 
-    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner_client_stub)
-    monkeypatch.setattr(sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_spy)
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_client_stub)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
+    )
+
+    async def _no_init(*_a: Any, **_k: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(routes_events_module, "_ensure_runner_session_initialized", _no_init)
 
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
-        json={"type": "message", "content": [{"type": "text", "text": "hello"}]},
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
     )
 
     assert resp.status_code in {200, 202}, resp.text
@@ -1877,12 +1888,17 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
     async def _heal_none(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner_none)
-    monkeypatch.setattr(sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_none)
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_none
+    )
 
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
-        json={"type": "message", "content": [{"type": "text", "text": "hello"}]},
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
     )
 
     assert resp.status_code == 503, resp.text
@@ -1901,7 +1917,7 @@ async def test_non_subagent_session_not_healed_via_parent(
     agent = await create_test_agent(client, name="msg-heal-toplevel")
     session_resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["agent_id"]},
+        json={"agent_id": agent["id"]},
     )
     assert session_resp.status_code == 201, session_resp.text
     session_id = session_resp.json()["id"]
@@ -1915,12 +1931,17 @@ async def test_non_subagent_session_not_healed_via_parent(
     async def _runner_none(*_args: Any, **_kwargs: Any) -> None:
         return None
 
-    monkeypatch.setattr(sessions_module, "_get_runner_client", _runner_none)
-    monkeypatch.setattr(sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_spy)
+    monkeypatch.setattr(routes_events_module, "_get_runner_client", _runner_none)
+    monkeypatch.setattr(
+        routes_events_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
+    )
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "message", "content": [{"type": "text", "text": "hello"}]},
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
     )
 
     assert resp.status_code == 503, resp.text
