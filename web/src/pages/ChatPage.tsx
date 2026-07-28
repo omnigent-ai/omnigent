@@ -954,6 +954,7 @@ export function ChatPage() {
         ...activeConv,
         permission_level: activeSession?.permissionLevel ?? activeConv.permission_level,
         host_resumable: activeSession?.hostResumable ?? false,
+        kind: activeSession?.kind,
       }
     : livenessRowFromSession(activeSession);
   const liveness = useSessionLiveness(urlConvId ?? undefined, livenessRow, {
