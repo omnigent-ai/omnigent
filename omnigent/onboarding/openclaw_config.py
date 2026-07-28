@@ -7,7 +7,6 @@ agent keeps its own authentication.
 
 from __future__ import annotations
 
-import json
 import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -95,12 +94,13 @@ def read_openclaw_config(
 ) -> OpenClawDiscovery:
     """Read one selected acpx/OpenClaw config file.
 
-    When ``source`` is omitted, detects the top-level acpx ``agents`` shape or
-    the wrapped OpenClaw ``plugins.entries.acpx.config`` shape. Files that match
-    neither are rejected instead of being treated as an empty registry.
+    Both shapes accept JSON5 so auto-discovered and manually selected files
+    have identical parsing. When ``source`` is omitted, detects the top-level
+    acpx ``agents`` shape or wrapped OpenClaw registry. Files that match neither
+    are rejected instead of being treated as an empty registry.
     """
     try:
-        raw = _load_config(path, json5_format=source != "acpx")
+        raw = _load_config(path)
         resolved_source = source or _detect_source(raw)
         agents, errors = _extract_agents(raw, source=resolved_source, path=path)
         return OpenClawDiscovery(agents=tuple(agents), errors=tuple(errors))
@@ -187,15 +187,14 @@ def merge_imported_acp_entries(
     return current, added
 
 
-def _load_config(path: Path, *, json5_format: bool) -> Any:
+def _load_config(path: Path) -> Any:
     text = path.read_text(encoding="utf-8")
-    kind = "JSON5" if json5_format else "JSON"
     try:
-        return json5.loads(text) if json5_format else json.loads(text)
+        return json5.loads(text)
     except RecursionError as exc:
-        raise ValueError(f"invalid {kind}: nesting is too deep") from exc
+        raise ValueError("invalid JSON5: nesting is too deep") from exc
     except ValueError as exc:
-        raise ValueError(f"invalid {kind}: {exc}") from exc
+        raise ValueError(f"invalid JSON5: {exc}") from exc
 
 
 def _extract_agents(

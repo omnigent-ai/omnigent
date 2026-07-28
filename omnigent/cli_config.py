@@ -3719,7 +3719,8 @@ def _run_configure_harnesses_interactive() -> None:
         # _render_menu prefixes selected rows with ``"    ❯  "`` (7 cells).
         # Cap the status text from the actual terminal width so verbose status
         # rows (e.g. OpenCode's provider summary) do not wrap in the compact
-        # single-line overview.
+        # single-line overview. "Import from OpenClaw" can leave fewer than
+        # eight cells at the 40-column minimum, so the floor follows available space.
         max_status_width = max(1, min(30, term_width - 7 - name_col - len("✓ ")))
         options: list[str] = []
         selectable: list[bool] = []

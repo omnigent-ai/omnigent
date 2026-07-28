@@ -86,6 +86,29 @@ def test_reads_selected_acpx_config_by_shape(tmp_path: Path) -> None:
     ]
 
 
+def test_acpx_json5_parses_identically_via_discovery_and_selected_path(tmp_path: Path) -> None:
+    config = tmp_path / "config.json"
+    config.write_text(
+        """
+        {
+          // acpx registries use the same tolerant parser as wrapped OpenClaw.
+          agents: {
+            "Gemini CLI": {command: "gemini", args: ["--acp"],},
+          },
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    discovered = discover_openclaw_agents(
+        acpx_path=config, openclaw_path=tmp_path / "missing.json"
+    )
+    selected = read_openclaw_config(config)
+
+    assert discovered.errors == selected.errors == ()
+    assert discovered.agents == selected.agents
+
+
 def test_reads_selected_openclaw_config_by_shape(tmp_path: Path) -> None:
     config = tmp_path / "registry.json"
     config.write_text(
