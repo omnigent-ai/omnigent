@@ -4931,6 +4931,11 @@
             "title": "Items",
             "type": "array"
           },
+          "kind": {
+            "default": "default",
+            "title": "Kind",
+            "type": "string"
+          },
           "labels": {
             "additionalProperties": {
               "type": "string"
