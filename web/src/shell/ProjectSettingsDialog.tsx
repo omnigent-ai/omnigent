@@ -3,17 +3,16 @@
 // the new-chat composer pre-fill host / working directory / agent and the
 // isolated-worktree default when starting a session in the project.
 //
-// Scope mirrors what the composer prefills today: host, workspace, agent,
-// whether new sessions start in a fresh git worktree, and the base branch a
-// worktree forks from (which overrides the user-global default in Settings ›
-// Git). Model / reasoning-effort / harness are per-agent run config,
-// deliberately out of scope here. The host and agent pickers reuse the
-// composer's components; the working directory reuses its filesystem browser
-// (inline, so it scrolls inside the modal).
+// Scope mirrors what the composer prefills today: host, workspace, additional
+// folders, agent, whether new sessions start in a fresh git worktree, and the
+// base branch a worktree forks from (which overrides the user-global default in
+// Settings › Git). Model / reasoning-effort / harness remain per-agent run
+// config. The host and agent pickers reuse the composer's components; directory
+// fields reuse its filesystem browser inside the modal.
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
-import { ChevronDownIcon } from "lucide-react";
+import { ChevronDownIcon, PlusIcon, XIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -40,7 +39,11 @@ import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { isNativeCodingAgent } from "@/lib/nativeCodingAgents";
-import type { ProjectConfig } from "@/lib/projectsApi";
+import {
+  MAX_PROJECT_ADDITIONAL_DIRECTORIES,
+  normalizeProjectDirectories,
+  type ProjectConfig,
+} from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { isNavigablePath, WorkspacePicker } from "./WorkspacePicker";
@@ -114,6 +117,7 @@ export function ProjectSettingsDialog({
   // the fetched config arrives); local until saved.
   const [hostId, setHostId] = useState<string>(NONE);
   const [workspace, setWorkspace] = useState("");
+  const [directories, setDirectories] = useState<string[]>([]);
   // Worktrees are opt-in: the toggle starts OFF and only an explicit ON is
   // stored (as use_worktree:true), which the composer honors by creating a
   // fresh worktree for new sessions in the project.
@@ -124,6 +128,8 @@ export function ProjectSettingsDialog({
   const [baseBranch, setBaseBranch] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [directoryOpen, setDirectoryOpen] = useState(false);
+  const [directoryCandidate, setDirectoryCandidate] = useState("");
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
   // DialogContent, so their dismiss (pick an option / click the body while
@@ -165,10 +171,13 @@ export function ProjectSettingsDialog({
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
+    setDirectories(normalizeProjectDirectories(c.directories, c.workspace).map((d) => d.path));
     setUseWorktree(c.use_worktree ?? false);
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setWorkspaceOpen(false);
+    setDirectoryOpen(false);
+    setDirectoryCandidate("");
   }, [open, stored, loadFailed]);
 
   const onSubmit = (e: FormEvent) => {
@@ -184,9 +193,16 @@ export function ProjectSettingsDialog({
     // A workspace is host-relative and only meaningful with a concrete host —
     // don't persist a stale path from a since-cleared host, and drop it for the
     // sandbox (a sandbox create provisions its own workspace and ignores this).
-    const ws =
-      hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
+    const hasConcreteHost = hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE;
+    const ws = hasConcreteHost ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
+    if (hasConcreteHost) {
+      const normalizedDirectories = normalizeProjectDirectories(
+        directories.map((path) => ({ path })),
+        ws,
+      );
+      if (normalizedDirectories.length > 0) config.directories = normalizedDirectories;
+    }
     if (agentId) config.agent_id = agentId;
     // Worktrees are opt-in: only an explicit ON is stored (as use_worktree:true);
     // leaving it OFF stores nothing, so an all-default dialog still clears to {}.
@@ -217,6 +233,31 @@ export function ProjectSettingsDialog({
   // / an offline stored host). Otherwise the field is a plain path input.
   const browsableHostId =
     hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
+
+  const normalizedDirectoryCandidate = normalizeProjectDirectories(
+    [{ path: directoryCandidate }],
+    workspace,
+  )[0]?.path;
+  const canAddDirectory =
+    browsableHostId !== null &&
+    normalizedDirectoryCandidate !== undefined &&
+    !directories.includes(normalizedDirectoryCandidate) &&
+    directories.length < MAX_PROJECT_ADDITIONAL_DIRECTORIES;
+
+  const setDirectoryBrowserOpen = (nextOpen: boolean) => {
+    if (nextOpen) {
+      setWorkspaceOpen(false);
+      setDirectoryCandidate(isNavigablePath(workspace) ? workspace : "");
+    }
+    setDirectoryOpen(nextOpen);
+  };
+
+  const addDirectory = () => {
+    if (!canAddDirectory || normalizedDirectoryCandidate === undefined) return;
+    setDirectories((current) => [...current, normalizedDirectoryCandidate]);
+    setDirectoryCandidate("");
+    setDirectoryOpen(false);
+  };
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
@@ -314,7 +355,10 @@ export function ProjectSettingsDialog({
               >
                 <button
                   type="button"
-                  onClick={() => setWorkspaceOpen((v) => !v)}
+                  onClick={() => {
+                    setDirectoryOpen(false);
+                    setWorkspaceOpen((v) => !v);
+                  }}
                   aria-expanded={workspaceOpen}
                   disabled={isLoading}
                   className="flex h-8 w-full items-center justify-between gap-2 rounded-md border border-input bg-transparent px-3 text-ui outline-none disabled:cursor-not-allowed disabled:opacity-50"
@@ -362,6 +406,121 @@ export function ProjectSettingsDialog({
                 disabled={isLoading}
               />
             )}
+          </Field>
+
+          <Field
+            label="Additional folders"
+            hint={
+              hostId === NONE
+                ? "Pick a host first"
+                : hostId === SANDBOX_HOST_CHOICE
+                  ? "Not available for managed sandboxes"
+                  : browsableHostId
+                    ? "Attached to every new session"
+                    : "Connect this host to add folders"
+            }
+          >
+            <div className="flex flex-col gap-1.5" data-testid="project-settings-directories">
+              {hostId !== SANDBOX_HOST_CHOICE && directories.length > 0 && (
+                <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pr-1">
+                  {directories.map((path) => {
+                    const basename = path.split("/").filter(Boolean).pop() ?? path;
+                    return (
+                      <div
+                        key={path}
+                        className="flex min-w-0 items-center gap-2 rounded-md border bg-muted/30 px-2.5 py-1.5"
+                        data-testid="project-settings-directory"
+                      >
+                        <span className="flex min-w-0 flex-1 flex-col">
+                          <span className="truncate text-sm">{basename}</span>
+                          <span className="truncate font-mono text-[10px] text-muted-foreground">
+                            {path}
+                          </span>
+                        </span>
+                        <button
+                          type="button"
+                          className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          aria-label={`Remove additional folder ${path}`}
+                          onClick={() =>
+                            setDirectories((current) =>
+                              current.filter((directory) => directory !== path),
+                            )
+                          }
+                        >
+                          <XIcon className="size-3.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {hostId === SANDBOX_HOST_CHOICE ? (
+                <p className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-sm">
+                  Managed sandboxes use a server-provisioned workspace.
+                </p>
+              ) : browsableHostId === null ? (
+                <p className="rounded-md border border-dashed px-3 py-2 text-muted-foreground text-sm">
+                  {hostId === NONE ? "Pick a host first" : "Host unavailable"}
+                </p>
+              ) : directories.length < MAX_PROJECT_ADDITIONAL_DIRECTORIES ? (
+                <div className="relative">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="w-full justify-start gap-2 font-normal text-muted-foreground"
+                    aria-expanded={directoryOpen}
+                    onClick={() => setDirectoryBrowserOpen(!directoryOpen)}
+                    data-testid="project-settings-add-directory"
+                  >
+                    <PlusIcon className="size-3.5" />
+                    Add folder
+                  </Button>
+                  {directoryOpen && (
+                    <>
+                      <button
+                        type="button"
+                        aria-label="Close additional folder browser"
+                        className="fixed inset-0 z-10 cursor-default"
+                        onClick={() => setDirectoryBrowserOpen(false)}
+                      />
+                      <div className="absolute top-full right-0 left-0 z-20 mt-1 overflow-hidden rounded-md border bg-popover shadow-md">
+                        <WorkspacePicker
+                          hostId={browsableHostId}
+                          initialPath={
+                            isNavigablePath(directoryCandidate)
+                              ? directoryCandidate
+                              : isNavigablePath(workspace)
+                                ? workspace
+                                : undefined
+                          }
+                          onNavigate={setDirectoryCandidate}
+                        />
+                        <div className="flex items-center justify-between gap-2 border-t border-border p-2">
+                          <span className="min-w-0 truncate font-mono text-[10px] text-muted-foreground">
+                            {normalizedDirectoryCandidate ?? "Choose a folder"}
+                          </span>
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={!canAddDirectory}
+                            onClick={addDirectory}
+                            data-testid="project-settings-add-directory-confirm"
+                          >
+                            Add
+                          </Button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : (
+                <p className="text-muted-foreground text-xs">
+                  Maximum of {MAX_PROJECT_ADDITIONAL_DIRECTORIES} additional folders reached.
+                </p>
+              )}
+            </div>
           </Field>
 
           <Field

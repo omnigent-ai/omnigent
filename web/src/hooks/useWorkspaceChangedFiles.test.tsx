@@ -1,8 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
+
+type WorkspaceEnvironmentStatus = Pick<
+  WorkspaceEnvironment,
+  "available" | "root" | "home" | "reachable"
+>;
 
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
@@ -22,14 +27,17 @@ import {
   looksLikeWorkspaceFilePath,
   relativizeToWorkspace,
   runnerOfflineRetryDelay,
+  resolveWorkspaceFilePath,
   shouldRetryRunnerOffline,
   toWorkspaceRelativePath,
   useWorkspaceAllFiles,
   useWorkspaceChangedFiles,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
+  useWorkspaceEnvironments,
   useWorkspaceFileExists,
   useWorkspaceFileSearch,
+  useRenameWorkspaceEnvironment,
 } from "./useWorkspaceChangedFiles";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
@@ -110,13 +118,39 @@ function EnvironmentDataProbe({
   onData,
 }: {
   id: string | undefined;
-  onData: (data: WorkspaceEnvironment) => void;
+  onData: (data: WorkspaceEnvironmentStatus) => void;
 }) {
   const query = useWorkspaceEnvironment(id);
   useEffect(() => {
     if (query.isSuccess) onData(query.data);
   }, [query.isSuccess, query.data, onData]);
   return null;
+}
+
+function EnvironmentsDataProbe({
+  id,
+  onData,
+}: {
+  id: string | undefined;
+  onData: (data: { id: string; name: string; root: string | null }[]) => void;
+}) {
+  const query = useWorkspaceEnvironments(id);
+  useEffect(() => {
+    if (query.isSuccess) onData(query.data);
+  }, [query.isSuccess, query.data, onData]);
+  return null;
+}
+
+function RenameEnvironmentProbe({ id }: { id: string }) {
+  const rename = useRenameWorkspaceEnvironment(id);
+  return (
+    <button
+      type="button"
+      onClick={() => rename.mutate({ environmentId: "dir_shared", name: "Shared services" })}
+    >
+      Rename environment
+    </button>
+  );
 }
 
 function DisabledEnvironmentProbe({ id }: { id: string | undefined }) {
@@ -365,7 +399,7 @@ describe("useWorkspaceChangedFiles gating", () => {
         },
       }),
     );
-    const results: WorkspaceEnvironment[] = [];
+    const results: WorkspaceEnvironmentStatus[] = [];
 
     render(
       <Wrap>
@@ -507,7 +541,7 @@ describe("useWorkspaceEnvironment gating", () => {
   it("marks the environment unavailable when the server omits metadata.root", async () => {
     onlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValue(jsonResponse({ metadata: {} }));
-    const results: WorkspaceEnvironment[] = [];
+    const results: WorkspaceEnvironmentStatus[] = [];
 
     render(
       <Wrap>
@@ -531,7 +565,7 @@ describe("useWorkspaceEnvironment gating", () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ metadata: { root: "/home/u/ws", home: "/home/u" } }),
     );
-    const results: WorkspaceEnvironment[] = [];
+    const results: WorkspaceEnvironmentStatus[] = [];
 
     render(
       <Wrap>
@@ -573,6 +607,74 @@ describe("useWorkspaceEnvironment gating", () => {
     await flushMicrotasks();
 
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useWorkspaceEnvironments", () => {
+  it("returns filesystem roots with the working folder first", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        data: [
+          {
+            id: "env_terminal_claude_main",
+            name: "Environment for claude:main",
+            metadata: { role: "terminal", root: "/workspace" },
+          },
+          {
+            id: "dir_shared",
+            name: "shared",
+            metadata: { filesystem: true, role: "project", root: "/shared" },
+          },
+          {
+            id: "default",
+            name: "Primary environment",
+            metadata: { filesystem: true, role: "primary", root: "/workspace" },
+          },
+        ],
+      }),
+    );
+    const results: { id: string; name: string; root: string | null }[][] = [];
+
+    render(
+      <Wrap>
+        <EnvironmentsDataProbe id="conv_multi" onData={(data) => results.push(data)} />
+      </Wrap>,
+    );
+
+    await waitFor(() =>
+      expect(results.at(-1)?.map((environment) => environment.id)).toEqual([
+        "default",
+        "dir_shared",
+      ]),
+    );
+    expect(results.at(-1)?.[0]?.name).toBe("Working folder");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_multi/resources/environments?order=asc&limit=1000",
+    );
+  });
+
+  it("persists an environment nickname through the PATCH endpoint", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ id: "dir_shared", name: "Shared services" }));
+
+    render(
+      <Wrap>
+        <RenameEnvironmentProbe id="conv_multi" />
+      </Wrap>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Rename environment" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_multi/resources/environments/dir_shared",
+    );
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(init).toMatchObject({
+      method: "PATCH",
+      cache: "no-store",
+      body: JSON.stringify({ name: "Shared services" }),
+    });
+    expect(new Headers(init.headers).get("content-type")).toBe("application/json");
   });
 });
 
@@ -843,6 +945,31 @@ describe("toWorkspaceRelativePath", () => {
     // home "/" + "/ws/foo.md" must not become "//ws/foo.md" (which wouldn't
     // match root "/ws"). Guards the trailing-slash strip on home expansion.
     expect(toWorkspaceRelativePath("~/ws/foo.md", "/ws", "/")).toBe("foo.md");
+  });
+});
+
+describe("resolveWorkspaceFilePath", () => {
+  const environments = [
+    { id: "default", root: "/repo/main", home: "/home/u" },
+    {
+      id: "dir_00000000000000000000000000000001",
+      root: "/repo/shared",
+      home: "/home/u",
+    },
+  ];
+
+  it("routes an absolute path to its attached root", () => {
+    expect(resolveWorkspaceFilePath("/repo/shared/src/lib.ts", environments)).toEqual({
+      environmentId: "dir_00000000000000000000000000000001",
+      path: "src/lib.ts",
+    });
+  });
+
+  it("keeps legacy relative paths on the default root", () => {
+    expect(resolveWorkspaceFilePath("src/lib.ts", environments)).toEqual({
+      environmentId: "default",
+      path: "src/lib.ts",
+    });
   });
 });
 

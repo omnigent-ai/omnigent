@@ -2049,6 +2049,72 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("workspace-picker")).toBeTruthy();
   });
 
+  it("attaches additional project folders to a host session", async () => {
+    useHostFilesystemMock.mockReturnValue({
+      data: { entries: [fsEntry("/Users/corey/repo/shared")], truncated: false },
+      isLoading: false,
+      error: null,
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_multi" }),
+    } as unknown as Response);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-add-directory-chip"));
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-shared"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-add-directory-confirm")).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-add-directory-confirm"));
+    expect(screen.getByTestId("new-chat-landing-additional-directory")).toHaveAttribute(
+      "title",
+      "/Users/corey/repo/shared",
+    );
+
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "work across both repositories" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const body = JSON.parse(
+      (authenticatedFetchMock.mock.calls[0][1] as RequestInit).body as string,
+    );
+    expect(body.workspace).toBe("/Users/corey/repo");
+    expect(body.directories).toEqual([{ path: "/Users/corey/repo/shared" }]);
+  });
+
+  it("starts each add-folder browse from the workspace directory", async () => {
+    useHostFilesystemMock.mockReturnValue({
+      data: { entries: [fsEntry("/Users/corey/repo/shared")], truncated: false },
+      isLoading: false,
+      error: null,
+      isPlaceholderData: false,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    const addFolder = screen.getByTestId("new-chat-landing-add-directory-chip");
+    fireEvent.click(addFolder);
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/Users/corey/repo");
+
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-shared"));
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue(
+      "/Users/corey/repo/shared",
+    );
+    fireEvent.click(addFolder);
+    await waitFor(() => expect(screen.queryByTestId("workspace-picker")).toBeNull());
+
+    fireEvent.click(addFolder);
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/Users/corey/repo");
+  });
+
   it("hides the sandbox option when the server doesn't support managed sandboxes", () => {
     // Default renderLanding: managed_sandboxes_enabled false (the fail-closed
     // probe sentinel). The dropdown must not advertise a create path the

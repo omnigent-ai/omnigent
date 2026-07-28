@@ -2105,6 +2105,8 @@ export function NewChatLandingScreen() {
   const [additionalDirectories, setAdditionalDirectories] = useState<string[]>(
     () => landingDraft?.additionalDirectories ?? [],
   );
+  const [additionalDirectoryCandidate, setAdditionalDirectoryCandidate] = useState("");
+  const [additionalDirectoryPopoverOpen, setAdditionalDirectoryPopoverOpen] = useState(false);
   const [branchName, setBranchName] = useState<string>(() => landingDraft?.branchName ?? "");
   // The base branch auto-fills from the configured default (Settings › Git)
   // when the user names a worktree branch, and is left alone once the user
@@ -3888,6 +3890,30 @@ export function NewChatLandingScreen() {
     </button>
   );
 
+  const normalizedAdditionalCandidate = normalizeWorkspacePath(additionalDirectoryCandidate);
+  const normalizedWorkspace = normalizeWorkspacePath(workspaceTrimmed);
+  const canAddDirectory =
+    normalizedAdditionalCandidate !== null &&
+    isValidWorkspace(normalizedAdditionalCandidate) &&
+    normalizedAdditionalCandidate !== normalizedWorkspace &&
+    !additionalDirectories.includes(normalizedAdditionalCandidate) &&
+    additionalDirectories.length < 15;
+
+  function addAdditionalDirectory(): void {
+    if (!canAddDirectory || normalizedAdditionalCandidate === null) return;
+    setAdditionalDirectories((current) => [...current, normalizedAdditionalCandidate]);
+    setAdditionalDirectoryCandidate("");
+    setAdditionalDirectoryPopoverOpen(false);
+  }
+
+  function setAddDirectoryPopoverOpen(open: boolean): void {
+    // Each fresh browse starts from the primary working directory. A user can
+    // still navigate anywhere on the host while the picker is open, but an
+    // abandoned browse should not become the next add-folder default.
+    if (open) setAdditionalDirectoryCandidate(normalizedWorkspace ?? "");
+    setAdditionalDirectoryPopoverOpen(open);
+  }
+
   return (
     // pb-12 lifts the content slightly above the geometric center, where
     // the hero reads better optically.
@@ -4643,6 +4669,88 @@ export function NewChatLandingScreen() {
                       />
                     ) : (
                       <p className="p-3 text-sm text-muted-foreground">Select a host first.</p>
+                    )}
+                  </PopoverContent>
+                </Popover>
+              )}
+
+              {!sandboxSelected &&
+                additionalDirectories.map((path) => (
+                  <span
+                    key={path}
+                    className="flex h-6 max-w-44 items-center gap-1 rounded-full bg-muted px-2.5 text-13 text-foreground"
+                    title={path}
+                    data-testid="new-chat-landing-additional-directory"
+                  >
+                    <FolderIcon className="size-3.5 shrink-0" />
+                    <span className="hidden truncate sm:block">
+                      {path.split("/").filter(Boolean).pop() ?? path}
+                    </span>
+                    <button
+                      type="button"
+                      className="shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+                      aria-label={`Remove attached folder ${path}`}
+                      onClick={() =>
+                        setAdditionalDirectories((current) =>
+                          current.filter((directory) => directory !== path),
+                        )
+                      }
+                    >
+                      <XIcon className="size-3" />
+                    </button>
+                  </span>
+                ))}
+
+              {/* Additional roots are attached directly to the session. A
+                  worktree, when requested, still applies only to the primary
+                  working directory. Managed sandboxes intentionally hide this
+                  control because their filesystem is server-provisioned. */}
+              {!sandboxSelected && additionalDirectories.length < 15 && (
+                <Popover
+                  open={additionalDirectoryPopoverOpen}
+                  onOpenChange={setAddDirectoryPopoverOpen}
+                >
+                  <PopoverTrigger asChild>
+                    <button
+                      type="button"
+                      className="flex h-6 items-center gap-1 rounded-full px-2.5 text-13 font-normal text-muted-foreground transition-colors hover:text-foreground"
+                      data-testid="new-chat-landing-add-directory-chip"
+                    >
+                      <PlusIcon className="size-3.5 shrink-0" />
+                      <span className="hidden sm:block">Add folder</span>
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent align="start" className="w-[min(420px,calc(100vw-2rem))] p-0">
+                    {selectedHostId ? (
+                      <div className="flex flex-col">
+                        <WorkspacePicker
+                          hostId={selectedHostId}
+                          initialPath={
+                            isNavigablePath(additionalDirectoryCandidate)
+                              ? additionalDirectoryCandidate
+                              : isNavigablePath(workspaceTrimmed)
+                                ? workspaceTrimmed
+                                : undefined
+                          }
+                          onNavigate={setAdditionalDirectoryCandidate}
+                        />
+                        <div className="flex items-center justify-between gap-2 border-t border-border p-2">
+                          <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
+                            {normalizedAdditionalCandidate ?? "Choose a folder"}
+                          </span>
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={!canAddDirectory}
+                            onClick={addAdditionalDirectory}
+                            data-testid="new-chat-landing-add-directory-confirm"
+                          >
+                            Add
+                          </Button>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="p-3 text-xs text-muted-foreground">Select a host first.</p>
                     )}
                   </PopoverContent>
                 </Popover>

@@ -74,6 +74,8 @@ import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
+import { DEFAULT_WORKSPACE_ENVIRONMENT_ID } from "@/lib/workspaceFiles";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
 
 // Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
 // actually viewed, so the initial bundle and markdown/preview paths don't pay
@@ -338,6 +340,8 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 export interface CodeViewerProps {
   conversationId: string;
   path: string;
+  /** Stable attached-directory/environment identity. */
+  environmentId?: string;
   fileQuery: ReturnType<typeof useFileContent>;
   comments: Comment[];
   /** Highlights the selection range in the code. */
@@ -369,6 +373,7 @@ export interface CodeViewerProps {
 export function CodeViewer({
   conversationId,
   path,
+  environmentId = DEFAULT_WORKSPACE_ENVIRONMENT_ID,
   fileQuery,
   comments,
   activeSelection,
@@ -435,6 +440,11 @@ export function CodeViewer({
   // composer reads — only the native coding-agent harnesses act on it, so
   // gate the button to them (same set as the "@"-mention feature).
   const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const environmentQuery = useWorkspaceEnvironment(
+    conversationId,
+    { enabled: environmentId !== DEFAULT_WORKSPACE_ENVIRONMENT_ID },
+    environmentId,
+  );
   // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
   // emit a malformed ``[Attached: :start-end]`` marker. ``path`` is typed
   // non-optional here, but the guard keeps the two surfaces in lockstep.
@@ -720,6 +730,7 @@ export function CodeViewer({
         content={content}
         conversationId={conversationId}
         path={path}
+        environmentId={environmentId}
         isSettled={fileQuery.isSuccess}
         truncated={truncated}
         onDirtyChange={onDirtyChange}
@@ -778,6 +789,7 @@ export function CodeViewer({
           content={content}
           conversationId={conversationId}
           path={path}
+          environmentId={environmentId}
           isSettled={fileQuery.isSuccess}
           truncated={truncated}
           onDirtyChange={onDirtyChange}
@@ -1065,7 +1077,15 @@ export function CodeViewer({
                     rawLines,
                   );
                   useChatStore.getState().addComposerAttachment({
-                    path,
+                    // Additional-root paths are absolute so the native agent
+                    // can distinguish identical relative names across roots.
+                    // Default-root attachments keep their historical relative
+                    // marker for backwards compatibility.
+                    path:
+                      environmentId === DEFAULT_WORKSPACE_ENVIRONMENT_ID ||
+                      !environmentQuery.data?.root
+                        ? path
+                        : `${environmentQuery.data.root.replace(/\/$/, "")}/${path}`,
                     isDir: false,
                     lineRange: { start: startLine, end: endLine },
                   });

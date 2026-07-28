@@ -4,8 +4,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import type * as ProjectsApiModule from "@/lib/projectsApi";
 
-vi.mock("@/lib/projectsApi", () => ({
+vi.mock("@/lib/projectsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ProjectsApiModule>()),
   getProject: vi.fn(),
   updateProjectConfig: vi.fn(),
   createProject: vi.fn(),
@@ -37,8 +39,14 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 // the live workspace update without the host-filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: (p: string) => p.startsWith("/"),
-  WorkspacePicker: ({ onNavigate }: { onNavigate: (p: string) => void }) => (
-    <div data-testid="mock-workspace-picker">
+  WorkspacePicker: ({
+    initialPath,
+    onNavigate,
+  }: {
+    initialPath?: string;
+    onNavigate: (p: string) => void;
+  }) => (
+    <div data-testid="mock-workspace-picker" data-initial-path={initialPath ?? ""}>
       <button type="button" onClick={() => onNavigate("/picked/dir")}>
         pick dir
       </button>
@@ -192,11 +200,16 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).toHaveBeenCalledWith("p_new", { use_worktree: true });
   });
 
-  it("persists host, workspace, and agent from a seeded config on save", async () => {
+  it("persists host, workspace, directories, and agent from a seeded config on save", async () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
-      config: { host_id: "h1", workspace: "/repo", agent_id: "ag_1" },
+      config: {
+        host_id: "h1",
+        workspace: "/repo",
+        directories: [{ path: "/repo/shared" }],
+        agent_id: "ag_1",
+      },
     });
     renderDialog();
     await waitFor(() =>
@@ -210,7 +223,43 @@ describe("ProjectSettingsDialog", () => {
       expect(updateMock).toHaveBeenCalledWith("p_1", {
         host_id: "h1",
         workspace: "/repo",
+        directories: [{ path: "/repo/shared" }],
         agent_id: "ag_1",
+      }),
+    );
+  });
+
+  it("adds and removes default folders from a browser rooted at the workspace", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: {
+        host_id: "h1",
+        workspace: "/repo",
+        directories: [{ path: "/repo/old" }],
+      },
+    });
+    renderDialog();
+    await waitFor(() => expect(screen.getByText("old")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove additional folder /repo/old" }));
+    expect(screen.queryByText("/repo/old")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-add-directory"));
+    expect(screen.getByTestId("mock-workspace-picker")).toHaveAttribute(
+      "data-initial-path",
+      "/repo",
+    );
+    fireEvent.click(screen.getByText("pick dir"));
+    fireEvent.click(screen.getByTestId("project-settings-add-directory-confirm"));
+    expect(screen.getByText("/picked/dir")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        host_id: "h1",
+        workspace: "/repo",
+        directories: [{ path: "/picked/dir" }],
       }),
     );
   });

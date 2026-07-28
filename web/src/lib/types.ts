@@ -288,6 +288,12 @@ export interface Session {
    * unbound. The fork-resume picker prefills the source's value.
    */
   workspace?: string | null;
+  /** Stable project roots visible to this session. `default` is the cwd. */
+  directories?: {
+    id: string;
+    path: string;
+    name: string;
+  }[];
   /**
    * Git branch checked out in a server-created worktree, e.g.
    * ``"feature/login"``. ``null`` when the session uses no worktree.

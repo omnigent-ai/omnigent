@@ -965,22 +965,23 @@ export function initChatStore(client: QueryClient): void {
   queryClient = client;
 }
 
-function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
-  if (workspaceInvalidationTimers.has(sessionId)) return;
+function scheduleWorkspaceFilesystemInvalidation(sessionId: string, environmentId: string): void {
+  const timerKey = `${sessionId}:${environmentId}`;
+  if (workspaceInvalidationTimers.has(timerKey)) return;
   const timer = setTimeout(() => {
-    workspaceInvalidationTimers.delete(sessionId);
+    workspaceInvalidationTimers.delete(timerKey);
     queryClient?.invalidateQueries({
-      queryKey: ["workspace-changed-files", sessionId],
+      queryKey: ["workspace-changed-files", sessionId, environmentId],
     });
     queryClient?.invalidateQueries({
-      queryKey: ["workspace-all-files", sessionId],
+      queryKey: ["workspace-all-files", sessionId, environmentId],
     });
     queryClient?.invalidateQueries({
-      queryKey: ["workspace-dir", sessionId],
+      queryKey: ["workspace-dir", sessionId, environmentId],
       refetchType: "none",
     });
     queryClient?.invalidateQueries({
-      queryKey: ["workspace-dir-listing", sessionId],
+      queryKey: ["workspace-dir-listing", sessionId, environmentId],
       refetchType: "none",
     });
     // Environment availability (root/home → the Files tab gate) can
@@ -990,10 +991,13 @@ function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
     // the query's 60 s staleTime. Active in AppShell, so the default
     // refetch flips the tab promptly.
     queryClient?.invalidateQueries({
-      queryKey: ["workspace-environment", sessionId],
+      queryKey: ["workspace-environment", sessionId, environmentId],
+    });
+    queryClient?.invalidateQueries({
+      queryKey: ["workspace-environments", sessionId],
     });
   }, WORKSPACE_INVALIDATION_DEBOUNCE_MS);
-  workspaceInvalidationTimers.set(sessionId, timer);
+  workspaceInvalidationTimers.set(timerKey, timer);
 }
 
 /**
@@ -4935,7 +4939,7 @@ export function handleSessionEvent(event: StreamEvent): void {
       // Coarse "something changed" signal. Coalesce bursts into one
       // changed-files/root refresh, and mark expanded directory caches
       // stale without immediately refetching every visible folder.
-      scheduleWorkspaceFilesystemInvalidation(event.sessionId);
+      scheduleWorkspaceFilesystemInvalidation(event.sessionId, event.environmentId);
       return;
     case "session_terminal_activity":
       // Runner-determined PTY-output pulse — drives the "active" badge

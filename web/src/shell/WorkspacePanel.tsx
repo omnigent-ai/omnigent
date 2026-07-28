@@ -43,6 +43,7 @@ import { SubagentsPanel } from "./SubagentsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+import { parseWorkspaceFileKey } from "@/lib/workspaceFiles";
 
 function WorkspaceTabTooltip({
   label,
@@ -297,7 +298,8 @@ function FileTabsStrip({
   return (
     <div className="flex items-center gap-0.5">
       {openFiles.map((path) => {
-        const name = path.split("/").pop() ?? path;
+        const identity = parseWorkspaceFileKey(path);
+        const name = identity.path.split("/").pop() ?? identity.path;
         const active = path === activeFilePath;
         return (
           <div
@@ -306,7 +308,11 @@ function FileTabsStrip({
             role="button"
             tabIndex={0}
             aria-current={active}
-            title={path}
+            title={
+              identity.environmentId === "default"
+                ? identity.path
+                : `${identity.environmentId}: ${identity.path}`
+            }
             onClick={() => onFileSelect(path)}
             onAuxClick={(e) => {
               // Middle click (button 1) closes the tab, matching browser /
@@ -559,7 +565,7 @@ interface WorkspacePanelProps {
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
   /** Open a file in the inline viewer (adds/activates its tab). */
-  openFileViewer: (path: string) => void;
+  openFileViewer: (path: string, environmentId?: string) => void;
   /** Close a single open file tab by path. */
   onCloseFile: (path: string) => void;
   /** Deselect the active file tab to reveal the scope view (Changed/All). */
@@ -649,6 +655,7 @@ export function WorkspacePanel({
   onShowHiddenChange,
   liveness,
 }: WorkspacePanelProps) {
+  const selectedFileIdentity = selectedFilePath ? parseWorkspaceFileKey(selectedFilePath) : null;
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
@@ -910,15 +917,16 @@ export function WorkspacePanel({
             terminalKey={selectedTerminalKey}
             readOnly={!isOwnerLevel(permissionLevel)}
           />
-        ) : selectedFilePath !== null ? (
+        ) : selectedFileIdentity !== null ? (
           <FileViewer
             frameless
             open
             conversationId={conversationId}
-            path={selectedFilePath}
+            path={selectedFileIdentity.path}
+            environmentId={selectedFileIdentity.environmentId}
             onClose={onShowScopeView}
             onCloseTab={handleCloseTab}
-            onNavigateTo={openFileViewer}
+            onNavigateTo={(path) => openFileViewer(path, selectedFileIdentity.environmentId)}
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}

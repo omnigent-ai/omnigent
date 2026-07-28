@@ -177,8 +177,13 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project prefill", () => {
-  it("seeds host / workspace / agent from the stored config", async () => {
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
+  it("seeds host / workspace / directories / agent from the stored config", async () => {
+    setProjectConfig({
+      host_id: "host_1",
+      workspace: REPO,
+      directories: [{ path: "/Users/corey/projects/shared" }],
+      agent_id: "ag_other",
+    });
     renderLanding();
 
     await waitFor(() =>
@@ -187,6 +192,7 @@ describe("NewChatLandingScreen project prefill", () => {
     const body = await submitAndReadBody();
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(REPO);
+    expect(body.directories).toEqual([{ path: "/Users/corey/projects/shared" }]);
     expect(body.agent_id).toBe("ag_other");
     // No opt-in worktree → no git block.
     expect(body.git).toBeUndefined();

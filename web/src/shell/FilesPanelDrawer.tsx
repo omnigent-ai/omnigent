@@ -27,7 +27,7 @@ interface FilesPanelDrawerProps {
    * routes to the FileViewer in AppShell; AppShell is responsible
    * for closing this drawer in response.
    */
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, environmentId?: string) => void;
   /**
    * Which scope the drawer renders: false = full folder tree, true =
    * changed-files-only flat list. Fixed by the FAB entry that opened it

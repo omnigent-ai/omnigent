@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -8,7 +8,8 @@ import {
   type WorkspaceFile,
   PathUnreachableError,
   useWorkspaceAllFiles,
-  useWorkspaceChangedFiles,
+  useAllWorkspaceChangedFiles,
+  useRenameWorkspaceEnvironment,
   useWorkspaceDirectory,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
@@ -31,17 +32,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   // panel makes, so stubbing it would test a fiction.
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
-  useWorkspaceChangedFiles: vi.fn(),
+  useAllWorkspaceChangedFiles: vi.fn(),
+  useRenameWorkspaceEnvironment: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
   useWorkspaceEnvironment: vi.fn(),
   useWorkspaceFileSearch: vi.fn(),
-  // Real exports consumed by `instanceof` checks (FlatFileList's offline
-  // hint, FilesPanel's unreachable-location message); the full module mock
-  // would otherwise drop them (undefined → instanceof throws).
-  RunnerOfflineError: class RunnerOfflineError extends Error {},
-  PathUnreachableError: class extends Error {
-    reachableRoots: string[] = [];
-  },
 }));
 
 // Stub only the browser component -- its own suite covers its behaviour, and
@@ -62,7 +57,8 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
-const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
+const useChangedFilesMock = vi.mocked(useAllWorkspaceChangedFiles);
+const useRenameEnvironmentMock = vi.mocked(useRenameWorkspaceEnvironment);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useEnvironmentMock = vi.mocked(useWorkspaceEnvironment);
 const useSearchMock = vi.mocked(useWorkspaceFileSearch);
@@ -103,13 +99,37 @@ function allFilesResult(files: WorkspaceFile[]) {
   } as unknown as ReturnType<typeof useWorkspaceAllFiles>;
 }
 
-function changedFilesResult(files: WorkspaceChangedFile[] = []) {
+function changedFilesResult(
+  files: WorkspaceChangedFile[] = [],
+  root: string | null = null,
+  environments?: {
+    id: string;
+    name: string;
+    available: boolean;
+    root: string | null;
+    home: string | null;
+  }[],
+) {
+  const normalizedFiles = files.map((entry) => ({
+    ...entry,
+    environment_id: entry.environment_id ?? "default",
+    directory_id: entry.directory_id ?? "default",
+  }));
   return {
-    data: { available: true, data: files },
+    data: { available: true, data: normalizedFiles },
+    environments: environments ?? [
+      {
+        id: "default",
+        name: root ? (root.split(/[/\\]/).filter(Boolean).pop() ?? root) : "Working folder",
+        available: true,
+        root,
+        home: null,
+      },
+    ],
     error: null,
     isError: false,
     isLoading: false,
-  } as unknown as ReturnType<typeof useWorkspaceChangedFiles>;
+  } as unknown as ReturnType<typeof useAllWorkspaceChangedFiles>;
 }
 
 function directoryResult(files: WorkspaceFile[] = []) {
@@ -157,6 +177,7 @@ function renderPanel({
   treeSearchResults = [],
   isSearching = false,
   reachable = null,
+  environments,
   onFileSelect = vi.fn(),
 }: {
   conversationId: string;
@@ -172,10 +193,11 @@ function renderPanel({
     unconfined: boolean;
     roots: { path: string; access: string; origin: string }[];
   } | null;
-  onFileSelect?: (path: string) => void;
+  environments?: Parameters<typeof changedFilesResult>[2];
+  onFileSelect?: (path: string, environmentId?: string) => void;
 }) {
   useAllFilesMock.mockReturnValue(allFilesResult(files));
-  useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
+  useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles, workingDir, environments));
   useDirectoryMock.mockReturnValue(directoryResult());
   useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
   useSearchMock.mockReturnValue(searchResult(treeSearchResults, isSearching));
@@ -208,6 +230,9 @@ beforeEach(() => {
   useDirectoryMock.mockReset();
   useEnvironmentMock.mockReset();
   useSearchMock.mockReset();
+  useRenameEnvironmentMock.mockReturnValue({
+    mutateAsync: vi.fn().mockResolvedValue(undefined),
+  } as unknown as ReturnType<typeof useRenameWorkspaceEnvironment>);
 });
 
 afterEach(() => {
@@ -222,7 +247,7 @@ describe("FilesPanel working folder directory", () => {
       files: [],
       workingDir: "/home/user/my-project",
     });
-    expect(screen.getByText("my-project")).toBeInTheDocument();
+    expect(screen.getAllByText("my-project").length).toBeGreaterThan(0);
   });
 
   it("does not use the native title tooltip because the custom tooltip shows the full path", () => {
@@ -230,8 +255,19 @@ describe("FilesPanel working folder directory", () => {
       conversationId: "conv_wdir_title",
       files: [],
       workingDir: "/home/user/my-project",
+      environments: [
+        {
+          id: "default",
+          name: "Working folder",
+          available: true,
+          root: "/home/user/my-project",
+          home: null,
+        },
+      ],
     });
-    const el = screen.getByText("my-project");
+    const el = screen
+      .getAllByText("my-project")
+      .find((candidate) => candidate.getAttribute("data-slot") === "tooltip-trigger")!;
     expect(el).not.toHaveAttribute("title");
   });
 
@@ -241,15 +277,240 @@ describe("FilesPanel working folder directory", () => {
       files: [],
       workingDir: "C:\\Users\\foo\\my-project",
     });
-    expect(screen.getByText("my-project")).toBeInTheDocument();
+    expect(screen.getAllByText("my-project").length).toBeGreaterThan(0);
   });
 
   it("does not render a directory label when workingDir is null", () => {
     renderPanel({ conversationId: "conv_wdir_null", files: [] });
-    // "Working folder" label is present but no directory name span
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.getByText("Project folders")).toBeInTheDocument();
     // There should be no element with a title that looks like a path
     expect(screen.queryByTitle("/")).toBeNull();
+  });
+});
+
+describe("FilesPanel attached directories", () => {
+  it("groups duplicate relative paths by root and preserves root identity on open", () => {
+    const onFileSelect = vi.fn();
+    renderPanel({
+      conversationId: "conv_multi",
+      flatView: true,
+      files: [],
+      onFileSelect,
+      environments: [
+        {
+          id: "default",
+          name: "main",
+          available: true,
+          root: "/repo/main",
+          home: null,
+        },
+        {
+          id: "dir_00000000000000000000000000000001",
+          name: "shared",
+          available: true,
+          root: "/repo/shared",
+          home: null,
+        },
+      ],
+      changedFiles: [
+        { ...changedFile("README.md"), environment_id: "default", directory_id: "default" },
+        {
+          ...changedFile("README.md"),
+          environment_id: "dir_00000000000000000000000000000001",
+          directory_id: "dir_00000000000000000000000000000001",
+        },
+      ],
+    });
+
+    expect(screen.getAllByText("main").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("shared").length).toBeGreaterThan(0);
+    const rows = screen.getAllByText("README.md");
+    fireEvent.click(rows[0].closest("button")!);
+    fireEvent.click(rows[1].closest("button")!);
+    expect(onFileSelect).toHaveBeenNthCalledWith(1, "README.md", "default");
+    expect(onFileSelect).toHaveBeenNthCalledWith(
+      2,
+      "README.md",
+      "dir_00000000000000000000000000000001",
+    );
+  });
+
+  it("collapses each root independently in Changed view", () => {
+    renderPanel({
+      conversationId: "conv_multi_changed_collapse",
+      flatView: true,
+      files: [],
+      environments: [
+        {
+          id: "default",
+          name: "main",
+          available: true,
+          root: "/repo/main",
+          home: null,
+        },
+        {
+          id: "dir_shared",
+          name: "shared",
+          available: true,
+          root: "/repo/shared",
+          home: null,
+        },
+      ],
+      changedFiles: [
+        {
+          ...changedFile("main-only.txt"),
+          environment_id: "default",
+          directory_id: "default",
+        },
+        {
+          ...changedFile("shared-only.txt"),
+          environment_id: "dir_shared",
+          directory_id: "dir_shared",
+        },
+      ],
+    });
+
+    const mainToggle = screen.getByRole("button", { name: "Collapse main folder" });
+    expect(mainToggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(mainToggle);
+
+    expect(mainToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("main-only.txt")).toBeNull();
+    expect(screen.getByText("shared-only.txt")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse shared folder" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  it("always shows the bold title and non-bold root basename", () => {
+    renderPanel({
+      conversationId: "conv_multi_root_headers",
+      flatView: true,
+      files: [],
+      environments: [
+        {
+          id: "dir_shared",
+          name: "shared",
+          available: true,
+          root: "/repo/shared",
+          home: null,
+        },
+      ],
+      changedFiles: [],
+    });
+
+    const toggle = screen.getByRole("button", { name: "Collapse shared folder" });
+    const header = toggle.closest("div");
+    expect(header).toHaveClass("rounded-lg", "border", "shadow-sm");
+    expect(header?.querySelector(".lucide-folder")).toBeNull();
+    const labels = within(toggle).getAllByText("shared");
+    expect(labels).toHaveLength(2);
+    expect(labels.some((label) => label.classList.contains("font-semibold"))).toBe(true);
+    expect(labels.some((label) => label.classList.contains("font-normal"))).toBe(true);
+  });
+
+  it("edits and persists a root nickname inline", async () => {
+    const mutateAsync = vi.fn().mockResolvedValue({ name: "Shared services" });
+    useRenameEnvironmentMock.mockReturnValue({
+      mutateAsync,
+    } as unknown as ReturnType<typeof useRenameWorkspaceEnvironment>);
+    renderPanel({
+      conversationId: "conv_rename_root",
+      flatView: true,
+      files: [],
+      environments: [
+        {
+          id: "dir_shared",
+          name: "shared",
+          available: true,
+          root: "/repo/shared",
+          home: null,
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename shared folder" }));
+    const input = screen.getByRole("textbox", { name: "Name for shared folder" });
+    fireEvent.change(input, { target: { value: "  Shared services  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Save name for shared folder" }));
+
+    await waitFor(() =>
+      expect(mutateAsync).toHaveBeenCalledWith({
+        environmentId: "dir_shared",
+        name: "Shared services",
+      }),
+    );
+  });
+
+  it("clears a root nickname when the edited value is empty", async () => {
+    const mutateAsync = vi.fn().mockResolvedValue({ name: "shared" });
+    useRenameEnvironmentMock.mockReturnValue({
+      mutateAsync,
+    } as unknown as ReturnType<typeof useRenameWorkspaceEnvironment>);
+    renderPanel({
+      conversationId: "conv_clear_root_name",
+      flatView: true,
+      files: [],
+      environments: [
+        {
+          id: "dir_shared",
+          name: "Shared services",
+          available: true,
+          root: "/repo/shared",
+          home: null,
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename Shared services folder" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Name for Shared services folder" }), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save name for Shared services folder" }));
+
+    await waitFor(() =>
+      expect(mutateAsync).toHaveBeenCalledWith({
+        environmentId: "dir_shared",
+        name: null,
+      }),
+    );
+  });
+
+  it("collapses each root independently in All view", () => {
+    renderPanel({
+      conversationId: "conv_multi_all_collapse",
+      files: [file("README.md")],
+      environments: [
+        {
+          id: "default",
+          name: "main",
+          available: true,
+          root: "/repo/main",
+          home: null,
+        },
+        {
+          id: "dir_shared",
+          name: "shared",
+          available: true,
+          root: "/repo/shared",
+          home: null,
+        },
+      ],
+    });
+
+    expect(screen.getAllByText("README.md")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse main folder" }));
+
+    expect(screen.getAllByText("README.md")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Expand main folder" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "Collapse shared folder" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
   });
 });
 
@@ -260,8 +521,8 @@ describe("FilesPanel working folder header role", () => {
   // always visible and the header never carries aria-expanded.
   it("renders the header as a static label (no toggle button) in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /project folders/i })).toBeNull();
+    expect(screen.getByText("Project folders")).toBeInTheDocument();
     // Content is always shown — the tree search box is part of it.
     expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
@@ -294,16 +555,16 @@ describe("FilesPanel working folder header role", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /project folders/i })).toBeNull();
+    expect(screen.getByText("Project folders")).toBeInTheDocument();
     expect(screen.getByRole("searchbox", { name: "Search all files" })).toBeInTheDocument();
   });
 
   it("renders a static label header with a Close button in the drawer", () => {
     renderPanel({ conversationId: "conv_header_drawer", files: [], onClose: vi.fn() });
     // The drawer adds an X close button; the title is a plain label everywhere.
-    expect(screen.queryByRole("button", { name: /working folder/i })).toBeNull();
-    expect(screen.getByText("Working folder")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /project folders/i })).toBeNull();
+    expect(screen.getByText("Project folders")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close files" })).toBeInTheDocument();
   });
 });
@@ -337,15 +598,8 @@ describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {
     expect(useChangedFilesMock).toHaveBeenCalledWith("conv_changed_only", {
       enabled: true,
     });
-    expect(useAllFilesMock).toHaveBeenCalledWith("conv_changed_only", { enabled: false }, "");
-    expect(useSearchMock).toHaveBeenCalledWith(
-      "conv_changed_only",
-      "",
-      "",
-      "",
-      { enabled: false },
-      "",
-    );
+    expect(useAllFilesMock).not.toHaveBeenCalled();
+    expect(useSearchMock).not.toHaveBeenCalled();
   });
 
   it("enables the root filesystem listing while showing All files", () => {
@@ -356,13 +610,17 @@ describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {
       changedFiles: [changedFile("src/App.tsx")],
     });
 
-    expect(useAllFilesMock).toHaveBeenCalledWith("conv_all_files", { enabled: true }, "");
+    expect(useAllFilesMock).toHaveBeenCalledWith(
+      "conv_all_files",
+      { enabled: true, environmentId: "default" },
+      "",
+    );
     expect(useSearchMock).toHaveBeenCalledWith(
       "conv_all_files",
       "",
       "",
       "",
-      { enabled: false },
+      { enabled: false, environmentId: "default" },
       "",
     );
   });
@@ -1255,7 +1513,7 @@ describe("FilesPanel scroll position persistence", () => {
     };
     useAllFilesMock.mockReturnValue(pending as unknown as ReturnType<typeof useWorkspaceAllFiles>);
     useChangedFilesMock.mockReturnValue(
-      pending as unknown as ReturnType<typeof useWorkspaceChangedFiles>,
+      pending as unknown as ReturnType<typeof useAllWorkspaceChangedFiles>,
     );
     useDirectoryMock.mockReturnValue(directoryResult());
     useEnvironmentMock.mockReturnValue(environmentResult(null));
@@ -1376,7 +1634,7 @@ describe("FilesPanel browse location", () => {
     });
 
     expect(screen.queryByTestId("browse-location-path")).toBeNull();
-    expect(screen.getByText("proj")).toBeInTheDocument();
+    expect(screen.getAllByText("proj").length).toBeGreaterThan(0);
   });
 
   it("shows the full path, clickable, when the session is unconfined", () => {
@@ -1493,7 +1751,7 @@ describe("FilesPanel browse permission", () => {
 
     expect(screen.queryByTestId("browse-location-path")).toBeNull();
     // Still the plain label — the collaborator keeps the workspace view.
-    expect(screen.getByText("proj")).toBeInTheDocument();
+    expect(screen.getAllByText("proj").length).toBeGreaterThan(0);
   });
 
   it("keeps the control for the session owner", () => {
@@ -1584,7 +1842,11 @@ describe("FilesPanel double-click navigation", () => {
     useAllFilesMock.mockClear();
     fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
 
-    expect(useAllFilesMock).toHaveBeenCalledWith("conv_dblclick", { enabled: true }, "src");
+    expect(useAllFilesMock).toHaveBeenCalledWith(
+      "conv_dblclick",
+      { enabled: true, environmentId: "default" },
+      "src",
+    );
     // The header still names the absolute directory the user is standing in.
     expect(screen.getByText("src")).toBeInTheDocument();
   });
@@ -1613,6 +1875,6 @@ describe("FilesPanel double-click navigation", () => {
     fireEvent.doubleClick(screen.getByRole("button", { name: "src/" }));
     fireEvent.click(screen.getByText("App.tsx"));
 
-    expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx");
+    expect(onFileSelect).toHaveBeenCalledWith("src/App.tsx", "default");
   });
 });

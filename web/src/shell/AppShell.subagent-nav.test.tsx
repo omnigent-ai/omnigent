@@ -46,8 +46,9 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
     data: { available: true, root: null },
     isLoading: false,
   })),
-  useWorkspaceChangedFiles: vi.fn(() => ({
+  useAllWorkspaceChangedFiles: vi.fn(() => ({
     data: { data: [] },
+    environments: [],
     isSuccess: true,
     isLoading: false,
   })),

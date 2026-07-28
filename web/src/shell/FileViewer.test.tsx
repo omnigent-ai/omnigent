@@ -142,6 +142,7 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -151,6 +152,9 @@ import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
+const useFileContentMock = vi.mocked(useFileContent);
+const useFileDiffMock = vi.mocked(useFileDiff);
+const useWorkspaceChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 
 function makeCommentsQuery(data: Comment[] | undefined) {
   return { data } as ReturnType<typeof useComments>;
@@ -195,6 +199,7 @@ interface RenderProps {
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
   onNavigateTo?: (path: string) => void;
+  environmentId?: string;
 }
 
 /**
@@ -212,6 +217,7 @@ function viewerTree({
   onClose = vi.fn(),
   sort,
   onNavigateTo,
+  environmentId,
 }: RenderProps = {}) {
   const url = initialSearch ? `/?${initialSearch}` : "/";
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -223,6 +229,7 @@ function viewerTree({
           open={open}
           conversationId="conv_1"
           path={path}
+          environmentId={environmentId}
           onClose={onClose}
           sort={sort}
           onNavigateTo={onNavigateTo}
@@ -252,6 +259,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
   // Restore any getBoundingClientRect spy installed by the width-gating tests.
   vi.restoreAllMocks();
+});
+
+it("routes content, diff, and changed-file navigation through the selected root", () => {
+  const environmentId = "dir_00000000000000000000000000000001";
+  useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  renderViewer({ open: true, path: "README.md", environmentId });
+
+  expect(useFileContentMock).toHaveBeenCalledWith("conv_1", "README.md", environmentId);
+  expect(useFileDiffMock).toHaveBeenCalledWith("conv_1", "README.md", environmentId);
+  expect(useWorkspaceChangedFilesMock).toHaveBeenCalledWith("conv_1", { environmentId });
 });
 
 /**

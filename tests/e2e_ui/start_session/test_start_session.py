@@ -2271,12 +2271,12 @@ async def _drive_kimi_picker_dedup(base_url: str, session_id: str) -> None:
 
 
 def test_start_session_select_folder(seeded_session: tuple[str, str]) -> None:
-    """Browsing into a folder sets the new session's working directory.
+    """Browsing selects both the working folder and an attached folder.
 
     The composer seeds the working directory to the host's home, then the
-    user opens the file browser and navigates into a subfolder. The chip
-    label must follow the navigation and the picked path must reach
-    ``POST /v1/sessions`` as ``workspace``.
+    user attaches one sibling repository and navigates the primary picker
+    into another. Both chip labels must follow those choices and the paths
+    must reach ``POST /v1/sessions`` as ``workspace`` and ``directories``.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_folder_selection(base_url, session_id))
@@ -2347,12 +2347,29 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
                 "e2e"
             )
 
+            # Attach the sibling repository while the primary working
+            # directory is still /home/e2e. This exercises the second picker
+            # and its explicit Add confirmation, rather than only asserting
+            # the request shape in a component test.
+            await page.get_by_test_id("new-chat-landing-add-directory-chip").click()
+            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
+            await page.get_by_test_id("workspace-picker-entry-repo").click()
+            await page.get_by_test_id("new-chat-landing-add-directory-confirm").click()
+            attached = page.get_by_test_id("new-chat-landing-additional-directory")
+            await expect(attached).to_contain_text("repo")
+            await expect(attached).to_have_attribute("title", "/home/e2e/repo")
+
             # Open the file browser and navigate into the "projects" folder.
             await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible()
-            await page.get_by_test_id("workspace-picker-entry-projects").click()
+            # Radix keeps the closed add-folder picker mounted briefly, so
+            # scope to the visible primary picker after opening it.
+            workspace_picker = page.get_by_test_id("workspace-picker").last
+            await expect(workspace_picker).to_be_visible()
+            await workspace_picker.get_by_test_id("workspace-picker-entry-projects").click()
             # The child listing confirms we navigated in.
-            await expect(page.get_by_test_id("workspace-picker-entry-src")).to_be_visible()
+            await expect(
+                workspace_picker.get_by_test_id("workspace-picker-entry-src")
+            ).to_be_visible()
 
             # Filling the message clicks outside the popover, closing it; the
             # chip now shows the navigated folder.
@@ -2367,6 +2384,7 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/home/e2e/projects", body
+            assert body["directories"] == [{"path": "/home/e2e/repo"}], body
         finally:
             await browser.close()
 
