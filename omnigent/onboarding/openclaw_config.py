@@ -33,13 +33,12 @@ class OpenClawAgentEntry:
     @property
     def command_line(self) -> str:
         """Return the shell command Omnigent should persist."""
-        parts = [self.command, *(shlex.quote(arg) for arg in self.args)]
-        return " ".join(part for part in parts if part).strip()
+        return shlex.join([self.command, *self.args])
 
 
 @dataclass(frozen=True)
 class OpenClawConfigError:
-    """A config file existed but could not be parsed or did not match schema."""
+    """A config file or agent could not be read or normalized."""
 
     path: Path
     message: str
@@ -66,8 +65,8 @@ def discover_openclaw_agents(
 ) -> OpenClawDiscovery:
     """Read supported acpx/OpenClaw config files and return normalized agents.
 
-    Missing files are ignored. Malformed files are reported as soft errors so
-    setup can show a hint without blocking imports from the other location.
+    Missing files are ignored. Unreadable or malformed entries are reported as
+    soft errors without blocking valid agents from either location.
     """
     default_acpx_path, default_openclaw_path = default_config_paths()
     paths: tuple[tuple[SourceKind, Path], ...] = (
@@ -77,12 +76,14 @@ def discover_openclaw_agents(
     agents: list[OpenClawAgentEntry] = []
     errors: list[OpenClawConfigError] = []
     for source, path in paths:
-        if not path.exists():
-            continue
         try:
+            if not path.exists():
+                continue
             raw = _load_config(path, json5_format=source == "openclaw")
-            agents.extend(_extract_agents(raw, source=source, path=path))
-        except ValueError as exc:
+            extracted, extraction_errors = _extract_agents(raw, source=source, path=path)
+            agents.extend(extracted)
+            errors.extend(extraction_errors)
+        except (OSError, ValueError) as exc:
             errors.append(OpenClawConfigError(path=path, message=str(exc)))
     return OpenClawDiscovery(agents=tuple(agents), errors=tuple(errors))
 
@@ -165,14 +166,21 @@ def merge_imported_acp_entries(
 
 def _load_config(path: Path, *, json5_format: bool) -> Any:
     text = path.read_text(encoding="utf-8")
+    kind = "JSON5" if json5_format else "JSON"
     try:
         return json5.loads(text) if json5_format else json.loads(text)
+    except RecursionError as exc:
+        raise ValueError(f"invalid {kind}: nesting is too deep") from exc
     except ValueError as exc:
-        kind = "JSON5" if json5_format else "JSON"
         raise ValueError(f"invalid {kind}: {exc}") from exc
 
 
-def _extract_agents(raw: Any, *, source: SourceKind, path: Path) -> list[OpenClawAgentEntry]:
+def _extract_agents(
+    raw: Any,
+    *,
+    source: SourceKind,
+    path: Path,
+) -> tuple[list[OpenClawAgentEntry], list[OpenClawConfigError]]:
     if not isinstance(raw, dict):
         raise ValueError("config root must be an object")
 
@@ -186,18 +194,23 @@ def _extract_agents(raw: Any, *, source: SourceKind, path: Path) -> list[OpenCla
         config = _object(acpx.get("config"))
         raw_agents = config.get("agents")
     if raw_agents is None:
-        return []
+        return [], []
     if not isinstance(raw_agents, dict):
         raise ValueError("agents must be an object mapping name to config")
 
     agents: list[OpenClawAgentEntry] = []
+    errors: list[OpenClawConfigError] = []
     for name, config in raw_agents.items():
         if not isinstance(name, str) or not name.strip() or not isinstance(config, dict):
             continue
         command = config.get("command")
         if not isinstance(command, str) or not command.strip():
             continue
-        args = _normalize_args(config.get("args"), agent_name=name)
+        try:
+            args = _normalize_args(config.get("args"), agent_name=name)
+        except ValueError as exc:
+            errors.append(OpenClawConfigError(path=path, message=str(exc)))
+            continue
         agents.append(
             OpenClawAgentEntry(
                 name=name.strip(),
@@ -207,7 +220,7 @@ def _extract_agents(raw: Any, *, source: SourceKind, path: Path) -> list[OpenCla
                 path=path,
             )
         )
-    return agents
+    return agents, errors
 
 
 def _normalize_args(raw: Any, *, agent_name: str) -> tuple[str, ...]:

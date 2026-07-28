@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from omnigent.onboarding.acp_auth import AcpAgentEntry, acp_agents_settings
 from omnigent.onboarding.openclaw_config import (
     discover_openclaw_agents,
@@ -143,11 +145,26 @@ def test_agent_args_are_shell_quoted(tmp_path: Path) -> None:
     assert discovery.agents[0].command_line == "helper 'a b' '--flag=v;rm'"
 
 
-def test_non_string_args_are_reported_without_coercion(tmp_path: Path) -> None:
+def test_command_path_with_spaces_is_shell_quoted(tmp_path: Path) -> None:
+    acpx = tmp_path / "config.json"
+    acpx.write_text(
+        '{"agents": {"Helper": {"command": "/Applications/My App/bin/helper", '
+        '"args": ["--acp"]}}}',
+        encoding="utf-8",
+    )
+
+    discovery = discover_openclaw_agents(acpx_path=acpx, openclaw_path=tmp_path / "missing.json")
+
+    assert discovery.errors == ()
+    assert discovery.agents[0].command_line == "'/Applications/My App/bin/helper' --acp"
+
+
+def test_non_string_args_skip_only_malformed_agent(tmp_path: Path) -> None:
     openclaw = tmp_path / "openclaw.json"
     openclaw.write_text(
         "{plugins: {entries: {acpx: {config: {agents: "
-        '{Helper: {command: "helper", args: [1.20]}}}}}}}',
+        '{Broken: {command: "broken", args: [1.20]}, '
+        'Helper: {command: "helper", args: ["--acp"]}}}}}}}',
         encoding="utf-8",
     )
 
@@ -155,7 +172,9 @@ def test_non_string_args_are_reported_without_coercion(tmp_path: Path) -> None:
         acpx_path=tmp_path / "missing.json", openclaw_path=openclaw
     )
 
-    assert discovery.agents == ()
+    assert [(agent.name, agent.command_line) for agent in discovery.agents] == [
+        ("Helper", "helper --acp")
+    ]
     assert len(discovery.errors) == 1
     assert "args must be a string or list of strings" in discovery.errors[0].message
 
@@ -170,6 +189,49 @@ def test_malformed_config_is_soft_error(tmp_path: Path) -> None:
     assert len(discovery.errors) == 1
     assert discovery.errors[0].path == acpx
     assert "invalid JSON" in discovery.errors[0].message
+
+
+def test_config_path_directory_is_soft_error(tmp_path: Path) -> None:
+    acpx = tmp_path / "config.json"
+    acpx.mkdir()
+
+    discovery = discover_openclaw_agents(acpx_path=acpx, openclaw_path=tmp_path / "missing.json")
+
+    assert discovery.agents == ()
+    assert len(discovery.errors) == 1
+    assert discovery.errors[0].path == acpx
+
+
+def test_unreadable_config_is_soft_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acpx = tmp_path / "config.json"
+    acpx.write_text("{}", encoding="utf-8")
+
+    def deny_read(*args: object, **kwargs: object) -> str:
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(Path, "read_text", deny_read)
+
+    discovery = discover_openclaw_agents(acpx_path=acpx, openclaw_path=tmp_path / "missing.json")
+
+    assert discovery.agents == ()
+    assert len(discovery.errors) == 1
+    assert discovery.errors[0].message == "permission denied"
+
+
+def test_deeply_nested_json5_is_soft_error(tmp_path: Path) -> None:
+    openclaw = tmp_path / "openclaw.json"
+    openclaw.write_text("[" * 100 + "]" * 100, encoding="utf-8")
+
+    discovery = discover_openclaw_agents(
+        acpx_path=tmp_path / "missing.json", openclaw_path=openclaw
+    )
+
+    assert discovery.agents == ()
+    assert len(discovery.errors) == 1
+    assert discovery.errors[0].message == "invalid JSON5: nesting is too deep"
 
 
 def test_empty_configs_return_no_agents(tmp_path: Path) -> None:
