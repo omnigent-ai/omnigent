@@ -31,6 +31,12 @@ const PROMPT_HISTORY_KEY = "omnigent:prompt-history:conv_new";
 // The seeded working directory (from the host's persisted recent) that the
 // create body must carry through.
 const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
+const PI_DEFAULT_MODEL = "system.ai.gpt-5-6-sol";
+const PI_ALTERNATE_MODEL = "system.ai.gpt-5-6-luna";
+const PI_MODEL_OPTIONS = [
+  { id: PI_DEFAULT_MODEL, displayName: PI_DEFAULT_MODEL, isDefault: true },
+  { id: PI_ALTERNATE_MODEL, displayName: PI_ALTERNATE_MODEL },
+];
 
 // The landing screen navigates via the embed-aware routing abstraction
 // (`@/lib/routing`), not react-router directly — mock that so the create
@@ -138,6 +144,19 @@ function setHosts(hosts: Host[]): void {
 function setAgents(agents: AvailableAgent[]): void {
   vi.mocked(useAvailableAgents).mockReturnValue({ data: agents } as ReturnType<
     typeof useAvailableAgents
+  >);
+}
+
+function setPiAgent(): void {
+  setAgents([agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi" })]);
+}
+
+function mockPiModelOptions(
+  isLoading = false,
+  data: ReturnType<typeof useHostModelOptions>["data"] = isLoading ? undefined : PI_MODEL_OPTIONS,
+): void {
+  vi.mocked(useHostModelOptions).mockReturnValue({ data, isLoading } as ReturnType<
+    typeof useHostModelOptions
   >);
 }
 
@@ -838,21 +857,8 @@ describe("NewChatLandingScreen create flow", () => {
   });
 
   it("offers Pi models before launch and seeds Pi's direct default", async () => {
-    vi.mocked(useHostModelOptions).mockReturnValue({
-      data: [
-        {
-          id: "system.ai.gpt-5-6-sol",
-          displayName: "system.ai.gpt-5-6-sol",
-          isDefault: true,
-        },
-        {
-          id: "system.ai.gpt-5-6-luna",
-          displayName: "system.ai.gpt-5-6-luna",
-        },
-      ],
-      isLoading: false,
-    } as ReturnType<typeof useHostModelOptions>);
-    setAgents([agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi" })]);
+    mockPiModelOptions();
+    setPiAgent();
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
       json: async () => ({ id: "conv_pi" }),
@@ -870,9 +876,9 @@ describe("NewChatLandingScreen create flow", () => {
     );
     openAgentConfig("ag_pi");
     expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-      "system.ai.gpt-5-6-sol",
+      PI_DEFAULT_MODEL,
     );
-    pickSelectOption("new-chat-landing-config-model", "system.ai.gpt-5-6-luna");
+    pickSelectOption("new-chat-landing-config-model", PI_ALTERNATE_MODEL);
     saveConfig();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -880,16 +886,13 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
-    expect(body.model_override).toBe("system.ai.gpt-5-6-luna");
+    expect(body.model_override).toBe(PI_ALTERNATE_MODEL);
     expect(body.reasoning_effort).toBeUndefined();
   });
 
   it("shows Pi's default when its catalog resolves after the config opens", async () => {
-    vi.mocked(useHostModelOptions).mockReturnValue({
-      data: undefined,
-      isLoading: true,
-    } as ReturnType<typeof useHostModelOptions>);
-    setAgents([agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi" })]);
+    mockPiModelOptions(true);
+    setPiAgent();
 
     renderLanding();
     await waitForWorkspaceSeed();
@@ -898,25 +901,12 @@ describe("NewChatLandingScreen create flow", () => {
       "Loading models…",
     );
 
-    vi.mocked(useHostModelOptions).mockReturnValue({
-      data: [
-        {
-          id: "system.ai.gpt-5-6-sol",
-          displayName: "system.ai.gpt-5-6-sol",
-          isDefault: true,
-        },
-        {
-          id: "system.ai.gpt-5-6-luna",
-          displayName: "system.ai.gpt-5-6-luna",
-        },
-      ],
-      isLoading: false,
-    } as ReturnType<typeof useHostModelOptions>);
+    mockPiModelOptions();
     typeMessage("trigger rerender");
 
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain(
-        "system.ai.gpt-5-6-sol (Default)",
+        `${PI_DEFAULT_MODEL} (Default)`,
       ),
     );
   });
@@ -924,23 +914,10 @@ describe("NewChatLandingScreen create flow", () => {
   it("prefers the last valid Pi selection over Pi's configured default", async () => {
     localStorage.setItem(
       "omnigent:last-mode-by-harness",
-      JSON.stringify({ "pi-native": { model: "system.ai.gpt-5-6-luna" } }),
+      JSON.stringify({ "pi-native": { model: PI_ALTERNATE_MODEL } }),
     );
-    vi.mocked(useHostModelOptions).mockReturnValue({
-      data: [
-        {
-          id: "system.ai.gpt-5-6-sol",
-          displayName: "system.ai.gpt-5-6-sol",
-          isDefault: true,
-        },
-        {
-          id: "system.ai.gpt-5-6-luna",
-          displayName: "system.ai.gpt-5-6-luna",
-        },
-      ],
-      isLoading: false,
-    } as ReturnType<typeof useHostModelOptions>);
-    setAgents([agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi" })]);
+    mockPiModelOptions();
+    setPiAgent();
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
       json: async () => ({ id: "conv_pi" }),
@@ -954,7 +931,7 @@ describe("NewChatLandingScreen create flow", () => {
     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string);
-    expect(body.model_override).toBe("system.ai.gpt-5-6-luna");
+    expect(body.model_override).toBe(PI_ALTERNATE_MODEL);
   });
 
   it("seeds the model + effort from the last pick for claude-native on a new session", async () => {

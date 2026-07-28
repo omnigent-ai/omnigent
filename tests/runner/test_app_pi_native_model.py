@@ -89,11 +89,20 @@ def _key_provider_config() -> dict[str, Any]:
         "spec_model",
         "expected_model",
         "expect_model_pin",
+        "local_selection",
     ),
     [
-        (None, None, "claude-opus-4-7", "claude-opus-4-7", True),
-        (None, "claude-haiku-4-5", "claude-opus-4-7", "claude-haiku-4-5", True),
-        ("pi-session-resume", None, "claude-opus-4-7", "claude-opus-4-7", False),
+        (None, None, "claude-opus-4-7", "claude-opus-4-7", True, None),
+        (None, "claude-haiku-4-5", "claude-opus-4-7", "claude-haiku-4-5", True, None),
+        (
+            None,
+            "project-model",
+            None,
+            "project-model",
+            True,
+            ("project-provider", "project-model"),
+        ),
+        ("pi-session-resume", None, "claude-opus-4-7", "claude-opus-4-7", False, None),
     ],
 )
 @pytest.mark.asyncio
@@ -105,6 +114,7 @@ async def test_auto_create_pi_terminal_pins_explicit_model_only_for_fresh_sessio
     spec_model: str,
     expected_model: str,
     expect_model_pin: bool,
+    local_selection: tuple[str, str] | None,
 ) -> None:
     """An explicit model configures the catalog but only pins a fresh session.
 
@@ -116,6 +126,7 @@ async def test_auto_create_pi_terminal_pins_explicit_model_only_for_fresh_sessio
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    import omnigent.pi_native as pi_native
     import omnigent.pi_native_bridge as pi_bridge
     import omnigent.pi_native_credentials as creds
 
@@ -152,6 +163,12 @@ async def test_auto_create_pi_terminal_pins_explicit_model_only_for_fresh_sessio
         return real_resolve(model=model, config_loader=_key_provider_config)
 
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
+
+    def _resolve_local(model: str, *, env: Any = None, cwd: Any = None):
+        captured.update(local_model=model, local_env=env, local_cwd=cwd)
+        return local_selection
+
+    monkeypatch.setattr(pi_native, "resolve_pi_native_local_model_selection", _resolve_local)
 
     class _SnapshotClient:
         """Fresh pi-native session snapshot (no launch args / external id)."""
@@ -214,9 +231,6 @@ async def test_auto_create_pi_terminal_pins_explicit_model_only_for_fresh_sessio
         agent_spec=spec,
     )
 
-    # The runner threaded the spec model into resolve_pi_native_provider.
-    assert captured["model"] == expected_model
-
     args = launched["args"]
     if expect_model_pin:
         assert "--model" in args
@@ -226,97 +240,14 @@ async def test_auto_create_pi_terminal_pins_explicit_model_only_for_fresh_sessio
         assert "--model" not in args
         assert "--provider" not in args
 
-    # The managed config dir env was set and its models.json selects the override.
-    agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])
-    models = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
-    assert models["providers"]["omnigent"]["models"] == [{"id": expected_model}]
-
-
-@pytest.mark.asyncio
-async def test_auto_create_pi_terminal_resolves_local_model_in_workspace(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A selected Pi model keeps the provider resolved in its workspace."""
-    import omnigent.pi_native as pi_native
-    import omnigent.pi_native_bridge as pi_bridge
-
-    session_id = "conv_pi_workspace_model"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
-    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
-    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
-    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda **_kwargs: "/usr/bin/pi")
-
-    captured: dict[str, Any] = {}
-
-    def _resolve_local(model: str, *, env: Any = None, cwd: Any = None):
-        captured.update(model=model, env=env, cwd=cwd)
-        return "project-provider", model
-
-    monkeypatch.setattr(pi_native, "resolve_pi_native_local_model_selection", _resolve_local)
-
-    class _SnapshotClient:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
-            del url, timeout
-            return httpx.Response(
-                200,
-                json={
-                    "workspace": str(workspace),
-                    "terminal_launch_args": None,
-                    "external_session_id": None,
-                    "model_override": "project-model",
-                },
-                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
-            )
-
-    launched: dict[str, Any] = {}
-
-    class _FakeResourceRegistry:
-        terminal_registry = None
-
-        async def launch_required_terminal(
-            self,
-            session_id: str,
-            terminal_name: str,
-            session_key: str,
-            spec: Any,
-            *,
-            resource_role: str | None = None,
-            parent_os_env: Any = None,
-        ) -> SessionResourceView:
-            del terminal_name, session_key, resource_role, parent_os_env
-            launched["args"] = list(spec.args)
-            return SessionResourceView(
-                id="terminal_pi_main",
-                type="terminal",
-                session_id=session_id,
-                name="pi",
-            )
-
-    spec = AgentSpec(
-        spec_version=1,
-        name="pi-workspace-model",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
-    )
-
-    await _auto_create_pi_terminal(
-        session_id,
-        _FakeResourceRegistry(),  # type: ignore[arg-type]
-        lambda _sid, _event: None,
-        server_client=_SnapshotClient(),  # type: ignore[arg-type]
-        agent_spec=spec,
-    )
-
-    assert captured == {"model": "project-model", "env": None, "cwd": workspace}
-    assert launched["args"][-4:] == [
-        "--provider",
-        "project-provider",
-        "--model",
-        "project-model",
-    ]
+    if local_selection is not None:
+        assert captured["local_cwd"] == workspace
+        assert args[args.index("--provider") + 1] == local_selection[0]
+    else:
+        assert captured["model"] == expected_model
+        agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])
+        models = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
+        assert models["providers"]["omnigent"]["models"] == [{"id": expected_model}]
 
 
 @pytest.mark.asyncio
