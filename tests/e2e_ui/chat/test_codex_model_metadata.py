@@ -123,8 +123,9 @@ def test_codex_native_picker_uses_raw_model_metadata(
     model_row = page.locator('[role="option"][data-model-id="gpt-5.5"]')
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text("Codex Pretty 5.5")
-    # Close the model listbox, then open the Effort dropdown.
-    page.keyboard.press("Escape")
+    # Re-select the current model to close the listbox without sending Escape
+    # to the surrounding dialog.
+    model_row.click()
     expect(model_row).to_be_hidden()
     effort_trigger = page.get_by_test_id("composer-config-effort")
     expect(effort_trigger).to_be_visible()
