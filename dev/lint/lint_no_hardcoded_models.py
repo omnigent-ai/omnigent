@@ -197,7 +197,12 @@ def _load_allowlist(path: Path = ALLOWLIST_PATH) -> Counter[tuple[str, str]]:
         if len(parts) != 3:
             raise ValueError(f"{path}:{line_number}: expected: <path> <model> <count>")
         rel_path, model, count_text = parts
-        allowed[(rel_path, model)] += int(count_text)
+        key = (rel_path, model)
+        if key in allowed:
+            raise ValueError(
+                f"{path}:{line_number}: duplicate baseline entry for {rel_path} {model}"
+            )
+        allowed[key] = int(count_text)
     return allowed
 
 

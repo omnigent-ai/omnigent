@@ -47,9 +47,21 @@ Tests, Markdown/prose, top-level files, `web` TypeScript/JavaScript, and
 generated/vendor trees are intentionally outside the initial lint surface.
 Tests need concrete ids as fixtures, while prose and frontend sources need
 syntax-aware handling before they can be added without excessive false
-positives. Like the existing Ruff hooks, local pre-commit execution assumes the
-repository `.venv` has been prepared with `just ensure`; CI is the enforcement
-backstop.
+positives.
+
+This is a heuristic ratchet, not a parser-level guarantee. Python detection is
+limited to model-named assignments, keyword arguments, and dictionary keys; a
+model id in an unrelated positional argument or bare collection can escape the
+check. Config and shell detection requires the model context and id on the same
+line, so multiline/block-scalar values are also outside the initial coverage.
+These gaps should be closed with syntax-aware scanners rather than broader
+regexes that would make prose false-positive.
+
+The hook intentionally scans the full tracked surface when a supported file
+changes. That bounded cost is what lets it enforce exact global baseline counts
+instead of only checking additions in changed files. Like the existing Ruff
+hooks, local pre-commit execution assumes the repository `.venv` has been
+prepared with `just ensure`; CI is the enforcement backstop.
 
 ## Migration Plan
 

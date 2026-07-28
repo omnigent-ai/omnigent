@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
 from dev.lint.lint_no_hardcoded_models import (
     Hit,
     _find_new_hits,
     _find_stale_allowances,
+    _load_allowlist,
     scan,
 )
 
@@ -67,3 +70,13 @@ def test_find_stale_allowances_requires_ratchet_down() -> None:
     assert _find_stale_allowances(hits, allowed) == Counter(
         {("omnigent/example.py", "databricks-gpt-5-5"): 1}
     )
+
+
+def test_load_allowlist_rejects_duplicate_path_model(tmp_path: Path) -> None:
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text(
+        "omnigent/example.py databricks-gpt-5-5 1\nomnigent/example.py databricks-gpt-5-5 1\n"
+    )
+
+    with pytest.raises(ValueError, match="duplicate baseline entry"):
+        _load_allowlist(allowlist)
