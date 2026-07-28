@@ -1849,9 +1849,7 @@ async def test_subagent_message_heals_stale_runner_binding_via_parent(
         return fake_runner
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _runner_client_stub)
-    monkeypatch.setattr(
-        sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
-    )
+    monkeypatch.setattr(sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_spy)
 
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
@@ -1880,9 +1878,7 @@ async def test_subagent_message_503s_when_heal_finds_no_live_ancestor(
         return None
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _runner_none)
-    monkeypatch.setattr(
-        sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_none
-    )
+    monkeypatch.setattr(sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_none)
 
     resp = await client.post(
         f"/v1/sessions/{child['id']}/events",
@@ -1914,15 +1910,13 @@ async def test_non_subagent_session_not_healed_via_parent(
 
     async def _heal_spy(*_args: Any, **_kwargs: Any) -> None:
         heal_called.append(True)
-        return None
+        return
 
     async def _runner_none(*_args: Any, **_kwargs: Any) -> None:
         return None
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _runner_none)
-    monkeypatch.setattr(
-        sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_spy
-    )
+    monkeypatch.setattr(sessions_module, "_heal_subagent_runner_binding_via_parent", _heal_spy)
 
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
