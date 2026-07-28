@@ -333,6 +333,8 @@ class _CodexForwarderState:
     :param posted_collaboration_mode: Last collaboration mode kind already
         mirrored to Omnigent via
         ``external_codex_collaboration_mode_change``.
+    :param terminal_launch_args: Latest known Codex approval/sandbox launch args.
+    :param posted_terminal_launch_args: Last mirrored permission launch args.
     :param parent_session_id: Omnigent parent session id, e.g.
         ``"conv_parent"``. Set by ``supervise_forwarder`` so collab-agent
         helpers can register child sessions without extra parameter
@@ -385,6 +387,8 @@ class _CodexForwarderState:
     posted_effort_known: bool = False
     collaboration_mode: str | None = None
     posted_collaboration_mode: str | None = None
+    terminal_launch_args: list[str] | None = None
+    posted_terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
@@ -427,6 +431,7 @@ class _CodexForwarderState:
         if not isinstance(result, dict):
             return
         self._note_model_fields(result)
+        self._note_approval_mode_fields(result)
         # Do NOT seed ``posted_model`` here. Omnigent must learn the session's
         # ACTUAL model — including the spawn default — because the cost-budget
         # gate resolves the model as ``conv.model_override or spec.llm.model``,
@@ -451,6 +456,7 @@ class _CodexForwarderState:
             self._note_model_fields(settings)
             self._note_effort_fields(settings)
             self._note_collaboration_mode_fields(settings)
+            self._note_approval_mode_fields(settings)
 
     def record_completed_plan(self, params: dict[str, Any]) -> None:
         """
@@ -812,6 +818,12 @@ class _CodexForwarderState:
         if isinstance(mode, str) and mode:
             self.collaboration_mode = mode
 
+    def _note_approval_mode_fields(self, payload: dict[str, Any]) -> None:
+        """Record Codex approval/sandbox settings as launch args."""
+        args = _codex_terminal_launch_args_from_settings(payload)
+        if args is not None:
+            self.terminal_launch_args = args
+
 
 @dataclass(frozen=True)
 class _CodexTerminalError:
@@ -884,6 +896,47 @@ def _error_payload_message(payload: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return "Codex turn ended with an unspecified error."
+
+
+def _codex_terminal_launch_args_from_settings(payload: dict[str, Any]) -> list[str] | None:
+    """Convert Codex thread settings into persisted terminal launch args."""
+    active_profile = payload.get("activePermissionProfile")
+    if active_profile is None:
+        active_profile = payload.get("active_permission_profile")
+    reviewer = payload.get("approvalsReviewer")
+    if reviewer is None:
+        reviewer = payload.get("approvals_reviewer")
+    approval_policy = payload.get("approvalPolicy")
+    if approval_policy is None:
+        approval_policy = payload.get("approval_policy")
+    if approval_policy not in {"never", "on-failure", "on-request", "untrusted"}:
+        return None
+
+    args: list[str] = []
+    if isinstance(active_profile, dict) and isinstance(active_profile.get("id"), str):
+        args.extend(
+            [
+                "-c",
+                f"default_permissions={json.dumps(active_profile['id'])}",
+                "-c",
+                f"approval_policy={json.dumps(approval_policy)}",
+            ]
+        )
+    else:
+        sandbox_policy = payload.get("sandboxPolicy")
+        if sandbox_policy is None:
+            sandbox_policy = payload.get("sandbox_policy")
+        if not isinstance(sandbox_policy, dict):
+            return None
+        sandbox_mode = sandbox_policy.get("type")
+        if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+            return None
+        if approval_policy != "on-request" or sandbox_mode != "workspace-write":
+            args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
+
+    if reviewer in {"user", "auto_review", "guardian_subagent"}:
+        args.extend(["-c", f"approvals_reviewer={json.dumps(reviewer)}"])
+    return args
 
 
 def _error_item_from_turn(turn: dict[str, Any]) -> dict[str, Any] | None:
@@ -2069,6 +2122,9 @@ async def _subscribe_until_ready(
             await _sync_model_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
+            await _sync_codex_approval_mode_change(
+                ap_client, session_id=session_id, forwarder_state=forwarder_state
+            )
         await _replay_resume_response(
             ap_client,
             session_id=session_id,
@@ -2769,6 +2825,27 @@ async def _sync_codex_collaboration_mode_change(
         forwarder_state.posted_collaboration_mode = mode
 
 
+async def _sync_codex_approval_mode_change(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """Mirror Codex ``/permissions`` changes into session metadata."""
+    args = forwarder_state.terminal_launch_args
+    if args is None or args == forwarder_state.posted_terminal_launch_args:
+        return
+    response = await _post_session_event(
+        client,
+        session_id,
+        event_type="external_codex_approval_mode_change",
+        data={"terminal_launch_args": args},
+    )
+    _log_failed_session_event_post("external_codex_approval_mode_change", response)
+    if response is not None and response.status_code < 400:
+        forwarder_state.posted_terminal_launch_args = list(args)
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -2845,6 +2922,9 @@ async def _maybe_handle_turn_event(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
             await _sync_codex_collaboration_mode_change(
+                client, session_id=session_id, forwarder_state=forwarder_state
+            )
+            await _sync_codex_approval_mode_change(
                 client, session_id=session_id, forwarder_state=forwarder_state
             )
         return True

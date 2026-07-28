@@ -2131,6 +2131,82 @@ async def _persist_external_codex_collaboration_mode_change(
     _publish_collaboration_mode(session_id, mode)
 
 
+async def _persist_external_codex_approval_mode_change(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+) -> None:
+    """Merge Codex's terminal-observed permission launch args."""
+    raw_args = body.data.get("terminal_launch_args")
+    if not isinstance(raw_args, list):
+        raise OmnigentError(
+            "external_codex_approval_mode_change requires data.terminal_launch_args list",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    try:
+        permission_args = _validate_terminal_launch_args(raw_args)
+        terminal_launch_args = _validate_terminal_launch_args(
+            _merge_codex_permission_launch_args(conv.terminal_launch_args, permission_args or [])
+        )
+    except ValueError as exc:
+        raise OmnigentError(
+            f"invalid terminal_launch_args: {exc}",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    if conv.terminal_launch_args == terminal_launch_args:
+        return
+    await asyncio.to_thread(
+        conversation_store.update_conversation,
+        session_id,
+        terminal_launch_args=terminal_launch_args,
+    )
+
+
+def _merge_codex_permission_launch_args(
+    existing_args: Sequence[str] | None,
+    permission_args: Sequence[str],
+) -> list[str]:
+    """Replace Codex permission arguments while preserving other launch args."""
+    config_keys = {
+        "approval_policy",
+        "approvals_reviewer",
+        "default_permissions",
+        "sandbox_mode",
+    }
+    value_options = {"--ask-for-approval", "-a", "--sandbox", "-s"}
+    merged: list[str] = []
+    args = list(existing_args or ())
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            index += 1
+            continue
+        if arg in value_options:
+            index += 2
+            continue
+        if arg.startswith(("--ask-for-approval=", "-a=", "--sandbox=", "-s=")):
+            index += 1
+            continue
+        if arg in {"--config", "-c"} and index + 1 < len(args):
+            key = args[index + 1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 2
+                continue
+            merged.extend(args[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith(("--config=", "-c=")):
+            key = arg.split("=", 1)[1].partition("=")[0].strip()
+            if key in config_keys:
+                index += 1
+                continue
+        merged.append(arg)
+        index += 1
+    return [*merged, *permission_args]
+
+
 def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,
@@ -8471,6 +8547,7 @@ __all__ = [
     "_pending_elicitation_snapshot_for_session",
     "_permission_level_from_grants",
     "_persist_external_assistant_message",
+    "_persist_external_codex_approval_mode_change",
     "_persist_external_codex_collaboration_mode_change",
     "_persist_external_model_change",
     "_persist_external_model_options",

@@ -666,7 +666,12 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         async def close(self) -> None:
             """:returns: None."""
 
-    async def _fake_preload_thread(transport: str, loaded_thread_id: str) -> None:
+    async def _fake_preload_thread(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+    ) -> None:
         """
         No-op thread preload.
 
@@ -674,7 +679,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
-        del transport, loaded_thread_id
+        del transport, loaded_thread_id, terminal_launch_args
 
     runs: list[_ForwarderRun] = []
 

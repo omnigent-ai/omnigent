@@ -3535,6 +3535,7 @@ async def _auto_create_codex_terminal(
                 workspace=clone_workspace,
                 model_provider=_session_meta_provider,
                 codex_path=_codex_cli_path,
+                terminal_launch_args=launch_config.terminal_launch_args,
             )
         except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
             built_rollout = None
@@ -3582,6 +3583,7 @@ async def _auto_create_codex_terminal(
             workspace=Path(workspace).resolve(),
             model_provider=_session_meta_provider,
             codex_path=_codex_cli_path,
+            terminal_launch_args=launch_config.terminal_launch_args,
         )
     # Link the bundle's skills into the per-bridge CODEX_HOME before the
     # app-server boots — Codex discovers ``$CODEX_HOME/skills/<name>/``
@@ -3676,7 +3678,11 @@ async def _auto_create_codex_terminal(
     else:
         from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
 
-        await preload_codex_thread_for_resume(codex_ws_url, launch_config.external_session_id)
+        await preload_codex_thread_for_resume(
+            codex_ws_url,
+            launch_config.external_session_id,
+            terminal_launch_args=launch_config.terminal_launch_args,
+        )
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(

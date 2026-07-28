@@ -12,7 +12,7 @@ import shlex
 import sys
 import tempfile
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1676,7 +1676,98 @@ def client_for_transport(
     return CodexAppServerClient(Path(transport), client_name=client_name)
 
 
-async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> None:
+def normalize_codex_permission_launch_args(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Complete legacy Full Access args with their approval policy."""
+    args = list(terminal_launch_args or ())
+    full_access = False
+    has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
+            has_approval_policy = True
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            assignment = args[index]
+        elif arg.startswith(("--config=", "-c=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, _, raw_value = assignment.partition("=")
+            if key.strip() == "approval_policy":
+                has_approval_policy = True
+            elif key.strip() == "default_permissions":
+                full_access = _codex_config_string(raw_value) == ":danger-full-access"
+        index += 1
+    if full_access and not has_approval_policy:
+        args.extend(["-c", 'approval_policy="never"'])
+    return args
+
+
+def _codex_config_string(raw_value: str) -> str:
+    try:
+        value = tomlkit.parse(f"value = {raw_value}")["value"]
+    except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
+        value = raw_value.strip().strip('"').strip("'")
+    return value if isinstance(value, str) else ""
+
+
+def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
+    """Convert persisted Codex permission args into thread-resume overrides."""
+    params: CodexParams = {}
+    args = normalize_codex_permission_launch_args(terminal_launch_args)
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        value: str | None = None
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            params.update(approvalPolicy="never", sandbox="danger-full-access")
+        elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
+            if index + 1 < len(args):
+                value = args[index + 1]
+                index += 1
+            if value is not None:
+                field = "approvalPolicy" if arg in {"--ask-for-approval", "-a"} else "sandbox"
+                params[field] = value
+        elif arg.startswith(("--ask-for-approval=", "-a=")):
+            params["approvalPolicy"] = arg.split("=", 1)[1]
+        elif arg.startswith(("--sandbox=", "-s=")):
+            params["sandbox"] = arg.split("=", 1)[1]
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            key, _, value = args[index].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        elif arg.startswith(("--config=", "-c=")):
+            key, _, value = arg.split("=", 1)[1].partition("=")
+            _set_codex_resume_config_param(params, key, value)
+        index += 1
+    if "permissions" in params:
+        params.pop("sandbox", None)
+    return params
+
+
+def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> None:
+    field = {
+        "approval_policy": "approvalPolicy",
+        "approvals_reviewer": "approvalsReviewer",
+        "default_permissions": "permissions",
+        "sandbox_mode": "sandbox",
+    }.get(key.strip())
+    if field is None:
+        return
+    value = _codex_config_string(raw_value)
+    if value:
+        params[field] = value
+
+
+async def preload_codex_thread_for_resume(
+    transport: str,
+    thread_id: str,
+    *,
+    terminal_launch_args: Sequence[str] | None = None,
+) -> None:
     """
     Load an existing Codex thread into a freshly started app-server.
 
@@ -1690,6 +1781,7 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
         or ``"/tmp/app-server.sock"``.
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
+    :param terminal_launch_args: Persisted permission overrides for the resumed thread.
     :returns: None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -1701,7 +1793,11 @@ async def preload_codex_thread_for_resume(transport: str, thread_id: str) -> Non
     try:
         await client.request(
             "thread/resume",
-            {"threadId": thread_id, "excludeTurns": True},
+            {
+                "threadId": thread_id,
+                "excludeTurns": True,
+                **_codex_resume_permission_params(terminal_launch_args),
+            },
         )
     finally:
         await client.close()
@@ -1868,7 +1964,7 @@ def build_codex_remote_args(
         # bypass flag (a global flag, so it precedes any ``resume``).
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
-        passthrough = list(codex_args)
+        passthrough = normalize_codex_permission_launch_args(codex_args)
     if thread_id is None:
         return [*override_args, *passthrough, "--remote", remote_url]
     return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]

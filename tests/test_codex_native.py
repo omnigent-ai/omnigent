@@ -422,6 +422,14 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
         codex_native_app_server.preload_codex_thread_for_resume(
             "ws://127.0.0.1:1234",
             "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            terminal_launch_args=[
+                "-c",
+                'default_permissions=":danger-full-access"',
+                "-c",
+                'approval_policy="never"',
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
         )
     )
 
@@ -432,10 +440,52 @@ def test_preload_codex_thread_for_resume_resumes_and_closes(
             {
                 "threadId": "019e96aa-0be2-7343-8d3b-6f914d60936b",
                 "excludeTurns": True,
+                "permissions": ":danger-full-access",
+                "approvalPolicy": "never",
+                "approvalsReviewer": "auto_review",
             },
         )
     ]
     assert fake_client.closed is True
+
+
+def test_codex_resume_permission_params_parse_legacy_flags() -> None:
+    """Legacy approval and sandbox flags become preload overrides."""
+    assert codex_native_app_server._codex_resume_permission_params(
+        ["-a", "on-failure", "-s=read-only"]
+    ) == {
+        "approvalPolicy": "on-failure",
+        "sandbox": "read-only",
+    }
+
+
+def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> None:
+    """An incomplete stored Full Access profile resumes as the matching preset."""
+    args = [
+        "-c",
+        'default_permissions=":danger-full-access"',
+        "-c",
+        'approvals_reviewer="user"',
+    ]
+
+    assert codex_native_app_server._codex_resume_permission_params(args) == {
+        "permissions": ":danger-full-access",
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+    }
+    assert codex_native_app_server.build_codex_remote_args(
+        codex_args=tuple(args),
+        thread_id="thread_x",
+        remote_url="ws://127.0.0.1:9876",
+    ) == [
+        *args,
+        "-c",
+        'approval_policy="never"',
+        "resume",
+        "--remote",
+        "ws://127.0.0.1:9876",
+        "thread_x",
+    ]
 
 
 def _started_event(turn_id: str) -> dict[str, Any]:
@@ -9891,6 +9941,40 @@ def test_rollout_records_without_compaction_item_has_no_compacted_entry() -> Non
     )
     types = [r["type"] for r in records]
     assert "compacted" not in types
+
+
+@pytest.mark.parametrize(
+    "terminal_launch_args",
+    [
+        ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+        ["-c", 'default_permissions=":danger-full-access"'],
+    ],
+)
+def test_rollout_records_use_terminal_launch_permission_args(
+    terminal_launch_args: list[str],
+) -> None:
+    """Cold-resume turn_context preserves the persisted Codex permission mode."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "response_id": "resp_1",
+            }
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+        terminal_launch_args=terminal_launch_args,
+    )
+
+    turn_context = next(r for r in records if r["type"] == "turn_context")["payload"]
+    assert turn_context["approval_policy"] == "never"
+    assert turn_context["sandbox_policy"] == {"type": "danger-full-access"}
 
 
 # --- #2745: routing summary surfaced in the startup-timeout error ---

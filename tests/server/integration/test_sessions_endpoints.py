@@ -6055,6 +6055,79 @@ async def test_post_external_codex_collaboration_mode_change_rejects_unknown_mod
     assert "external_codex_collaboration_mode_change" in resp.text
 
 
+async def test_post_external_codex_approval_mode_change_persists_terminal_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """Codex approval-mode events update stored native launch args."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    args = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"terminal_launch_args": args},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json() == {"queued": False}
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == args
+
+
+async def test_post_external_codex_approval_mode_change_preserves_other_args(
+    client: httpx.AsyncClient,
+) -> None:
+    """Codex permission updates replace only permission-family launch args."""
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        terminal_launch_args=[
+            "--search",
+            "-a=never",
+            "-s=read-only",
+            "--sandbox",
+            "read-only",
+            "--profile",
+            "work",
+            "-c",
+            'approvals_reviewer="user"',
+            "--add-dir",
+            "/tmp/shared",
+        ],
+    )
+    permission_args = [
+        "-c",
+        'default_permissions="dev"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'approvals_reviewer="auto_review"',
+    ]
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_codex_approval_mode_change",
+            "data": {"terminal_launch_args": permission_args},
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["terminal_launch_args"] == [
+        "--search",
+        "--profile",
+        "work",
+        "--add-dir",
+        "/tmp/shared",
+        *permission_args,
+    ]
+
+
 def _model_change_notes(published: list[tuple[str, dict[str, Any]]]) -> list[str]:
     """
     Extract ``[System: ...]`` model-change note texts from published events.
