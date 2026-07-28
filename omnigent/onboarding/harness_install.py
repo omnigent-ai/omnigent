@@ -103,13 +103,15 @@ KIRO_KEY = "kiro"
 #   to the day after 2026-06-01 so we don't support stale pre-June builds.
 # - kimi: first ``kimi-cli`` release after 2026-06-01 is 1.47.0
 #   (https://github.com/MoonshotAI/kimi-cli/blob/main/CHANGELOG.md).
-# - hermes: parent_session_id schema was introduced in v0.17.0, but Hermes now
-#   ships date-tagged releases; the first one after 2026-06-01 is 2026.06.05.
+# - hermes: parent_session_id schema was introduced in v0.17.0. Although Hermes
+#   also publishes date-tagged releases, `hermes --version` reports the agent
+#   SEMVER (e.g. 0.19.0), which is what _parse_harness_cli_version extracts, so
+#   the floor must be the semver feature floor (0.17.0), not a YYYY.MM.DD date.
 _CODEX_MIN_VERSION = "0.137.0"
 _PI_MIN_VERSION = "0.79.0"
 _QWEN_MIN_VERSION = "0.18.1"
 _GOOSE_MIN_VERSION = "1.38.0"
-_HERMES_MIN_VERSION = "2026.06.05"
+_HERMES_MIN_VERSION = "0.17.0"
 _KIRO_MIN_VERSION = "2.10.0"
 _CLAUDE_MIN_VERSION = "2.1.161"
 _CURSOR_MIN_VERSION = "2026.06.02"

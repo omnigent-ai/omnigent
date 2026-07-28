@@ -862,9 +862,14 @@ def _build_models_json(
 # parser only consumes that channel when the model entry declares
 # ``reasoning: true``; without it the stream carries no ``content`` and the
 # turn dies with "Stream ended without finish_reason".
+# gpt-5.6 also needs it: pi 0.80.7 hardcodes ``store: false`` and then replays a
+# prior reasoning-item id (``rs_...``) on a later tool-loop turn, which CST
+# cannot resolve because ``store: false`` means items are never persisted.
+# Declaring reasoning here makes pi request portable ``reasoning.encrypted_content``,
+# the stateless fix.
 # Note: GLM, kimi, and inkling now route via Responses API (system.ai.* ids)
 # so they no longer need this flag.
-_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
+_PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek", "gpt-5.6")
 
 
 def _pi_model_is_reasoning(model: str) -> bool:

@@ -45,6 +45,7 @@ omnigent/inner/pi_executor.py databricks-gpt-5-4 1
 omnigent/inner/pi_executor.py databricks-gpt-5-4-mini 1
 omnigent/inner/pi_executor.py databricks-gpt-5-5 1
 omnigent/inner/pi_executor.py databricks-gpt-5-5-pro 1
+omnigent/inner/pi_executor.py gpt-5.6 1
 omnigent/kiro_native.py claude-haiku-4.5 1
 omnigent/kiro_native.py claude-sonnet-4 1
 omnigent/kiro_native.py claude-sonnet-4.5 1
