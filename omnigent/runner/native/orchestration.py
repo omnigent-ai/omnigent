@@ -44,6 +44,7 @@ from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    COPILOT_NATIVE_TERMINAL_ROLE,
     CURSOR_NATIVE_TERMINAL_ROLE,
     GOOSE_NATIVE_TERMINAL_ROLE,
     HERMES_NATIVE_TERMINAL_ROLE,
@@ -4046,6 +4047,181 @@ async def _run_antigravity_reader(
     )
 
 
+async def _auto_create_copilot_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+) -> SessionResourceView:
+    """
+    Auto-create the Copilot TUI terminal for a copilot-native session.
+
+    Launches ``copilot --session-id <uuid>`` in a runner-owned tmux pane. Auth is
+    the CLI's own ``copilot login`` state, so HOME is inherited and Omnigent
+    writes no vendor config (Copilot owns its own tool surface / MCP servers,
+    the same posture as :func:`_auto_create_goose_terminal`). The pinned
+    ``--session-id`` lets the forwarder address *this* session's event stream
+    deterministically.
+
+    :param session_id: Session/conversation identifier.
+    :param resource_registry: Session resource registry for launching the terminal.
+    :param publish_event: Runner session event publisher.
+    :param server_client: Runner Omnigent server client.
+    :param agent_spec: Resolved agent spec, for the pinned model and explicit auth.
+    :returns: Created terminal resource view.
+    """
+    del ensure_comment_relay
+    from omnigent.copilot_native import resolve_copilot_executable
+    from omnigent.copilot_native_bridge import (
+        bridge_dir_for_session_id,
+        inject_model_command,
+        write_tmux_target,
+    )
+    from omnigent.copilot_native_forwarder import clear_copilot_bridge_state
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.onboarding.copilot_auth import resolve_copilot_github_token
+    from omnigent.spec.types import ApiKeyAuth
+
+    # Tear down any forwarder left from a prior terminal for this session before
+    # re-creating, so old and new tasks can't both mirror (double-posting), and
+    # drop the prior terminal's stale forward cursor.
+    await _cancel_auto_forwarder_task(session_id)
+    bridge_dir = bridge_dir_for_session_id(session_id)
+    clear_copilot_bridge_state(bridge_dir)
+
+    # ``_pi_native_launch_config`` is a generic session-snapshot reader
+    # (workspace + terminal_launch_args + model_override); reused here, not
+    # Pi-specific.
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id,
+        server_client=server_client,
+    )
+    workspace = os.path.realpath(str(launch_config.workspace))
+    copilot_command = resolve_copilot_executable()
+    # Launch-unique Copilot session uuid. ``--session-id`` sets the uuid for a
+    # NEW session (verified, Copilot CLI 1.0.63), which fixes the path of the
+    # events.jsonl the forwarder tails — no recency guessing. Fresh per launch,
+    # like goose's per-launch ``--name``, so a relaunch can never bind to an
+    # older session's stream and replay its transcript.
+    copilot_session_uuid = str(uuid.uuid4())
+    launch_args = [
+        "--session-id",
+        copilot_session_uuid,
+        *(launch_config.terminal_launch_args or []),
+    ]
+    model = launch_config.model_override or _copilot_native_model_from_spec(agent_spec)
+    env: dict[str, str] = {}
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    # Only a credential the user explicitly bound to Copilot is injected: the
+    # spec's own api_key, else the token registered under the `copilot:` config
+    # block. Ambient GH_TOKEN / GITHUB_TOKEN are deliberately NOT promoted --
+    # the pane inherits them already, and copying one into Copilot's auth slot
+    # silently signs the agent in as whatever identity happened to be exported.
+    # With neither, the pane inherits HOME and uses the CLI's own `copilot
+    # login` state, the same posture as cursor-native.
+    if spec is not None and isinstance(spec.executor.auth, ApiKeyAuth):
+        token = spec.executor.auth.api_key
+    else:
+        token = resolve_copilot_github_token()
+    if token:
+        # COPILOT_GITHUB_TOKEN alone: it is the highest-precedence variable the
+        # CLI reads, and writing GH_TOKEN / GITHUB_TOKEN would re-point `gh` and
+        # git's credential helpers inside this interactive pane at a token the
+        # user did not choose for them -- enough to push or open a PR under the
+        # wrong identity. --secret-env-vars keeps the value out of the
+        # environment of shells and MCP servers Copilot spawns, and redacts it
+        # from pane output; the pane is unsandboxed and the model runs commands
+        # in it, so the credential must not be readable there.
+        env["COPILOT_GITHUB_TOKEN"] = token
+        launch_args.append("--secret-env-vars=COPILOT_GITHUB_TOKEN")
+
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="copilot",
+        session_key="main",
+        resource_role=COPILOT_NATIVE_TERMINAL_ROLE,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(type="caller_process", cwd=workspace),
+            command=copilot_command,
+            args=launch_args,
+            env=env,
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    # Advertise the tmux socket+target so the copilot-native harness executor can
+    # inject web-UI messages into this same pane (tmux paste). Publication is
+    # transactional: the pane is already live and registered by this point, so a
+    # failure here would otherwise leave a running terminal that a later ensure
+    # finds and reuses — skipping the very setup that failed, and leaving the
+    # session permanently unable to inject.
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "copilot", "main")
+        if instance is not None and instance.running:
+            try:
+                write_tmux_target(
+                    bridge_dir,
+                    session_id=session_id,
+                    socket_path=instance.socket_path,
+                    tmux_target=instance.tmux_target,
+                )
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await resource_registry.close_terminal(
+                        session_id, terminal_resource_id("copilot", "main")
+                    )
+                raise
+            if model:
+                try:
+                    await asyncio.to_thread(inject_model_command, bridge_dir, model=model)
+                except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
+                    _logger.warning(
+                        "Failed to apply Copilot model override for session %s",
+                        session_id,
+                        exc_info=True,
+                    )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+
+    # Mirror the Copilot TUI's conversation back into the Omnigent session so the
+    # chat view tracks the embedded terminal. Host-spawned sessions have no CLI
+    # client to start this, so the runner owns it — reusing the runner's own
+    # server URL + refresh-capable auth.
+    from omnigent.copilot_native_forwarder import supervise_copilot_forwarder
+    from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
+
+    server_url = _required_runner_env("RUNNER_SERVER_URL")
+    _forwarder_task = asyncio.create_task(
+        supervise_copilot_forwarder(
+            base_url=server_url,
+            headers={},
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            agent_name="copilot-native-ui",
+            copilot_session_id=copilot_session_uuid,
+            auth=_RunnerDatabricksAuth(_make_auth_token_factory()),
+        ),
+        name=f"copilot-forwarder-{session_id}",
+    )
+    _register_auto_forwarder_task(session_id, _forwarder_task)
+    _logger.info(
+        "Auto-created copilot terminal + forwarder for session %s; task=%s",
+        session_id,
+        _forwarder_task.get_name(),
+    )
+    return terminal_view
+
+
 async def _auto_create_antigravity_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -4763,6 +4939,15 @@ def _codex_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -
         return model
     config_model = spec.executor.config.get("model")
     return config_model if isinstance(config_model, str) and config_model else None
+
+
+def _copilot_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
+    """Read the Copilot model default from a resolved agent spec."""
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if spec is None:
+        return None
+    model = spec.executor.model
+    return model if isinstance(model, str) and model else None
 
 
 def _claude_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:

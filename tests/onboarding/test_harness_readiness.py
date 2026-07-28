@@ -131,6 +131,8 @@ def test_sdk_and_unknown_harnesses_are_never_gated(
         "goose-native",
         "native-goose",
         "hermes",
+        "copilot-native",
+        "native-copilot",
     ],
 )
 def test_cli_harness_configured_only_when_binary_installed(
@@ -145,6 +147,8 @@ def test_cli_harness_configured_only_when_binary_installed(
     breaks every native launch (if it stayed False).
     """
     _all_clis_installed(monkeypatch)
+    if harness in {"copilot-native", "native-copilot"}:
+        monkeypatch.setenv("GH_TOKEN", "gho_ready")
     assert harness_is_configured(harness) is True
     _no_clis_installed(monkeypatch)
     assert harness_is_configured(harness) is False
@@ -333,6 +337,9 @@ def test_configured_harness_map_covers_all_spellings(
         # Copilot SDK harness + its user-facing alias.
         "copilot",
         "github-copilot",
+        # Copilot native TUI harness + alias.
+        "copilot-native",
+        "native-copilot",
         # Hermes — headless subprocess harness (``hermes``) + native TUI
         # (``hermes-native`` / ``native-hermes``); all gate on the hermes CLI.
         "hermes",
@@ -406,6 +413,9 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "pi-native",
     ):
         assert result[missing] == "binary-missing", f"{missing} should name the missing CLI binary"
+    monkeypatch.setenv("GH_TOKEN", "gho_ready")
+    for copilot in ("copilot-native", "native-copilot"):
+        assert harness_is_configured(copilot) is False, f"{copilot} still needs the CLI binary"
 
 
 def test_configured_harness_map_all_true_with_clis(

@@ -31,6 +31,8 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
     {
         "claude-sdk",
         "codex",
+        "copilot",
+        "copilot-native",
         "pi",
         "openai-agents",
         "cursor",
@@ -38,7 +40,6 @@ _SDK_MODEL_OVERRIDE_HARNESSES: frozenset[str] = frozenset(
         "kimi",
         "qwen",
         "goose",
-        "copilot",
     }
 )
 _SDK_MODEL_OVERRIDE_HARNESSES = frozenset(model_env_keys())

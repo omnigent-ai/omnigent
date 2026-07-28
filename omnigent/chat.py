@@ -1102,6 +1102,14 @@ def _redirect_native_resume_if_needed(
             progress=progress,
         )
         return True
+    if native_agent.key == "copilot":
+        _run_copilot_native_resume_redirect(
+            base_url=base_url,
+            conversation_id=conversation_id,
+            auto_open_conversation=auto_open_conversation,
+            progress=progress,
+        )
+        return True
     return False
 
 
@@ -1331,6 +1339,30 @@ def _run_kimi_native_resume_redirect(
         server=base_url,
         session_id=conversation_id,
         kimi_args=(),
+        auto_open_conversation=auto_open_conversation,
+    )
+
+
+def _run_copilot_native_resume_redirect(
+    *,
+    base_url: str,
+    conversation_id: str,
+    auto_open_conversation: bool,
+    progress: RunnerStartupProgress | None,
+) -> None:
+    """Hand a copilot-native conversation back to ``omnigent copilot``."""
+    _finish_native_redirect_progress(
+        progress=progress,
+        conversation_id=conversation_id,
+        wrapper_name="copilot-native",
+        native_command="copilot",
+    )
+    from omnigent.copilot_native import run_copilot_native
+
+    run_copilot_native(
+        server=base_url,
+        session_id=conversation_id,
+        copilot_args=(),
         auto_open_conversation=auto_open_conversation,
     )
 

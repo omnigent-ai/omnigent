@@ -132,6 +132,10 @@ _HARNESS_MODULES: dict[str, str] = {
     # Omnigent spawns no separately-installed CLI. Authenticates against GitHub's
     # Copilot backend with a GitHub token (no Databricks gateway).
     "copilot": "omnigent.inner.copilot_harness",
+    # Native GitHub Copilot TUI bridge used by ``omnigent copilot``. It
+    # launches the verified ``copilot`` CLI in a runner-owned tmux pane and
+    # injects web turns into that pane.
+    "copilot-native": "omnigent.inner.copilot_native_harness",
     # Hermes Agent harness wrap. Runs the ``hermes`` CLI as a subprocess
     # for each turn, managing its own session state via Hermes' SQLite
     # session store. See omnigent/inner/hermes_harness.py and

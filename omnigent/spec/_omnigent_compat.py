@@ -94,6 +94,7 @@ OMNIGENT_HARNESSES = frozenset(
         "codex",
         "codex-native",
         "copilot",
+        "copilot-native",
         "cursor",
         "kimi",
         "kimi-native",
@@ -129,6 +130,7 @@ OMNIGENT_HARNESS_ALIASES = frozenset(
         "native-opencode",
         "native-hermes",
         "github-copilot",
+        "native-copilot",
         "native-kimi",
     }
 )

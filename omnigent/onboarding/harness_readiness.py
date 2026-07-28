@@ -106,6 +106,11 @@ KIMI_SURFACE = "kimi"
 # open like an unknown harness.
 _OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native"})
 
+# Copilot splits into an SDK harness (``copilot``) and a native TUI wrapper
+# (``copilot-native``). The SDK harness is runtime-keyed only; the native TUI
+# needs the CLI binary too.
+_COPILOT_NATIVE_HARNESSES: frozenset[str] = frozenset({"copilot-native", "native-copilot"})
+
 # Native Cursor harnesses. These boot the ``cursor-agent`` TUI (``omni cursor``)
 # and so, like the other native CLI harnesses, can't launch without that binary
 # on ``PATH`` — gate them on it. Distinct from the SDK ``cursor`` harness
@@ -241,13 +246,12 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
 
         return cursor_api_key_configured() or bool(os.environ.get("CURSOR_API_KEY"))
     if canonical == COPILOT_KEY:
-        # Copilot runs in-process via the ``github-copilot-sdk`` package (the
-        # SDK bundles the CLI binary it drives, so there is no separate binary to
-        # gate on) and authenticates against GitHub's Copilot backend with a
-        # GitHub token. So, like cursor, readiness is whether a token is
-        # resolvable — one stored by ``omnigent setup`` (the ``copilot:`` config
-        # block — see :mod:`omnigent.onboarding.copilot_auth`) or inherited from
-        # the environment. A bad / Copilot-less token surfaces at run time.
+        # Copilot runs in-process via the ``github-copilot-sdk`` package and
+        # authenticates against GitHub's Copilot backend with a GitHub token.
+        # Like cursor, readiness is whether a token is resolvable — one stored
+        # by ``omnigent setup`` (the ``copilot:`` config block — see
+        # :mod:`omnigent.onboarding.copilot_auth`) or inherited from the
+        # environment. A bad / Copilot-less token surfaces at run time.
         from omnigent.onboarding.copilot_auth import (
             COPILOT_TOKEN_ENV_VARS,
             copilot_github_token_configured,
@@ -256,12 +260,23 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return copilot_github_token_configured() or any(
             os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS
         )
+    if canonical in _COPILOT_NATIVE_HARNESSES:
+        from omnigent.onboarding.copilot_auth import (
+            COPILOT_TOKEN_ENV_VARS,
+            copilot_github_token_configured,
+        )
+
+        return harness_cli_installed(COPILOT_KEY) and (
+            copilot_github_token_configured()
+            or any(os.environ.get(var) for var in COPILOT_TOKEN_ENV_VARS)
+        )
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
         and canonical != KIMI_SURFACE
         and canonical not in _KIMI_NATIVE_HARNESSES
         and canonical not in _OPENCODE_HARNESSES
+        and canonical not in _COPILOT_NATIVE_HARNESSES
         and canonical not in _QWEN_HARNESSES
     ):
         required_cli = required_cli_for_harness(canonical) or required_cli_for_harness(harness)
@@ -482,6 +497,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(HARNESS_ALIASES)
     spellings.update(_PI_HARNESSES)
     spellings.update(_OPENCODE_HARNESSES)
+    spellings.update(_COPILOT_NATIVE_HARNESSES)
     spellings.update(_CURSOR_NATIVE_HARNESSES)
     spellings.update(_KIRO_NATIVE_HARNESSES)
     spellings.update(_GOOSE_NATIVE_HARNESSES)

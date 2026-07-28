@@ -262,10 +262,14 @@ Or launch a specific agent runtime:
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
 omnigent cursor                      # Cursor
+omnigent copilot                     # GitHub Copilot (native terminal)
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
+
+The registry also accepts `copilot-native` as the native GitHub Copilot
+terminal harness.
 
 #### 🐙 Polly and 🟠🔵 Debby
 
