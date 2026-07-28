@@ -1864,9 +1864,19 @@ async def _heal_subagent_runner_binding_via_parent(
     ``httpx.AsyncClient`` so the caller can proceed as if the binding were always
     current.
 
-    After healing, the caller must set ``_runner_needs_session_init = True`` and
-    re-read the conversation row, because rebinding the DB row does not by itself
-    prove the replacement runner has initialized that child's harness/session state.
+    After healing, the caller must re-read the conversation row (the healed
+    ``runner_id`` is now in the DB).  Whether session re-initialization is
+    needed depends on the harness:
+
+    - **Native-terminal harnesses** (``pi-native``, ``claude-native``): the
+      replacement runner does not automatically spawn the child's terminal
+      process — the caller must set ``_runner_needs_session_init = True`` so
+      ``_ensure_runner_session_initialized`` creates it.
+    - **SDK / non-native harnesses**: all active sub-agent sessions are loaded
+      in-process by the runner on startup; the parent's live runner already
+      holds the child's session state, so ``_runner_needs_session_init``
+      should remain ``False`` (calling ``_ensure_runner_session_initialized``
+      would be a no-op at best and a spurious timeout at worst).
 
     :param child_conv: The sub-agent child whose ``runner_id`` may be stale.
     :param runner_router: Router used to resolve runner clients, or ``None`` in
