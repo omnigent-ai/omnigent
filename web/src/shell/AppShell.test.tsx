@@ -114,11 +114,13 @@ vi.mock("./FileViewer", () => ({
     open,
     path,
     onClose,
+    onNavigateTo,
     frameless,
   }: {
     open: boolean;
     path: string;
     onClose: () => void;
+    onNavigateTo?: (path: string) => void;
     frameless?: boolean;
   }) => (
     <div
@@ -128,6 +130,9 @@ vi.mock("./FileViewer", () => ({
     >
       <button type="button" aria-label="file-viewer: close" onClick={onClose}>
         close
+      </button>
+      <button type="button" aria-label="file-viewer: next" onClick={() => onNavigateTo?.("c.ts")}>
+        next
       </button>
     </div>
   ),
@@ -1777,6 +1782,32 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTitle("a.ts")).toBeInTheDocument();
     expect(screen.getByTitle("b.ts")).toBeInTheDocument();
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "b.ts");
+  });
+
+  it("replaces the active tab in place when the viewer navigates", () => {
+    writeSessionWorkspaceState("conv_navtabs", {
+      open: true,
+      openFiles: ["a.ts", "b.ts"],
+      selectedFilePath: "b.ts",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_navtabs", permission_level: null }]);
+
+    renderShell("/c/conv_navtabs");
+    fireEvent.click(
+      within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+        name: "file-viewer: next",
+      }),
+    );
+
+    expect(screen.getByTitle("a.ts")).toBeInTheDocument();
+    expect(screen.queryByTitle("b.ts")).toBeNull();
+    expect(screen.getByTitle("c.ts")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /^Close / })).toHaveLength(2);
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "c.ts");
   });
 });
 

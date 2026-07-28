@@ -190,6 +190,8 @@ interface WorkspacePanelProps {
   openFiles: string[];
   /** Open a file in the inline viewer (adds/activates its tab). */
   openFileViewer: (path: string) => void;
+  /** Navigate within the active viewer tab (replaces that tab in place). */
+  navigateFileViewer: (path: string) => void;
   /** Close a single open file tab by path. */
   onCloseFile: (path: string) => void;
   /** Deselect the active file tab to reveal the scope view (Changed/All). */
@@ -251,6 +253,7 @@ export function WorkspacePanel({
   selectedFilePath,
   openFiles,
   openFileViewer,
+  navigateFileViewer,
   onCloseFile,
   onShowScopeView,
   onCommentsOpenChange,
@@ -440,7 +443,7 @@ export function WorkspacePanel({
             path={selectedFilePath}
             onClose={onShowScopeView}
             onCloseTab={handleCloseTab}
-            onNavigateTo={openFileViewer}
+            onNavigateTo={navigateFileViewer}
             permissionLevel={permissionLevel}
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}

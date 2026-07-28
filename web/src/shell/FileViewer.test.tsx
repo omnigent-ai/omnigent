@@ -507,6 +507,56 @@ describe("FileViewer prev/next navigation order", () => {
       } as ReturnType<typeof useWorkspaceChangedFiles>);
     }
   });
+
+  it("keeps the active index stable when recency metadata refreshes", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    try {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: { available: true, data: changedFiles },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      const view = renderViewer({
+        open: true,
+        path: "c.py",
+        sort: "recent",
+        onNavigateTo: vi.fn(),
+      });
+
+      const indexText = () =>
+        screen
+          .getByRole("button", { name: "Previous file" })
+          .parentElement?.querySelector("span.tabular-nums")?.textContent;
+      expect(indexText()).toBe("2/3");
+
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: changedFiles.map((file) =>
+            file.path === "c.py" ? { ...file, modified_at: 400 } : file,
+          ),
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      view.rerender(
+        viewerTree({ open: true, path: "c.py", sort: "recent", onNavigateTo: vi.fn() }),
+      );
+
+      expect(indexText()).toBe("2/3");
+    } finally {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [
+            {
+              path: "file1.py",
+              bytes: 10,
+              modified_at: null,
+              name: "file1.py",
+              status: "modified",
+            },
+          ],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+    }
+  });
 });
 
 describe("FileViewer URL sync — diff param", () => {

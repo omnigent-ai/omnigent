@@ -832,12 +832,9 @@ export function AppShell() {
     writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
 
-  const openFileViewer = useCallback(
+  const showFileViewer = useCallback(
     (path: string) => {
       setSelectedFilePath(path);
-      // Add the path to the open tabs if it isn't already open; activating an
-      // already-open tab just re-selects it (no duplicate).
-      setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
       // Close the terminal drawer so the file viewer is unobscured —
       // but only in non-terminal-first sessions, where opening a file
       // and viewing the terminal compete for the same rail slot. In
@@ -880,6 +877,39 @@ export function AppShell() {
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
   ); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const openFileViewer = useCallback(
+    (path: string) => {
+      // Opening from the file list or selecting a tab adds/activates a tab.
+      setOpenFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
+      showFileViewer(path);
+    },
+    [showFileViewer],
+  );
+
+  const navigateFileViewer = useCallback(
+    (path: string) => {
+      // Prev/next navigation replaces the active tab in place. If the target
+      // is already open, swap the two paths so tab count and active position
+      // remain stable without introducing duplicate tabs.
+      setOpenFiles((prev) => {
+        const activeIndex = selectedFilePath === null ? -1 : prev.indexOf(selectedFilePath);
+        if (activeIndex === -1) return prev.includes(path) ? prev : [...prev, path];
+
+        const targetIndex = prev.indexOf(path);
+        if (targetIndex === activeIndex) return prev;
+
+        const next = [...prev];
+        next[activeIndex] = path;
+        if (targetIndex !== -1 && selectedFilePath !== null) {
+          next[targetIndex] = selectedFilePath;
+        }
+        return next;
+      });
+      showFileViewer(path);
+    },
+    [selectedFilePath, showFileViewer],
+  );
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
@@ -1371,6 +1401,7 @@ export function AppShell() {
                     selectedFilePath={selectedFilePath}
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
+                    navigateFileViewer={navigateFileViewer}
                     onCloseFile={closeFile}
                     onShowScopeView={showScopeView}
                     onCommentsOpenChange={setFileViewerCommentsOpen}
@@ -1469,7 +1500,7 @@ export function AppShell() {
                     conversationId={conversationId}
                     path={selectedFilePath}
                     onClose={closeFileViewer}
-                    onNavigateTo={openFileViewer}
+                    onNavigateTo={navigateFileViewer}
                     permissionLevel={permissionLevel}
                     sort={filesPanelSort}
                   />

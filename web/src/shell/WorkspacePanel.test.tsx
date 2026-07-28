@@ -10,7 +10,16 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // testid (plus, for FileViewer, the path it was asked to show) so we can prove
 // which child mounted without dragging in Monaco / hook stacks.
 vi.mock("./FileViewer", () => ({
-  FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
+  FileViewer: ({ path, onNavigateTo }: { path: string; onNavigateTo: (path: string) => void }) => (
+    <div data-testid="file-viewer-stub">
+      {path}
+      <button
+        type="button"
+        aria-label="viewer: next file"
+        onClick={() => onNavigateTo("next.ts")}
+      />
+    </div>
+  ),
 }));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel-stub" />,
@@ -49,6 +58,7 @@ function renderWorkspace(
   } = {},
 ) {
   const openFileViewer = vi.fn();
+  const navigateFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   render(
@@ -72,6 +82,7 @@ function renderWorkspace(
       selectedFilePath={overrides.selectedFilePath ?? null}
       openFiles={overrides.openFiles ?? []}
       openFileViewer={openFileViewer}
+      navigateFileViewer={navigateFileViewer}
       onCloseFile={onCloseFile}
       onShowScopeView={vi.fn()}
       onCommentsOpenChange={vi.fn()}
@@ -85,7 +96,7 @@ function renderWorkspace(
       onShowHiddenChange={vi.fn()}
     />,
   );
-  return { openFileViewer, onCloseFile, onRightRailTabChange };
+  return { openFileViewer, navigateFileViewer, onCloseFile, onRightRailTabChange };
 }
 
 describe("WorkspacePanel open-file tabs", () => {
@@ -136,6 +147,18 @@ describe("WorkspacePanel open-file tabs", () => {
     // must read inactive — otherwise both "Files" and the file tab would look
     // selected at once (the bug the sentinel prevents).
     expect(screen.getByRole("tab", { name: /files/i })).toHaveAttribute("data-state", "inactive");
+  });
+
+  it("routes viewer navigation through the replace-tab callback", () => {
+    const { openFileViewer, navigateFileViewer } = renderWorkspace({
+      openFiles: ["src/App.tsx"],
+      selectedFilePath: "src/App.tsx",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "viewer: next file" }));
+
+    expect(navigateFileViewer).toHaveBeenCalledWith("next.ts");
+    expect(openFileViewer).not.toHaveBeenCalled();
   });
 
   it("shows the Files tab as active when no file is selected", () => {

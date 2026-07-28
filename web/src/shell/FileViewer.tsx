@@ -372,14 +372,36 @@ function FileViewerBody({
   const diffQuery = useFileDiff(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
-  // Build the navigable file list from all changed files (including deleted),
-  // sorted the same way FilesPanel sorts its flat view so the "X/N" index
-  // matches the Changes list position. Memoized so the sort runs only when the
-  // changed-files list or sort order changes, not on every viewer re-render.
-  const navigableFiles = useMemo(
+  // Start from the same order as FilesPanel, then preserve that sequence across
+  // changed-file metadata refreshes. Autosave updates modified_at and invalidates
+  // the query; re-sorting on every refresh would make the active index jump.
+  const sortedNavigableFiles = useMemo(
     () => [...(changedFiles.data?.data ?? [])].sort(compareChangedFiles(sort)).map((f) => f.path),
     [changedFiles.data?.data, sort],
   );
+  const navigationSequenceRef = useRef<{
+    conversationId: string;
+    sort: ChangedSort;
+    paths: string[];
+  } | null>(null);
+  const previousSequence = navigationSequenceRef.current;
+  if (
+    previousSequence === null ||
+    previousSequence.conversationId !== conversationId ||
+    previousSequence.sort !== sort ||
+    !previousSequence.paths.includes(path)
+  ) {
+    navigationSequenceRef.current = { conversationId, sort, paths: sortedNavigableFiles };
+  } else {
+    const currentPaths = new Set(sortedNavigableFiles);
+    const stablePaths = previousSequence.paths.filter((candidate) => currentPaths.has(candidate));
+    const stablePathSet = new Set(stablePaths);
+    for (const candidate of sortedNavigableFiles) {
+      if (!stablePathSet.has(candidate)) stablePaths.push(candidate);
+    }
+    navigationSequenceRef.current = { conversationId, sort, paths: stablePaths };
+  }
+  const navigableFiles = navigationSequenceRef.current!.paths;
   const currentNavIdx = navigableFiles.indexOf(path);
   const prevPath = currentNavIdx > 0 ? navigableFiles[currentNavIdx - 1] : null;
   const nextPath =
