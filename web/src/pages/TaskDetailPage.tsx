@@ -350,7 +350,7 @@ export function TaskDetailPage() {
       <hr className="my-6 border-border" />
 
       {/* Run history. */}
-      <h2 className="mb-3 text-sm font-medium text-muted-foreground">Run history</h2>
+      <h2 className="mb-2 text-sm font-medium text-muted-foreground">Run history</h2>
       {runsLoading ? (
         <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
