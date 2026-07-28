@@ -502,3 +502,92 @@ async def test_call_tool_uses_configured_read_timeout() -> None:
         "otherwise call_tool may regress to httpx's shorter default."
     )
     assert timeout["connect"] == 10.0, "Connect timeout stays short to fail fast on a dead server"
+
+
+# ── call_tool approval timeout ─────────────────────────────────────────────
+
+
+def _input_required_resp(params: dict[str, Any]) -> httpx.Response:
+    """Build an MRTR ``input_required`` response with one elicitation.
+
+    :param params: The elicitation ``params`` dict, e.g.
+        ``{"message": "Approve?", "timeoutSeconds": 600}``.
+    :returns: A scripted :class:`httpx.Response` for the stub transport.
+    """
+    return _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "resultType": "input_required",
+                "requestState": "{}",
+                "inputRequests": {"elicit_1": {"method": "elicitation/create", "params": params}},
+            },
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_call_tool_passes_elicitation_timeout_to_approval_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``timeoutSeconds`` on the elicitation params must reach ``wait_for_user_approval``.
+
+    Failure means a policy's ``ask_timeout`` never applies on the MCP proxy
+    path, so the approval park falls back to the runner's one-day default.
+    """
+    done = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"content": [{"type": "text", "text": "ok"}], "isError": False},
+        }
+    )
+    transport = _StubTransport(
+        [_input_required_resp({"message": "Approve?", "timeoutSeconds": 600}), done]
+    )
+    manager = _make_manager(transport)
+    captured: dict[str, Any] = {}
+
+    async def _fake_wait(**kwargs: Any) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr("omnigent.runner.pending_approvals.wait_for_user_approval", _fake_wait)
+
+    output = await manager.call_tool(_make_spec("github"), "github__search", {})
+
+    assert output == "ok"
+    assert captured["timeout_seconds"] == 600.0, (
+        "The elicitation's timeoutSeconds must be forwarded as the approval "
+        "wait budget; otherwise ask_timeout policies are unreachable here."
+    )
+    retry = transport.calls[1]
+    assert retry.body["params"]["inputResponses"] == {"elicit_1": {"action": "accept"}}
+
+
+@pytest.mark.asyncio
+async def test_call_tool_approval_wait_unbounded_without_timeout_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``timeoutSeconds`` the approval wait must pass ``None``.
+
+    Failure means the runner invents a budget the server never sent, changing
+    behavior for servers that intentionally leave the fallback in place.
+    """
+    done = _json_resp({"jsonrpc": "2.0", "id": 2, "result": {"content": []}})
+    transport = _StubTransport([_input_required_resp({"message": "Approve?"}), done])
+    manager = _make_manager(transport)
+    captured: dict[str, Any] = {}
+
+    async def _fake_wait(**kwargs: Any) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr("omnigent.runner.pending_approvals.wait_for_user_approval", _fake_wait)
+
+    await manager.call_tool(_make_spec("github"), "github__search", {})
+
+    assert captured["timeout_seconds"] is None, (
+        "No timeoutSeconds hint means the runner keeps its existing fallback"
+    )

@@ -278,10 +278,16 @@ class ProxyMcpManager:
                     if self._publish_event is not None
                     else (lambda _s, _e: None)
                 )
+                # The spec-resolved ask_timeout rides on the elicitation
+                # params; without it the park falls back to one day and a
+                # policy's own approval window never applies on this path.
+                _req: dict[str, Any] = input_requests[elicitation_id] or {}
+                _ask_timeout = (_req.get("params") or {}).get("timeoutSeconds")
                 approved = await pending_approvals.wait_for_user_approval(
                     elicitation_id=elicitation_id,
                     conversation_id=self._session_id,
                     publish_event=_pub,
+                    timeout_seconds=float(_ask_timeout) if _ask_timeout is not None else None,
                 )
 
                 payload = {

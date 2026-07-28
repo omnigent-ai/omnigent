@@ -1515,3 +1515,43 @@ def test_mrtr_response_no_session_id_stays_form(monkeypatch: pytest.MonkeyPatch)
     params = body["result"]["inputRequests"]["elicit_abc"]["params"]
     assert params["mode"] == "form"
     assert "url" not in params
+
+
+def test_mrtr_response_carries_ask_timeout() -> None:
+    """
+    A spec-resolved ``ask_timeout`` must surface as ``timeoutSeconds``
+    in the MRTR elicitation params, so the runner's approval park can
+    honor the policy's window instead of its own fallback.
+    """
+
+    from omnigent.server.routes.sessions import _mcp_input_required_response
+
+    resp = _mcp_input_required_response(
+        rpc_id=1,
+        elicitation_id="elicit_abc",
+        message="Approve?",
+        request_state="{}",
+        ask_timeout=600,
+    )
+    body = json.loads(resp.body)
+    params = body["result"]["inputRequests"]["elicit_abc"]["params"]
+    assert params["timeoutSeconds"] == 600
+
+
+def test_mrtr_response_omits_timeout_when_unresolved() -> None:
+    """
+    Without ``ask_timeout`` the MRTR params must not carry
+    ``timeoutSeconds``, leaving the runner's existing fallback in place.
+    """
+
+    from omnigent.server.routes.sessions import _mcp_input_required_response
+
+    resp = _mcp_input_required_response(
+        rpc_id=1,
+        elicitation_id="elicit_abc",
+        message="Approve?",
+        request_state="{}",
+    )
+    body = json.loads(resp.body)
+    params = body["result"]["inputRequests"]["elicit_abc"]["params"]
+    assert "timeoutSeconds" not in params
