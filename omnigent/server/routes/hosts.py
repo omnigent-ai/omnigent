@@ -37,6 +37,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerFrame,
     HostListDirFrame,
     HostModelOptionsFrame,
+    HostShutdownFrame,
     HostStoreSecretFrame,
     encode_host_frame,
 )
@@ -1062,6 +1063,15 @@ def create_hosts_router(
         if agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
         # When the launching user (the session owner) is not the host owner —
+        # a shared / externally-owned host, e.g. a service-principal-owned
+        # Databricks App host serving another user's session — tell the runner
+        # to authenticate its server callbacks with its tunnel binding token
+        # (matched against the session's runner_id) instead of the host-owner
+        # credential, which can't read a guest session's spec (404). Equal
+        # owners (own-host, the common case) leave this False → unchanged.
+        prefer_binding_token_mint = (
+            user_id is not None and conn.owner is not None and user_id != conn.owner
+        )
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -1069,6 +1079,7 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                prefer_binding_token_mint=prefer_binding_token_mint,
             )
         )
         try:
@@ -1114,6 +1125,69 @@ def create_hosts_router(
             "runner_id": runner_id,
             "status": "launching",
         }
+
+    @router.post("/hosts/{host_id}/shutdown")
+    async def shutdown_host(request: Request, host_id: str) -> dict[str, str]:
+        """Shut down a host: terminate its runners and exit the daemon.
+
+        Owner-or-admin gated. Sends ``host.shutdown`` over the tunnel;
+        the daemon terminates its runners and exits instead of
+        reconnecting, and the tunnel's existing disconnect path then
+        deregisters the connection and marks the host offline in the DB.
+        Fire-and-forget: the offline flip lands via that disconnect
+        path, so callers observe it on their next poll.
+
+        :param request: The incoming request (for auth).
+        :param host_id: Host to shut down, e.g. ``"host_a1b2c3d4..."``.
+        :returns: ``{"status": "shutting_down"}``.
+        :raises HTTPException: 404 unknown host, 403 when the caller is
+            neither the owner nor an admin, 400 for server-managed
+            sandbox hosts, 409 when the host has no live connection.
+        """
+        # require_user: unauthenticated callers 401 instead of slipping
+        # past the owner/admin check below as None.
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if (
+            user_id is not None
+            and host.user_id != user_id
+            and not await asyncio.to_thread(_is_admin_caller, user_id)
+        ):
+            raise HTTPException(status_code=403, detail="not your host")
+        # Managed sandbox hosts are created/terminated by the server's
+        # own lifecycle (provider API, not the tunnel); routing them
+        # through a daemon-exit frame would leave the provider-side
+        # sandbox running. Out of scope here.
+        if host.sandbox_provider is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="managed sandbox hosts are terminated by the server automatically",
+            )
+
+        conn = host_registry.get(host_id)
+        if conn is None:
+            raise HTTPException(status_code=409, detail="host is offline")
+
+        actor_label = user_id if user_id is not None else "server operator"
+        frame = encode_host_frame(HostShutdownFrame(reason=f"shut down by {actor_label}"))
+        try:
+            host_registry.send_text(conn, frame)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="host connection was replaced",
+            ) from exc
+
+        audit_event(
+            "host.shutdown",
+            actor=user_id,
+            target=host_id,
+            host_name=host.name,
+            host_owner=host.user_id,
+        )
+        return {"status": "shutting_down"}
 
     @router.get("/hosts/{host_id}/filesystem")
     async def list_host_filesystem_root(

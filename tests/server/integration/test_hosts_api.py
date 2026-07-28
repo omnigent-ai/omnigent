@@ -1411,6 +1411,145 @@ def _register_live_conn(registry: HostRegistry, host_id: str, owner: str) -> obj
     return registry.register(host_id, ws=object(), hello=hello, owner=owner)
 
 
+async def test_shutdown_host_owner_sends_frame(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the owner can shut their host down: 200, and a
+    host.shutdown frame is enqueued on the host's tunnel.
+    """
+    import json as _json
+
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect(
+        "e5c55b6d8f254722a0e787b819c2b24c", "alice-laptop", "alice@test.com"
+    )
+    conn = _register_live_conn(registry, "e5c55b6d8f254722a0e787b819c2b24c", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/e5c55b6d8f254722a0e787b819c2b24c/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "shutting_down"}
+    frame = _json.loads(conn.outbound_queue.get_nowait())
+    assert frame["kind"] == "host.shutdown"
+    assert "alice@test.com" in frame["reason"]
+
+
+async def test_shutdown_host_admin_non_owner_allowed(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify an admin who does NOT own the host can still shut it down
+    (the operator reclaim path).
+    """
+    app, registry, host_store, _cs = multi_user_app
+    perm_store: SqlAlchemyPermissionStore = app.state.permission_store
+    perm_store.ensure_user("admin@test.com", is_admin=True)
+    host_store.upsert_on_connect(
+        "4078a80e3f15475ebf47f46c644196d9", "alice-laptop", "alice@test.com"
+    )
+    _register_live_conn(registry, "4078a80e3f15475ebf47f46c644196d9", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/4078a80e3f15475ebf47f46c644196d9/shutdown",
+            headers={"x-test-user": "admin@test.com"},
+        )
+    assert resp.status_code == 200
+
+
+async def test_shutdown_host_403_non_owner_non_admin(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown fails closed for a caller who is neither the owner
+    nor an admin — and no frame reaches the host.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect(
+        "c55224ec2a2b448087b27f82d5156a64", "alice-laptop", "alice@test.com"
+    )
+    conn = _register_live_conn(registry, "c55224ec2a2b448087b27f82d5156a64", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/c55224ec2a2b448087b27f82d5156a64/shutdown",
+            headers={"x-test-user": "bob@test.com"},
+        )
+    assert resp.status_code == 403
+    assert conn.outbound_queue.empty(), "No shutdown frame may be sent on a refused request"
+
+
+async def test_shutdown_host_409_offline(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown returns 409 when the host has no live tunnel —
+    there is nothing to signal.
+    """
+    app, _reg, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect(
+        "1a88f8a24a3140a09156c5410bf94509", "alice-laptop", "alice@test.com"
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/1a88f8a24a3140a09156c5410bf94509/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 409
+
+
+async def test_shutdown_host_404_unknown(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Verify shutdown returns 404 for an unknown host id."""
+    app, _reg, _hs, _cs = multi_user_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/55e2a20e479540eb8c1f3bdb4ae3490e/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 404
+
+
+async def test_shutdown_host_400_managed_sandbox(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify shutdown refuses managed sandbox hosts (400) — they are
+    torn down via the provider API, not a daemon-exit frame.
+    """
+    app, registry, host_store, _cs = multi_user_app
+    host_store.register_managed_host(
+        host_id="6f0c09196f6441c5b6183de0905e31f2",
+        name="sandbox-e",
+        user_id="alice@test.com",
+        token="tok-shut-e",
+        provider="modal",
+        sandbox_id="sb-1",
+        token_expires_at=now_epoch() + 3600,
+    )
+    _register_live_conn(registry, "6f0c09196f6441c5b6183de0905e31f2", "alice@test.com")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/v1/hosts/6f0c09196f6441c5b6183de0905e31f2/shutdown",
+            headers={"x-test-user": "alice@test.com"},
+        )
+    assert resp.status_code == 400
+
+
+# ── Host sharing (shared visibility for SP-owned hosts) ───────────
+# Covers the feature spec acceptance criteria AC-002..AC-007: shared
+# hosts appear in /v1/hosts, a `view` grantee can read but not browse
+# or launch, a `use` grantee can, non-granted users are blocked, and
+# only owner/admin/manage can mutate grants.
+
+
 def _grant_host(app: FastAPI, user_id: str, host_id: str, level: int) -> None:
     """Seed a host grant directly via the app's host permission store.
 
@@ -1696,6 +1835,7 @@ async def test_new_endpoints_401_unauthenticated(
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         for method, url, kwargs in [
             ("GET", "/v1/hosts?all=true", {}),
+            ("POST", "/v1/hosts/73abbbf15a0b428aafd6c9ed565a6f56/shutdown", {}),
             ("GET", "/v1/hosts/73abbbf15a0b428aafd6c9ed565a6f56/permissions", {}),
             (
                 "PUT",
@@ -1731,6 +1871,58 @@ async def test_stranger_cannot_read_grant_list(
                 headers={"x-test-user": caller},
             )
             assert resp.status_code == 403, f"{caller} must not read the grant list"
+
+
+async def test_audit_trail_for_shutdown_grant_revoke(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Shutdown, grant, and revoke each emit an omnigent.audit entry
+    carrying actor + target (C-N3), so an operator can reconstruct who
+    did what from the server log alone.
+    """
+    import json as _json
+
+    app, registry, host_store, _cs = multi_user_app
+    host_store.upsert_on_connect(
+        "9501718ba729402da4ee5b9febb363dd", "alice-laptop", "alice@test.com"
+    )
+    _register_live_conn(registry, "9501718ba729402da4ee5b9febb363dd", "alice@test.com")
+
+    with caplog.at_level("INFO", logger="omnigent.audit"):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.put(
+                "/v1/hosts/9501718ba729402da4ee5b9febb363dd/permissions/bob@test.com",
+                json={"level": "use"},
+                headers={"x-test-user": "alice@test.com"},
+            )
+            await client.delete(
+                "/v1/hosts/9501718ba729402da4ee5b9febb363dd/permissions/bob@test.com",
+                headers={"x-test-user": "alice@test.com"},
+            )
+            await client.post(
+                "/v1/hosts/9501718ba729402da4ee5b9febb363dd/shutdown",
+                headers={"x-test-user": "alice@test.com"},
+            )
+
+    entries = [
+        _json.loads(r.message.removeprefix("audit: "))
+        for r in caplog.records
+        if r.name == "omnigent.audit"
+    ]
+    by_action = {e["action"]: e for e in entries}
+    assert set(by_action) == {
+        "host.permission.grant",
+        "host.permission.revoke",
+        "host.shutdown",
+    }
+    for entry in entries:
+        assert entry["actor"] == "alice@test.com"
+        assert entry["target"] == "9501718ba729402da4ee5b9febb363dd"
+    assert by_action["host.permission.grant"]["principal"] == "bob@test.com"
+    assert by_action["host.permission.grant"]["level"] == "use"
+    assert by_action["host.permission.revoke"]["principal"] == "bob@test.com"
 
 
 async def test_audit_trail_for_fleet_view(

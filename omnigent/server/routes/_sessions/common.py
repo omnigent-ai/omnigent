@@ -367,6 +367,35 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
 }
 
+# A runner capability may use the shared event endpoint only for events that
+# originate from the runner itself. Human controls and item inputs (notably a
+# user-role ``message``) continue through normal user permission checks.
+_RUNNER_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        _MCP_ELICITATION_TYPE,
+        "compaction",
+        _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+        _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
+        _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+        _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+        _EXTERNAL_SESSION_INTERRUPTED_TYPE,
+        _EXTERNAL_SESSION_SUPERSEDED_TYPE,
+        _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+        _EXTERNAL_SESSION_STATUS_TYPE,
+        _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_COMPACTION_STATUS_TYPE,
+        _EXTERNAL_MCP_STARTUP_TYPE,
+        _EXTERNAL_MODEL_CHANGE_TYPE,
+        _EXTERNAL_MODEL_OPTIONS_TYPE,
+        _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
+        _EXTERNAL_SESSION_TODOS_TYPE,
+        _EXTERNAL_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
+        _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
+    }
+)
+
 
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
 
@@ -759,6 +788,7 @@ __all__ = [
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RUNNER_CONVICTION_POLL_S",
+    "_RUNNER_EVENT_TYPES",
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
     "_RUNNER_SESSION_INIT_TIMEOUT_S",

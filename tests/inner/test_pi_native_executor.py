@@ -131,6 +131,32 @@ async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
     assert refreshed == [{"Authorization": "Bearer tok"}, {"Authorization": "Bearer tok"}]
 
 
+async def test_turn_refresh_supplies_only_bearer(tmp_path: Path, monkeypatch) -> None:
+    """The per-turn refresh rotates ONLY the bearer.
+
+    The guest-on-shared-host X-Omnigent-Runner-Tunnel-Token is written at launch
+    (runner-main process, which has the binding token). The refresh runs in a
+    harness worker whose env has the token scrubbed, so it can only supply the
+    bearer — and it must, so ``refresh_config_auth_headers`` MERGES it over the
+    existing headers and the launch-written tunnel token survives (covered by
+    ``test_refresh_config_auth_headers_preserves_launch_headers``).
+    """
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: lambda: "tok")
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
+    refreshed: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        pne,
+        "refresh_config_auth_headers",
+        lambda bridge_dir, headers: bool(refreshed.append(headers)),
+    )
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+
+    [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "")]
+    assert refreshed == [{"Authorization": "Bearer tok"}]
+
+
 async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
     """A mint failure never blocks the turn (best-effort refresh)."""
     import omnigent.runner._entry as entry

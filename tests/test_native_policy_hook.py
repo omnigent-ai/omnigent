@@ -670,6 +670,68 @@ def test_policy_hook_wrapper_script_bakes_auth_and_routing(
     assert "X-Databricks-Org-Id" in line and "org123" in line
 
 
+def test_policy_hook_wrapper_bakes_tunnel_token_on_guest_shared_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Guest-on-shared-host: the baked headers carry the tunnel binding token.
+
+    On a shared/externally-owned host the SP bearer has no user grant on the
+    guest's conversation, so the hook's POST to
+    ``/v1/sessions/{id}/policies/evaluate`` 404s and the hook FAILS CLOSED —
+    blocking every tool call. Attaching X-Omnigent-Runner-Tunnel-Token (gated
+    on RUNNER_PREFER_BINDING_TOKEN_MINT) lets the server's runner self-access
+    check authorize the evaluate. The evaluate route already reads this header
+    (see sessions.py evaluate_policy).
+    """
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    monkeypatch.setattr(
+        entry, "_make_auth_token_factory", lambda *, server_url=None: lambda: "tok"
+    )
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr(entry, "_runner_tunnel_binding_token_from_env", lambda: "bind-xyz")
+    monkeypatch.setenv(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR, "1")
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "https://acme.databricks.com", "conv_guest", "/path/hook.py"
+    )
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("export _OMNIGENT_AUTH_HEADERS=")
+    )
+    assert RUNNER_TUNNEL_TOKEN_HEADER in line
+    assert "bind-xyz" in line
+    assert "Bearer tok" in line  # SP bearer still present alongside
+
+
+def test_policy_hook_wrapper_no_tunnel_token_on_own_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Own-host (flag unset): no tunnel token baked — SP bearer suffices."""
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+    from omnigent.runner.identity import (
+        RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    monkeypatch.setattr(
+        entry, "_make_auth_token_factory", lambda *, server_url=None: lambda: "tok"
+    )
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: None)
+    monkeypatch.setattr(entry, "_runner_tunnel_binding_token_from_env", lambda: "bind-xyz")
+    monkeypatch.delenv(RUNNER_PREFER_BINDING_TOKEN_MINT_ENV_VAR, raising=False)
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "https://acme.databricks.com", "conv_own", "/path/hook.py"
+    )
+    assert RUNNER_TUNNEL_TOKEN_HEADER not in script
+
+
 def test_policy_hook_wrapper_script_omits_auth_when_unauthenticated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -25,6 +25,7 @@ from fastapi import Request
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
@@ -34,6 +35,12 @@ from omnigent.server.permissions import (
     check_session_access,
     resolved_allows,
     resolved_level,
+)
+from omnigent.server.runner_capabilities import (
+    RunnerAction,
+    RunnerPrincipal,
+    authenticate_runner,
+    runner_allows,
 )
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -284,6 +291,7 @@ def _require_access_and_level_sync(
     """
     if permission_store is None:
         return SessionAccess(level=None, conversation=None)
+
     if user_id is None:
         raise OmnigentError(
             "Authentication required",
@@ -381,6 +389,123 @@ async def require_access_and_level(
         required_level,
         permission_store,
         conversation_store,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class RequestAuth:
+    """Result of authorizing a request via runner capability or human permission.
+
+    Returned by :func:`authorize_runner_or_user`. When the caller is a
+    runner, ``runner_principal`` is set and ``user_id``/``level`` are
+    ``None``. When the caller is a human, ``user_id`` and ``level`` are
+    set and ``runner_principal`` is ``None``.
+
+    :param user_id: Authenticated human identity, or ``None`` for runner.
+    :param runner_principal: Non-human runner principal, or ``None`` for human.
+    :param level: Human permission level for UI display, or ``None`` for runner.
+    :param conversation: The fetched conversation, reusable by the route.
+    """
+
+    user_id: str | None
+    runner_principal: RunnerPrincipal | None
+    level: int | None
+    conversation: Conversation | None
+
+    @property
+    def is_runner(self) -> bool:
+        """``True`` when this request was authenticated as a runner."""
+        return self.runner_principal is not None
+
+
+def _authorize_runner_or_user_sync(
+    request: Request,
+    conversation_id: str,
+    action: RunnerAction,
+    required_level: int,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+    user_id: str | None = None,
+) -> RequestAuth:
+    """Synchronous core of :func:`authorize_runner_or_user`.
+
+    Tries runner capability auth first; on success returns a runner
+    context without a human identity. Falls through to human permission
+    auth on any runner failure (missing, blank, mismatched, or
+    unauthorized token).
+    """
+    token = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+    if token:
+        principal = authenticate_runner(token, conversation_id, conversation_store)
+        if principal is not None and runner_allows(principal, conversation_id, action):
+            conv = conversation_store.get_conversation(conversation_id)
+            return RequestAuth(
+                user_id=None,
+                runner_principal=principal,
+                level=None,
+                conversation=conv,
+            )
+
+    if user_id is None:
+        user_id = get_user_id(request, auth_provider)
+    access = _require_access_and_level_sync(
+        user_id, conversation_id, required_level, permission_store, conversation_store
+    )
+    return RequestAuth(
+        user_id=user_id,
+        runner_principal=None,
+        level=access.level,
+        conversation=access.conversation,
+    )
+
+
+async def authorize_runner_or_user(
+    request: Request,
+    conversation_id: str,
+    action: RunnerAction,
+    required_level: int,
+    auth_provider: AuthProvider | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+    user_id: str | None = None,
+) -> RequestAuth:
+    """Authorize a request via runner capability or human permission.
+
+    Resolves a :class:`RunnerPrincipal` from the binding-token header
+    first. If the token matches the conversation's current runner and the
+    action is on the allow-list, the request is authorized as a runner
+    with no human identity. Otherwise the request falls through to the
+    normal human permission check (:func:`require_access_and_level`).
+
+    Routes pass the :class:`RunnerAction` that matches their callback
+    class; the action is never derived from client input. A runner token
+    that is missing, blank, mismatched, or unauthorized for the declared
+    action falls through to human auth — it does not short-circuit a 401.
+
+    :param request: The incoming FastAPI request (carries the token header).
+    :param conversation_id: Target session identifier from the route.
+    :param action: Runner action declared by the route, e.g.
+        :attr:`RunnerAction.READ_SESSION`.
+    :param required_level: Minimum human permission level needed as a
+        fallback, e.g. :data:`LEVEL_READ`.
+    :param auth_provider: Auth provider, or ``None`` if auth is disabled.
+    :param permission_store: Permission store, or ``None`` if disabled.
+    :param conversation_store: Conversation store for runner-ID comparison.
+    :returns: A :class:`RequestAuth` with either a runner principal or a
+        human permission level.
+    :raises OmnigentError: 401/403/404 from the human auth fallback.
+    """
+    return await asyncio.to_thread(
+        _authorize_runner_or_user_sync,
+        request,
+        conversation_id,
+        action,
+        required_level,
+        auth_provider,
+        permission_store,
+        conversation_store,
+        user_id,
     )
 
 
