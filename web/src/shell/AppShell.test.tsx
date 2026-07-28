@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -531,6 +531,106 @@ describe("AppShell header", () => {
     renderShell("/c/conv_terminal");
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
+  });
+});
+
+describe("AppShell browser design-mode submit", () => {
+  it("queues a browser element request while the conversation is running", () => {
+    mockConversations([{ id: "conv_browser", permission_level: 4 }]);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "agent_browser", name: "browser-agent", description: "" } as Agent,
+    } as ReturnType<typeof useSessionAgent>);
+
+    let submit:
+      | ((payload: {
+          conversationId?: string;
+          id?: number;
+          element?: { tag?: string; text?: string };
+          prompt?: string;
+        }) => void)
+      | undefined;
+    let select:
+      | ((payload: { conversationId?: string; screenshot?: string | null }) => void)
+      | undefined;
+    const signalResult = vi.fn().mockResolvedValue({ ok: true });
+    const desktop = {
+      kind: "electron",
+      browserOpenOrNavigate: vi.fn(),
+      onBrowserElementSelected: vi.fn((callback) => {
+        select = callback;
+        return vi.fn();
+      }),
+      onBrowserElementPromptSubmit: vi.fn((callback) => {
+        submit = callback;
+        return vi.fn();
+      }),
+      onBrowserElementPromptDismiss: vi.fn(() => vi.fn()),
+      browserSignalDesignResult: signalResult,
+    };
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: desktop,
+    });
+
+    const originalSend = useChatStore.getState().send;
+    const send = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_browser",
+      boundAgentId: "agent_browser",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [],
+      send,
+    });
+
+    try {
+      renderShell("/c/conv_browser");
+      expect(submit).toBeTypeOf("function");
+
+      act(() => {
+        select?.({
+          conversationId: "conv_browser",
+          screenshot: "data:image/png;base64,cG5n",
+        });
+        submit?.({
+          conversationId: "conv_browser",
+          id: 7,
+          element: { tag: "button", text: "Save" },
+          prompt: "Make this button larger",
+        });
+      });
+
+      const queued = useChatStore.getState().queuedMessages;
+      expect(queued).toHaveLength(1);
+      expect(queued[0]).toEqual(
+        expect.objectContaining({
+          conversationId: "conv_browser",
+          agentId: "agent_browser",
+        }),
+      );
+      expect(queued[0]!.text).toContain("Make this button larger");
+      expect(queued[0]!.text).toContain("Element: <button>");
+      expect(queued[0]!.files).toHaveLength(1);
+      expect(queued[0]!.files?.[0]).toEqual(
+        expect.objectContaining({ name: "design-element-7.png", type: "image/png" }),
+      );
+      expect(send).not.toHaveBeenCalled();
+      expect(signalResult).toHaveBeenCalledWith("conv_browser", {
+        id: 7,
+        ok: true,
+        message: "Queued. Use Steer now to send it immediately.",
+      });
+    } finally {
+      useChatStore.setState({
+        conversationId: null,
+        boundAgentId: null,
+        status: "idle",
+        sessionStatus: "idle",
+        send: originalSend,
+        queuedMessages: [],
+      });
+      Reflect.deleteProperty(window, "omnigentDesktop");
+    }
   });
 });
 

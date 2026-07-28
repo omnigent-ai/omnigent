@@ -62,7 +62,7 @@ import { isCodexNativeSession } from "@/lib/codexPlanMode";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
-import { useChatStore } from "@/store/chatStore";
+import { shouldQueueMessage, useChatStore } from "@/store/chatStore";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { ChatHeader } from "./ChatHeader";
@@ -569,8 +569,8 @@ export function AppShell() {
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted
   // shell, not BrowserPane. On submit: build the `[Design Mode — …]` message,
-  // attach the cropped screenshot, send via the NORMAL chat path (no backend
-  // route), then signal the result back for green/red. Dismiss is a no-op.
+  // attach the cropped screenshot, then use the same queue-or-send policy as
+  // the composer. Dismiss is a no-op.
   // Routes to the conversation's own bound agent (the picked element belongs to
   // the page it drives). The screenshot arrives on the earlier element-selected
   // event, so we stash the latest per conversation and pair it at submit time.
@@ -631,14 +631,24 @@ export function AppShell() {
         const text = buildDesignModePrompt(payload.element, payload.prompt);
         const shot = designShotRef.current.get(cid);
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
-        void useChatStore
-          .getState()
-          .send(text, boundAgentId, file ? [file] : undefined)
-          .then(() => signal(true, "Sent to agent."))
-          .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
-        // Clear the stashed screenshot so a later submit without a fresh pick
-        // doesn't reuse a stale crop.
+        const files = file ? [file] : undefined;
+        // The File now owns the screenshot bytes; don't let a later submit
+        // reuse this crop even if the owning session changed meanwhile.
         designShotRef.current.delete(cid);
+        const chat = useChatStore.getState();
+        if (chat.conversationId !== cid) {
+          signal(false, "This browser session is no longer active.");
+          return;
+        }
+        if (shouldQueueMessage(cid, chat.status, chat.sessionStatus, chat.queuedMessages)) {
+          chat.enqueueMessageForConversation(cid, text, boundAgentId, files);
+          signal(true, "Queued. Use Steer now to send it immediately.");
+        } else {
+          void chat
+            .send(text, boundAgentId, files)
+            .then(() => signal(true, "Sent to agent."))
+            .catch((err: unknown) => signal(false, `Send failed: ${String(err)}`));
+        }
       } catch (err) {
         signal(false, `Error: ${String(err)}`);
       }

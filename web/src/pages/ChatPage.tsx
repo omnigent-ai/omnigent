@@ -104,6 +104,7 @@ import {
   type PendingInitialPrompt,
   type PendingUserMessage,
   type QueuedMessage,
+  shouldQueueMessage,
   useChatStore,
 } from "@/store/chatStore";
 import { isNativeTerminalSession, nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
@@ -500,10 +501,7 @@ export function shouldQueueSend(
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
 ): boolean {
-  if (conversationId === null) return false;
-  const isBusy = status === "streaming" || sessionStatus === "running";
-  const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  return isBusy || hasQueued;
+  return shouldQueueMessage(conversationId, status, sessionStatus, queuedMessages);
 }
 
 // Author labels render only in a shared session; ChatPage provides the
