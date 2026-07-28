@@ -1273,6 +1273,7 @@ def test_kimi_no_provider_emits_no_gateway_vars(config_home: Path) -> None:
 
     env = _build_kimi_spawn_env(spec, cwd=None)
 
+    assert "HARNESS_KIMI_MODEL" not in env
     assert "HARNESS_KIMI_GATEWAY_BASE_URL" not in env
     assert "HARNESS_KIMI_GATEWAY_API_KEY" not in env
     assert "HARNESS_KIMI_GATEWAY_PROVIDER" not in env

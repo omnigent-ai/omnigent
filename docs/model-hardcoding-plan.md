@@ -171,3 +171,9 @@ prefilling a source-controlled model pin.
 The same policy supplies the final runtime fallback for key, gateway, and local
 providers. Explicit agent and provider defaults still win; without either,
 runtime discovery fails with configuration guidance when no catalog is available.
+
+## Kimi Example Default
+
+The Kimi launcher example declares only the harness. With no explicit
+`--model` or session override, Omnigent omits `HARNESS_KIMI_MODEL` and lets the
+Kimi CLI use the default from its own provider configuration.
