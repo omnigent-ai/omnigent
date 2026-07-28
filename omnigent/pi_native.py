@@ -86,15 +86,14 @@ def pi_native_model_options(
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> list[dict[str, Any]]:
     """Return the models Pi itself reports as available on this machine."""
-    launch_env = dict(os.environ if env is None else env)
     try:
-        executable = resolve_pi_executable(env=launch_env)
+        executable = resolve_pi_executable(env=env)
     except click.ClickException:
         return []
     try:
         result = run(
             [executable, "--list-models"],
-            env=launch_env,
+            env=dict(env) if env is not None else None,
             capture_output=True,
             text=True,
             timeout=15,
@@ -105,8 +104,8 @@ def pi_native_model_options(
     if result.returncode != 0:
         return []
 
-    configured_agent_dir = launch_env.get("PI_CODING_AGENT_DIR", "").strip()
-    home = Path(launch_env.get("HOME", str(Path.home())))
+    configured_agent_dir = env.get("PI_CODING_AGENT_DIR", "").strip() if env else ""
+    home = Path(env.get("HOME", str(Path.home()))) if env else Path.home()
     default = _pi_default_model_selection(
         Path(configured_agent_dir) if configured_agent_dir else home / ".pi" / "agent"
     )
