@@ -1526,10 +1526,6 @@ async def _execute_subagent_tool(
         _runner_app._session_inboxes_ref.setdefault(conversation_id, session_inbox)
     elif conversation_id not in _runner_app._session_inboxes_ref:
         return "Error: sys_session_send requires parent session inbox"
-    dispatch_created_by = await _session_turn_actor(
-        server_client=server_client,
-        conversation_id=conversation_id,
-    )
 
     try:
         model = _subagent_model_from_args(args)
@@ -1590,6 +1586,10 @@ async def _execute_subagent_tool(
                 "existing session. Re-send without 'cost_budget' to continue "
                 f"session {target_session_id!r}."
             )
+        dispatch_created_by = await _session_turn_actor(
+            server_client=server_client,
+            conversation_id=conversation_id,
+        )
         return await _send_to_existing_session(
             target_session_id,
             message,
@@ -1610,6 +1610,11 @@ async def _execute_subagent_tool(
     # Verify the sub-agent exists in the parent spec.
     if not _has_subagent(sub_agent_name, agent_spec):
         return f"Error: sub-agent {sub_agent_name!r} not found in agent spec"
+
+    dispatch_created_by = await _session_turn_actor(
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
 
     # Use the PARENT's agent_id — inline sub-agents are part of
     # the same bundle, not separately registered. The runner
