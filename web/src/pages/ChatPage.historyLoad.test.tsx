@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { MAX_INITIAL_PAGES } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
-import { HistoryAutoLoader, JumpToTopButton } from "./ChatPage";
+import { HistoryAutoLoader, JumpToTopButton, LatestTurnSpacer } from "./ChatPage";
 
 const stickContext = vi.hoisted(() => ({
   scrollRef: { current: null as HTMLElement | null },
@@ -118,6 +118,27 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps loading after reaching the top during an in-flight fetch", () => {
+    const loadMoreHistory = vi.fn(async () => {});
+    useChatStore.setState({ loadMoreHistory });
+    const scrollRoot = document.createElement("div");
+    const metrics = { scrollTop: 299, scrollHeight: 1000 };
+    setScrollMetrics(scrollRoot, metrics);
+    stickContext.scrollRef.current = scrollRoot;
+
+    const view = render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    fireEvent.scroll(scrollRoot);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
+    metrics.scrollTop = 0;
+    fireEvent.scroll(scrollRoot);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+
+    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
+    expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+  });
+
   it("loads to the second real user prompt even when the viewport already scrolls", async () => {
     const loadMoreHistory = vi.fn(async () => {});
     useChatStore.setState({
@@ -142,85 +163,42 @@ describe("HistoryAutoLoader", () => {
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
   });
 
-  it("caps the prompt search but keeps filling an underflowing viewport", async () => {
+  it("caps the prompt search at the page cap", async () => {
     const loadMoreHistory = vi.fn(async () => {});
     useChatStore.setState({ blocks: [userBlock("latest")], loadMoreHistory });
 
-    const holder: { cb: (() => void) | null } = { cb: null };
-    class StubResizeObserver {
-      constructor(cb: () => void) {
-        holder.cb = cb;
-      }
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-    }
-    vi.stubGlobal("ResizeObserver", StubResizeObserver);
-
     const scrollRoot = document.createElement("div");
-    const metrics = { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 };
-    setScrollMetrics(scrollRoot, metrics);
+    setScrollMetrics(scrollRoot, { scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
     const view = render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
     expect(loadMoreHistory).toHaveBeenCalledTimes(1);
 
-    // The newest page counts as page one. Settle seven older pages without
-    // finding another prompt; the semantic search must then stop at the cap.
-    for (let page = 2; page < MAX_INITIAL_PAGES; page++) {
+    // The newest page counts as page one. Settle older pages without finding a
+    // second prompt; the semantic search must stop at the cap — reachability is
+    // no longer this loop's job (the spacer keeps the pane scrollable).
+    for (let page = 2; page <= MAX_INITIAL_PAGES; page++) {
       view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
       view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
     }
-    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={true} />);
-    view.rerender(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
 
     await waitFor(() => expect(useChatStore.getState().loadingInitialWindow).toBe(false));
+    // MAX_INITIAL_PAGES total fetches: the initial page plus (cap − 1) more.
     expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES - 1);
-
-    // Once the viewport underflows, reachability wins over the prompt cap.
-    metrics.clientHeight = 1200;
-    act(() => holder.cb?.());
-    expect(loadMoreHistory).toHaveBeenCalledTimes(MAX_INITIAL_PAGES);
-    expect(useChatStore.getState().loadingInitialWindow).toBe(true);
   });
 
-  it("auto-loads when the window is too short to scroll", () => {
+  it("does not page a short window for viewport fill (the spacer handles reachability)", () => {
     const loadMoreHistory = vi.fn(async () => {});
-    useChatStore.setState({ loadMoreHistory });
+    // Two prompts already loaded → prompt boundary met. A window too short to
+    // scroll must NOT trigger a fetch: the spacer keeps it reachable instead.
+    useChatStore.setState({ blocks: [userBlock("user_1"), userBlock("user_2")], loadMoreHistory });
     const scrollRoot = document.createElement("div");
-    // Content shorter than the viewport → no scrollbar, scroll trigger can't fire.
     setScrollMetrics(scrollRoot, { scrollTop: 0, scrollHeight: 100, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
 
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not count the transient spinner toward viewport fill", () => {
-    const loadMoreHistory = vi.fn(async () => {});
-    useChatStore.setState({ loadMoreHistory });
-    const scrollRoot = document.createElement("div");
-    const spinner = document.createElement("div");
-    spinner.dataset.initialHistorySpinner = "";
-    vi.spyOn(spinner, "getBoundingClientRect").mockReturnValue({
-      x: 0,
-      y: 0,
-      top: 0,
-      right: 0,
-      bottom: 30,
-      left: 0,
-      width: 0,
-      height: 30,
-      toJSON: () => ({}),
-    });
-    scrollRoot.append(spinner);
-    setScrollMetrics(scrollRoot, { scrollTop: 20, scrollHeight: 520, clientHeight: 500 });
-    stickContext.scrollRef.current = scrollRoot;
-
-    render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
-
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    expect(loadMoreHistory).not.toHaveBeenCalled();
   });
 
   it("does not auto-load a short window once history is exhausted", () => {
@@ -234,11 +212,48 @@ describe("HistoryAutoLoader", () => {
 
     expect(loadMoreHistory).not.toHaveBeenCalled();
   });
+});
 
-  it("re-fills when the viewport grows so content no longer overflows", () => {
-    const loadMoreHistory = vi.fn(async () => {});
-    useChatStore.setState({ loadMoreHistory });
+describe("LatestTurnSpacer", () => {
+  beforeEach(() => {
+    stickContext.scrollRef.current = null;
+    useChatStore.setState({ blocks: [], historyGeneration: 0 });
+  });
 
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  function rect(top: number): DOMRect {
+    return {
+      top,
+      bottom: top,
+      height: 0,
+      left: 0,
+      right: 0,
+      width: 0,
+      x: 0,
+      y: top,
+      toJSON: () => ({}),
+    };
+  }
+
+  /**
+   * Render the spacer, wire up an optional anchor inside the scroll container,
+   * and pin both rects, then drive one measure via the captured ResizeObserver
+   * callback (so it runs after the rects are in place). Anchors match the same
+   * selectors the component uses: `[data-role="user"]` for a real prompt,
+   * `[data-testid="assistant-text-section"]` for assistant text.
+   *
+   * @returns the height (px) the component set on its spacer div.
+   */
+  function measureSpacer(opts: {
+    clientHeight: number;
+    anchorTop: number;
+    spacerTop: number;
+    anchor: "user" | "text" | "none";
+  }): number {
     const holder: { cb: (() => void) | null } = { cb: null };
     class StubResizeObserver {
       constructor(cb: () => void) {
@@ -251,19 +266,56 @@ describe("HistoryAutoLoader", () => {
     vi.stubGlobal("ResizeObserver", StubResizeObserver);
 
     const scrollRoot = document.createElement("div");
-    // Content overflows the viewport at first — scrollbar present, fill dormant.
-    const metrics = { scrollTop: 600, scrollHeight: 1000, clientHeight: 500 };
-    setScrollMetrics(scrollRoot, metrics);
+    setScrollMetrics(scrollRoot, {
+      scrollTop: 0,
+      scrollHeight: 0,
+      clientHeight: opts.clientHeight,
+    });
     stickContext.scrollRef.current = scrollRoot;
 
-    render(<HistoryAutoLoader hasMoreHistory={true} loadingMoreHistory={false} />);
-    expect(loadMoreHistory).not.toHaveBeenCalled();
+    if (opts.anchor !== "none") {
+      const anchor = document.createElement("div");
+      if (opts.anchor === "user") anchor.dataset.role = "user";
+      else anchor.dataset.testid = "assistant-text-section";
+      vi.spyOn(anchor, "getBoundingClientRect").mockReturnValue(rect(opts.anchorTop));
+      scrollRoot.append(anchor);
+    }
 
-    // Window grows: content no longer overflows, so the resize re-check pages.
-    metrics.clientHeight = 1200;
-    holder.cb?.();
+    const { container } = render(<LatestTurnSpacer />);
+    const spacer = container.querySelector<HTMLElement>("div[aria-hidden]")!;
+    vi.spyOn(spacer, "getBoundingClientRect").mockReturnValue(rect(opts.spacerTop));
+    // Re-measure now that the rects are pinned (mount ran against jsdom's 0s).
+    act(() => holder.cb?.());
 
-    expect(loadMoreHistory).toHaveBeenCalledTimes(1);
+    return parseFloat(spacer.style.height || "0");
+  }
+
+  it("pads a short reply so the anchor prompt pins to the top", () => {
+    // anchor→end = 100px content, viewport 500 → spacer = 500 − 100 − 88 = 312.
+    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 100, anchor: "user" })).toBe(
+      312,
+    );
+  });
+
+  it("collapses to zero once the reply alone exceeds the viewport", () => {
+    // Reply taller than the viewport (spacer top far below the anchor):
+    // 500 − 900 − 88 < 0, clamped to 0.
+    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 900, anchor: "user" })).toBe(
+      0,
+    );
+  });
+
+  it("anchors to the last assistant text when no user prompt is present", () => {
+    // 500 − 50 − 88 = 362.
+    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 50, anchor: "text" })).toBe(
+      362,
+    );
+  });
+
+  it("adds no padding when there is no anchor (pure tool output)", () => {
+    expect(measureSpacer({ clientHeight: 500, anchorTop: 0, spacerTop: 0, anchor: "none" })).toBe(
+      0,
+    );
   });
 });
 

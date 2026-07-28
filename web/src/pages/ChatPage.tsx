@@ -1753,10 +1753,7 @@ function MainAgentSurface({
               <>
                 {/* The newest page renders first; older initial pages arrive here. */}
                 {loadingInitialWindow && (
-                  <div
-                    data-initial-history-spinner
-                    className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm"
-                  >
+                  <div className="flex items-center justify-center gap-2 py-2 text-muted-foreground text-sm">
                     <Loader2Icon className="size-4 animate-spin" aria-hidden />
                     Loading earlier messages…
                   </div>
@@ -1805,6 +1802,11 @@ function MainAgentSurface({
                     Working… shimmer — it is strictly more specific about why
                     the turn hasn't produced output yet. */}
                 <McpStartupIndicator />
+                {/* Pins the latest turn's anchor to the top of the viewport
+                    (question at top, reply grows below) and keeps the pane
+                    scrollable so older history stays reachable. Last child so
+                    it measures everything above it. */}
+                <LatestTurnSpacer />
               </>
             )}
           </ConversationContent>
@@ -2116,9 +2118,11 @@ function PreserveScrollDistanceOnResize() {
 }
 
 /**
- * Builds the initial history window after first paint, then loads on scroll-up.
- * Viewport filling remains uncapped so older history never becomes unreachable.
+ * Builds the initial history window after first paint, then keeps loading while
+ * the transcript remains near its top.
  */
+const HISTORY_LOAD_TOP_THRESHOLD_PX = 300;
+
 export function HistoryAutoLoader({
   hasMoreHistory,
   loadingMoreHistory,
@@ -2141,9 +2145,11 @@ export function HistoryAutoLoader({
     ),
   );
   const pagesFetchedRef = useRef(1);
+  const [isNearHistoryTop, setIsNearHistoryTop] = useState(false);
 
   useEffect(() => {
     pagesFetchedRef.current = 1;
+    setIsNearHistoryTop(false);
     useChatStore.setState({ loadingInitialWindow: false });
   }, [historyGeneration]);
 
@@ -2176,57 +2182,118 @@ export function HistoryAutoLoader({
   useEffect(() => {
     const el = ctx.scrollRef?.current;
     if (!el) return;
-    const handleScroll = () => {
-      if (el.scrollTop < 300 && hasMoreHistory && !loadingMoreHistory) {
-        loadOlderPreservingOffset();
-      }
-    };
+    const handleScroll = () => setIsNearHistoryTop(el.scrollTop < HISTORY_LOAD_TOP_THRESHOLD_PX);
     el.addEventListener("scroll", handleScroll, { passive: true });
     return () => el.removeEventListener("scroll", handleScroll);
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, loadOlderPreservingOffset]);
+  }, [ctx.scrollRef]);
 
-  // Continue until the prompt boundary is satisfied AND the viewport scrolls.
-  // The page cap is inside initialWindowComplete, so it never caps viewport fill.
-  const maybeBuildInitialWindow = useCallback(() => {
+  // Keep paging while the pane remains near the top. This re-runs when an
+  // in-flight request settles, so arriving at the top during that request does
+  // not require another scroll gesture to fetch the following page.
+  useEffect(() => {
     const el = ctx.scrollRef?.current;
-    if (!el || loadingMoreHistory || useChatStore.getState().loadingMoreHistory) return;
-    if (!hasMoreHistory) {
-      useChatStore.setState({ loadingInitialWindow: false });
-      return;
-    }
-    const needsPromptBoundary = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
-    // The transient spinner must not be what creates the scrollbar.
-    const spinnerHeight =
-      el.querySelector<HTMLElement>("[data-initial-history-spinner]")?.getBoundingClientRect()
-        .height ?? 0;
-    const needsViewportFill = el.scrollHeight - spinnerHeight <= el.clientHeight;
-    if (!needsPromptBoundary && !needsViewportFill) {
+    if (!isNearHistoryTop || !el || el.scrollTop >= HISTORY_LOAD_TOP_THRESHOLD_PX) return;
+    loadOlderPreservingOffset();
+  }, [ctx.scrollRef, isNearHistoryTop, loadOlderPreservingOffset]);
+
+  // Page older history until the previous-prompt boundary is reached (or the
+  // page cap trips). Reachability is no longer this loop's concern: the
+  // <LatestTurnSpacer> keeps the transcript taller than its viewport whenever
+  // content sits above the anchor, so scroll-up stays available even when the
+  // loaded turns collapse too short to overflow on their own — no viewport-fill
+  // fetch loop needed.
+  const maybeBuildInitialWindow = useCallback(() => {
+    if (loadingMoreHistory || useChatStore.getState().loadingMoreHistory) return;
+    if (!hasMoreHistory || initialWindowComplete(userPromptCount, pagesFetchedRef.current)) {
       useChatStore.setState({ loadingInitialWindow: false });
       return;
     }
     pagesFetchedRef.current += 1;
     useChatStore.setState({ loadingInitialWindow: true });
     void useChatStore.getState().loadMoreHistory();
-  }, [ctx.scrollRef, hasMoreHistory, loadingMoreHistory, userPromptCount]);
+  }, [hasMoreHistory, loadingMoreHistory, userPromptCount]);
 
-  // Re-check after every prepend so layout can settle between requests.
+  // Re-check after every prepend so the next page loads once state settles.
   useEffect(() => {
     maybeBuildInitialWindow();
   }, [maybeBuildInitialWindow]);
 
-  // Re-check when the viewport grows (window resize, side panel close): a
-  // previously-scrollable window can stop overflowing, removing the scrollbar
-  // and stranding older history with nothing left to trigger a fetch.
-  useEffect(() => {
-    const el = ctx.scrollRef?.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => maybeBuildInitialWindow());
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [ctx.scrollRef, maybeBuildInitialWindow]);
-
-  // No visible control — history loads purely on scroll-up / viewport fill.
+  // No visible control — history loads purely on scroll-up / the initial-window
+  // build above.
   return null;
+}
+
+/** Top inset for a pinned anchor: 8px beyond the fade's fully opaque edge. */
+const PINNED_ANCHOR_TOP_GAP_PX = 88;
+
+/**
+ * Trailing spacer that pins the latest turn's anchor to the top of the
+ * viewport — the newest real user prompt, or (on a page deep in a long tool
+ * chain with no prompt yet) the newest assistant text output — leaving the
+ * reply free to grow below it. As a side effect it keeps the transcript taller
+ * than its scroll container whenever any content sits above the anchor, so
+ * older history stays reachable by scroll-up without a viewport-fill loop.
+ *
+ * Height = clientHeight − (anchor-top → content-bottom) − top gap, clamped to
+ * ≥ 0: a short reply leaves empty space below (anchor stays pinned at top);
+ * once the reply alone exceeds the viewport the spacer collapses to 0 and
+ * normal stick-to-bottom following resumes. The "content-bottom" edge is the
+ * spacer's own top, whose position is fixed by the content above it and so is
+ * independent of the height we set — the measurement can't feed back on itself.
+ */
+export function LatestTurnSpacer() {
+  const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
+    scrollRef: React.RefObject<HTMLElement>;
+  };
+  // Structural changes (new turn, prepend, conversation switch) flip block
+  // count; a streaming reply grows height without changing it, so the
+  // ResizeObserver below covers that (plus viewport resize and image/markdown
+  // reflow). Keying the measure on both keeps re-renders off the per-frame path.
+  const blockCount = useChatStore((s) => s.blocks.length);
+  const spacerRef = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState(0);
+
+  const measure = useCallback(() => {
+    const scrollEl = ctx.scrollRef?.current;
+    const spacerEl = spacerRef.current;
+    if (!scrollEl || !spacerEl) return;
+    // Newest real user prompt, else newest assistant text output. System
+    // markers render without data-role="user", so they're correctly skipped.
+    const users = scrollEl.querySelectorAll<HTMLElement>('[data-role="user"]');
+    const texts = scrollEl.querySelectorAll<HTMLElement>('[data-testid="assistant-text-section"]');
+    const anchor =
+      users.length > 0
+        ? users[users.length - 1]!
+        : texts.length > 0
+          ? texts[texts.length - 1]!
+          : null;
+    if (!anchor) {
+      setHeight(0);
+      return;
+    }
+    // rect diffs are scroll-invariant (both edges shift together), and the
+    // spacer's top is fixed by the content above it, so this is stable across
+    // the height we're about to set — it converges in one pass.
+    const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
+    const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
+    setHeight((prev) => (Math.abs(prev - next) < 1 ? prev : next));
+  }, [ctx.scrollRef]);
+
+  useLayoutEffect(() => {
+    measure();
+  }, [measure, blockCount]);
+
+  useEffect(() => {
+    const scrollEl = ctx.scrollRef?.current;
+    const contentEl = spacerRef.current?.parentElement;
+    if (!scrollEl || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(scrollEl); // viewport (clientHeight) changes
+    if (contentEl) observer.observe(contentEl); // streaming / reflow growth
+    return () => observer.disconnect();
+  }, [ctx.scrollRef, measure]);
+
+  return <div ref={spacerRef} aria-hidden style={{ height, flexShrink: 0 }} />;
 }
 
 /**
