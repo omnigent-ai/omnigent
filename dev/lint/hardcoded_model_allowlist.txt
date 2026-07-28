@@ -49,9 +49,6 @@ omnigent/model_catalog.py claude-sonnet-5 1
 omnigent/model_catalog.py gpt-5.4 1
 omnigent/model_catalog.py gpt-5.4-mini 1
 omnigent/model_catalog.py gpt-5.5 1
-omnigent/onboarding/providers/__init__.py claude-opus-4-8 1
-omnigent/onboarding/providers/__init__.py gpt-5.5 1
-omnigent/onboarding/providers/__init__.py kimi-k2.6 1
 omnigent/onboarding/wizard.py databricks-gpt-5-4 1
 omnigent/onboarding/wizard.py gpt-4o 1
 omnigent/policies/builtins/routing.py databricks-claude-opus-4-6 1

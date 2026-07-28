@@ -860,9 +860,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             wire_api = RESPONSES_WIRE_API if wire_choice == 0 else CHAT_WIRE_API
         # Default model per served surface. A gateway has NO catalog default,
         # so without a pin routing would fall back to a vendor model the
-        # gateway can't serve. The OpenAI surface pre-fills a broadly-served
-        # OSS default (moonshotai/kimi-k2.6, via the openrouter pin); the
-        # user can type any gateway model id.
+        # gateway can't serve. The OpenAI surface pre-fills the catalog's
+        # preferred broadly-served OSS model; the user can type any gateway
+        # model id.
         from omnigent.onboarding.providers import default_chat_model
 
         models: dict[str, str] = {}

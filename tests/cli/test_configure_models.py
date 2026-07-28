@@ -46,6 +46,7 @@ import yaml
 from click.testing import CliRunner
 
 from omnigent.cli import cli
+from omnigent.onboarding import providers as provider_catalog
 from omnigent.onboarding import secrets
 from omnigent.onboarding.configure_models import (
     add_menu_options,
@@ -134,6 +135,38 @@ def _harnesses_installed(monkeypatch):
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_logged_in",
         lambda family: True,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _catalog_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide deterministic live-catalog defaults for interactive setup tests."""
+    catalogs = {
+        "anthropic": {
+            "models": {
+                "claude-sonnet-4-6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openai": {
+            "models": {
+                "gpt-5.5": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "openrouter": {
+            "models": {
+                "moonshotai/kimi-k2.6": {"mode": "chat", "capabilities": {}},
+            }
+        },
+        "xai": {
+            "models": {
+                "grok-3": {"mode": "chat", "capabilities": {}},
+            }
+        },
+    }
+    monkeypatch.setattr(
+        provider_catalog,
+        "_fetch_provider_catalog",
+        lambda provider: catalogs.get(provider, {}),
     )
 
 

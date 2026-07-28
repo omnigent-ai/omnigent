@@ -431,22 +431,7 @@ _SPECIALTY_MODEL_TOKENS: tuple[str, ...] = (
 # flagship ``gpt-*`` is broadly accessible, so no steering is needed).
 _PREFERRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "anthropic": "sonnet",
-}
-
-# Explicit per-provider default-model pins. These win over the catalog's
-# dynamic rule so the out-of-box default is a specific, current model even
-# when the bundled catalog lags a new release (these ids may not be in the
-# catalog yet). The user can still pick another via ``configure harness`` /
-# ``/model``.
-_DEFAULT_MODEL_OVERRIDE: dict[str, str] = {
-    "anthropic": "claude-opus-4-8",
-    "openai": "gpt-5.5",
-    # OpenRouter (and the gateway add's OSS pre-fill) → a broadly-served OSS
-    # model rather than an OpenAI/Anthropic id.
-    "openrouter": "moonshotai/kimi-k2.6",
-    # xAI — pin the flagship so click.prompt(default=...) always has a value
-    # even when the catalog fetch is disabled (e.g. in tests).
-    "xai": "grok-3",
+    "openrouter": "kimi",
 }
 
 
@@ -474,28 +459,14 @@ def default_chat_model(
        actually use. Fall back to the newest remaining general-purpose model
        when no model matches the tier.
 
-    ``anthropic`` and ``openai`` carry an explicit pin
-    (:data:`_DEFAULT_MODEL_OVERRIDE`) that wins over steps 1-3, so the
-    out-of-box default is a specific current model (``claude-opus-4-8`` /
-    ``gpt-5.5``) even when the bundled catalog lags. Other providers follow
-    the dynamic rule above.
-
-    Explicit provider pins remain authoritative even when they are newer than
-    the catalog. ``allowed_models`` constrains only the dynamic catalog rule,
-    which lets callers apply family or routing compatibility before selection.
+    ``allowed_models`` constrains the catalog rule so callers can apply family
+    or routing compatibility before selection.
 
     :param provider: Provider name, e.g. ``"anthropic"`` or ``"openai"``.
-    :param allowed_models: Optional model ids eligible for dynamic selection.
-    :returns: The default model id, e.g. ``"claude-opus-4-8"`` or
-        ``"gpt-5.5"``, or ``None`` when the catalog has no chat model for
-        that provider (genuinely unknown provider).
+    :param allowed_models: Optional model ids eligible for selection.
+    :returns: The selected catalog model id, or ``None`` when the catalog has
+        no chat model for that provider.
     """
-    # An explicit pin wins over the dynamic catalog rule (and may name a
-    # model newer than the bundled catalog).
-    override = _DEFAULT_MODEL_OVERRIDE.get(provider)
-    if override is not None:
-        return override
-
     allowed = set(allowed_models) if allowed_models is not None else None
     general: list[str] = []
     for model in get_chat_models(provider):

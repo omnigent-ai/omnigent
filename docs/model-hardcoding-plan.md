@@ -160,3 +160,11 @@ Databricks OpenAI-family default from the provider catalog during bundle
 materialization. `--model` and `OMNIGENT_MODEL` remain higher-precedence explicit
 choices. If discovery is unavailable, the CLI asks for one of those explicit
 values instead of silently baking a release-specific model into the bundle.
+
+## Onboarding Defaults
+
+Provider setup derives its suggested default from the live catalog after
+excluding specialty modalities. Stable family preferences choose broadly
+accessible Anthropic and OpenRouter tiers without naming a release. When the
+catalog is unavailable, onboarding accepts an explicit value instead of
+prefilling a source-controlled model pin.
