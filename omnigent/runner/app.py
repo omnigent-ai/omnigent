@@ -1295,6 +1295,7 @@ async def _deliver_subagent_wake_post(
     :returns: ``True`` if a 2xx was confirmed, ``False`` if every attempt
         failed (transport error, timeout, or non-2xx response).
     """
+    attribution_created_by = created_by
     for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
         try:
             resp = await server_client.post(
@@ -1305,7 +1306,11 @@ async def _deliver_subagent_wake_post(
                         "role": "user",
                         "content": [{"type": "input_text", "text": notice}],
                     },
-                    **({"created_by": created_by} if created_by is not None else {}),
+                    **(
+                        {"created_by": attribution_created_by}
+                        if attribution_created_by is not None
+                        else {}
+                    ),
                 },
                 # The server gates this injected wake at the parent's REQUEST
                 # phase, which can PARK on a human ASK (e.g. session_cost_budget)
@@ -1324,6 +1329,18 @@ async def _deliver_subagent_wake_post(
             resp.raise_for_status()
             return True
         except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            if (
+                attribution_created_by is not None
+                and isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code == 403
+            ):
+                _logger.debug(
+                    "Sub-agent wake POST attribution rejected for parent=%s; "
+                    "retrying without actor",
+                    parent_id,
+                )
+                attribution_created_by = None
+                continue
             last_attempt = attempt >= _WAKE_POST_MAX_ATTEMPTS
             retryable = isinstance(exc, asyncio.TimeoutError) or _wake_post_is_retryable(exc)
             _logger.debug(

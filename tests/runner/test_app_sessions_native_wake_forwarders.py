@@ -166,6 +166,26 @@ async def test_wake_post_carries_dispatch_actor() -> None:
     assert client.calls[0].created_by == "bob@example.com"
 
 
+async def test_wake_post_retries_without_actor_when_attribution_is_rejected() -> None:
+    """A stale collaborator grant cannot permanently drop a parent wake."""
+    parent_id = "32561551610d43b39dc4e394b78ea89d"
+    client = _QueuedResponseServerClient(
+        [_wake_response(403, parent_id), _wake_response(200, parent_id)]
+    )
+
+    delivered = await runner_app_mod._deliver_subagent_wake_post(
+        client,  # type: ignore[arg-type]
+        parent_id,
+        "[System: worker completed]",
+        created_by="bob@example.com",
+    )
+
+    assert delivered is True
+    assert len(client.calls) == 2
+    assert client.calls[0].created_by == "bob@example.com"
+    assert client.calls[1].created_by is None
+
+
 async def test_wake_post_persistent_503_returns_failure(
     _no_wake_backoff: list[float],
 ) -> None:
