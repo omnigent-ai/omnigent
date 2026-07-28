@@ -36,6 +36,7 @@ MODEL_ID_RE = re.compile(
 )
 
 TEXT_EXTENSIONS = {".json", ".toml", ".yaml", ".yml", ".sh"}
+SOURCE_EXTENSIONS = {".py", *TEXT_EXTENSIONS}
 SCAN_ROOTS = (
     Path("omnigent"),
     Path("scripts"),
@@ -162,7 +163,11 @@ def _scan_text(path: Path) -> list[Hit]:
 
 def scan(path: Path) -> list[Hit]:
     """Return hardcoded model hits in ``path``."""
-    if not path.is_file() or any(part in SKIP_PARTS for part in path.parts):
+    if (
+        not path.is_file()
+        or path.suffix not in SOURCE_EXTENSIONS
+        or any(part in SKIP_PARTS for part in path.parts)
+    ):
         return []
     if path.suffix == ".py":
         return _scan_python(path)
@@ -180,7 +185,8 @@ def _iter_scannable_paths() -> list[Path]:
         path
         for raw_path in output.decode().split("\0")
         if raw_path
-        if (path := Path(raw_path)).suffix == ".py" or path.suffix in TEXT_EXTENSIONS
+        if (path := Path(raw_path)).suffix in SOURCE_EXTENSIONS
+        if not any(part in SKIP_PARTS for part in path.parts)
     ]
 
 
@@ -202,7 +208,12 @@ def _load_allowlist(path: Path = ALLOWLIST_PATH) -> Counter[tuple[str, str]]:
             raise ValueError(
                 f"{path}:{line_number}: duplicate baseline entry for {rel_path} {model}"
             )
-        allowed[key] = int(count_text)
+        try:
+            allowed[key] = int(count_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"{path}:{line_number}: count must be an integer, got {count_text!r}"
+            ) from exc
     return allowed
 
 

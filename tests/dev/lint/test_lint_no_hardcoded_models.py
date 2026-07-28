@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import re
+import subprocess
 from collections import Counter
 from pathlib import Path
 
 import pytest
+import yaml
 
 from dev.lint.lint_no_hardcoded_models import (
+    ALLOWLIST_PATH,
+    SCAN_ROOTS,
+    SOURCE_EXTENSIONS,
     Hit,
     _find_new_hits,
     _find_stale_allowances,
+    _iter_scannable_paths,
     _load_allowlist,
     scan,
 )
@@ -80,3 +87,39 @@ def test_load_allowlist_rejects_duplicate_path_model(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="duplicate baseline entry"):
         _load_allowlist(allowlist)
+
+
+def test_load_allowlist_reports_malformed_count_location(tmp_path: Path) -> None:
+    allowlist = tmp_path / "allowlist.txt"
+    allowlist.write_text("omnigent/example.py databricks-gpt-5-5 many\n")
+
+    with pytest.raises(ValueError) as error:
+        _load_allowlist(allowlist)
+
+    assert str(error.value) == f"{allowlist}:1: count must be an integer, got 'many'"
+
+
+def test_precommit_trigger_matches_scan_surface() -> None:
+    config = yaml.safe_load(Path(".pre-commit-config.yaml").read_text())
+    hook = next(
+        hook
+        for repo in config["repos"]
+        for hook in repo["hooks"]
+        if hook["id"] == "no-hardcoded-models"
+    )
+    files_pattern = re.compile(hook["files"])
+    exclude_pattern = re.compile(config["exclude"])
+    tracked_paths = {
+        Path(path) for path in subprocess.check_output(["git", "ls-files"]).decode().splitlines()
+    }
+    triggered_paths = {
+        path
+        for path in tracked_paths
+        if files_pattern.search(path.as_posix()) and not exclude_pattern.search(path.as_posix())
+    }
+    scanned_paths = set(_iter_scannable_paths()) | {ALLOWLIST_PATH}
+
+    assert triggered_paths == scanned_paths
+    for root in SCAN_ROOTS:
+        for extension in SOURCE_EXTENSIONS:
+            assert files_pattern.fullmatch(f"{root.as_posix()}/lint_probe{extension}")
