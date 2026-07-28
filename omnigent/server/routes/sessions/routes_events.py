@@ -218,6 +218,16 @@ def register_events_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        body_created_by = _attribution_user(body.created_by)
+        if body_created_by is not None:
+            await _require_access_and_level(
+                body_created_by,
+                session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+            )
+        created_by = body_created_by or _attribution_user(user_id)
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent
@@ -649,7 +659,7 @@ def register_events_routes(
                 conv,
                 body,
                 conversation_store,
-                created_by=_attribution_user(user_id),
+                created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
             )
             return {"queued": False, "item_id": item_id}
@@ -1113,7 +1123,7 @@ def register_events_routes(
                             conversation_store,
                             launch_attempt.error,
                             runner_router,
-                            created_by=_attribution_user(user_id),
+                            created_by=created_by,
                         )
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
@@ -1197,7 +1207,7 @@ def register_events_routes(
                     conversation_store,
                     offline_error,
                     runner_router,
-                    created_by=_attribution_user(user_id),
+                    created_by=created_by,
                 )
                 return {"queued": True, "item_id": item_id}
             # Raise so the Omnigent server doesn't persist an item the
@@ -1275,7 +1285,7 @@ def register_events_routes(
                 runner_client,
                 agent=_agent,
                 has_mcp_servers=_has_mcp_servers,
-                created_by=_attribution_user(user_id),
+                created_by=created_by,
             )
             if pending_background_title is not None:
                 pending_background_title.schedule()
@@ -1290,7 +1300,7 @@ def register_events_routes(
             file_store=file_store,
             artifact_store=artifact_store,
             has_mcp_servers=_has_mcp_servers,
-            created_by=_attribution_user(user_id),
+            created_by=created_by,
             runner_router=runner_router,
             native_terminal_ready=native_terminal_ready,
         )

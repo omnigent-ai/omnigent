@@ -2778,6 +2778,11 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         nonlocal create_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "bob@example.com"}},
+            )
         if (
             request.method == "GET"
             and request.url.path == "/v1/sessions/conv_parent/child_sessions"
@@ -2832,6 +2837,7 @@ async def test_sys_session_send_reuses_existing_child_session(
     assert payload["conversation_id"] == "conv_existing"
     assert payload["status"] == "launching"
     assert "continued ok" not in payload["message"]
+    assert event_posts[0]["created_by"] == "bob@example.com"
     assert event_posts[0]["data"]["content"][0]["text"] == "continue"
     assert published[-1]["type"] == "session.child_session.updated"
     assert published[-1]["child"]["current_task_status"] == "launching"

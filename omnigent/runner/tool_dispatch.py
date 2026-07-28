@@ -212,6 +212,7 @@ _ASYNC_INBOX_TOOLS = frozenset(
 # continues child sessions. The read-only observability helpers
 # (peek/list/close) dispatch via ``_SESSION_QUERY_TOOLS`` below.
 _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
+_TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 # Priority 5f.0a: Session-create write. ``sys_session_create`` spawns a
 # child session (parent forced to the caller) from an existing agent_id
@@ -981,6 +982,25 @@ def _subagent_message_from_args(args: dict[str, Any]) -> str | None:
     return None
 
 
+async def _session_turn_actor(
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> str | None:
+    """Return the parent turn actor label for runner-originated callbacks."""
+    try:
+        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    if resp.status_code != 200:
+        return None
+    labels = resp.json().get("labels")
+    if not isinstance(labels, dict):
+        return None
+    actor = labels.get(_TURN_ACTOR_LABEL)
+    return actor if isinstance(actor, str) and actor else None
+
+
 def _subagent_model_from_args(args: dict[str, Any]) -> str | None:
     """
     Extract and validate the per-dispatch model from ``sys_session_send`` args.
@@ -1463,6 +1483,10 @@ async def _execute_subagent_tool(
         _runner_app._session_inboxes_ref.setdefault(conversation_id, session_inbox)
     elif conversation_id not in _runner_app._session_inboxes_ref:
         return "Error: sys_session_send requires parent session inbox"
+    dispatch_created_by = await _session_turn_actor(
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
 
     try:
         model = _subagent_model_from_args(args)
@@ -1529,6 +1553,7 @@ async def _execute_subagent_tool(
             server_client=server_client,
             conversation_id=conversation_id,
             publish_event=publish_event,
+            created_by=dispatch_created_by,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
@@ -1817,6 +1842,7 @@ async def _execute_subagent_tool(
         agent=str(sub_agent_name),
         title=session_name,
         wrapper_label=child_wrapper_label,
+        created_by=dispatch_created_by,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -1862,6 +1888,7 @@ async def _execute_subagent_tool(
                     "role": "user",
                     "content": message_content,
                 },
+                **({"created_by": dispatch_created_by} if dispatch_created_by is not None else {}),
             },
             # This message is gated at the recipient's REQUEST phase, which can
             # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
@@ -1921,6 +1948,7 @@ async def _send_to_existing_session(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     publish_event: Callable[[str, dict[str, Any]], None] | None = None,
+    created_by: str | None = None,
 ) -> str:
     """
     Post a message to an existing direct-child session, return a handle.
@@ -2002,6 +2030,7 @@ async def _send_to_existing_session(
         agent=agent_label,
         title=parsed.title or "",
         wrapper_label=_session_wrapper_label(snap_data),
+        created_by=created_by,
     )
     _publish_child_launching_update(
         parent_session_id=conversation_id,
@@ -2021,6 +2050,7 @@ async def _send_to_existing_session(
                     "role": "user",
                     "content": [{"type": "input_text", "text": message}],
                 },
+                **({"created_by": created_by} if created_by is not None else {}),
             },
             # Same as the other message-send: gated at the recipient's REQUEST
             # phase, which can PARK on a human ASK up to the policy's

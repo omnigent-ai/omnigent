@@ -912,6 +912,8 @@ class _SubagentWorkEntry:
     :param wrapper_label: Optional terminal wrapper label from the
         child session, e.g. ``"codex-native-ui"`` for codex-native
         native sub-agents.
+    :param created_by: Human actor that dispatched this child turn, if
+        known from the parent turn context.
     :param status: Current work status, e.g. ``"launching"`` or
         ``"running"``.
     :param output: Terminal child output or error text. ``None``
@@ -929,6 +931,7 @@ class _SubagentWorkEntry:
     agent: str
     title: str
     wrapper_label: str | None = None
+    created_by: str | None = None
     status: str = "launching"
     output: str | None = None
     created_at: float = dataclasses.field(default_factory=time.time)
@@ -970,6 +973,7 @@ def register_subagent_work(
     agent: str,
     title: str,
     wrapper_label: str | None = None,
+    created_by: str | None = None,
 ) -> _SubagentWorkEntry:
     """
     Register one running sub-agent dispatch.
@@ -985,6 +989,8 @@ def register_subagent_work(
     :param title: Sub-agent instance title, e.g. ``"auth"``.
     :param wrapper_label: Optional child ``omnigent.wrapper``
         label, e.g. ``"claude-code-native-ui"``.
+    :param created_by: Human actor that dispatched this child turn, if
+        known from the parent turn context.
     :returns: The registered work entry.
     """
     prior = _subagent_work_by_child.get(child_session_id)
@@ -1002,6 +1008,7 @@ def register_subagent_work(
         agent=agent,
         title=title,
         wrapper_label=wrapper_label,
+        created_by=created_by,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -1266,6 +1273,8 @@ async def _deliver_subagent_wake_post(
     server_client: httpx.AsyncClient,
     parent_id: str,
     notice: str,
+    *,
+    created_by: str | None = None,
 ) -> bool:
     """
     POST a sub-agent wake notice with a bounded retry on transient failure.
@@ -1281,6 +1290,8 @@ async def _deliver_subagent_wake_post(
     :param server_client: Omnigent HTTP client for the runner subprocess.
     :param parent_id: Parent session to wake, e.g. ``"conv_parent123"``.
     :param notice: The ``[System: ...]`` notice text to inject.
+    :param created_by: Human actor that dispatched the completed child
+        turn, if known.
     :returns: ``True`` if a 2xx was confirmed, ``False`` if every attempt
         failed (transport error, timeout, or non-2xx response).
     """
@@ -1294,6 +1305,7 @@ async def _deliver_subagent_wake_post(
                         "role": "user",
                         "content": [{"type": "input_text", "text": notice}],
                     },
+                    **({"created_by": created_by} if created_by is not None else {}),
                 },
                 # The server gates this injected wake at the parent's REQUEST
                 # phase, which can PARK on a human ASK (e.g. session_cost_budget)
@@ -5504,8 +5516,12 @@ def create_runner_app(
                 _ingest_now_serving[session_id] = _seq + 1
                 _cond.notify_all()
 
-    async def _post_subagent_wake_notice(parent_id: str, notice: str, child_id: str) -> None:
-        delivered = await _deliver_subagent_wake_post(server_client, parent_id, notice)
+    async def _post_subagent_wake_notice(
+        parent_id: str, notice: str, child_id: str, created_by: str | None
+    ) -> None:
+        delivered = await _deliver_subagent_wake_post(
+            server_client, parent_id, notice, created_by=created_by
+        )
         if not delivered:
             _subagent_wake_pending.discard(parent_id)
             _logger.warning(
@@ -5536,7 +5552,12 @@ def create_runner_app(
             pending=inbox.qsize(),
         )
         _wake_task = loop.create_task(
-            _post_subagent_wake_notice(entry.parent_session_id, notice, entry.child_session_id)
+            _post_subagent_wake_notice(
+                entry.parent_session_id,
+                notice,
+                entry.child_session_id,
+                entry.created_by,
+            )
         )
         _wake_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_wake_task)

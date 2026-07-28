@@ -1158,6 +1158,8 @@ class SessionEventInput(BaseModel):
         "description": "...", "parameters": {...}}}]``. Ignored
         when the event steers into an active task: that task's
         tools are fixed at start time.
+    :param created_by: Optional internal attribution actor for runner-
+        originated events that are triggered by a prior human turn.
     """
 
     type: str
@@ -1167,6 +1169,7 @@ class SessionEventInput(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
+    created_by: str | None = None
 
 
 class SessionGitOptions(BaseModel):

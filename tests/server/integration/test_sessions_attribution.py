@@ -266,7 +266,10 @@ async def test_post_event_records_authenticated_poster(
 
     monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
 
-    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    session_id = _seed_shared_session(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+    )
 
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
@@ -281,6 +284,44 @@ async def test_post_event_records_authenticated_poster(
     items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
     [persisted] = items.data
     assert persisted.created_by == "alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_post_event_uses_runner_supplied_created_by(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner-originated wake events preserve the triggering collaborator."""
+    from omnigent.server.routes import sessions as sessions_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+
+    session_id = _seed_shared_session(
+        db_uri,
+        {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
+    )
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "created_by": "bob@example.com",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "[System: sub-agent done]"}],
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
+    [persisted] = items.data
+    assert persisted.created_by == "bob@example.com"
 
 
 @pytest.mark.asyncio
