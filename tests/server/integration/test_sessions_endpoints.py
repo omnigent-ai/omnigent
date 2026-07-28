@@ -3560,6 +3560,7 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
                 "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
                 "model_override": None,
                 "tools": None,
+                "created_by": None,
             },
         }
     ]
