@@ -45,6 +45,7 @@ from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
 from omnigent.server.app import create_app
+from omnigent.server.auth import LEVEL_EDIT
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -1337,26 +1338,31 @@ async def test_resolve_url_cross_user_forbidden(
     auth_client: httpx.AsyncClient,
 ) -> None:
     """
-    A non-owner cannot reach the resolve endpoint when auth is
+    A shared editor cannot reach the resolve endpoint when auth is
     active.
 
-    Alice owns the session; Bob's POST to its resolve URL is rejected
-    by the ``LEVEL_EDIT`` access gate before any resolution runs. The
+    Alice owns the session and grants Bob edit access. Bob's POST to
+    its resolve URL is rejected by the ``LEVEL_OWNER`` access gate
+    before any resolution runs. The
     unguessable elicitation id is a capability, but session-owner
-    access control is the outer fence — Bob must not get past it even
-    with a valid-looking id.
+    access control is the outer fence — edit access must not authorize
+    tools that execute with Alice's credentials.
     """
     agent = await create_test_agent(auth_client, user="alice@example.com")
     session_id = await _create_session(auth_client, agent["id"], user="alice@example.com")
+    grant = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "bob@example.com", "level": LEVEL_EDIT},
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert grant.status_code == 200, grant.text
 
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/elicitations/elicit_whatever/resolve",
         json={"action": "accept"},
         headers={"X-Forwarded-Email": "bob@example.com"},
     )
-    # Non-owner is denied (403 forbidden, or 404 to avoid leaking
-    # existence — both are acceptable refusals).
-    assert resp.status_code in (403, 404), resp.text
+    assert resp.status_code == 403, resp.text
 
 
 # ── GET /sessions/{id}/elicitations/{eid} (approval page) ────

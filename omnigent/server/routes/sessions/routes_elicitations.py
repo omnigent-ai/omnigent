@@ -25,6 +25,7 @@ from omnigent.server._elicitation_registry import (
 )
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_OWNER,
     AuthProvider,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -91,7 +92,7 @@ def register_elicitations_routes(
         The ``elicitation_id`` is taken from the URL rather than the
         body, so the unguessable id (``secrets.token_hex(16)``) is
         the capability scoping the resolution — combined with the
-        session-owner ``LEVEL_EDIT`` gate below and the server-side
+        session-owner ``LEVEL_OWNER`` gate below and the server-side
         ownership check inside :func:`_resolve_elicitation`.
 
         :param request: The inbound request, used for identity
@@ -110,7 +111,7 @@ def register_elicitations_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
         )
         conv = access.conversation
         if conv is None:

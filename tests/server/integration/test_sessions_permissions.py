@@ -734,6 +734,41 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
     )
 
 
+async def test_edit_grant_cannot_resolve_approval_event(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Only the owner may approve tools that run with owner credentials."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "user-a")
+    session_id = session["id"]
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-a",
+        target_user="user-b",
+        level=LEVEL_EDIT,
+    )
+    assert grant.status_code == 200
+
+    approval = {
+        "type": "approval",
+        "data": {"elicitation_id": "elicit_test", "action": "accept"},
+    }
+    editor_response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=approval,
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert editor_response.status_code == 403, editor_response.text
+
+    owner_response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=approval,
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert owner_response.status_code == 202, owner_response.text
+
+
 async def test_archive_requires_owner_access(
     auth_client: httpx.AsyncClient,
 ) -> None:
