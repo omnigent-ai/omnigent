@@ -37,6 +37,7 @@ load-bearing behavior — it has dedicated coverage below.
 from __future__ import annotations
 
 import os
+from unittest.mock import Mock
 
 import pytest
 import tomllib
@@ -2007,6 +2008,10 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     monkeypatch.setattr(
         "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed", lambda: True
     )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: family != GEMINI_FAMILY,
+    )
     monkeypatch.setattr("omnigent.onboarding.copilot_auth.copilot_sdk_installed", lambda: True)
     monkeypatch.setattr(
         "omnigent.onboarding.opencode_auth.opencode_auth_summary",
@@ -2035,7 +2040,9 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     assert desc_by_name["OpenCode"] == "Open to sign in (opencode auth login)."
     assert desc_by_name["Hermes"] == "Open to configure with `hermes model`."
     assert desc_by_name["Pi"] == "Open to add a credential."
-    assert desc_by_name["Antigravity"] == "Open to add the Gemini API key."
+    assert (
+        desc_by_name["Antigravity"] == "Open to sign in with Antigravity, or add a Gemini API key."
+    )
     assert desc_by_name["Qwen Code"] == "Open to set up auth (/auth or env vars)."
     assert desc_by_name["Goose"] == "Open to run `goose configure`."
     assert desc_by_name["Copilot"] == "Open to add the GitHub token."
@@ -2673,11 +2680,11 @@ def test_cursor_install_now_invokes_runner_without_index(
     assert not any("index" in part or "://" in part for part in argv)
 
 
-# ── Antigravity Gemini API-key flow ─────────────────────────────────────────
+# ── Antigravity auth flow ───────────────────────────────────────────────────
 # Antigravity (Gemini-native, no provider family) is row 7 on the overview (it
 # follows Pi) and stores its key in the secret store + the ``antigravity:``
-# config block. API-key-only menu (Set/Replace/Remove); ``isolated_config``
-# clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
+# config block. The same drill-in also exposes native ``agy`` sign-in;
+# ``isolated_config`` clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
 
 
 @pytest.fixture()
@@ -2738,6 +2745,46 @@ def test_antigravity_adopt_env_api_key_writes_env_ref(
     cfg = _config_yaml(isolated_config)
     assert cfg["antigravity"] == {"api_key_ref": "env:GEMINI_API_KEY"}
     assert secrets.load_secret("antigravity") is None
+
+
+def test_antigravity_sign_in_runs_agy_auth_service(
+    isolated_config, monkeypatch, _antigravity_sdk_present
+) -> None:
+    """Selecting Antigravity sign-in launches bare ``agy`` through harness auth."""
+    login = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
+
+    # L1 7=Antigravity → 2=Sign in → q back → q quit.
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "2", "q", "q"]) + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    login.assert_called_once_with(GEMINI_FAMILY)
+
+
+def test_antigravity_sign_in_skips_sdk_install_prompt(isolated_config, monkeypatch) -> None:
+    """An installed agy can sign in even when the optional SDK is absent."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
+        lambda: False,
+    )
+    prompt = Mock()
+    monkeypatch.setattr("omnigent.cli_config._prompt_install_antigravity", prompt)
+    login = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
+
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "2", "q", "q"]) + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    prompt.assert_not_called()
+    login.assert_called_once_with(GEMINI_FAMILY)
 
 
 def test_antigravity_remove_api_key_drops_block_and_secret(
@@ -2816,17 +2863,23 @@ def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(
 
 @pytest.fixture()
 def _antigravity_sdk_absent(monkeypatch):
-    """Force ``google-antigravity`` detection to report missing.
+    """Force ``google-antigravity`` and native ``agy`` detection to report missing.
 
     Both call sites (overview row + drill-in) resolve ``antigravity_sdk_installed``
     from the source module at call time, so patching the module attribute is seen by
-    both.
+    both. The autouse harness fixture marks CLIs installed by default, so this
+    also clears only the Gemini/agy install bit to exercise the SDK-install hint
+    instead of the native sign-in row.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
     monkeypatch.setattr(
         "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
         lambda: False,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_installed",
+        lambda family: family != GEMINI_FAMILY,
     )
 
 

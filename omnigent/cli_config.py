@@ -1746,40 +1746,54 @@ def _prompt_install_antigravity() -> str | None:
 
 
 def _manage_antigravity_harness() -> None:
-    """Run the level-2 loop for Antigravity: set / replace / remove its Gemini key.
+    """Run the level-2 loop for Antigravity auth.
 
-    Antigravity is Gemini-native (no provider family), so this manages just its
-    API key — stored in the secret store, referenced from the ``antigravity:``
-    config block — mirroring how the other harnesses persist api keys.
+    Antigravity can authenticate either through the native ``agy`` auth service
+    (Google sign-in for ``antigravity-native``) or through a Gemini API key for
+    the in-process SDK harness. The API key is stored in the secret store and
+    referenced from the ``antigravity:`` config block.
 
-    When the optional ``google-antigravity`` SDK is missing, the drill-in first offers
-    to install it (:func:`_prompt_install_antigravity`). Unlike the CLI-backed harnesses
-    (whose drill-in *gates* on the CLI), declining here still drops into the key menu,
-    since the ``antigravity:`` key is independently storable.
+    When both the optional ``google-antigravity`` SDK and ``agy`` are missing,
+    the drill-in first offers to install the SDK
+    (:func:`_prompt_install_antigravity`). An installed ``agy`` goes straight
+    to the auth choices so SDK setup never hides the native sign-in path.
 
-    :returns: None. Side effects: may install the ``antigravity`` extra, and may write
-        the ``antigravity:`` config block and the secret store.
+    :returns: None. Side effects: may launch ``agy``, install the
+        ``antigravity`` extra, and write the ``antigravity:`` config block and
+        secret store.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
         ANTIGRAVITY_CONFIG_KEY,
+        ANTIGRAVITY_ENV_VARS,
         ANTIGRAVITY_SECRET_NAME,
         antigravity_api_key_configured,
         antigravity_api_key_ref,
         antigravity_sdk_installed,
     )
+    from omnigent.onboarding.harness_install import (
+        harness_cli_installed,
+        harness_cli_logged_in,
+        harness_install_spec,
+        harness_login,
+    )
     from omnigent.onboarding.interactive import select
+    from omnigent.onboarding.provider_config import GEMINI_FAMILY
 
     # Offer the install once on entry (not per loop iteration); the returned status
     # seeds the menu's transient status line.
     status: str | None = None
-    if not antigravity_sdk_installed():
+    if not antigravity_sdk_installed() and not harness_cli_installed(GEMINI_FAMILY):
         status = _prompt_install_antigravity()
         if status == _SOFT_INSTALL_ABORT:
             return
     while True:
         config = _load_global_config()
-        key_set = antigravity_api_key_configured(config)
+        key_set = antigravity_api_key_configured(config) or any(
+            os.environ.get(var) for var in ANTIGRAVITY_ENV_VARS
+        )
+        agy_installed = harness_cli_installed(GEMINI_FAMILY)
+        agy_signed_in = agy_installed and harness_cli_logged_in(GEMINI_FAMILY)
 
         rows: list[_HarnessMenuRow] = [
             _HarnessMenuRow(
@@ -1789,20 +1803,47 @@ def _manage_antigravity_harness() -> None:
         ]
         if key_set:
             rows.append(_HarnessMenuRow("Remove API key", action="remove_key"))
+        if agy_installed:
+            rows.append(
+                _HarnessMenuRow(
+                    "Re-run Antigravity sign-in" if agy_signed_in else "Sign in with Antigravity",
+                    action="sign_in",
+                )
+            )
+        else:
+            spec = harness_install_spec(GEMINI_FAMILY)
+            hint = spec.install_hint if spec is not None and spec.install_hint else "install agy"
+            rows.append(_HarnessMenuRow(f"Install agy first ({hint})", action="show_install"))
         rows.append(_HarnessMenuRow("← Back", action="back"))
 
-        header = (
-            "Antigravity — Gemini API key configured"
-            if key_set
-            else "Antigravity — no Gemini API key yet"
-        )
+        auth_bits: list[str] = []
+        if agy_signed_in:
+            auth_bits.append("Antigravity sign-in ready")
+        elif agy_installed:
+            auth_bits.append("Antigravity sign-in needed")
+        else:
+            auth_bits.append("agy not installed")
+        auth_bits.append("Gemini API key configured" if key_set else "no Gemini API key")
+        header = f"Antigravity — {' · '.join(auth_bits)}"
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
             return
         action = rows[idx].action
         if action == "back":
             return
-        if action == "set_key":
+        if action == "show_install":
+            spec = harness_install_spec(GEMINI_FAMILY)
+            hint = (
+                spec.install_hint if spec is not None and spec.install_hint else "curl installer"
+            )
+            status = f"Install agy manually, then re-open: {hint}"
+        elif action == "sign_in":
+            status = (
+                "✓ Antigravity sign-in ready"
+                if harness_login(GEMINI_FAMILY)
+                else "✗ Antigravity sign-in not detected"
+            )
+        elif action == "set_key":
             status = _set_antigravity_api_key()
         elif action == "remove_key":
             ref = antigravity_api_key_ref(config)
@@ -3212,6 +3253,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.interactive import select
     from omnigent.onboarding.provider_config import (
         ANTHROPIC_FAMILY,
+        GEMINI_FAMILY,
         OPENAI_FAMILY,
         PI_SURFACE,
         surface_default_provider,
@@ -3460,11 +3502,23 @@ def _run_configure_harnesses_interactive() -> None:
 
         rows.append(_family_row(PI_SURFACE))
 
-        # Antigravity — Gemini key (antigravity-sdk extra is soft, like Cursor).
+        # Antigravity — native agy sign-in OR Gemini key (SDK extra is soft, like Cursor).
         if antigravity_api_key_configured(config) or any(
             os.environ.get(v) for v in ANTIGRAVITY_ENV_VARS
         ):
             rows.append((_ANTIGRAVITY, "Antigravity", "Gemini API key", "ready", ""))
+        elif harness_cli_installed(GEMINI_FAMILY) and harness_cli_logged_in(GEMINI_FAMILY):
+            rows.append((_ANTIGRAVITY, "Antigravity", "Signed in", "ready", ""))
+        elif harness_cli_installed(GEMINI_FAMILY):
+            rows.append(
+                (
+                    _ANTIGRAVITY,
+                    "Antigravity",
+                    "Needs sign-in",
+                    "warn",
+                    "Open to sign in with Antigravity, or add a Gemini API key.",
+                ),
+            )
         elif not antigravity_sdk_installed():
             rows.append(
                 (
@@ -3482,7 +3536,7 @@ def _run_configure_harnesses_interactive() -> None:
                     "Antigravity",
                     "Not configured",
                     "warn",
-                    "Open to add the Gemini API key.",
+                    "Open to sign in with Antigravity, or add a Gemini API key.",
                 ),
             )
 
