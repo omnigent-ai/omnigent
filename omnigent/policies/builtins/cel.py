@@ -10,7 +10,36 @@ The expression receives the full ``PolicyEvent`` dict as an
 (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
 ``"reason"`` key. Non-map returns abstain.
 
-Register via the session policy API::
+Register statically in an agent's YAML, or dynamically on a running
+session via the policy API.
+
+Static, in an agent ``config.yaml`` (``policies:`` block, parsed by
+:mod:`omnigent.inner.loader` — ``handler`` + ``factory_params``)::
+
+    policies:
+      block_shell:
+        type: function
+        handler: omnigent.policies.builtins.cel.cel_policy
+        factory_params:
+          expression: 'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+          reason: Shell access is blocked.
+
+Static, in a bundled agent spec (``guardrails.policies``, parsed by
+:mod:`omnigent.spec.parser` — note the different spelling: a
+``function`` mapping with ``path`` + ``arguments``; this parser does
+NOT read ``factory_params``)::
+
+    guardrails:
+      policies:
+        block_shell:
+          type: function
+          function:
+            path: omnigent.policies.builtins.cel.cel_policy
+            arguments:
+              expression: 'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+              reason: Shell access is blocked.
+
+Dynamic, via the session policy API::
 
     POST /v1/sessions/{session_id}/policies
     {
