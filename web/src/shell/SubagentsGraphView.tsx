@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NodeTypes, NodeProps, Node } from "@xyflow/react";
 import { ReactFlow, Background, Position, Handle } from "@xyflow/react";
-import { Link, useLocation } from "@/lib/routing";
+import { useLocation, useNavigate } from "@/lib/routing";
 import { RunningDot } from "@/components/RunningDot";
 import { Badge } from "@/components/ui/badge";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -51,16 +51,9 @@ function NodeStatusDot({ activity }: { activity: AgentActivity }) {
 function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
   const { label, activity, statusLabel, isActive, preview } = data;
   const tint = ACTIVITY_TINT[activity];
-  const location = useLocation();
-  const search = useMemo(() => {
-    const params = new URLSearchParams(location.search);
-    for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
-    const next = params.toString();
-    return next ? `?${next}` : "";
-  }, [location.search]);
 
   return (
-    <Link to={{ pathname: `/c/${data.sessionId}`, search }} className="block">
+    <>
       <Handle
         type="target"
         position={Position.Top}
@@ -92,7 +85,7 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         position={Position.Bottom}
         className="!bg-muted-foreground/40 !w-1.5 !h-1.5 !border-0"
       />
-    </Link>
+    </>
   );
 }
 
@@ -181,6 +174,21 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
     [rootSessionId, rootLabel, rootActivity, rootStatusLabel, childrenMap, conversationId],
   );
 
+  const navigate = useNavigate();
+  const location = useLocation();
+  const handleNodeClick = useCallback(
+    (_event: React.MouseEvent, node: Node<AgentNodeData>) => {
+      const params = new URLSearchParams(location.search);
+      for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
+      const search = params.toString();
+      navigate({
+        pathname: `/c/${node.data.sessionId}`,
+        search: search ? `?${search}` : "",
+      });
+    },
+    [navigate, location.search],
+  );
+
   return (
     <div
       data-workspace-panel-surface
@@ -191,6 +199,7 @@ export function SubagentsGraphView({ conversationId, rootSessionId }: SubagentsG
           nodes={layoutNodes}
           edges={layoutEdges}
           nodeTypes={nodeTypes}
+          onNodeClick={handleNodeClick}
           fitView
           fitViewOptions={{ padding: 0.3 }}
           panOnDrag
