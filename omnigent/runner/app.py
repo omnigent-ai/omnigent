@@ -9767,6 +9767,13 @@ def _build_spawn_env_from_spec(
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
     harness = canonicalize_harness(harness) or harness
+    effective_spec = spec
+    if model_override is not None:
+        executor = getattr(spec, "executor", None)
+        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+            effective_spec = spec.model_copy(
+                update={"executor": executor.model_copy(update={"model": model_override})}
+            )
     try:
         from omnigent.runtime.workflow import (
             _build_acp_spawn_env,
@@ -9783,32 +9790,32 @@ def _build_spawn_env_from_spec(
         )
 
         if harness == "claude-sdk":
-            env = _build_claude_sdk_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_claude_sdk_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "codex":
-            env = _build_codex_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "pi":
-            env = _build_pi_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_pi_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "openai-agents":
-            env = _build_openai_agents_sdk_spawn_env(spec)
+            env = _build_openai_agents_sdk_spawn_env(effective_spec)
         elif harness == "cursor":
-            env = _build_cursor_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_cursor_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "antigravity":
-            env = _build_antigravity_spawn_env(spec)
+            env = _build_antigravity_spawn_env(effective_spec)
         elif harness == "kimi":
-            env = _build_kimi_spawn_env(spec, cwd=cwd)
+            env = _build_kimi_spawn_env(effective_spec, cwd=cwd)
         elif harness == "qwen":
-            env = _build_qwen_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_qwen_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "goose":
-            env = _build_goose_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
-            env = _build_acp_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "copilot":
-            env = _build_copilot_spawn_env(spec, cwd=cwd, workdir=workdir)
+            env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         else:
             builder_path = spawn_env_builders().get(harness)
             if builder_path is not None:
                 builder = load_object(builder_path)
-                env = builder(spec, cwd=cwd, workdir=workdir)
+                env = builder(effective_spec, cwd=cwd, workdir=workdir)
             else:
                 # Native terminal harnesses and unknown harnesses build env elsewhere.
                 return None

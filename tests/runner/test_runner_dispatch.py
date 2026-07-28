@@ -1389,6 +1389,8 @@ def test_build_spawn_env_applies_model_override(
         "    anthropic:\n"
         "      base_url: https://api.anthropic.com\n"
         "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
     )
     spec = AgentSpec(
         spec_version=1,
@@ -1430,6 +1432,8 @@ async def test_resolve_harness_config_applies_harness_override(
         "    anthropic:\n"
         "      base_url: https://api.anthropic.com\n"
         "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
     )
     spec = AgentSpec(
         spec_version=1,
