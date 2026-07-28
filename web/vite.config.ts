@@ -294,5 +294,21 @@ export default defineConfig({
     target: ["chrome111", "edge111", "firefox114", "safari15", "ios15"],
     outDir: path.resolve(__dirname, "../omnigent/server/static/web-ui"),
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        // Keep Shiki and its first-party packages in a single chunk. pnpm's
+        // symlinks + Vite's default split expose a top-level cyclic import
+        // between the full language bundle and the alias-map chunk that ends
+        // up executing before its data dependency is initialized, producing
+        // "Cannot read properties of undefined (reading 'flatMap')" and a
+        // blank Monaco/file-viewer screen.
+        manualChunks(id) {
+          const normalized = id.replaceAll("\\", "/");
+          if (normalized.includes("/shiki") || normalized.includes("/@shikijs/")) {
+            return "shiki";
+          }
+        },
+      },
+    },
   },
 });

@@ -22,6 +22,11 @@ dependency).
    and opens its OWN PR for the branch. Every commit the worker authors must
    end with a blank line followed by the exact co-sign trailer as its final
    line — `Co-authored-by: omnigent <noreply@omnigent.ai>`.
+   For a long-running `claude_code` or `codex` implementation with an explicit
+   completion condition, the `input` may instead be one standalone
+   `/goal <condition>` command containing that same task, worktree, acceptance
+   contract, green gates, and PR requirement.
+   Do not use child goal mode for other workers or non-implementation purposes.
    Record each handle's `conversation_id`
    in the registry. Emit the worktree + `sys_session_send` tool calls in THIS
    turn — never end a turn having only said you will dispatch; the dispatch

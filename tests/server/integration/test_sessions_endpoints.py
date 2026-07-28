@@ -4832,6 +4832,69 @@ async def test_accumulate_session_usage_unpriced_without_usage_model(
     assert "total_cost_usd" not in usage
 
 
+async def test_accumulate_session_usage_codex_unpinned_model_gets_by_model_entry(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Regression test for the Debby/Polly per-model-breakdown bug.
+
+    A codex-harness agent that pins no ``llm.model`` (the exact shape of
+    Debby's ``gpt`` head, ``examples/debby/agents/gpt/config.yaml``) has no
+    ``model_override`` and no spec ``llm.model``, so ``_resolve_llm_model``
+    falls back to ``None`` unless the turn's own ``usage.model`` supplies it.
+    Before ``codex_executor.py``'s ``_extract_codex_last_turn_usage`` stamped
+    the resolved model onto the usage dict, codex turns never carried
+    ``usage.model`` — so the flat token total still accumulated (first call
+    below) but ``by_model`` was silently never written for it. The second
+    call reproduces the fixed shape (``model`` present, exactly what
+    ``_extract_codex_last_turn_usage`` now returns) and must get an entry —
+    surfaced through the real ``GET /v1/sessions/{id}`` API the web UI reads.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+        include_llm=False,  # mirrors examples/debby/agents/gpt/config.yaml
+    )
+    session = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+
+    # BEFORE (the bug): no "model" in usage — the old codex_executor shape.
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500}},
+        session["id"],
+        store,
+    )
+    before = _read_session_usage(db_uri, session["id"])
+    assert before.get("input_tokens") == 1000  # flat total still accumulates...
+    assert "by_model" not in before  # ...but no per-model entry is ever written.
+
+    # AFTER (the fix): usage carries "model", as _extract_codex_last_turn_usage
+    # now stamps it.
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 200,
+                "output_tokens": 100,
+                "total_tokens": 300,
+                "model": "gpt-5.4-mini",
+            }
+        },
+        session["id"],
+        store,
+    )
+    after = _read_session_usage(db_uri, session["id"])
+    assert after["input_tokens"] == 1200  # flat total keeps accumulating
+    assert after["by_model"]["gpt-5.4-mini"]["input_tokens"] == 200
+    assert after["by_model"]["gpt-5.4-mini"]["output_tokens"] == 100
+
+    # And the real HTTP read API — the same one the web UI's cost panel
+    # reads on load — projects the per-model entry too.
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["usage_by_model"]["gpt-5.4-mini"]["input_tokens"] == 200
+
+
 async def test_accumulate_session_usage_records_per_model_breakdown(
     client: httpx.AsyncClient,
     db_uri: str,

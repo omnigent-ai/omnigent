@@ -12,8 +12,10 @@ from typing import Any
 from omnigent.claude_native_bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
+    inject_slash_command,
     inject_user_message,
     read_active_session_id,
+    read_launch_model,
 )
 from omnigent.inner.executor import (
     Executor,
@@ -60,6 +62,10 @@ class ClaudeNativeExecutor(Executor):
         # adapter caching one executor per conversation; per-turn
         # construction would regress the lock to per-turn scope.
         self._inject_lock = asyncio.Lock()
+        # The model the pane is currently on, so a routing turn only types
+        # ``/model`` when the model actually changes. Seeded lazily from the
+        # spawn ``launch_model`` on the first turn (``None`` = not yet known).
+        self._applied_model: str | None = None
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -115,12 +121,15 @@ class ClaudeNativeExecutor(Executor):
         :param system_prompt: System prompt from the agent spec. The
             native Claude Code terminal controls its own prompt/settings,
             so this is ignored.
-        :param config: Per-turn executor config. Unused by this
-            terminal-backed executor.
+        :param config: Per-turn executor config. Only ``config.model``
+            is used: when intelligent routing picks a model for this turn,
+            it arrives here (adapter maps ``request.model_override`` →
+            ``config.model``) and the switch is applied inline, before the
+            message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
             or :class:`ExecutorError` on bridge failure.
         """
-        del tools, system_prompt, config
+        del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             yield ExecutorError(
                 message=(
@@ -139,9 +148,35 @@ class ClaudeNativeExecutor(Executor):
         # native path. session.id is applied generically by the span processor
         # (the executor adapter binds session_scope for the turn), so there's
         # no per-call-site stamping here.
+        #
+        # Apply a routed ``/model`` switch and inject the message as ONE
+        # step under ``_inject_lock``. Intelligent routing used to switch
+        # the model with a separate server-issued ``model_change`` event
+        # that raced this inject on the same tmux pane, so the message's
+        # keystrokes could land mid-switch and be lost (the "routing drops
+        # the first message" bug). Folding the switch into the turn under
+        # the same lock removes the second writer entirely: ``/model`` fully
+        # commits, then ``inject_user_message`` (which waits for the input
+        # box and verifies its submit) delivers the message — in order,
+        # once.
+        wanted_model = config.model if config is not None else None
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
+                    if self._should_switch_model(wanted_model):
+                        await asyncio.to_thread(
+                            inject_slash_command,
+                            self._bridge_dir,
+                            command=f"/model {wanted_model}",
+                            # Accept the switch dialog if the CLI ever pops one,
+                            # matching the manual picker path. Runs to completion
+                            # before the message inject below (same lock), so its
+                            # confirm Enter can't race the message; a no-op on the
+                            # gateway pane, which switches inline with no dialog.
+                            auto_confirm=True,
+                        )
+                        # ``wanted_model`` is non-None here (guarded above).
+                        self._applied_model = wanted_model
                     await asyncio.to_thread(
                         inject_user_message,
                         self._bridge_dir,
@@ -151,6 +186,30 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=str(exc))
             return
         yield TurnComplete(response=None)
+
+    def _should_switch_model(self, wanted_model: str | None) -> bool:
+        """
+        Return whether this turn must type ``/model`` before the message.
+
+        Only switches when routing named a model AND it differs from the
+        model the pane is already on. The baseline is tracked per turn in
+        ``_applied_model``, seeded lazily from the spawn ``launch_model``
+        so turn 1's routed pick is compared against what Claude actually
+        booted with — not blindly re-issued.
+
+        :param wanted_model: The turn's routed model, or ``None`` when the
+            turn carries no override (routing off / already-pinned session).
+        :returns: ``True`` when a ``/model`` switch is required.
+        """
+        if not wanted_model:
+            return False
+        if self._applied_model is None:
+            # First turn: compare against the spawn model. read_launch_model
+            # is best-effort (None when no ucode profile was active); an
+            # unknown baseline means we switch to be safe — a redundant
+            # ``/model`` to the current model is a harmless no-op.
+            self._applied_model = read_launch_model(self._bridge_dir)
+        return wanted_model != self._applied_model
 
 
 def _bridge_dir_from_env() -> Path:

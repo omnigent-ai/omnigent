@@ -11,7 +11,13 @@ from __future__ import annotations
 import re as _re
 from typing import Any
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_attachments,
+    request_user_text,
+)
 
 _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
@@ -302,8 +308,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
         # user message ``"/<name> <args>"`` and evaluates it at the
         # REQUEST phase.  Match ``/<blocked-name>`` at the start.
         if event_type == "request":
-            data = event.get("data")
-            text = data if isinstance(data, str) else ""
+            text = request_user_text(event.get("data"))
             if text.startswith("/"):
                 # Extract the command name: first token after "/".
                 # ``split(None, ...)`` drops empty tokens, so a bare "/"
@@ -502,19 +507,18 @@ def deny_pii_in_llm_request(
         event_type = event.get("type")
 
         if event_type == "request":
-            # REQUEST phase: ``data`` is the user message string.
-            text = event.get("data")
-            if isinstance(text, str):
-                return _scan_text(text)
-            # Content-block list (multimodal input).
-            if isinstance(text, list):
-                for block in text:
-                    if isinstance(block, dict):
-                        t = block.get("text", "")
-                        if isinstance(t, str):
-                            result = _scan_text(t)
-                            if result is not _ALLOW:
-                                return result
+            # REQUEST phase: scan the typed message plus each text attachment.
+            # ``data`` is {"user_content", "attachments"} from the input gate.
+            data = event.get("data")
+            result = _scan_text(request_user_text(data))
+            if result is not _ALLOW:
+                return result
+            for attachment in request_attachments(data):
+                att_text = attachment.get("text", "")
+                if isinstance(att_text, str) and att_text:
+                    result = _scan_text(att_text)
+                    if result is not _ALLOW:
+                        return result
             return _ALLOW
 
         if event_type == "llm_request":

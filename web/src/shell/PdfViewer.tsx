@@ -36,13 +36,11 @@ import {
 import { TruncatedBanner } from "./TruncatedBanner";
 import "./pdfViewer.css";
 
-// Point pdf.js at its worker. `new URL(..., import.meta.url)` lets Vite fingerprint
-// and serve the worker as an asset; running it at module scope is fine because the
-// module itself is lazy-loaded (no cost until a PDF opens).
-pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url,
-).toString();
+// Point pdf.js at its worker. Vite imports the worker entry as a static asset so
+// the bundled SPA emits it as a hashed file without relying on the package
+// path resolving from `node_modules`.
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;

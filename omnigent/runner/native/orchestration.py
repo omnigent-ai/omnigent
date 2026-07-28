@@ -2175,7 +2175,10 @@ async def _auto_create_cursor_terminal(
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
     from omnigent.cursor_native_forwarder import supervise_cursor_forwarder
-    from omnigent.cursor_native_permissions import supervise_cursor_transcript_elicitations
+    from omnigent.cursor_native_permissions import (
+        cursor_launch_args_enable_yolo,
+        supervise_cursor_transcript_elicitations,
+    )
     from omnigent.cursor_native_usage import supervise_cursor_usage_forwarder
 
     if server_client is not None and ensure_comment_relay is not None:
@@ -2220,6 +2223,12 @@ async def _auto_create_cursor_terminal(
                 workspace=workspace,
                 launch_epoch_ms=launch_epoch_ms,
                 auth=_runner_auth,
+                # Yolo / force sessions still sometimes leave pending markers;
+                # answer those in-pane instead of mirroring a card to a parent
+                # that cannot click it.
+                auto_accept_approvals=cursor_launch_args_enable_yolo(
+                    launch_config.terminal_launch_args
+                ),
             ),
             supervise_cursor_usage_forwarder(
                 base_url=server_url,
@@ -3762,6 +3771,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url=codex_ws_url,
                 codex_home=codex_home,
                 event_client=event_client,
+                routing_summary=_codex_launch.summary,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -3797,6 +3807,7 @@ async def _codex_discover_thread_and_forward(
     codex_ws_url: str,
     codex_home: Path,
     event_client: CodexAppServerClient,
+    routing_summary: str,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -3817,6 +3828,10 @@ async def _codex_discover_thread_and_forward(
     :param codex_home: Per-session private ``CODEX_HOME`` path.
     :param event_client: Connected app-server listener that will observe the
         TUI's ``thread/started``; reused to subscribe the forwarder.
+    :param routing_summary: One-line description of the resolved launch
+        routing (provider / profile / model, or the login-fallback state),
+        threaded into the startup-timeout error so hosted users can diagnose
+        without runner-log access (see #2745).
     """
     from omnigent.codex_native_bridge import (
         CodexNativeBridgeState,
@@ -3853,8 +3868,8 @@ async def _codex_discover_thread_and_forward(
             write_bridge_startup_error(
                 bridge_dir,
                 f"Codex app-server never started a thread ({cause}: "
-                f"{type(exc).__name__}). See the runner log near 'native-codex "
-                "routing' for the resolved provider/model.",
+                f"{type(exc).__name__}). Launch routing: {routing_summary}. "
+                "(The runner log has the same near 'native-codex routing'.)",
             )
             return
 

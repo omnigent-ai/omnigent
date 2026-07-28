@@ -322,7 +322,7 @@ describe("Sidebar session list", () => {
     renderSidebar();
 
     const headerActions = screen.getByTestId("sidebar-header-actions");
-    expect(headerActions.parentElement).toHaveClass("h-8");
+    expect(headerActions.parentElement).toHaveClass("h-12");
     const search = within(headerActions).getByTestId("sidebar-search-button");
     const settings = screen.getByTestId("settings-button");
 

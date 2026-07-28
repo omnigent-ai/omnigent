@@ -1686,8 +1686,9 @@ async def _execute_subagent_tool(
                 return (
                     f"Error: sub-agent {sub_agent_name!r} can't start on this "
                     f"machine: harness {child_harness!r} needs the "
-                    f"{missing_cli.binary!r} CLI on PATH, which was not found. "
-                    f"Install it with: {install} "
+                    f"{missing_cli.binary!r} CLI on PATH and on a supported "
+                    f"version, but it is missing or outdated. "
+                    f"Install/upgrade it with: {install} "
                     f"(or don't dispatch to {sub_agent_name!r} here)."
                 )
         # Create child session on the server (no initial items —

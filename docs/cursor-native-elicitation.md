@@ -3,16 +3,21 @@
 **Status:** implemented
 **Supersedes:** [`cursor-native-tui-mirror-plan.md`](./cursor-native-tui-mirror-plan.md) (pane-scrape design)
 **Code:** `omnigent/cursor_native_permissions.py`, the `cursor-permission-request` hook in
-`omnigent/server/routes/sessions.py`, runner wiring in `omnigent/runner/app.py`,
-`web/.../ApprovalCard.tsx`.
+`omnigent/server/routes/sessions.py`, runner wiring in
+`omnigent/runner/native/orchestration.py`, `web/.../ApprovalCard.tsx`.
 
 ## Goal / behavior
 
 Surface an Omnigent **elicitation card whenever the `cursor-agent` TUI gates a tool call or
 asks a question**, answerable from the web **or** the embedded TUI. Cursor's own native gate
-stays the source of truth — **no `--force`, no JS-bundle modification**. The failure mode is
-benign: if detection ever breaks, the embedded TUI prompt still works and the user answers
-there.
+stays the source of truth — Omnigent never modifies cursor's JS bundle and never suppresses
+the TUI prompt. The failure mode is benign: if detection ever breaks, the embedded TUI prompt
+still works and the user answers there.
+
+One exception: a session the *caller* launched with `--yolo` / `--force` / `-f` has already
+declared it wants no approvals, and a card mirrored to a piloted parent is a stall nobody can
+click. Those sessions answer lingering gates in the pane instead — see
+[Yolo sessions](#yolo-sessions-run-everything) below.
 
 Two interaction kinds are surfaced (both ride cursor's per-call "pending" mechanism):
 
@@ -89,6 +94,28 @@ The pane is still used to *deliver* the verdict. Two gotchas, both handled in
   doesn't park at the reason input. (The `AskQuestion` picker's "Esc to skip" dismisses
   cleanly, so the question decline is a single key.)
 
+### Yolo sessions (Run Everything)
+
+A session launched with `--yolo` / `--force` / `-f` (`cursor_launch_args_enable_yolo`) still
+occasionally leaves a pending marker behind. Mirroring that as a card stalls a piloted parent
+that has no human to click it, so the supervisor answers it in the pane instead — with the
+opposite default of the rest of this design, so the accept is deliberately fail-closed:
+
+- **Only while cursor is asking.** `capture_cursor_pane` must show cursor's parenthesised
+  accept hint (`→ Run (once) (y)`). A stale marker with no gate rendered gets no keystroke —
+  `tmux send-keys y` would type a literal `y` into the composer, which then prepends itself to
+  whatever the user types next in the embedded terminal.
+- **Bounded.** `_YOLO_ACCEPT_MAX_ATTEMPTS` tries, paced by `_YOLO_ACCEPT_RETRY_S`, at most one
+  keystroke per poll (cursor renders one prompt at a time).
+- **Falls back to the card.** A dead pane, a send tmux rejects, or a gate still pending after
+  the budget all surface the ordinary ApprovalCard. The worst case is therefore today's visible
+  stall, never a keystroke loop.
+- **`AskQuestion` is excluded** — a question is human input, not a gate `y` can answer.
+- Because a gate answered this way is never seen by a human, the accept logs the tool name and
+  an argument preview at INFO: that line is the only record Omnigent approved the call.
+
+The attempt counters are in-memory, so a runner restart re-tries a call that is still pending.
+
 ### AskQuestion specifics
 
 - Rendered via the existing web form: the runner stamps the full questions as the **structured
@@ -143,6 +170,11 @@ in-memory. Byte-scanning the frames for embedded JSON reveals the pending tool c
   double-surface. Low likelihood; not yet addressed.
 - **Store schema is private and version-sensitive.** Confirmed against cursor-agent 2026.06.24
   (and the marker present back to 2026.06.18). Failure stays benign (TUI gate authoritative).
+- **Why a `--yolo` session gates at all is unconfirmed.** cursor documents `--force` as "force
+  allow commands unless explicitly denied", so a surviving gate may be one cursor deliberately
+  held back (a user deny rule, or a server-side classifier). The auto-accept above answers it
+  anyway, which is what the flag asks for; the pane check is what keeps that from becoming a
+  blind keystroke.
 - **Keystroke delivery assumes the pane still shows the prompt** and the picker's key bindings
   (`Down`/`Space`/`Enter`, highlight resets per question). Verified live; re-check on cursor
   upgrades.

@@ -37,7 +37,6 @@ from omnigent.claude_native_bridge import url_component
 from omnigent.codex_native_app_server import (
     CodexAppServerClient,
     CodexNativeAppServer,
-    _find_codex_cli,
     build_codex_native_server,
     build_codex_remote_args,
     client_for_transport,
@@ -64,6 +63,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
+    HARNESS_VERSION_TOO_LOW,
     HarnessUnavailableReason,
 )
 from omnigent.host.daemon_launch import (
@@ -188,6 +188,17 @@ def _codex_auth_json_has_available_credential(auth_path: Path) -> bool:
     return False
 
 
+def _find_codex_cli() -> str | None:
+    """Return the resolved path to the Codex CLI binary, if any."""
+    from omnigent._platform import resolve_cli_binary
+    from omnigent.onboarding.harness_install import OPENAI_FAMILY, harness_install_spec
+
+    spec = harness_install_spec(OPENAI_FAMILY)
+    if spec is None:
+        return None
+    return resolve_cli_binary(spec.binary)
+
+
 def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     """
     Return why local Codex is unavailable, or ``None`` when available.
@@ -216,8 +227,15 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         Token *validity* (revoked/expired refresh, an unreachable gateway) is
         not judged locally — it surfaces at the first turn via the executor.
     """
+    from omnigent.onboarding.harness_install import (
+        OPENAI_FAMILY,
+        harness_cli_installed,
+    )
+
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
+    if not harness_cli_installed(OPENAI_FAMILY):
+        return HARNESS_VERSION_TOO_LOW
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     try:

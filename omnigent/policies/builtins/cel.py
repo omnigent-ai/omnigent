@@ -37,7 +37,12 @@ try:
 except ImportError:
     celpy = None  # type: ignore[assignment]
 
-from omnigent.policies.schema import PolicyCallable, PolicyEvent, PolicyResponse
+from omnigent.policies.schema import (
+    PolicyCallable,
+    PolicyEvent,
+    PolicyResponse,
+    request_user_text,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -92,6 +97,15 @@ def cel_policy(
         # CEL expressions cannot call methods on it and json_to_cel would
         # raise ValueError trying to convert it.
         cel_event = {k: v for k, v in event.items() if k != "llm_client"}
+        # REQUEST-phase ``data`` is now the structured dict
+        # ({"user_content", "attachments"}) from the input gate, but CEL
+        # expressions authored against the request phase expect the user text as
+        # a bare string (e.g. ``event.data.contains("secret")``). Project it back
+        # to that string so existing request-phase CEL policies keep matching — a
+        # map here would silently fail-open (string ops raise -> abstain -> ALLOW,
+        # and ``==`` against a string is just false).
+        if event.get("type") == "request":
+            cel_event["data"] = request_user_text(event.get("data"))
         try:
             result = prog.evaluate({"event": celpy.json_to_cel(cel_event)})
         except (celpy.CELEvalError, ValueError, TypeError):

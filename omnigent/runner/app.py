@@ -4792,7 +4792,7 @@ def create_runner_app(
         selected_model = model.strip()
         resolved_model = resolve_claude_native_model_selection(
             selected_model,
-            _session_claude_launch_configs.get(conv_id),
+            await _resolve_session_claude_launch_config(conv_id),
         )
         command = f"/model {resolved_model}"
         try:
