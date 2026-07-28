@@ -1880,10 +1880,11 @@ function ArchivedSection() {
   );
 
   const groupedArchived = useMemo(() => {
+    const now = new Date();
     const groups: { label: string; conversations: typeof archived }[] = [];
     let currentLabel = "";
     for (const conv of archived) {
-      const label = dateGroupLabel(conv.updated_at);
+      const label = dateGroupLabel(conv.updated_at, now);
       if (label !== currentLabel) {
         currentLabel = label;
         groups.push({ label, conversations: [] });

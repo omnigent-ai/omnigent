@@ -931,35 +931,44 @@ describe("SettingsPage", () => {
   });
 
   it("groups archived sessions under date headers", () => {
-    // Fix "now" to 2026-07-15T12:00:00Z so bucket boundaries are deterministic.
     vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.setSystemTime(new Date("2026-07-15T12:00:00Z"));
+    // Use local-time construction so bucket boundaries align with the
+    // local-time arithmetic in dateGroupLabel regardless of the test runner's
+    // timezone.
+    vi.setSystemTime(new Date(2026, 6, 15, 12, 0, 0));
 
-    const todaySec = new Date("2026-07-15T10:00:00Z").getTime() / 1000;
-    const yesterdaySec = new Date("2026-07-14T08:00:00Z").getTime() / 1000;
-    const fiveDaysAgoSec = new Date("2026-07-10T08:00:00Z").getTime() / 1000;
-    const twentyDaysAgoSec = new Date("2026-06-25T08:00:00Z").getTime() / 1000;
-    const oldSec = new Date("2026-03-01T08:00:00Z").getTime() / 1000;
+    try {
+      const todaySec = new Date(2026, 6, 15, 10, 0, 0).getTime() / 1000;
+      const yesterdaySec = new Date(2026, 6, 14, 8, 0, 0).getTime() / 1000;
+      const fiveDaysAgoSec = new Date(2026, 6, 10, 8, 0, 0).getTime() / 1000;
+      const twentyDaysAgoSec = new Date(2026, 5, 25, 8, 0, 0).getTime() / 1000;
+      const oldDate = new Date(2026, 2, 1, 8, 0, 0);
+      const oldSec = oldDate.getTime() / 1000;
 
-    mocks.conversations = [
-      conv("c_today", { archived: true, title: "Today chat", updated_at: todaySec }),
-      conv("c_yesterday", { archived: true, title: "Yesterday chat", updated_at: yesterdaySec }),
-      conv("c_week", { archived: true, title: "This week chat", updated_at: fiveDaysAgoSec }),
-      conv("c_month", { archived: true, title: "This month chat", updated_at: twentyDaysAgoSec }),
-      conv("c_old", { archived: true, title: "Old chat", updated_at: oldSec }),
-    ];
-    renderPage("/settings/archived");
+      mocks.conversations = [
+        conv("c_today", { archived: true, title: "Today chat", updated_at: todaySec }),
+        conv("c_yesterday", { archived: true, title: "Yesterday chat", updated_at: yesterdaySec }),
+        conv("c_week", { archived: true, title: "This week chat", updated_at: fiveDaysAgoSec }),
+        conv("c_month", { archived: true, title: "This month chat", updated_at: twentyDaysAgoSec }),
+        conv("c_old", { archived: true, title: "Old chat", updated_at: oldSec }),
+      ];
+      renderPage("/settings/archived");
 
-    expect(screen.getByText("Today")).toBeInTheDocument();
-    expect(screen.getByText("Yesterday")).toBeInTheDocument();
-    expect(screen.getByText("Previous 7 days")).toBeInTheDocument();
-    expect(screen.getByText("Previous 30 days")).toBeInTheDocument();
-    // March 2026 — locale-dependent label for the oldest session.
-    expect(screen.getByText(/March.*2026/)).toBeInTheDocument();
+      expect(screen.getByText("Today")).toBeInTheDocument();
+      expect(screen.getByText("Yesterday")).toBeInTheDocument();
+      expect(screen.getByText("Previous 7 days")).toBeInTheDocument();
+      expect(screen.getByText("Previous 30 days")).toBeInTheDocument();
+      // Derive the expected label the same way the component does so the
+      // assertion is locale-independent.
+      const expectedOldLabel = oldDate.toLocaleDateString(undefined, {
+        month: "long",
+        year: "numeric",
+      });
+      expect(screen.getByText(expectedOldLabel)).toBeInTheDocument();
 
-    // Each session renders under its respective group.
-    expect(screen.getAllByTestId("archived-row")).toHaveLength(5);
-
-    vi.useRealTimers();
+      expect(screen.getAllByTestId("archived-row")).toHaveLength(5);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
