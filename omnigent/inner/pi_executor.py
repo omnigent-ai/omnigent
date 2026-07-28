@@ -875,7 +875,24 @@ _PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek", "gpt-5.6")
 def _pi_model_is_reasoning(model: str) -> bool:
     """Return whether *model* needs Pi's ``reasoning: true`` model flag."""
     lower = model.lower()
-    return any(fragment in lower for fragment in _PI_REASONING_MODEL_FRAGMENTS)
+    return any(_fragment_matches(fragment, lower) for fragment in _PI_REASONING_MODEL_FRAGMENTS)
+
+
+def _fragment_matches(fragment: str, text: str) -> bool:
+    """True if *fragment* occurs in *text* and is not immediately followed by a digit.
+
+    A plain substring test would let a version-bearing fragment like ``gpt-5.6``
+    also match a longer, unrelated token such as ``gpt-5.60`` and mis-classify it
+    as a reasoning model. Requiring a non-digit after the match keeps ``gpt-5.6``
+    and ``gpt-5.6-sol`` matching while rejecting ``gpt-5.60``.
+    """
+    start = text.find(fragment)
+    while start != -1:
+        end = start + len(fragment)
+        if end == len(text) or not text[end].isdigit():
+            return True
+        start = text.find(fragment, start + 1)
+    return False
 
 
 def _pi_needs_responses_api(model: str) -> bool:
