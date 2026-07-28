@@ -198,6 +198,7 @@ interface SessionResponseWire {
    * absent) for top-level sessions.
    */
   sub_agent_name?: string | null;
+  kind?: "default" | "sub_agent" | null;
   todos?: Array<{
     content: string;
     status: "pending" | "in_progress" | "completed";
@@ -311,6 +312,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     permissionLevel: wire.permission_level ?? null,
     parentSessionId: wire.parent_session_id ?? null,
     subAgentName: wire.sub_agent_name ?? null,
+    kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
     codexModelOptions: wire.model_options ?? [],
