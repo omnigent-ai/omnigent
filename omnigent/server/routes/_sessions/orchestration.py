@@ -6286,7 +6286,7 @@ async def _fetch_model_options(
       cache below: the catalog never changes per session, and routing it
       through that cache would let a ``refresh_state`` snapshot (which pops the
       cache) blank the picker on an effort/model change.
-    * **codex-native** — a *live*, account-scoped catalog only the bound runner
+    * **codex-native / kiro-native** — a *live* catalog only the bound runner
       can read (its app-server ``model/list``). Like skills, this stays off the
       snapshot hot path: the first snapshot kicks a background fetch and returns
       ``[]``; subsequent snapshots serve the cache.
@@ -6306,10 +6306,6 @@ async def _fetch_model_options(
         from omnigent.cursor_native import cursor_base_model_options
 
         return cursor_base_model_options()
-    if wrapper == _KIRO_NATIVE_WRAPPER_LABEL_VALUE:
-        from omnigent.kiro_native import kiro_base_model_options
-
-        return kiro_base_model_options()
     if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
         # pi-native's catalog is PUSHED by its extension (its live
         # ``ctx.modelRegistry``), not fetched: that reflects the models pi

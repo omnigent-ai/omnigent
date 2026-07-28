@@ -15,9 +15,9 @@ The remaining pins fall into a few buckets:
   `omnigent/pi_native_credentials.py`, `omnigent/opencode_native_provider.py`,
   `omnigent/inner/*_executor.py`, and `omnigent/codex_native_app_server.py`
   still carry fallback model ids.
-- **Static pickers/catalogs:** `omnigent/model_catalog.py`,
-  `omnigent/cursor_native.py`, and `omnigent/kiro_native.py` encode static
-  model choices for CLIs that do not always expose a live listing API.
+- **Static pickers/catalogs:** `omnigent/model_catalog.py` and
+  `omnigent/cursor_native.py` encode static model choices for CLIs that do not
+  expose a directly reusable live listing API.
 - **Policy and sizing logic:** `omnigent/llms/context_window.py`,
   `omnigent/policies/builtins/routing.py`, and `omnigent/tools/builtins/spawn.py`
   mention concrete models when mapping windows, routing examples, or dispatch
@@ -144,3 +144,11 @@ harness keeps the provider-resolved default instead of consulting a stale table.
 The remaining exact compatibility exclusions in smart routing are temporary
 wire-API workarounds. They stay isolated until catalog wire metadata can express
 the affected harness constraints without model-name checks.
+
+## Kiro Picker Migration
+
+The Kiro Web picker now runs `kiro-cli chat --list-models --format json` on the
+bound runner and forwards the CLI's model ids, default, descriptions, context
+windows, and credit rates. The server caches the runner response through the
+same asynchronous picker path as Codex, so provider changes no longer require an
+Omnigent source update and snapshots do not block on the CLI process.

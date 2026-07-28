@@ -13,6 +13,7 @@ import pytest
 from omnigent import (
     claude_native_bridge,
     codex_native_bridge,
+    kiro_native,
     kiro_native_bridge,
 )
 from omnigent.claude_native_bridge import (
@@ -244,6 +245,46 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         f"codex-native {event_payload['type']} must call thread/settings/update "
         f"with next-turn settings; got {fake_client.requests!r}."
     )
+
+
+@pytest.mark.asyncio
+async def test_kiro_native_model_options_use_cli_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conv_id = "a7e721bf0e124d2fb5bc1bc36772864e"
+    expected = [
+        {
+            "id": "provider-latest",
+            "displayName": "Provider Latest",
+            "isDefault": True,
+        }
+    ]
+    monkeypatch.setattr(kiro_native, "list_kiro_cli_model_options", lambda: expected)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.get(f"/v1/sessions/{conv_id}/kiro-model-options")
+
+    assert response.status_code == 200
+    assert response.json() == {"models": expected}
 
 
 @pytest.mark.asyncio
