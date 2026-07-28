@@ -136,9 +136,9 @@ def test_scheduled_task_detail_page_run_now_records_run_row(
     # The POST returns 202; the actual run is written by a background task.
     # Poll the API until the run is recorded (mirrors the sibling list-page test).
     def _has_run() -> bool:
-        runs = httpx.get(
-            f"{live_server}/v1/scheduled-tasks/{task_id}/runs", timeout=10.0
-        ).json()["runs"]
+        runs = httpx.get(f"{live_server}/v1/scheduled-tasks/{task_id}/runs", timeout=10.0).json()[
+            "runs"
+        ]
         return len(runs) >= 1
 
     deadline = 0
