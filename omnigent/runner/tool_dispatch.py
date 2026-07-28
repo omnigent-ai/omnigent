@@ -6165,17 +6165,29 @@ async def _evaluate_async_tool_call_policy(
     Evaluate PHASE_TOOL_CALL policy for an out-of-turn background dispatch.
 
     Calls the AP server's policy-evaluate endpoint directly (no SSE
-    round-trip, since the originating turn has already ended).  ASK is
-    treated as DENY — there is no active turn to surface an approval prompt.
+    round-trip, since the originating turn has already ended).
+
+    ``arguments`` is sent as a dict (not a JSON string) so the server's policy
+    context builder and argument-aware built-in policies (e.g. safety rules
+    that inspect ``arguments.command``) see the same structure every in-turn
+    evaluation path delivers.
 
     :returns: ``True`` when the tool may proceed; ``False`` to DENY.
     """
     evaluation_id = f"poleval_async_{uuid.uuid4().hex[:12]}"
     phase = "PHASE_TOOL_CALL"
     try:
+        try:
+            arguments_dict: dict[str, Any] = json.loads(tool_args)
+            if not isinstance(arguments_dict, dict):
+                arguments_dict = {}
+        except (json.JSONDecodeError, ValueError):
+            arguments_dict = {}
         resp = await server_client.post(
             f"/v1/sessions/{conversation_id}/policies/evaluate",
-            json={"event": {"type": phase, "data": {"name": tool_name, "arguments": tool_args}}},
+            json={
+                "event": {"type": phase, "data": {"name": tool_name, "arguments": arguments_dict}}
+            },
             timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
         if resp.status_code == 200:

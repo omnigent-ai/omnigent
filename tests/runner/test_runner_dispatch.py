@@ -7382,6 +7382,13 @@ async def test_spawn_async_tool_phase_tool_call_policy_deny(
     event = policy_requests[0]["event"]
     assert event["type"] == "PHASE_TOOL_CALL"
     assert event["data"]["name"] == "sys_os_shell"
+    # arguments must arrive as a dict so argument-aware policies (e.g. safety
+    # rules that inspect arguments.command) see the same structure every
+    # in-turn evaluation path delivers — not a raw JSON string.
+    assert isinstance(event["data"]["arguments"], dict), (
+        "arguments must be a dict, not a JSON string"
+    )
+    assert event["data"]["arguments"] == {"command": "echo hi"}
 
     item = inbox.get_nowait()
     assert item["status"] == "failed"
