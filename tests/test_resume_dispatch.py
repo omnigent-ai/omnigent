@@ -339,6 +339,108 @@ def test_dispatch_by_runtime_claude_native_local_still_routes_to_wrapper(
     assert captured["claude_args"] == ()
 
 
+@pytest.mark.parametrize(
+    "pasted",
+    [
+        "7e52264a6dc51b019fc572f221c81e72.",  # sentence-final period
+        "`7e52264a6dc51b019fc572f221c81e72`",  # markdown backticks
+        "'7e52264a6dc51b019fc572f221c81e72',",  # quoted list element
+        "(7e52264a6dc51b019fc572f221c81e72)",  # parenthesized
+    ],
+)
+def test_dispatch_by_runtime_accepts_id_with_paste_punctuation(
+    monkeypatch: pytest.MonkeyPatch,
+    pasted: str,
+) -> None:
+    """
+    An id pasted with surrounding punctuation resolves — the lookup and
+    the wrapper both receive the bare id it contains. Rejecting it (or
+    worse, the raw ``StatementError`` traceback the ``Uuid16`` bind used
+    to raise) would fail a command the user copied in good faith.
+    """
+    seen: dict[str, str] = {}
+
+    def _label(*, conv_id: str) -> str:
+        """Record the id the store lookup receives."""
+        seen["conv_id"] = conv_id
+        return "codex-native-ui"
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_local", _label)
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """Record the kwargs ``run_codex_native`` was called with."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(target=pasted, server=None)
+
+    assert seen["conv_id"] == "7e52264a6dc51b019fc572f221c81e72"
+    assert captured["session_id"] == "7e52264a6dc51b019fc572f221c81e72"
+
+
+def test_dispatch_by_runtime_malformed_id_raises_before_any_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An argument containing no valid conv id (here: truncated) surfaces
+    a short ``ClickException`` — and never reaches a store or server
+    lookup, where the ``Uuid16`` bind would raise a raw
+    ``StatementError`` traceback at the user.
+    """
+
+    def _fail_if_called(**kwargs: Any) -> None:
+        """Marker — fails the test if any lookup is reached."""
+        del kwargs
+        raise AssertionError("lookup reached with a malformed conv id")
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_local", _fail_if_called)
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_remote", _fail_if_called)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        resume_dispatch._dispatch_by_runtime(
+            target="7e52264a",
+            server=None,
+        )
+
+    assert excinfo.value.message == "Invalid session id."
+
+
+def test_dispatch_by_runtime_legacy_prefixed_id_canonicalized_to_bare_hex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A legacy ``conv_<hex>`` spelling still resolves — and is
+    canonicalized to bare hex before lookup and wrapper dispatch, so
+    downstream consumers that key sessions on the bare spelling never
+    see the prefixed form.
+    """
+    seen: dict[str, str] = {}
+
+    def _label(*, conv_id: str) -> str:
+        """Record the id the store lookup receives."""
+        seen["conv_id"] = conv_id
+        return "codex-native-ui"
+
+    monkeypatch.setattr(resume_dispatch, "_read_wrapper_label_local", _label)
+    captured: dict[str, Any] = {}
+
+    def _capture(**kwargs: Any) -> None:
+        """Record the kwargs ``run_codex_native`` was called with."""
+        captured.update(kwargs)
+
+    monkeypatch.setattr("omnigent.codex_native.run_codex_native", _capture)
+
+    resume_dispatch._dispatch_by_runtime(
+        target="conv_415c9954e2fe4b9276083a4d2c66f689",
+        server=None,
+    )
+
+    assert seen["conv_id"] == "415c9954e2fe4b9276083a4d2c66f689"
+    assert captured["session_id"] == "415c9954e2fe4b9276083a4d2c66f689"
+
+
 def test_dispatch_by_runtime_non_wrapper_local_raises_with_hint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

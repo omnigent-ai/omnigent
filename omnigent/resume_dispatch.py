@@ -35,6 +35,11 @@ from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
 
 _logger = logging.getLogger(__name__)
 
+# Characters a copy-paste commonly drags along around an id (sentence
+# punctuation, quoting, brackets). Never valid in any id spelling, so
+# stripping them from the ends cannot change which conversation resolves.
+_PASTE_PUNCTUATION = " \t`'\"()[]{}<>.,;:"
+
 
 def run_resume(
     *,
@@ -164,10 +169,24 @@ def _dispatch_by_runtime(
     :param server: Optional remote Omnigent server URL. ``None`` when
         the lookup should hit a freshly-started local server (the
         claude-native wrapper owns its own local server lifecycle).
-    :raises click.ClickException: When the conversation can't be
-        resolved, can't be classified, or is not a terminal-native
-        session.
+    :raises click.ClickException: When *target* is not a valid
+        conversation id, the conversation can't be resolved, can't be
+        classified, or is not a terminal-native session.
     """
+    from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+
+    # Resolve the id the argument contains, then canonicalize to bare hex
+    # before any lookup: a paste drags punctuation along (trailing period,
+    # wrapping quotes or backticks), and none of it can ever be part of a
+    # valid id — so strip it and resume rather than erroring. A malformed
+    # id would otherwise surface as a raw StatementError traceback from
+    # the local store's Uuid16 bind, and downstream consumers key
+    # sessions on the bare spelling.
+    try:
+        target = uuid_to_bytes(target.strip(_PASTE_PUNCTUATION)).hex()
+    except InvalidUuidError as exc:
+        raise click.ClickException("Invalid session id.") from exc
+
     if server is not None:
         wrapper = _read_wrapper_label_remote(server=server, conv_id=target)
         if _dispatch_wrapper(
