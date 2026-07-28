@@ -7,11 +7,13 @@ executor:
   config:
     harness: claude-native
     # ``permission_mode: auto`` becomes Claude Code's ``--permission-mode auto``:
-    # tool calls are auto-approved while Claude's background safety checks still
-    # run, unlike ``bypassPermissions``, which skips Claude's gates entirely.
-    # polly runs this worker headless, so a prompting mode stalls it because nobody
-    # is watching to answer an ApprovalCard. Omnigent's independent
-    # ``blast_radius`` gate below still denies the catastrophic set.
+    # Claude auto-approves tool calls instead of prompting, which this worker
+    # needs because polly runs it headless and nobody is watching to answer an
+    # ApprovalCard. ``bypassPermissions`` also skips prompting, but its
+    # ``PermissionRequest`` hook never fires for ``AskUserQuestion``; Omnigent
+    # needs a separate interception shim to deliver those questions to the web UI.
+    # Omnigent's independent ``blast_radius`` gate below still denies the
+    # catastrophic set.
     permission_mode: auto
 
 prompt: |
