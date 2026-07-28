@@ -15,7 +15,14 @@
 // menu (Run now / Pause / Resume / Edit / Delete) sits on the right.
 
 import { useMemo, useState } from "react";
-import { MoreHorizontalIcon, PauseIcon, PencilIcon, PlayIcon, Trash2Icon } from "lucide-react";
+import {
+  CirclePlayIcon,
+  MoreHorizontalIcon,
+  PauseIcon,
+  PencilIcon,
+  PlayIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
@@ -173,7 +180,7 @@ export function ScheduledTaskRow({
           <DropdownMenuItem onSelect={() => onPauseToggle(task)} data-testid="task-pause-toggle">
             {paused ? (
               <>
-                <PlayIcon className="size-4" />
+                <CirclePlayIcon className="size-4" />
                 Resume
               </>
             ) : (
