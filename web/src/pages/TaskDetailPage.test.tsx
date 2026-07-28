@@ -242,17 +242,15 @@ describe("header, prompt, configuration", () => {
     expect(toggle).toHaveAttribute("aria-checked", "true");
   });
 
-  it("renders the status line as [state pill] [toggle] [schedule], in that order", () => {
+  it("renders the status line as [toggle] [state pill] [schedule], in that order", () => {
     setTask(task({ state: "active" }));
     renderPage();
     const pill = screen.getByTestId("task-detail-state-pill");
     const toggle = screen.getByTestId("task-detail-pause-toggle");
     const schedule = screen.getByTestId("task-detail-schedule");
-    // Document order: pill before toggle before schedule.
-    expect(pill.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(
-      toggle.compareDocumentPosition(schedule) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+    // Document order: toggle before pill before schedule.
+    expect(toggle.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(pill.compareDocumentPosition(schedule) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 });
 

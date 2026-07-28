@@ -202,9 +202,19 @@ export function TaskDetailPage() {
         </div>
       </div>
 
-      {/* Status line: state pill + active toggle (Switch, ON = active) +
-          schedule + next-run. The Switch sits to the RIGHT of the pill. */}
+      {/* Status line: active toggle (Switch, ON = active) + state pill +
+          schedule + next-run. The Switch sits to the LEFT of the pill. */}
       <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+        {/* A scheduled task is ON when active. onCheckedChange passes a boolean,
+            but handlePauseToggle derives the next state from `paused` and
+            ignores its args, so no rewiring is needed. */}
+        <Switch
+          aria-label={paused ? "Resume automation" : "Pause automation"}
+          data-testid="task-detail-pause-toggle"
+          checked={!paused}
+          disabled={busy}
+          onCheckedChange={handlePauseToggle}
+        />
         <span
           data-testid="task-detail-state-pill"
           className={cn(
@@ -216,16 +226,6 @@ export function TaskDetailPage() {
         >
           {paused ? "Paused" : "Active"}
         </span>
-        {/* A scheduled task is ON when active. onCheckedChange passes a boolean,
-            but handlePauseToggle derives the next state from `paused` and
-            ignores its args, so no rewiring is needed. */}
-        <Switch
-          aria-label={paused ? "Resume automation" : "Pause automation"}
-          data-testid="task-detail-pause-toggle"
-          checked={!paused}
-          disabled={busy}
-          onCheckedChange={handlePauseToggle}
-        />
         <span className="text-muted-foreground" data-testid="task-detail-schedule">
           {scheduleSummary}
           {nextRun && ` · Next run ${nextRun}`}
