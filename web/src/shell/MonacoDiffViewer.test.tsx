@@ -183,11 +183,14 @@ describe("MonacoDiffViewer", () => {
   it("restores and records the modified side's scroll offset", async () => {
     saveScrollTop("viewer-diff:conv_1:src/a.ts", 260);
     const setScrollTop = vi.fn();
-    const onDidScrollChange = vi.fn(() => ({ dispose: () => {} }));
+    const onDidScrollChange = vi.fn((_listener: (e: { scrollTop: number }) => void) => ({
+      dispose: () => {},
+    }));
     const fakeModified = {
       getModel: () => ({ setEOL: vi.fn() }),
       setScrollTop,
       onDidScrollChange,
+      getDomNode: () => document.createElement("div"),
     };
     renderDiff({ before: "a", after: "b", layout: "split" });
     await waitFor(() => expect(h.onMount).not.toBeNull());
@@ -204,11 +207,48 @@ describe("MonacoDiffViewer", () => {
     // The reader's place in the diff is restored, and further scrolling is
     // cached under the diff's own key.
     expect(setScrollTop).toHaveBeenCalledWith(260);
-    const handler = onDidScrollChange.mock.calls[0]?.[0] as unknown as (e: {
-      scrollTop: number;
-    }) => void;
+    const handler = onDidScrollChange.mock.calls[0]![0];
+    handler({ scrollTop: 260 });
     handler({ scrollTop: 88 });
     expect(getSavedScrollTop("viewer-diff:conv_1:src/a.ts")).toBe(88);
+  });
+
+  it("does not let the mount-time clamp overwrite the diff's saved offset", async () => {
+    saveScrollTop("viewer-diff:conv_1:src/a.ts", 260);
+    const setScrollTop = vi.fn();
+    const onDidScrollChange = vi.fn((_listener: (e: { scrollTop: number }) => void) => ({
+      dispose: () => {},
+    }));
+    const fakeModified = {
+      getModel: () => ({ setEOL: vi.fn() }),
+      setScrollTop,
+      onDidScrollChange,
+      getDomNode: () => document.createElement("div"),
+    };
+    renderDiff({ before: "a", after: "b", layout: "split" });
+    await waitFor(() => expect(h.onMount).not.toBeNull());
+
+    act(() => {
+      h.onMount?.(
+        { getModifiedEditor: () => fakeModified } as unknown as Parameters<DiffOnMount>[0],
+        {
+          editor: { EndOfLineSequence: { LF: 0, CRLF: 1 } },
+        } as unknown as Parameters<DiffOnMount>[1],
+      );
+    });
+    setScrollTop.mockClear();
+
+    // The panes aren't laid out yet, so Monaco reports the clamped 0; caching it
+    // would lose the reader's place, so the target is re-asserted instead.
+    const handler = onDidScrollChange.mock.calls[0]![0];
+    handler({ scrollTop: 0 });
+    expect(getSavedScrollTop("viewer-diff:conv_1:src/a.ts")).toBe(260);
+    expect(setScrollTop).toHaveBeenCalledWith(260);
+
+    // Once the offset is reachable, saving resumes.
+    handler({ scrollTop: 260 });
+    handler({ scrollTop: 12 });
+    expect(getSavedScrollTop("viewer-diff:conv_1:src/a.ts")).toBe(12);
   });
 
   it("re-fonts the mounted diff editor when the code-font preference changes", async () => {

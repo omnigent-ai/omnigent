@@ -42,7 +42,7 @@ import {
 } from "./monacoSetup";
 import type { monaco } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
-import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 type EditorOptions = EditorProps["options"];
@@ -335,18 +335,12 @@ function MonacoCodeEditorInner({
         if (viewState) ed.restoreViewState(viewState);
       };
       // Reopening a file (or switching sessions and back) lands where the user
-      // left off. The editor is not laid out yet at mount, which clamps the
-      // offset to 0, so re-assert it once the first frame has sized it.
-      const saved = getSavedScrollTop(scrollKeyRef.current);
-      if (saved !== undefined && saved > 0) {
-        editor.setScrollTop(saved);
-        requestAnimationFrame(() => {
-          if (editorInstanceRef.current === editor) editor.setScrollTop(saved);
-        });
-      }
-      editor.onDidScrollChange((e) => {
-        saveScrollTop(scrollKeyRef.current, e.scrollTop);
-      });
+      // left off, and further scrolling is cached under the current file's key.
+      attachEditorScrollRestore(
+        editor,
+        () => scrollKeyRef.current,
+        () => editorInstanceRef.current === editor,
+      );
       setMounted(true);
     },
     [setContentRef, setDirty, content],

@@ -21,6 +21,7 @@ const h = vi.hoisted(() => ({
   blur: null as (() => void) | null,
   scrollTops: [] as number[],
   scroll: null as ((e: { scrollTop: number }) => void) | null,
+  domNode: document.createElement("div"),
 }));
 
 // Minimal Monaco namespace: only the members handleMount touches.
@@ -38,6 +39,8 @@ interface FakeEditor {
   onDidBlurEditorWidget: (handler: () => void) => { dispose: () => void };
   setScrollTop: (top: number) => void;
   onDidScrollChange: (handler: (e: { scrollTop: number }) => void) => { dispose: () => void };
+  /** Real node so the restore can listen for the reader taking over scrolling. */
+  getDomNode: () => HTMLElement;
   saveViewState: () => null;
   restoreViewState: () => void;
   getAction: () => { run: () => void };
@@ -72,6 +75,7 @@ function makeFakeEditor(initial: string): FakeEditor {
       h.scroll = handler;
       return { dispose: () => {} };
     },
+    getDomNode: () => h.domNode,
     saveViewState: () => null,
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
@@ -180,6 +184,7 @@ beforeEach(() => {
   h.blur = null;
   h.scrollTops = [];
   h.scroll = null;
+  h.domNode = document.createElement("div");
   mockWrite();
   // Online → auto-save enabled.
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
@@ -328,8 +333,36 @@ describe("MonacoCodeEditor scroll position persistence", () => {
     saveScrollTop(KEY, 320);
     saveScrollTop("viewer:conv_monaco_autosave:src/other.ts", 15);
     await renderMounted(makeEditor());
+    // Reaching the restored offset ends the restore, so later scrolls persist.
+    h.scroll?.({ scrollTop: 320 });
     h.scroll?.({ scrollTop: 44 });
     expect(getSavedScrollTop(KEY)).toBe(44);
     expect(getSavedScrollTop("viewer:conv_monaco_autosave:src/other.ts")).toBe(15);
+  });
+
+  it("does not let the mount-time clamp overwrite the saved offset", async () => {
+    saveScrollTop(KEY, 320);
+    await renderMounted(makeEditor());
+    h.scrollTops = [];
+
+    // Not laid out yet: Monaco clamps to 0 and reports it. Persisting that would
+    // destroy the reader's position, so the target is re-asserted instead.
+    h.scroll?.({ scrollTop: 0 });
+    expect(getSavedScrollTop(KEY)).toBe(320);
+    expect(h.scrollTops).toContain(320);
+
+    // Once the editor can hold the offset, saving resumes.
+    h.scroll?.({ scrollTop: 320 });
+    h.scroll?.({ scrollTop: 90 });
+    expect(getSavedScrollTop(KEY)).toBe(90);
+  });
+
+  it("stops re-asserting when the reader scrolls during the restore", async () => {
+    saveScrollTop(KEY, 320);
+    await renderMounted(makeEditor());
+
+    h.domNode.dispatchEvent(new Event("wheel"));
+    h.scroll?.({ scrollTop: 10 });
+    expect(getSavedScrollTop(KEY)).toBe(10);
   });
 });

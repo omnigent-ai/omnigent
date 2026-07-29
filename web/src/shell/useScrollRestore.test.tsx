@@ -5,13 +5,21 @@
 //   2. A fresh key starts at the top, unaffected by another key's offset.
 //   3. The loading clamp (scrollTop forced to 0 before the content is tall
 //      enough) cannot overwrite the saved offset.
-//   4. Saving resumes once the restore settles.
-//   5. A null key disables persistence entirely.
+//   4. The restore keeps trying while the content is still growing, and only
+//      gives up once its time budget expires.
+//   5. Real user input (a wheel gesture) settles the restore immediately.
+//   6. Saving resumes once the restore settles.
+//   7. A null key disables persistence entirely.
 
 import { useRef } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
-import { getSavedScrollTop, saveScrollTop, useScrollRestore } from "./useScrollRestore";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  SCROLL_RESTORE_BUDGET_MS,
+  getSavedScrollTop,
+  saveScrollTop,
+  useScrollRestore,
+} from "./useScrollRestore";
 
 function Scroller({ scrollKey, ready }: { scrollKey: string | null; ready: boolean }) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -25,14 +33,30 @@ function mount(scrollKey: string | null, ready = true) {
   return { view, el };
 }
 
-// jsdom has no layout (scrollHeight/clientHeight are 0), so a saved offset > 0
-// is never "reachable" — the restore settles via the height-stopped-changing
-// path after one animation frame.
-async function settleRestore() {
+// The restore's budget is measured with performance.now(), so tests drive a
+// controllable clock instead of waiting out real seconds.
+let now = 0;
+
+async function nextFrame() {
   await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))));
 }
 
-afterEach(cleanup);
+// jsdom has no layout (scrollHeight/clientHeight are 0), so a saved offset > 0
+// is never reachable — the restore settles when the budget runs out.
+async function settleRestore() {
+  now += SCROLL_RESTORE_BUDGET_MS + 1;
+  await nextFrame();
+}
+
+beforeEach(() => {
+  now = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+});
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("useScrollRestore", () => {
   it("restores the saved offset when a key is revisited", async () => {
@@ -57,7 +81,7 @@ describe("useScrollRestore", () => {
     expect(other.el.scrollTop).toBe(0);
   });
 
-  it("does not let the loading clamp overwrite the saved offset", async () => {
+  it("does not let the loading clamp overwrite the saved offset", () => {
     saveScrollTop("view:clamp", 90);
 
     // Revisit: the container is still a short placeholder, so the browser
@@ -67,6 +91,44 @@ describe("useScrollRestore", () => {
     fireEvent.scroll(el);
 
     expect(getSavedScrollTop("view:clamp")).toBe(90);
+  });
+
+  it("keeps retrying while the height is stable but the budget has not expired", async () => {
+    saveScrollTop("view:slow", 140);
+    const { el } = mount("view:slow");
+
+    // Async content (highlighting, images, lazy cells) can stall for several
+    // frames before growing; the restore must not surrender during the stall.
+    now += 100;
+    await nextFrame();
+    await nextFrame();
+
+    el.scrollTop = 0;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:slow")).toBe(140);
+  });
+
+  it("settles as soon as the target is reachable", async () => {
+    saveScrollTop("view:reachable", 50);
+    const { el } = mount("view:reachable");
+    // Tall content: the offset fits, so no budget needs to be spent.
+    Object.defineProperty(el, "scrollHeight", { configurable: true, value: 1000 });
+    await nextFrame();
+
+    el.scrollTop = 60;
+    fireEvent.scroll(el);
+    expect(getSavedScrollTop("view:reachable")).toBe(60);
+  });
+
+  it("stops fighting the user when they scroll during a pending restore", async () => {
+    saveScrollTop("view:wheel", 300);
+    const { el } = mount("view:wheel");
+
+    fireEvent.wheel(el);
+    el.scrollTop = 12;
+    fireEvent.scroll(el);
+
+    expect(getSavedScrollTop("view:wheel")).toBe(12);
   });
 
   it("saves again once the restore has settled", async () => {

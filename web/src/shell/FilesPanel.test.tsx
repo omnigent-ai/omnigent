@@ -15,6 +15,7 @@ import {
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
+import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceAllFiles: vi.fn(),
@@ -1331,10 +1332,13 @@ describe("FilesPanel scroll position persistence", () => {
     view.rerender(panel());
     expect(section.scrollTop).toBe(120);
 
-    // Let the restore's animation-frame loop settle (jsdom has no layout,
-    // so the target is never "reachable" — the loop gives up once the
-    // content height stops changing), then user scrolls are saved again.
+    // Let the restore's animation-frame loop settle (jsdom has no layout, so
+    // the target is never "reachable" — the loop runs until its time budget
+    // expires), then user scrolls are saved again.
+    const expired = performance.now() + SCROLL_RESTORE_BUDGET_MS + 1;
+    vi.spyOn(performance, "now").mockReturnValue(expired);
     await act(() => new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))));
+    vi.mocked(performance.now).mockRestore();
     section.scrollTop = 40;
     fireEvent.scroll(section);
     view.unmount();

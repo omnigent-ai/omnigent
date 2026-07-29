@@ -26,7 +26,7 @@ import {
   resolvedThemeToMonaco,
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
-import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
+import { attachEditorScrollRestore } from "./useScrollRestore";
 import "./monacoCodeEditor.css";
 
 interface MonacoDiffViewerProps {
@@ -128,18 +128,13 @@ export function MonacoDiffViewer({
             ? monaco.editor.EndOfLineSequence.CRLF
             : monaco.editor.EndOfLineSequence.LF,
         );
-      // Restore the reader's place in the diff; the panes aren't laid out yet at
-      // mount (the offset would clamp to 0), so re-assert after the first frame.
-      const saved = getSavedScrollTop(scrollKeyRef.current);
-      if (saved !== undefined && saved > 0) {
-        modified.setScrollTop(saved);
-        requestAnimationFrame(() => {
-          if (modifiedEditorRef.current === modified) modified.setScrollTop(saved);
-        });
-      }
-      modified.onDidScrollChange((e) => {
-        saveScrollTop(scrollKeyRef.current, e.scrollTop);
-      });
+      // Restore the reader's place in the diff and cache further scrolling under
+      // the diff's own key.
+      attachEditorScrollRestore(
+        modified,
+        () => scrollKeyRef.current,
+        () => modifiedEditorRef.current === modified,
+      );
       setMounted(true);
     },
     [after],
