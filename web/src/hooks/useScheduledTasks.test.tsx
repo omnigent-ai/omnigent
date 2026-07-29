@@ -65,6 +65,9 @@ const RUN: api.ScheduledTaskRun = {
   firedAt: 1_700_000_000,
   finishedAt: null,
   errorCode: null,
+  conversationUpdatedAt: 1_700_000_500,
+  conversationStatus: "running",
+  viewerUnread: false,
 };
 
 beforeEach(() => {

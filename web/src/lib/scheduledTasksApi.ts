@@ -78,6 +78,19 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
+  conversationUpdatedAt: number | null;
+  /**
+   * The conversation's live status (e.g. `"idle"`, `"running"`); `null` for runs without a
+   * conversation. Same semantics as the `status` field in `GET /v1/sessions` list items.
+   */
+  conversationStatus: string | null;
+  /**
+   * Whether the caller has explicitly marked this conversation unread (server-side
+   * `viewer_unread`); `null` for runs without a conversation. Hydrates
+   * `useUnseenConversations` on load so the dot can be computed without per-row fetches.
+   */
+  viewerUnread: boolean | null;
 }
 
 /** Body for `POST /v1/scheduled-tasks`. */
@@ -144,6 +157,9 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  conversation_updated_at: number | null;
+  conversation_status: string | null;
+  viewer_unread: boolean | null;
 }
 
 /**
@@ -219,6 +235,9 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    conversationUpdatedAt: wire.conversation_updated_at ?? null,
+    conversationStatus: wire.conversation_status ?? null,
+    viewerUnread: wire.viewer_unread ?? null,
   };
 }
 

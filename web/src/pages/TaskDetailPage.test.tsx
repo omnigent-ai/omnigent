@@ -50,20 +50,6 @@ vi.mock("@/hooks/useHosts", () => ({
   useHosts: () => ({ data: [{ host_id: "h_1", name: "My Laptop" }] }),
 }));
 
-// Conversation fetch backing the per-run unread query. Default: a live
-// conversation exists (idle) so unread is driven purely by the read-state
-// mirror mock below. Individual tests override the resolved value (e.g. null
-// for a deleted conversation).
-const fetchConversationById = vi.fn(async (id: string) => ({
-  id,
-  object: "conversation" as const,
-  updated_at: 1_700_000_500,
-  status: "idle",
-}));
-vi.mock("@/hooks/useConversations", () => ({
-  fetchConversationById: (id: string) => fetchConversationById(id),
-}));
-
 // Read-state mirror: control unread verdicts deterministically. Default read.
 const isConversationUnseen = vi.fn(() => false);
 const isExplicitlyUnread = vi.fn(() => false);
@@ -126,6 +112,9 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
     firedAt: 1_700_000_000,
     finishedAt: 1_700_000_102,
     errorCode: null,
+    conversationUpdatedAt: 1_700_000_500,
+    conversationStatus: "idle",
+    viewerUnread: null,
     ...overrides,
   };
 }
@@ -159,13 +148,6 @@ beforeEach(() => {
   deleteMutate.mockReset();
   runNowMutate.mockReset();
   showToast.mockReset();
-  fetchConversationById.mockClear();
-  fetchConversationById.mockResolvedValue({
-    id: "c_9",
-    object: "conversation",
-    updated_at: 1_700_000_500,
-    status: "idle",
-  } as never);
   isConversationUnseen.mockReset();
   isConversationUnseen.mockReturnValue(false);
   isExplicitlyUnread.mockReset();
@@ -189,7 +171,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 function renderPage() {
-  // A real QueryClient backs the per-run unread useQuery in useRunUnread.
+  // QueryClient required by other hooks in the tree (useScheduledTask, etc.).
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0 } },
   });
@@ -518,11 +500,41 @@ describe("run history", () => {
     await waitFor(() => expect(screen.getAllByText("Unread").length).toBeGreaterThan(0));
   });
 
-  it("treats a deleted conversation (fetch → null) as read: grey dot, still clickable", async () => {
-    isConversationUnseen.mockReturnValue(true); // would be unread IF it existed
-    fetchConversationById.mockResolvedValue(null as never);
+  it("shows unread dot from server viewerUnread=true with no per-row fetchConversationById call", async () => {
+    // isConversationUnseen stays false (local mirror has no baseline yet, as on
+    // a fresh page load). The server-side viewerUnread flag drives the dot.
+    isConversationUnseen.mockReturnValue(false);
     setTask(task());
-    setRuns([run({ status: "succeeded", conversationId: "c_gone" })]);
+    setRuns([
+      run({
+        status: "succeeded",
+        conversationId: "c_server_unread",
+        conversationUpdatedAt: 1_700_000_500,
+        conversationStatus: "idle",
+        viewerUnread: true,
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    await waitFor(() => expect(row).toHaveAttribute("data-run-unread", "true"));
+    const dot = within(row).getByTestId("run-status-dot");
+    expect(dot).toHaveAttribute("data-run-icon", "unread");
+  });
+
+  it("treats a deleted/missing conversation (no payload) as read: grey dot, still clickable", async () => {
+    isConversationUnseen.mockReturnValue(true); // would be unread IF it existed
+    setTask(task());
+    // A run whose conversation was deleted: the backend returns null for the
+    // enriched fields (no conversation found in the store).
+    setRuns([
+      run({
+        status: "succeeded",
+        conversationId: "c_gone",
+        conversationUpdatedAt: null,
+        conversationStatus: null,
+        viewerUnread: null,
+      }),
+    ]);
     renderPage();
     const row = screen.getByTestId("task-detail-run");
     await waitFor(() => expect(row).toHaveAttribute("data-run-unread", "false"));
@@ -758,9 +770,7 @@ describe("auto-mark runs unread", () => {
 
     // seedRunUnreadBaseline was called — not markConversationUnread.
     expect(seedRunUnreadBaseline).toHaveBeenCalledWith("c_run", expect.any(Number));
-    // isExplicitlyUnread is never set by seedRunUnreadBaseline, so opening the
-    // conversation (markConversationSeen) is not blocked. The dot is driven
-    // purely by isConversationUnseen, which clears normally on open.
-    expect(isExplicitlyUnread).not.toHaveBeenCalledWith("c_run");
+    // seedRunUnreadBaseline does NOT set the explicitlyUnread override, so
+    // markConversationSeen is never blocked by it when the user clicks through.
   });
 });

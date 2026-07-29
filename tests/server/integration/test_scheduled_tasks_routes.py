@@ -574,6 +574,67 @@ async def test_list_runs_returns_history_for_owned_task(
     assert "error" not in newest
 
 
+async def test_list_runs_includes_conversation_read_state_fields(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Run rows include batched conversation read-state fields; skipped runs get nulls.
+
+    The ``/runs`` endpoint enriches each run that has a ``conversation_id`` with
+    ``conversation_updated_at``, ``conversation_status``, and ``viewer_unread``
+    so the frontend can compute the unread dot without per-row session GETs.
+    Runs with no conversation (skipped/failed host-less) get null for all three.
+    """
+    import uuid
+
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    task_id = created["id"]
+
+    # Create a real conversation in the store so the batch-fetch can hydrate it.
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
+
+    succeeded_id = uuid.uuid4().hex
+    skipped_id = uuid.uuid4().hex
+    _seed_run(
+        db_uri,
+        task_id,
+        succeeded_id,
+        scheduled_at=1000,
+        status="succeeded",
+        conversation_id=conv.id,
+    )
+    _seed_run(
+        db_uri,
+        task_id,
+        skipped_id,
+        scheduled_at=2000,
+        status="skipped",
+        error_code="no_online_host",
+        conversation_id=None,
+    )
+
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    runs = {r["id"]: r for r in resp.json()["runs"]}
+
+    # The succeeded run with a real conversation gets enriched fields.
+    succ = runs[succeeded_id]
+    assert succ["conversation_updated_at"] == conv.updated_at
+    assert succ["conversation_status"] is None  # live_status is None until first turn
+    assert succ["viewer_unread"] is False  # no explicit-unread set for this viewer
+
+    # The skipped run (no conversation_id) gets null for all three fields.
+    skip = runs[skipped_id]
+    assert skip["conversation_updated_at"] is None
+    assert skip["conversation_status"] is None
+    assert skip["viewer_unread"] is None
+
+
 async def test_list_runs_empty_for_task_with_no_runs(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

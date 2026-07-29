@@ -13,7 +13,6 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import {
   CalendarOffIcon,
   ChevronLeftIcon,
@@ -37,7 +36,6 @@ import {
   useScheduledTaskRuns,
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
-import { fetchConversationById } from "@/hooks/useConversations";
 import {
   isConversationUnseen,
   isExplicitlyUnread,
@@ -412,32 +410,38 @@ function ConfigField({ label, value, testId }: { label: string; value: string; t
 }
 
 /**
- * Resolve whether a succeeded run's conversation is genuinely UNREAD, using the
- * SAME read-state signal as the sidebar's "new messages" dot.
+ * Resolve whether a run's conversation is genuinely UNREAD from the enriched
+ * run payload — with zero per-row session GETs.
  *
- * IMPORTANT: the run row carries only `conversationId`; unread lives on the
- * conversation. The single-session `GET /v1/sessions/{id}` (what
- * `fetchConversationById` calls) does NOT return `viewer_unread` — that field
- * is only on the LIST items (`SessionListItem`), verified against the schema
- * and the live backend. So we don't read a `viewer_unread` off the fetch.
- * Instead we fetch the conversation for its authoritative `updated_at` +
- * `status`, then feed those to the app's `isConversationUnseen` (the read-state
- * mirror in `useUnseenConversations`), OR honor an explicit "mark unread".
- * `useUnseenTick()` makes this recompute the instant the user opens the thread
- * (marking it read) without a refetch. A deleted conversation → `null` → read.
+ * The runs endpoint returns `conversationUpdatedAt`, `conversationStatus`, and
+ * `viewerUnread` (batched server-side). Priority:
+ *   1. Local explicit-unread override (app-level "mark unread", a628dc12 path).
+ *   2. Local `isConversationUnseen` — fires once `lastSeenMap` has a baseline
+ *      for this conversation (set by `seedRunUnreadBaseline` on new completions,
+ *      or by the sidebar's `seedReadState` on load).
+ *   3. Server `viewerUnread` — the server-side explicit-unread flag, covering
+ *      runs that were completed before this page was ever opened (no local
+ *      baseline yet).
+ * `useUnseenTick()` re-renders the instant the user opens the thread (marking
+ * it read in the local mirror) so the dot clears without a refetch.
  */
-function useRunUnread(conversationId: string | null, enabled: boolean): boolean {
+function useRunUnread(run: ScheduledTaskRun): boolean {
   // Re-render when the read-state mirror changes (open thread → mark read).
   useUnseenTick();
-  const { data: conversation } = useQuery({
-    queryKey: ["conversation-unread", conversationId],
-    queryFn: () => fetchConversationById(conversationId as string),
-    enabled: enabled && conversationId !== null,
-    staleTime: 30_000,
-  });
-  if (!conversationId || !conversation) return false;
-  if (isExplicitlyUnread(conversationId)) return true;
-  return isConversationUnseen(conversationId, conversation.updated_at, conversation.status);
+  if (run.conversationId === null || run.conversationUpdatedAt === null) return false;
+  if (isExplicitlyUnread(run.conversationId)) return true;
+  if (
+    isConversationUnseen(
+      run.conversationId,
+      run.conversationUpdatedAt,
+      run.conversationStatus ?? undefined,
+    )
+  ) {
+    return true;
+  }
+  // Fall back to the server's explicit-unread flag for runs the local mirror
+  // hasn't seeded yet (no lastSeenMap entry from this client session).
+  return run.viewerUnread === true;
 }
 
 /**
@@ -458,10 +462,7 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
-  const unread = useRunUnread(
-    run.conversationId,
-    run.status === "succeeded" && run.conversationId !== null,
-  );
+  const unread = useRunUnread(run);
 
   const body = (
     <>
