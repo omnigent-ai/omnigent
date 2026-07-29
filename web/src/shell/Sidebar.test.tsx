@@ -539,8 +539,8 @@ describe("Sidebar session list", () => {
       // (bg-popover surface), not the old wide card.
       expect(tooltip.className).toContain("bg-popover");
       expect(tooltip.className).not.toContain("bg-card-solid");
-      // The title is sized to match the sidebar row name (fixed
-      // --sidebar-font-size via `sidebar-compact-text`), not rem-based text-sm.
+      // The title is sized to match the sidebar row name
+      // (`sidebar-compact-text`, 13px at the default), not the larger text-sm.
       const tooltipTitle = tooltip.querySelector("p.sidebar-compact-text");
       expect(tooltipTitle).not.toBeNull();
       expect(tooltipTitle).toHaveTextContent(title);
