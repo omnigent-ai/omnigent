@@ -27,12 +27,12 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
-from omnigent.server.routes._sessions.helpers import _read_state_entry
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
 )
+from omnigent.server.routes._sessions.helpers import _read_state_entry
 from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -440,7 +440,7 @@ def create_scheduled_tasks_router(
         for r in runs:
             if r.conversation_id is not None and r.conversation_id in convs:
                 conv = convs[r.conversation_id]
-                last_seen, explicit_unread = _read_state_entry(owner_id, r.conversation_id)
+                _last_seen, explicit_unread = _read_state_entry(owner_id, r.conversation_id)
                 run_rows.append(
                     _run_to_response(
                         r,
