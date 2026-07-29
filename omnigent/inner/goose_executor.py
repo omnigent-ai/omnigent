@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -267,7 +268,13 @@ class GooseExecutor(Executor):
         """
         # This may be a restart after the previous subprocess died.
         self._reset_process_state()
-        env = os.environ.copy()
+        # Deny-by-default: base + this harness's own families + the spec's
+        # env_passthrough. Previously os.environ.copy() handed the goose CLI
+        # every host secret (#3445).
+        env = clean_agent_env(
+            allow_prefixes=("GOOSE_",),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
         env.update(self._provider_env())
         argv: list[str] = ["acp"]
         for builtin in self._builtins:

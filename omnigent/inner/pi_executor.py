@@ -49,6 +49,7 @@ from typing import Any, TypeAlias
 from urllib.parse import urlparse as _urlparse
 
 from omnigent import model_catalog
+from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
@@ -929,30 +930,24 @@ def _clean_pi_env(extra_allowed: Sequence[str] | None = None) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the Pi subprocess.
 
-    Deny-by-default allowlist mirroring the codex path's
-    :func:`omnigent.inner.codex_executor._clean_codex_env`. The previous
-    additive ``{**os.environ, **env}`` merge leaked every host secret
+    Thin wrapper over :func:`omnigent.inner.agent_env.clean_agent_env`. The
+    previous additive ``{**os.environ, **env}`` merge leaked every host secret
     — cloud tokens, API keys — into the Pi process, sandboxed or not.
-    Credential families are deliberately not allowlisted:
-    gateway runs authenticate through the generated ``models.json``,
-    and a spec that legitimately needs a variable inside the Pi
-    process opts in via ``os_env.sandbox.env_passthrough``.
+    Credential families are deliberately not allowlisted: gateway runs
+    authenticate through the generated ``models.json``, and a spec that
+    legitimately needs a variable inside the Pi process opts in via
+    ``os_env.sandbox.env_passthrough``.
 
-    :param extra_allowed: Extra exact names to pass through, e.g. the
-        spec's ``os_env.sandbox.env_passthrough`` entries
-        (``["ANTHROPIC_API_KEY"]`` for an env-key-authenticated
-        non-gateway run). ``None`` means no extras.
-    :returns: Filtered environment dict, ready to extend with the
-        executor's own variables (``PI_CODING_AGENT_DIR``, ...).
+    :param extra_allowed: Extra exact names to pass through, e.g. the spec's
+        ``os_env.sandbox.env_passthrough`` entries. ``None`` means no extras.
+    :returns: Filtered environment dict, ready to extend with the executor's
+        own variables (``PI_CODING_AGENT_DIR``, ...).
     """
-    allow_exact = set(_PI_ENV_ALLOW_EXACT)
-    if extra_allowed is not None:
-        allow_exact.update(extra_allowed)
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key in allow_exact or key.startswith(_PI_ENV_ALLOW_PREFIXES)
-    }
+    return clean_agent_env(
+        allow_prefixes=_PI_ENV_ALLOW_PREFIXES,
+        allow_exact=_PI_ENV_ALLOW_EXACT,
+        extra_allowed=extra_allowed or (),
+    )
 
 
 # ---------------------------------------------------------------------------

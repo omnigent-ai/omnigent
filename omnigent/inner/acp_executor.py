@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -317,7 +318,13 @@ class AcpExecutor(Executor):
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
         self._image_supported = False
-        env = os.environ.copy()
+        # Deny-by-default: base + this harness's own families + the spec's
+        # env_passthrough. Previously os.environ.copy() handed the acp CLI
+        # every host secret (#3445).
+        env = clean_agent_env(
+            allow_prefixes=(),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
         self._proc = await asyncio.create_subprocess_exec(

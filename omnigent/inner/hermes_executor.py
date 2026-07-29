@@ -48,6 +48,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -374,10 +375,21 @@ class HermesExecutor(Executor):
             skills_filter=self._skills_filter,
         )
 
-        # Build subprocess env with per-session HERMES_HOME for policy hooks.
-        proc_env: dict[str, str] | None = None
+        # Deny-by-default: base + hermes's own family + the spec's
+        # env_passthrough (#3445). Previously the hermes_home branch merged the
+        # whole of os.environ, and the else branch passed env=None — which
+        # inherits everything, so the no-policy-hooks path leaked the most.
+        #
+        # NOTE for review: DATABRICKS_* is deliberately NOT allowlisted here.
+        # If hermes's legitimate auth needs it, that family is exactly the one
+        # this change exists to stop leaking, so it should be declared per-spec
+        # via os_env.sandbox.env_passthrough rather than blanket-allowed.
+        proc_env = clean_agent_env(
+            allow_prefixes=("HERMES_",),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
         if self._hermes_home is not None:
-            proc_env = {**os.environ, "HERMES_HOME": str(self._hermes_home)}
+            proc_env["HERMES_HOME"] = str(self._hermes_home)
             _logger.info("Hermes using per-session HERMES_HOME=%s", self._hermes_home)
         else:
             _logger.warning("Hermes running WITHOUT per-session HERMES_HOME (no policy hooks)")

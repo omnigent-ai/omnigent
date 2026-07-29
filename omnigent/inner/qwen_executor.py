@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
+from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     Executor,
@@ -293,7 +294,13 @@ class QwenExecutor(Executor):
         # derived from the initialize response, so it's stale too.
         self._initialized = False
         self._image_supported = False
-        env = os.environ.copy()
+        # Deny-by-default: base + this harness's own families + the spec's
+        # env_passthrough. Previously os.environ.copy() handed the qwen CLI
+        # every host secret (#3445).
+        env = clean_agent_env(
+            allow_prefixes=("QWEN_", "OPENAI_", "DASHSCOPE_"),
+            extra_allowed=declared_passthrough(self._os_env),
+        )
         # Translate Omnigent's provider/gateway routing into the OpenAI-compatible
         # env vars qwen reads (overriding any ambient values). No-op when no
         # gateway is wired (the CLI's own ambient auth is used).
