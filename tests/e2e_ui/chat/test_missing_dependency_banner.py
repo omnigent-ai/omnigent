@@ -1,31 +1,16 @@
 """Missing-dependency banner renders for an executor missing an optional dep.
 
-Covers issue #548 (PR #570): when an inner executor's optional harness
-dependency is missing, it raises a message shaped
-``<Executor> requires the '<pkg>' package. Install it with: <cmd>``.
-``ErrorBanner`` (``web/src/components/blocks/StatusBlocks.tsx``) detects
-this via ``parseMissingDependency`` and renders ``MissingDependencyBanner``
-(copyable install command via ``CliCommandBlock`` + the raw executor error
-collapsed behind a ``<details>`` block).
-
 Trigger: a test agent on the ``cursor`` harness. ``cursor-sdk`` is an opt-in
-extra (``omnigent[cursor]``) that the e2e-ui install does NOT pull in — both
-local setup (``uv sync --extra all --extra dev``) and CI
-(``uv sync --extra all --extra dev`` in ``.github/workflows/e2e-ui.yml``)
-omit it, so the package is genuinely absent without uninstalling anything.
-On the first turn ``CursorExecutor._ensure_session`` tries
-``from cursor_sdk import ...``, raises ``ImportError("CursorExecutor
-requires the 'cursor-sdk' package. Install it with:
-<extra_install_display(CURSOR_EXTRA)>")`` — the command adapts to the
-host's installer (``omnigent/onboarding/extra_install.py``), e.g.
-``uv pip install 'omnigent[cursor]'`` under uv —
-the cursor executor wraps it as an ``ExecutorError`` and
-the adapter re-raises — the wrapped message still contains the
-``requires the 'cursor-sdk' package. Install it with: …`` substring, so
-``parseMissingDependency`` matches and the friendly banner renders. The
-error fires before any LLM call, so no gateway response is needed for the
-assertion; the banner appears as soon as the harness subprocess reports the
-failed turn.
+extra (``omnigent[cursor]``) that the e2e-ui install does not pull in, so the
+package is genuinely absent without uninstalling anything. On the first turn
+``CursorExecutor._ensure_session`` fails to import it and raises
+``"CursorExecutor requires the 'cursor-sdk' package. Install it with: …"``
+(the command adapts to the host's installer via
+``omnigent/onboarding/extra_install.py``). The executor wraps it as an
+``ExecutorError``, and the prefixed message still carries that substring, so
+``parseMissingDependency`` in ``web/src/components/blocks/StatusBlocks.tsx``
+matches and ``MissingDependencyBanner`` renders. The error fires before any
+LLM call, so no gateway response is needed for the assertion.
 
 Like the rest of ``tests/e2e_ui``, this boots the live ``omnigent server``
 + runner (see ``conftest.py``); the suite is gated to the LLM workflow.
@@ -111,7 +96,7 @@ def missing_dep_session(
 # Deterministic: the cursor-sdk ImportError fires in _ensure_session on the
 # first turn, before any LLM call — so this isn't LLM-nondeterministic. Use a
 # plain `flaky` rerun (covers banner-appearance timing races) rather than
-# `llm_flaky`, which would pointlessly rotate models per attempt. #548
+# `llm_flaky`, which would pointlessly rotate models per attempt.
 @pytest.mark.flaky(reruns=2, reruns_delay=1)
 def test_missing_dependency_banner_renders(
     page: Page,

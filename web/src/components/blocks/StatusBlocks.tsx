@@ -31,32 +31,37 @@ interface ErrorBannerProps {
 }
 
 /**
- * Detect the "<Executor> requires the '<pkg>' package. Install it with:
- * <cmd>" convention the inner executors raise when an optional harness
- * dependency is missing (antigravity, claude-agent-sdk, cursor-sdk,
- * openai-agents, databricks-sdk, mlflow, …). This "Format A" shape is the
- * common one. A few executors use a "Format B" shape ("The '<pkg>' package
- * is required for <Executor>. Install it with: …") or an unquoted variant
- * (cel-expr-python); those aren't matched here and fall back to the generic
- * banner — tracked as a follow-up. Returns null when the message isn't
- * that shape so the banner falls back to the generic raw rendering. #548
+ * Pull the package name and install command out of the two shapes the inner
+ * executors raise when an optional harness dependency is missing:
+ *
+ *   "<Executor> requires the '<pkg>' package. Install it with: <cmd>"
+ *   "The '<pkg>' package is required for <what>. Install it with: <cmd>"
+ *
+ * Returns null for any other message so the banner falls back to the generic
+ * raw rendering.
  */
-const MISSING_DEP_RE = /requires the '([^']+)' package\. Install it with:\s*(.+)$/;
+const MISSING_DEP_PATTERNS = [
+  /requires the '([^']+)' package\. Install it with:\s*(.+)$/,
+  /'([^']+)' package is required for [^.]*\. Install it with:\s*(.+)$/,
+];
 function parseMissingDependency(
   message: string,
 ): { packageName: string; installCommand: string } | null {
   if (!message) return null;
-  // `String.match(regex)` here, not the RegExp prototype's exec method: both
-  // are equivalent for a non-global regex (each returns [full, g1, g2, …] or
-  // null). The security-scan exfil heuristic flags that method's literal call
-  // token (it conflates the regex API with dynamic code execution), so
-  // `.match(` — which reads identically — keeps the PR's Security Scan green. #548
-  const m = message.match(MISSING_DEP_RE);
-  if (!m) return null;
-  // The antigravity executor trails its install command with a period (it
-  // appends a parenthetical alternative ending "...') ."); strip one so the
-  // copied install command doesn't carry it.
-  return { packageName: m[1], installCommand: m[2].replace(/\.$/, "").trim() };
+  for (const pattern of MISSING_DEP_PATTERNS) {
+    // `String.match(regex)` here, not the RegExp prototype's exec method: both
+    // are equivalent for a non-global regex (each returns [full, g1, g2, …] or
+    // null). The security-scan exfil heuristic flags that method's literal call
+    // token (it conflates the regex API with dynamic code execution), so
+    // `.match(` — which reads identically — keeps the Security Scan green.
+    const m = message.match(pattern);
+    if (!m) continue;
+    // Some executors trail the install command with a period (antigravity
+    // appends a parenthetical alternative ending "...') ."); strip one so the
+    // copied install command doesn't carry it.
+    return { packageName: m[1], installCommand: m[2].replace(/\.$/, "").trim() };
+  }
+  return null;
 }
 
 interface MissingDependencyBannerProps {
@@ -68,8 +73,7 @@ interface MissingDependencyBannerProps {
 /**
  * Friendly remediation for a missing optional dependency: a concise summary,
  * the install command as a copyable action, and the raw executor error
- * collapsed behind a details block for diagnostics. Replaces the raw
- * `RuntimeError` dump the chat transcript used to show for these. #548
+ * collapsed behind a details block for diagnostics.
  */
 function MissingDependencyBanner({
   packageName,
@@ -109,7 +113,7 @@ function MissingDependencyBanner({
  * `message` is empty (matches the reducer's intent — never show a blank
  * panel even when the LLM error payload omits the message). Missing-
  * dependency errors route to `MissingDependencyBanner` for a friendlier,
- * actionable remediation. #548
+ * actionable remediation.
  */
 export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
   const dep = parseMissingDependency(message);
