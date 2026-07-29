@@ -396,7 +396,12 @@ def parse_kiro_jsonl_record(line: str) -> KiroTranscriptRecord | None:
     raw_message_id = data.get("message_id")
     message_id = raw_message_id if isinstance(raw_message_id, str) else ""
     if kind == "ToolResults":
-        tool_results = _extract_tool_results(data.get("content"))
+        # A ``ToolResults`` record carries its items under ``results`` (kiro-cli
+        # 2.15.1 serde metadata: ``ToolResults{results}``), with ``content`` kept
+        # as a tolerant fallback for a variant/older shape.
+        tool_results = _extract_tool_results(data.get("results"))
+        if not tool_results:
+            tool_results = _extract_tool_results(data.get("content"))
         if not tool_results:
             return None
         return KiroTranscriptRecord(
@@ -439,17 +444,20 @@ def _kiro_content_text(content: object) -> str:
     return "\n".join(parts)
 
 
-# kiro-cli is closed-source and no public capture pins the exact key spellings
-# inside its tool blocks (the record kinds and the ``tooluse_`` id shape are
-# corroborated; the block-level keys are not). Until a captured transcript
-# locks them, accept the tag/key spellings of both the transcript's own
-# ``kind``/``data`` block style and the ACP wire style kiro also speaks.
+# Tag/key spellings taken from kiro-cli 2.15.1 serde type metadata (record
+# kinds, the ``ContentBlock`` enum tags ``toolUse``/``toolResult``, and the
+# field clusters ``ToolUseBlock{toolUseId|tool_use_id, name, input}`` /
+# ``ToolResultContent{toolUseId, content, structuredContent, isError}``). The
+# binary carries two co-existing representations (the camelCase ACP/content
+# form and a snake_case bedrock form), and which one lands in the on-disk JSONL
+# is not yet pinned by a captured transcript, so both spellings are accepted
+# until a live capture locks the shape.
 _TOOL_USE_BLOCK_TAGS = frozenset({"toolUse", "tool_use"})
 _TOOL_RESULT_BLOCK_TAGS = frozenset({"toolResult", "tool_result"})
-_TOOL_ID_KEYS = ("tool_use_id", "toolUseId", "id", "toolCallId")
+_TOOL_ID_KEYS = ("toolUseId", "tool_use_id", "id", "toolCallId")
 _TOOL_NAME_KEYS = ("name", "toolName", "tool_name")
 _TOOL_ARGS_KEYS = ("input", "args", "arguments")
-_TOOL_OUTPUT_KEYS = ("content", "output", "text", "data")
+_TOOL_OUTPUT_KEYS = ("content", "structuredContent", "output", "text", "data")
 
 
 def _block_tag(block: dict[str, object]) -> str | None:

@@ -82,11 +82,16 @@ def _assistant_record(
 
 
 def _tool_results_record(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """One ``ToolResults`` record with ``toolResult`` blocks."""
+    """One ``ToolResults`` record with ``toolResult`` blocks.
+
+    The list field is ``results`` (kiro-cli 2.15.1 serde metadata:
+    ``ToolResults{results}``), each block adjacently tagged ``toolResult`` with
+    its fields under ``data``.
+    """
     return {
         "version": "v1",
         "kind": "ToolResults",
-        "data": {"content": [{"kind": "toolResult", "data": result} for result in results]},
+        "data": {"results": [{"kind": "toolResult", "data": result} for result in results]},
     }
 
 
@@ -955,6 +960,65 @@ def test_parse_kiro_jsonl_record_extracts_tool_vocabulary() -> None:
         forwarder.KiroToolResult(call_id="tooluse_A", output="file contents"),
     )
     assert forwarder.parse_kiro_jsonl_line(results_line) is None
+
+
+def test_parse_kiro_jsonl_record_tool_results_field_and_fallback() -> None:
+    """``ToolResults`` items read from ``results`` (kiro-cli 2.15.1) and, as a
+    tolerant fallback, from ``content`` for an older/variant shape."""
+    primary = json.dumps(
+        {
+            "version": "v1",
+            "kind": "ToolResults",
+            "data": {
+                "results": [
+                    {"kind": "toolResult", "data": {"toolUseId": "tooluse_A", "content": "out-a"}}
+                ]
+            },
+        }
+    )
+    record = forwarder.parse_kiro_jsonl_record(primary)
+    assert record is not None
+    assert record.tool_results == (forwarder.KiroToolResult(call_id="tooluse_A", output="out-a"),)
+
+    # structuredContent is accepted when there is no plain content block.
+    structured = json.dumps(
+        {
+            "version": "v1",
+            "kind": "ToolResults",
+            "data": {
+                "results": [
+                    {
+                        "kind": "toolResult",
+                        "data": {"toolUseId": "tooluse_B", "structuredContent": {"rows": 3}},
+                    }
+                ]
+            },
+        }
+    )
+    structured_record = forwarder.parse_kiro_jsonl_record(structured)
+    assert structured_record is not None
+    assert structured_record.tool_results[0].call_id == "tooluse_B"
+    assert "rows" in structured_record.tool_results[0].output
+
+    fallback = json.dumps(
+        {
+            "version": "v1",
+            "kind": "ToolResults",
+            "data": {
+                "content": [
+                    {
+                        "kind": "toolResult",
+                        "data": {"tool_use_id": "tooluse_C", "content": "out-c"},
+                    }
+                ]
+            },
+        }
+    )
+    fallback_record = forwarder.parse_kiro_jsonl_record(fallback)
+    assert fallback_record is not None
+    assert fallback_record.tool_results == (
+        forwarder.KiroToolResult(call_id="tooluse_C", output="out-c"),
+    )
 
 
 def test_parse_kiro_jsonl_record_accepts_flat_acp_style_tool_blocks() -> None:
