@@ -839,6 +839,55 @@ async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> No
             await reaper
 
 
+async def test_approval_lease_spares_then_releases_stale_entry(tmp_path: Path) -> None:
+    """A pending native approval keeps both harness and pane lifecycle busy."""
+    mgr = HarnessProcessManager(
+        idle_timeout_s=0.5,
+        reaper_interval_s=0.2,
+        tmp_parent=tmp_path,
+    )
+    entry = _SubprocessEntry(
+        _FakeReapProc(),
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "h",
+    )  # type: ignore[arg-type]
+    entry.last_used_at = time.monotonic() - 100.0
+    mgr._entries = {"conv": entry}
+    cutoff = time.monotonic() - 0.5
+
+    mgr.mark_approval_pending("conv", "approval-1", ttl_s=60.0)
+    assert mgr.has_active_turn("conv")
+    await mgr.release("conv", only_if_idle_cutoff=cutoff)
+    assert "conv" in mgr._entries
+    assert not entry.process.killed
+
+    mgr.clear_approval_pending("conv", "approval-1")
+    assert not mgr.has_active_turn("conv")
+    await mgr.release("conv", only_if_idle_cutoff=cutoff)
+    assert "conv" not in mgr._entries
+    assert entry.process.killed
+
+
+def test_expired_approval_lease_fails_closed_without_lifecycle_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lost completion events expire instead of keeping a process forever."""
+    clock = {"now": 100.0}
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager.time.monotonic",
+        lambda: clock["now"],
+    )
+    mgr = HarnessProcessManager(tmp_parent=tmp_path)
+
+    mgr.mark_approval_pending("conv", "approval-1", ttl_s=5.0)
+    assert mgr.has_active_turn("conv")
+
+    clock["now"] = 106.0
+    assert not mgr.has_active_turn("conv")
+
+
 async def test_idle_reaper_disabled_when_timeout_zero(
     register_test_harness: None,
     short_tmp_parent: Path,

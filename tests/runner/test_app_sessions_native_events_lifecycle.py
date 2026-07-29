@@ -111,6 +111,81 @@ class _RecordingCodexAppServerClient:
 
 
 @pytest.mark.asyncio
+async def test_approval_wait_event_leases_and_releases_runner_lifecycle() -> None:
+    """The server can protect a native approval without starting a new turn."""
+
+    class _ApprovalTrackingProcessManager(_FakeProcessManager):
+        def __init__(self) -> None:
+            super().__init__(_ScriptedHarnessClient([]))
+            self.approval_events: list[tuple[str, str, str, float | None]] = []
+
+        def mark_approval_pending(
+            self,
+            conversation_id: str,
+            elicitation_id: str,
+            *,
+            ttl_s: float,
+        ) -> None:
+            self.approval_events.append(("started", conversation_id, elicitation_id, ttl_s))
+
+        def clear_approval_pending(
+            self,
+            conversation_id: str,
+            elicitation_id: str,
+        ) -> None:
+            self.approval_events.append(("ended", conversation_id, elicitation_id, None))
+
+    conversation_id = "conv_kimi_approval_wait"
+    process_manager = _ApprovalTrackingProcessManager()
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        started = await client.post(
+            f"/v1/sessions/{conversation_id}/events",
+            json={
+                "type": "approval_wait",
+                "data": {
+                    "state": "started",
+                    "elicitation_id": "approval-1",
+                    "ttl_s": 120.0,
+                },
+            },
+        )
+        ended = await client.post(
+            f"/v1/sessions/{conversation_id}/events",
+            json={
+                "type": "approval_wait",
+                "data": {
+                    "state": "ended",
+                    "elicitation_id": "approval-1",
+                },
+            },
+        )
+        invalid = await client.post(
+            f"/v1/sessions/{conversation_id}/events",
+            json={
+                "type": "approval_wait",
+                "data": {
+                    "state": "started",
+                    "elicitation_id": "approval-2",
+                    "ttl_s": 0,
+                },
+            },
+        )
+
+    assert started.status_code == 204
+    assert ended.status_code == 204
+    assert invalid.status_code == 400
+    assert process_manager.approval_events == [
+        ("started", conversation_id, "approval-1", 120.0),
+        ("ended", conversation_id, "approval-1", None),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event_payload,expected_params",
     [

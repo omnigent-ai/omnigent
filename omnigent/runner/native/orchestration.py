@@ -3198,13 +3198,14 @@ async def _auto_create_kimi_terminal(
     then advertises the pane's tmux socket+target so the kimi-native harness
     executor can inject web-UI turns into the same pane (tmux paste).
 
-    The pane runs with a session-scoped ``KIMI_CODE_HOME`` (built by
+    The pane runs with session-scoped current and legacy Kimi homes (built by
     :func:`omnigent.kimi_native_credentials.build_kimi_session_home`) that
     mirrors the user's global ``kimi login`` (symlinked ``oauth`` / providers)
-    and adds the Omnigent tool-policy hooks — a ``PreToolUse`` deny-gate and a
-    ``PermissionRequest`` read-only surface dispatched to
-    :mod:`omnigent.kimi_native_hook`. The hook subprocess reads its routing
-    from ``hook_config.json`` in the bridge dir.
+    and adds the Omnigent ``PreToolUse`` policy hook. Kimi 1.49's in-process
+    approval runtime is subscribed through
+    :mod:`omnigent.kimi_native_approval_bridge`; its web request is only
+    resolved on a concrete user verdict, leaving Kimi's native modal
+    authoritative when the bridge is unavailable.
 
     A background forwarder (:func:`omnigent.kimi_native_forwarder.
     supervise_kimi_forwarder`) tails kimi's per-session ``wire.jsonl`` transcript
@@ -3228,6 +3229,7 @@ async def _auto_create_kimi_terminal(
     del ensure_comment_relay, agent_spec
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.kimi_native import resolve_kimi_executable
+    from omnigent.kimi_native_approval_bridge import materialize_kimi_approval_bridge
     from omnigent.kimi_native_bridge import (
         bridge_dir_for_session_id,
         write_hook_config,
@@ -3258,15 +3260,9 @@ async def _auto_create_kimi_terminal(
     # snapshot and threaded here.
     kimi_args = list(launch_config.terminal_launch_args or [])
 
-    # Wire the Omnigent tool-policy hooks: kimi reads a single
-    # ``$KIMI_CODE_HOME/config.toml``, so point it at a session-scoped home that
-    # mirrors the user's global kimi config (symlinked auth) plus a PreToolUse
-    # deny-gate and a PermissionRequest read-only surface, both dispatched to
-    # ``omnigent.kimi_native_hook``. The hook subprocess reads the server URL +
-    # auth + session id from ``hook_config.json`` in the bridge dir, so persist
-    # those first. The hook gets a one-shot token snapshot (a quick
-    # request/reply, like claude-native's permission hook); ``None`` factory is
-    # a safe no-op for local unauthenticated runs.
+    # Isolate both state layouts and add policy. Current Kimi uses the in-process
+    # approval bridge; legacy Kimi keeps its PermissionRequest hook. Both read
+    # routing from ``hook_config.json``; missing auth is safe for local runs.
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
     _auth_factory = _make_auth_token_factory()
     _auth_token = _auth_factory() if _auth_factory is not None else None
@@ -3282,10 +3278,14 @@ async def _auto_create_kimi_terminal(
         headers=_runner_headers,
         session_id=session_id,
     )
-    kimi_env = build_kimi_session_home(
-        bridge_dir / "kimi-code-home",
-        bridge_dir=bridge_dir,
-    )
+    kimi_env = {
+        **build_kimi_session_home(
+            bridge_dir / "kimi-code-home",
+            bridge_dir=bridge_dir,
+            include_current=True,
+        ),
+        **materialize_kimi_approval_bridge(bridge_dir),
+    }
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
         terminal_name="kimi",
@@ -3330,7 +3330,8 @@ async def _auto_create_kimi_terminal(
             headers=_runner_headers,
             session_id=session_id,
             bridge_dir=bridge_dir,
-            kimi_home=bridge_dir / "kimi-code-home",
+            kimi_share_dir=bridge_dir / "kimi-share",
+            legacy_kimi_home=bridge_dir / "kimi-code-home",
             workspace=workspace,
             launch_epoch_ms=launch_epoch_ms,
         ),

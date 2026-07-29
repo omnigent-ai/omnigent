@@ -568,6 +568,10 @@ class HarnessProcessManager:
         # and the idle reaper skips any conversation present here so an
         # actively-streaming turn is never reaped mid-flight.
         self._in_flight_response_ids: dict[str, str] = {}
+        # Native approvals outlive the injection request. A bounded lease keeps
+        # the runner and pane busy while the user decides, without leaking
+        # forever when a completion event is lost.
+        self._pending_approval_deadlines: dict[str, dict[str, float]] = {}
         # Per-conversation spawn lock — see §Process management:
         # Spawn lock. The lock guards the lazy-init window in
         # ``get_client``; uncontested after the first spawn for a
@@ -901,15 +905,57 @@ class HarnessProcessManager:
 
     def has_active_turn(self, conversation_id: str) -> bool:
         """
-        Check whether the given conversation has an in-flight
-        harness response (i.e. a turn is currently streaming).
+        Check whether the conversation has an in-flight response or approval.
 
         :param conversation_id: AP-allocated conversation id,
             e.g. ``"conv_abc123"``.
-        :returns: ``True`` if an in-flight response id is
+        :returns: ``True`` if a response id or unexpired approval lease is
             registered.
         """
-        return conversation_id in self._in_flight_response_ids
+        return conversation_id in self._in_flight_response_ids or self._has_pending_approval(
+            conversation_id
+        )
+
+    def _has_pending_approval(self, conversation_id: str) -> bool:
+        approvals = self._pending_approval_deadlines.get(conversation_id)
+        if not approvals:
+            return False
+        now = time.monotonic()
+        expired = [
+            elicitation_id for elicitation_id, deadline in approvals.items() if deadline <= now
+        ]
+        for elicitation_id in expired:
+            approvals.pop(elicitation_id, None)
+        if approvals:
+            return True
+        self._pending_approval_deadlines.pop(conversation_id, None)
+        return False
+
+    def mark_approval_pending(
+        self,
+        conversation_id: str,
+        elicitation_id: str,
+        *,
+        ttl_s: float,
+    ) -> None:
+        """Lease one native approval so idle cleanup cannot reap its session."""
+        if ttl_s <= 0:
+            raise ValueError("approval lease ttl_s must be positive")
+        approvals = self._pending_approval_deadlines.setdefault(conversation_id, {})
+        approvals[elicitation_id] = time.monotonic() + ttl_s
+
+    def clear_approval_pending(
+        self,
+        conversation_id: str,
+        elicitation_id: str,
+    ) -> None:
+        """Release one native approval lease, if present."""
+        approvals = self._pending_approval_deadlines.get(conversation_id)
+        if approvals is None:
+            return
+        approvals.pop(elicitation_id, None)
+        if not approvals:
+            self._pending_approval_deadlines.pop(conversation_id, None)
 
     def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
         """
@@ -998,6 +1044,7 @@ class HarnessProcessManager:
                         current is None
                         or current.last_used_at > only_if_idle_cutoff
                         or conversation_id in self._in_flight_response_ids
+                        or self._has_pending_approval(conversation_id)
                     ):
                         _logger.info(
                             "skipping idle reap for conversation %s: entry became "
@@ -1009,6 +1056,7 @@ class HarnessProcessManager:
                     self._release_generations.get(conversation_id, 0) + 1
                 )
                 entry = self._entries.pop(conversation_id, None)
+                self._pending_approval_deadlines.pop(conversation_id, None)
                 # NOTE: ``_spawn_locks[conversation_id]`` intentionally
                 # NOT popped — see this method's docstring for the
                 # per-conv lock-identity invariant rationale.
@@ -1251,15 +1299,15 @@ class HarnessProcessManager:
         Background task: periodically reap idle subprocesses.
 
         Iterates the registry, releasing any entry whose
-        ``last_used_at`` is older than ``idle_timeout_s`` AND
-        has no in-flight response on the harness. Sleeps for
+        ``last_used_at`` is older than ``idle_timeout_s`` AND has neither an
+        in-flight response nor a pending native approval. Sleeps for
         ``reaper_interval_s`` between passes. Terminates on
         :class:`asyncio.CancelledError` from :meth:`shutdown`. A
         non-positive ``idle_timeout_s`` (e.g.
         ``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``) disables reaping — each
         pass is a no-op.
 
-        Two safety guards beyond raw ``last_used_at`` checks:
+        Three safety guards beyond raw ``last_used_at`` checks:
 
         1. **In-flight skip** — entries with an active
            harness ``response_id`` (set when the harness
@@ -1285,6 +1333,10 @@ class HarnessProcessManager:
            different clock sources; ``time.monotonic()`` is
            the single process-wide source both ends of the
            comparison agree on.
+
+        3. **Approval lease skip** — native terminal approvals can remain
+           pending after their injection request finishes. A bounded lease
+           keeps the harness and terminal pane alive while the user decides.
         """
         while True:
             try:
@@ -1306,6 +1358,8 @@ class HarnessProcessManager:
                     if entry.last_used_at > cutoff:
                         continue
                     if conv_id in self._in_flight_response_ids:
+                        continue
+                    if self._has_pending_approval(conv_id):
                         continue
                     stale.append(conv_id)
             for conv_id in stale:

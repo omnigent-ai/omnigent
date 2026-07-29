@@ -289,6 +289,7 @@ async def test_cursor_permission_request_hook_allow_round_trip(
 
 async def test_qwen_permission_request_hook_allow_round_trip(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     qwen-native TUI ``can_use_tool`` → web ApprovalCard → accept → verdict.
@@ -315,6 +316,21 @@ async def test_qwen_permission_request_hook_allow_round_trip(
         "message": "qwen wants to run run_shell_command",
         "content_preview": "echo hi > out.txt",
     }
+    lifecycle_events: list[dict[str, Any]] = []
+
+    async def _capture_lifecycle(
+        forwarded_session_id: str,
+        _runner_router: object,
+        event: dict[str, Any],
+    ) -> None:
+        assert forwarded_session_id == session_id
+        lifecycle_events.append(event)
+
+    monkeypatch.setattr(
+        sessions_route,
+        "_forward_session_change_to_runner",
+        _capture_lifecycle,
+    )
 
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
     await asyncio.sleep(0.05)
@@ -339,6 +355,23 @@ async def test_qwen_permission_request_hook_allow_round_trip(
     resp = await hook_task
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"action": "accept"}
+    assert lifecycle_events == [
+        {
+            "type": "approval_wait",
+            "data": {
+                "state": "started",
+                "elicitation_id": elicitation_id,
+                "ttl_s": sessions_route._NATIVE_PERMISSION_HOOK_TIMEOUT_S + 60.0,
+            },
+        },
+        {
+            "type": "approval_wait",
+            "data": {
+                "state": "ended",
+                "elicitation_id": elicitation_id,
+            },
+        },
+    ]
 
 
 async def test_cursor_permission_request_hook_stamps_ask_user_question_extra(

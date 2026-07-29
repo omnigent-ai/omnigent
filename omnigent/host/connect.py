@@ -357,6 +357,11 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # Native Kimi executable selector. This is a filesystem path, not a
+        # credential, and must survive the host→runner environment boundary so
+        # wrappers can pin the current Kimi Code install when a legacy
+        # ``kimi-cli`` executable is also present on PATH.
+        "OMNIGENT_KIMI_PATH",
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips

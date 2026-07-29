@@ -1114,15 +1114,40 @@ def register_hooks_routes(
         )
         from omnigent.server.routes import sessions as _sf
 
-        result = await _publish_and_wait_for_harness_elicitation(
-            request,
-            session_id=session_id,
-            params=params,
-            timeout_s=_sf._NATIVE_PERMISSION_HOOK_TIMEOUT_S,
-            conversation_store=conversation_store,
-            elicitation_id=elicitation_id,
-            tool_name=f"{agent}({operation_type})",
+        await _forward_session_change_to_runner(
+            session_id,
+            get_server_runner_router(),
+            {
+                "type": "approval_wait",
+                "data": {
+                    "state": "started",
+                    "elicitation_id": elicitation_id,
+                    "ttl_s": _sf._NATIVE_PERMISSION_HOOK_TIMEOUT_S + 60.0,
+                },
+            },
         )
+        try:
+            result = await _publish_and_wait_for_harness_elicitation(
+                request,
+                session_id=session_id,
+                params=params,
+                timeout_s=_sf._NATIVE_PERMISSION_HOOK_TIMEOUT_S,
+                conversation_store=conversation_store,
+                elicitation_id=elicitation_id,
+                tool_name=f"{agent}({operation_type})",
+            )
+        finally:
+            await _forward_session_change_to_runner(
+                session_id,
+                get_server_runner_router(),
+                {
+                    "type": "approval_wait",
+                    "data": {
+                        "state": "ended",
+                        "elicitation_id": elicitation_id,
+                    },
+                },
+            )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
         if result.action == "decline":

@@ -31,8 +31,8 @@ _TMUX_FILE = "tmux.json"
 # Omnigent routing details the kimi hook subprocess reads to reach the server.
 # Mirrors claude-native's ``permission_hook.json`` (server URL + auth headers +
 # the active Omnigent session). Written by the runner at terminal-create time;
-# read by :mod:`omnigent.kimi_native_hook` (PreToolUse deny-gate + the
-# PermissionRequest read-only surface).
+# read by :mod:`omnigent.kimi_native_hook` (PreToolUse deny-gate) and
+# :mod:`omnigent.kimi_native_approval_bridge` (Kimi 1.49 approval runtime).
 _HOOK_CONFIG_FILE = "hook_config.json"
 _TMUX_READY_TIMEOUT_S = 30.0
 _TMUX_SEND_TIMEOUT_S = 5.0
