@@ -50,6 +50,9 @@ const DISPLAY_NAMES: Record<string, string> = {
   nessie: "Nessie",
   polly: "Polly",
   debby: "Debby",
+  // omp is the built-in ACP-backed "Oh My Pi" agent (not a native coding-agent
+  // tile), so its picker label is mapped here rather than in NATIVE_CODING_AGENTS.
+  omp: "Oh My Pi",
 };
 
 function displayNameForAgent(name: string, harness?: string | null): string {
