@@ -466,7 +466,7 @@ function RunRow({ run, now }: { run: ScheduledTaskRun; now: Date }) {
 
   const body = (
     <>
-      <span className="flex size-4 shrink-0 items-center justify-center">
+      <span className="flex size-5 shrink-0 items-center justify-center">
         <RunStatusIcon run={run} unread={unread} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
@@ -534,7 +534,8 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
         <TriangleAlertIcon
           data-testid="run-status-icon"
           data-run-icon="failed"
-          className="size-3.5 shrink-0 text-amber-500"
+          className="size-4 shrink-0 text-amber-500"
+          strokeWidth={1.75}
         />
       </IndicatorWithTooltip>
     );
@@ -545,7 +546,8 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
         <CalendarOffIcon
           data-testid="run-status-icon"
           data-run-icon="skipped"
-          className="size-3.5 shrink-0 text-muted-foreground"
+          className="size-4 shrink-0 text-muted-foreground"
+          strokeWidth={1.75}
         />
       </IndicatorWithTooltip>
     );
@@ -556,7 +558,7 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
         <Loader2Icon
           data-testid="run-status-icon"
           data-run-icon="running"
-          className="size-3 shrink-0 animate-spin text-muted-foreground"
+          className="size-3.5 shrink-0 animate-spin text-muted-foreground"
         />
       </IndicatorWithTooltip>
     );
