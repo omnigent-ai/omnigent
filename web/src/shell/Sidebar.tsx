@@ -3374,8 +3374,11 @@ function DeletingRow({
     );
   }
   return (
+    // Match the interactive row's box metrics (h-7, font-size, radius) so the
+    // swap only changes color/opacity — otherwise the row visibly grows and
+    // shifts the list while a delete is in flight.
     <div
-      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-sm text-muted-foreground opacity-70"
+      className="sidebar-compact-text flex h-7 w-full items-center gap-1.5 rounded-[var(--radius-otto-sm)] px-2 text-muted-foreground opacity-70"
       data-testid="conversation-deleting"
       aria-live="polite"
     >
