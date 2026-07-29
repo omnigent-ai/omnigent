@@ -3798,9 +3798,11 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
   }
 
   return (
-    // pl-1 + the input's px-1 line the text up with the row's px-2 title;
-    // py-1 around the size-7 buttons matches the 36px single-line row height.
-    <div className="flex items-center gap-1 rounded-md bg-muted py-1 pr-1 pl-1">
+    // Match the interactive row's box metrics (h-7, sidebar-compact-text) so
+    // entering edit mode doesn't grow the row or bump the font size. pl-1 + the
+    // input's px-1 line the text up with the row's px-2 title; the size-6
+    // buttons sit inside the 28px row height.
+    <div className="sidebar-compact-text flex h-7 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1">
       <input
         ref={inputRef}
         type="text"
@@ -3815,12 +3817,12 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
         onKeyDown={handleKeyDown}
         onBlur={handleBlur}
         data-testid="rename-conversation-input"
-        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-1 text-sm outline-none md:select-text"
+        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
       />
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        size="icon-xs"
         aria-label="Save rename"
         onMouseDown={(e) => {
           // Prevent the input's blur from firing before the commit.
@@ -3833,7 +3835,7 @@ function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationE
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        size="icon-xs"
         aria-label="Cancel rename"
         onMouseDown={(e) => e.preventDefault()}
         onClick={() => {
