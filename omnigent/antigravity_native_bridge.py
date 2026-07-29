@@ -855,6 +855,15 @@ _AGY_IDLE_MARKER = "? for shortcuts"
 # a mid-turn steer; submission itself is verified by draft disappearance, NOT by
 # this marker (footer text can change across agy builds or be truncated).
 _AGY_ACTIVE_MARKER = "esc to cancel"
+# agy collapses a paste carrying many line breaks into a single placeholder row
+# (``[Pasted text #1 +17 lines]``) instead of echoing the text into the composer.
+# The threshold is line-count based — ~13+ line breaks; total length does not
+# matter, so a long single-line message still renders verbatim (measured against
+# agy 1.1.8). The pasted text is therefore NEVER visible for a multi-line prompt,
+# which is exactly the shape a sub-agent task prompt has. Treated as draft content
+# so both the render gate and the submit verification key off the placeholder
+# appearing and then leaving the composer.
+_AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1180,6 +1189,10 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     if region == baseline_region:
         return False
     candidates = _agy_draft_candidate_lines(region)
+    # A collapsed paste hides the text behind a placeholder, so no needle can
+    # match; the placeholder itself IS the draft (see _AGY_PASTE_PLACEHOLDER_RE).
+    if any(_AGY_PASTE_PLACEHOLDER_RE.search(line) for line in candidates):
+        return True
     normalized_needle = needle.strip() if needle else ""
     if not normalized_needle:
         return bool(candidates)

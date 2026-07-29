@@ -1050,6 +1050,67 @@ def test_inject_user_message_via_tui_rejects_empty_content(tmp_path: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# Collapsed-paste draft detection
+# ---------------------------------------------------------------------------
+
+
+def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
+    """
+    agy's collapsed-paste placeholder counts as a rendered draft.
+
+    Past ~13 line breaks agy replaces the pasted text with a single
+    ``[Pasted text #N +M lines]`` row instead of echoing it, so the needle is
+    never visible in the composer. Without this the render gate reads a
+    correctly pasted multi-line prompt as "never rendered".
+    """
+    baseline = "> "
+    pane = "> [Pasted text #1 +17 lines]\n? for shortcuts"
+    assert _mod._draft_in_input_region(pane, "Find the current weather", baseline)
+    # Once the placeholder leaves the composer the draft is gone (submit verified).
+    submitted = "> \n? for shortcuts"
+    assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
+
+
+def test_inject_user_message_via_tui_submits_a_collapsed_paste(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """
+    A multi-line prompt agy collapses is still submitted, not reported as lost.
+
+    Reproduces the polly sub-agent dispatch: the task prompt is long enough that
+    agy shows only the placeholder, which previously failed the render gate and
+    raised "did not render the pasted message" while the draft sat in the
+    composer.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    content = "\n".join(f"Find the current weather line {i}" for i in range(1, 19))
+    tui = {"pane": "> \n? for shortcuts"}
+    enters = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """agy collapses the paste, then starts a turn on Enter."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = "> [Pasted text #1 +18 lines]\n? for shortcuts"
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+            tui["pane"] = "> \nesc to cancel"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=content, timeout_s=0.5)
+
+    assert enters["n"] == 1, "the collapsed draft should submit on the first Enter"
+
+
+# ---------------------------------------------------------------------------
 # Account-verification re-delivery
 # ---------------------------------------------------------------------------
 
