@@ -1673,6 +1673,27 @@ describe("Composer config gear", () => {
     expect(screen.getByTestId("composer-config-effort")).toBeTruthy();
   });
 
+  it("uses the Default sentinel when Kiro marks no catalog row as default", async () => {
+    const options = [
+      { id: "auto", displayName: "Automatic", isDefault: false },
+      { id: "provider-latest", displayName: "Latest", isDefault: false },
+    ];
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showEffort: false,
+          showModels: true,
+          modelPickerKind: "kiro",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    fireEvent.click(gear()!);
+    await screen.findByTestId("composer-config-modal");
+    expect(screen.getByTestId("composer-config-model")).toHaveTextContent("Default");
+  });
+
   it("does not open the modal via bare /model when the gear is disabled (not live)", async () => {
     // Bare /model bumps the open nonce; on a non-live session the gear is
     // inert, so the nonce must NOT open a modal that can't apply a change.

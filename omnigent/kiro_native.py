@@ -161,7 +161,6 @@ def list_kiro_cli_model_options(
             "id": model_id,
             "displayName": display_name,
             "isDefault": model_id == default_id,
-            "isCurrent": False,
         }
         description = raw_model.get("description")
         if isinstance(description, str) and description.strip():
@@ -179,11 +178,6 @@ def list_kiro_cli_model_options(
     if not options:
         raise ValueError("Kiro model list did not contain any valid models")
     return options
-
-
-def kiro_base_model_options() -> list[dict[str, Any]]:
-    """Backward-compatible alias for live Kiro model discovery."""
-    return list_kiro_cli_model_options()
 
 
 def build_kiro_launch(

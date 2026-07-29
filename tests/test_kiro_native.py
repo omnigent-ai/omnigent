@@ -30,7 +30,6 @@ from omnigent.kiro_native import (
     _update_startup_progress,
     _wait_for_kiro_terminal_ready,
     build_kiro_launch,
-    kiro_base_model_options,
     kiro_terminal_resource_id,
     list_kiro_cli_model_options,
     resolve_kiro_executable,
@@ -579,7 +578,6 @@ def test_list_kiro_cli_model_options_maps_live_metadata(monkeypatch: pytest.Monk
             "id": "auto",
             "displayName": "Automatic",
             "isDefault": True,
-            "isCurrent": False,
             "description": "Choose by task",
             "contextWindow": 1_000_000,
             "rateMultiplier": 1.0,
@@ -589,10 +587,38 @@ def test_list_kiro_cli_model_options_maps_live_metadata(monkeypatch: pytest.Monk
             "id": "provider-latest",
             "displayName": "Latest",
             "isDefault": False,
-            "isCurrent": False,
         },
     ]
-    assert kiro_base_model_options() == options
+
+
+@pytest.mark.parametrize("default_model", [None, "missing-model"])
+def test_list_kiro_cli_model_options_allows_no_matching_default(
+    monkeypatch: pytest.MonkeyPatch,
+    default_model: str | None,
+) -> None:
+    payload: dict[str, object] = {
+        "models": [{"model_name": "Latest", "model_id": "provider-latest"}],
+    }
+    if default_model is not None:
+        payload["default_model"] = default_model
+    monkeypatch.setattr(shutil, "which", lambda _command: "/opt/kiro-cli")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda argv, **_: subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    options = list_kiro_cli_model_options()
+
+    assert options == [
+        {
+            "id": "provider-latest",
+            "displayName": "Latest",
+            "isDefault": False,
+        }
+    ]
 
 
 def test_list_kiro_cli_model_options_rejects_empty_catalog(
