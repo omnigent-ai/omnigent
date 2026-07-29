@@ -274,6 +274,26 @@ def test_default_chat_model_dynamic_skips_specialty_variants() -> None:
     assert general[0].startswith("gpt-")
 
 
+def test_default_chat_model_limits_dynamic_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callers can constrain dynamic defaults before policy selection."""
+    models = [
+        ModelInfo(name="gpt-audio-new", provider="vendor", mode="chat"),
+        ModelInfo(name="gpt-new", provider="vendor", mode="chat"),
+        ModelInfo(name="gpt-compatible", provider="vendor", mode="chat"),
+    ]
+    monkeypatch.setattr(_providers_mod, "get_chat_models", lambda _provider: models)
+
+    assert (
+        default_chat_model(
+            "vendor",
+            allowed_models={"gpt-audio-new", "gpt-compatible"},
+        )
+        == "gpt-compatible"
+    )
+
+
 def test_default_chat_model_unknown_provider_is_none() -> None:
     """An unknown provider yields None (the runtime then fails loud)."""
     assert default_chat_model("nonexistent_provider_xyz") is None

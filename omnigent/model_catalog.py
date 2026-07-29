@@ -46,7 +46,12 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.model_metadata import ModelCapability, ModelCostTier, ModelIntent, ModelMetadata
 from omnigent.model_override import model_family_mismatch
-from omnigent.model_resolver import ModelResolution, ModelResolutionRequest, resolve_model
+from omnigent.model_resolver import (
+    ModelResolution,
+    ModelResolutionError,
+    ModelResolutionRequest,
+    resolve_model,
+)
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     CLI_CONFIG_KIND,
@@ -336,11 +341,6 @@ def catalog_model_entries(provider_name: str) -> tuple[ModelEntry, ...]:
                 supported.add(capability)
             elif value is False:
                 unsupported.add(capability)
-        context_window = (
-            model.max_input_tokens + (model.max_output_tokens or 0)
-            if model.max_input_tokens is not None
-            else None
-        )
         entries.append(
             ModelEntry(
                 id=model.name,
@@ -348,7 +348,7 @@ def catalog_model_entries(provider_name: str) -> tuple[ModelEntry, ...]:
                 metadata=ModelMetadata(
                     supported_capabilities=frozenset(supported),
                     unsupported_capabilities=frozenset(unsupported),
-                    context_window=context_window,
+                    context_window=model.max_input_tokens,
                     cost_tier=cost_tiers.get(index),
                 ),
             )
@@ -365,6 +365,10 @@ def resolve_catalog_model(
 ) -> ModelResolution:
     """Resolve a model from the live bundled provider catalog.
 
+    Default intent preserves the onboarding provider's general-purpose model
+    policy after family and gateway-routing constraints are applied. Other
+    intents continue to rank all compatible catalog candidates by metadata.
+
     :param provider_name: MLflow catalog provider name.
     :param intent: Stable selection intent.
     :param configured_default: Optional provider-configured model. It is
@@ -375,7 +379,23 @@ def resolve_catalog_model(
     :returns: The resolver result with source and normalized metadata.
     :raises ModelResolutionError: When no compatible catalog model exists.
     """
+    from omnigent.onboarding.providers import default_chat_model
+
     models = list(catalog_model_entries(provider_name))
+    if provider_name.lower() == "databricks":
+        models = [model for model in models if model.id.lower().startswith("databricks-")]
+
+    if configured_default is None and intent == ModelIntent.DEFAULT:
+        compatible_ids = {model.id for model in models if family is None or model.family == family}
+        preferred_default = default_chat_model(
+            provider_name,
+            allowed_models=compatible_ids,
+        )
+        if preferred_default is not None and (
+            family is None or model_family_token(preferred_default) == family
+        ):
+            configured_default = preferred_default
+
     if configured_default is not None and all(model.id != configured_default for model in models):
         models.insert(
             0,
@@ -384,14 +404,21 @@ def resolve_catalog_model(
                 family=family or model_family_token(configured_default),
             ),
         )
-    return resolve_model(
-        ModelResolutionRequest(
-            intent=intent,
-            configured_default=configured_default,
-            allowed_families=frozenset({family}) if family is not None else frozenset(),
-        ),
-        models,
-    )
+    try:
+        return resolve_model(
+            ModelResolutionRequest(
+                intent=intent,
+                configured_default=configured_default,
+                allowed_families=(frozenset({family}) if family is not None else frozenset()),
+            ),
+            models,
+        )
+    except ModelResolutionError as exc:
+        family_detail = f" for family {family!r}" if family is not None else ""
+        raise ModelResolutionError(
+            f"no compatible model resolved from provider {provider_name!r}{family_detail}; "
+            "configure an explicit model or retry when catalog discovery is available"
+        ) from exc
 
 
 def _catalog_cost_tiers(models: list[ModelInfo]) -> dict[int, ModelCostTier]:

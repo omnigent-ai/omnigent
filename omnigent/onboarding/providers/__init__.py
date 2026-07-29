@@ -15,7 +15,7 @@ import json
 import re
 import threading
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -450,7 +450,11 @@ _DEFAULT_MODEL_OVERRIDE: dict[str, str] = {
 }
 
 
-def default_chat_model(provider: str) -> str | None:
+def default_chat_model(
+    provider: str,
+    *,
+    allowed_models: Collection[str] | None = None,
+) -> str | None:
     """
     Return the catalog's canonical default chat model for a provider.
 
@@ -476,7 +480,12 @@ def default_chat_model(provider: str) -> str | None:
     ``gpt-5.5``) even when the bundled catalog lags. Other providers follow
     the dynamic rule above.
 
+    Explicit provider pins remain authoritative even when they are newer than
+    the catalog. ``allowed_models`` constrains only the dynamic catalog rule,
+    which lets callers apply family or routing compatibility before selection.
+
     :param provider: Provider name, e.g. ``"anthropic"`` or ``"openai"``.
+    :param allowed_models: Optional model ids eligible for dynamic selection.
     :returns: The default model id, e.g. ``"claude-opus-4-8"`` or
         ``"gpt-5.5"``, or ``None`` when the catalog has no chat model for
         that provider (genuinely unknown provider).
@@ -487,8 +496,11 @@ def default_chat_model(provider: str) -> str | None:
     if override is not None:
         return override
 
+    allowed = set(allowed_models) if allowed_models is not None else None
     general: list[str] = []
     for model in get_chat_models(provider):
+        if allowed is not None and model.name not in allowed:
+            continue
         lowered = model.name.lower()
         if any(token in lowered for token in _SPECIALTY_MODEL_TOKENS):
             continue
