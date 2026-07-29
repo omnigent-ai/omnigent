@@ -94,6 +94,8 @@ def _make_policy(
     read_roots: list[Path] | None = None,
     cwd_hidden_scan_max_entries: int | None = None,
     cwd_hidden_scan_overflow: str | None = None,
+    cwd_hidden_scan_recursive: bool | None = None,
+    mask_paths: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -116,6 +118,11 @@ def _make_policy(
         cwd scan cap; ``None`` keeps the dataclass default (50000).
     :param cwd_hidden_scan_overflow: Override for the overflow mode;
         ``None`` keeps the dataclass default (``"error"``).
+    :param cwd_hidden_scan_recursive: Override for the recursive-walk
+        flag; ``None`` keeps the dataclass default (``False``,
+        top-level only).
+    :param mask_paths: Explicit absolute paths to mask; ``None`` keeps
+        the dataclass default (no explicit masks).
     :returns: A populated :class:`SandboxPolicy`.
     """
     kwargs: dict[str, object] = {
@@ -131,6 +138,10 @@ def _make_policy(
         kwargs["cwd_hidden_scan_max_entries"] = cwd_hidden_scan_max_entries
     if cwd_hidden_scan_overflow is not None:
         kwargs["cwd_hidden_scan_overflow"] = cwd_hidden_scan_overflow
+    if cwd_hidden_scan_recursive is not None:
+        kwargs["cwd_hidden_scan_recursive"] = cwd_hidden_scan_recursive
+    if mask_paths is not None:
+        kwargs["mask_paths"] = mask_paths
     return SandboxPolicy(**kwargs)  # type: ignore[arg-type]
 
 
@@ -1074,6 +1085,86 @@ def test_dotfile_masking_hides_disallowed_dotfiles(tmp_path: Path) -> None:
     # Non-dotfile is untouched.
     assert not _argv_mentions(argv, regular_path, after_token="--tmpfs")
     assert not _argv_mentions(argv, regular_path, after_token="--bind-try")
+
+
+def test_dotfile_masking_non_recursive_default_leaves_nested_dotfiles(
+    tmp_path: Path,
+) -> None:
+    """
+    With the production default (``cwd_hidden_scan_recursive=False``)
+    the bwrap masker hides top-level dotfiles but leaves a nested
+    dotfile visible — no mask triple is emitted for it.
+    """
+    (tmp_path / ".env").write_text("TOP=secret")
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=secret")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    cwd = tmp_path.resolve(strict=False)
+    top_env = str(cwd / ".env")
+    nested_env = str(cwd / "services" / "api" / ".env")
+
+    assert _has_pair(argv, "--bind-try", "/dev/null", top_env), (
+        "Top-level .env should still be masked in non-recursive mode."
+    )
+    assert not _argv_mentions(argv, nested_env, after_token="--bind-try"), (
+        "Non-recursive default must NOT descend into subdirectories; "
+        "nested .env should stay visible."
+    )
+
+
+def test_dotfile_masking_recursive_opt_in_masks_nested_dotfiles(
+    tmp_path: Path,
+) -> None:
+    """
+    Opting into ``cwd_hidden_scan_recursive=True`` restores the deep
+    walk: a nested dotfile is masked with ``--bind-try /dev/null``.
+    """
+    nested = tmp_path / "services" / "api"
+    nested.mkdir(parents=True)
+    (nested / ".env").write_text("DB=secret")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, allow_hidden=[".venv"], cwd_hidden_scan_recursive=True)
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    nested_env = str(tmp_path.resolve(strict=False) / "services" / "api" / ".env")
+    assert _has_pair(argv, "--bind-try", "/dev/null", nested_env), (
+        "Recursive opt-in should mask the nested .env."
+    )
+
+
+def test_mask_paths_hides_explicit_file_and_dir(tmp_path: Path) -> None:
+    """
+    Explicit ``mask_paths`` entries are masked regardless of name or
+    depth: a plain (non-dot) file becomes ``--bind-try /dev/null`` and
+    a directory becomes ``--tmpfs``.
+    """
+    secret_file = tmp_path / "config" / "production.key"
+    secret_file.parent.mkdir(parents=True)
+    secret_file.write_text("KEY")
+    secret_dir = tmp_path / "private"
+    secret_dir.mkdir()
+    (secret_dir / "data").write_text("x")
+
+    backend = _make_backend()
+    policy = _make_policy(
+        tmp_path,
+        allow_hidden=[".venv"],
+        mask_paths=[secret_file.resolve(strict=False), secret_dir.resolve(strict=False)],
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _has_pair(argv, "--bind-try", "/dev/null", str(secret_file.resolve(strict=False))), (
+        "Explicit mask_paths file must be masked with --bind-try /dev/null."
+    )
+    assert _has_pair_single_dest(argv, "--tmpfs", str(secret_dir.resolve(strict=False))), (
+        "Explicit mask_paths directory must be masked with --tmpfs."
+    )
 
 
 def test_dotfile_masking_skips_target_that_vanished_after_scan(
