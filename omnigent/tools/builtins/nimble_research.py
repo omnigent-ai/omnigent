@@ -39,9 +39,10 @@ clear rejection (401/403/404/422) created nothing and carries no such warning.
 Effort is optional. When omitted, Nimble applies the selected agent/template
 default (the documented product default is ``high``; template defaults vary).
 The generally available ``low``, ``medium``, ``high``, and ``x-high`` tiers
-can be selected per run. The coming-soon custom-budget ``max`` tier remains
-selectable: it stops with product-team guidance by default, or explicitly and
-visibly degrades to ``x-high`` when ``gate_policy: degrade`` is configured.
+can be selected per run. The schema-visible ``max`` value is a coming-soon
+custom-budget capability and is not offered as a selectable tier. If supplied
+directly, it stops before create with product-team guidance and is never
+silently substituted.
 
 Configured in the agent spec::
 
@@ -51,7 +52,6 @@ Configured in the agent spec::
           api_key: ${NIMBLE_API_KEY}
           # optional:
           # agent_id: wsa_...          # omit to let Nimble provision the agent
-          # gate_policy: reject        # or degrade for announced max -> x-high
           # timeout_seconds: 300
           # poll_interval_seconds: 10
 
@@ -95,9 +95,8 @@ _DEFAULT_BASE_URL = "https://sdk.nimbleway.com"
 # Nimble's own SDKs send (same convention as the web_search nimble backend).
 _CLIENT_SOURCE = "omnigent"
 
-_VALID_EFFORTS = frozenset({"low", "medium", "high", "x-high", "max"})
+_SELECTABLE_EFFORTS = frozenset({"low", "medium", "high", "x-high"})
 _VALID_USE_CASES = frozenset({"research", "enrichment", "dataset_building"})
-_GATE_POLICIES = frozenset({"reject", "degrade"})
 _MAX_CONTACT = "https://www.nimbleway.com/contact"
 
 # Run lifecycle statuses. Anything outside these sets is a protocol error.
@@ -219,40 +218,25 @@ def _resolve_effort(
     if raw is None or not str(raw).strip():
         return None, None, None
     value = str(raw).strip().lower()
-    if value not in _VALID_EFFORTS:
-        return (
-            None,
-            None,
-            (f"Error: unsupported effort {str(raw)!r}. Choose low, medium, high, x-high, or max."),
-        )
-    if value != "max":
-        return value, None, None
-    policy = str(config.get("gate_policy", "reject")).strip().lower()
-    if policy not in _GATE_POLICIES:
-        return (
-            None,
-            None,
-            (f"Error: unsupported gate_policy {policy!r}. Choose reject or degrade."),
-        )
-    if policy == "reject":
+    if value == "max":
         return (
             None,
             None,
             (
-                "Max effort is a coming-soon custom-budget capability. Requested "
-                "effort='max'; nothing was sent and no run was created. Talk to "
-                f"the Nimble product team about enabling Max: {_MAX_CONTACT}"
+                "Max effort is a coming-soon custom-budget capability and is not "
+                "generally selectable. Requested effort='max'; nothing was sent "
+                "and no run was created. Contact the Nimble product team about "
+                f"enabling Max: {_MAX_CONTACT}. To continue now, explicitly choose "
+                "x-high; it will never be substituted silently."
             ),
         )
-    return (
-        "x-high",
-        (
-            "Max effort is a coming-soon custom-budget capability. Requested "
-            "effort='max' -> effective effort='x-high' because gate_policy="
-            f"'degrade' was selected explicitly. Learn about enabling Max: {_MAX_CONTACT}"
-        ),
-        None,
-    )
+    if value not in _SELECTABLE_EFFORTS:
+        return (
+            None,
+            None,
+            (f"Error: unsupported effort {str(raw)!r}. Choose low, medium, high, or x-high."),
+        )
+    return value, None, None
 
 
 def _unresolved_create_error(message: str, run_id: str | None = None) -> str:
@@ -333,13 +317,56 @@ def _resolve_controls(parsed: dict[str, Any]) -> tuple[dict[str, Any] | None, st
             return None, "Error: 'input_data' must be a JSON object or an array of JSON objects."
         controls["input_data"] = input_data
 
-    for key in ("output_schema", "sources"):
-        value = parsed.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, dict):
-            return None, f"Error: {key!r} must be a JSON object."
-        controls[key] = value
+    output_schema = parsed.get("output_schema")
+    if output_schema is not None:
+        if not isinstance(output_schema, dict):
+            return None, "Error: 'output_schema' must be a JSON object."
+        controls["output_schema"] = output_schema
+
+    sources = parsed.get("sources")
+    if sources is not None:
+        if not isinstance(sources, dict):
+            return None, "Error: 'sources' must be a JSON object."
+        allowed_keys = {"allow", "avoid", "block", "prioritize"}
+        unknown_keys = set(sources) - allowed_keys
+        if unknown_keys:
+            return None, (
+                "Error: 'sources' contains unsupported keys: "
+                + ", ".join(sorted(str(key) for key in unknown_keys))
+                + "."
+            )
+        for key in ("prioritize", "avoid"):
+            value = sources.get(key)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                return None, f"Error: 'sources.{key}' must be a non-empty string."
+        for key in ("allow", "block"):
+            entries = sources.get(key)
+            if entries is None:
+                continue
+            if not isinstance(entries, list):
+                return None, f"Error: 'sources.{key}' must be an array."
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    return None, f"Error: 'sources.{key}[{index}]' must be a JSON object."
+                title = entry.get("title")
+                domains = entry.get("domains")
+                if not isinstance(title, str) or not title.strip():
+                    return None, (
+                        f"Error: 'sources.{key}[{index}].title' must be a non-empty string."
+                    )
+                if (
+                    not isinstance(domains, list)
+                    or not domains
+                    or not all(isinstance(domain, str) and domain.strip() for domain in domains)
+                ):
+                    return None, (
+                        f"Error: 'sources.{key}[{index}].domains' must be a non-empty "
+                        "array of non-empty strings."
+                    )
+                order = entry.get("order")
+                if order is not None and (not isinstance(order, int) or isinstance(order, bool)):
+                    return None, f"Error: 'sources.{key}[{index}].order' must be an integer."
+        controls["sources"] = sources
 
     for key in ("agent_name", "skill"):
         value = parsed.get(key)
@@ -994,14 +1021,13 @@ class NimbleResearchTool(Tool):
     Nimble Agent API v2 tool: asynchronous research runs with cited results.
 
     :param config: Spec-level config, e.g. ``{"api_key": "..."}``, optionally
-        with ``agent_id`` to run on an agent you already own and
-        ``gate_policy`` to control gated-value treatment.
+        with ``agent_id`` to run on an agent you already own.
     """
 
     def __init__(self, config: dict[str, str] | None = None) -> None:
         """
         :param config: Spec-level config with ``api_key`` and optional
-            ``agent_id``/``effort``/``gate_policy``/``timeout_seconds``/
+            ``agent_id``/``effort``/``timeout_seconds``/
             ``poll_interval_seconds``.
         """
         self._config = config or {}
@@ -1037,7 +1063,7 @@ class NimbleResearchTool(Tool):
                         },
                         "effort": {
                             "type": "string",
-                            "enum": sorted(_VALID_EFFORTS),
+                            "enum": sorted(_SELECTABLE_EFFORTS),
                             "description": (
                                 "Optional effort override. Omit it to use the "
                                 "agent/template default (documented product "
@@ -1073,9 +1099,46 @@ class NimbleResearchTool(Tool):
                         },
                         "sources": {
                             "type": "object",
+                            "properties": {
+                                "prioritize": {"type": "string"},
+                                "avoid": {"type": "string"},
+                                "allow": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "title": {"type": "string"},
+                                            "domains": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                                "minItems": 1,
+                                            },
+                                            "order": {"type": "integer"},
+                                        },
+                                        "required": ["title", "domains"],
+                                    },
+                                },
+                                "block": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "title": {"type": "string"},
+                                            "domains": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                                "minItems": 1,
+                                            },
+                                            "order": {"type": "integer"},
+                                        },
+                                        "required": ["title", "domains"],
+                                    },
+                                },
+                            },
                             "description": (
-                                "Source guidance for the run, e.g. sites to "
-                                "prioritize, allow, avoid, or block."
+                                "Source guidance. prioritize/avoid are free-text "
+                                "instructions; allow/block are arrays of named "
+                                "domain groups with {title, domains, order?}."
                             ),
                         },
                     },

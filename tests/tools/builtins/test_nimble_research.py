@@ -164,7 +164,7 @@ def test_tool_name() -> None:
 
 
 def test_schema_requires_task_and_exposes_selectable_effort_tiers() -> None:
-    """C04: ordinary tiers and gated ``max`` are selectable."""
+    """C04: only generally available tiers are selectable."""
     schema = NimbleResearchTool().get_schema()
     assert schema["type"] == "function"
     assert schema["function"]["name"] == "nimble_research"
@@ -174,7 +174,6 @@ def test_schema_requires_task_and_exposes_selectable_effort_tiers() -> None:
     assert params["properties"]["effort"]["enum"] == [
         "high",
         "low",
-        "max",
         "medium",
         "x-high",
     ]
@@ -265,7 +264,7 @@ def test_blank_task_returns_error(tool_ctx: ToolContext) -> None:
 def test_invalid_effort_config_returns_error(tool_ctx: ToolContext) -> None:
     """An unsupported spec-level effort is rejected before any request."""
     out = _invoke(_config(effort="turbo"), tool_ctx)
-    assert out == ("Error: unsupported effort 'turbo'. Choose low, medium, high, x-high, or max.")
+    assert out == ("Error: unsupported effort 'turbo'. Choose low, medium, high, or x-high.")
     assert respx.calls.call_count == 0
 
 
@@ -282,60 +281,24 @@ def test_max_effort_is_rejected_unbilled(tool_ctx: ToolContext) -> None:
     """C04: default max treatment stops with positive guidance before create."""
     out = _invoke(_config(), tool_ctx, args={"task": "x", "effort": "max"})
     assert "coming-soon custom-budget capability" in out
+    assert "not generally selectable" in out
     assert "nothing was sent and no run was created" in out
+    assert "explicitly choose x-high" in out
     assert "https://www.nimbleway.com/contact" in out
     assert respx.calls.call_count == 0
 
 
 @respx.mock
-def test_explicit_max_degradation_is_announced(
-    tool_ctx: ToolContext, fake_clock: _FakeClock
-) -> None:
-    create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
-    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+def test_legacy_gate_policy_cannot_degrade_max(tool_ctx: ToolContext) -> None:
+    """A stale config cannot silently turn the coming-soon tier into x-high."""
     out = _invoke(
         _config(gate_policy="degrade"),
         tool_ctx,
         args={"task": "x", "effort": "max"},
     )
-    body = json.loads(create.calls.last.request.content)
-    envelope = json.loads(out)
-    assert body["effort"] == "x-high"
-    assert "Requested effort='max' -> effective effort='x-high'" in envelope["notice"]
-    assert "https://www.nimbleway.com/contact" in envelope["notice"]
-
-
-@respx.mock
-@pytest.mark.parametrize("failure", ["terminal", "create_error", "timeout"])
-def test_max_degradation_is_announced_on_failure_paths(
-    tool_ctx: ToolContext, fake_clock: _FakeClock, failure: str
-) -> None:
-    """A degraded run announces the downgrade even when it does not succeed.
-
-    The caller asked for an effort they did not get; that stays true when the
-    run then fails, so the notice must not be conditional on success.
-    """
-    if failure == "create_error":
-        respx.post(_RUNS_URL).mock(return_value=httpx.Response(503))
-    elif failure == "terminal":
-        respx.post(_RUNS_URL).mock(
-            return_value=httpx.Response(
-                202, json=_run("failed", error={"ref_id": _RUN_ID, "message": "unreachable"})
-            )
-        )
-    else:
-        respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued")))
-        respx.get(_RUN_URL).mock(return_value=httpx.Response(200, json=_run("running")))
-
-    out = _invoke(
-        _config(gate_policy="degrade", timeout_seconds="10", poll_interval_seconds="2"),
-        tool_ctx,
-        args={"task": "x", "effort": "max"},
-    )
-
-    assert "effective effort='x-high'" in out, (
-        f"the {failure} path dropped the degradation notice: {out!r}"
-    )
+    assert "nothing was sent and no run was created" in out
+    assert "explicitly choose x-high" in out
+    assert respx.calls.call_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +986,7 @@ def test_clamp_seconds_junk_and_bounds() -> None:
 
 
 def test_resolve_effort_preserves_omission_and_validates_tiers() -> None:
-    """Unset stays omitted; released tiers normalize; max is gated."""
+    """Unset stays omitted; released tiers normalize; max always stops."""
     assert _resolve_effort({}, None) == (None, None, None)
     assert _resolve_effort({"effort": "  "}, None) == (None, None, None)
     for tier in ("low", "medium", "high", "x-high"):
@@ -1033,9 +996,9 @@ def test_resolve_effort_preserves_omission_and_validates_tiers() -> None:
     assert notice is None
     assert error is not None and "nothing was sent" in error
     effort, notice, error = _resolve_effort({"effort": "max", "gate_policy": "degrade"}, None)
-    assert effort == "x-high"
-    assert notice is not None and "effective effort='x-high'" in notice
-    assert error is None
+    assert effort is None
+    assert notice is None
+    assert error is not None and "explicitly choose x-high" in error
 
 
 def test_map_trust_non_dict_is_empty() -> None:
@@ -1216,7 +1179,10 @@ def test_structured_controls_pass_through_unchanged(
         "required": ["revenue"],
     }
     input_data = [{"company": "Nimbleway"}, {"company": "Acme"}]
-    sources = {"prioritize": ["sec.gov"], "avoid": ["forums.example"]}
+    sources = {
+        "allow": [{"title": "SEC", "domains": ["sec.gov"], "order": 1}],
+        "avoid": "Do not use discussion forums.",
+    }
 
     is_generic = route == "generic"
     create_url = _GENERIC_RUNS_URL if is_generic else _RUNS_URL
@@ -1276,6 +1242,24 @@ def test_malformed_controls_are_rejected_unbilled(
     """A malformed control fails locally rather than as a 422 on a billable request."""
     out = _invoke(_config(), tool_ctx, args={"task": "x", key: value})
     assert out.startswith(f"Error: {key!r} must be a JSON object"), out
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "sources",
+    [
+        {"allow": ["python.org"]},
+        {"allow": [{"title": "Python", "domains": []}]},
+        {"allow": [{"title": "", "domains": ["python.org"]}]},
+        {"prioritize": ["python.org"]},
+        {"unknown": "python.org"},
+    ],
+)
+def test_malformed_sources_are_rejected_unbilled(tool_ctx: ToolContext, sources: object) -> None:
+    """The SDK 1.2 sources shape is enforced before the billable create POST."""
+    out = _invoke(_config(), tool_ctx, args={"task": "x", "sources": sources})
+    assert out.startswith("Error: 'sources"), out
     assert respx.calls.call_count == 0
 
 
