@@ -253,6 +253,7 @@ describe("isUnexpectedTerminalClose", () => {
 class FakeWebSocket {
   static OPEN = 1;
   static CLOSED = 3;
+  static instances: FakeWebSocket[] = [];
   readyState = 0;
   binaryType = "blob";
   sent: Array<string | Uint8Array> = [];
@@ -262,6 +263,7 @@ class FakeWebSocket {
 
   constructor(url: string) {
     this.url = url;
+    FakeWebSocket.instances.push(this);
   }
 
   addEventListener(type: string, fn: (ev: unknown) => void) {
@@ -305,20 +307,10 @@ class FakeResizeObserver {
 }
 
 describe("TerminalSession", () => {
-  let lastSocket: FakeWebSocket | null = null;
-
   beforeEach(() => {
-    lastSocket = null;
+    FakeWebSocket.instances = [];
     FakeResizeObserver.instances = [];
-    vi.stubGlobal(
-      "WebSocket",
-      class extends FakeWebSocket {
-        constructor(url: string) {
-          super(url);
-          lastSocket = this;
-        }
-      },
-    );
+    vi.stubGlobal("WebSocket", FakeWebSocket);
     vi.stubGlobal("ResizeObserver", FakeResizeObserver);
   });
 
@@ -339,7 +331,7 @@ describe("TerminalSession", () => {
       onActivity,
       onInput,
     );
-    return { session, states, container, socket: lastSocket as unknown as FakeWebSocket };
+    return { session, states, container, socket: FakeWebSocket.instances.at(-1)! };
   }
 
   it("reports 'connected' and sends an initial resize on socket open", () => {

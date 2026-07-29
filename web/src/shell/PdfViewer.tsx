@@ -39,6 +39,7 @@ import "./pdfViewer.css";
 // Point pdf.js at its worker. Vite imports the worker entry as a static asset so
 // the bundled SPA emits it as a hashed file without relying on the package
 // path resolving from `node_modules`.
+// oxlint-disable-next-line import/default -- Vite's `?url` import returns the asset URL.
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
