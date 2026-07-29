@@ -4,6 +4,28 @@ Kiro CLI persists chat turns under ``~/.kiro/sessions/cli`` as session metadata
 plus JSONL message records. The native Kiro terminal path injects web prompts
 into the TUI; this forwarder mirrors Kiro's persisted assistant messages back
 into the Omnigent conversation with ``external_conversation_item`` events.
+
+**Live tool-call cards**: when a persisted ``AssistantMessage`` record carries
+``toolUse`` content blocks the forwarder emits ``function_call`` /
+``function_call_output`` items stamped with a per-turn ``response_id``
+(``kiro:turn:{prompt_message_id}``, anchored to the turn's opening ``Prompt``
+record — Kiro's transcript has an explicit turn opener, so the id is known
+before any assistant activity). A ``running`` status edge carrying the same id
+is POSTed before the turn's first mirrored item. The closing ``idle`` edge is
+posted when the turn's final prose record lands (Kiro's agent loop ends on an
+assistant reply with no tool uses and none outstanding), when the next
+``Prompt`` record arrives, or — as a backstop for turns that died without
+either (TUI interrupt, kiro-cli crash) — after :data:`_STALLED_TURN_IDLE_S` of
+transcript inactivity. Open-turn state is persisted alongside the byte cursor,
+so a supervisor restart resumes the turn under its original id instead of
+splitting the streaming group or stranding a spinner.
+
+The PTY-activity watcher continues to drive the generic session-level
+running/idle badge (id-less); the id-bearing edges here drive only the
+streaming lifecycle of the individual tool-call bubbles, matching the
+goose-native forwarder. The #1137 rule stands as: this forwarder never posts
+an *id-less* session status (double-sourcing the session badge was that bug);
+every edge it posts carries a ``response_id``.
 """
 
 from __future__ import annotations
@@ -14,12 +36,13 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
+from omnigent._native_post_delivery import post_external_session_status
 from omnigent.kiro_native_bridge import write_forwarder_ready
 
 _logger = logging.getLogger(__name__)
@@ -29,6 +52,14 @@ _POST_TIMEOUT_S = 30.0
 _DISCOVERY_SKEW_MS = 10_000
 _STATE_FILE = "kiro_session_forwarder.json"
 
+#: Seconds of transcript inactivity after which an open turn's live card is
+#: closed. This is only a backstop for turns that died without their normal
+#: close (the final prose record or the next ``Prompt``) — e.g. a TUI interrupt
+#: or a kiro-cli crash. Minutes, not seconds: a legitimately long tool call
+#: appends no transcript records while it runs, and closing early makes the
+#: spinner flicker on exactly the calls the live card is most useful for.
+_STALLED_TURN_IDLE_S = 300.0
+
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
@@ -36,10 +67,21 @@ _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
 
 @dataclass
 class _ForwardState:
-    """Durable cursor for one Kiro JSONL session file."""
+    """Durable cursor + open-turn card state for one Kiro JSONL session file.
+
+    The turn fields persist with the byte cursor so a restart mid-turn neither
+    mints a fresh turn id (splitting the streaming group of items already
+    posted under the original id) nor re-posts ``running`` for a turn whose
+    edge already went out — and a ``running`` the previous run posted can still
+    be closed. Kiro's transcript is the only store, so persisting the derived
+    state is simpler and cheaper than a goose-style open-turn replay.
+    """
 
     session_id: str | None = None
     byte_offset: int = 0
+    turn_response_id: str | None = None
+    turn_live: bool = False
+    pending_call_ids: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -49,6 +91,39 @@ class KiroConversationMessage:
     message_id: str
     role: str
     text: str
+
+
+@dataclass(frozen=True)
+class KiroToolCall:
+    """One ``toolUse`` content block from an ``AssistantMessage`` record."""
+
+    call_id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class KiroToolResult:
+    """One tool-result content block from a ``ToolResults`` record."""
+
+    call_id: str
+    output: str
+
+
+@dataclass(frozen=True)
+class KiroTranscriptRecord:
+    """One parsed transcript record — the superset the live mirror consumes.
+
+    :func:`parse_kiro_jsonl_line` remains the message-only projection of this
+    (the stable contract offline import pins); tool vocabulary only appears
+    here.
+    """
+
+    kind: str
+    message_id: str
+    text: str
+    tool_calls: tuple[KiroToolCall, ...] = ()
+    tool_results: tuple[KiroToolResult, ...] = ()
 
 
 _KiroConversationMessage = KiroConversationMessage
@@ -70,9 +145,20 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
         return _ForwardState()
     session_id = data.get("session_id")
     byte_offset = data.get("byte_offset")
+    turn_response_id = data.get("turn_response_id")
+    pending = data.get("pending_call_ids")
     return _ForwardState(
         session_id=session_id if isinstance(session_id, str) and session_id else None,
         byte_offset=byte_offset if isinstance(byte_offset, int) and byte_offset >= 0 else 0,
+        turn_response_id=(
+            turn_response_id if isinstance(turn_response_id, str) and turn_response_id else None
+        ),
+        turn_live=data.get("turn_live") is True,
+        pending_call_ids=(
+            {entry for entry in pending if isinstance(entry, str) and entry}
+            if isinstance(pending, list)
+            else set()
+        ),
     )
 
 
@@ -83,7 +169,15 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         os.chmod(bridge_dir, 0o700)
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     tmp.write_text(
-        json.dumps({"session_id": state.session_id, "byte_offset": state.byte_offset}),
+        json.dumps(
+            {
+                "session_id": state.session_id,
+                "byte_offset": state.byte_offset,
+                "turn_response_id": state.turn_response_id,
+                "turn_live": state.turn_live,
+                "pending_call_ids": sorted(state.pending_call_ids),
+            }
+        ),
         encoding="utf-8",
     )
     os.replace(tmp, bridge_dir / _STATE_FILE)
@@ -218,12 +312,17 @@ def _kiro_session_jsonl_for_id(
     return jsonl_path
 
 
-def _read_new_kiro_messages(
+def _read_new_kiro_records(
     jsonl_path: Path,
     byte_offset: int,
-) -> tuple[list[KiroConversationMessage], int]:
-    """Read conversation messages after *byte_offset* from Kiro's JSONL file."""
-    messages: list[KiroConversationMessage] = []
+) -> tuple[list[tuple[KiroTranscriptRecord, int]], int]:
+    """Read parsed records after *byte_offset*, each paired with its end offset.
+
+    The per-record end offsets let the mirror loop persist the cursor after
+    each record's items are posted (goose's per-row cursor discipline), so a
+    crash mid-batch re-reads at most one record instead of the whole batch.
+    """
+    records: list[tuple[KiroTranscriptRecord, int]] = []
     try:
         with jsonl_path.open("rb") as handle:
             handle.seek(byte_offset)
@@ -241,16 +340,47 @@ def _read_new_kiro_messages(
                     line = raw_line.decode("utf-8")
                 except UnicodeDecodeError:
                     continue
-                message = parse_kiro_jsonl_line(line)
-                if message is not None:
-                    messages.append(message)
-            return messages, offset
+                record = parse_kiro_jsonl_record(line)
+                if record is not None:
+                    records.append((record, offset))
+            return records, offset
     except OSError:
         return [], byte_offset
 
 
-def parse_kiro_jsonl_line(line: str) -> KiroConversationMessage | None:
-    """Parse one Kiro JSONL line into the stable shared message contract."""
+def _read_new_kiro_messages(
+    jsonl_path: Path,
+    byte_offset: int,
+) -> tuple[list[KiroConversationMessage], int]:
+    """Read conversation messages after *byte_offset* from Kiro's JSONL file.
+
+    Message-only projection of :func:`_read_new_kiro_records`, retained for the
+    offline-import surface and existing tests.
+    """
+    records, offset = _read_new_kiro_records(jsonl_path, byte_offset)
+    messages: list[KiroConversationMessage] = []
+    for record, _end_offset in records:
+        message = _record_to_message(record)
+        if message is not None:
+            messages.append(message)
+    return messages, offset
+
+
+def _record_to_message(record: KiroTranscriptRecord) -> KiroConversationMessage | None:
+    """Project a transcript record onto the stable message-only contract."""
+    if record.kind == "ToolResults" or not record.text:
+        return None
+    role = "user" if record.kind == "Prompt" else "assistant"
+    return KiroConversationMessage(message_id=record.message_id, role=role, text=record.text)
+
+
+def parse_kiro_jsonl_record(line: str) -> KiroTranscriptRecord | None:
+    """Parse one Kiro JSONL line into the full transcript-record contract.
+
+    Superset of :func:`parse_kiro_jsonl_line`: also surfaces ``toolUse``
+    content blocks on assistant records and ``ToolResults`` records, which the
+    message-only contract drops. Any other record kind still parses to ``None``.
+    """
     try:
         record = json.loads(line)
     except ValueError:
@@ -258,22 +388,35 @@ def parse_kiro_jsonl_line(line: str) -> KiroConversationMessage | None:
     if not isinstance(record, dict):
         return None
     kind = record.get("kind")
-    if kind == "Prompt":
-        role = "user"
-    elif kind == "AssistantMessage":
-        role = "assistant"
-    else:
+    if kind not in ("Prompt", "AssistantMessage", "ToolResults"):
         return None
     data = record.get("data")
     if not isinstance(data, dict):
         return None
-    message_id = data.get("message_id")
-    if not isinstance(message_id, str) or not message_id:
+    raw_message_id = data.get("message_id")
+    message_id = raw_message_id if isinstance(raw_message_id, str) else ""
+    if kind == "ToolResults":
+        tool_results = _extract_tool_results(data.get("content"))
+        if not tool_results:
+            return None
+        return KiroTranscriptRecord(
+            kind=kind, message_id=message_id, text="", tool_results=tool_results
+        )
+    if not message_id:
         return None
     text = _kiro_content_text(data.get("content")).strip()
-    if not text:
+    tool_calls = _extract_tool_calls(data.get("content")) if kind == "AssistantMessage" else ()
+    if not text and not tool_calls:
         return None
-    return KiroConversationMessage(message_id=message_id, role=role, text=text)
+    return KiroTranscriptRecord(kind=kind, message_id=message_id, text=text, tool_calls=tool_calls)
+
+
+def parse_kiro_jsonl_line(line: str) -> KiroConversationMessage | None:
+    """Parse one Kiro JSONL line into the stable shared message contract."""
+    record = parse_kiro_jsonl_record(line)
+    if record is None:
+        return None
+    return _record_to_message(record)
 
 
 _parse_kiro_jsonl_line = parse_kiro_jsonl_line
@@ -296,14 +439,122 @@ def _kiro_content_text(content: object) -> str:
     return "\n".join(parts)
 
 
+# kiro-cli is closed-source and no public capture pins the exact key spellings
+# inside its tool blocks (the record kinds and the ``tooluse_`` id shape are
+# corroborated; the block-level keys are not). Until a captured transcript
+# locks them, accept the tag/key spellings of both the transcript's own
+# ``kind``/``data`` block style and the ACP wire style kiro also speaks.
+_TOOL_USE_BLOCK_TAGS = frozenset({"toolUse", "tool_use"})
+_TOOL_RESULT_BLOCK_TAGS = frozenset({"toolResult", "tool_result"})
+_TOOL_ID_KEYS = ("tool_use_id", "toolUseId", "id", "toolCallId")
+_TOOL_NAME_KEYS = ("name", "toolName", "tool_name")
+_TOOL_ARGS_KEYS = ("input", "args", "arguments")
+_TOOL_OUTPUT_KEYS = ("content", "output", "text", "data")
+
+
+def _block_tag(block: dict[str, object]) -> str | None:
+    """Return a content block's discriminator under either tag style."""
+    for key in ("kind", "type"):
+        tag = block.get(key)
+        if isinstance(tag, str) and tag:
+            return tag
+    return None
+
+
+def _block_payload(block: dict[str, object]) -> dict[str, object]:
+    """Return the fields of a tool block, unwrapping a ``data`` envelope.
+
+    Text blocks nest their value under ``data`` (``{"kind": "text", "data":
+    ...}``), so tool blocks plausibly nest an object the same way; a flat block
+    carries its fields directly.
+    """
+    data = block.get("data")
+    return data if isinstance(data, dict) else block
+
+
+def _first_str(payload: dict[str, object], keys: tuple[str, ...]) -> str:
+    """Return the first non-empty string among *keys* in *payload*."""
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _tool_arguments_json(payload: dict[str, object]) -> str:
+    """Return a tool block's arguments as a JSON-encoded string."""
+    for key in _TOOL_ARGS_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict | list):
+            return json.dumps(value, ensure_ascii=True)
+    return "{}"
+
+
+def _tool_output_text(payload: dict[str, object]) -> str:
+    """Return a tool-result block's output as display text."""
+    for key in _TOOL_OUTPUT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict | list):
+            nested = _kiro_content_text(value)
+            if nested:
+                return nested
+            return json.dumps(value, ensure_ascii=True)
+    return ""
+
+
+def _extract_tool_calls(content: object) -> tuple[KiroToolCall, ...]:
+    """Extract ``toolUse`` blocks from an ``AssistantMessage`` record's content."""
+    if not isinstance(content, list):
+        return ()
+    calls: list[KiroToolCall] = []
+    for block in content:
+        if not isinstance(block, dict) or _block_tag(block) not in _TOOL_USE_BLOCK_TAGS:
+            continue
+        payload = _block_payload(block)
+        call_id = _first_str(payload, _TOOL_ID_KEYS)
+        name = _first_str(payload, _TOOL_NAME_KEYS)
+        if not call_id or not name:
+            continue
+        calls.append(
+            KiroToolCall(call_id=call_id, name=name, arguments=_tool_arguments_json(payload))
+        )
+    return tuple(calls)
+
+
+def _extract_tool_results(content: object) -> tuple[KiroToolResult, ...]:
+    """Extract tool-result blocks from a ``ToolResults`` record's content."""
+    if not isinstance(content, list):
+        return ()
+    results: list[KiroToolResult] = []
+    for block in content:
+        if not isinstance(block, dict) or _block_tag(block) not in _TOOL_RESULT_BLOCK_TAGS:
+            continue
+        payload = _block_payload(block)
+        call_id = _first_str(payload, _TOOL_ID_KEYS)
+        if not call_id:
+            continue
+        results.append(KiroToolResult(call_id=call_id, output=_tool_output_text(payload)))
+    return tuple(results)
+
+
 async def _post_conversation_message(
     client: httpx.AsyncClient,
     *,
     session_id: str,
     agent_name: str,
     message: KiroConversationMessage,
+    response_id: str | None = None,
 ) -> None:
-    """POST one Kiro message as an external conversation item."""
+    """POST one Kiro message as an external conversation item.
+
+    :param response_id: The open turn's shared id for assistant prose (so the
+        bubble joins the turn's streaming group). ``None`` keeps the historic
+        per-message id — user prompts and the offline-import surface.
+    """
     if message.role == "assistant":
         item_data = {
             "role": "assistant",
@@ -322,11 +573,66 @@ async def _post_conversation_message(
             "data": {
                 "item_type": "message",
                 "item_data": item_data,
-                "response_id": f"kiro:{message.message_id}",
+                "response_id": response_id or f"kiro:{message.message_id}",
             },
         },
     )
     resp.raise_for_status()
+
+
+async def _post_function_call(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    agent_name: str,
+    response_id: str,
+    call: KiroToolCall,
+) -> None:
+    """POST one ``toolUse`` block as a ``function_call`` item."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call",
+                "item_data": {
+                    "agent": agent_name,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "call_id": call.call_id,
+                },
+                "response_id": response_id,
+            },
+        },
+    )
+    resp.raise_for_status()
+
+
+async def _post_function_call_output(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    response_id: str,
+    result: KiroToolResult,
+) -> None:
+    """POST one tool-result block as a ``function_call_output`` item."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "function_call_output",
+                "item_data": {"call_id": result.call_id, "output": result.output},
+                "response_id": response_id,
+            },
+        },
+    )
+    resp.raise_for_status()
+
+
+def _turn_monotonic() -> float:
+    """Indirection so tests can stub the stalled-turn clock."""
+    return time.monotonic()
 
 
 async def _patch_external_session_id(
@@ -496,6 +802,93 @@ async def _post_session_cost(
     resp.raise_for_status()
 
 
+async def _mirror_record(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    agent_name: str,
+    record: KiroTranscriptRecord,
+    state: _ForwardState,
+) -> None:
+    """Mirror one transcript record, advancing the turn's card lifecycle.
+
+    Turn shape (mirrors the goose-native forwarder): a ``Prompt`` record
+    authoritatively closes the previous turn and anchors the next turn's id;
+    ``running`` is posted once per turn before its first mirrored item; the
+    ledger of pending ``toolUse`` ids decides when an assistant prose record is
+    the turn's final message (none emitted, none outstanding); prose posts
+    before the record's tool calls so the web spinner sits on the trailing
+    item.
+    """
+    if record.kind == "Prompt":
+        # A new user turn authoritatively closes the previous one.
+        if state.turn_live and state.turn_response_id:
+            await post_external_session_status(
+                client,
+                session_id=session_id,
+                status="idle",
+                response_id=state.turn_response_id,
+            )
+        state.turn_response_id = f"kiro:turn:{record.message_id}"
+        state.turn_live = False
+        state.pending_call_ids.clear()
+        message = _record_to_message(record)
+        if message is not None:
+            await _post_conversation_message(
+                client, session_id=session_id, agent_name=agent_name, message=message
+            )
+        return
+
+    if state.turn_response_id is None:
+        # Forwarder attached mid-turn (its Prompt is behind the cursor or was
+        # never seen): anchor the turn to the first record observed instead.
+        anchor = record.message_id or (state.session_id or "unknown")
+        state.turn_response_id = f"kiro:turn:{anchor}"
+    response_id = state.turn_response_id
+
+    if not state.turn_live:
+        await post_external_session_status(
+            client, session_id=session_id, status="running", response_id=response_id
+        )
+        state.turn_live = True
+
+    if record.kind == "AssistantMessage":
+        message = _record_to_message(record)
+        if message is not None:
+            await _post_conversation_message(
+                client,
+                session_id=session_id,
+                agent_name=agent_name,
+                message=message,
+                response_id=response_id,
+            )
+        for call in record.tool_calls:
+            state.pending_call_ids.add(call.call_id)
+            await _post_function_call(
+                client,
+                session_id=session_id,
+                agent_name=agent_name,
+                response_id=response_id,
+                call=call,
+            )
+        # Kiro's agent loop keeps stepping while the model returns tool uses
+        # and stops on a plain reply, so an assistant prose record with no tool
+        # uses (and none outstanding) is the authoritative end of the turn.
+        if not record.tool_calls and not state.pending_call_ids:
+            await post_external_session_status(
+                client, session_id=session_id, status="idle", response_id=response_id
+            )
+            # Keep turn_response_id: a late resume rejoins the same turn.
+            state.turn_live = False
+        return
+
+    for result in record.tool_results:
+        state.pending_call_ids.discard(result.call_id)
+        await _post_function_call_output(
+            client, session_id=session_id, response_id=response_id, result=result
+        )
+
+
 async def forward_kiro_session_to_omnigent(
     *,
     base_url: str,
@@ -509,13 +902,16 @@ async def forward_kiro_session_to_omnigent(
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
 ) -> None:
-    """Tail Kiro's session JSONL and mirror assistant messages into AP."""
+    """Tail Kiro's session JSONL and mirror messages + live tool-call cards."""
     state = _read_state(bridge_dir)
     jsonl_path: Path | None = None
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     mirrored_external_session_id: str | None = None
     last_posted_cost: float | None = None
     last_posted_model: str | None = None
+    # Monotonic clocks don't survive a restart; a restored open turn restarts
+    # its inactivity window from now.
+    last_turn_activity_ts: float | None = _turn_monotonic() if state.turn_live else None
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -540,8 +936,18 @@ async def forward_kiro_session_to_omnigent(
                     if discovered is not None:
                         discovered_session_id, discovered_path = discovered
                         if state.session_id != discovered_session_id:
+                            if state.turn_live and state.turn_response_id:
+                                # Rebinding to a different Kiro session strands
+                                # the old turn's card; settle it before switching.
+                                await post_external_session_status(
+                                    client,
+                                    session_id=session_id,
+                                    status="idle",
+                                    response_id=state.turn_response_id,
+                                )
                             state = _ForwardState(session_id=discovered_session_id, byte_offset=0)
                             _write_state(bridge_dir, state)
+                            last_turn_activity_ts = None
                         jsonl_path = discovered_path
                 if jsonl_path is not None and state.session_id is not None:
                     if mirrored_external_session_id != state.session_id:
@@ -551,27 +957,52 @@ async def forward_kiro_session_to_omnigent(
                             external_session_id=state.session_id,
                         )
                         mirrored_external_session_id = state.session_id
-                    messages, byte_offset = await asyncio.to_thread(
-                        _read_new_kiro_messages,
+                    records, batch_end_offset = await asyncio.to_thread(
+                        _read_new_kiro_records,
                         jsonl_path,
                         state.byte_offset,
                     )
-                    for message in messages:
-                        # Mirror the transcript only. Running/idle status for
-                        # kiro-native is owned by the PTY watcher's ``emit_status``
-                        # (``runner/resource_registry.py``), matching the other
-                        # forwarder-backed native harnesses (goose/qwen/hermes),
-                        # whose forwarders mirror the transcript, not the
-                        # running/idle session status. Posting status here too
-                        # double-sourced it (#1137).
-                        await _post_conversation_message(
+                    for record, record_end_offset in records:
+                        # Mirror the transcript plus id-bearing card edges only.
+                        # The id-less running/idle session badge stays owned by
+                        # the PTY watcher's ``emit_status``
+                        # (``runner/resource_registry.py``); double-sourcing it
+                        # was #1137. The edges posted here always carry the
+                        # turn's ``response_id``, which is what drives the live
+                        # tool-call bubbles (the goose-native split).
+                        await _mirror_record(
                             client,
                             session_id=session_id,
                             agent_name=agent_name,
-                            message=message,
+                            record=record,
+                            state=state,
                         )
-                    if byte_offset != state.byte_offset:
-                        state.byte_offset = byte_offset
+                        if state.turn_response_id is not None:
+                            # Any transcript record while a turn is open proves
+                            # kiro is alive; only true silence trips the backstop.
+                            last_turn_activity_ts = _turn_monotonic()
+                        state.byte_offset = record_end_offset
+                        _write_state(bridge_dir, state)
+                    if batch_end_offset != state.byte_offset:
+                        # Skipped tail bytes (unparseable/foreign records) still
+                        # advance the cursor once their lines are complete.
+                        state.byte_offset = batch_end_offset
+                        _write_state(bridge_dir, state)
+                    # Backstop: a turn that died without its normal close (TUI
+                    # interrupt, kiro-cli crash) must not leave a spinner forever.
+                    if (
+                        state.turn_live
+                        and last_turn_activity_ts is not None
+                        and _turn_monotonic() - last_turn_activity_ts > _STALLED_TURN_IDLE_S
+                    ):
+                        await post_external_session_status(
+                            client,
+                            session_id=session_id,
+                            status="idle",
+                            response_id=state.turn_response_id,
+                        )
+                        # Keep turn_response_id: a late resume rejoins the turn.
+                        state.turn_live = False
                         _write_state(bridge_dir, state)
                     write_forwarder_ready(bridge_dir)
                     # Forward kiro's credit metering as authoritative session

@@ -54,6 +54,64 @@ def _write_kiro_session(
     return jsonl_path
 
 
+def _prompt_record(message_id: str, text: str) -> dict[str, Any]:
+    """One ``Prompt`` transcript record with a single text block."""
+    return {
+        "version": "v1",
+        "kind": "Prompt",
+        "data": {"message_id": message_id, "content": [{"kind": "text", "data": text}]},
+    }
+
+
+def _assistant_record(
+    message_id: str,
+    text: str | None = None,
+    tool_uses: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """One ``AssistantMessage`` record with optional text and ``toolUse`` blocks."""
+    content: list[dict[str, Any]] = []
+    if text is not None:
+        content.append({"kind": "text", "data": text})
+    for tool_use in tool_uses or []:
+        content.append({"kind": "toolUse", "data": tool_use})
+    return {
+        "version": "v1",
+        "kind": "AssistantMessage",
+        "data": {"message_id": message_id, "content": content},
+    }
+
+
+def _tool_results_record(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """One ``ToolResults`` record with ``toolResult`` blocks."""
+    return {
+        "version": "v1",
+        "kind": "ToolResults",
+        "data": {"content": [{"kind": "toolResult", "data": result} for result in results]},
+    }
+
+
+def _stub_status_posts(
+    monkeypatch: pytest.MonkeyPatch,
+    sink: list[tuple[str, str | None]] | None = None,
+) -> None:
+    """Replace the forwarder's status-edge post with a capturing stub."""
+
+    async def _fake_status(
+        client: httpx.AsyncClient,
+        *,
+        session_id: str,
+        status: str,
+        output: str | None = None,
+        background_task_count: int | None = None,
+        response_id: str | None = None,
+    ) -> None:
+        del client, session_id, output, background_task_count
+        if sink is not None:
+            sink.append((status, response_id))
+
+    monkeypatch.setattr(forwarder, "post_external_session_status", _fake_status)
+
+
 def test_discover_kiro_session_jsonl_filters_by_workspace_and_launch_time(
     tmp_path: Path,
 ) -> None:
@@ -304,8 +362,9 @@ async def test_forward_kiro_session_posts_conversation_messages(
         session_id: str,
         agent_name: str,
         message: forwarder._KiroConversationMessage,
+        response_id: str | None = None,
     ) -> None:
-        del client
+        del client, response_id
         posted.append((session_id, agent_name, message))
 
     async def _fake_patch_external_session_id(
@@ -326,6 +385,7 @@ async def test_forward_kiro_session_posts_conversation_messages(
         "_patch_external_session_id",
         _fake_patch_external_session_id,
     )
+    _stub_status_posts(monkeypatch)
     monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
 
     with pytest.raises(asyncio.CancelledError):
@@ -353,9 +413,9 @@ async def test_forward_kiro_session_posts_conversation_messages(
             ),
         ),
     ]
-    # The forwarder no longer posts session status; running/idle for
-    # kiro-native is owned by the PTY watcher's emit_status (#1137). See
-    # test_forward_kiro_session_does_not_post_session_status for the guard.
+    # The forwarder's status edges always carry a response_id; the id-less
+    # session badge stays PTY-owned (#1137). See
+    # test_forward_kiro_session_posts_only_id_bearing_status for the guard.
     assert external_ids == [("conv_kiro", "kiro-session")]
 
 
@@ -444,6 +504,7 @@ async def test_forward_kiro_session_posts_cumulative_cost_once(
         session_id: str,
         agent_name: str,
         message: forwarder._KiroConversationMessage,
+        response_id: str | None = None,
     ) -> None:
         del client
 
@@ -466,6 +527,7 @@ async def test_forward_kiro_session_posts_cumulative_cost_once(
     monkeypatch.setattr(forwarder, "_post_external_model_change", _noop_model)
     monkeypatch.setattr(forwarder, "_post_conversation_message", _noop_message)
     monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
+    _stub_status_posts(monkeypatch)
     monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_after_two_polls)
 
     with pytest.raises(asyncio.CancelledError):
@@ -553,8 +615,9 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
         session_id: str,
         agent_name: str,
         message: forwarder._KiroConversationMessage,
+        response_id: str | None = None,
     ) -> None:
-        del client, session_id, agent_name
+        del client, session_id, agent_name, response_id
         posted.append(message)
 
     async def _fake_patch_external_session_id(
@@ -575,6 +638,7 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
         "_patch_external_session_id",
         _fake_patch_external_session_id,
     )
+    _stub_status_posts(monkeypatch)
     monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
 
     with pytest.raises(asyncio.CancelledError):
@@ -595,7 +659,7 @@ async def test_forward_kiro_session_prefers_expected_resume_session(
             message_id="resumed-assistant", role="assistant", text="resumed reply"
         ),
     ]
-    # No session status is posted by the forwarder anymore (#1137).
+    # Status edges (stubbed above) always carry the turn's response_id (#1137).
     assert external_ids == ["resumed-session"]
     state = json.loads((bridge_dir / "kiro_session_forwarder.json").read_text())
     assert state["session_id"] == "resumed-session"
@@ -638,8 +702,9 @@ async def test_forward_kiro_session_waits_for_expected_resume_session(
         session_id: str,
         agent_name: str,
         message: forwarder._KiroConversationMessage,
+        response_id: str | None = None,
     ) -> None:
-        del client, session_id, agent_name
+        del client, session_id, agent_name, response_id
         posted.append(message)
 
     async def _fake_patch_external_session_id(
@@ -660,6 +725,7 @@ async def test_forward_kiro_session_waits_for_expected_resume_session(
         "_patch_external_session_id",
         _fake_patch_external_session_id,
     )
+    _stub_status_posts(monkeypatch)
     monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
 
     with pytest.raises(asyncio.CancelledError):
@@ -679,15 +745,18 @@ async def test_forward_kiro_session_waits_for_expected_resume_session(
 
 
 @pytest.mark.asyncio
-async def test_forward_kiro_session_does_not_post_session_status(
+async def test_forward_kiro_session_posts_only_id_bearing_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression for #1137: the forwarder mirrors the transcript but must NOT
-    post ``external_session_status``. Running/idle for kiro-native is owned by
-    the PTY watcher's ``emit_status`` (runner/resource_registry.py); posting it
-    here too double-sourced the session status. Captures real HTTP via a mock
-    transport so it guards the behaviour however status might be sent."""
+    """Regression for #1137, updated for live tool-call cards: every
+    ``external_session_status`` the forwarder posts must carry a ``response_id``.
+    The id-less session badge stays owned by the PTY watcher's ``emit_status``
+    (runner/resource_registry.py) — double-sourcing *that* was #1137 — while the
+    id-bearing edges drive only the per-turn card lifecycle (the goose-native
+    split; an id-less idle is a no-op for a still-streaming card web-side).
+    Captures real HTTP via a mock transport so it guards the behaviour however
+    status might be sent."""
     sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
     workspace = tmp_path / "repo"
     workspace.mkdir()
@@ -713,11 +782,11 @@ async def test_forward_kiro_session_does_not_post_session_status(
     )
     monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
 
-    posted_event_types: list[str] = []
+    posted_events: list[dict[str, Any]] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path.endswith("/events"):
-            posted_event_types.append(json.loads(request.content)["type"])
+            posted_events.append(json.loads(request.content))
         return httpx.Response(200, json={})
 
     real_async_client = forwarder.httpx.AsyncClient
@@ -744,10 +813,19 @@ async def test_forward_kiro_session_does_not_post_session_status(
             launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
         )
 
+    posted_event_types = [event["type"] for event in posted_events]
     # The transcript is still mirrored…
     assert "external_conversation_item" in posted_event_types
-    # …but the forwarder posts no session status (the PTY watcher owns it).
-    assert "external_session_status" not in posted_event_types
+    # …and every status edge the forwarder posts carries the turn's id (the
+    # id-less session badge remains PTY-owned, per #1137).
+    status_edges = [
+        event["data"] for event in posted_events if event["type"] == "external_session_status"
+    ]
+    assert status_edges, "the prose turn should open and close its card"
+    assert all(edge.get("response_id") for edge in status_edges)
+    assert [edge["status"] for edge in status_edges] == ["running", "idle"]
+    turn_id = "kiro:turn:user-1"
+    assert {edge["response_id"] for edge in status_edges} == {turn_id}
 
 
 def test_read_kiro_current_model_reads_without_metering(tmp_path: Path) -> None:
@@ -798,6 +876,7 @@ async def test_forward_kiro_session_mirrors_current_model_once(
         session_id: str,
         agent_name: str,
         message: forwarder._KiroConversationMessage,
+        response_id: str | None = None,
     ) -> None:
         del client
 
@@ -816,6 +895,7 @@ async def test_forward_kiro_session_mirrors_current_model_once(
     monkeypatch.setattr(forwarder, "_post_external_model_change", _fake_post_model)
     monkeypatch.setattr(forwarder, "_post_conversation_message", _noop_message)
     monkeypatch.setattr(forwarder, "_patch_external_session_id", _noop_patch)
+    _stub_status_posts(monkeypatch)
     monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_after_two_polls)
 
     with pytest.raises(asyncio.CancelledError):
@@ -831,3 +911,424 @@ async def test_forward_kiro_session_mirrors_current_model_once(
 
     # Mirrored once; the unchanged second poll does not re-post.
     assert models == [("conv_kiro", "claude-haiku-4.5")]
+
+
+def test_parse_kiro_jsonl_record_extracts_tool_vocabulary() -> None:
+    """``toolUse`` blocks and ``ToolResults`` records parse into the superset
+    contract, while :func:`parse_kiro_jsonl_line` stays message-only."""
+    assistant_line = json.dumps(
+        _assistant_record(
+            "a1",
+            text="Let me check",
+            tool_uses=[{"tool_use_id": "tooluse_A", "name": "read", "input": {"path": "f.txt"}}],
+        )
+    )
+    record = forwarder.parse_kiro_jsonl_record(assistant_line)
+    assert record is not None
+    assert record.kind == "AssistantMessage"
+    assert record.text == "Let me check"
+    assert record.tool_calls == (
+        forwarder.KiroToolCall(
+            call_id="tooluse_A", name="read", arguments=json.dumps({"path": "f.txt"})
+        ),
+    )
+
+    # A tool-only assistant record has no prose: the superset parser keeps it,
+    # the stable message-only projection drops it (as it always did).
+    tool_only_line = json.dumps(
+        _assistant_record(
+            "a2", tool_uses=[{"tool_use_id": "tooluse_B", "name": "shell", "input": {"cmd": "ls"}}]
+        )
+    )
+    tool_only = forwarder.parse_kiro_jsonl_record(tool_only_line)
+    assert tool_only is not None
+    assert tool_only.text == "" and len(tool_only.tool_calls) == 1
+    assert forwarder.parse_kiro_jsonl_line(tool_only_line) is None
+
+    results_line = json.dumps(
+        _tool_results_record([{"tool_use_id": "tooluse_A", "content": "file contents"}])
+    )
+    results = forwarder.parse_kiro_jsonl_record(results_line)
+    assert results is not None
+    assert results.kind == "ToolResults"
+    assert results.tool_results == (
+        forwarder.KiroToolResult(call_id="tooluse_A", output="file contents"),
+    )
+    assert forwarder.parse_kiro_jsonl_line(results_line) is None
+
+
+def test_parse_kiro_jsonl_record_accepts_flat_acp_style_tool_blocks() -> None:
+    """Tool blocks parse under the ACP-style tag/key spellings too.
+
+    kiro-cli is closed-source and no public capture pins the block-level key
+    spellings, so the parser accepts both the transcript's ``kind``/``data``
+    envelope style and the flat ACP wire style until a captured transcript
+    locks them.
+    """
+    line = json.dumps(
+        {
+            "version": "v1",
+            "kind": "AssistantMessage",
+            "data": {
+                "message_id": "a1",
+                "content": [
+                    {"type": "tool_use", "toolUseId": "tooluse_C", "toolName": "write", "args": {}}
+                ],
+            },
+        }
+    )
+    record = forwarder.parse_kiro_jsonl_record(line)
+    assert record is not None
+    assert record.tool_calls == (
+        forwarder.KiroToolCall(call_id="tooluse_C", name="write", arguments="{}"),
+    )
+
+
+def test_forward_state_round_trips_turn_fields(tmp_path: Path) -> None:
+    """The persisted cursor carries the open turn's card state across restarts."""
+    state = forwarder._ForwardState(
+        session_id="kiro-session",
+        byte_offset=123,
+        turn_response_id="kiro:turn:user-1",
+        turn_live=True,
+        pending_call_ids={"tooluse_A", "tooluse_B"},
+    )
+    forwarder._write_state(tmp_path, state)
+    restored = forwarder._read_state(tmp_path)
+    assert restored == state
+
+    # A legacy state file (no turn fields) restores with a closed turn.
+    (tmp_path / forwarder._STATE_FILE).write_text(
+        json.dumps({"session_id": "kiro-session", "byte_offset": 7}), encoding="utf-8"
+    )
+    legacy = forwarder._read_state(tmp_path)
+    assert legacy.turn_response_id is None
+    assert legacy.turn_live is False
+    assert legacy.pending_call_ids == set()
+
+
+def _capture_events_client(
+    monkeypatch: pytest.MonkeyPatch,
+    posted_events: list[dict[str, Any]],
+) -> None:
+    """Route the forwarder's HTTP through a mock transport capturing /events."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            posted_events.append(json.loads(request.content))
+        return httpx.Response(200, json={})
+
+    real_async_client = forwarder.httpx.AsyncClient
+
+    def _client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("transport", None)
+        return real_async_client(*args, transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr(forwarder.httpx, "AsyncClient", _client_factory)
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_multi_call_turn_shares_turn_response_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn with parallel tool calls mirrors as one streaming group.
+
+    One ``running`` edge before the turn's first item; the assistant prose,
+    both ``function_call`` items, both ``function_call_output`` items, and the
+    closing ``idle`` all share ``kiro:turn:{prompt_message_id}``; prose posts
+    before the calls so the web spinner sits on the trailing item; the final
+    prose record closes the card immediately.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            _prompt_record("user-1", "run it"),
+            _assistant_record(
+                "a1",
+                text="Let me check",
+                tool_uses=[
+                    {"tool_use_id": "tooluse_A", "name": "read", "input": {"path": "f.txt"}},
+                    {"tool_use_id": "tooluse_B", "name": "shell", "input": {"cmd": "ls"}},
+                ],
+            ),
+            _tool_results_record(
+                [
+                    {"tool_use_id": "tooluse_A", "content": "data-a"},
+                    {"tool_use_id": "tooluse_B", "content": "data-b"},
+                ]
+            ),
+            _assistant_record("a2", text="Done"),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, posted_events)
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    turn_id = "kiro:turn:user-1"
+    lifecycle = [
+        (event["type"], event["data"].get("item_type"), event["data"].get("status"))
+        for event in posted_events
+        if event["type"] in ("external_conversation_item", "external_session_status")
+    ]
+    assert lifecycle == [
+        ("external_conversation_item", "message", None),  # user prompt
+        ("external_session_status", None, "running"),
+        ("external_conversation_item", "message", None),  # prose before the calls
+        ("external_conversation_item", "function_call", None),
+        ("external_conversation_item", "function_call", None),
+        ("external_conversation_item", "function_call_output", None),
+        ("external_conversation_item", "function_call_output", None),
+        ("external_conversation_item", "message", None),  # final prose
+        ("external_session_status", None, "idle"),
+    ]
+    items = [e["data"] for e in posted_events if e["type"] == "external_conversation_item"]
+    # The user prompt keeps its per-message id; everything else shares the turn id.
+    assert items[0]["response_id"] == "kiro:user-1"
+    assert {item["response_id"] for item in items[1:]} == {turn_id}
+    calls = [item["item_data"] for item in items if item["item_type"] == "function_call"]
+    assert [(call["call_id"], call["name"]) for call in calls] == [
+        ("tooluse_A", "read"),
+        ("tooluse_B", "shell"),
+    ]
+    outputs = [item["item_data"] for item in items if item["item_type"] == "function_call_output"]
+    assert [(out["call_id"], out["output"]) for out in outputs] == [
+        ("tooluse_A", "data-a"),
+        ("tooluse_B", "data-b"),
+    ]
+    edges = [e["data"] for e in posted_events if e["type"] == "external_session_status"]
+    assert [(edge["status"], edge["response_id"]) for edge in edges] == [
+        ("running", turn_id),
+        ("idle", turn_id),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_restart_mid_turn_keeps_turn_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restart between a call and its result resumes the same streaming group.
+
+    The persisted turn state means the second run posts no second ``running``,
+    stamps the remaining items with the original turn id, and closes the card
+    once the final prose record lands — instead of splitting the turn across
+    two response ids (the failure goose needed open-turn replay to fix).
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    jsonl_path = _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            _prompt_record("user-1", "run it"),
+            _assistant_record(
+                "a1",
+                text="Checking",
+                tool_uses=[{"tool_use_id": "tooluse_A", "name": "read", "input": {}}],
+            ),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    bridge_dir = tmp_path / "bridge"
+    turn_id = "kiro:turn:user-1"
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    # One shared sink for both runs: patching the client factory twice would
+    # wrap the first patch and route the second run's events to the first sink.
+    all_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, all_events)
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=bridge_dir,
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+    first_run_events = list(all_events)
+
+    first_edges = [e["data"] for e in first_run_events if e["type"] == "external_session_status"]
+    assert [(edge["status"], edge["response_id"]) for edge in first_edges] == [
+        ("running", turn_id)
+    ]
+    persisted = json.loads((bridge_dir / forwarder._STATE_FILE).read_text())
+    assert persisted["turn_response_id"] == turn_id
+    assert persisted["turn_live"] is True
+    assert persisted["pending_call_ids"] == ["tooluse_A"]
+
+    # The tool finishes and the turn ends while the forwarder is down.
+    with jsonl_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(_tool_results_record([{"tool_use_id": "tooluse_A", "content": "data"}]))
+            + "\n"
+        )
+        handle.write(json.dumps(_assistant_record("a2", text="Done")) + "\n")
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=bridge_dir,
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+    second_run_events = all_events[len(first_run_events) :]
+
+    items = [e["data"] for e in second_run_events if e["type"] == "external_conversation_item"]
+    assert [item["item_type"] for item in items] == ["function_call_output", "message"]
+    assert {item["response_id"] for item in items} == {turn_id}
+    second_edges = [e["data"] for e in second_run_events if e["type"] == "external_session_status"]
+    # No second running; the original turn closes under its original id.
+    assert [(edge["status"], edge["response_id"]) for edge in second_edges] == [("idle", turn_id)]
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_missed_opener_anchors_to_first_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attaching mid-turn (no ``Prompt`` seen) still yields a stable turn id."""
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            _assistant_record(
+                "a1",
+                text="Working",
+                tool_uses=[{"tool_use_id": "tooluse_A", "name": "shell", "input": {}}],
+            ),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, posted_events)
+
+    async def _cancel_sleep(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    turn_id = "kiro:turn:a1"
+    edges = [e["data"] for e in posted_events if e["type"] == "external_session_status"]
+    assert [(edge["status"], edge["response_id"]) for edge in edges] == [("running", turn_id)]
+    items = [e["data"] for e in posted_events if e["type"] == "external_conversation_item"]
+    assert {item["response_id"] for item in items} == {turn_id}
+
+
+@pytest.mark.asyncio
+async def test_forward_kiro_session_stalled_turn_backstop_closes_card(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that dies without its normal close settles after the backstop.
+
+    A pending tool call with no result and no further transcript activity (TUI
+    interrupt, kiro-cli crash) must not leave a spinner forever: after
+    ``_STALLED_TURN_IDLE_S`` of transcript inactivity the card is closed with
+    the turn's own id.
+    """
+    sessions_dir = tmp_path / "home" / ".kiro" / "sessions" / "cli"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    _write_kiro_session(
+        sessions_dir,
+        session_id="kiro-session",
+        cwd=workspace,
+        lines=[
+            _prompt_record("user-1", "run it"),
+            _assistant_record(
+                "a1",
+                text="Running",
+                tool_uses=[{"tool_use_id": "tooluse_A", "name": "shell", "input": {}}],
+            ),
+        ],
+    )
+    monkeypatch.setattr(forwarder, "kiro_cli_sessions_dir", lambda: sessions_dir)
+    posted_events: list[dict[str, Any]] = []
+    _capture_events_client(monkeypatch, posted_events)
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(forwarder, "_turn_monotonic", lambda: clock["now"])
+
+    polls = {"n": 0}
+
+    async def _advance_clock_then_cancel(_seconds: float) -> None:
+        polls["n"] += 1
+        if polls["n"] == 1:
+            # Poll 1 mirrored the open turn; silence past the backstop window.
+            clock["now"] = forwarder._STALLED_TURN_IDLE_S + 1.0
+            return
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(forwarder.asyncio, "sleep", _advance_clock_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await forwarder.forward_kiro_session_to_omnigent(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id="conv_kiro",
+            bridge_dir=tmp_path / "bridge",
+            agent_name="kiro-native-ui",
+            workspace=str(workspace),
+            launch_epoch_ms=forwarder._parse_iso_epoch_ms("2026-06-21T01:39:34Z"),
+        )
+
+    turn_id = "kiro:turn:user-1"
+    edges = [e["data"] for e in posted_events if e["type"] == "external_session_status"]
+    assert [(edge["status"], edge["response_id"]) for edge in edges] == [
+        ("running", turn_id),
+        ("idle", turn_id),
+    ]
+    # The settled turn is persisted closed, so a restart won't re-close it.
+    persisted = json.loads(
+        (tmp_path / "bridge" / forwarder._STATE_FILE).read_text(encoding="utf-8")
+    )
+    assert persisted["turn_live"] is False
+    assert persisted["turn_response_id"] == turn_id
