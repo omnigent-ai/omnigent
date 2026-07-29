@@ -31,6 +31,7 @@ from omnigent.spec.types import RetryPolicy
 
 from . import _proc
 from ._subprocess_lifecycle import close_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .codex_goal_command import goal_objective_from_content as _goal_objective_from_content
 from .databricks_executor import (
     _databricks_gateway_host,
@@ -2702,7 +2703,12 @@ class CodexExecutor(Executor):
         model = cfg.model or self._model_override
         if model is None:
             provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
-            model = model_catalog.resolve_catalog_model(provider_name, family="openai").model_id
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                provider_name,
+                family="openai",
+            )
+            model = resolution.model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )

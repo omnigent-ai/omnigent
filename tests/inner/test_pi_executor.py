@@ -1491,7 +1491,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="cfg-override")), "cfg-override"
+            _run(executor._resolve_model(ExecutorConfig(model="cfg-override"))),
+            "cfg-override",
         )
 
     def test_constructor_default_used_when_no_cfg_override(self):
@@ -1501,7 +1502,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor(model="constructor-default")
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model=None)), "constructor-default"
+            _run(executor._resolve_model(ExecutorConfig(model=None))),
+            "constructor-default",
         )
 
     def test_cfg_model_used_when_no_constructor_default(self):
@@ -1512,7 +1514,8 @@ class TestResolveModel(unittest.TestCase):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
             executor = PiExecutor()
         self.assertEqual(
-            executor._resolve_model(ExecutorConfig(model="config-model")), "config-model"
+            _run(executor._resolve_model(ExecutorConfig(model="config-model"))),
+            "config-model",
         )
 
 
@@ -2875,7 +2878,7 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True)
-    assert executor._resolve_model(ExecutorConfig(model=None)) == (
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
         "catalog-databricks-claude-default"
     )
 
@@ -2896,7 +2899,7 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True, model="databricks-gpt-5-4")
-    assert executor._resolve_model(ExecutorConfig(model=None)) == "databricks-gpt-5-4"
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
 
 
 def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
@@ -2921,7 +2924,7 @@ def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
             gateway_host="https://example.databricks.com",
             gateway_auth_command="printf token",
         )
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
 def test_non_gateway_path_does_not_inject_default_model() -> None:
@@ -2932,7 +2935,7 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     """
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor()
-    assert executor._resolve_model(ExecutorConfig(model=None)) is None
+    assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
 def test_models_json_lists_only_gateway_verified_models() -> None:

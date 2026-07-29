@@ -899,7 +899,12 @@ class DatabricksExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model
         if not model:
-            model = model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            model = resolution.model_id
         session_key = self._session_key(messages)
         state = self._get_or_create_session_state(session_key)
         state.interrupt_requested = False

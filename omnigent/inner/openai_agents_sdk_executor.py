@@ -32,6 +32,7 @@ from omnigent.llms.errors import is_context_length_exceeded as _is_context_lengt
 from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
 from omnigent.spec.types import RetryPolicy
 
+from .async_utils import run_sync_on_thread
 from .executor import (
     Executor,
     ExecutorConfig,
@@ -1443,7 +1444,12 @@ class OpenAIAgentsSDKExecutor(Executor):
         model = cfg.model or self._model_override
         if model is None:
             provider_name = "databricks" if self._databricks else "openai"
-            model = model_catalog.resolve_catalog_model(provider_name, family="openai").model_id
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                provider_name,
+                family="openai",
+            )
+            model = resolution.model_id
         agents_sdk = cast(_AgentsSDK, _ensure_agents_sdk())
         session_key = self._session_key(messages)
         try:

@@ -55,6 +55,7 @@ from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
+from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -1861,7 +1862,7 @@ class PiExecutor(Executor):
                 return str(meta["session_id"])
         return "__default__"
 
-    def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
+    async def _resolve_model(self, config: ExecutorConfig | None) -> str | None:
         """
         Determine the model name to pass to Pi.
 
@@ -1879,7 +1880,12 @@ class PiExecutor(Executor):
         cfg = config or ExecutorConfig()
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                "databricks",
+                family="claude",
+            )
+            return resolution.model_id
         return model
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
@@ -2115,7 +2121,7 @@ class PiExecutor(Executor):
                 if token:
                     self._databricks_token = token
         session_key = self._session_key(messages)
-        model = self._resolve_model(config)
+        model = await self._resolve_model(config)
 
         try:
             rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
