@@ -289,7 +289,7 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
         env={
             "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+            "CLAUDE_CODE_USE_GATEWAY": "1",
         },
         api_key_helper="printf token",
         model="databricks-claude-opus-test",

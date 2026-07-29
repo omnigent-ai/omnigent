@@ -134,6 +134,7 @@ _BEDROCK_AUTH_COMMAND_TIMEOUT_S = 15.0
 _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
+_CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # Claude Code's agent view (the session list opened by `claude agents`, the
 # left-arrow shortcut on an empty prompt, or /background) lets the user hop to
@@ -1685,11 +1686,8 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
+        _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
     }
-    # Don't disable betas when gateway-aware mode (CLAUDE_CODE_USE_GATEWAY=1)
-    # is selected: that mode keeps tool search on so MCP schemas load on demand.
-    if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1":
-        env[_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV] = "1"
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
     # names.  Without this Claude Code normalises the picked model to a
