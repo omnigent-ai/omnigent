@@ -128,17 +128,19 @@ def _pick_minute(page: Page, minute: int) -> None:
     :param minute: Minute of the hour to select (0-59).
     """
     name_input = page.get_by_test_id("task-name-input")
-    # The popover element itself (the one carrying data-state), not its content.
-    popover = page.locator('[data-slot="popover-content"]').filter(
+    # The popover content element: it carries data-state (open/closed) and
+    # unmounts only after the exit animation finishes, so its count/state are
+    # the reliable signals for both waits below.
+    popover_content = page.locator('[data-slot="popover-content"]').filter(
         has=page.get_by_test_id("schedule-time-picker")
     )
-    expect(popover).to_have_count(0)
+    expect(popover_content).to_have_count(0)
     page.get_by_test_id("schedule-time-picker-trigger").click()
-    expect(popover).to_have_attribute("data-state", "open")
+    expect(popover_content).to_have_attribute("data-state", "open")
     page.get_by_test_id(f"schedule-minute-{minute:02d}").click()
     # Dismiss the picker so its floating position stops churning the layout.
     name_input.click()
-    expect(popover).to_have_count(0)
+    expect(popover_content).to_have_count(0)
 
 
 def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
