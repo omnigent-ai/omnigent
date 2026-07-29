@@ -43,6 +43,7 @@ dependencies = [
     # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
     "websockets>=10.4,<15",
     "httpx>=0.27,<1",
+    "nimble-python>=1.2.0,<2",
     "ftfy>=6.0",
     # Portable zombie-aware PID liveness checks for the host daemon
     # lifecycle (omnigent/host/local_server.py).

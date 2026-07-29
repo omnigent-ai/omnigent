@@ -1,13 +1,40 @@
 """Built-in tool: nimble_research — Nimble Agent API v2 research runs.
 
 Runs a research task on a Nimble Web Search Agent through the asynchronous
-Agent API v2: start a run (``POST /v2/agents/{agent_id}/runs``), poll the run
-to a terminal status, then fetch the cited result. Returns a bounded JSON
-envelope with the run id, the output (prose text or structured JSON), and
-trust metadata (overall confidence, consulted sources, per-claim citations).
-A run can take minutes; the tool blocks its worker thread and enforces its
-``timeout_seconds`` deadline internally (a dispatched call cannot be
-interrupted mid-run — it returns by its clamped deadline).
+Agent API v2: start a run, poll it to a terminal status, then fetch the cited
+result. Returns a bounded JSON envelope with both run identifiers, the output
+(prose text or structured JSON), and trust metadata (overall confidence,
+consulted sources, per-claim citations). A run can take minutes; the tool
+blocks its worker thread and enforces its ``timeout_seconds`` deadline
+internally (a dispatched call cannot be interrupted mid-run — it returns by
+its clamped deadline).
+
+``agent_id`` is optional, and selects which of the two published create routes
+is used:
+
+* omitted — ``POST /v2/agents/runs``. Nimble provisions the agent for this run
+  and returns its id. No account agent has to exist first.
+* provided — ``POST /v2/agents/{agent_id}/runs``, against an agent you own.
+
+Either way the ``202`` carries both a run ``id`` and a ``web_search_agent_id``.
+The **returned** agent id — never the configured one — is what the subsequent
+status and result requests are addressed to, because on the generic route it
+is the only id that exists. When both are present and disagree, the run is
+rejected rather than silently re-pointed at the configured agent.
+
+Run creation is billable and not idempotent, and the API exposes no idempotency
+key, so the create call is issued exactly once and never retried — on any
+outcome, including transport errors, 408, 409, 429, and 5xx. Retries are
+confined to the read-only calls, each within a bounded budget: polling retries
+transport errors, 408, 429, and 5xx, while the result call re-checks only the
+documented 409 (completed, but the result is not materialized yet).
+
+Effort is optional. When omitted, Nimble applies the selected agent/template
+default (the documented product default is ``high``; template defaults vary).
+The generally available ``low``, ``medium``, ``high``, and ``x-high`` tiers
+can be selected per run. The coming-soon custom-budget ``max`` tier remains
+selectable: it stops with product-team guidance by default, or explicitly and
+visibly degrades to ``x-high`` when ``gate_policy: degrade`` is configured.
 
 Configured in the agent spec::
 
@@ -15,24 +42,22 @@ Configured in the agent spec::
       builtins:
         - name: nimble_research
           api_key: ${NIMBLE_API_KEY}
-          agent_id: wsa_...            # a Web Search Agent instance you own
           # optional:
-          # effort: medium             # low | medium | high | x-high | max
+          # agent_id: wsa_...          # omit to let Nimble provision the agent
+          # gate_policy: reject        # or degrade for announced max -> x-high
           # timeout_seconds: 300
-          # poll_interval_seconds: 2
+          # poll_interval_seconds: 10
 
-``agent_id`` references an agent instance on your Nimble account; the tool
-never creates one. One-time bootstrap::
+Per-call ``input_data``, ``output_schema``, and ``sources`` are exposed as tool
+arguments and forwarded unchanged on both create routes, for enrichment,
+structured output, and source guidance respectively.
 
-    # list templates, create an instance from one, then copy its wsa_... id
-    curl -H "Authorization: Bearer $NIMBLE_API_KEY" \\
-         https://sdk.nimbleway.com/v2/agents/templates
-    curl -X POST -H "Authorization: Bearer $NIMBLE_API_KEY" \\
-         -H "Content-Type: application/json" -d '{"template": "company-profile"}' \\
-         https://sdk.nimbleway.com/v2/agents
+Released ``nimble-python`` 1.2 typed fields ``skill``, ``use_case``, and
+``agent_name`` are exposed per run and forwarded through the SDK on both
+create routes. No ``extra_body`` escape hatch is used.
 
-Per-run ``output_schema`` / ``input_data`` / ``sources`` overrides and event
-streaming are not exposed here.
+Event streaming (``enable_events``) and ``previous_interaction_id`` are not
+exposed here.
 
 See https://docs.nimbleway.com/
 """
@@ -42,6 +67,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 
 # Any: Nimble's JSON payloads are heterogeneous dicts with string keys and
@@ -49,6 +75,7 @@ import time
 from typing import Any
 
 import httpx
+from nimble_python import APIConnectionError, APIStatusError, Nimble
 
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -61,9 +88,10 @@ _DEFAULT_BASE_URL = "https://sdk.nimbleway.com"
 # Nimble's own SDKs send (same convention as the web_search nimble backend).
 _CLIENT_SOURCE = "omnigent"
 
-# Effort tiers accepted by the Agent API v2. Validated locally so a bad spec or
-# tool call gets a clear error instead of an opaque API failure.
 _VALID_EFFORTS = frozenset({"low", "medium", "high", "x-high", "max"})
+_VALID_USE_CASES = frozenset({"research", "enrichment", "dataset_building"})
+_GATE_POLICIES = frozenset({"reject", "degrade"})
+_MAX_CONTACT = "https://www.nimbleway.com/contact"
 
 # Run lifecycle statuses. Anything outside these sets is a protocol error.
 _NONTERMINAL_STATUSES = frozenset({"queued", "running"})
@@ -72,13 +100,21 @@ _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 # Run ids have the form ``task_run_<uuid>``.
 _RUN_ID_PREFIX = "task_run_"
 
+# Run and agent ids are interpolated into request paths, so they are restricted
+# to the characters their documented forms actually use. This is an allowlist on
+# purpose: a value like ``../../admin`` contains no control characters, but
+# httpx resolves the dot segments and would silently retarget an authenticated
+# request at a different endpoint. Ids arrive from config *and* from API
+# responses, so neither source is trusted to be path-safe.
+_ID_SAFE_RE = re.compile(r"\A[A-Za-z0-9_-]+\Z")
+
 # Overall deadline for one tool call (start + poll + result), and the pause
 # between polls. Spec-configurable; clamped to keep a typo from hanging the
 # worker thread (the runner cannot interrupt it).
 _DEFAULT_TIMEOUT_S = 300.0
 _MIN_TIMEOUT_S = 10.0
 _MAX_TIMEOUT_S = 3600.0
-_DEFAULT_POLL_INTERVAL_S = 2.0
+_DEFAULT_POLL_INTERVAL_S = 10.0
 _MIN_POLL_INTERVAL_S = 0.5
 _MAX_POLL_INTERVAL_S = 30.0
 
@@ -101,8 +137,10 @@ _MAX_FIELD_CHARS = 2_000
 # trust section is bounded as a whole too.
 _MAX_TRUST_CHARS = 20_000
 # A run id is "task_run_" + a uuid (~45 chars); anything far longer is a
-# protocol violation, not a value to echo back or build a URL from.
+# protocol violation, not a value to echo back or build a URL from. The same
+# bound applies to the agent id, which is likewise interpolated into a URL.
 _MAX_RUN_ID_CHARS = 200
+_MAX_AGENT_ID_CHARS = 200
 
 # Test seams: unit tests monkeypatch these module attributes with a fake clock
 # instead of patching the process-global ``time`` module.
@@ -111,10 +149,12 @@ _sleep = time.sleep
 
 _DESCRIPTION = (
     "Run a Nimble research agent (Agent API v2) on a task and return its cited "
-    "result as JSON: {run_id, status, output: {type: text|json, content}, "
-    "trust: {confidence, sources, claims}}. The agent researches the live web; "
-    "a run can take minutes. Use for questions that need fresh, sourced "
-    "research rather than a quick search."
+    "result as JSON: {run_id, web_search_agent_id, status, "
+    "output: {type: text|json, content}, trust: {confidence, sources, claims}}. "
+    "The agent researches the live web; a run can take minutes. Use for "
+    "questions that need fresh, sourced research rather than a quick search. "
+    "Pass output_schema to get structured output, input_data to enrich given "
+    "records, and sources to steer which sites are used."
 )
 
 
@@ -159,27 +199,125 @@ def _clamp_seconds(
 
 def _resolve_effort(
     config: dict[str, str], arg_value: str | None
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     """
-    Resolve the effort for this run: the tool-call value overrides the spec
-    default; neither set means the field is omitted so the agent instance's
-    own default effort applies server-side.
+    Resolve an optional effort override. An omission stays ``None`` so the
+    selected agent/template default applies.
 
     :param config: Spec-level config (optional ``effort``).
     :param arg_value: Effort from the tool call, if any.
-    :returns: ``(effort, None)`` on success (``effort`` may be ``None`` =
-        omit), or ``(None, error_message)``.
+    :returns: ``(effective_effort, notice, error_message)``.
     """
     raw = arg_value if arg_value is not None else config.get("effort")
     if raw is None or not str(raw).strip():
-        return None, None
+        return None, None, None
     value = str(raw).strip().lower()
     if value not in _VALID_EFFORTS:
-        return None, (
-            f"Error: unsupported effort {str(raw)!r}. "
-            f"Use one of: {', '.join(sorted(_VALID_EFFORTS))}."
+        return (
+            None,
+            None,
+            (f"Error: unsupported effort {str(raw)!r}. Choose low, medium, high, x-high, or max."),
         )
-    return value, None
+    if value != "max":
+        return value, None, None
+    policy = str(config.get("gate_policy", "reject")).strip().lower()
+    if policy not in _GATE_POLICIES:
+        return (
+            None,
+            None,
+            (f"Error: unsupported gate_policy {policy!r}. Choose reject or degrade."),
+        )
+    if policy == "reject":
+        return (
+            None,
+            None,
+            (
+                "Max effort is a coming-soon custom-budget capability. Requested "
+                "effort='max'; nothing was sent and no run was created. Talk to "
+                f"the Nimble product team about enabling Max: {_MAX_CONTACT}"
+            ),
+        )
+    return (
+        "x-high",
+        (
+            "Max effort is a coming-soon custom-budget capability. Requested "
+            "effort='max' -> effective effort='x-high' because gate_policy="
+            f"'degrade' was selected explicitly. Learn about enabling Max: {_MAX_CONTACT}"
+        ),
+        None,
+    )
+
+
+def _validate_agent_id(agent_id: object, source: str) -> str | None:
+    """
+    Reject an agent id that is unsafe to interpolate into a request URL.
+
+    Applied to the configured id and to the one returned by run creation: both
+    end up in a path, and the returned one is not under our control at all.
+
+    :param agent_id: The candidate id.
+    :param source: Where it came from, for the error message.
+    :returns: An error message, or ``None`` when the id is usable.
+    """
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        return f"Nimble research error: {source} agent id is missing or not a string."
+    if len(agent_id) > _MAX_AGENT_ID_CHARS:
+        return f"Nimble research error: {source} agent id is implausibly long."
+    if not _ID_SAFE_RE.match(agent_id):
+        return (
+            f"Nimble research error: {source} agent id "
+            f"{_cap_field(repr(agent_id))} is not a valid agent id."
+        )
+    return None
+
+
+def _resolve_controls(parsed: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    Collect the per-run controls the published run-create schema accepts, and
+    type-check them here so a malformed one is a clear tool error rather than
+    an opaque 422 on a billable request.
+
+    Values are forwarded unchanged — their shapes are the API's contract, not
+    this tool's, so remapping them would only lose fidelity.
+
+    :param parsed: The decoded tool-call arguments.
+    :returns: ``(controls, None)``, possibly empty, or ``(None, error_message)``.
+    """
+    controls: dict[str, Any] = {}
+
+    input_data = parsed.get("input_data")
+    if input_data is not None:
+        is_object = isinstance(input_data, dict)
+        is_object_array = isinstance(input_data, list) and all(
+            isinstance(row, dict) for row in input_data
+        )
+        if not (is_object or is_object_array):
+            return None, "Error: 'input_data' must be a JSON object or an array of JSON objects."
+        controls["input_data"] = input_data
+
+    for key in ("output_schema", "sources"):
+        value = parsed.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            return None, f"Error: {key!r} must be a JSON object."
+        controls[key] = value
+
+    for key in ("agent_name", "skill"):
+        value = parsed.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            return None, f"Error: {key!r} must be a non-empty string."
+        controls[key] = value
+
+    use_case = parsed.get("use_case")
+    if use_case is not None:
+        if use_case not in _VALID_USE_CASES:
+            return None, ("Error: 'use_case' must be research, enrichment, or dataset_building.")
+        controls["use_case"] = use_case
+
+    return controls, None
 
 
 def _parse_json_dict(resp: httpx.Response) -> dict[str, Any] | None:
@@ -253,67 +391,127 @@ def _run_error_message(run_id: str, status: str, error: object) -> str:
 def _start_run(
     base: str,
     headers: dict[str, str],
-    agent_id: str,
+    agent_id: str | None,
     task: str,
     effort: str | None,
-) -> tuple[dict[str, Any] | None, str | None]:
+    controls: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """
-    Start a run (``POST /v2/agents/{agent_id}/runs``). Never retried — run
-    creation is not idempotent.
+    Start a run, on whichever create route the caller's identity selects:
+    ``POST /v2/agents/{agent_id}/runs`` when an agent is configured, else
+    ``POST /v2/agents/runs``, which has Nimble provision one.
+
+    Issued exactly once and never retried, on any outcome: creation is billable
+    and not idempotent, and the API offers no idempotency key, so a retry risks
+    paying for — and orphaning — a second run.
 
     :param base: API base URL.
     :param headers: Request headers.
-    :param agent_id: The Web Search Agent instance id.
+    :param agent_id: A Web Search Agent instance id, or ``None`` for a
+        generated agent.
     :param task: The research task (the run's ``input``).
-    :param effort: Optional effort override; omitted from the body when ``None``.
-    :returns: ``(run, None)`` with a validated ``task_run_...`` id, or
-        ``(None, error_message)``.
+    :param effort: Optional effort override. Omitted to use the agent/template
+        default.
+    :param controls: Validated SDK 1.2 per-run controls (``input_data``,
+        ``output_schema``, ``sources``, ``agent_name``, ``skill``, and
+        ``use_case``) to forward unchanged.
+    :returns: ``(run, agent_id, None)`` with a validated ``task_run_...`` id
+        and the agent id to address the rest of the lifecycle to, or
+        ``(None, None, error_message)``.
     """
     body: dict[str, Any] = {"input": task}
     if effort is not None:
         body["effort"] = effort
+    body.update(controls)
+    api_key = headers["Authorization"].removeprefix("Bearer ")
+    client = Nimble(
+        api_key=api_key,
+        base_url=base,
+        default_headers={"X-Client-Source": _CLIENT_SOURCE},
+        max_retries=0,
+    )
+    created: Any
     try:
-        resp = httpx.post(
-            f"{base}/v2/agents/{agent_id}/runs",
-            headers=headers,
-            json=body,
-            timeout=_HTTP_TIMEOUT_S,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        code = exc.response.status_code
+        if agent_id:
+            created = client.agents.runs.create(agent_id, **body, timeout=_HTTP_TIMEOUT_S)
+        else:
+            created = client.agents.run(**body, timeout=_HTTP_TIMEOUT_S)
+    except APIStatusError as exc:
+        code = exc.status_code
         if code in (401, 403):
-            return None, (
-                f"Nimble research error: HTTP {code} (authentication failed — check the "
-                "api_key in the nimble_research config)."
+            return (
+                None,
+                None,
+                (
+                    f"Nimble research error: HTTP {code} (authentication failed — check the "
+                    "api_key in the nimble_research config)."
+                ),
             )
         if code == 404:
-            return None, (
-                "Nimble research error: HTTP 404 (agent not found — verify the agent_id "
-                "in the nimble_research config)."
+            if agent_id:
+                return (
+                    None,
+                    None,
+                    (
+                        "Nimble research error: HTTP 404 (agent not found — verify the agent_id "
+                        "in the nimble_research config)."
+                    ),
+                )
+            return (
+                None,
+                None,
+                ("Nimble research error: HTTP 404 (the run-create endpoint was not found)."),
             )
         if code == 422:
             return (
                 None,
+                None,
                 "Nimble research error: HTTP 422 (the run request was rejected as invalid).",
             )
-        return None, f"Nimble research error: HTTP {code}{_http_error_detail(exc.response)}"
-    except (httpx.RequestError, httpx.InvalidURL) as exc:
-        return None, f"Nimble research error: {exc}"
-    run = _parse_json_dict(resp)
-    if run is None:
-        return None, "Nimble research error: run creation returned a non-JSON response."
+        return (
+            None,
+            None,
+            f"Nimble research error: HTTP {code}{_http_error_detail(exc.response)}",
+        )
+    except APIConnectionError as exc:
+        return None, None, f"Nimble research error: {exc}"
+    finally:
+        client.close()
+    run = created.model_dump(mode="json")
     run_id = run.get("id")
     if (
         not isinstance(run_id, str)
         or not run_id.startswith(_RUN_ID_PREFIX)
         or len(run_id) > _MAX_RUN_ID_CHARS
+        or not _ID_SAFE_RE.match(run_id)
     ):
-        return None, (
-            f"Nimble research error: expected a '{_RUN_ID_PREFIX}...' run id, "
-            f"got {_cap_field(repr(run_id))}."
+        return (
+            None,
+            None,
+            (
+                f"Nimble research error: expected a '{_RUN_ID_PREFIX}...' run id, "
+                f"got {_cap_field(repr(run_id))}."
+            ),
         )
-    return run, None
+    returned_agent_id = run.get("web_search_agent_id")
+    identity_error = _validate_agent_id(returned_agent_id, "the returned")
+    if identity_error is not None:
+        return None, None, identity_error
+    assert isinstance(returned_agent_id, str)
+    if agent_id is not None and returned_agent_id != agent_id:
+        # The run belongs to a different agent than the one it was requested
+        # on. Addressing the rest of the lifecycle to either id would be a
+        # guess, so surface it instead of silently picking one.
+        return (
+            None,
+            None,
+            (
+                f"Nimble research run {_cap_field(run_id)} was created on agent "
+                f"{_cap_field(returned_agent_id)} but was requested on "
+                f"{_cap_field(agent_id)}; refusing to continue with a mismatched agent."
+            ),
+        )
+    return run, returned_agent_id, None
 
 
 def _poll_until_terminal(
@@ -576,7 +774,7 @@ def _map_trust(trust: object) -> dict[str, Any]:
     return mapped
 
 
-def _build_envelope(run_id: str, output: dict[str, Any]) -> str:
+def _build_envelope(run_id: str, agent_id: str, output: dict[str, Any]) -> str:
     """
     Serialize the completed run's output into the tool's bounded JSON
     envelope. Caps are applied before the single ``json.dumps`` so the
@@ -584,7 +782,12 @@ def _build_envelope(run_id: str, output: dict[str, Any]) -> str:
     ``content`` falls back to a truncated string while ``type`` stays
     ``json`` — ``content_truncated: true`` marks that case.
 
+    Both identifiers are reported: on a generated run the agent id is only
+    knowable from the run that created it, so dropping it would strand the
+    run for any later follow-up.
+
     :param run_id: The ``task_run_...`` id.
+    :param agent_id: The agent id the run actually executed on.
     :param output: The result's ``output`` object (``type``/``content``/``trust``).
     :returns: The envelope as a JSON string.
     """
@@ -609,6 +812,7 @@ def _build_envelope(run_id: str, output: dict[str, Any]) -> str:
             content_truncated = True
     envelope: dict[str, Any] = {
         "run_id": run_id,
+        "web_search_agent_id": agent_id,
         "status": "completed",
         "output": {"type": output_type, "content": content},
         "trust": _map_trust(output.get("trust")),
@@ -618,28 +822,33 @@ def _build_envelope(run_id: str, output: dict[str, Any]) -> str:
     return json.dumps(envelope, ensure_ascii=False)
 
 
-def _run_agent_v2(task: str, effort_arg: str | None, config: dict[str, str]) -> str:
+def _run_agent_v2(
+    task: str,
+    effort_arg: str | None,
+    controls: dict[str, Any],
+    config: dict[str, str],
+) -> str:
     """
     Run the full Agent API v2 lifecycle for one task: start, poll to a
     terminal status, fetch the result, and build the envelope.
 
     :param task: The research task.
     :param effort_arg: Effort from the tool call, if any.
-    :param config: Spec-level config (``api_key``, ``agent_id``, optional
+    :param controls: Validated per-run controls to forward on create.
+    :param config: Spec-level config (``api_key``, optional ``agent_id``,
         ``effort``/``timeout_seconds``/``poll_interval_seconds``).
     :returns: The JSON envelope, or an error message. Never raises.
     """
     api_key = config.get("api_key")
     if not api_key:
         return "Error: api_key must be provided in the nimble_research config in config.yaml."
-    agent_id = config.get("agent_id")
-    if not agent_id:
-        return (
-            "Error: agent_id must be provided in the nimble_research config in config.yaml. "
-            "List your agents (GET /v2/agents) or create one from a template "
-            "(POST /v2/agents) — see the nimble_research module docstring."
-        )
-    effort, effort_error = _resolve_effort(config, effort_arg)
+    # Optional: absent means the generic create route provisions the agent.
+    configured_agent_id = config.get("agent_id") or None
+    if configured_agent_id is not None:
+        config_error = _validate_agent_id(configured_agent_id, "the configured")
+        if config_error is not None:
+            return config_error
+    effort, gate_notice, effort_error = _resolve_effort(config, effort_arg)
     if effort_error is not None:
         return effort_error
     timeout_s = _clamp_seconds(
@@ -656,11 +865,67 @@ def _run_agent_v2(task: str, effort_arg: str | None, config: dict[str, str]) -> 
     headers = _headers(api_key)
     deadline = _monotonic() + timeout_s
 
-    run, error = _start_run(base, headers, agent_id, task, effort)
-    if error is not None or run is None:
+    outcome = _run_lifecycle(
+        base, headers, configured_agent_id, task, effort, controls, deadline, interval_s, timeout_s
+    )
+    # A degraded run is announced on every outcome, not only a successful one:
+    # the caller asked for an effort they did not get, and that stays true when
+    # the run then fails or times out.
+    return _attach_notice(outcome, gate_notice)
+
+
+def _attach_notice(outcome: str, notice: str | None) -> str:
+    """
+    Surface a gate notice alongside the run's outcome.
+
+    :param outcome: The JSON envelope, or an error message.
+    :param notice: The notice to surface, if any.
+    :returns: The outcome carrying the notice.
+    """
+    if notice is None:
+        return outcome
+    try:
+        envelope = json.loads(outcome)
+    except (json.JSONDecodeError, ValueError):
+        envelope = None
+    if isinstance(envelope, dict):
+        envelope["notice"] = notice
+        return json.dumps(envelope, ensure_ascii=False)
+    return f"{outcome} ({notice})"
+
+
+def _run_lifecycle(
+    base: str,
+    headers: dict[str, str],
+    configured_agent_id: str | None,
+    task: str,
+    effort: str | None,
+    controls: dict[str, Any],
+    deadline: float,
+    interval_s: float,
+    timeout_s: float,
+) -> str:
+    """
+    Drive create → poll → result and render the outcome.
+
+    :param base: API base URL.
+    :param headers: Request headers.
+    :param configured_agent_id: The spec's agent id, or ``None``.
+    :param task: The research task.
+    :param effort: Optional effort override.
+    :param controls: Validated per-run controls.
+    :param deadline: Absolute ``_monotonic()`` deadline.
+    :param interval_s: Pause between polls.
+    :param timeout_s: Total budget, used in the timeout message.
+    :returns: The JSON envelope, or an error message. Never raises.
+    """
+    run, agent_id, error = _start_run(base, headers, configured_agent_id, task, effort, controls)
+    if error is not None or run is None or agent_id is None:
         return error or "Nimble research error: run creation returned no data."
     run_id = str(run.get("id"))
 
+    # From here on the agent id is the one the run reported, which is the only
+    # one that exists when the run was created without a configured agent.
     terminal, error = _poll_until_terminal(
         base, headers, agent_id, run, deadline, interval_s, timeout_s
     )
@@ -676,20 +941,23 @@ def _run_agent_v2(task: str, effort_arg: str | None, config: dict[str, str]) -> 
     output = result.get("output")
     if not isinstance(output, dict):
         return f"Nimble research run {run_id} result had no output object."
-    return _build_envelope(run_id, output)
+    return _build_envelope(run_id, agent_id, output)
 
 
 class NimbleResearchTool(Tool):
     """
     Nimble Agent API v2 tool: asynchronous research runs with cited results.
 
-    :param config: Spec-level config, e.g. ``{"api_key": "...", "agent_id": "wsa_..."}``.
+    :param config: Spec-level config, e.g. ``{"api_key": "..."}``, optionally
+        with ``agent_id`` to run on an agent you already own and
+        ``gate_policy`` to control gated-value treatment.
     """
 
     def __init__(self, config: dict[str, str] | None = None) -> None:
         """
-        :param config: Spec-level config with ``api_key`` + ``agent_id`` and
-            optional ``effort``/``timeout_seconds``/``poll_interval_seconds``.
+        :param config: Spec-level config with ``api_key`` and optional
+            ``agent_id``/``effort``/``gate_policy``/``timeout_seconds``/
+            ``poll_interval_seconds``.
         """
         self._config = config or {}
 
@@ -707,8 +975,8 @@ class NimbleResearchTool(Tool):
         """
         Return the OpenAI function schema for nimble_research.
 
-        :returns: A function tool schema with a required ``task`` parameter
-            and an optional ``effort`` enum.
+        :returns: A function tool schema with a required ``task`` parameter,
+            the optional per-run controls, and supported ``effort`` choices.
         """
         return {
             "type": "function",
@@ -725,7 +993,45 @@ class NimbleResearchTool(Tool):
                         "effort": {
                             "type": "string",
                             "enum": sorted(_VALID_EFFORTS),
-                            "description": "Optional effort override for this run.",
+                            "description": (
+                                "Optional effort override. Omit it to use the "
+                                "agent/template default (documented product "
+                                "default: high; template defaults vary)."
+                            ),
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Optional SDK 1.2 name hint for the run agent.",
+                        },
+                        "skill": {
+                            "type": "string",
+                            "description": "Optional SDK 1.2 skill identifier.",
+                        },
+                        "use_case": {
+                            "type": "string",
+                            "enum": sorted(_VALID_USE_CASES),
+                            "description": "SDK 1.2 run mode.",
+                        },
+                        "input_data": {
+                            "type": ["object", "array"],
+                            "description": (
+                                "Records to enrich: a JSON object, or an array of "
+                                "JSON objects, passed to the agent as input."
+                            ),
+                        },
+                        "output_schema": {
+                            "type": "object",
+                            "description": (
+                                "JSON Schema the agent's output must conform to. "
+                                "Use for structured research or dataset building."
+                            ),
+                        },
+                        "sources": {
+                            "type": "object",
+                            "description": (
+                                "Source guidance for the run, e.g. sites to "
+                                "prioritize, allow, avoid, or block."
+                            ),
                         },
                     },
                     "required": ["task"],
@@ -748,8 +1054,9 @@ class NimbleResearchTool(Tool):
         """
         Execute a nimble_research call.
 
-        :param arguments: JSON-encoded dict with a ``task`` key and an
-            optional ``effort`` key.
+        :param arguments: JSON-encoded dict with a ``task`` key and optional
+            ``effort``, ``input_data``, ``output_schema``, ``sources``,
+            ``agent_name``, ``skill``, and ``use_case`` keys.
         :param ctx: Tool execution context (unused).
         :returns: The JSON envelope, or an error message.
         """
@@ -761,7 +1068,13 @@ class NimbleResearchTool(Tool):
         task = parsed.get("task")
         if task is None or not str(task).strip():
             return "Error: 'task' parameter is required."
+        controls, controls_error = _resolve_controls(parsed)
+        if controls_error is not None or controls is None:
+            return controls_error or "Error: invalid per-run controls."
         effort_arg = parsed.get("effort")
         return _run_agent_v2(
-            str(task), str(effort_arg) if effort_arg is not None else None, self._config
+            str(task),
+            str(effort_arg) if effort_arg is not None else None,
+            controls,
+            self._config,
         )

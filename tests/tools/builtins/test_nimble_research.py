@@ -4,6 +4,10 @@ HTTP is mocked at the transport layer with ``respx`` so the start → poll →
 result lifecycle exercises real URLs, status codes, and headers. Time is
 controlled by monkeypatching the module's ``_monotonic``/``_sleep`` seams —
 never the process-global ``time`` module.
+
+Explicit 2-second polling values are test-only overrides used to exercise
+pacing and deadlines without lengthening the suite. The runtime default is
+10 seconds.
 """
 
 from __future__ import annotations
@@ -32,6 +36,8 @@ _BASE = "https://sdk.nimbleway.com"
 _AGENT_ID = "wsa_0a1b2c3d-0000-4000-8000-000000000000"
 _RUN_ID = "task_run_11111111-2222-4333-8444-555555555555"
 _RUNS_URL = f"{_BASE}/v2/agents/{_AGENT_ID}/runs"
+# The generated-agent create route, used when no agent_id is configured.
+_GENERIC_RUNS_URL = f"{_BASE}/v2/agents/runs"
 _RUN_URL = f"{_RUNS_URL}/{_RUN_ID}"
 _RESULT_URL = f"{_RUN_URL}/result"
 
@@ -157,15 +163,43 @@ def test_tool_name() -> None:
     assert NimbleResearchTool.name() == "nimble_research"
 
 
-def test_schema_requires_task_and_offers_effort_enum() -> None:
-    """The schema requires ``task`` and offers ``effort`` as a closed enum."""
+def test_schema_requires_task_and_exposes_selectable_effort_tiers() -> None:
+    """C04: ordinary tiers and gated ``max`` are selectable."""
     schema = NimbleResearchTool().get_schema()
     assert schema["type"] == "function"
     assert schema["function"]["name"] == "nimble_research"
     params = schema["function"]["parameters"]
     assert params["required"] == ["task"]
     assert "query" not in params["properties"]
-    assert params["properties"]["effort"]["enum"] == ["high", "low", "max", "medium", "x-high"]
+    assert params["properties"]["effort"]["enum"] == [
+        "high",
+        "low",
+        "max",
+        "medium",
+        "x-high",
+    ]
+
+
+def test_schema_exposes_published_per_run_controls() -> None:
+    """C07/C08/C09: the published per-run controls are reachable from a tool call."""
+    params = NimbleResearchTool().get_schema()["function"]["parameters"]
+    assert set(params["properties"]) == {
+        "task",
+        "effort",
+        "agent_name",
+        "input_data",
+        "output_schema",
+        "skill",
+        "sources",
+        "use_case",
+    }
+
+
+def test_schema_exposes_sdk_12_typed_fields() -> None:
+    """SDK 1.2 typed fields are offered without an escape hatch."""
+    params = NimbleResearchTool().get_schema()["function"]["parameters"]
+    for typed in ("skill", "use_case", "agent_name"):
+        assert typed in params["properties"]
 
 
 def test_is_sync() -> None:
@@ -187,12 +221,19 @@ def test_missing_api_key_returns_error(tool_ctx: ToolContext) -> None:
 
 
 @respx.mock
-def test_missing_agent_id_returns_error(tool_ctx: ToolContext) -> None:
-    """Without agent_id the tool returns a bootstrap-pointing error, no request."""
+def test_missing_agent_id_uses_generic_create_route(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """C01: without agent_id the run is created on ``POST /v2/agents/runs``."""
+    create = respx.post(_GENERIC_RUNS_URL).mock(
+        return_value=httpx.Response(202, json=_run("completed"))
+    )
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+
     out = _invoke({"api_key": "test-key"}, tool_ctx)
-    assert out.startswith("Error: agent_id must be provided")
-    assert "/v2/agents" in out
-    assert respx.calls.call_count == 0
+
+    assert create.call_count == 1, "exactly one create POST"
+    assert json.loads(out)["status"] == "completed"
 
 
 @respx.mock
@@ -222,18 +263,79 @@ def test_blank_task_returns_error(tool_ctx: ToolContext) -> None:
 
 @respx.mock
 def test_invalid_effort_config_returns_error(tool_ctx: ToolContext) -> None:
-    """An unsupported spec-level effort gets the allowlist error, no request."""
+    """An unsupported spec-level effort is rejected before any request."""
     out = _invoke(_config(effort="turbo"), tool_ctx)
-    assert out == "Error: unsupported effort 'turbo'. Use one of: high, low, max, medium, x-high."
+    assert out == ("Error: unsupported effort 'turbo'. Choose low, medium, high, x-high, or max.")
     assert respx.calls.call_count == 0
 
 
 @respx.mock
 def test_invalid_effort_llm_arg_returns_error(tool_ctx: ToolContext) -> None:
-    """An unsupported tool-call effort gets the allowlist error, no request."""
+    """An unsupported tool-call effort is rejected before any request."""
     out = _invoke(_config(), tool_ctx, args={"task": "x", "effort": "hyper"})
     assert out.startswith("Error: unsupported effort 'hyper'.")
     assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_max_effort_is_rejected_unbilled(tool_ctx: ToolContext) -> None:
+    """C04: default max treatment stops with positive guidance before create."""
+    out = _invoke(_config(), tool_ctx, args={"task": "x", "effort": "max"})
+    assert "coming-soon custom-budget capability" in out
+    assert "nothing was sent and no run was created" in out
+    assert "https://www.nimbleway.com/contact" in out
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_explicit_max_degradation_is_announced(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+    out = _invoke(
+        _config(gate_policy="degrade"),
+        tool_ctx,
+        args={"task": "x", "effort": "max"},
+    )
+    body = json.loads(create.calls.last.request.content)
+    envelope = json.loads(out)
+    assert body["effort"] == "x-high"
+    assert "Requested effort='max' -> effective effort='x-high'" in envelope["notice"]
+    assert "https://www.nimbleway.com/contact" in envelope["notice"]
+
+
+@respx.mock
+@pytest.mark.parametrize("failure", ["terminal", "create_error", "timeout"])
+def test_max_degradation_is_announced_on_failure_paths(
+    tool_ctx: ToolContext, fake_clock: _FakeClock, failure: str
+) -> None:
+    """A degraded run announces the downgrade even when it does not succeed.
+
+    The caller asked for an effort they did not get; that stays true when the
+    run then fails, so the notice must not be conditional on success.
+    """
+    if failure == "create_error":
+        respx.post(_RUNS_URL).mock(return_value=httpx.Response(503))
+    elif failure == "terminal":
+        respx.post(_RUNS_URL).mock(
+            return_value=httpx.Response(
+                202, json=_run("failed", error={"ref_id": _RUN_ID, "message": "unreachable"})
+            )
+        )
+    else:
+        respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued")))
+        respx.get(_RUN_URL).mock(return_value=httpx.Response(200, json=_run("running")))
+
+    out = _invoke(
+        _config(gate_policy="degrade", timeout_seconds="10", poll_interval_seconds="2"),
+        tool_ctx,
+        args={"task": "x", "effort": "max"},
+    )
+
+    assert "effective effort='x-high'" in out, (
+        f"the {failure} path dropped the degradation notice: {out!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,17 +362,20 @@ def test_create_request_shape_and_headers(tool_ctx: ToolContext, fake_clock: _Fa
 
 
 @respx.mock
-def test_llm_effort_overrides_config(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
-    """The tool-call effort wins over the spec default."""
+@pytest.mark.parametrize("tier", ["low", "medium", "high", "x-high"])
+def test_explicit_released_effort_is_accepted(
+    tool_ctx: ToolContext, fake_clock: _FakeClock, tier: str
+) -> None:
+    """An explicit generally available tier is honored."""
     create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
     respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
-    _invoke(_config(effort="low"), tool_ctx, args={"task": "x", "effort": "max"})
-    assert json.loads(create.calls.last.request.content)["effort"] == "max"
+    _invoke(_config(), tool_ctx, args={"task": "x", "effort": tier})
+    assert json.loads(create.calls.last.request.content)["effort"] == tier
 
 
 @respx.mock
-def test_effort_omitted_when_unset(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
-    """With no effort anywhere, the field is omitted so the agent default applies."""
+def test_effort_is_omitted_when_unset(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
+    """C04: omission preserves the selected agent/template default."""
     create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
     respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
     _invoke(_config(), tool_ctx)
@@ -330,7 +435,7 @@ def test_lifecycle_queued_running_completed_text(
     assert envelope["trust"]["confidence"] == "high"
     assert envelope["trust"]["sources"][0]["url"] == "https://source-0.example"
     assert envelope["trust"]["claims"][0]["citations"][0]["url"] == "https://cite-0-0.example"
-    assert fake_clock.sleeps == [2.0, 2.0]
+    assert fake_clock.sleeps == [10.0, 10.0]
 
 
 @respx.mock
@@ -520,7 +625,7 @@ def test_poll_429_honors_retry_after(tool_ctx: ToolContext, fake_clock: _FakeClo
     respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
     out = _invoke(_config(), tool_ctx)
     assert json.loads(out)["status"] == "completed"
-    assert fake_clock.sleeps == [2.0, 7.0, 2.0], (
+    assert fake_clock.sleeps == [10.0, 7.0, 10.0], (
         "pacing sleep, then the honored Retry-After, then the next pacing sleep"
     )
 
@@ -698,27 +803,24 @@ def test_oversized_trust_reasoning_is_capped(
 
 
 @respx.mock
-def test_control_char_run_id_from_poll_hop_returns_error(
-    tool_ctx: ToolContext, fake_clock: _FakeClock
+@pytest.mark.parametrize("status", ["queued", "completed"])
+def test_path_unsafe_run_id_is_rejected_at_create(
+    tool_ctx: ToolContext, fake_clock: _FakeClock, status: str
 ) -> None:
-    """A control char in the API-supplied run id fails cleanly on the poll hop."""
-    bad = "task_run_\n0000"
-    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("queued", id=bad)))
-    out = _invoke(_config(), tool_ctx)
-    assert out.startswith("Nimble research run "), out
-    assert "polling failed" in out
+    """An API-supplied run id that is unsafe in a URL never reaches a request.
 
-
-@respx.mock
-def test_control_char_run_id_from_result_hop_returns_error(
-    tool_ctx: ToolContext, fake_clock: _FakeClock
-) -> None:
-    """A control char in the API-supplied run id fails cleanly on the result hop."""
-    bad = "task_run_\n0000"
-    respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed", id=bad)))
-    out = _invoke(_config(), tool_ctx)
-    assert out.startswith("Nimble research run "), out
-    assert "result fetch failed" in out
+    ``task_run_`` is only a prefix, so a value like ``task_run_../..`` passes a
+    prefix check while resolving to a different path once httpx normalizes it.
+    """
+    for bad in ("task_run_\n0000", "task_run_../../admin", "task_run_a/b"):
+        with respx.mock:
+            create = respx.post(_RUNS_URL).mock(
+                return_value=httpx.Response(202, json=_run(status, id=bad))
+            )
+            out = _invoke(_config(), tool_ctx)
+            assert out.startswith("Nimble research error: expected a 'task_run_...' run id"), out
+            assert create.call_count == 1
+            assert respx.calls.call_count == 1, "no poll or result request may be issued"
 
 
 @respx.mock
@@ -916,18 +1018,339 @@ def test_clamp_seconds_junk_and_bounds() -> None:
     )
 
 
-def test_resolve_effort_precedence_and_validation() -> None:
-    """Tool-call effort beats config; both validate; unset means omit."""
-    assert _resolve_effort({}, None) == (None, None)
-    assert _resolve_effort({"effort": "low"}, None) == ("low", None)
-    assert _resolve_effort({"effort": "low"}, "max") == ("max", None)
-    assert _resolve_effort({}, "X-HIGH") == ("x-high", None)
-    effort, error = _resolve_effort({"effort": "warp"}, None)
+def test_resolve_effort_preserves_omission_and_validates_tiers() -> None:
+    """Unset stays omitted; released tiers normalize; max is gated."""
+    assert _resolve_effort({}, None) == (None, None, None)
+    assert _resolve_effort({"effort": "  "}, None) == (None, None, None)
+    for tier in ("low", "medium", "high", "x-high"):
+        assert _resolve_effort({}, tier.upper()) == (tier, None, None)
+    effort, notice, error = _resolve_effort({"effort": "max"}, None)
     assert effort is None
-    assert error is not None and "warp" in error
+    assert notice is None
+    assert error is not None and "nothing was sent" in error
+    effort, notice, error = _resolve_effort({"effort": "max", "gate_policy": "degrade"}, None)
+    assert effort == "x-high"
+    assert notice is not None and "effective effort='x-high'" in notice
+    assert error is None
 
 
 def test_map_trust_non_dict_is_empty() -> None:
     """Absent/malformed trust maps to an empty dict, not a crash."""
     assert _map_trust(None) == {}
     assert _map_trust("high") == {}
+
+
+# ---------------------------------------------------------------------------
+# Launch contract: optional identity, create-once, structured controls (C01-C14)
+# ---------------------------------------------------------------------------
+
+_GENERATED_AGENT_ID = "wsa_9f8e7d6c-0000-4000-8000-999999999999"
+_GENERATED_RUN_URL = f"{_BASE}/v2/agents/{_GENERATED_AGENT_ID}/runs/{_RUN_ID}"
+_GENERATED_RESULT_URL = f"{_GENERATED_RUN_URL}/result"
+
+
+@respx.mock
+def test_configured_agent_id_uses_persistent_create_route(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """C02: with agent_id the run is created on ``POST /v2/agents/{agent_id}/runs``."""
+    completed = httpx.Response(202, json=_run("completed"))
+    generic = respx.post(_GENERIC_RUNS_URL).mock(return_value=completed)
+    persistent = respx.post(_RUNS_URL).mock(return_value=completed)
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+
+    _invoke(_config(), tool_ctx)
+
+    assert persistent.call_count == 1
+    assert generic.call_count == 0, "a configured agent must not hit the generic route"
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [408, 409, 429, 500, 502, 503])
+def test_create_is_never_retried_on_failure(tool_ctx: ToolContext, status: int) -> None:
+    """C03: a failed create is never re-issued — a run is billable and not idempotent."""
+    create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(status))
+    out = _invoke(_config(), tool_ctx)
+    assert create.call_count == 1, f"HTTP {status} must not trigger a second create"
+    assert out.startswith("Nimble research error:")
+
+
+@respx.mock
+def test_create_transport_error_is_never_retried(tool_ctx: ToolContext) -> None:
+    """C03: a transport failure on create is not retried either.
+
+    A connection error is the most tempting case to retry, and the most
+    dangerous: the request may have reached the API and started a billed run.
+    """
+    create = respx.post(_RUNS_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+    out = _invoke(_config(), tool_ctx)
+    assert create.call_count == 1
+    assert out.startswith("Nimble research error: ")
+
+
+@respx.mock
+def test_generic_create_is_never_retried(tool_ctx: ToolContext) -> None:
+    """C03: the create-once rule holds on the generic route too."""
+    create = respx.post(_GENERIC_RUNS_URL).mock(return_value=httpx.Response(503))
+    _invoke({"api_key": "test-key"}, tool_ctx)
+    assert create.call_count == 1
+
+
+@respx.mock
+def test_generated_agent_id_drives_status_and_result(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """C05: a generated run's returned agent id addresses the rest of the lifecycle."""
+    respx.post(_GENERIC_RUNS_URL).mock(
+        return_value=httpx.Response(
+            202, json=_run("queued", web_search_agent_id=_GENERATED_AGENT_ID)
+        )
+    )
+    poll = respx.get(_GENERATED_RUN_URL).mock(
+        return_value=httpx.Response(
+            200, json=_run("completed", web_search_agent_id=_GENERATED_AGENT_ID)
+        )
+    )
+    result = respx.get(_GENERATED_RESULT_URL).mock(
+        return_value=httpx.Response(200, json=_text_result())
+    )
+
+    envelope = json.loads(_invoke({"api_key": "test-key"}, tool_ctx))
+
+    assert poll.call_count == 1, "polling must target the returned agent"
+    assert result.call_count == 1, "result must target the returned agent"
+    assert envelope["run_id"] == _RUN_ID
+    assert envelope["web_search_agent_id"] == _GENERATED_AGENT_ID, (
+        "the generated agent id is only knowable from this run; it must survive"
+    )
+
+
+@respx.mock
+def test_owner_mismatch_is_rejected_not_substituted(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """C06: a create whose run belongs to another agent stops the lifecycle."""
+    respx.post(_RUNS_URL).mock(
+        return_value=httpx.Response(
+            202, json=_run("completed", web_search_agent_id=_GENERATED_AGENT_ID)
+        )
+    )
+    configured_result = respx.get(_RESULT_URL).mock(
+        return_value=httpx.Response(200, json=_text_result())
+    )
+    returned_result = respx.get(_GENERATED_RESULT_URL).mock(
+        return_value=httpx.Response(200, json=_text_result())
+    )
+
+    out = _invoke(_config(), tool_ctx)
+
+    assert "mismatched agent" in out, out
+    assert _GENERATED_AGENT_ID in out and _AGENT_ID in out, "both ids must be named"
+    assert configured_result.call_count == 0
+    assert returned_result.call_count == 0, "neither id may be silently chosen"
+
+
+@respx.mock
+@pytest.mark.parametrize("missing", [None, "", 42])
+def test_create_without_usable_agent_id_is_protocol_error(
+    tool_ctx: ToolContext, missing: object
+) -> None:
+    """C05: a create response with no usable agent id cannot be polled."""
+    body = _run("completed")
+    if missing is None:
+        del body["web_search_agent_id"]
+    else:
+        body["web_search_agent_id"] = missing
+    respx.post(_GENERIC_RUNS_URL).mock(return_value=httpx.Response(202, json=body))
+    out = _invoke({"api_key": "test-key"}, tool_ctx)
+    assert out.startswith("Nimble research error:")
+    assert "returned agent id" in out
+    assert respx.calls.call_count == 1, "no lifecycle call may follow"
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "hostile",
+    ["wsa_\n0000", "../../../v1/admin", "x/../../../etc", "a#frag", "a?evil=1", "a/b"],
+)
+def test_path_unsafe_returned_agent_id_is_rejected(tool_ctx: ToolContext, hostile: str) -> None:
+    """C05: a server-supplied agent id cannot retarget our authenticated requests.
+
+    On the generic route there is no configured id to compare against, so the
+    returned value is the only thing addressing the poll and result URLs. httpx
+    resolves dot segments and honors ``#``/``?``, so an unvalidated id would
+    silently send the bearer token to a different endpoint.
+    """
+    respx.post(_GENERIC_RUNS_URL).mock(
+        return_value=httpx.Response(202, json=_run("completed", web_search_agent_id=hostile))
+    )
+    out = _invoke({"api_key": "test-key"}, tool_ctx)
+    assert out.startswith("Nimble research error:"), out
+    assert "not a valid agent id" in out
+    assert respx.calls.call_count == 1, "no request may be issued to the hostile path"
+
+
+@respx.mock
+@pytest.mark.parametrize("hostile", ["../../../v1/agents", "wsa_a/b", "wsa_a#f", "wsa_a?q=1"])
+def test_path_unsafe_configured_agent_id_is_rejected(tool_ctx: ToolContext, hostile: str) -> None:
+    """A path-unsafe agent id from the spec is rejected before the create POST."""
+    out = _invoke(_config(agent_id=hostile), tool_ctx)
+    assert out.startswith("Nimble research error:"), out
+    assert "not a valid agent id" in out
+    assert respx.calls.call_count == 0, "the credential must not reach an unintended endpoint"
+
+
+@respx.mock
+@pytest.mark.parametrize("route", ["persistent", "generic"])
+def test_structured_controls_pass_through_unchanged(
+    tool_ctx: ToolContext, fake_clock: _FakeClock, route: str
+) -> None:
+    """C07/C08/C09: input_data, output_schema, and sources reach both create routes intact."""
+    output_schema = {
+        "type": "object",
+        "properties": {"revenue": {"type": "number"}, "hq": {"type": "string"}},
+        "required": ["revenue"],
+    }
+    input_data = [{"company": "Nimbleway"}, {"company": "Acme"}]
+    sources = {"prioritize": ["sec.gov"], "avoid": ["forums.example"]}
+
+    is_generic = route == "generic"
+    create_url = _GENERIC_RUNS_URL if is_generic else _RUNS_URL
+    config = {"api_key": "test-key"} if is_generic else _config()
+    create = respx.post(create_url).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+
+    _invoke(
+        config,
+        tool_ctx,
+        args={
+            "task": "enrich these companies",
+            "input_data": input_data,
+            "output_schema": output_schema,
+            "sources": sources,
+        },
+    )
+
+    body = json.loads(create.calls.last.request.content)
+    assert body["input_data"] == input_data, "enrichment rows must not be remapped"
+    assert body["output_schema"] == output_schema, "the schema is the API's contract, verbatim"
+    assert body["sources"] == sources
+
+
+@respx.mock
+def test_input_data_accepts_a_single_object(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
+    """C08: input_data may be one object, not only an array."""
+    create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+    _invoke(_config(), tool_ctx, args={"task": "x", "input_data": {"company": "Nimbleway"}})
+    assert json.loads(create.calls.last.request.content)["input_data"] == {"company": "Nimbleway"}
+
+
+@respx.mock
+def test_controls_absent_when_not_requested(tool_ctx: ToolContext, fake_clock: _FakeClock) -> None:
+    """An unused control is omitted rather than sent as null."""
+    create = respx.post(_RUNS_URL).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+    _invoke(_config(), tool_ctx)
+    body = json.loads(create.calls.last.request.content)
+    assert set(body) == {"input"}
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("input_data", "not-an-object"),
+        ("input_data", [{"ok": 1}, "not-an-object"]),
+        ("output_schema", ["not", "an", "object"]),
+        ("sources", "sec.gov"),
+    ],
+)
+def test_malformed_controls_are_rejected_unbilled(
+    tool_ctx: ToolContext, key: str, value: object
+) -> None:
+    """A malformed control fails locally rather than as a 422 on a billable request."""
+    out = _invoke(_config(), tool_ctx, args={"task": "x", key: value})
+    assert out.startswith(f"Error: {key!r} must be a JSON object"), out
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+@pytest.mark.parametrize("route", ["persistent", "generic"])
+def test_sdk_12_typed_fields_reach_both_create_routes(
+    tool_ctx: ToolContext, fake_clock: _FakeClock, route: str
+) -> None:
+    """SDK 1.2 fields are forwarded directly on both routes."""
+    is_generic = route == "generic"
+    create_url = _GENERIC_RUNS_URL if is_generic else _RUNS_URL
+    config = {"api_key": "test-key"} if is_generic else _config()
+    create = respx.post(create_url).mock(return_value=httpx.Response(202, json=_run("completed")))
+    respx.get(_RESULT_URL).mock(return_value=httpx.Response(200, json=_text_result()))
+
+    _invoke(
+        config,
+        tool_ctx,
+        args={
+            "task": "x",
+            "skill": "company-profile",
+            "use_case": "research",
+            "agent_name": "my-agent",
+        },
+    )
+
+    body = json.loads(create.calls.last.request.content)
+    assert body["skill"] == "company-profile"
+    assert body["use_case"] == "research"
+    assert body["agent_name"] == "my-agent"
+    assert "extra_body" not in body
+
+
+@respx.mock
+def test_client_source_and_no_credential_reflection_on_every_hop(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """C14: attribution is preserved on all three hops and the key stays in the header."""
+    secret = "sk-ATTRIBUTION-SECRET"
+    create = respx.post(_GENERIC_RUNS_URL).mock(
+        return_value=httpx.Response(
+            202, json=_run("queued", web_search_agent_id=_GENERATED_AGENT_ID)
+        )
+    )
+    poll = respx.get(_GENERATED_RUN_URL).mock(
+        return_value=httpx.Response(
+            200, json=_run("completed", web_search_agent_id=_GENERATED_AGENT_ID)
+        )
+    )
+    result = respx.get(_GENERATED_RESULT_URL).mock(
+        return_value=httpx.Response(200, json=_text_result())
+    )
+
+    out = _invoke({"api_key": secret}, tool_ctx)
+
+    for route in (create, poll, result):
+        headers = route.calls.last.request.headers
+        assert headers["X-Client-Source"] == "omnigent"
+        assert headers["Authorization"] == f"Bearer {secret}"
+    assert secret not in json.loads(create.calls.last.request.content.decode()).get("input", "")
+    assert secret not in out, "the credential must never reach the model-visible envelope"
+
+
+@respx.mock
+def test_generated_run_terminal_failure_keeps_run_id(
+    tool_ctx: ToolContext, fake_clock: _FakeClock
+) -> None:
+    """C11: a failed generated run reports the run id and skips /result."""
+    respx.post(_GENERIC_RUNS_URL).mock(
+        return_value=httpx.Response(
+            202,
+            json=_run(
+                "failed",
+                web_search_agent_id=_GENERATED_AGENT_ID,
+                error={"ref_id": _RUN_ID, "message": "source unreachable"},
+            ),
+        )
+    )
+    result = respx.get(_GENERATED_RESULT_URL).mock(return_value=httpx.Response(200, json={}))
+    out = _invoke({"api_key": "test-key"}, tool_ctx)
+    assert out == f"Nimble research run {_RUN_ID} failed: source unreachable"
+    assert result.call_count == 0, "C12: never fetch a result for a non-completed run"
