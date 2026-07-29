@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
 from omnigent.runner.app import (
@@ -22,6 +23,7 @@ from omnigent.runner.app import (
     _resolved_workdir_for_spec,
     _session_labels_for_runner_spawn,
 )
+from omnigent.runner.native import _resolve_native_spawn_env
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
@@ -132,8 +134,6 @@ async def test_session_labels_for_runner_spawn_empty_200_body_recovers(
 @pytest.mark.asyncio
 async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> None:
     """A bare-shape harness (pi) calls its builder with just the session id."""
-    from omnigent.runner.native import _resolve_native_spawn_env
-
     captured: dict[str, Any] = {}
 
     def _fake_build(conversation_id: str) -> dict[str, str]:
@@ -157,9 +157,6 @@ async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> 
 @pytest.mark.asyncio
 async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
     """A label-shape harness (codex) reads its bridge id from session labels."""
-    from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
-    from omnigent.runner.native import _resolve_native_spawn_env
-
     captured: dict[str, Any] = {}
 
     def _fake_build(conversation_id: str, *, bridge_id: str | None = None) -> dict[str, str]:
@@ -190,8 +187,6 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 @pytest.mark.asyncio
 async def test_resolve_native_spawn_env_claude_uses_bridge_id_helper() -> None:
     """Claude resolves its bridge id through the runner helper, not a label read."""
-    from omnigent.runner.native import _resolve_native_spawn_env
-
     captured: dict[str, Any] = {}
 
     def _fake_build(conversation_id: str, *, bridge_id: str | None = None) -> dict[str, str]:
@@ -227,8 +222,6 @@ async def test_resolve_native_spawn_env_claude_uses_bridge_id_helper() -> None:
 @pytest.mark.asyncio
 async def test_resolve_native_spawn_env_hermes_writes_policy_hook_before_build() -> None:
     """Hermes writes its policy-hook config before building the spawn env."""
-    from omnigent.runner.native import _resolve_native_spawn_env
-
     order: list[str] = []
 
     def _fake_write(bridge_dir: Any, server_url: str, session_id: str) -> None:
@@ -257,8 +250,6 @@ async def test_resolve_native_spawn_env_hermes_writes_policy_hook_before_build()
 @pytest.mark.asyncio
 async def test_resolve_native_spawn_env_non_native_returns_none() -> None:
     """A non-native harness yields None so the caller keeps its SDK spawn env."""
-    from omnigent.runner.native import _resolve_native_spawn_env
-
     async with httpx.AsyncClient(base_url="http://ap") as client:
         env = await _resolve_native_spawn_env(
             "claude-sdk",
